@@ -8,6 +8,8 @@ import inspector from "node:inspector";
 import { getHeapStatistics } from "node:v8";
 import { headers } from "next/headers";
 import { hasAuthorizedDiagnosticRunMarker } from "./performance-diagnostic-marker";
+import { categoryForFrame } from "./cpu-profile-categories.mjs";
+import { isHtmlSsrCaptureEligible } from "./ssr-capture-sampling.mjs";
 import { releaseMetadataPathFromStandaloneCwd } from "./release-identity-path.mjs";
 import {
   claimWorkspaceCpuWindowStart,
@@ -29,10 +31,11 @@ import {
 const PLAN_DIRECTORY = "/run/oldsparky-platform";
 const PLAN_PATH = `${PLAN_DIRECTORY}/performance-diagnostic-plan.web.json`;
 const MAX_PLAN_BYTES = 4096;
-const MAX_TOTAL_WINDOW_MS = 60_000;
+const MAX_TOTAL_WINDOW_MS = 160_000;
 const OFF_WINDOW_MS = 20_000;
 const IDLE_WINDOW_MS = 5_000;
 const ON_WINDOW_MS = 20_000;
+const HTML_CAPACITY_ON_WINDOW_MS = 120_000;
 const MAX_SAMPLES = 1200;
 const MAX_PROFILE_NODES = 10_000;
 const MAX_PROFILE_CPU_US = 60_000_000;
@@ -44,7 +47,10 @@ const CGROUP_MEMORY_EVENT_NAMES = ["low", "high", "max", "oom", "oom_kill", "oom
 const WORKLOAD_CPU_PAIR = "authenticated_workspace_read_pair_v1";
 const WORKLOAD_SSR_CAPACITY = "authenticated_workspace_read_capacity_v1";
 const WORKLOAD_HTML_SSR_CAPACITY = "authenticated_html_ssr_capacity_v1";
+const WORKLOAD_HTML_SSR_CAPACITY_120S = "authenticated_html_ssr_capacity_120s_v1";
+const WORKLOAD_HTML_SSR_CPU_PROFILE_20S = "authenticated_html_ssr_cpu_profile_20s_v1";
 const DIAGNOSTIC_TRACE_HEADER = "x-platform-ssr-trace";
+const SSR_STREAM_SELECTOR = Symbol.for("old-sparky.ssr-stream-selector");
 
 type PlanTarget = {
   readonly service: "web";
@@ -58,7 +64,9 @@ type DiagnosticPlan = {
   readonly run_id: string;
   readonly source_sha: string;
   readonly release_slug: string;
-  readonly workload: typeof WORKLOAD_CPU_PAIR | typeof WORKLOAD_SSR_CAPACITY | typeof WORKLOAD_HTML_SSR_CAPACITY;
+  readonly workload: typeof WORKLOAD_CPU_PAIR | typeof WORKLOAD_SSR_CAPACITY
+    | typeof WORKLOAD_HTML_SSR_CAPACITY | typeof WORKLOAD_HTML_SSR_CAPACITY_120S
+    | typeof WORKLOAD_HTML_SSR_CPU_PROFILE_20S;
   readonly off_start_ms: number;
   readonly off_end_ms: number;
   readonly on_start_ms: number;
@@ -163,7 +171,9 @@ function validatePayload(value: unknown): DiagnosticPlan | null {
   if (plan.schema !== 1
       || (plan.workload !== WORKLOAD_CPU_PAIR
         && plan.workload !== WORKLOAD_SSR_CAPACITY
-        && plan.workload !== WORKLOAD_HTML_SSR_CAPACITY)
+        && plan.workload !== WORKLOAD_HTML_SSR_CAPACITY
+        && plan.workload !== WORKLOAD_HTML_SSR_CAPACITY_120S
+        && plan.workload !== WORKLOAD_HTML_SSR_CPU_PROFILE_20S)
       || typeof plan.run_id !== "string" || !/^[0-9a-f]{32}$/u.test(plan.run_id)
       || typeof plan.source_sha !== "string" || !/^[0-9a-f]{40}$/u.test(plan.source_sha)
       || typeof plan.release_slug !== "string" || !/^[a-z0-9][a-z0-9-]{0,79}$/u.test(plan.release_slug)) {
@@ -173,10 +183,17 @@ function validatePayload(value: unknown): DiagnosticPlan | null {
   const times = timeNames.map((name) => plan[name]);
   if (times.some((time) => typeof time !== "number" || !Number.isSafeInteger(time) || time <= 0)) return null;
   const [offStart, offEnd, onStart, onEnd, expires] = times as number[];
-  if (!(offStart < offEnd && offEnd <= onStart && onStart < onEnd && onEnd === expires)
+  const expectedOnWindow = plan.workload === WORKLOAD_HTML_SSR_CAPACITY_120S
+    ? HTML_CAPACITY_ON_WINDOW_MS
+    : ON_WINDOW_MS;
+  const typedHtmlWorkload = plan.workload === WORKLOAD_HTML_SSR_CAPACITY_120S
+    || plan.workload === WORKLOAD_HTML_SSR_CPU_PROFILE_20S;
+  const expectedExpiry = onEnd + (typedHtmlWorkload ? 15_000 : 0);
+  if (!(offStart < offEnd && offEnd <= onStart && onStart < onEnd && onEnd <= expires)
       || offEnd - offStart !== OFF_WINDOW_MS
       || onStart - offEnd !== IDLE_WINDOW_MS
-      || onEnd - onStart !== ON_WINDOW_MS
+      || onEnd - onStart !== expectedOnWindow
+      || expires !== expectedExpiry
       || expires - offStart > MAX_TOTAL_WINDOW_MS || onEnd - onStart > MAX_TOTAL_WINDOW_MS) return null;
   if (!Array.isArray(plan.targets) || plan.targets.length < 1 || plan.targets.length > 32) return null;
   const targetKeys = new Set<string>();
@@ -282,6 +299,81 @@ export function current_diagnostic_run_id(): string | null {
     : null;
 }
 
+export function isCurrentTypedHtmlSsrDiagnosticPlan(): boolean {
+  const current = diagnosticStorage.getStore();
+  return current !== undefined && (
+    current.plan.workload === WORKLOAD_HTML_SSR_CAPACITY_120S
+    || current.plan.workload === WORKLOAD_HTML_SSR_CPU_PROFILE_20S
+  );
+}
+
+export function currentTypedHtmlSsrDiagnosticExpiryMs(): number | null {
+  const current = diagnosticStorage.getStore();
+  return current && (
+    current.plan.workload === WORKLOAD_HTML_SSR_CAPACITY_120S
+    || current.plan.workload === WORKLOAD_HTML_SSR_CPU_PROFILE_20S
+  )
+    ? current.plan.expires_at_ms
+    : null;
+}
+
+function validatedSsrDiagnostic(requestHeaders: Pick<Headers, "get">): ActiveDiagnostic | null {
+  const incomingTrace = requestHeaders.get(DIAGNOSTIC_TRACE_HEADER);
+  if (!incomingTrace || !/^[0-9a-f]{32}$/u.test(incomingTrace)) return null;
+  const plan = currentPlan();
+  if (!plan
+      || (plan.workload !== WORKLOAD_HTML_SSR_CAPACITY_120S
+        && plan.workload !== WORKLOAD_HTML_SSR_CPU_PROFILE_20S)
+      || !hasAuthorizedDiagnosticRunMarker(incomingTrace, plan.run_id)) return null;
+  const phase = activePhase(plan, Date.now());
+  return phase === null ? null : { plan, phase };
+}
+
+function registerSsrStreamRequest(
+  requestHeaders: Pick<Headers, "get">,
+  diagnostic: ActiveDiagnostic,
+): void {
+  const requestId = requestHeaders.get("x-request-id") ?? "";
+  const register = (globalThis as typeof globalThis & Record<PropertyKey, unknown>)[SSR_STREAM_SELECTOR];
+  if (!/^[0-9a-f]{32}$/u.test(requestId) || typeof register !== "function") return;
+  try {
+    (register as (entry: {
+      requestId: string;
+      runId: string;
+      expiresAtMs: number;
+      captureEligible: boolean;
+    }) => unknown)({
+      requestId,
+      runId: diagnostic.plan.run_id,
+      expiresAtMs: diagnostic.plan.expires_at_ms,
+      captureEligible: isHtmlSsrCaptureEligible(diagnostic.plan.run_id, requestId),
+    });
+  } catch {
+    // Stream diagnostics are optional; selection failure must not affect SSR.
+  }
+}
+
+export async function runWithSsrDiagnosticPlan<T>(
+  requestHeaders: Pick<Headers, "get">,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const inherited = diagnosticStorage.getStore();
+  const diagnostic = inherited ?? validatedSsrDiagnostic(requestHeaders);
+  if (!diagnostic) return operation();
+  registerSsrStreamRequest(requestHeaders, diagnostic);
+  if (diagnosticStorage.getStore()) return operation();
+  startCpuUsageWindow(diagnostic.plan, diagnostic.phase);
+  startNodeMemoryWindow(diagnostic.plan, diagnostic.phase);
+  if (diagnostic.plan.workload === WORKLOAD_HTML_SSR_CPU_PROFILE_20S
+      && diagnostic.phase === "on"
+      && !consumedCpuRunIds.has(diagnostic.plan.run_id)
+      && activeCpuRunId === null) {
+    consumedCpuRunIds.add(diagnostic.plan.run_id);
+    await startNodeCpuProfile(diagnostic.plan, Date.now());
+  }
+  return diagnosticStorage.run(diagnostic, operation);
+}
+
 export function current_workspace_cpu_diagnostic_prearm_run_id(): string | null {
   const prearmPlan = diagnosticPrearmStorage.getStore();
   return readAuthorizedWorkspaceDiagnosticPrearmRunId(
@@ -321,7 +413,8 @@ export async function run_with_workspace_cpu_diagnostic<T>(
   }
   startCpuUsageWindow(plan, phase);
   startNodeMemoryWindow(plan, phase);
-  if (plan.workload === WORKLOAD_CPU_PAIR && phase === "on"
+  if ((plan.workload === WORKLOAD_CPU_PAIR || plan.workload === WORKLOAD_HTML_SSR_CPU_PROFILE_20S)
+      && phase === "on"
       && !consumedCpuRunIds.has(plan.run_id) && activeCpuRunId === null) {
     consumedCpuRunIds.add(plan.run_id);
     await startNodeCpuProfile(plan, Date.now());
@@ -413,6 +506,7 @@ function startCpuUsageWindow(plan: DiagnosticPlan, phase: DiagnosticPhase): void
   })) return;
   const startTarget = phase === "off" ? plan.off_start_ms : plan.on_start_ms;
   const endTarget = phase === "off" ? plan.off_end_ms : plan.on_end_ms;
+  const expectedWindowMs = endTarget - startTarget;
   const startMs = Date.now();
   const startLagMs = startMs - startTarget;
   const startCpu = process.cpuUsage();
@@ -427,8 +521,8 @@ function startCpuUsageWindow(plan: DiagnosticPlan, phase: DiagnosticPhase): void
     const timingComplete = Boolean(
       startLagMs >= 0 && startLagMs <= CPU_WINDOW_TOLERANCE_MS
       && Math.abs(endLagMs) <= CPU_WINDOW_TOLERANCE_MS
-      && windowMs >= 20_000 - CPU_WINDOW_TOLERANCE_MS
-      && windowMs <= 20_000 + 2 * CPU_WINDOW_TOLERANCE_MS
+      && windowMs >= expectedWindowMs - CPU_WINDOW_TOLERANCE_MS
+      && windowMs <= expectedWindowMs + 2 * CPU_WINDOW_TOLERANCE_MS
     );
     console.info(
       `cpu_diagnostic_usage service=web run_id=${plan.run_id} phase=${phase}`
@@ -592,8 +686,11 @@ function startNodeMemoryWindow(plan: DiagnosticPlan, phase: DiagnosticPhase): vo
   let gcOverflow = false;
   let observer: PerformanceObserver | null = null;
   const phaseStartEpochMs = phase === "off" ? plan.off_start_ms : plan.on_start_ms;
+  const phaseDurationMs = phase === "off"
+    ? plan.off_end_ms - plan.off_start_ms
+    : plan.on_end_ms - plan.on_start_ms;
   const phaseStartMonotonicMs = performance.now() + (phaseStartEpochMs - Date.now());
-  const phaseEndMonotonicMs = phaseStartMonotonicMs + ON_WINDOW_MS;
+  const phaseEndMonotonicMs = phaseStartMonotonicMs + phaseDurationMs;
   const consumeGcEntries = (entries: readonly PerformanceEntry[]): void => {
     for (const entry of entries) {
       const attributedDurationMs = timelineEntryDurationWithinWindow(
@@ -630,10 +727,14 @@ function startNodeMemoryWindow(plan: DiagnosticPlan, phase: DiagnosticPhase): vo
     if (value !== null) appendBoundedSample(samples, value, MEMORY_SAMPLE_LIMIT);
   };
   sample();
-  const interval = setInterval(sample, MEMORY_SAMPLE_INTERVAL_MS);
+  const sampleIntervalMs = phaseDurationMs > ON_WINDOW_MS
+    ? Math.ceil(phaseDurationMs / (MEMORY_SAMPLE_LIMIT - 1))
+    : MEMORY_SAMPLE_INTERVAL_MS;
+  const interval = setInterval(sample, sampleIntervalMs);
   interval.unref();
   const finish = setTimeout(() => {
     clearInterval(interval);
+    sample();
     if (observer !== null) consumeGcEntries(observer.takeRecords());
     observer?.disconnect();
     const fields = ["rssBytes", "heapTotalBytes", "heapUsedBytes", "heapLimitBytes", "externalBytes", "arrayBuffersBytes"] as const;
@@ -698,22 +799,6 @@ function startNodeMemoryWindow(plan: DiagnosticPlan, phase: DiagnosticPhase): vo
     }
   }, Math.max(1, phaseEndMonotonicMs - performance.now()));
   finish.unref();
-}
-
-function categoryForFrame(url: string, functionName: string): string {
-  const normalized = url.replaceAll("\\", "/");
-  if (normalized.includes("/apps/platform_web/.next/server/app/(site)/tournaments/")) {
-    if (["getTournamentWorkspace", "loadTournamentWorkspace", "TournamentPage"].includes(functionName)) {
-      return `repo.${functionName === "getTournamentWorkspace" ? "workspace_api_fetch" : "workspace_page"}`;
-    }
-  }
-  if (normalized.includes("/node_modules/next/")) return "web_framework";
-  if (normalized.includes("/node_modules/react/")) return "serialization_validation";
-  if (normalized.includes("/node_modules/zod/")) return "serialization_validation";
-  if (normalized.startsWith("node:internal/")) return "async_event_loop";
-  if (normalized.includes("/node_modules/undici/")) return "http_client";
-  if (normalized.startsWith("node:crypto") || normalized.includes("/node:crypto")) return "crypto";
-  return "other";
 }
 
 type InspectorResponse<T> = { readonly result?: T };
@@ -787,11 +872,14 @@ async function stopNodeCpuProfile(
       totals.set(category, row);
       acceptedSamples += 1;
     }
-    const summary = [...totals.entries()]
+    const otherTotals = totals.get("other") ?? { samples: 0, cpuUs: 0 };
+    const summaryRows = [...totals.entries()]
+      .filter(([name]) => name !== "other")
       .sort((left, right) => right[1].cpuUs - left[1].cpuUs || left[0].localeCompare(right[0]))
-      .slice(0, 8)
-      .map(([name, row]) => `${name}:${row.cpuUs}:${row.samples}`)
-      .join(",");
+      .slice(0, 7)
+      .map(([name, row]) => `${name}:${row.cpuUs}:${row.samples}`);
+    summaryRows.push(`other:${otherTotals.cpuUs}:${otherTotals.samples}`);
+    const summary = summaryRows.join(",");
     const elapsedMs = Math.max(0, Math.floor(performance.now() - startedMonotonicMs));
     console.info(
       `cpu_diagnostic_complete service=web run_id=${runId} timer=v8_cpu `

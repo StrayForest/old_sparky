@@ -47,6 +47,10 @@ WORKLOAD = "authenticated_workspace_read_capacity_v1"
 FIXTURE_KIND = "ssr_capacity_diagnostic_v1"
 HTML_WORKLOAD = "authenticated_html_ssr_capacity_v1"
 HTML_FIXTURE_KIND = "ssr_html_capacity_diagnostic_v1"
+HTML_CAPACITY_120S_WORKLOAD = "authenticated_html_ssr_capacity_120s_v1"
+HTML_CPU_PROFILE_20S_WORKLOAD = "authenticated_html_ssr_cpu_profile_20s_v1"
+HTML_COMPOSITE_WORKLOAD = "authenticated_html_ssr_capacity_120s_plus_cpu_profile_20s_v1"
+HTML_COMPOSITE_FIXTURE_KIND = "ssr_html_capacity_composite_diagnostic_v1"
 SCHEMA = 1
 CONCURRENCY_PRESETS = frozenset({8, 16})
 HTML_CONCURRENCY_PRESETS = frozenset({8, 16, 32, 64})
@@ -57,6 +61,28 @@ CAPACITY_ERROR_CODES = frozenset({
 FIXTURE_TOURNAMENTS = 1
 FIXTURE_USERS = 14
 ON_WINDOW_MS = 20_000
+ON_WINDOW_MS_BY_WORKLOAD = {
+    WORKLOAD: ON_WINDOW_MS,
+    HTML_WORKLOAD: ON_WINDOW_MS,
+    HTML_CAPACITY_120S_WORKLOAD: 120_000,
+    HTML_CPU_PROFILE_20S_WORKLOAD: ON_WINDOW_MS,
+}
+NEW_TYPED_WORKLOADS = frozenset({HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD})
+PLAN_EXPIRY_GRACE_MS = 15_000
+PLAN_EXPIRY_GRACE_MS_BY_WORKLOAD = {
+    HTML_CAPACITY_120S_WORKLOAD: PLAN_EXPIRY_GRACE_MS,
+    HTML_CPU_PROFILE_20S_WORKLOAD: PLAN_EXPIRY_GRACE_MS,
+}
+WORKER_RUNTIME_SECONDS_BY_WORKLOAD = {
+    WORKLOAD: 150,
+    HTML_WORKLOAD: 150,
+    HTML_CAPACITY_120S_WORKLOAD: 225,
+    HTML_CPU_PROFILE_20S_WORKLOAD: 125,
+}
+MAX_OBSERVED_DURATION_MS_BY_WORKLOAD = {
+    workload: window_ms + 10_000
+    for workload, window_ms in ON_WINDOW_MS_BY_WORKLOAD.items()
+}
 FAILURE_RECORD_LIMIT = 8
 FAILURE_STAGES = frozenset({
     "connect_or_request_write", "response_headers", "body_receive", "response_complete", "unknown",
@@ -68,11 +94,13 @@ FAILURE_TIMING_KEYS = frozenset({
 CONTROL_BASENAME = "capacity-control.json"
 REMOTE_WATCH_PREFIX = b"CAPACITY_MEMORY_GUARD "
 REMOTE_WATCH_ERROR_PREFIX = b"CAPACITY_MEMORY_GUARD_ERROR "
-# Match the dispatcher's fixed 130s cap: at most 522 sampled/terminal rows
-# at 250ms. The parent caps each complete prefixed wire line at 2048 bytes;
-# 522 lines plus newlines remain comfortably within this cumulative 2MiB cap.
+# Bound 145s of plan sampling to 600 rows at 250ms, plus terminal margin.
+# The parent caps each complete prefixed wire line at 2048 bytes; this remains
+# comfortably within the cumulative 2MiB cap.
 REMOTE_WATCH_CAP = 2 * 1024 * 1024
-REMOTE_ROW_CAP = 2_048
+MAX_SSR_JOIN_REQUEST_IDS = 1_000
+SSR_JOIN_SAMPLE_SCHEME = "sha256-runid-requestid-1of8-v1"
+REMOTE_ROW_CAP = 600
 MEMORY_OBSERVER_FAILURE_STAGES = frozenset({
     "ssh_material_validation", "ssh_spawn", "input_write", "first_row_read",
     "row_decode", "row_accept", "thread_start", "sample_loop",
@@ -107,8 +135,7 @@ CPU_WINDOW_TOLERANCE_NS = 500_000_000
 # is requested on_end (+97s from plan creation); add 8s for that offset and 1s
 # so the host's strict `expires_at_ms < now` cleanup guard is satisfied.
 PLAN_EXPIRY_SKEW_MARGIN_MS = 9_000
-PLAN_EXPIRY_HORIZON_MS = 97_000
-PLAN_EXPIRY_WAIT_LIMIT_MS = 107_000
+PLAN_EXPIRY_WAIT_LIMIT_MS = 230_000
 SANITIZER_FAILURE_STAGES = frozenset({
     "manifest_read", "report_read", "report_projection", "report_binding", "output_write",
 })
@@ -587,7 +614,8 @@ class _RemoteMemoryWatcher:
                 or type(row.get("plan_on_end_ms")) is not int
                 or row["plan_off_start_ms"] >= row["plan_on_start_ms"]
                 or row["plan_on_start_ms"] - row["plan_off_start_ms"] != 25_000
-                or row["plan_on_end_ms"] - row["plan_on_start_ms"] != ON_WINDOW_MS
+                or row["plan_on_end_ms"] - row["plan_on_start_ms"]
+                != ON_WINDOW_MS_BY_WORKLOAD[self.workload]
                 or row["elapsed_ms"] != max(0, row["sampled_at_ms"] - row["plan_off_start_ms"])
                 or row.get("phase") not in {"off", "idle", "on", "complete", "abort"}
                 or row["phase"] != (
@@ -844,7 +872,26 @@ def _profile_spec(workload: str) -> tuple[str, frozenset[int], int]:
         return FIXTURE_KIND, CONCURRENCY_PRESETS, 8
     if workload == HTML_WORKLOAD:
         return HTML_FIXTURE_KIND, HTML_CONCURRENCY_PRESETS, FIXTURE_USERS
+    if workload in {HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD}:
+        return HTML_FIXTURE_KIND, frozenset({32}), FIXTURE_USERS
     raise ValueError("capacity workload rejected")
+
+
+def _is_html_workload(workload: str) -> bool:
+    return workload in {
+        HTML_WORKLOAD,
+        HTML_CAPACITY_120S_WORKLOAD,
+        HTML_CPU_PROFILE_20S_WORKLOAD,
+    }
+
+
+def _plan_expiry_ms(workload: str, on_end_ms: int) -> int:
+    return on_end_ms + PLAN_EXPIRY_GRACE_MS_BY_WORKLOAD.get(workload, 0)
+
+
+def _plan_expiry_horizon_ms(workload: str) -> int:
+    on_window_ms = ON_WINDOW_MS_BY_WORKLOAD[workload]
+    return 52_000 + 20_000 + 5_000 + on_window_ms + PLAN_EXPIRY_GRACE_MS_BY_WORKLOAD.get(workload, 0)
 
 
 def _capacity_error_code(result: Any) -> str:
@@ -892,6 +939,214 @@ def _request_evidence_fields(
             off_results=off_results, on_results=on_results,
         ),
     }
+
+
+def _request_timestamp_ms(value: Any) -> int | None:
+    if not isinstance(value, str) or not 1 <= len(value) <= 64:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed.tzinfo is None:
+        return None
+    timestamp_ms = int(parsed.timestamp() * 1000)
+    return timestamp_ms if timestamp_ms >= 0 else None
+
+
+def _phase_request_window_evidence(
+    results: list[Any], *, start_ms: int, end_ms: int, run_id: str,
+) -> tuple[list[Any], dict[str, Any]]:
+    """Filter by actual client request start and account for post-edge drain."""
+
+    in_window: list[Any] = []
+    started_outside = 0
+    missing_start = 0
+    missing_finish = 0
+    completed_by_end = 0
+    drain_completed = 0
+    cf_ray_present = 0
+    cf_ray_missing = 0
+    ssr_request_id_counts: Counter[str] = Counter()
+    eligible_response_id_count = 0
+    ssr_request_id_missing = 0
+    ssr_request_id_malformed = 0
+    for result in results:
+        started = _request_timestamp_ms(getattr(result, "started_at_utc", None))
+        finished = _request_timestamp_ms(getattr(result, "finished_at_utc", None))
+        if started is None:
+            missing_start += 1
+            continue
+        if not start_ms <= started < end_ms:
+            started_outside += 1
+            continue
+        in_window.append(result)
+        if finished is None:
+            missing_finish += 1
+        elif finished <= end_ms:
+            completed_by_end += 1
+        else:
+            drain_completed += 1
+        cf_ray = getattr(result, "cf_ray", None)
+        if isinstance(cf_ray, str) and cf_ray:
+            cf_ray_present += 1
+        else:
+            cf_ray_missing += 1
+        request_id = getattr(result, "ssr_request_id", None)
+        if isinstance(request_id, str) and re.fullmatch(r"[0-9a-f]{32}", request_id):
+            ssr_request_id_counts[request_id] += 1
+        elif getattr(result, "ssr_request_id_malformed", False) is True:
+            ssr_request_id_malformed += 1
+        else:
+            ssr_request_id_missing += 1
+    eligible_response_id_count = sum(
+        1 for request_id, count in ssr_request_id_counts.items()
+        if count == 1 and _ssr_join_id_is_eligible(run_id, request_id)
+    )
+    return in_window, {
+        "schema": 1,
+        "window_start_ms": start_ms,
+        "window_end_ms": end_ms,
+        "request_start_basis": "client_actual_started_at_utc",
+        "submitted_results": len(results),
+        "started_in_window_count": len(in_window),
+        "started_outside_window_count": started_outside,
+        "missing_start_timestamp_count": missing_start,
+        "missing_finish_timestamp_count": missing_finish,
+        "completed_by_window_end_count": completed_by_end,
+        "drain_completed_after_window_count": drain_completed,
+        "cf_ray_present_count": cf_ray_present,
+        "cf_ray_missing_count": cf_ray_missing,
+        "ssr_request_id_singleton_count": sum(1 for count in ssr_request_id_counts.values() if count == 1),
+        "ssr_request_id_missing_count": ssr_request_id_missing,
+        "ssr_request_id_duplicate_count": sum(count for count in ssr_request_id_counts.values() if count > 1),
+        "ssr_request_id_malformed_count": ssr_request_id_malformed,
+        "eligible_response_id_count": eligible_response_id_count,
+        "retained_sample_count": min(eligible_response_id_count, MAX_SSR_JOIN_REQUEST_IDS),
+        "sample_scheme": SSR_JOIN_SAMPLE_SCHEME,
+        "sample_cap_truncated": eligible_response_id_count > MAX_SSR_JOIN_REQUEST_IDS,
+        "status": (
+            "complete"
+            if in_window and not started_outside and not missing_start and not missing_finish
+            else "incomplete"
+        ),
+    }
+
+
+def _selected_ssr_join_request_ids(results: list[Any], run_id: str) -> list[str]:
+    """Select a deterministic, bounded sample of server-issued request IDs."""
+
+    if not RUN_RE.fullmatch(run_id):
+        raise ValueError("SSR join run identity rejected")
+    id_counts = Counter(
+        value for item in results
+        if isinstance((value := getattr(item, "ssr_request_id", None)), str)
+        and re.fullmatch(r"[0-9a-f]{32}", value)
+    )
+    ids = {
+        value for value, count in id_counts.items()
+        if count == 1 and _ssr_join_id_is_eligible(run_id, value)
+    }
+    ranked = sorted(
+        ids,
+        key=lambda value: (hashlib.sha256(f"{run_id}:{value}".encode("ascii")).digest(), value),
+    )
+    return sorted(ranked[:MAX_SSR_JOIN_REQUEST_IDS])
+
+
+def _ssr_join_id_is_eligible(run_id: str, request_id: str) -> bool:
+    if not RUN_RE.fullmatch(run_id) or not RUN_RE.fullmatch(request_id):
+        return False
+    return hashlib.sha256(f"{run_id}:{request_id}".encode("ascii")).digest()[0] & 7 == 0
+
+
+def _empty_phase_request_window_evidence(*, start_ms: int, end_ms: int) -> dict[str, Any]:
+    return {
+        "schema": 1,
+        "window_start_ms": start_ms,
+        "window_end_ms": end_ms,
+        "request_start_basis": "client_actual_started_at_utc",
+        "submitted_results": 0,
+        "started_in_window_count": 0,
+        "started_outside_window_count": 0,
+        "missing_start_timestamp_count": 0,
+        "missing_finish_timestamp_count": 0,
+        "completed_by_window_end_count": 0,
+        "drain_completed_after_window_count": 0,
+        "cf_ray_present_count": 0,
+        "cf_ray_missing_count": 0,
+        "ssr_request_id_singleton_count": 0,
+        "ssr_request_id_missing_count": 0,
+        "ssr_request_id_duplicate_count": 0,
+        "ssr_request_id_malformed_count": 0,
+        "eligible_response_id_count": 0,
+        "retained_sample_count": 0,
+        "sample_scheme": SSR_JOIN_SAMPLE_SCHEME,
+        "sample_cap_truncated": False,
+        "status": "incomplete",
+    }
+
+
+def _phase_request_window_evidence_is_closed(
+    value: Any, *, start_ms: int, end_ms: int,
+) -> bool:
+    fields = {
+        "schema", "window_start_ms", "window_end_ms", "request_start_basis",
+        "submitted_results", "started_in_window_count", "started_outside_window_count",
+        "missing_start_timestamp_count", "missing_finish_timestamp_count",
+        "completed_by_window_end_count", "drain_completed_after_window_count",
+        "cf_ray_present_count", "cf_ray_missing_count", "ssr_request_id_singleton_count",
+        "ssr_request_id_missing_count", "ssr_request_id_duplicate_count",
+        "ssr_request_id_malformed_count", "eligible_response_id_count",
+        "retained_sample_count", "sample_scheme", "sample_cap_truncated", "status",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != fields
+        or type(value.get("schema")) is not int
+        or value.get("schema") != 1
+        or value.get("window_start_ms") != start_ms
+        or value.get("window_end_ms") != end_ms
+        or value.get("request_start_basis") != "client_actual_started_at_utc"
+        or value.get("sample_scheme") != SSR_JOIN_SAMPLE_SCHEME
+        or value.get("status") not in {"complete", "incomplete"}
+        or type(value.get("sample_cap_truncated")) is not bool
+        or any(type(value.get(field)) is not int or value[field] < 0 for field in fields if field.endswith("_count"))
+    ):
+        return False
+    if (
+        value["started_in_window_count"]
+        + value["started_outside_window_count"]
+        + value["missing_start_timestamp_count"]
+        != value["submitted_results"]
+        or value["completed_by_window_end_count"]
+        + value["drain_completed_after_window_count"]
+        + value["missing_finish_timestamp_count"]
+        != value["started_in_window_count"]
+        or value["cf_ray_present_count"] + value["cf_ray_missing_count"]
+        != value["started_in_window_count"]
+        or sum(value[key] for key in (
+            "ssr_request_id_singleton_count", "ssr_request_id_missing_count",
+            "ssr_request_id_duplicate_count", "ssr_request_id_malformed_count",
+        )) != value["started_in_window_count"]
+        or value["eligible_response_id_count"] > value["ssr_request_id_singleton_count"]
+        or value["retained_sample_count"] != min(
+            value["eligible_response_id_count"], MAX_SSR_JOIN_REQUEST_IDS,
+        )
+        or value["sample_cap_truncated"] != (
+            value["eligible_response_id_count"] > MAX_SSR_JOIN_REQUEST_IDS
+        )
+    ):
+        return False
+    expected_status = (
+        "complete"
+        if value["started_in_window_count"] > 0
+        and value["started_outside_window_count"] == 0
+        and value["missing_start_timestamp_count"] == 0
+        and value["missing_finish_timestamp_count"] == 0
+        else "incomplete"
+    )
+    return value["status"] == expected_status
 
 
 def _capacity_worker_status(*, aborted: bool, all_200: bool) -> str:
@@ -1114,7 +1369,7 @@ def _worker_counts_are_closed(payload: Mapping[str, Any]) -> bool:
 def _warmup_diagnostic_trace_run_id(workload: str, run_id: str) -> str | None:
     """Only HTML capacity warmups may carry the root-bound API prearm marker."""
 
-    return run_id if workload == HTML_WORKLOAD else None
+    return run_id if _is_html_workload(workload) else None
 
 
 def _warmup_exception_class(value: Any) -> str:
@@ -1353,15 +1608,38 @@ def profile_payload(concurrency: int, workload: str = WORKLOAD) -> dict[str, Any
         "concurrency": concurrency,
         "max_inflight": concurrency,
         "load_model": "closed_loop_best_effort",
-        "window_ms": ON_WINDOW_MS,
+        "window_ms": ON_WINDOW_MS_BY_WORKLOAD[workload],
         "matrix_credit": False,
         "slo_credit": False,
     }
 
 
 def profile_digest(concurrency: int, workload: str = WORKLOAD) -> str:
+    if workload == HTML_COMPOSITE_WORKLOAD:
+        if concurrency != 32:
+            raise ValueError("composite capacity preset rejected")
+        payload = {
+            "schema": SCHEMA,
+            "mode": HTML_COMPOSITE_WORKLOAD,
+            "fixture_kind": HTML_COMPOSITE_FIXTURE_KIND,
+            "phase_workloads": [HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD],
+            "phase_windows_ms": [120_000, 20_000],
+            "fixture_tournaments": FIXTURE_TOURNAMENTS,
+            "fixture_users": FIXTURE_USERS,
+            "actors": FIXTURE_USERS,
+            "concurrency": 32,
+            "max_inflight": 32,
+            "load_model": "closed_loop_best_effort",
+            "client_transport": external_load.HTTP11_KEEPALIVE_TRANSPORT,
+            "auth_bootstrap_transport": "native",
+            "workspace_transport": "platform_fetch",
+            "matrix_credit": False,
+            "slo_credit": False,
+        }
+    else:
+        payload = profile_payload(concurrency, workload)
     raw = json.dumps(
-        profile_payload(concurrency, workload), ensure_ascii=True, allow_nan=False,
+        payload, ensure_ascii=True, allow_nan=False,
         sort_keys=True, separators=(",", ":"),
     ).encode("ascii")
     return hashlib.sha256(raw).hexdigest()
@@ -1429,7 +1707,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
     if (not isinstance(capacity, dict) or set(capacity) != expected_fields
             or type(capacity.get("schema")) is not int or capacity["schema"] != SCHEMA
             or not isinstance(capacity.get("workload"), str)
-            or capacity.get("workload") not in {WORKLOAD, HTML_WORKLOAD}
+            or capacity.get("workload") not in ON_WINDOW_MS_BY_WORKLOAD
             or capacity.get("fixture_kind") != _profile_spec(capacity["workload"])[0]
             or type(capacity.get("concurrency")) is not int
             or capacity["concurrency"] not in _profile_spec(capacity["workload"])[1]
@@ -1441,7 +1719,8 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
             or type(capacity.get("off_end_ms")) is not int
             or capacity["off_end_ms"] - capacity["off_start_ms"] != ON_WINDOW_MS
             or capacity["on_start_ms"] - capacity["off_end_ms"] != 5_000
-            or capacity["on_end_ms"] - capacity["on_start_ms"] != ON_WINDOW_MS):
+            or capacity["on_end_ms"] - capacity["on_start_ms"]
+            != ON_WINDOW_MS_BY_WORKLOAD[capacity["workload"]]):
         raise ValueError("capacity worker config rejected")
     binding = capacity.get("binding")
     binding_fields = {
@@ -1516,7 +1795,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
             transport=external_load.HTTP11_KEEPALIVE_TRANSPORT,
             capture_timestamps=True,
             diagnostic_trace_run_id=binding["run_id"],
-            require_authenticated_html=capacity["workload"] == HTML_WORKLOAD,
+            require_authenticated_html=_is_html_workload(capacity["workload"]),
         )
 
     off_results: list[Any] = []
@@ -1530,7 +1809,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
             diagnostic_trace_run_id=_warmup_diagnostic_trace_run_id(
                 capacity["workload"], binding["run_id"],
             ),
-            require_authenticated_html=capacity["workload"] == HTML_WORKLOAD,
+            require_authenticated_html=_is_html_workload(capacity["workload"]),
         )
 
     def marked_probe(actor: external_load.VirtualUser, barrier: threading.Barrier):
@@ -1544,7 +1823,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
             transport=external_load.HTTP11_KEEPALIVE_TRANSPORT,
             capture_timestamps=True,
             diagnostic_trace_run_id=binding["run_id"],
-            require_authenticated_html=capacity["workload"] == HTML_WORKLOAD,
+            require_authenticated_html=_is_html_workload(capacity["workload"]),
         )
 
     def fail_off(
@@ -1706,7 +1985,8 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
     on_start_edge = _capture_cpu_edge(capacity["on_start_ms"])
     on_end_edge: dict[str, int] | None = None
 
-    local_window_end_monotonic = on_start_monotonic + ON_WINDOW_MS / 1000
+    on_window_ms = ON_WINDOW_MS_BY_WORKLOAD[capacity["workload"]]
+    local_window_end_monotonic = on_start_monotonic + on_window_ms / 1000
 
     def timed_guard() -> str | None:
         return _guard_reason_for_local_window(
@@ -1724,7 +2004,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
         phase_result = external_load.run_authenticated_workspace_capacity_phase(
             manifest["origin"], selected,
             phase="authenticated_workspace_read_capacity",
-            duration_seconds=20,
+            duration_seconds=on_window_ms / 1000,
             start_at_epoch_ms=capacity["on_start_ms"],
             end_at_epoch_ms=capacity["on_end_ms"],
             concurrency=capacity["concurrency"],
@@ -1733,9 +2013,9 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
             stop_requested=timed_guard,
             abort_on_result=(
                 (lambda result: "response_failure" if result.ok is not True else None)
-                if capacity["workload"] == HTML_WORKLOAD else None
+                if _is_html_workload(capacity["workload"]) else None
             ),
-            max_supported_concurrency=(64 if capacity["workload"] == HTML_WORKLOAD else 16),
+            max_supported_concurrency=(64 if capacity["workload"] == HTML_WORKLOAD else 32 if _is_html_workload(capacity["workload"]) else 16),
             window_end_callback=capture_on_window_end,
             executor=capacity_executor,
         )
@@ -1743,7 +2023,11 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
         return _incomplete_report(
             capacity, binding, "worker_error", submitted=0, completed=0,
             observed_duration_ms=max(
-                0, min(30_000, round((time.monotonic() - on_start_monotonic) * 1000)),
+                0,
+                min(
+                    MAX_OBSERVED_DURATION_MS_BY_WORKLOAD[capacity["workload"]],
+                    round((time.monotonic() - on_start_monotonic) * 1000),
+                ),
             ),
             off_probe_submitted=probe_count, off_probe_completed=probe_count,
             off_probe_status=200,
@@ -1754,7 +2038,13 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
     if on_end_edge is None:
         on_end_edge = _capture_cpu_edge(capacity["on_end_ms"])
     on_cpu_window = _cpu_window_row("on", on_start_edge, on_end_edge)
-    results = phase_result["results"]
+    raw_results = phase_result["results"]
+    results, request_window_evidence = _phase_request_window_evidence(
+        raw_results,
+        start_ms=capacity["on_start_ms"],
+        end_ms=capacity["on_end_ms"],
+        run_id=binding["run_id"],
+    )
     statuses = Counter(
         str(item.status) if type(item.status) is int and 100 <= item.status <= 599 else "unknown"
         for item in results
@@ -1764,16 +2054,20 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
         for item in results if item.error_kind is not None
     )
     latencies = [float(item.elapsed_ms) for item in results if type(item.elapsed_ms) in (int, float)]
-    all_200 = len(results) == phase_result["submitted"] and all(
+    all_200 = (
+        request_window_evidence["status"] == "complete"
+        and len(results) == phase_result["submitted"]
+        and all(
         item.ok is True and item.status == 200
-        and (capacity["workload"] != HTML_WORKLOAD or (
+        and (not _is_html_workload(capacity["workload"]) or (
             item.html_content_type_ok is True and item.html_page_marker_ok is True
         ))
         for item in results
+        )
     )
     final_reason = phase_result["abort_reason"]
     status = _capacity_worker_status(aborted=phase_result["aborted"], all_200=all_200)
-    return {
+    report = {
         **profile_payload(capacity["concurrency"], capacity["workload"]),
         "report_complete": True,
         "status": status,
@@ -1797,8 +2091,9 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
         "on_window_end_ms": phase_result["window_end_at_ms"],
         **_request_evidence_fields(on_results=results),
         "observed_duration_ms": phase_result["duration_ms"],
-        "submitted": phase_result["submitted"],
-        "completed": phase_result["completed"],
+        "submitted": request_window_evidence["started_in_window_count"],
+        "completed": len(results),
+        "request_window_evidence": request_window_evidence,
         "response_bytes_total": sum(
             item.response_bytes for item in results
             if type(getattr(item, "response_bytes", None)) is int
@@ -1823,12 +2118,16 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
            else {}),
         "generator_cpu_evidence": _generator_cpu_evidence_status(
             [off_cpu_window, on_cpu_window],
+            capacity["workload"],
         ),
         "server_capacity_claim": None,
         "server_capacity_claim_reason": "resource_correlation_not_provided",
         "diagnostic_credit": False,
         "namespace_closed": False,
     }
+    if capacity["workload"] in {HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD}:
+        report["client_join_request_ids"] = _selected_ssr_join_request_ids(results, binding["run_id"])
+    return report
 
 
 def _incomplete_report(
@@ -1843,7 +2142,11 @@ def _incomplete_report(
     off_results: list[Any] | None = None,
     on_results: list[Any] | None = None,
 ) -> dict[str, Any]:
-    if type(observed_duration_ms) is not int or not 0 <= observed_duration_ms <= 30_000:
+    if (
+        type(observed_duration_ms) is not int
+        or not 0 <= observed_duration_ms
+        <= MAX_OBSERVED_DURATION_MS_BY_WORKLOAD[capacity["workload"]]
+    ):
         raise ValueError("capacity incomplete duration is invalid")
     report = {
         **profile_payload(capacity["concurrency"], capacity["workload"]),
@@ -1866,6 +2169,11 @@ def _incomplete_report(
         # This field measures the ON window; pre-ON aborts pass zero explicitly.
         "observed_duration_ms": observed_duration_ms,
         "submitted": submitted, "completed": completed,
+        "request_window_evidence": _phase_request_window_evidence(
+            on_results or [],
+            start_ms=capacity["on_start_ms"], end_ms=capacity["on_end_ms"],
+            run_id=binding["run_id"],
+        )[1],
         "response_bytes_total": 0,
         "http_status_counts": {}, "error_counts": {},
         "latency_ms": {"sample_count": 0, "p50": None, "p95": None, "p99": None, "max": None},
@@ -1894,6 +2202,15 @@ def _incomplete_report(
                 )):
             raise ValueError("capacity warmup failure projection rejected")
         report["warmup_failure"] = dict(warmup_failure)
+    if capacity["workload"] in {HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD}:
+        report["client_join_request_ids"] = _selected_ssr_join_request_ids(
+            _phase_request_window_evidence(
+                on_results or [],
+                start_ms=capacity["on_start_ms"], end_ms=capacity["on_end_ms"],
+                run_id=binding["run_id"],
+            )[0],
+            binding["run_id"],
+        )
     return report
 
 
@@ -1905,12 +2222,15 @@ def _unknown_cpu_windows() -> list[dict[str, Any]]:
     ]
 
 
-def _valid_cpu_window_rows(value: Any) -> bool:
+def _valid_cpu_window_rows(value: Any, workload: str = WORKLOAD) -> bool:
     if not isinstance(value, list) or len(value) != 2:
+        return False
+    if workload not in ON_WINDOW_MS_BY_WORKLOAD:
         return False
     if [row.get("window") if isinstance(row, dict) else None for row in value] != ["off", "on"]:
         return False
     for row in value:
+        expected_ms = 20_000 if row.get("window") == "off" else ON_WINDOW_MS_BY_WORKLOAD[workload]
         if not isinstance(row, dict) or set(row) != {
             "window", "status", "cpu_ns", "elapsed_ns", "cores",
         }:
@@ -1921,7 +2241,8 @@ def _valid_cpu_window_rows(value: Any) -> bool:
         elif row["status"] == "complete":
             if (type(row["cpu_ns"]) is not int or row["cpu_ns"] < 0
                     or type(row["elapsed_ns"]) is not int or row["elapsed_ns"] <= 0
-                    or abs(row["elapsed_ns"] - 20_000_000_000) > CPU_WINDOW_TOLERANCE_NS
+                    or abs(row["elapsed_ns"] - expected_ms * 1_000_000)
+                    > CPU_WINDOW_TOLERANCE_NS
                     or type(row["cores"]) not in (int, float)
                     or isinstance(row["cores"], bool) or not math.isfinite(row["cores"])
                     or row["cores"] < 0 or row["cores"] > 128
@@ -1932,8 +2253,8 @@ def _valid_cpu_window_rows(value: Any) -> bool:
     return True
 
 
-def _generator_cpu_evidence_status(rows: Any) -> str:
-    if (not _valid_cpu_window_rows(rows)
+def _generator_cpu_evidence_status(rows: Any, workload: str = WORKLOAD) -> str:
+    if (not _valid_cpu_window_rows(rows, workload)
             or any(row["status"] != "complete" for row in rows)):
         return "incomplete"
     return "measured"
@@ -2018,7 +2339,12 @@ def run_isolated_capacity_worker(
 ) -> dict[str, Any]:
     """Run the typed worker behind the repository's mandatory PID namespace."""
 
-    if not SHA_RE.fullmatch(source_sha) or maximum_runtime_seconds <= 0 or maximum_runtime_seconds > 180:
+    workload = capacity_config.get("workload")
+    if (
+        not SHA_RE.fullmatch(source_sha)
+        or workload not in WORKER_RUNTIME_SECONDS_BY_WORKLOAD
+        or maximum_runtime_seconds != WORKER_RUNTIME_SECONDS_BY_WORKLOAD[workload]
+    ):
         raise ValueError("capacity supervisor bounds rejected")
     runner = external_load.RunnerCgroupSampler(
         runner_environment=os.environ.get("PLATFORM_RUNNER_ENVIRONMENT"),
@@ -2116,6 +2442,24 @@ def run_isolated_capacity_worker(
         worker_payload = None
     namespace_closed = result.namespace_closed is True and reason == "none"
     valid_worker = _worker_report_matches(worker_payload, capacity_config)
+    if (valid_worker and isinstance(worker_payload, Mapping)
+            and capacity_config.get("workload")
+            in {HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD}):
+        stage_state["transient_ssr_join_ids"] = list(
+            worker_payload["client_join_request_ids"]
+        )
+        evidence = worker_payload["request_window_evidence"]
+        stage_state["transient_ssr_join_counts"] = {
+            "submitted_html_count": evidence["started_in_window_count"],
+            "valid_response_id_count": evidence["ssr_request_id_singleton_count"],
+            "missing_response_id_count": evidence["ssr_request_id_missing_count"],
+            "duplicate_response_id_count": evidence["ssr_request_id_duplicate_count"],
+            "malformed_response_id_count": evidence["ssr_request_id_malformed_count"],
+            "eligible_response_id_count": evidence["eligible_response_id_count"],
+            "retained_sample_count": evidence["retained_sample_count"],
+            "sample_scheme": evidence["sample_scheme"],
+            "sample_cap_truncated": evidence["sample_cap_truncated"],
+        }
     memory = watcher_summary[0]
     observer_failure = {
         "failure_stage": memory.get("failure_stage"),
@@ -2173,14 +2517,14 @@ def run_isolated_capacity_worker(
         "concurrency": capacity_config["concurrency"],
         "max_inflight": capacity_config["concurrency"],
         "load_model": "closed_loop_best_effort",
-        "window_ms": ON_WINDOW_MS,
+        "window_ms": ON_WINDOW_MS_BY_WORKLOAD[capacity_config["workload"]],
         "namespace_closed": namespace_closed,
         "worker": {
             key: worker_payload.get(key, _unknown_cpu_windows() if key == "process_cpu_windows" else None) for key in (
                 "status", "submitted", "completed", "http_status_counts", "error_counts",
                 "failure_evidence", "actual_on_request_started_at_utc",
                 "actual_on_request_finished_at_utc", "failure_evidence_status",
-                "latency_ms", "resource_abort_reason", "on_window_start_ms", "on_window_end_ms",
+                "latency_ms", "request_window_evidence", "resource_abort_reason", "on_window_start_ms", "on_window_end_ms",
                 "observed_duration_ms", "max_inflight", "fixture_manifest_bytes",
                 "response_bytes_total", "off_probe", "process_cpu_windows",
             )
@@ -2188,6 +2532,7 @@ def run_isolated_capacity_worker(
         "generator_cpu_evidence": (
             _generator_cpu_evidence_status(
                 worker_payload.get("process_cpu_windows", _unknown_cpu_windows()),
+                capacity_config["workload"],
             ) if valid_worker else "incomplete"
         ),
         "memory_guard": memory,
@@ -2210,6 +2555,7 @@ def _worker_report_matches(payload: Any, capacity_config: Mapping[str, Any]) -> 
     binding = capacity_config.get("binding")
     if not isinstance(binding, Mapping) or not isinstance(payload, dict):
         return False
+    workload = capacity_config.get("workload")
     # Validation may normalize legacy evidence fields; keep caller-owned reports
     # reusable for additional projections and mutation checks.
     payload = dict(payload)
@@ -2222,7 +2568,8 @@ def _worker_report_matches(payload: Any, capacity_config: Mapping[str, Any]) -> 
         "fixture_manifest_sha256", "on_window_start_ms", "on_window_end_ms",
         "observed_duration_ms", "submitted", "completed", "max_inflight",
         "fixture_manifest_bytes", "response_bytes_total", "http_status_counts",
-        "error_counts", "latency_ms", "off_probe", "process_cpu_windows", "resource_abort_reason",
+        "error_counts", "latency_ms", "request_window_evidence", "client_join_request_ids",
+        "off_probe", "process_cpu_windows", "resource_abort_reason",
         "generator_cpu_evidence", "server_capacity_claim", "server_capacity_claim_reason",
         "diagnostic_credit", "namespace_closed",
     }
@@ -2246,10 +2593,14 @@ def _worker_report_matches(payload: Any, capacity_config: Mapping[str, Any]) -> 
         "actual_on_request_finished_at_utc", "failure_evidence_status",
     }
     legacy_shapes = tuple(frozenset(shape) for shape in (
-        expected_fields, expected_fields - {"process_cpu_windows"},
-        control_diagnostic_fields, control_diagnostic_fields - {"process_cpu_windows"},
-        warmup_fields, warmup_fields - {"process_cpu_windows"},
-        warmup_control_fields, warmup_control_fields - {"process_cpu_windows"},
+        expected_fields - {"request_window_evidence", "client_join_request_ids"},
+        expected_fields - {"process_cpu_windows", "request_window_evidence", "client_join_request_ids"},
+        control_diagnostic_fields - {"request_window_evidence", "client_join_request_ids"},
+        control_diagnostic_fields - {"process_cpu_windows", "request_window_evidence", "client_join_request_ids"},
+        warmup_fields - {"request_window_evidence", "client_join_request_ids"},
+        warmup_fields - {"process_cpu_windows", "request_window_evidence", "client_join_request_ids"},
+        warmup_control_fields - {"request_window_evidence", "client_join_request_ids"},
+        warmup_control_fields - {"process_cpu_windows", "request_window_evidence", "client_join_request_ids"},
     ))
     new_shapes = tuple(frozenset(shape) for shape in (
         new_fields, new_fields - {"process_cpu_windows"},
@@ -2278,6 +2629,30 @@ def _worker_report_matches(payload: Any, capacity_config: Mapping[str, Any]) -> 
                 )
             ))):
         return False
+    request_window = payload.get("request_window_evidence")
+    if request_window is not None and not _phase_request_window_evidence_is_closed(
+        request_window,
+        start_ms=payload.get("on_window_start_ms"),
+        end_ms=payload.get("on_window_end_ms"),
+    ):
+        return False
+    join_ids = payload.get("client_join_request_ids")
+    if join_ids is not None and (
+        not isinstance(join_ids, list)
+        or len(join_ids) > MAX_SSR_JOIN_REQUEST_IDS
+        or any(not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{32}", value) is None
+               for value in join_ids)
+        or len(set(join_ids)) != len(join_ids)
+        or join_ids != sorted(join_ids)
+        or (request_window is not None and len(join_ids) != request_window.get("retained_sample_count"))
+        or (workload in {HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD}
+            and any(not _ssr_join_id_is_eligible(payload.get("run_id", ""), item)
+                    for item in join_ids))
+    ):
+        return False
+    if (workload in {HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD}
+            and (request_window is None or join_ids is None)):
+        return False
     cpu_rows = payload.get("process_cpu_windows", _unknown_cpu_windows())
     return bool(
         type(payload.get("worker_report_schema")) is int
@@ -2296,7 +2671,7 @@ def _worker_report_matches(payload: Any, capacity_config: Mapping[str, Any]) -> 
         and payload.get("workload") == capacity_config.get("workload")
         and payload.get("fixture_kind") == capacity_config.get("fixture_kind")
         and payload.get("load_model") == "closed_loop_best_effort"
-        and payload.get("window_ms") == ON_WINDOW_MS
+        and payload.get("window_ms") == ON_WINDOW_MS_BY_WORKLOAD[capacity_config["workload"]]
         and payload.get("source_sha") == binding.get("source_sha")
         and payload.get("app_target_sha") == binding.get("app_target_sha")
         and payload.get("external_run_id") == binding.get("external_run_id")
@@ -2308,7 +2683,9 @@ def _worker_report_matches(payload: Any, capacity_config: Mapping[str, Any]) -> 
         and payload.get("concurrency") == capacity_config.get("concurrency")
         and payload.get("max_inflight") == capacity_config.get("concurrency")
         and payload.get("actors") == _profile_spec(capacity_config["workload"])[2]
-        and payload.get("generator_cpu_evidence") == _generator_cpu_evidence_status(cpu_rows)
+        and payload.get("generator_cpu_evidence") == _generator_cpu_evidence_status(
+            cpu_rows, capacity_config["workload"],
+        )
         and _worker_counts_are_closed(payload)
         and ((legacy_failure_evidence and payload.get("failure_evidence") is None)
              or (not legacy_failure_evidence and _failure_evidence_is_closed(
@@ -2336,7 +2713,7 @@ def _worker_report_matches(payload: Any, capacity_config: Mapping[str, Any]) -> 
              <= payload.get("actual_on_request_finished_at_utc"))
         and payload.get("fixture_tournaments") == FIXTURE_TOURNAMENTS
         and payload.get("fixture_users") == FIXTURE_USERS
-        and _valid_cpu_window_rows(cpu_rows)
+        and _valid_cpu_window_rows(cpu_rows, capacity_config["workload"])
         and payload.get("on_window_start_ms") == capacity_config.get("on_start_ms")
         and payload.get("on_window_end_ms") == capacity_config.get("on_end_ms")
         and _valid_off_probe(
@@ -2357,10 +2734,12 @@ def _worker_report_matches(payload: Any, capacity_config: Mapping[str, Any]) -> 
         and type(payload.get("submitted")) is int
         and type(payload.get("completed")) is int
         and 0 <= payload["completed"] <= payload["submitted"] <= 100_000
+        and (request_window is None or payload["submitted"] == request_window["started_in_window_count"])
         and type(payload.get("response_bytes_total")) is int
         and 0 <= payload["response_bytes_total"] <= 10**12
         and type(payload.get("observed_duration_ms")) is int
-        and 0 <= payload["observed_duration_ms"] <= 30_000
+        and 0 <= payload["observed_duration_ms"]
+        <= MAX_OBSERVED_DURATION_MS_BY_WORKLOAD[capacity_config["workload"]]
         and isinstance(payload.get("http_status_counts"), dict)
         and isinstance(payload.get("error_counts"), dict)
     )
@@ -2479,11 +2858,14 @@ def _prepare_remote_capacity_plan(
     except ModuleNotFoundError:  # direct execution from platform/tools
         import platform_cpu_diagnostic_pair as cpu_pair  # type: ignore[no-redef]
     off_start = now_ms + 52_000
+    on_window_ms = ON_WINDOW_MS_BY_WORKLOAD[workload]
+    on_end_ms = off_start + 25_000 + on_window_ms
+    expires_at_ms = _plan_expiry_ms(workload, on_end_ms)
     plan = {
         "schema": 1, "operation": "prepare", "run_id": run_id,
         "source_sha": source_sha, "workload": workload,
         "off_start_ms": off_start, "off_end_ms": off_start + 20_000,
-        "on_start_ms": off_start + 25_000, "on_end_ms": off_start + 45_000,
+        "on_start_ms": off_start + 25_000, "on_end_ms": on_end_ms,
     }
     lifecycle = lifecycle if lifecycle is not None else {}
     lifecycle.update({
@@ -2497,7 +2879,7 @@ def _prepare_remote_capacity_plan(
     except Exception as exc:
         error_class = type(exc).__name__
         raise _RemoteCapacityPlanError(
-            lifecycle, error_class, expires_at_ms=plan["on_end_ms"],
+            lifecycle, error_class, expires_at_ms=expires_at_ms,
             plan_created_at_ms=now_ms,
             plan_created_monotonic=plan_created_monotonic,
         ) from None
@@ -2509,19 +2891,22 @@ def _prepare_remote_capacity_plan(
         raise _RemoteCapacityPlanError(
             lifecycle, error_class,
             expires_at_ms=(
-                plan["on_end_ms"]
+                expires_at_ms
                 if lifecycle.get("plan_prepare_status") == "prepared" else None
             ),
             plan_created_at_ms=now_ms,
             plan_created_monotonic=plan_created_monotonic,
         ) from None
     plan["release_slug"] = release_slug
+    plan["expires_at_ms"] = expires_at_ms
     return plan, lifecycle
 
 
 def _cleanup_remote_capacity_plan(
     *, host: str, user: str, config: Path, key: Path, run_id: str,
     lifecycle: dict[str, Any] | None = None,
+    client_request_ids: list[str] | None = None,
+    client_cohort_counts: Mapping[str, int] | None = None,
 ) -> tuple[bool, dict[str, Any] | None]:
     try:
         from tools import platform_cpu_diagnostic_pair as cpu_pair
@@ -2533,6 +2918,9 @@ def _cleanup_remote_capacity_plan(
         "last_command_returned": False,
     })
     payload = {"schema": 1, "operation": "cleanup", "run_id": run_id}
+    if client_request_ids is not None:
+        payload["client_request_ids"] = client_request_ids
+        payload["client_cohort_counts"] = dict(client_cohort_counts or {})
     result, _release_slug, summary = cpu_pair._ssh_plan(
         argparse.Namespace(), host, user, config, key, payload, lifecycle,
         allow_noop_cleanup=True,
@@ -2565,19 +2953,20 @@ def _prepare_transport_is_closed(lifecycle: Mapping[str, Any]) -> bool:
 
 
 def _wait_for_remote_plan_expiry(
-    expires_at_ms: int, *, plan_created_at_ms: int,
+    expires_at_ms: int, *, workload: str, plan_created_at_ms: int,
     plan_created_monotonic: float,
 ) -> None:
     """Wait against the plan-creation monotonic clock, with a fixed upper bound."""
 
+    expected_horizon_ms = _plan_expiry_horizon_ms(workload)
     if (type(expires_at_ms) is not int or expires_at_ms < 0
             or type(plan_created_at_ms) is not int or plan_created_at_ms < 0
             or type(plan_created_monotonic) not in (int, float)
             or not math.isfinite(plan_created_monotonic)
-            or expires_at_ms - plan_created_at_ms != PLAN_EXPIRY_HORIZON_MS):
+            or expires_at_ms - plan_created_at_ms != expected_horizon_ms):
         raise ValueError("capacity plan expiry rejected")
     target_monotonic = plan_created_monotonic + (
-        PLAN_EXPIRY_HORIZON_MS + PLAN_EXPIRY_SKEW_MARGIN_MS
+        expected_horizon_ms + PLAN_EXPIRY_SKEW_MARGIN_MS
     ) / 1000
     deadline = plan_created_monotonic + PLAN_EXPIRY_WAIT_LIMIT_MS / 1000
     while True:
@@ -2746,7 +3135,220 @@ def _valid_gc_duration_ms(value: Any) -> bool:
     )
 
 
-def _project_server_telemetry(summary: Any) -> dict[str, Any]:
+def _project_request_correlation(value: Any) -> dict[str, Any] | None:
+    """Project the private SSR/API join to fixed aggregate-only keys."""
+
+    if (not isinstance(value, dict) or set(value) != {"status", "summary"}
+            or value.get("status") not in {"complete", "incomplete"}):
+        return None
+    summary = value.get("summary")
+    if summary is None:
+        return {"status": "incomplete", "summary": None} if value["status"] == "incomplete" else None
+    top = {"schema_version", "phase", "cohort", "join", "timing_ms", "coverage", "ssr_stream_coverage"}
+    if (not isinstance(summary, dict) or set(summary) != top
+            or summary.get("schema_version") != 1 or summary.get("phase") != "on"):
+        return None
+
+    cohort_fields = {
+        "submitted_html_requests", "valid_response_ids", "eligible_response_ids",
+        "missing_response_ids",
+        "duplicate_response_ids", "malformed_response_ids", "valid_response_id_coverage_percent",
+        "selected_sample_limit", "selection_scheme", "selected_sample_expected",
+        "selected_sample_received", "selected_sample_valid", "selected_sample_malformed_ids",
+        "selected_sample_ineligible_ids", "selected_sample_duplicate_ids",
+        "selected_sample_complete",
+    }
+    cohort = summary.get("cohort")
+    if not isinstance(cohort, dict) or set(cohort) != cohort_fields:
+        return None
+    if any(type(cohort.get(key)) is not int or not 0 <= cohort[key] <= 100_000
+           for key in cohort_fields - {
+               "valid_response_id_coverage_percent", "selected_sample_complete", "selection_scheme",
+           }):
+        return None
+    percent = cohort.get("valid_response_id_coverage_percent")
+    if (type(percent) not in (int, float) or isinstance(percent, bool)
+            or not math.isfinite(percent) or not 0 <= percent <= 100
+            or type(cohort.get("selected_sample_complete")) is not bool
+            or cohort.get("selection_scheme") != "sha256-runid-requestid-1of8-v1"
+            or sum(cohort[key] for key in (
+                "valid_response_ids", "missing_response_ids", "duplicate_response_ids",
+                "malformed_response_ids",
+            )) != cohort["submitted_html_requests"]
+            or cohort["eligible_response_ids"] > cohort["valid_response_ids"]
+            or cohort["selected_sample_valid"] > cohort["selected_sample_expected"]
+            or cohort["selected_sample_expected"] > cohort["selected_sample_limit"]
+            or cohort["selected_sample_received"] > cohort["selected_sample_limit"]
+            or cohort["selected_sample_expected"] != min(
+                cohort["eligible_response_ids"], cohort["selected_sample_limit"],
+            )):
+        return None
+
+    join_fields = {
+        "matched_nginx_parents", "matched_ssr_parents", "matched_stream_parents",
+        "matched_api_rows",
+        "matched_api_by_request_id", "matched_api_by_cf_ray", "unmatched_selected_to_nginx",
+        "unmatched_selected_to_ssr", "unmatched_selected_to_stream", "unmatched_selected_to_api",
+        "orphan_ssr_rows", "orphan_stream_rows", "orphan_api_rows", "duplicate_nginx_request_ids",
+    }
+    join = summary.get("join")
+    if (not isinstance(join, dict) or set(join) != join_fields
+            or any(type(item) is not int or not 0 <= item <= 200_001 for item in join.values())):
+        return None
+
+    def metric_ok(item: Any, *, scalar: bool = False) -> bool:
+        keys = {"count", "avg", "p50", "p95", "p99", "max"} if scalar else {
+            "count", "avg_ms", "p50_ms", "p95_ms", "p99_ms", "max_ms",
+        }
+        if (not isinstance(item, dict) or set(item) != keys
+                or type(item.get("count")) is not int or not 0 <= item["count"] <= 200_000):
+            return False
+        for key in keys - {"count"}:
+            number = item.get(key)
+            if number is not None and (
+                type(number) not in (int, float) or isinstance(number, bool)
+                or not math.isfinite(number) or not 0 <= number <= 1_000_000_000
+            ):
+                return False
+        return True
+
+    timing = summary.get("timing_ms")
+    timing_fields = {
+        "nginx_request", "ssr_stage", "ssr_stream_milestone_elapsed_ms",
+        "stream_milestone_missing_or_invalid", "stream_milestone_unknown_rows",
+        "api_request_by_route", "api_request_rows_by_route",
+        "api_metric_missing_or_invalid_by_route",
+    }
+    if (not isinstance(timing, dict) or set(timing) != timing_fields
+            or not metric_ok(timing.get("nginx_request"))):
+        return None
+    ssr_stage_allowlist = {
+        "auth_bootstrap_fetch", "tournament_workspace", "tournament_detail_data_ready",
+        "http_request_start", "root_layout", "page_component", "page_render", "proxy_start",
+        "proxy_to_root_layout_start", "request_to_proxy",
+    }
+    ssr_stages = timing.get("ssr_stage")
+    if (not isinstance(ssr_stages, dict)
+            or any(key not in ssr_stage_allowlist or not metric_ok(item)
+                   for key, item in ssr_stages.items())):
+        return None
+    stream_milestone_allowlist = {
+        "request_start", "response_stream_start", "first_body_write_attempt",
+        "response_finish", "response_close", "response_error",
+    }
+    stream_milestones = timing.get("ssr_stream_milestone_elapsed_ms")
+    if (not isinstance(stream_milestones, dict)
+            or set(stream_milestones) != stream_milestone_allowlist
+            or any(not metric_ok(item) for item in stream_milestones.values())):
+        return None
+    stream_missing = timing.get("stream_milestone_missing_or_invalid")
+    if (not isinstance(stream_missing, dict)
+            or any(key not in stream_milestone_allowlist or type(count) is not int
+                   or not 0 <= count <= 200_001 for key, count in stream_missing.items())
+            or type(timing.get("stream_milestone_unknown_rows")) is not int
+            or not 0 <= timing["stream_milestone_unknown_rows"] <= 200_001):
+        return None
+    api_routes = {"auth_bootstrap", "tournament_workspace", "other"}
+    api_fields = {
+        "total_ms", "sql_ms", "max_sql_ms", "pool_checkout_wait_ms",
+        "pool_connection_hold_ms", "compute_ms", "sql_count",
+    }
+    api_timing = timing.get("api_request_by_route")
+    if (not isinstance(api_timing, dict)
+            or any(route not in api_routes or not isinstance(metrics, dict)
+                   or set(metrics) != api_fields
+                   or any(not metric_ok(item, scalar=field == "sql_count")
+                          for field, item in metrics.items())
+                   for route, metrics in api_timing.items())):
+        return None
+    for name in ("api_request_rows_by_route", "api_metric_missing_or_invalid_by_route"):
+        routes = timing.get(name)
+        if not isinstance(routes, dict) or any(route not in api_routes for route in routes):
+            return None
+        for counts in routes.values():
+            if name == "api_request_rows_by_route":
+                if type(counts) is not int or not 0 <= counts <= 200_001:
+                    return None
+            elif (not isinstance(counts, dict)
+                  or any(key not in api_fields or type(count) is not int
+                         or not 0 <= count <= 200_001 for key, count in counts.items())):
+                return None
+
+    coverage_fields = {
+        "complete", "full_cohort", "source_rows_truncated", "source_input_rows",
+        "source_rejections", "cf_ray_fallback_enabled",
+    }
+    coverage = summary.get("coverage")
+    sources = {"nginx", "ssr", "stream", "api"}
+    if (not isinstance(coverage, dict) or set(coverage) != coverage_fields
+            or type(coverage.get("complete")) is not bool
+            or type(coverage.get("full_cohort")) is not bool
+            or coverage.get("cf_ray_fallback_enabled") is not False
+            or not isinstance(coverage.get("source_rows_truncated"), dict)
+            or set(coverage["source_rows_truncated"]) != sources
+            or any(type(item) is not bool for item in coverage["source_rows_truncated"].values())
+            or not isinstance(coverage.get("source_input_rows"), dict)
+            or set(coverage["source_input_rows"]) != sources
+            or any(type(item) is not int or not 0 <= item <= 200_001
+                   for item in coverage["source_input_rows"].values())
+            or not isinstance(coverage.get("source_rejections"), dict)
+            or set(coverage["source_rejections"]) != sources):
+        return None
+    for rejection_counts in coverage["source_rejections"].values():
+        if (not isinstance(rejection_counts, dict)
+                or any(key not in {
+                    "context_mismatch", "missing_or_invalid_timestamp", "outside_window",
+                    "malformed_request_id",
+                } or type(count) is not int or not 0 <= count <= 200_001
+                       for key, count in rejection_counts.items())):
+            return None
+
+    stream_fields = {
+        "records", "selector_overflow", "selector_overflow_unattributed", "row_cap_records",
+        "row_cap_rows", "truncated_records", "malformed_records",
+        "capture_marker_records", "capture_eligible_requests", "capture_retained_requests",
+        "capture_lost_requests", "capture_rows", "capture_lost_rows",
+        "capture_truncated_records", "capture_malformed_records", "capture_status", "status",
+    }
+    stream = summary.get("ssr_stream_coverage")
+    if (not isinstance(stream, dict) or set(stream) != stream_fields
+            or any(type(stream.get(key)) is not int or not 0 <= stream[key] <= 1_000_000
+                   for key in stream_fields - {"status", "capture_status"})
+            or stream["capture_rows"] > 6_000
+            or stream.get("capture_status") not in {"complete", "incomplete", "missing"}
+            or stream.get("status") not in {"none", "incomplete"}):
+        return None
+    expected_capture_status = (
+        "incomplete" if stream["capture_malformed_records"]
+        else "missing" if stream["capture_marker_records"] == 0
+        else "incomplete" if (
+            stream["capture_marker_records"] != 1
+            or stream["capture_truncated_records"] > 0
+        ) else "complete"
+    )
+    truncated_stream = (
+        stream["truncated_records"] > 0 or stream["malformed_records"] > 0
+        or stream["capture_marker_records"] != 1
+        or stream["capture_truncated_records"] > 0
+        or stream["capture_malformed_records"] > 0
+        or stream["capture_status"] != "complete"
+        or stream["capture_eligible_requests"]
+        != stream["capture_retained_requests"] + stream["capture_lost_requests"]
+    )
+    if (stream["capture_status"] != expected_capture_status
+            or stream["status"] != ("incomplete" if truncated_stream else "none")
+            or (value["status"] == "complete"
+                and (coverage["complete"] is not True or truncated_stream))
+            or (value["status"] == "incomplete"
+                and coverage["complete"] is True and not truncated_stream)):
+        return None
+    return {"status": value["status"], "summary": summary}
+
+
+def _project_server_telemetry(
+    summary: Any, *, include_request_correlation: bool = False,
+    include_cpu_profile: bool = False,
+) -> dict[str, Any]:
     """Keep only closed CPU and Node-memory aggregates from the fixed plan collector."""
 
     cpu_rows: list[dict[str, Any]] = []
@@ -2757,6 +3359,12 @@ def _project_server_telemetry(summary: Any) -> dict[str, Any]:
     memory_reason = "unavailable"
     cgroup_status = "unknown"
     cgroup_reason = "hierarchy_unavailable"
+    request_correlation = {"status": "incomplete", "summary": None}
+    profile_projection = {
+        "profile_status": "incomplete",
+        "profile_reason": "missing",
+        "profile_rows": [],
+    }
     if isinstance(summary, dict):
         cpu_status = summary.get("usage_status") if summary.get("usage_status") in {"complete", "incomplete", "unavailable"} else "incomplete"
         cpu_reason = summary.get("usage_reason") if summary.get("usage_reason") in {"none", "incomplete", "unavailable", "missing", "identity_changed", "invalid_event", "invalid_profile", "journal_failed", "other"} else "other"
@@ -2780,6 +3388,28 @@ def _project_server_telemetry(summary: Any) -> dict[str, Any]:
                         clean[field] = None
                 clean["timing_complete"] = row.get("timing_complete") is True
                 cpu_rows.append(clean)
+        if include_cpu_profile:
+            try:
+                from tools import platform_cpu_diagnostic_pair as cpu_pair
+            except ModuleNotFoundError:
+                import platform_cpu_diagnostic_pair as cpu_pair  # type: ignore[no-redef]
+            validated = cpu_pair._validate_usage_summary(summary)
+            if validated is None:
+                profile_projection = {
+                    "profile_status": "incomplete",
+                    "profile_reason": "invalid_profile",
+                    "profile_rows": [],
+                }
+            else:
+                profile_projection = {
+                    "profile_status": validated["profile_status"],
+                    "profile_reason": validated["profile_reason"],
+                    "profile_rows": validated["profile_rows"],
+                }
+        if include_request_correlation:
+            projected = _project_request_correlation(summary.get("request_telemetry"))
+            if projected is not None:
+                request_correlation = projected
         raw_memory_rows = summary.get("memory_rows")
         node_fields = (
             "sample_count", "rss_min_bytes", "rss_max_bytes", "rss_mean_bytes",
@@ -2818,7 +3448,7 @@ def _project_server_telemetry(summary: Any) -> dict[str, Any]:
                     clean[field] = row.get(field) if row.get(field) in allowed else "invalid_snapshot" if field == "cgroup_memory_reason" else "incomplete"
                 clean["gc_overflow"] = row.get("gc_overflow") if type(row.get("gc_overflow")) is bool else None
                 memory_rows.append(clean)
-    return {
+    result = {
         "schema": 1,
         "cpu_status": cpu_status,
         "cpu_reason": cpu_reason,
@@ -2829,6 +3459,11 @@ def _project_server_telemetry(summary: Any) -> dict[str, Any]:
         "cgroup_memory_reason": cgroup_reason,
         "node_memory_rows": memory_rows,
     }
+    if include_request_correlation:
+        result["request_correlation"] = request_correlation
+    if include_cpu_profile:
+        result.update(profile_projection)
+    return result
 
 
 def _write_report(path: Path, payload: Mapping[str, Any]) -> None:
@@ -2856,7 +3491,7 @@ def _write_report(path: Path, payload: Mapping[str, Any]) -> None:
         os.close(fd)
 
 
-def _parent_run(
+def _parent_run_once(
     args: argparse.Namespace, stage_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     state = stage_state if stage_state is not None else {}
@@ -2880,7 +3515,7 @@ def _parent_run(
         state["profile_digest"] = profile_digest(args.concurrency, workload)
     if (SHA_RE.fullmatch(args.source_sha) is None or SHA_RE.fullmatch(args.app_target_sha) is None
             or not args.external_run_id.isdecimal() or ATTEMPT_RE.fullmatch(args.external_run_attempt) is None
-            or workload not in {WORKLOAD, HTML_WORKLOAD}
+            or workload not in {WORKLOAD, HTML_WORKLOAD, HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD}
             or type(args.concurrency) is not int or args.concurrency not in workload_presets):
         raise ValueError("capacity parent identity or preset rejected")
     report_path = Path(args.report)
@@ -2938,6 +3573,7 @@ def _parent_run(
                     raise ValueError("capacity plan clock anchor unavailable")
                 _wait_for_remote_plan_expiry(
                     exc.expires_at_ms,
+                    workload=args.workload,
                     plan_created_at_ms=exc.plan_created_at_ms,
                     plan_created_monotonic=exc.plan_created_monotonic,
                 )
@@ -2992,7 +3628,7 @@ def _parent_run(
             cleanup_lifecycle=cleanup_lifecycle, cleanup_ok=cleanup_ok,
             workload=workload,
         )
-    state["plan_expiry_ms"] = planned["on_end_ms"]
+    state["plan_expiry_ms"] = planned["expires_at_ms"]
     control_path: Path | None = None
     ssh_contents: dict[str, bytearray] = {}
     ssh_lifecycle: dict[str, int] = {}
@@ -3055,7 +3691,7 @@ def _parent_run(
                 watcher=watcher,
                 hide_ssh_material=hide_material,
                 restore_ssh_material=restore_material,
-                maximum_runtime_seconds=150,
+                maximum_runtime_seconds=WORKER_RUNTIME_SECONDS_BY_WORKLOAD[workload],
                 on_start_ms=planned["on_start_ms"],
                 on_end_ms=planned["on_end_ms"],
             )
@@ -3077,7 +3713,8 @@ def _parent_run(
             ):
                 try:
                     _wait_for_remote_plan_expiry(
-                        planned["on_end_ms"],
+                        planned["expires_at_ms"],
+                        workload=workload,
                         plan_created_at_ms=plan_created_at_ms,
                         plan_created_monotonic=plan_created_monotonic,
                     )
@@ -3096,6 +3733,8 @@ def _parent_run(
                         host=args.ssh_host, user=args.ssh_user,
                         config=ssh_config, key=ssh_key, run_id=run_id,
                         lifecycle=cleanup_lifecycle,
+                        client_request_ids=state.pop("transient_ssr_join_ids", None),
+                        client_cohort_counts=state.pop("transient_ssr_join_counts", None),
                     )
             else:
                 cleanup_ok = False
@@ -3108,9 +3747,17 @@ def _parent_run(
                     },
                 })
             state["cleanup_ok"] = cleanup_ok
+            state.pop("transient_ssr_join_ids", None)
+            state.pop("transient_ssr_join_counts", None)
             state["stage"] = "worker_supervision"
     if isinstance(outcome, dict):
-        server_telemetry = _project_server_telemetry(telemetry_summary)
+        correlation_required = workload in {
+            HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD,
+        }
+        server_telemetry = _project_server_telemetry(
+            telemetry_summary, include_request_correlation=correlation_required,
+            include_cpu_profile=workload == HTML_CPU_PROFILE_20S_WORKLOAD,
+        )
         outcome["server_telemetry"] = server_telemetry
         worker_row = outcome.get("worker")
         runner_row = outcome.get("runner_headroom")
@@ -3126,6 +3773,8 @@ def _parent_run(
             or server_telemetry.get("cgroup_memory_reason") != "none"
             or len(node_rows) != 2
             or any(row.get("sample_count") != 5 or row.get("status") != "complete" for row in node_rows)
+            or (correlation_required
+                and server_telemetry.get("request_correlation", {}).get("status") != "complete")
         ):
             outcome["status"] = "incomplete"
             outcome["passed"] = False
@@ -3144,7 +3793,8 @@ def _parent_run(
             "fixture_tournaments": FIXTURE_TOURNAMENTS,
             "fixture_users": FIXTURE_USERS, "actors": _profile_spec(workload)[2],
             "concurrency": args.concurrency, "max_inflight": args.concurrency,
-            "load_model": "closed_loop_best_effort", "window_ms": ON_WINDOW_MS,
+            "load_model": "closed_loop_best_effort",
+            "window_ms": ON_WINDOW_MS_BY_WORKLOAD[workload],
             "namespace_closed": False,
             "worker": None,
             "generator_cpu_evidence": "incomplete",
@@ -3170,7 +3820,12 @@ def _parent_run(
                 "window_scope": "on_window", "window_start_offset_ms": None,
                 "window_end_offset_ms": None,
             },
-            "server_telemetry": _project_server_telemetry(None),
+            "server_telemetry": _project_server_telemetry(
+                None, include_request_correlation=workload in {
+                    HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD,
+                },
+                include_cpu_profile=workload == HTML_CPU_PROFILE_20S_WORKLOAD,
+            ),
             "server_capacity_claim": None,
             "server_capacity_claim_reason": "resource_correlation_not_provided",
         }
@@ -3188,7 +3843,183 @@ def _parent_run(
     return outcome
 
 
+def _parent_composite_run(
+    args: argparse.Namespace, stage_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run the fixed 120s capacity phase and separate 20s attribution phase."""
+
+    started = time.monotonic()
+    deadline = started + 600
+    state = stage_state if stage_state is not None else {}
+    state.update({
+        "stage": "composite_manifest_read",
+        "workload": HTML_COMPOSITE_WORKLOAD,
+        "source_sha": args.source_sha,
+        "app_target_sha": args.app_target_sha,
+        "external_run_id": args.external_run_id,
+        "external_run_attempt": args.external_run_attempt,
+        "concurrency": args.concurrency,
+        "composite_run_id": os.urandom(16).hex(),
+        "composite_profile_digest": profile_digest(32, HTML_COMPOSITE_WORKLOAD),
+    })
+    manifest_raw, manifest, actors = _read_manifest(Path(args.manifest))
+    manifest_sha = hashlib.sha256(manifest_raw).hexdigest()
+    if (
+        manifest.get("runner_sha") != args.source_sha
+        or manifest.get("app_target_sha") != args.app_target_sha
+        or len(manifest.get("tournaments", [])) != FIXTURE_TOURNAMENTS
+        or len(actors) != FIXTURE_USERS
+        or any(item.get("user_count") != FIXTURE_USERS for item in manifest["tournaments"])
+        or args.concurrency != 32
+    ):
+        raise ValueError("composite fixture or concurrency binding rejected")
+    phases: dict[str, dict[str, Any] | None] = {
+        "capacity": None,
+        "cpu_profile": None,
+    }
+    phase_run_ids: list[str] = []
+    phase_profile_digests: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="ssr-capacity-composite-", dir=Path(args.report).parent) as temp_dir:
+        private = Path(temp_dir)
+        os.chmod(private, 0o700)
+        for phase_name, workload in (
+            ("capacity", HTML_CAPACITY_120S_WORKLOAD),
+            ("cpu_profile", HTML_CPU_PROFILE_20S_WORKLOAD),
+        ):
+            if phase_name == "cpu_profile":
+                capacity_phase = phases["capacity"]
+                if (
+                    capacity_phase is None
+                    or capacity_phase.get("status") != "complete"
+                    or capacity_phase.get("namespace_closed") is not True
+                    or capacity_phase.get("remote_plan_cleanup") != "complete"
+                ):
+                    break
+                try:
+                    current_raw, current_manifest, current_actors = _read_manifest(Path(args.manifest))
+                except Exception:
+                    break
+                if (
+                    hashlib.sha256(current_raw).hexdigest() != manifest_sha
+                    or len(current_raw) != len(manifest_raw)
+                    or current_manifest.get("runner_sha") != args.source_sha
+                    or current_manifest.get("app_target_sha") != args.app_target_sha
+                    or len(current_actors) != FIXTURE_USERS
+                    or len(current_manifest.get("tournaments", [])) != FIXTURE_TOURNAMENTS
+                    or any(item.get("user_count") != FIXTURE_USERS
+                           for item in current_manifest.get("tournaments", []))
+                ):
+                    break
+                state["stage"] = "composite_quiescent_gap"
+                if time.monotonic() + 5 > deadline:
+                    break
+                time.sleep(5)
+            if time.monotonic() >= deadline:
+                break
+            phase_args = argparse.Namespace(**vars(args))
+            phase_args.workload = workload
+            phase_args.report = str(private / f"{phase_name}.json")
+            phase_args.failure_report = None
+            phase_state: dict[str, Any] = {}
+            state["stage"] = f"composite_{phase_name}"
+            phase_report = _parent_run_once(phase_args, phase_state)
+            if (
+                phase_report.get("fixture_manifest_sha256") != manifest_sha
+                or phase_report.get("fixture_manifest_bytes") != len(manifest_raw)
+                or phase_report.get("source_sha") != args.source_sha
+                or phase_report.get("app_target_sha") != args.app_target_sha
+                or phase_report.get("external_run_id") != args.external_run_id
+                or phase_report.get("external_run_attempt") != args.external_run_attempt
+            ):
+                phase_report["status"] = "incomplete"
+                phase_report["passed"] = False
+            phases[phase_name] = phase_report
+            run_id = phase_report.get("run_id")
+            digest = phase_report.get("profile_digest")
+            if isinstance(run_id, str) and RUN_RE.fullmatch(run_id):
+                phase_run_ids.append(run_id)
+            if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest):
+                phase_profile_digests.append(digest)
+
+    phase_ids_unique = len(phase_run_ids) == 2 and len(set(phase_run_ids)) == 2
+    same_fixture = all(
+        phase is not None
+        and phase.get("fixture_manifest_sha256") == manifest_sha
+        and phase.get("fixture_manifest_bytes") == len(manifest_raw)
+        for phase in phases.values()
+    )
+    both_complete = all(
+        phase is not None
+        and phase.get("status") == "complete"
+        and phase.get("remote_plan_cleanup") == "complete"
+        and phase.get("namespace_closed") is True
+        for phase in phases.values()
+    )
+    profile_report = phases["cpu_profile"]
+    if profile_report is not None:
+        profile_report = {
+            **profile_report,
+            "attribution_only": True,
+            "performance_credit": False,
+            "capacity_quantile_member": False,
+        }
+    return {
+        "schema": SCHEMA,
+        "report_complete": True,
+        "workload": HTML_COMPOSITE_WORKLOAD,
+        "fixture_kind": HTML_COMPOSITE_FIXTURE_KIND,
+        "status": "complete" if both_complete and same_fixture and phase_ids_unique else "incomplete",
+        "passed": bool(
+            both_complete
+            and same_fixture
+            and phase_ids_unique
+            and phases["capacity"].get("passed") is True
+        ),
+        "matrix_credit": False,
+        "slo_credit": False,
+        "diagnostic_credit": False,
+        "source_sha": args.source_sha,
+        "app_target_sha": args.app_target_sha,
+        "external_run_id": args.external_run_id,
+        "external_run_attempt": args.external_run_attempt,
+        "run_id": state["composite_run_id"],
+        "profile_digest": state["composite_profile_digest"],
+        "fixture_manifest_sha256": manifest_sha,
+        "fixture_manifest_bytes": len(manifest_raw),
+        "fixture_tournaments": FIXTURE_TOURNAMENTS,
+        "fixture_users": FIXTURE_USERS,
+        "actors": FIXTURE_USERS,
+        "concurrency": 32,
+        "max_inflight": 32,
+        "load_model": "closed_loop_best_effort",
+        "phase_windows_ms": [120_000, 20_000],
+        "phase_workloads": [HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD],
+        "phase_gap_ms": 5_000,
+        "phase_run_ids": phase_run_ids,
+        "phase_profile_digests": phase_profile_digests,
+        "same_fixture_manifest": same_fixture,
+        "capacity_phase": phases["capacity"],
+        "cpu_profile_phase": profile_report,
+        "capacity_quantiles_scope": "capacity_phase_on_window_only",
+        "profile_latency_scope": "excluded",
+        "remote_plan_cleanup": "complete" if both_complete else "incomplete",
+        "namespace_closed": both_complete,
+        "maximum_wall_seconds": 600,
+        "wall_elapsed_seconds": round(min(600, max(0, time.monotonic() - started)), 3),
+    }
+
+
+def _parent_run(
+    args: argparse.Namespace, stage_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if getattr(args, "workload", WORKLOAD) == HTML_COMPOSITE_WORKLOAD:
+        return _parent_composite_run(args, stage_state)
+    return _parent_run_once(args, stage_state)
+
+
 def _project_capacity_report(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict) and value.get("workload") == HTML_COMPOSITE_WORKLOAD:
+        return _project_composite_capacity_report(value)
     top_fields = {
         "schema", "report_complete", "workload", "fixture_kind", "status", "passed",
         "matrix_credit", "slo_credit", "diagnostic_credit", "source_sha",
@@ -3235,7 +4066,8 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
             or type(value.get("max_inflight")) is not int
             or value.get("max_inflight") != value.get("concurrency")
             or value.get("load_model") != "closed_loop_best_effort"
-            or type(value.get("window_ms")) is not int or value.get("window_ms") != ON_WINDOW_MS
+            or type(value.get("window_ms")) is not int
+            or value.get("window_ms") != ON_WINDOW_MS_BY_WORKLOAD[value["workload"]]
             or type(value.get("namespace_closed")) is not bool
             or value.get("server_capacity_claim") is not None
             or value.get("server_capacity_claim_reason") != "resource_correlation_not_provided"
@@ -3252,13 +4084,14 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
             "status", "submitted", "completed", "http_status_counts", "error_counts",
             "failure_evidence", "actual_on_request_started_at_utc",
             "actual_on_request_finished_at_utc", "failure_evidence_status",
-            "latency_ms", "resource_abort_reason", "on_window_start_ms",
+            "latency_ms", "request_window_evidence", "resource_abort_reason", "on_window_start_ms",
             "on_window_end_ms", "observed_duration_ms", "off_probe", "max_inflight",
             "fixture_manifest_bytes", "response_bytes_total", "process_cpu_windows",
         }
         legacy_worker = expected_worker - {
             "failure_evidence", "actual_on_request_started_at_utc",
             "actual_on_request_finished_at_utc", "failure_evidence_status",
+            "request_window_evidence",
         }
         warmup_worker = expected_worker | {"warmup_failure"}
         control_diagnostic_worker = expected_worker | {"control_failure_reason"}
@@ -3325,6 +4158,17 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
                 or not 0 <= worker["response_bytes_total"] <= 10**12
                 or not isinstance(worker.get("http_status_counts"), dict)
                 or not isinstance(worker.get("error_counts"), dict)
+                or ("request_window_evidence" in worker and not _phase_request_window_evidence_is_closed(
+                    worker.get("request_window_evidence"),
+                    start_ms=worker.get("on_window_start_ms"),
+                    end_ms=worker.get("on_window_end_ms"),
+                ))
+                or ("request_window_evidence" in worker
+                    and worker["submitted"]
+                    != worker["request_window_evidence"].get("started_in_window_count"))
+                or (_is_html_workload(value["workload"])
+                    and value["workload"] in {HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD}
+                    and "request_window_evidence" not in worker)
                 or not (
                     (legacy_failure_evidence is True
                      and worker.get("failure_evidence_status") == "unavailable"
@@ -3357,9 +4201,11 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
                     > worker.get("actual_on_request_finished_at_utc"))
                 or type(worker.get("on_window_start_ms")) is not int
                 or type(worker.get("on_window_end_ms")) is not int
-                or worker["on_window_end_ms"] - worker["on_window_start_ms"] != ON_WINDOW_MS
+                or worker["on_window_end_ms"] - worker["on_window_start_ms"]
+                != ON_WINDOW_MS_BY_WORKLOAD[value["workload"]]
                 or type(worker.get("observed_duration_ms")) is not int
-                or not 0 <= worker["observed_duration_ms"] <= 30_000
+                or not 0 <= worker["observed_duration_ms"]
+                <= MAX_OBSERVED_DURATION_MS_BY_WORKLOAD[value["workload"]]
                 or not _valid_off_probe(
                     worker.get("off_probe"),
                     submitted_limit=value.get("concurrency", 0),
@@ -3370,7 +4216,9 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
                         if worker.get("status") == "complete" else None
                     ),
                 )
-                or not _valid_cpu_window_rows(worker.get("process_cpu_windows"))):
+                or not _valid_cpu_window_rows(
+                    worker.get("process_cpu_windows"), value.get("workload"),
+                )):
             return None
         latency = worker.get("latency_ms")
         if (not isinstance(latency, dict)
@@ -3460,9 +4308,10 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
                 or runner["max_visible_throttled_periods_delta"] < 0):
             return None
         if (runner["sample_count"] < 3 or runner["window_seconds"] < 1.0
-                or runner["window_seconds"] > 20.5
+                or runner["window_seconds"]
+                > ON_WINDOW_MS_BY_WORKLOAD[value["workload"]] / 1000 + 0.5
                 or not 0 <= runner["window_start_offset_ms"]
-                < runner["window_end_offset_ms"] <= ON_WINDOW_MS):
+                < runner["window_end_offset_ms"] <= ON_WINDOW_MS_BY_WORKLOAD[value["workload"]]):
             return None
     elif any(runner.get(key) is not None for key in (
         "window_seconds", "effective_cpu_capacity_cores", "max_cgroup_cpu_usage_cores",
@@ -3474,6 +4323,14 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
         "schema", "cpu_status", "cpu_reason", "cpu_rows", "node_memory_status",
         "node_memory_reason", "cgroup_memory_status", "cgroup_memory_reason", "node_memory_rows",
     }
+    correlation_required = value.get("workload") in {
+        HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD,
+    }
+    if correlation_required:
+        telemetry_fields.add("request_correlation")
+    profile_required = value.get("workload") == HTML_CPU_PROFILE_20S_WORKLOAD
+    if profile_required:
+        telemetry_fields.update({"profile_status", "profile_reason", "profile_rows"})
     if (not isinstance(telemetry, dict) or set(telemetry) != telemetry_fields
             or type(telemetry.get("schema")) is not int or telemetry["schema"] != 1
             or telemetry.get("cpu_status") not in {"complete", "incomplete", "unavailable"}
@@ -3485,6 +4342,26 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
             or not isinstance(telemetry.get("cpu_rows"), list) or len(telemetry["cpu_rows"]) > 4
             or not isinstance(telemetry.get("node_memory_rows"), list) or len(telemetry["node_memory_rows"]) > 2):
         return None
+    if correlation_required:
+        correlation = _project_request_correlation(telemetry.get("request_correlation"))
+        if correlation is None:
+            return None
+        telemetry = {**telemetry, "request_correlation": correlation}
+        value = {**value, "server_telemetry": telemetry}
+    if profile_required:
+        try:
+            from tools import platform_cpu_diagnostic_pair as cpu_pair
+        except ModuleNotFoundError:
+            import platform_cpu_diagnostic_pair as cpu_pair  # type: ignore[no-redef]
+        profile = cpu_pair._validate_profile_projection({
+            key: telemetry[key] for key in ("profile_status", "profile_reason", "profile_rows")
+        })
+        if profile is None or (
+            value.get("status") == "complete" and profile["profile_status"] != "complete"
+        ):
+            return None
+        telemetry = {**telemetry, **profile}
+        value = {**value, "server_telemetry": telemetry}
     for row in telemetry["cpu_rows"]:
         if (not isinstance(row, dict) or set(row) != {
             "service", "phase", "expected_targets", "observed_targets", "event_count", "cpu_ns",
@@ -3530,7 +4407,9 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
             return None
     cpu_rows = (value["worker"].get("process_cpu_windows", _unknown_cpu_windows())
                 if value.get("worker") else _unknown_cpu_windows())
-    if value.get("generator_cpu_evidence") != _generator_cpu_evidence_status(cpu_rows):
+    if value.get("generator_cpu_evidence") != _generator_cpu_evidence_status(
+        cpu_rows, value.get("workload"),
+    ):
         return None
     if "plan_cleanup_failure_detail" in value:
         detail = _project_cpu_plan_failure_detail(value["plan_cleanup_failure_detail"])
@@ -3544,6 +4423,112 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
             return None
         value = {**value, "plan_cleanup_failure_detail": detail}
     return value
+
+
+def _project_composite_capacity_report(value: dict[str, Any]) -> dict[str, Any] | None:
+    fields = {
+        "schema", "report_complete", "workload", "fixture_kind", "status", "passed",
+        "matrix_credit", "slo_credit", "diagnostic_credit", "source_sha",
+        "app_target_sha", "external_run_id", "external_run_attempt", "run_id",
+        "profile_digest", "fixture_manifest_sha256", "fixture_manifest_bytes",
+        "fixture_tournaments", "fixture_users", "actors", "concurrency", "max_inflight",
+        "load_model", "phase_windows_ms", "phase_workloads", "phase_gap_ms",
+        "phase_run_ids", "phase_profile_digests", "same_fixture_manifest",
+        "capacity_phase", "cpu_profile_phase", "capacity_quantiles_scope",
+        "profile_latency_scope", "remote_plan_cleanup", "namespace_closed",
+        "maximum_wall_seconds", "wall_elapsed_seconds",
+    }
+    if set(value) != fields:
+        return None
+    if (
+        type(value.get("schema")) is not int or value["schema"] != SCHEMA
+        or value.get("report_complete") is not True
+        or value.get("workload") != HTML_COMPOSITE_WORKLOAD
+        or value.get("fixture_kind") != HTML_COMPOSITE_FIXTURE_KIND
+        or value.get("status") not in {"complete", "incomplete"}
+        or type(value.get("passed")) is not bool
+        or any(value.get(key) is not False for key in ("matrix_credit", "slo_credit", "diagnostic_credit"))
+        or not isinstance(value.get("source_sha"), str) or SHA_RE.fullmatch(value["source_sha"]) is None
+        or not isinstance(value.get("app_target_sha"), str) or SHA_RE.fullmatch(value["app_target_sha"]) is None
+        or not isinstance(value.get("external_run_id"), str) or not value["external_run_id"].isdecimal()
+        or not isinstance(value.get("external_run_attempt"), str) or ATTEMPT_RE.fullmatch(value["external_run_attempt"]) is None
+        or not isinstance(value.get("run_id"), str) or RUN_RE.fullmatch(value["run_id"]) is None
+        or not isinstance(value.get("profile_digest"), str) or re.fullmatch(r"[0-9a-f]{64}", value["profile_digest"]) is None
+        or not isinstance(value.get("fixture_manifest_sha256"), str) or re.fullmatch(r"[0-9a-f]{64}", value["fixture_manifest_sha256"]) is None
+        or type(value.get("fixture_manifest_bytes")) is not int or not 0 < value["fixture_manifest_bytes"] <= 256 * 1024
+        or value.get("fixture_tournaments") != FIXTURE_TOURNAMENTS
+        or value.get("fixture_users") != FIXTURE_USERS
+        or value.get("actors") != FIXTURE_USERS
+        or value.get("concurrency") != 32 or value.get("max_inflight") != 32
+        or value.get("load_model") != "closed_loop_best_effort"
+        or value.get("phase_windows_ms") != [120_000, 20_000]
+        or value.get("phase_workloads") != [HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD]
+        or value.get("phase_gap_ms") != 5_000
+        or value.get("capacity_quantiles_scope") != "capacity_phase_on_window_only"
+        or value.get("profile_latency_scope") != "excluded"
+        or value.get("remote_plan_cleanup") not in {"complete", "incomplete"}
+        or type(value.get("namespace_closed")) is not bool
+        or value.get("maximum_wall_seconds") != 600
+        or type(value.get("wall_elapsed_seconds")) not in (int, float)
+        or isinstance(value.get("wall_elapsed_seconds"), bool)
+        or not math.isfinite(value["wall_elapsed_seconds"])
+        or not 0 <= value["wall_elapsed_seconds"] <= 600
+        or type(value.get("same_fixture_manifest")) is not bool
+    ):
+        return None
+    run_ids, digests = value.get("phase_run_ids"), value.get("phase_profile_digests")
+    if (
+        not isinstance(run_ids, list) or len(run_ids) > 2
+        or any(not isinstance(item, str) or RUN_RE.fullmatch(item) is None for item in run_ids)
+        or len(set(run_ids)) != len(run_ids)
+        or not isinstance(digests, list) or len(digests) > 2
+        or any(not isinstance(item, str) or re.fullmatch(r"[0-9a-f]{64}", item) is None for item in digests)
+        or len(run_ids) != len(digests)
+    ):
+        return None
+    capacity = _project_capacity_report(value.get("capacity_phase")) if value.get("capacity_phase") is not None else None
+    profile = _project_capacity_report(value.get("cpu_profile_phase")) if value.get("cpu_profile_phase") is not None else None
+    if (value.get("capacity_phase") is not None and capacity is None
+            or value.get("cpu_profile_phase") is not None and profile is None):
+        return None
+    for phase, workload in ((capacity, HTML_CAPACITY_120S_WORKLOAD), (profile, HTML_CPU_PROFILE_20S_WORKLOAD)):
+        if phase is not None and (
+            phase.get("workload") != workload
+            or phase.get("source_sha") != value["source_sha"]
+            or phase.get("app_target_sha") != value["app_target_sha"]
+            or phase.get("external_run_id") != value["external_run_id"]
+            or phase.get("external_run_attempt") != value["external_run_attempt"]
+            or phase.get("fixture_manifest_sha256") != value["fixture_manifest_sha256"]
+            or phase.get("fixture_manifest_bytes") != value["fixture_manifest_bytes"]
+            or phase.get("concurrency") != 32
+        ):
+            return None
+    if profile is not None:
+        profile.update({
+            "attribution_only": True, "performance_credit": False,
+            "capacity_quantile_member": False,
+        })
+    complete = bool(
+        capacity is not None and profile is not None
+        and capacity.get("status") == "complete" and profile.get("status") == "complete"
+        and capacity.get("remote_plan_cleanup") == "complete"
+        and profile.get("remote_plan_cleanup") == "complete"
+        and capacity.get("namespace_closed") is True
+        and profile.get("namespace_closed") is True
+        and value["same_fixture_manifest"] is True
+        and len(run_ids) == 2 and len(set(run_ids)) == 2
+    )
+    if (value["status"] == "complete") != complete or value["namespace_closed"] != complete:
+        return None
+    if value["passed"] != bool(complete and capacity and capacity.get("passed") is True):
+        return None
+    return {
+        **{key: value[key] for key in fields if key not in {"capacity_phase", "cpu_profile_phase"}},
+        "phase_run_ids": run_ids,
+        "phase_profile_digests": digests,
+        "capacity_phase": capacity,
+        "cpu_profile_phase": profile,
+    }
 
 
 def evaluate_capacity_report(
@@ -3565,6 +4550,34 @@ def evaluate_capacity_report(
         ),
     )):
         return "INVALID"
+    if workload == HTML_COMPOSITE_WORKLOAD:
+        capacity = report.get("capacity_phase")
+        profile = report.get("cpu_profile_phase")
+        if (report.get("status") != "complete" or report.get("passed") is not True
+                or report.get("namespace_closed") is not True
+                or report.get("remote_plan_cleanup") != "complete"
+                or not isinstance(capacity, dict) or not isinstance(profile, dict)
+                or capacity.get("status") != "complete" or capacity.get("passed") is not True
+                or profile.get("status") != "complete"
+                or capacity.get("remote_plan_cleanup") != "complete"
+                or profile.get("remote_plan_cleanup") != "complete"
+                or capacity.get("namespace_closed") is not True
+                or profile.get("namespace_closed") is not True):
+            return "FAIL" if report.get("status") == "incomplete" else "INVALID"
+        capacity_worker = capacity.get("worker")
+        if (not isinstance(capacity_worker, dict)
+                or not _phase_request_window_evidence_is_closed(
+                    capacity_worker.get("request_window_evidence"),
+                    start_ms=capacity_worker.get("on_window_start_ms"),
+                    end_ms=capacity_worker.get("on_window_end_ms"),
+                )
+                or capacity_worker["request_window_evidence"].get("status") != "complete"):
+            return "INVALID"
+        profile_telemetry = profile.get("server_telemetry")
+        if (not isinstance(profile_telemetry, dict)
+                or profile_telemetry.get("profile_status") != "complete"):
+            return "INVALID"
+        return "PASS"
     if (report.get("status") != "complete" or report.get("passed") is not True
             or report.get("namespace_closed") is not True
             or report.get("remote_plan_cleanup") != "complete"):
@@ -4063,7 +5076,10 @@ def sanitize_capacity_report(
     source_sha: str, app_target_sha: str, run_id: str, attempt: str,
     workload: str = WORKLOAD,
 ) -> str:
-    if not isinstance(workload, str) or workload not in {WORKLOAD, HTML_WORKLOAD}:
+    if not isinstance(workload, str) or workload not in {
+        WORKLOAD, HTML_WORKLOAD, HTML_CAPACITY_120S_WORKLOAD,
+        HTML_CPU_PROFILE_20S_WORKLOAD, HTML_COMPOSITE_WORKLOAD,
+    }:
         raise _sanitization_failure("report_binding", "report_binding_rejected")
     try:
         manifest_raw, manifest, _actors = _read_manifest(manifest_path)
@@ -4181,7 +5197,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--external-run-id")
     parser.add_argument("--external-run-attempt")
     parser.add_argument("--concurrency", type=int, choices=tuple(sorted(CONCURRENCY_PRESETS | HTML_CONCURRENCY_PRESETS)))
-    parser.add_argument("--workload", choices=(WORKLOAD, HTML_WORKLOAD), default=WORKLOAD)
+    parser.add_argument("--workload", choices=(
+        WORKLOAD, HTML_WORKLOAD, HTML_CAPACITY_120S_WORKLOAD,
+        HTML_CPU_PROFILE_20S_WORKLOAD, HTML_COMPOSITE_WORKLOAD,
+    ), default=WORKLOAD)
     parser.add_argument("--ssh-host", default=os.environ.get("PROD_SSH_HOST", ""))
     parser.add_argument("--ssh-user", default=os.environ.get("PROD_SSH_USER", ""))
     parser.add_argument("--ssh-config")
@@ -4215,7 +5234,10 @@ def main(argv: list[str] | None = None) -> int:
             or not args.external_run_id or not args.external_run_attempt
             or args.concurrency is None or not args.ssh_config or not args.ssh_key
             or not isinstance(args.workload, str)
-            or args.workload not in {WORKLOAD, HTML_WORKLOAD}
+            or args.workload not in {
+                WORKLOAD, HTML_WORKLOAD, HTML_CAPACITY_120S_WORKLOAD,
+                HTML_CPU_PROFILE_20S_WORKLOAD, HTML_COMPOSITE_WORKLOAD,
+            }
             or re.fullmatch(r"[A-Za-z0-9.-]{1,253}", args.ssh_host) is None
             or re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", args.ssh_user) is None):
         parser.error("parent command arguments are incomplete")
@@ -4273,6 +5295,7 @@ def main(argv: list[str] | None = None) -> int:
                     raise ValueError("capacity plan expiry unavailable")
                 _wait_for_remote_plan_expiry(
                     planned_expiry,
+                    workload=str(stage_state.get("workload")),
                     plan_created_at_ms=plan_created_at_ms,
                     plan_created_monotonic=plan_created_monotonic,
                 )

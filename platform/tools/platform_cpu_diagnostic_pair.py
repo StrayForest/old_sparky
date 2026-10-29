@@ -101,13 +101,111 @@ MEMORY_METRIC_FIELDS = MEMORY_ROW_FIELDS - {
 }
 PROFILE_CATEGORIES = frozenset({
     "repo.get_tournament_workspace", "repo.get_tournament_workspace_by_slug",
+    "repo.get_auth_bootstrap", "repo.build_auth_bootstrap",
     "repo.workspace_conditional_preflight", "repo.get_current_user",
     "repo.get_current_user_optional", "repo.get_server_request_correlation_headers",
     "repo.run_with_ssr_trace", "repo.workspace_api_fetch", "repo.workspace_page",
+    "repo.ensure_workspace_private_membership", "repo.ensure_tournament_workspace_visible",
+    "repo.build_tournament_workspace_detail_bracket_response",
+    "repo.build_tournament_workspace_bracket_summary_response",
+    "repo._workspace_response_etag", "repo._serialized_model_response",
+    "repo.ssr_route_module", "react_server_render", "compiled_server_chunk",
     "orm_result", "db_driver", "async_event_loop", "serialization_validation",
     "crypto", "web_framework", "http_client", "other",
 })
 RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _validate_profile_projection(value: Any) -> dict[str, Any] | None:
+    """Validate the fixed per-service CPU profile projection in a parent report."""
+
+    fields = {"profile_status", "profile_reason", "profile_rows"}
+    if (not isinstance(value, dict) or set(value) != fields
+            or value.get("profile_status") not in {"complete", "incomplete", "unavailable"}
+            or value.get("profile_reason") not in {
+                "none", "missing", "duplicate", "identity_changed", "journal_failed",
+                "byte_cap", "line_cap", "timeout", "invalid_profile",
+            }
+            or not isinstance(value.get("profile_rows"), list)
+            or len(value["profile_rows"]) > 2):
+        return None
+    rows = value["profile_rows"]
+    if not rows:
+        if value["profile_status"] not in {"incomplete", "unavailable"} or value["profile_reason"] == "none":
+            return None
+        return {"profile_status": value["profile_status"], "profile_reason": value["profile_reason"], "profile_rows": []}
+    if len(rows) != 2:
+        return None
+    expected = (("api", 2, "thread_cpu", "calls"), ("web", 1, "v8_cpu", "samples"))
+    clean_rows: list[dict[str, Any]] = []
+    for row, (service, targets, timer, unit) in zip(rows, expected):
+        if (not isinstance(row, dict) or set(row) != PROFILE_ROW_FIELDS
+                or row.get("service") != service or row.get("expected_targets") != targets
+                or type(row.get("observed_targets")) is not int
+                or not 0 <= row["observed_targets"] <= targets
+                or type(row.get("event_count")) is not int
+                or not 0 <= row["event_count"] <= 8
+                or row.get("timer") != timer or row.get("observation_unit") != unit
+                or not isinstance(row.get("categories"), list)
+                or len(row["categories"]) > 16):
+            return None
+        clean = {key: row[key] for key in PROFILE_ROW_FIELDS}
+        for name in (
+            "total_cpu_us", "sample_count", "start_lag_ms_min", "start_lag_ms_max",
+            "elapsed_ms_min", "elapsed_ms_max", "end_lag_ms_min", "end_lag_ms_max",
+        ):
+            item = clean[name]
+            if item is not None and (type(item) is not int or not 0 <= item <= 10**10):
+                return None
+        categories: list[dict[str, Any]] = []
+        names: list[str] = []
+        for category in clean["categories"]:
+            if (not isinstance(category, dict) or set(category) != PROFILE_CATEGORY_FIELDS
+                    or category.get("category") not in PROFILE_CATEGORIES
+                    or type(category.get("cpu_us")) is not int
+                    or not 0 <= category["cpu_us"] <= 10**10
+                    or type(category.get("observations")) is not int
+                    or not 0 <= category["observations"] <= 10**10):
+                return None
+            names.append(category["category"])
+            categories.append({
+                "category": category["category"],
+                "cpu_us": category["cpu_us"],
+                "observations": category["observations"],
+            })
+        if names != sorted(names) or len(set(names)) != len(names):
+            return None
+        clean["categories"] = categories
+        clean_rows.append(clean)
+    if value["profile_status"] == "complete" and (
+        value["profile_reason"] != "none"
+        or any(
+            row["observed_targets"] != row["expected_targets"]
+            or row["event_count"] != row["expected_targets"]
+            or not isinstance(row["total_cpu_us"], int) or row["total_cpu_us"] <= 0
+            or (row["service"] == "api" and row["sample_count"] is not None)
+            or (row["service"] == "web" and (
+                not isinstance(row["sample_count"], int) or row["sample_count"] <= 0
+            ))
+            or not row["categories"]
+            or not isinstance(row["start_lag_ms_min"], int)
+            or not isinstance(row["start_lag_ms_max"], int)
+            or not 0 <= row["start_lag_ms_min"] <= row["start_lag_ms_max"] <= 250
+            or not isinstance(row["elapsed_ms_min"], int)
+            or not isinstance(row["elapsed_ms_max"], int)
+            or not 19_750 <= row["elapsed_ms_min"] <= row["elapsed_ms_max"] <= 20_500
+            or not isinstance(row["end_lag_ms_min"], int)
+            or not isinstance(row["end_lag_ms_max"], int)
+            or not -250 <= row["end_lag_ms_min"] <= row["end_lag_ms_max"] <= 250
+            for row in clean_rows
+        )
+    ):
+        return None
+    return {
+        "profile_status": value["profile_status"],
+        "profile_reason": value["profile_reason"],
+        "profile_rows": clean_rows,
+    }
 SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RELEASE_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,95}$")
 HOST_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
@@ -1090,11 +1188,16 @@ def _quality_gate(
 def _validate_usage_summary(value: Any) -> dict[str, Any] | None:
     """Validate the closed root-controller CPU summary without retaining identities."""
 
+    from math import isfinite
+
     top_fields = {
         "status", "service_count", "usage_status", "usage_reason", "usage_rows",
         "profile_status", "profile_reason", "profile_rows", "memory_status",
         "memory_reason", "cgroup_memory_status", "cgroup_memory_reason", "memory_rows",
     }
+    has_request_telemetry = isinstance(value, dict) and "request_telemetry" in value
+    if has_request_telemetry:
+        top_fields.add("request_telemetry")
     if (
         not isinstance(value, dict)
         or set(value) != top_fields
@@ -1122,6 +1225,229 @@ def _validate_usage_summary(value: Any) -> dict[str, Any] | None:
         or not isinstance(value.get("memory_rows"), list)
     ):
         return None
+    clean_request_telemetry: dict[str, Any] | None = None
+    if has_request_telemetry:
+        raw_telemetry = value.get("request_telemetry")
+        if (not isinstance(raw_telemetry, dict)
+                or set(raw_telemetry) != {"status", "summary"}
+                or raw_telemetry.get("status") not in {"complete", "incomplete"}):
+            return None
+        raw_summary = raw_telemetry.get("summary")
+        if raw_summary is None:
+            if raw_telemetry["status"] != "incomplete":
+                return None
+            clean_request_telemetry = {"status": "incomplete", "summary": None}
+        else:
+            summary_fields = {
+                "schema_version", "phase", "cohort", "join", "timing_ms",
+                "coverage", "ssr_stream_coverage",
+            }
+            if (not isinstance(raw_summary, dict) or set(raw_summary) != summary_fields
+                    or raw_summary.get("schema_version") != 1
+                    or raw_summary.get("phase") != "on"):
+                return None
+
+            cohort_fields = {
+                "submitted_html_requests", "valid_response_ids", "eligible_response_ids",
+                "missing_response_ids",
+                "duplicate_response_ids", "malformed_response_ids",
+                "valid_response_id_coverage_percent", "selected_sample_limit", "selection_scheme",
+                "selected_sample_expected", "selected_sample_received", "selected_sample_valid",
+                "selected_sample_malformed_ids", "selected_sample_ineligible_ids",
+                "selected_sample_duplicate_ids",
+                "selected_sample_complete",
+            }
+            cohort = raw_summary.get("cohort")
+            if not isinstance(cohort, dict) or set(cohort) != cohort_fields:
+                return None
+            for field in cohort_fields - {
+                "valid_response_id_coverage_percent", "selected_sample_complete", "selection_scheme",
+            }:
+                item = cohort.get(field)
+                if type(item) is not int or not 0 <= item <= 100_000:
+                    return None
+            coverage_percent = cohort.get("valid_response_id_coverage_percent")
+            if (type(coverage_percent) not in (int, float) or isinstance(coverage_percent, bool)
+                    or not isfinite(coverage_percent) or not 0 <= coverage_percent <= 100
+                    or type(cohort.get("selected_sample_complete")) is not bool
+                    or cohort.get("selection_scheme") != "sha256-runid-requestid-1of8-v1"):
+                return None
+            if (cohort["valid_response_ids"] + cohort["missing_response_ids"]
+                    + cohort["duplicate_response_ids"] + cohort["malformed_response_ids"]
+                    != cohort["submitted_html_requests"]
+                    or cohort["eligible_response_ids"] > cohort["valid_response_ids"]
+                    or cohort["selected_sample_valid"] > cohort["selected_sample_expected"]
+                    or cohort["selected_sample_expected"] > cohort["selected_sample_limit"]
+                    or cohort["selected_sample_received"] > cohort["selected_sample_limit"]
+                    or cohort["selected_sample_expected"] != min(
+                        cohort["eligible_response_ids"], cohort["selected_sample_limit"],
+                    )):
+                return None
+
+            join_fields = {
+                "matched_nginx_parents", "matched_ssr_parents", "matched_stream_parents",
+                "matched_api_rows",
+                "matched_api_by_request_id", "matched_api_by_cf_ray",
+                "unmatched_selected_to_nginx", "unmatched_selected_to_ssr",
+                "unmatched_selected_to_stream", "unmatched_selected_to_api",
+                "orphan_ssr_rows", "orphan_stream_rows", "orphan_api_rows",
+                "duplicate_nginx_request_ids",
+            }
+            join = raw_summary.get("join")
+            if (not isinstance(join, dict) or set(join) != join_fields
+                    or any(type(item) is not int or not 0 <= item <= 200_001
+                           for item in join.values())):
+                return None
+
+            def valid_metric(metric: Any, *, scalar: bool = False) -> bool:
+                keys = {"count", "avg", "p50", "p95", "p99", "max"} if scalar else {
+                    "count", "avg_ms", "p50_ms", "p95_ms", "p99_ms", "max_ms",
+                }
+                if not isinstance(metric, dict) or set(metric) != keys:
+                    return False
+                if type(metric.get("count")) is not int or not 0 <= metric["count"] <= 200_000:
+                    return False
+                for key in keys - {"count"}:
+                    item = metric.get(key)
+                    if item is not None and (
+                        type(item) not in (int, float) or isinstance(item, bool)
+                        or not isfinite(item) or not 0 <= item <= 1_000_000_000
+                    ):
+                        return False
+                return True
+
+            timing = raw_summary.get("timing_ms")
+            if (not isinstance(timing, dict) or set(timing) != {
+                    "nginx_request", "ssr_stage", "ssr_stream_milestone_elapsed_ms",
+                    "stream_milestone_missing_or_invalid", "stream_milestone_unknown_rows",
+                    "api_request_by_route",
+                    "api_request_rows_by_route", "api_metric_missing_or_invalid_by_route",
+                }
+                    or not valid_metric(timing.get("nginx_request"))):
+                return None
+            allowed_ssr_stages = {
+                "auth_bootstrap_fetch", "tournament_workspace", "tournament_detail_data_ready",
+                "http_request_start", "root_layout", "page_component", "page_render", "proxy_start",
+                "proxy_to_root_layout_start", "request_to_proxy",
+            }
+            ssr_stages = timing.get("ssr_stage")
+            if (not isinstance(ssr_stages, dict)
+                    or any(key not in allowed_ssr_stages or not valid_metric(metric)
+                           for key, metric in ssr_stages.items())):
+                return None
+            milestone_names = {
+                "request_start", "response_stream_start", "first_body_write_attempt",
+                "response_finish", "response_close", "response_error",
+            }
+            milestones = timing.get("ssr_stream_milestone_elapsed_ms")
+            missing_milestones = timing.get("stream_milestone_missing_or_invalid")
+            if (not isinstance(milestones, dict) or set(milestones) != milestone_names
+                    or any(not valid_metric(metric) for metric in milestones.values())
+                    or not isinstance(missing_milestones, dict)
+                    or any(key not in milestone_names or type(count) is not int
+                           or not 0 <= count <= 200_001
+                           for key, count in missing_milestones.items())
+                    or type(timing.get("stream_milestone_unknown_rows")) is not int
+                    or not 0 <= timing["stream_milestone_unknown_rows"] <= 200_001):
+                return None
+            api_routes = {"auth_bootstrap", "tournament_workspace", "other"}
+            metric_fields = {
+                "total_ms", "sql_ms", "max_sql_ms", "pool_checkout_wait_ms",
+                "pool_connection_hold_ms", "compute_ms", "sql_count",
+            }
+            api_by_route = timing.get("api_request_by_route")
+            if (not isinstance(api_by_route, dict)
+                    or any(route not in api_routes or not isinstance(metrics, dict)
+                           or set(metrics) != metric_fields
+                           or any(not valid_metric(metric, scalar=field == "sql_count")
+                                  for field, metric in metrics.items())
+                           for route, metrics in api_by_route.items())):
+                return None
+            for map_name in ("api_request_rows_by_route", "api_metric_missing_or_invalid_by_route"):
+                route_map = timing.get(map_name)
+                if not isinstance(route_map, dict) or any(route not in api_routes for route in route_map):
+                    return None
+                for route_value in route_map.values():
+                    if map_name == "api_request_rows_by_route":
+                        if type(route_value) is not int or not 0 <= route_value <= 200_001:
+                            return None
+                    elif (not isinstance(route_value, dict)
+                          or any(field not in metric_fields or type(count) is not int
+                                 or not 0 <= count <= 200_001
+                                 for field, count in route_value.items())):
+                        return None
+
+            coverage_fields = {
+                "complete", "full_cohort", "source_rows_truncated", "source_input_rows",
+                "source_rejections", "cf_ray_fallback_enabled",
+            }
+            coverage = raw_summary.get("coverage")
+            if (not isinstance(coverage, dict) or set(coverage) != coverage_fields
+                    or type(coverage.get("complete")) is not bool
+                    or type(coverage.get("full_cohort")) is not bool
+                    or type(coverage.get("cf_ray_fallback_enabled")) is not bool
+                    or coverage["cf_ray_fallback_enabled"] is not False):
+                return None
+            sources = {"nginx", "ssr", "stream", "api"}
+            truncated = coverage.get("source_rows_truncated")
+            row_counts = coverage.get("source_input_rows")
+            rejections = coverage.get("source_rejections")
+            if (not isinstance(truncated, dict) or set(truncated) != sources
+                    or any(type(item) is not bool for item in truncated.values())
+                    or not isinstance(row_counts, dict) or set(row_counts) != sources
+                    or any(type(item) is not int or not 0 <= item <= 200_001 for item in row_counts.values())
+                    or not isinstance(rejections, dict) or set(rejections) != sources):
+                return None
+            for rejection_map in rejections.values():
+                if (not isinstance(rejection_map, dict)
+                        or any(not isinstance(key, str) or len(key) > 64 or type(item) is not int
+                               or not 0 <= item <= 200_001 for key, item in rejection_map.items())):
+                    return None
+
+            stream = raw_summary.get("ssr_stream_coverage")
+            stream_fields = {
+                "records", "selector_overflow", "selector_overflow_unattributed",
+                "row_cap_records", "row_cap_rows", "truncated_records",
+                "malformed_records", "capture_marker_records", "capture_eligible_requests",
+                "capture_retained_requests", "capture_lost_requests", "capture_rows",
+                "capture_lost_rows", "capture_truncated_records", "capture_malformed_records",
+                "capture_status", "status",
+            }
+            if (not isinstance(stream, dict) or set(stream) != stream_fields
+                    or any(type(stream.get(field)) is not int or not 0 <= stream[field] <= 1_000_000
+                           for field in stream_fields - {"status", "capture_status"})
+                    or stream["capture_rows"] > 6_000
+                    or stream.get("capture_status") not in {"complete", "incomplete", "missing"}
+                    or stream.get("status") not in {"none", "incomplete"}):
+                return None
+            expected_capture_status = (
+                "incomplete" if stream["capture_malformed_records"]
+                else "missing" if stream["capture_marker_records"] == 0
+                else "incomplete" if (
+                    stream["capture_marker_records"] != 1
+                    or stream["capture_truncated_records"] > 0
+                ) else "complete"
+            )
+            stream_incomplete = (
+                stream["truncated_records"] > 0 or stream["malformed_records"] > 0
+                or stream["capture_marker_records"] != 1
+                or stream["capture_truncated_records"] > 0
+                or stream["capture_malformed_records"] > 0
+                or stream["capture_status"] != "complete"
+                or stream["capture_eligible_requests"]
+                != stream["capture_retained_requests"] + stream["capture_lost_requests"]
+            )
+            if (stream["capture_status"] != expected_capture_status
+                    or stream["status"] != ("incomplete" if stream_incomplete else "none")
+                    or (raw_telemetry["status"] == "complete"
+                        and (not coverage["complete"] or stream_incomplete))
+                    or (raw_telemetry["status"] == "incomplete"
+                        and coverage["complete"] and not stream_incomplete)):
+                return None
+            clean_request_telemetry = {
+                "status": raw_telemetry["status"],
+                "summary": raw_summary,
+            }
     rows = value["usage_rows"]
     if not rows:
         if not (
@@ -1138,7 +1464,7 @@ def _validate_usage_summary(value: Any) -> dict[str, Any] | None:
             and value["memory_rows"] == []
         ):
             return None
-        return {
+        result = {
             "status": value["status"], "service_count": value["service_count"],
             "usage_status": "unavailable", "usage_reason": "missing", "usage_rows": [],
             "profile_status": "unavailable", "profile_reason": "missing", "profile_rows": [],
@@ -1146,6 +1472,9 @@ def _validate_usage_summary(value: Any) -> dict[str, Any] | None:
             "cgroup_memory_status": "unknown", "cgroup_memory_reason": "hierarchy_unavailable",
             "memory_rows": [],
         }
+        if clean_request_telemetry is not None:
+            result["request_telemetry"] = clean_request_telemetry
+        return result
     expected = (("api", "off", 2), ("api", "on", 2), ("web", "off", 1), ("web", "on", 1))
     if len(rows) != len(expected) or value["service_count"] != 2:
         return None
@@ -1326,7 +1655,7 @@ def _validate_usage_summary(value: Any) -> dict[str, Any] | None:
                for row in clean_memory)
     ):
         return None
-    return {
+    result = {
         "status": value["status"], "service_count": value["service_count"],
         "usage_status": value["usage_status"], "usage_reason": value["usage_reason"],
         "usage_rows": clean_rows,
@@ -1336,6 +1665,9 @@ def _validate_usage_summary(value: Any) -> dict[str, Any] | None:
         "cgroup_memory_status": value["cgroup_memory_status"],
         "cgroup_memory_reason": value["cgroup_memory_reason"], "memory_rows": clean_memory,
     }
+    if clean_request_telemetry is not None:
+        result["request_telemetry"] = clean_request_telemetry
+    return result
 
 
 def _usage_delta_percentage_points(summary: dict[str, Any] | None) -> dict[str, float | None] | None:

@@ -122,6 +122,37 @@ def _external_payload(schema: int = 2) -> dict[str, object]:
 
 
 class SourceBindingDispatchTests(unittest.TestCase):
+    def test_cpu_plan_cleanup_accepts_only_bounded_sorted_request_ids(self) -> None:
+        payload = {
+            "schema": 1, "operation": "cleanup",
+            "run_id": "0123456789abcdef0123456789abcdef",
+            "client_request_ids": ["00000000000000000000000000000002"],
+            "client_cohort_counts": {
+                "submitted_html_count": 2,
+                "valid_response_id_count": 2,
+                "missing_response_id_count": 0,
+                "duplicate_response_id_count": 0,
+                "malformed_response_id_count": 0,
+                "eligible_response_id_count": 1,
+                "retained_sample_count": 1,
+                "sample_scheme": "sha256-runid-requestid-1of8-v1",
+                "sample_cap_truncated": False,
+            },
+        }
+        self.assertEqual(
+            validate_cpu_diagnostic_payload(payload)["client_request_ids"],
+            ["00000000000000000000000000000002"],
+        )
+        for malformed in (
+            {**payload, "client_request_ids": ["11111111111111111111111111111111"]},
+            {**payload, "client_request_ids": ["other"]},
+            {**payload, "client_request_ids": ["b" * 32] * 1_001},
+            {**payload, "client_cohort_counts": {**payload["client_cohort_counts"], "submitted_html_count": 3}},
+        ):
+            with self.subTest(ids=malformed["client_request_ids"][:1]):
+                with self.assertRaises(WorkflowInputError):
+                    validate_cpu_diagnostic_payload(malformed)
+
     def test_html_capacity_workload_crosses_both_cpu_plan_dispatch_guards(self) -> None:
         html_plan = {
             "schema": 1,
@@ -423,6 +454,31 @@ class SourceBindingDispatchTests(unittest.TestCase):
                 with self.assertRaises(WorkflowInputError):
                     validate_external_payload(mutation)
 
+    def test_composite_html_ssr_capacity_is_fixed_to_c32_and_typed_workload(self) -> None:
+        workload = "authenticated_html_ssr_capacity_120s_plus_cpu_profile_20s_v1"
+        payload = _external_payload()
+        payload.update(
+            confirmation="RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC",
+            fixture_kind="ssr_html_capacity_composite_diagnostic_v1",
+            ssr_capacity_workload=workload,
+            ssr_capacity_concurrency="32",
+            tournament_count="1",
+            users_per_tournament="14",
+        )
+        validated = validate_external_payload(payload)
+        self.assertEqual(validated["ssr_capacity_workload"], workload)
+        self.assertEqual(validated["ssr_capacity_concurrency"], "32")
+        for mutation in (
+            {**payload, "ssr_capacity_concurrency": "16"},
+            {**payload, "ssr_capacity_concurrency": "64"},
+            {**payload, "ssr_capacity_workload": "authenticated_html_ssr_capacity_v1"},
+            {**payload, "fixture_kind": "ssr_html_capacity_diagnostic_v1"},
+            {**payload, "timeout_diagnostics": "true"},
+        ):
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(WorkflowInputError):
+                    validate_external_payload(mutation)
+
     def test_legacy_schema_one_preserves_same_source_shape(self) -> None:
         payload = _external_payload(schema=1)
         payload["target_sha"] = APP_SHA
@@ -472,6 +528,7 @@ class SourceBindingDispatchTests(unittest.TestCase):
                 "cpu_diagnostic_only_v1",
                 "ssr_capacity_diagnostic_v1",
                 "ssr_html_capacity_diagnostic_v1",
+                "ssr_html_capacity_composite_diagnostic_v1",
             ):
                 typed_payload = {**payload, "fixture_kind": fixture_kind}
                 typed_child = FakeProcess()

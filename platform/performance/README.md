@@ -17,6 +17,9 @@ sequence. Together they completed `2,484/2,484` HTTP 200 responses: A1 `616`,
 B1 `648`, A2 `600`, and B2 `620`. The B candidate did not meet the required
 pairwise improvement threshold, so the comparison does not show a performance
 gain. No capacity ceiling can be inferred from these rows.
+The final B2 run [40786898526](https://github.com/StrayForest/old_sparky/actions/runs/40786898526)
+generated `620` HTML requests in its SSR-capacity diagnostic; its regular
+external client job was skipped and exact fixture cleanup passed.
 
 For the accepted 20-second request windows, host CPU samples were filtered to
 the report's actual request start/finish timestamps (19/18/19 one-second
@@ -59,21 +62,38 @@ Private analysis reference: `retained-resource-attribution-20261029.md`,
 SHA-256 `612026f8cde27f2a5b977866d6e0ccae442497e15ece36dedc18f645e8a109c9`.
 The report remains outside this repository.
 
-The next useful measurement would be an unchanged A/fetch C32 run of about two
-minutes with predeclared acceptance and phase-aligned host/process CPU, SSR
-stages, and per-request API pool-acquire/hold timings. A reviewed CPU profile
-would need to be armed for the same SSR workload. This is a proposal for a
-separately authorized follow-up; no additional A/B load is authorized by this
-checkpoint. These results support no code-level fix target.
+Offline analysis is complete. After implementation and evidence review, the
+next authorized measurement is the strict composite contract
+`authenticated_html_ssr_capacity_120s_plus_cpu_profile_20s_v1`: the same
+authenticated HTML fixture, A/fetch path, API 2/web 1, admission 24 with at most
+8 waiters per API worker, C32 concurrency, and 14-actor fixture. Its capacity
+plan `authenticated_html_ssr_capacity_120s_v1` runs OFF 20 seconds, GAP 5
+seconds, and ON 120 seconds without profiling. After a five-second quiet gap,
+the separate `authenticated_html_ssr_cpu_profile_20s_v1` plan runs OFF 20
+seconds, GAP 5 seconds, and ON 20 seconds with V8/Python profiling; that
+profiled phase earns no capacity credit. The legacy plan's 20-second expiry
+remains unchanged; the new plan expires 15 seconds after ON ends. At the web,
+API and client boundaries, deterministic request selection hashes ASCII
+`run_id:request_id` with SHA-256 and selects one in eight from the low three
+bits. Each parent-plan cap is 1,000 requests. Correlation covers the full
+submitted ON-start HTTP cohort, including late, failed and drain-completed
+requests; phase-scoped API events join one-to-many to requests using private
+identifiers, which are not included in public summaries. Measured phases total
+195 seconds, plus about 52 seconds of lead per plan, preparation, draining, and
+canonical cleanup under a 600-second outer deadline. C64 remains forbidden.
+These measurements do not establish a capacity ceiling or a proven application
+fix target.
+The run remains blocked until the production disk admission requirement in
+[current state](../docs/CURRENT.md) is satisfied; no deployment or load run is
+currently authorized.
 
-After B2, the production runtime was restored to A. The final automatic
-deployment was run [`40788852387`](https://github.com/StrayForest/old_sparky/actions/runs/40788852387).
+After B2, the production runtime was restored to A. The final deployment was
+run [`40788852387`](https://github.com/StrayForest/old_sparky/actions/runs/40788852387).
 The last retained status observation, at `2026-10-29T04:28Z`, recorded A
-restored with API `2`, web `1`, and admission `24` per worker across `8`
-workers. This is a timestamped observation, not a fresh health check. No
-additional A/B load is authorized while offline analysis continues; C64 is
-forbidden. See [current state](../docs/CURRENT.md) for the concise operational
-status.
+restored with API `2`, web `1`, and authenticated-read admission concurrency
+`24` with a maximum of `8` waiters per API worker. It is timestamped, not a
+fresh health check. Later storage and maintenance readiness findings are owned
+by [current state](../docs/CURRENT.md).
 
 ## Authenticated-page load comparison (2026-10-24)
 

@@ -20,8 +20,7 @@ inside the private cluster. SQL restore and validation use a passwordless
 `platform_user` role created only in that disposable cluster; its separate
 `postgres` admin connection creates and drops the temporary database.
 Production PostgreSQL is never used as the restore target. The disposable cluster is stopped and its unit and mount are confirmed gone before a verified
-backup pair is published. Ordinary rotating maintenance retains 14 verified
-copies; backup-only preserve-existing mode keeps every complete pair; see [named backup retention](backup-retention-protection.md) for opt-in rotation.
+backup pair is published. Generic ordinary rotation defaults to 14 verified copies. Backup-only mode preserves every complete existing pair and does not rotate. The canonical manifest-backed maintenance configuration can override that default with `--backup-keep 15`; see [named backup retention](backup-retention-protection.md) and verify the exact installed unit before a production operation.
 
 The lock-aware storage-maintenance path calls backup creation and freshness
 verification in-process, avoiding a second Python interpreter during the
@@ -217,9 +216,7 @@ existing rotation behavior. The canonical maintenance unit in this source
 tree opts into the fixed private manifest described in the [named backup
 retention policy](backup-retention-protection.md), with `--backup-keep 15`.
 It retains the named pairs plus the newest `max(keep, 15)` pairs whose
-sidecars explicitly mark restore verification true. The production host still
-runs the previously published unit until this source passes its release
-chain. The low-level backup CLI retains its historical default.
+sidecars explicitly mark restore verification true. The source-tree setting alone does not prove the installed production unit's configuration; check [current state](CURRENT.md) and verify the exact installed unit before operation. The low-level backup CLI retains its historical default.
 
 Manifest input and listed pairs are checked before DB work; the manifest and
 pair identities are rechecked around pruning. The private proof records each
@@ -305,10 +302,7 @@ fixed success marker records the exact workflow source SHA, attested bundle
 digest, and hashes of the staged storage-maintenance and backup-drill helpers.
 Its bounded public receipt contains counts, byte totals and inventory digests;
 failure diagnostics stay in a root-private file and are not copied to the
-public artifact. No backup-only or installed full-maintenance branch rotates
-or removes existing archives. Full maintenance still applies its non-backup
-release, source-artifact, transient and live-QA retention after the successful
-restore drill.
+public artifact. Backup-only and verify-existing-only routes do not rotate or remove existing archive pairs. Full maintenance may rotate older unprotected verified pairs only after a new backup passes the restore drill and fixed manifest checks; it has no existing-backup-only rotation mode. Full maintenance also applies its non-backup release, source-artifact, transient and live-QA retention after the successful restore drill.
 
 ### Pre-archive authorization probe
 

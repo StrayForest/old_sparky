@@ -8,7 +8,6 @@ import {
   getSsrAdmissionStageObserver,
   getSsrAuthBodyParseObserver,
   getServerRequestCorrelationHeaders,
-  isSsrDiagnosticsEnabled,
   isSsrObservabilityActive,
   measureSsrStage
 } from "@/lib/server-ssr-observability";
@@ -93,7 +92,7 @@ export const getServerCurrentUser = cache(async (
       : undefined;
     return runWithServerInternalRead(async (): Promise<ServerAuthSnapshot> => {
       try {
-        const requestHeaders = isSsrDiagnosticsEnabled()
+        const requestHeaders = isSsrObservabilityActive()
           ? await getServerRequestCorrelationHeaders()
           : { accept: "application/json", cookie: cookieHeader };
         if (requestHeaders instanceof Headers) {
@@ -154,7 +153,7 @@ export const getServerAuthBootstrap = cache(async (
       : undefined;
     return runWithServerInternalRead(async (): Promise<ServerAuthSnapshot> => {
       try {
-        const requestHeaders = isSsrDiagnosticsEnabled()
+        const requestHeaders = isSsrObservabilityActive()
           ? await getServerRequestCorrelationHeaders()
           : { accept: "application/json", cookie: cookieHeader };
         if (requestHeaders instanceof Headers) {

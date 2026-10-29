@@ -10,7 +10,7 @@ import { CspNonceProvider } from "@/components/security/csp-nonce-provider";
 import { CspRouteAnnouncer } from "@/components/security/csp-route-announcer";
 import { getServerAuthBootstrap, platformSessionCookieName } from "@/lib/server-auth";
 import {
-  isSsrDiagnosticsEnabled,
+  isSsrTraceSampled,
   measureSsrStage,
   recordSsrPoint,
   recordSsrRequestTimeline,
@@ -35,9 +35,6 @@ export default async function RootLayout({
 }: Readonly<{
   children: ReactNode;
 }>) {
-  const diagnosticsEnabled = isSsrDiagnosticsEnabled();
-  const startedAt = diagnosticsEnabled ? performance.now() : 0;
-  const rootStartedAtMs = diagnosticsEnabled ? Date.now() : 0;
   await connection();
   const [requestHeaders, requestCookies] = await Promise.all([headers(), cookies()]);
   const renderRoot = (
@@ -71,17 +68,8 @@ export default async function RootLayout({
     </html>
   );
 
-  if (!diagnosticsEnabled) {
-    const nonce = requestHeaders.get("x-nonce");
-    const cookieHeader = requestCookies.toString();
-    const initialAuth = requestCookies.has(platformSessionCookieName())
-      ? await measureSsrStage("auth_bootstrap", () => getServerAuthBootstrap(cookieHeader))
-      : { status: "anonymous" as const, user: null };
-    const adsenseEnabled = process.env.PLATFORM_ADSENSE_ENABLED !== "false";
-    return renderRoot(nonce, initialAuth, adsenseEnabled);
-  }
-
-  return runWithSsrTrace(startedAt, rootStartedAtMs, requestHeaders, async () => {
+  return runWithSsrTrace(requestHeaders, async () => {
+    const startedAt = await isSsrTraceSampled() ? performance.now() : null;
     await recordSsrRequestTimeline();
     await recordSsrPoint("root_layout_start", 0);
     const nonce = requestHeaders.get("x-nonce");
@@ -91,7 +79,9 @@ export default async function RootLayout({
       : { status: "anonymous" as const, user: null };
     const adsenseEnabled = process.env.PLATFORM_ADSENSE_ENABLED !== "false";
     const rendered = renderRoot(nonce, initialAuth, adsenseEnabled);
-    await recordSsrStage("root_layout", performance.now() - startedAt);
+    if (startedAt !== null) {
+      await recordSsrStage("root_layout", performance.now() - startedAt);
+    }
     await recordSsrPoint("react_render_unattributed_start");
     return rendered;
   });

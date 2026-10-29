@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -22,7 +23,7 @@ from typing import Any, Mapping
 
 
 MAX_INPUT_BYTES = 64 * 1024
-MAX_CPU_DIAGNOSTIC_INPUT_BYTES = 4 * 1024
+MAX_CPU_DIAGNOSTIC_INPUT_BYTES = 64 * 1024
 MAX_CONTROL_EMAIL_STDIN_BYTES = 1_024
 MAX_EMAIL_LENGTH = 254
 MAX_EMAIL_LOCAL_LENGTH = 64
@@ -104,6 +105,9 @@ CPU_DIAGNOSTIC_RUN_RE = re.compile(r"^[0-9a-f]{32}$")
 CPU_DIAGNOSTIC_WORKLOAD = "authenticated_workspace_read_pair_v1"
 SSR_CAPACITY_DIAGNOSTIC_WORKLOAD = "authenticated_workspace_read_capacity_v1"
 SSR_HTML_CAPACITY_DIAGNOSTIC_WORKLOAD = "authenticated_html_ssr_capacity_v1"
+SSR_HTML_COMPOSITE_DIAGNOSTIC_WORKLOAD = (
+    "authenticated_html_ssr_capacity_120s_plus_cpu_profile_20s_v1"
+)
 HOST_TOOLS_SIGNER_WORKFLOW = (
     "StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml"
 )
@@ -414,6 +418,8 @@ def validate_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         keys.add("ssr_capacity_concurrency")
     elif fixture_kind == "ssr_html_capacity_diagnostic_v1":
         keys.update({"ssr_capacity_concurrency", "ssr_capacity_workload"})
+    elif fixture_kind == "ssr_html_capacity_composite_diagnostic_v1":
+        keys.update({"ssr_capacity_concurrency", "ssr_capacity_workload"})
     if schema == 2:
         keys.add("source_binding")
     if set(payload) != keys and set(payload) != keys - {"fixture_kind"}:
@@ -441,12 +447,12 @@ def validate_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise _invalid()
     if fixture_kind not in {
         "external_load", "cpu_diagnostic_only_v1", "ssr_capacity_diagnostic_v1",
-        "ssr_html_capacity_diagnostic_v1",
+        "ssr_html_capacity_diagnostic_v1", "ssr_html_capacity_composite_diagnostic_v1",
     }:
         raise _invalid()
     if fixture_kind in {
         "cpu_diagnostic_only_v1", "ssr_capacity_diagnostic_v1",
-        "ssr_html_capacity_diagnostic_v1",
+        "ssr_html_capacity_diagnostic_v1", "ssr_html_capacity_composite_diagnostic_v1",
     }:
         expected_confirmation = (
             CPU_DIAGNOSTIC_CONFIRMATION if fixture_kind == "cpu_diagnostic_only_v1"
@@ -459,14 +465,26 @@ def validate_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             or users_per_tournament != "14"
         ):
             raise _invalid()
-    if fixture_kind in {"ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1"}:
+    if fixture_kind in {
+        "ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1",
+        "ssr_html_capacity_composite_diagnostic_v1",
+    }:
         concurrency = _require_string(payload, "ssr_capacity_concurrency")
-        presets = {"8", "16"} if fixture_kind == "ssr_capacity_diagnostic_v1" else {"8", "16", "32", "64"}
+        presets = (
+            {"8", "16"} if fixture_kind == "ssr_capacity_diagnostic_v1"
+            else {"32"} if fixture_kind == "ssr_html_capacity_composite_diagnostic_v1"
+            else {"8", "16", "32", "64"}
+        )
         if concurrency not in presets:
             raise _invalid()
-        if fixture_kind == "ssr_html_capacity_diagnostic_v1" and _require_string(
-            payload, "ssr_capacity_workload",
-        ) != SSR_HTML_CAPACITY_DIAGNOSTIC_WORKLOAD:
+        expected_workload = (
+            SSR_HTML_COMPOSITE_DIAGNOSTIC_WORKLOAD
+            if fixture_kind == "ssr_html_capacity_composite_diagnostic_v1"
+            else SSR_HTML_CAPACITY_DIAGNOSTIC_WORKLOAD
+        )
+        if fixture_kind in {
+            "ssr_html_capacity_diagnostic_v1", "ssr_html_capacity_composite_diagnostic_v1",
+        } and _require_string(payload, "ssr_capacity_workload") != expected_workload:
             raise _invalid()
     elif "ssr_capacity_concurrency" in payload:
         raise _invalid()
@@ -494,10 +512,15 @@ def validate_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
     if "fixture_kind" in payload:
         result["fixture_kind"] = fixture_kind
-    if fixture_kind in {"ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1"}:
+    if fixture_kind in {
+        "ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1",
+        "ssr_html_capacity_composite_diagnostic_v1",
+    }:
         result["ssr_capacity_concurrency"] = concurrency
     if fixture_kind == "ssr_html_capacity_diagnostic_v1":
         result["ssr_capacity_workload"] = SSR_HTML_CAPACITY_DIAGNOSTIC_WORKLOAD
+    if fixture_kind == "ssr_html_capacity_composite_diagnostic_v1":
+        result["ssr_capacity_workload"] = SSR_HTML_COMPOSITE_DIAGNOSTIC_WORKLOAD
     if source_binding is not None:
         result["source_binding"] = source_binding
     return result
@@ -509,13 +532,61 @@ def validate_cpu_diagnostic_payload(payload: Mapping[str, Any]) -> dict[str, Any
     payload = _require_mapping(payload)
     operation = _require_string(payload, "operation")
     if operation == "cleanup":
-        _require_exact_keys(payload, {"schema", "operation", "run_id"})
+        base = {"schema", "operation", "run_id"}
+        fields = set(payload)
+        correlation_fields = {"client_request_ids", "client_cohort_counts"}
+        if fields not in (base, base | correlation_fields):
+            _require_exact_keys(payload, base)
         if type(payload.get("schema")) is not int or payload["schema"] != 1:
             raise _invalid()
         run_id = payload.get("run_id")
         if not isinstance(run_id, str) or CPU_DIAGNOSTIC_RUN_RE.fullmatch(run_id) is None:
             raise _invalid()
-        return {"schema": 1, "operation": "cleanup", "run_id": run_id}
+        output = {"schema": 1, "operation": "cleanup", "run_id": run_id}
+        if "client_request_ids" in payload:
+            request_ids = payload.get("client_request_ids")
+            if (not isinstance(request_ids, list) or len(request_ids) > 1_000
+                    or any(not isinstance(item, str)
+                           or re.fullmatch(r"[0-9a-f]{32}", item) is None
+                           for item in request_ids)
+                    or len(set(request_ids)) != len(request_ids)
+                    or request_ids != sorted(request_ids)):
+                raise _invalid()
+            output["client_request_ids"] = list(request_ids)
+            counts = payload.get("client_cohort_counts")
+            expected_counts = {
+                "submitted_html_count", "valid_response_id_count",
+                "missing_response_id_count", "duplicate_response_id_count",
+                "malformed_response_id_count", "eligible_response_id_count",
+                "retained_sample_count", "sample_scheme", "sample_cap_truncated",
+            }
+            if (not isinstance(counts, Mapping) or set(counts) != expected_counts
+                    or any(type(counts[key]) is not int or counts[key] < 0
+                           or counts[key] > 100_000 for key in expected_counts - {
+                               "sample_scheme", "sample_cap_truncated",
+                           })
+                    or counts.get("sample_scheme") != "sha256-runid-requestid-1of8-v1"
+                    or type(counts.get("sample_cap_truncated")) is not bool
+                    or sum(counts[key] for key in {
+                        "valid_response_id_count", "missing_response_id_count",
+                        "duplicate_response_id_count", "malformed_response_id_count",
+                    })
+                    != counts["submitted_html_count"]
+                    or counts["eligible_response_id_count"] > counts["valid_response_id_count"]
+                    or counts["retained_sample_count"] != len(request_ids)
+                    or len(request_ids) != min(counts["eligible_response_id_count"], 1_000)
+                    or counts["sample_cap_truncated"] != (counts["eligible_response_id_count"] > 1_000)
+                    or any(
+                        hashlib.sha256(f"{run_id}:{item}".encode("ascii")).digest()[0] & 7
+                        for item in request_ids
+                    )):
+                raise _invalid()
+            output["client_cohort_counts"] = {
+                key: counts[key] for key in sorted(expected_counts)
+            }
+        elif "client_cohort_counts" in payload:
+            raise _invalid()
+        return output
     if operation != "prepare":
         raise _invalid()
     keys = {

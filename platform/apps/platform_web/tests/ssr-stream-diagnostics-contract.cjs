@@ -34,9 +34,38 @@ function signalProcessGroup(child, signal) {
   }
 }
 
-function fixtureSource({ disabled, diagnosticMarker }) {
+function fixtureSource({ disabled, diagnosticMarker, planSelection }) {
+  const planRunId = "0123456789abcdef0123456789abcdef";
+  const requestId = planSelection === "valid"
+    ? "00000000000000000000000000000002"
+    : planSelection === "unsampled"
+      ? "11111111111111111111111111111111"
+      : "d".repeat(32);
+  const captureEligible = (process.getBuiltinModule("node:crypto")
+    .createHash("sha256")
+    .update(`${planRunId}:${requestId}`, "ascii")
+    .digest()[0] & 7) === 0;
+  const requestMarker = planSelection ? planRunId : (diagnosticMarker ? "1" : "");
+  const registration = planSelection === "valid" || planSelection === "unsampled"
+    ? `if (!selectPlanRequest({requestId: "${requestId}", runId: "${planRunId}", expiresAtMs: Date.now() + 10_000, captureEligible: ${captureEligible}})) throw new Error("validated request was not selected");`
+    : planSelection === "wrong-request"
+      ? `globalThis[Symbol.for("old-sparky.ssr-stream-selector")]({requestId: "${"e".repeat(32)}", runId: "${planRunId}", expiresAtMs: Date.now() + 10_000});`
+      : planSelection === "wrong-run"
+        ? `globalThis[Symbol.for("old-sparky.ssr-stream-selector")]({requestId: "${requestId}", runId: "${"f".repeat(32)}", expiresAtMs: Date.now() + 10_000});`
+      : planSelection === "expired"
+        ? `globalThis[Symbol.for("old-sparky.ssr-stream-selector")]({requestId: "${requestId}", runId: "${planRunId}", expiresAtMs: Date.now() - 1});`
+        : "";
   return `
 const http = process.getBuiltinModule("node:http");
+const selectPlanRequest = globalThis[Symbol.for("old-sparky.ssr-stream-selector")];
+if (typeof selectPlanRequest !== "function") throw new Error("stream selector is unavailable");
+for (const rejected of [
+  {requestId: "bad request", runId: "${planRunId}", expiresAtMs: Date.now() + 1_000},
+  {requestId: "request-unselected", runId: "bad", expiresAtMs: Date.now() + 1_000},
+  {requestId: "request-unselected", runId: "${planRunId}", expiresAtMs: Date.now() + 160_001},
+]) {
+  if (selectPlanRequest(rejected) !== false) throw new Error("stream selector accepted unbounded or malformed selection");
+}
 const watchdog = setTimeout(() => {
   console.error("SSR diagnostics fixture watchdog elapsed");
   process.exit(124);
@@ -47,6 +76,8 @@ const server = http.createServer((request, response) => {
     response.end();
     return;
   }
+  console.log("request_start_marker=" + (request[Symbol.for("old-sparky.ssr-request-start")] ? "set" : "none"));
+  ${registration}
   response.writeHead(200, {"content-type": "text/html"});
   ${disabled ? 'response.end("<html></html>");' : 'response.write("<html>"); response.end("</html>");'}
 });
@@ -60,18 +91,21 @@ server.listen(0, "127.0.0.1", () => {
   fetch("http://127.0.0.1:" + port + "/tournaments/private-slug", {
     headers: {
       accept: "text/html",
-      "x-request-id": "${disabled ? "request-disabled" : "request-1"}",
+      "x-request-id": "${planSelection ? requestId : disabled ? "request-disabled" : "request-1"}",
       "cf-ray": "ray-1",
-      ${diagnosticMarker ? [
+      ${diagnosticMarker || planSelection ? [
         '"x-platform-timeout-diagnostic-id": "tdiag-123-00001",',
-        '"x-platform-ssr-trace": "1",',
+        '"x-platform-ssr-trace": "${requestMarker}",',
         '"x-platform-ssr-request-id": "forged-request-id",',
         '"x-platform-ssr-cf-ray": "forged-cf-ray",',
         '"x-platform-ssr-proxy-start-ms": "1",',
         '"x-platform-ssr-request-start-ms": "1",',
       ].join("\n      ") : ""}
     },
-  }).then((response) => response.text()).then(() => {
+  }).then((response) => {
+    console.log("client_join=" + (response.headers.get("x-platform-ssr-request-id") || "none"));
+    return response.text();
+  }).then(() => {
     server.close((error) => {
       clearTimeout(watchdog);
       if (error) {
@@ -89,7 +123,12 @@ server.listen(0, "127.0.0.1", () => {
 `;
 }
 
-async function runFixture(name, { disabled = false, diagnosticMarker = false, sampleRate = "1" } = {}) {
+async function runFixture(name, {
+  disabled = false,
+  diagnosticMarker = false,
+  planSelection = null,
+  sampleRate = "1",
+} = {}) {
   const environment = { ...process.env };
   if (disabled) {
     delete environment.PLATFORM_SSR_PERF_LOG_ENABLED;
@@ -99,7 +138,7 @@ async function runFixture(name, { disabled = false, diagnosticMarker = false, sa
   }
   const child = childProcess.spawn(
     process.execPath,
-    ["--require", guardPath, "-e", fixtureSource({ disabled, diagnosticMarker })],
+    ["--require", guardPath, "-e", fixtureSource({ disabled, diagnosticMarker, planSelection })],
     {
       detached: true,
       env: environment,
@@ -159,6 +198,23 @@ function assertCount(output, fragment, expected, name) {
 }
 
 async function main() {
+  const guardSource = fs.readFileSync(guardPath, "utf8");
+  for (const fragment of [
+    "maxSelectedRequests = 128",
+    "maxPendingRequests = 128",
+    "maxRowsPerRequest = 6",
+    "maxRowsPerPlan = 6_000",
+    'captureSampleScheme = "sha256-runid-requestid-1of8-v1"',
+    '(digest[0] & 7) === 0',
+    "captureEligible: entry.captureEligible",
+    "ssr_stream_capture_coverage scheme=${captureSampleScheme}",
+    "selector_overflow_unattributed=",
+    'setHeader("x-platform-ssr-request-id", entry.requestId)',
+  ]) {
+    if (!guardSource.includes(fragment)) {
+      throw new Error(`SSR stream guard contract omitted ${fragment}`);
+    }
+  }
   const prearmModule = await import(path.resolve(
     __dirname, "..", "lib", "workspace-diagnostic-prearm.mjs",
   ));
@@ -178,6 +234,14 @@ async function main() {
   const authorizedRunId = prearmModule.authorizedWorkspaceDiagnosticPrearmRunId(
     prearmPlan, { ...prearmPlan }, 48_000,
   );
+  for (const workload of ["authenticated_html_ssr_capacity_120s_v1"]) {
+    const typedPlan = { ...prearmPlan, workload };
+    if (prearmModule.authorizedWorkspaceDiagnosticPrearmRunId(
+      typedPlan, { ...typedPlan }, 48_000,
+    ) !== runId) {
+      throw new Error(`workspace prearm rejected the approved typed HTML workload ${workload}`);
+    }
+  }
   let prearmPlanReadCount = 0;
   const absentContextRunId = prearmModule.readAuthorizedWorkspaceDiagnosticPrearmRunId(
     null,
@@ -293,7 +357,9 @@ async function main() {
   }
 
   const disabledOutput = await runFixture("disabled", { disabled: true });
-  if (disabledOutput.includes("ssr_stream")) {
+  if (disabledOutput.includes("ssr_stream")
+      || !disabledOutput.includes("client_join=none")
+      || !disabledOutput.includes("request_start_marker=none")) {
     throw new Error("disabled SSR diagnostics emitted a stream log");
   }
 
@@ -301,8 +367,61 @@ async function main() {
     diagnosticMarker: true,
     sampleRate: "0",
   });
-  if (untrustedHeadersOutput.includes("ssr_stream")) {
+  if (untrustedHeadersOutput.includes("ssr_stream")
+      || !untrustedHeadersOutput.includes("client_join=none")) {
     throw new Error("public diagnostic headers promoted an unsampled SSR stream");
+  }
+
+  const validatedPlanOutput = await runFixture("validated-plan", {
+    disabled: true,
+    planSelection: "valid",
+  });
+  for (const stage of [
+    "request_start",
+    "response_stream_start",
+    "first_body_write_attempt",
+    "response_finish",
+    "response_close",
+  ]) {
+    assertCount(validatedPlanOutput, `stage=${stage}`, 1, "validated SSR plan");
+  }
+  if (!validatedPlanOutput.includes("request_id=00000000000000000000000000000002")
+      || !validatedPlanOutput.includes("client_join=00000000000000000000000000000002")
+      || !validatedPlanOutput.includes("request_start_marker=set")
+      || validatedPlanOutput.includes("session=")
+      || validatedPlanOutput.includes("private-slug")) {
+    throw new Error("validated plan stream rows lost correlation or exposed private request data");
+  }
+  const unsampledPlanOutput = await runFixture("validated-plan-unsampled", {
+    disabled: true,
+    planSelection: "unsampled",
+  });
+  if (unsampledPlanOutput.includes("ssr_stream")
+      || !unsampledPlanOutput.includes("client_join=11111111111111111111111111111111")
+      || !unsampledPlanOutput.includes("request_start_marker=set")) {
+    throw new Error("unsampled valid typed plan lost its response join or emitted stream rows");
+  }
+  for (const selection of ["wrong-request", "wrong-run", "expired"]) {
+    const rejectedPlanOutput = await runFixture(`plan-${selection}`, {
+      disabled: true,
+      planSelection: selection,
+    });
+    if (rejectedPlanOutput.includes("ssr_stream")) {
+      throw new Error(`SSR stream guard accepted ${selection} selector state`);
+    }
+    if (!rejectedPlanOutput.includes("client_join=none")) {
+      throw new Error(`SSR stream guard set a response join header for ${selection} selector state`);
+    }
+  }
+  const forgedPlanMarkerOutput = await runFixture("forged-plan-marker", {
+    disabled: true,
+    planSelection: "forged",
+  });
+  if (forgedPlanMarkerOutput.includes("ssr_stream")) {
+    throw new Error("SSR stream guard trusted a caller marker without validated request selection");
+  }
+  if (!forgedPlanMarkerOutput.includes("client_join=none")) {
+    throw new Error("SSR stream guard set a response join header from a caller marker alone");
   }
 }
 

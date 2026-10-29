@@ -3880,8 +3880,48 @@ def _project_statement_snapshot(value: Any) -> dict[str, Any]:
     available = _copy_bool(source, "available")
     if available is not None:
         output["available"] = available
+    complete = _copy_bool(source, "complete")
+    if complete is not None:
+        output["complete"] = complete
+    truncated = _copy_bool(source, "truncated")
+    if truncated is not None:
+        output["truncated"] = truncated
+    for key in ("before_truncated", "after_truncated"):
+        value = _copy_bool(source, key)
+        if value is not None:
+            output[key] = value
+    reason = source.get("reason")
+    safe_reasons = frozenset(
+        {
+            "complete",
+            "partial_coverage",
+            "snapshot_unavailable",
+            "reset_metadata_unavailable",
+            "statistics_reset",
+            "deallocation_metadata_unavailable",
+            "counter_regression",
+            "statement_eviction",
+            "counter_unavailable",
+        }
+    )
+    if isinstance(reason, str) and reason in safe_reasons:
+        output["reason"] = reason
     if "error_class" in source:
         output["error_class"] = safe_error_class(source.get("error_class"))
+    for key in (
+        "dealloc",
+        "total_rows",
+        "unknown_identity_groups",
+        "before_unknown_identity_groups",
+        "after_unknown_identity_groups",
+        "matched_rows",
+        "after_only_rows",
+        "excluded_after_only_rows",
+        "ambiguous_rows",
+    ):
+        number = _copy_int(source, key)
+        if number is not None and number >= 0:
+            output[key] = number
     rows = source.get("rows")
     if isinstance(rows, list):
         projected_rows: list[dict[str, Any]] = []

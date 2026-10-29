@@ -11,14 +11,52 @@ belong in the linked owner documents below.
 ## Live and pending state
 
 - The latest recorded production state is source
-  `9cbb73b930b71689843f58eb7b5492789f865ca1` with A restored by automatic
-  deployment
+  `9cbb73b930b71689843f58eb7b5492789f865ca1` with A restored by deployment
   [40788852387](https://github.com/StrayForest/old_sparky/actions/runs/40788852387).
   The last retained status observation at `2026-10-29T04:28Z` recorded API `2`,
-  web `1`, and admission `24` per worker across `8` workers. This timestamped
-  observation is not a fresh health check; see the
+  web `1`, and authenticated-read admission concurrency `24` with a maximum of
+  `8` waiters per API worker. The fresh read-only storage diagnostic
+  [40822844997](https://github.com/StrayForest/old_sparky/actions/runs/40822844997)
+  confirmed the active and previous release pointers, running API/worker/web
+  services, and an unlocked retained-load lock at `05:20Z`. Direct metadata
+  inspection at `05:40Z` found no pending release-operation receipt and no
+  holder of the release or retained-load lock. At the fresh `06:03Z` disk
+  sample, free space was `6,047,199,232` bytes, conservative use was `84.86%`,
+  and headroom before the `85%` threshold was `51,110,503` bytes. The backup
+  directory has 61 archive/metadata pairs: 60 verified and one unverified.
+  The installed retention manifest protects 26 exact pairs (25 verified and
+  one unverified); all are older than the newest 15 verified pairs. With a new
+  verified backup, the installed `--backup-keep 15` setting would retain those
+  pins plus the newest 15 verified pairs and rotate 21 older unprotected
+  verified pairs. Generic 14-copy retention is a default, not this installed
+  manifest-backed override.
+
+  The installed maintenance service failed at `2026-10-29T02:31Z` during
+  `scratch_image_admission`; its closed receipt recorded `6,006,538,240` bytes
+  free after the archive existed, below the required `6,241,124,352` bytes.
+  Cleanup was confirmed, no backup was published, and no scratch image or
+  temporary dump remains. The deployed restore path uses a fully allocated
+  576 MiB ext4 image and requires the 5 GiB free-space floor plus a 256 MiB
+  lead after allocation. Including the latest dump allocation of
+  `128,433,203` bytes, that stage requires `6,369,557,555` free bytes; the
+  `06:03Z` sample is short by `322,358,323` bytes, before any dump growth. No
+  canonical path rotates existing
+  backups without creating and verifying a new one. The two older release
+  trees previously counted as candidates are maintenance-protected pins; the
+  release-only dry run found zero candidates. The installed maintenance unit
+  configures a 90% used-space ceiling, while the operational admission check
+  used an 85% threshold. Treat this as unresolved policy drift; do not treat
+  the unit's 90% limit as approval to run maintenance. The operator disk-
+  capacity choice is pending: add about 1 GiB of provider disk, or request a
+  separately reviewed new rotation procedure. No canonical existing-backup-
+  only rotation route is available, and no deletion or maintenance action is
+  approved.
+  Production deployment and load measurement are currently blocked on satisfying
+  the disk admission requirement; do not start either while this shortfall
+  remains.
+  See the
   [performance evidence](../performance/README.md#ssr-c32-comparison-checkpoint-2026-10-29)
-  for the comparison outcome and limits.
+  for the comparison outcome and next diagnostic contract.
 - Source-bound backups must have exactly one producer run ID per Security
   run, attempt and SHA. Failed or cancelled IDs count; multiple IDs make that
   proof ambiguous. Follow the [backup and restore runbook](backup-restore-runbook.md).
@@ -54,15 +92,22 @@ belong in the linked owner documents below.
   [performance reference](../performance/README.md#authenticated-page-load-comparison-2026-10-24).
 - The SSR C32 comparison on source `9cbb73b930b71689843f58eb7b5492789f865ca1`
   completed four accepted A1/B1/A2/B2 rows, together `2,484/2,484` HTTP 200
-  responses. B did not meet the pairwise improvement threshold. The final
-  automatic deployment
+  responses. Its final B2 run
+  [40786898526](https://github.com/StrayForest/old_sparky/actions/runs/40786898526)
+  generated `620` HTML requests in the SSR-capacity diagnostic; the regular
+  external client job was skipped and exact fixture cleanup passed. B did not
+  meet the pairwise improvement threshold. The final deployment
   [40788852387](https://github.com/StrayForest/old_sparky/actions/runs/40788852387)
   restored A. The last retained status observation at `2026-10-29T04:28Z`
-  recorded API `2`, web `1`, and admission `24` per worker across `8` workers;
-  this is not a fresh health check. Offline analysis continues. No further A/B
-  load is authorized, C64 is forbidden, and these rows do not establish a
-  capacity ceiling. See the [performance reference](../performance/README.md#ssr-c32-comparison-checkpoint-2026-10-29)
-  for the evidence summary.
+  recorded API `2`, web `1`, and authenticated-read admission concurrency `24`
+  with a maximum of `8` waiters per API worker; it is a timestamped observation,
+  not a fresh health check. Offline analysis is complete. After the diagnostic
+  implementation and evidence packet pass review, the next authorized
+  measurement is the unchanged A/fetch C32 composite in the performance
+  reference. C64 remains forbidden, and these comparison rows establish neither
+  a capacity ceiling nor an SLO result. See the
+  [performance reference](../performance/README.md#ssr-c32-comparison-checkpoint-2026-10-29)
+  for the evidence summary and contract.
 - The installed canonical content sample on e920 exited successfully. This is
   not a new full GitHub content-diagnostics result; details were lost from its
   bounded prefix. Earlier full diagnostic [40113453588](https://github.com/StrayForest/old_sparky/actions/runs/40113453588)

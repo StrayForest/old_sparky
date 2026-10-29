@@ -19,6 +19,7 @@ import signal
 from contextlib import redirect_stderr, redirect_stdout
 from concurrent.futures import Future, ThreadPoolExecutor
 from argparse import Namespace
+from datetime import datetime
 from pathlib import Path
 import time
 from types import SimpleNamespace
@@ -32,6 +33,7 @@ from tools import platform_ssr_capacity_diagnostic as capacity_diagnostic
 from tools import platform_workflow_remote_dispatch as remote_dispatch
 from python_packages.platform_infra.performance_diagnostic import (
     ApiCpuDiagnostic,
+    authorize_html_request_perf_capture,
     parse_plan_payload,
 )
 from tools import platform_cpu_diagnostic_plan as diagnostic_plan_tool
@@ -4293,7 +4295,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                         "cpu_diagnostic_complete service=api "
                         f"run_id={'a' * 32} timer=thread_cpu start_lag_ms=0 elapsed_ms=20000 "
                         "total_self_cpu_us=150 functions="
-                        "orm_result:50:1,repo.get_current_user:100:2"
+                        "orm_result:50:1,repo.get_auth_bootstrap:25:1,"
+                        "repo.build_auth_bootstrap:25:1,repo.get_current_user:50:1"
                     )
                     journal_rows.append({
                         "MESSAGE": json.dumps(
@@ -4398,7 +4401,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(api_profile["total_cpu_us"], 300)
         self.assertEqual(
             [row["category"] for row in api_profile["categories"]],
-            ["orm_result", "repo.get_current_user"],
+            [
+                "orm_result", "repo.build_auth_bootstrap",
+                "repo.get_auth_bootstrap", "repo.get_current_user",
+            ],
         )
         self.assertEqual(web_profile["timer"], "v8_cpu")
         self.assertEqual(web_profile["sample_count"], 5)
@@ -4481,6 +4487,24 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertEqual(capacity_telemetry["node_memory_status"], "complete")
             self.assertEqual(capacity_telemetry["cgroup_memory_status"], "unknown")
             self.assertEqual(capacity_telemetry["node_memory_rows"][1]["gc_count"], 0)
+            profiled_capacity_telemetry = capacity_diagnostic._project_server_telemetry(
+                validated_cleanup, include_cpu_profile=True,
+            )
+            self.assertEqual(profiled_capacity_telemetry["profile_status"], "complete")
+            self.assertEqual(
+                [row["service"] for row in profiled_capacity_telemetry["profile_rows"]],
+                ["api", "web"],
+            )
+            self.assertEqual(
+                profiled_capacity_telemetry["profile_rows"][0]["observed_targets"], 2,
+            )
+            invalid_profile_summary = json.loads(json.dumps(validated_cleanup))
+            invalid_profile_summary["profile_rows"][0]["categories"][0]["category"] = "raw.function.name"
+            invalid_profile_telemetry = capacity_diagnostic._project_server_telemetry(
+                invalid_profile_summary, include_cpu_profile=True,
+            )
+            self.assertEqual(invalid_profile_telemetry["profile_status"], "incomplete")
+            self.assertEqual(invalid_profile_telemetry["profile_reason"], "invalid_profile")
 
             # No parsed Web memory samples must still produce the closed,
             # incomplete row shape accepted by the remote cleanup projection.
@@ -6011,6 +6035,302 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             parse_plan_payload(_canonical_payload(mismatched_expiry), expected_service="api")
 
+    def test_html_request_perf_capture_requires_typed_plan_on_window_and_matching_ids(self) -> None:
+        from python_packages.platform_infra.performance_diagnostic import (
+            WORKLOAD_HTML_SSR_CAPACITY_120S,
+            WORKLOAD_HTML_SSR_CPU_PROFILE_20S,
+        )
+
+        payload = _diagnostic_payload()
+        payload["run_id"] = "0123456789abcdef0123456789abcdef"
+        payload.update({
+            "workload": WORKLOAD_HTML_SSR_CAPACITY_120S,
+            "off_start_ms": 1_000,
+            "off_end_ms": 21_000,
+            "on_start_ms": 26_000,
+            "on_end_ms": 146_000,
+            "expires_at_ms": 161_000,
+        })
+        plan = parse_plan_payload(_canonical_payload(payload), expected_service="api")
+        headers = [
+            (b"x-platform-ssr-trace", b"0123456789abcdef0123456789abcdef"),
+            (b"x-platform-ssr-request-id", b"00000000000000000000000000000002"),
+            (b"x-request-id", b"00000000000000000000000000000002"),
+            (b"x-platform-ssr-request-start-ms", b"26001"),
+        ]
+        for path in (
+            "/api/v1/auth/bootstrap",
+            "/api/v1/tournaments/safe-slug/workspace",
+        ):
+            scope = {"type": "http", "method": "GET", "path": path, "headers": headers}
+            self.assertEqual(
+                authorize_html_request_perf_capture(scope, plan=plan, now_ms=26_001),
+                (plan, "on", True),
+            )
+        for scope in (
+            {"type": "http", "method": "POST", "path": "/api/v1/auth/bootstrap", "headers": headers},
+            {"type": "http", "method": "GET", "path": "/api/v1/users/me", "headers": headers},
+            {"type": "http", "method": "GET", "path": "/api/v1/auth/bootstrap", "headers": headers[:2] + [(b"x-request-id", b"e" * 32)]},
+            {"type": "http", "method": "GET", "path": "/api/v1/auth/bootstrap", "headers": headers[:1] + [(b"x-platform-ssr-trace", b"1")] + headers[1:]},
+        ):
+            self.assertEqual(
+                authorize_html_request_perf_capture(scope, plan=plan, now_ms=26_001),
+                (None, None, False),
+            )
+        self.assertEqual(
+            authorize_html_request_perf_capture(
+                {"type": "http", "method": "GET", "path": "/api/v1/auth/bootstrap", "headers": headers},
+                plan=plan, now_ms=146_000,
+            ),
+            (plan, "on", True),
+        )
+        self.assertEqual(
+            authorize_html_request_perf_capture(
+                {"type": "http", "method": "GET", "path": "/api/v1/auth/bootstrap", "headers": headers},
+                plan=plan, now_ms=161_000,
+            ),
+            (plan, "on", True),
+        )
+        self.assertEqual(
+            authorize_html_request_perf_capture(
+                {"type": "http", "method": "GET", "path": "/api/v1/auth/bootstrap", "headers": headers},
+                plan=plan, now_ms=161_001,
+            ),
+            (None, None, False),
+        )
+        with patch(
+            "python_packages.platform_infra.performance_diagnostic.read_process_plan",
+            return_value=plan,
+        ) as read_plan:
+            self.assertEqual(
+                authorize_html_request_perf_capture(
+                    {"type": "http", "method": "GET", "path": "/api/v1/auth/bootstrap", "headers": headers},
+                    now_ms=146_001,
+                ),
+                (plan, "on", True),
+            )
+            read_plan.assert_called_once_with(
+                "api", now_ms=146_001, allow_html_request_drain=True,
+            )
+        outside_parent = [
+            (name, b"145999" if name == b"x-platform-ssr-request-start-ms" else value)
+            for name, value in headers
+        ]
+        self.assertEqual(
+            authorize_html_request_perf_capture(
+                {"type": "http", "method": "GET", "path": "/api/v1/auth/bootstrap", "headers": outside_parent},
+                plan=plan, now_ms=146_000,
+            ),
+            (None, None, False),
+        )
+        ineligible_headers = [
+            (name, b"11111111111111111111111111111111"
+             if name == b"x-platform-ssr-request-id" or name == b"x-request-id" else value)
+            for name, value in headers
+        ]
+        self.assertEqual(
+            authorize_html_request_perf_capture(
+                {"type": "http", "method": "GET", "path": "/api/v1/auth/bootstrap", "headers": ineligible_headers},
+                plan=plan, now_ms=26_001,
+            ),
+            (None, None, False),
+        )
+        old = {**payload, "workload": "authenticated_workspace_read_pair_v1"}
+        old_plan = parse_plan_payload(_canonical_payload({
+            **old, "on_end_ms": 46_000, "expires_at_ms": 46_000,
+        }), expected_service="api")
+        scope = {"type": "http", "method": "GET", "path": "/api/v1/auth/bootstrap", "headers": headers}
+        self.assertEqual(
+            authorize_html_request_perf_capture(scope, plan=old_plan, now_ms=26_001),
+            (None, None, False),
+        )
+        profile = {
+            **payload,
+            "workload": WORKLOAD_HTML_SSR_CPU_PROFILE_20S,
+            "on_end_ms": 46_000,
+            "expires_at_ms": 61_000,
+        }
+        profile_plan = parse_plan_payload(_canonical_payload(profile), expected_service="api")
+        self.assertEqual(
+            authorize_html_request_perf_capture(scope, plan=profile_plan, now_ms=26_001),
+            (profile_plan, "on", True),
+        )
+
+    def test_ssr_stream_coverage_recognizes_both_caps_and_fails_closed(self) -> None:
+        coverage = {
+            "records": 0, "selector_overflow": 0,
+            "selector_overflow_unattributed": 0, "row_cap_records": 0,
+            "row_cap_rows": 0, "truncated_records": 0, "malformed_records": 0,
+            "capture_marker_records": 0, "capture_eligible_requests": 0,
+            "capture_retained_requests": 0, "capture_lost_requests": 0,
+            "capture_rows": 0, "capture_lost_rows": 0,
+            "capture_truncated_records": 0, "capture_malformed_records": 0,
+        }
+        run_id = "a" * 32
+        record = diagnostic_plan_tool._record_ssr_stream_coverage
+        self.assertTrue(record(
+            f"ssr_stream_coverage run_id={run_id} selector_overflow=2 "
+            "selector_overflow_unattributed=1 status=truncated",
+            run_id=run_id, coverage=coverage,
+        ))
+        self.assertTrue(record(
+            f"ssr_stream_coverage run_id={run_id} rows=3200 status=truncated",
+            run_id=run_id, coverage=coverage,
+        ))
+        self.assertTrue(record(
+            f"ssr_stream_coverage run_id={run_id} rows=unknown status=truncated",
+            run_id=run_id, coverage=coverage,
+        ))
+        self.assertTrue(record(
+            f"ssr_stream_coverage run_id={'b' * 32} unexpected=1 status=truncated",
+            run_id=run_id, coverage=coverage,
+        ))
+        self.assertEqual(coverage, {
+            "records": 2, "selector_overflow": 2,
+            "selector_overflow_unattributed": 1, "row_cap_records": 1,
+            "row_cap_rows": 3200, "truncated_records": 2, "malformed_records": 2,
+            "capture_marker_records": 0, "capture_eligible_requests": 0,
+            "capture_retained_requests": 0, "capture_lost_requests": 0,
+            "capture_rows": 0, "capture_lost_rows": 0,
+            "capture_truncated_records": 0, "capture_malformed_records": 0,
+        })
+        good_capture = (
+            "ssr_stream_capture_coverage scheme=sha256-runid-requestid-1of8-v1 "
+            f"run_id={run_id} eligible=3 retained=3 lost=0 rows=18 lost_rows=0 status=complete"
+        )
+        self.assertTrue(record(good_capture, run_id=run_id, coverage=coverage))
+        self.assertEqual(coverage["capture_marker_records"], 1)
+        self.assertEqual(coverage["capture_rows"], 18)
+        self.assertTrue(record(
+            "ssr_stream_capture_coverage scheme=sha256-runid-requestid-1of8-v1 "
+            f"run_id={run_id} eligible=3 retained=2 lost=1 rows=12 lost_rows=6 status=truncated",
+            run_id=run_id, coverage=coverage,
+        ))
+        self.assertEqual(coverage["capture_truncated_records"], 1)
+        self.assertTrue(record(
+            "ssr_stream_capture_coverage scheme=unknown "
+            f"run_id={run_id} eligible=3 retained=2 lost=1 rows=12 lost_rows=6 status=truncated",
+            run_id=run_id, coverage=coverage,
+        ))
+        self.assertEqual(coverage["capture_malformed_records"], 1)
+        self.assertTrue(record(
+            "ssr_stream_capture_coverage", run_id=run_id, coverage=coverage,
+        ))
+        self.assertEqual(coverage["capture_malformed_records"], 2)
+        self.assertFalse(record("ssr_stream request_id=x", run_id=run_id, coverage=coverage))
+
+    def test_ssr_request_correlation_projection_retains_only_closed_aggregates(self) -> None:
+        from tools import platform_ssr_request_correlation as correlation
+
+        request_id = "00000000000000000000000000000002"
+        event_at = "2026-10-29T12:00:01+00:00"
+        context = {
+            "run_id": "0123456789abcdef0123456789abcdef", "phase": "on",
+            "window_start_utc": "2026-10-29T12:00:00+00:00",
+            "window_end_utc": "2026-10-29T12:00:15+00:00",
+            "event_at_utc": event_at, "request_id": request_id,
+        }
+        summary = correlation.summarize_ssr_request_correlation(
+            selected_request_ids=[request_id],
+            submitted_html_count=1, valid_response_id_count=1,
+            eligible_response_id_count=1,
+            selection_scheme="sha256-runid-requestid-1of8-v1",
+            missing_response_id_count=0, duplicate_response_id_count=0,
+            malformed_response_id_count=0,
+            run_id="0123456789abcdef0123456789abcdef", phase="on",
+            window_start_utc="2026-10-29T12:00:00+00:00",
+            window_end_utc="2026-10-29T12:00:15+00:00",
+            nginx_rows=[{**context, "request_time_ms": 50.0, "cf_ray": None}],
+            ssr_rows=[{**context, "stage": "page_component", "duration_ms": 40.0}],
+            stream_rows=[{**context, "stage": "request_start", "elapsed_ms": 0.5}],
+            api_rows=[{
+                **context, "route_class": "tournament_workspace",
+                "total_ms": 20.0, "sql_ms": 4.0, "max_sql_ms": 2.0,
+                "pool_checkout_wait_ms": 1.0, "pool_connection_hold_ms": 3.0,
+                "compute_ms": 8.0, "sql_count": 2,
+            }],
+        )
+        summary["ssr_stream_coverage"] = {
+            "records": 0, "selector_overflow": 0,
+            "selector_overflow_unattributed": 0, "row_cap_records": 0,
+            "row_cap_rows": 0, "truncated_records": 0,
+            "malformed_records": 0, "capture_marker_records": 1,
+            "capture_eligible_requests": 1, "capture_retained_requests": 1,
+            "capture_lost_requests": 0, "capture_rows": 1,
+            "capture_lost_rows": 0, "capture_truncated_records": 0,
+            "capture_malformed_records": 0, "capture_status": "complete",
+            "status": "none",
+        }
+        projected = capacity_diagnostic._project_request_correlation({
+            "status": "complete", "summary": summary,
+        })
+        self.assertIsNotNone(projected)
+        self.assertEqual(projected["summary"]["join"]["matched_api_rows"], 1)
+        self.assertEqual(
+            projected["summary"]["timing_ms"]["ssr_stage"]["page_component"]["p50_ms"],
+            40.0,
+        )
+        self.assertEqual(
+            projected["summary"]["timing_ms"]["ssr_stream_milestone_elapsed_ms"]["request_start"]["p50_ms"],
+            0.5,
+        )
+        self.assertNotIn(request_id, json.dumps(projected))
+        self.assertEqual(
+            capacity_diagnostic._project_request_correlation({
+                "status": "incomplete", "summary": None,
+            }),
+            {"status": "incomplete", "summary": None},
+        )
+        with_raw_id = json.loads(json.dumps(projected))
+        with_raw_id["summary"]["unexpected_request_id"] = request_id
+        self.assertIsNone(capacity_diagnostic._project_request_correlation(with_raw_id))
+
+    async def test_plan_bound_request_perf_capture_overrides_disabled_sampling_safely(self) -> None:
+        from python_packages.platform_infra.performance import RequestPerformanceMiddleware
+
+        payload = _diagnostic_payload()
+        payload.update({
+            "workload": "authenticated_html_ssr_capacity_120s_v1",
+            "on_end_ms": 146_000,
+            "expires_at_ms": 161_000,
+        })
+        plan = parse_plan_payload(_canonical_payload(payload), expected_service="api")
+        sent: list[dict[str, object]] = []
+
+        class App:
+            async def __call__(self, scope, receive, send):
+                await send({"type": "http.response.start", "status": 200, "headers": []})
+                await send({"type": "http.response.body", "body": b"ok", "more_body": False})
+
+        scope = {
+            "type": "http", "method": "GET",
+            "path": "/api/v1/tournaments/private-fixture-slug/workspace",
+            "headers": [
+                (b"x-platform-ssr-trace", b"a" * 32),
+                (b"x-platform-ssr-request-id", b"d" * 32),
+                (b"x-request-id", b"d" * 32),
+                (b"x-platform-ssr-request-start-ms", b"26001"),
+            ],
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        with (
+            patch("python_packages.platform_infra.performance.ApiCpuDiagnostic.activate_for_scope", return_value=(None, None)),
+            patch("python_packages.platform_infra.performance.authorize_html_request_perf_capture", return_value=(plan, "on", True)),
+            patch("python_packages.platform_infra.performance.get_settings", return_value=SimpleNamespace(platform_perf_log_enabled=False)),
+            patch("python_packages.platform_infra.performance.logger.info") as info,
+        ):
+            await RequestPerformanceMiddleware(App())(scope, receive, sent.append)
+        self.assertEqual(len(sent), 2)
+        info.assert_called_once()
+        self.assertIn("request_perf request_id=%s", info.call_args.args[0])
+        self.assertIn("request_perf_selection=%s", info.call_args.args[0])
+        self.assertIn("diagnostic_plan", info.call_args.args)
+        self.assertIn("/api/v1/tournaments/{slug}/workspace", info.call_args.args)
+        self.assertNotIn("private-fixture-slug", info.call_args.args)
+
     def test_diagnostic_request_selector_is_exact_and_requires_internal_trace(self) -> None:
         scope = {
             "type": "http",
@@ -6147,3 +6467,43 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             await profiler.start()
             await profiler.stop()
             self.assertEqual(list(Path(temporary_dir).iterdir()), [])
+
+    def test_ssr_capacity_request_cohort_keeps_drained_failures_and_marks_bad_edges(self) -> None:
+        results = [
+            SimpleNamespace(
+                started_at_utc="2026-10-29T12:00:00.000+00:00",
+                finished_at_utc="2026-10-29T12:00:01.000+00:00",
+                cf_ray="edge-a", ssr_request_id="a" * 32,
+            ),
+            SimpleNamespace(
+                started_at_utc="2026-10-29T12:00:09.000+00:00",
+                finished_at_utc="2026-10-29T12:00:12.500+00:00",
+                cf_ray="edge-b", ssr_request_id="b" * 32,
+                status=503, ok=False,
+            ),
+            SimpleNamespace(
+                started_at_utc="2026-10-29T12:00:09.500+00:00",
+                finished_at_utc=None, cf_ray=None, ssr_request_id=None,
+                status=0, ok=False,
+            ),
+            SimpleNamespace(
+                started_at_utc="2026-10-29T12:00:10.000+00:00",
+                finished_at_utc="2026-10-29T12:00:10.100+00:00",
+                cf_ray="edge-c", ssr_request_id="c" * 32,
+            ),
+        ]
+        window_start_ms = int(datetime.fromisoformat("2026-10-29T12:00:00+00:00").timestamp() * 1000)
+        selected, evidence = capacity_diagnostic._phase_request_window_evidence(
+            results, start_ms=window_start_ms, end_ms=window_start_ms + 10_000,
+        )
+        self.assertEqual(len(selected), 3)
+        self.assertEqual(evidence["started_in_window_count"], 3)
+        self.assertEqual(evidence["started_outside_window_count"], 1)
+        self.assertEqual(evidence["completed_by_window_end_count"], 1)
+        self.assertEqual(evidence["drain_completed_after_window_count"], 1)
+        self.assertEqual(evidence["missing_finish_timestamp_count"], 1)
+        self.assertEqual(evidence["status"], "incomplete")
+        ids = capacity_diagnostic._selected_ssr_join_request_ids(
+            selected, "d" * 32,
+        )
+        self.assertEqual(ids, ["a" * 32, "b" * 32])

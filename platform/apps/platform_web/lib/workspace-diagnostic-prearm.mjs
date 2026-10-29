@@ -1,6 +1,9 @@
 const SSR_TRACE_HEADER = "x-platform-ssr-trace";
 const RUN_ID_RE = /^[0-9a-f]{32}$/u;
-const HTML_WORKLOAD = "authenticated_html_ssr_capacity_v1";
+const HTML_WORKLOADS = new Set([
+  "authenticated_html_ssr_capacity_v1",
+  "authenticated_html_ssr_capacity_120s_v1",
+]);
 
 export function authorizedWorkspaceDiagnosticPrearmRunId(contextPlan, currentPlan, nowMs) {
   if (contextPlan === null || typeof contextPlan !== "object"
@@ -9,7 +12,7 @@ export function authorizedWorkspaceDiagnosticPrearmRunId(contextPlan, currentPla
       || JSON.stringify(contextPlan) !== JSON.stringify(currentPlan)) return null;
   const plan = contextPlan;
   const leadMs = plan.off_start_ms - nowMs;
-  if (plan.workload !== HTML_WORKLOAD || !RUN_ID_RE.test(plan.run_id)
+  if (!HTML_WORKLOADS.has(plan.workload) || !RUN_ID_RE.test(plan.run_id)
       || !(leadMs > 0 && leadMs <= 52_000)) return null;
   return plan.run_id;
 }

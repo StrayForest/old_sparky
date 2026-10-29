@@ -67,6 +67,7 @@ on:
         options:
           - authenticated_workspace_read_capacity_v1
           - authenticated_html_ssr_capacity_v1
+          - authenticated_html_ssr_capacity_120s_plus_cpu_profile_20s_v1
 
 permissions:
   contents: read
@@ -217,7 +218,7 @@ jobs:
           SSR_CAPACITY_CONCURRENCY='${{ inputs.ssr_capacity_concurrency }}'
           SSR_CAPACITY_WORKLOAD='${{ inputs.ssr_capacity_workload }}'
           case "$SSR_CAPACITY_WORKLOAD:$SSR_CAPACITY_CONCURRENCY" in
-            authenticated_workspace_read_capacity_v1:8|authenticated_workspace_read_capacity_v1:16|authenticated_html_ssr_capacity_v1:8|authenticated_html_ssr_capacity_v1:16|authenticated_html_ssr_capacity_v1:32|authenticated_html_ssr_capacity_v1:64) ;;
+            authenticated_workspace_read_capacity_v1:8|authenticated_workspace_read_capacity_v1:16|authenticated_html_ssr_capacity_v1:8|authenticated_html_ssr_capacity_v1:16|authenticated_html_ssr_capacity_v1:32|authenticated_html_ssr_capacity_v1:64|authenticated_html_ssr_capacity_120s_plus_cpu_profile_20s_v1:32) ;;
             *) echo "SSR capacity workload/concurrency pair is invalid." >&2; exit 1 ;;
           esac
           if [[ "$SSR_CAPACITY_DIAGNOSTIC_ONLY" != true && "$SSR_CAPACITY_CONCURRENCY" != 8 ]]; then
@@ -391,6 +392,7 @@ jobs:
               "tournament_count": "1" if diagnostic_only else tournaments,
               "users_per_tournament": "14" if diagnostic_only else users,
               "fixture_kind": ("cpu_diagnostic_only_v1" if cpu_diagnostic_only == "true" else
+                               "ssr_html_capacity_composite_diagnostic_v1" if ssr_capacity_diagnostic_only == "true" and os.environ["SSR_CAPACITY_WORKLOAD"] == "authenticated_html_ssr_capacity_120s_plus_cpu_profile_20s_v1" else
                                "ssr_html_capacity_diagnostic_v1" if ssr_capacity_diagnostic_only == "true" and os.environ["SSR_CAPACITY_WORKLOAD"] == "authenticated_html_ssr_capacity_v1" else
                                "ssr_capacity_diagnostic_v1" if ssr_capacity_diagnostic_only == "true" else
                                "external_load"),
@@ -398,7 +400,7 @@ jobs:
           }
           if ssr_capacity_diagnostic_only == "true":
               payload["ssr_capacity_concurrency"] = os.environ["SSR_CAPACITY_CONCURRENCY"]
-              if os.environ["SSR_CAPACITY_WORKLOAD"] == "authenticated_html_ssr_capacity_v1":
+              if os.environ["SSR_CAPACITY_WORKLOAD"] in {"authenticated_html_ssr_capacity_v1", "authenticated_html_ssr_capacity_120s_plus_cpu_profile_20s_v1"}:
                   payload["ssr_capacity_workload"] = os.environ["SSR_CAPACITY_WORKLOAD"]
           if binding is not None:
               payload["source_binding"] = binding
@@ -655,8 +657,8 @@ jobs:
           binding_keys = {"schema", "binding_mode", "runner_sha", "app_target_sha", "baseline_identity", "receipt_document_sha256", "receipt_artifact_id", "receipt_artifact_name", "receipt_artifact_digest", "receipt_archive_sha256", "cumulative_manifest_sha256", "source_security_run_id", "source_security_run_attempt", "autodeploy_run_id", "autodeploy_run_attempt", "production_deploy_run_id", "production_deploy_run_attempt"}
           schema = payload.get("schema")
           binding = payload.get("source_binding")
-          capacity_kinds = {"ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1"}
-          html_capacity = payload.get("fixture_kind") == "ssr_html_capacity_diagnostic_v1"
+          capacity_kinds = {"ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1", "ssr_html_capacity_composite_diagnostic_v1"}
+          html_capacity = payload.get("fixture_kind") in {"ssr_html_capacity_diagnostic_v1", "ssr_html_capacity_composite_diagnostic_v1"}
           expected = base_keys | ({"fixture_kind"} if "fixture_kind" in payload else set()) | ({"ssr_capacity_concurrency"} if payload.get("fixture_kind") in capacity_kinds else set()) | ({"ssr_capacity_workload"} if html_capacity else set()) | ({"source_binding"} if schema in (2, "2") else set())
           if set(payload) != expected:
               raise SystemExit("external handoff schema is not closed")
@@ -676,7 +678,7 @@ jobs:
           if payload.get("profile") != "external-vote" or payload.get("timeout_diagnostics") not in {"true", "false"}:
               raise SystemExit("external handoff profile is invalid")
           fixture_kind = payload.get("fixture_kind", "external_load")
-          if fixture_kind not in {"external_load", "cpu_diagnostic_only_v1", "ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1"}:
+          if fixture_kind not in {"external_load", "cpu_diagnostic_only_v1", "ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1", "ssr_html_capacity_composite_diagnostic_v1"}:
               raise SystemExit("external handoff fixture mode is invalid")
           cpu_selected = os.environ.get("EXPECTED_CPU_DIAGNOSTIC_ONLY") == "true"
           ssr_selected = os.environ.get("EXPECTED_SSR_CAPACITY_DIAGNOSTIC_ONLY") == "true"
@@ -687,6 +689,7 @@ jobs:
           expected_fixture_kind = {
               "authenticated_workspace_read_capacity_v1": "ssr_capacity_diagnostic_v1",
               "authenticated_html_ssr_capacity_v1": "ssr_html_capacity_diagnostic_v1",
+              "authenticated_html_ssr_capacity_120s_plus_cpu_profile_20s_v1": "ssr_html_capacity_composite_diagnostic_v1",
           }.get(os.environ.get("EXPECTED_SSR_WORKLOAD", ""))
           if (
               ssr_selected
@@ -695,7 +698,7 @@ jobs:
               raise SystemExit("SSR capacity handoff does not match the requested mode")
           if not ssr_selected and fixture_kind in capacity_kinds:
               raise SystemExit("unexpected SSR capacity handoff fixture")
-          if fixture_kind in {"cpu_diagnostic_only_v1", "ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1"} and (
+          if fixture_kind in {"cpu_diagnostic_only_v1", "ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1", "ssr_html_capacity_composite_diagnostic_v1"} and (
               payload.get("confirmation") != (
                   "RUN-PRODUCTION-CPU-DIAGNOSTIC" if fixture_kind == "cpu_diagnostic_only_v1"
                   else "RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC"
@@ -710,6 +713,8 @@ jobs:
           if (fixture_kind == "ssr_capacity_diagnostic_v1" and (ssr_concurrency not in {"8", "16"} or ssr_workload is not None)) or (
               fixture_kind == "ssr_html_capacity_diagnostic_v1" and (ssr_concurrency not in {"8", "16", "32", "64"} or ssr_workload != "authenticated_html_ssr_capacity_v1")
           ) or (
+              fixture_kind == "ssr_html_capacity_composite_diagnostic_v1" and (ssr_concurrency != "32" or ssr_workload != "authenticated_html_ssr_capacity_120s_plus_cpu_profile_20s_v1")
+          ) or (
               fixture_kind not in capacity_kinds and (ssr_concurrency is not None or ssr_workload is not None)
           ):
               raise SystemExit("SSR capacity concurrency is invalid")
@@ -717,9 +722,9 @@ jobs:
               expected_workload = os.environ.get("EXPECTED_SSR_WORKLOAD", "")
               expected_concurrency = os.environ.get("EXPECTED_SSR_CONCURRENCY", "")
               if (
-                  expected_concurrency not in ({"8", "16"} if fixture_kind == "ssr_capacity_diagnostic_v1" else {"8", "16", "32", "64"})
+                  expected_concurrency not in ({"8", "16"} if fixture_kind == "ssr_capacity_diagnostic_v1" else {"32"} if fixture_kind == "ssr_html_capacity_composite_diagnostic_v1" else {"8", "16", "32", "64"})
                   or ssr_concurrency != expected_concurrency
-                  or (fixture_kind == "ssr_html_capacity_diagnostic_v1" and ssr_workload != expected_workload)
+              or (fixture_kind in {"ssr_html_capacity_diagnostic_v1", "ssr_html_capacity_composite_diagnostic_v1"} and ssr_workload != expected_workload)
               ):
                   raise SystemExit("SSR capacity handoff does not match the requested diagnostic")
           if re.fullmatch(r"[0-9a-f]{40}", target_sha) is None or re.fullmatch(r"[1-9][0-9]{0,31}", run_id) is None:
@@ -1614,11 +1619,12 @@ jobs:
           if payload.get("fixture_kind") == "cpu_diagnostic_only_v1":
               if payload.get("capacity_slo_credit") is not False or payload.get("diagnostic_credit") is not False:
                   raise SystemExit("CPU-only report is not zero-credit")
-          elif payload.get("fixture_kind") in {"ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1"}:
+          elif payload.get("fixture_kind") in {"ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1", "ssr_html_capacity_composite_diagnostic_v1"}:
               expected_workload = os.environ.get("EXPECTED_SSR_WORKLOAD", "")
               expected_fixture = {
                   "authenticated_workspace_read_capacity_v1": "ssr_capacity_diagnostic_v1",
                   "authenticated_html_ssr_capacity_v1": "ssr_html_capacity_diagnostic_v1",
+                  "authenticated_html_ssr_capacity_120s_plus_cpu_profile_20s_v1": "ssr_html_capacity_composite_diagnostic_v1",
               }.get(expected_workload)
               if (
                   type(payload.get("schema")) is not int
@@ -2490,9 +2496,9 @@ jobs:
           handoff = json.loads(Path(handoff_path).read_text(encoding="ascii"))
           source_binding = handoff.get("source_binding")
           base_handoff_keys = {"schema", "confirmation", "target_sha", "control_email", "setup_concurrency", "run_id", "profile", "tournament_count", "users_per_tournament", "timeout_diagnostics"}
-          if handoff.get("fixture_kind") in {"ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1"}:
+          if handoff.get("fixture_kind") in {"ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1", "ssr_html_capacity_composite_diagnostic_v1"}:
               base_handoff_keys.add("ssr_capacity_concurrency")
-          if handoff.get("fixture_kind") == "ssr_html_capacity_diagnostic_v1":
+          if handoff.get("fixture_kind") in {"ssr_html_capacity_diagnostic_v1", "ssr_html_capacity_composite_diagnostic_v1"}:
               base_handoff_keys.add("ssr_capacity_workload")
           if (
               not isinstance(handoff, dict)
@@ -2672,9 +2678,9 @@ jobs:
           payload = json.loads(Path(path).read_text(encoding="utf-8"))
           base_keys = {"schema", "confirmation", "target_sha", "control_email", "setup_concurrency", "run_id", "profile", "tournament_count", "users_per_tournament", "timeout_diagnostics"}
           fixture_kind = payload.get("fixture_kind")
-          if fixture_kind in {"ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1"}:
+          if fixture_kind in {"ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1", "ssr_html_capacity_composite_diagnostic_v1"}:
               base_keys.add("ssr_capacity_concurrency")
-          if fixture_kind == "ssr_html_capacity_diagnostic_v1":
+          if fixture_kind in {"ssr_html_capacity_diagnostic_v1", "ssr_html_capacity_composite_diagnostic_v1"}:
               base_keys.add("ssr_capacity_workload")
           binding = payload.get("source_binding")
           expected = base_keys | ({"fixture_kind"} if "fixture_kind" in payload else set()) | ({"source_binding"} if binding is not None else set())
@@ -2687,9 +2693,12 @@ jobs:
               expected_fixture_kind = {
                   "authenticated_workspace_read_capacity_v1": "ssr_capacity_diagnostic_v1",
                   "authenticated_html_ssr_capacity_v1": "ssr_html_capacity_diagnostic_v1",
+                  "authenticated_html_ssr_capacity_120s_plus_cpu_profile_20s_v1": "ssr_html_capacity_composite_diagnostic_v1",
               }.get(expected_workload)
               allowed_concurrency = (
-                  {"8", "16", "32", "64"}
+                  {"32"}
+                  if expected_fixture_kind == "ssr_html_capacity_composite_diagnostic_v1"
+                  else {"8", "16", "32", "64"}
                   if expected_fixture_kind == "ssr_html_capacity_diagnostic_v1"
                   else {"8", "16"}
               )
@@ -2698,7 +2707,7 @@ jobs:
                   or expected_concurrency not in allowed_concurrency
                   or payload.get("ssr_capacity_concurrency") != expected_concurrency
                   or (
-                      fixture_kind == "ssr_html_capacity_diagnostic_v1"
+                      fixture_kind in {"ssr_html_capacity_diagnostic_v1", "ssr_html_capacity_composite_diagnostic_v1"}
                       and payload.get("ssr_capacity_workload") != expected_workload
                   )
                   or (
@@ -2707,7 +2716,7 @@ jobs:
                   )
               ):
                   raise SystemExit("SSR capacity finalizer binding is invalid")
-          elif fixture_kind in {"ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1"}:
+          elif fixture_kind in {"ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1", "ssr_html_capacity_composite_diagnostic_v1"}:
               raise SystemExit("unexpected SSR capacity finalizer fixture")
           if binding is None:
               if payload.get("schema") not in (1, "1") or app_target_sha != target_sha:
@@ -3793,7 +3802,7 @@ jobs:
                   or len(manifest.get("users", [])) != 14
                   or handoff.get("target_sha") != source_sha
                   or handoff.get("run_id") != run_id
-                  or handoff.get("fixture_kind") not in {"ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1"}
+                  or handoff.get("fixture_kind") not in {"ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1", "ssr_html_capacity_composite_diagnostic_v1"}
                   or handoff.get("tournament_count") != "1"
                   or handoff.get("users_per_tournament") != "14"
                   or manifest.get("runner_sha") != source_sha

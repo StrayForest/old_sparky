@@ -10,6 +10,7 @@ from __future__ import annotations
 import cProfile
 from dataclasses import dataclass
 import grp
+import hashlib
 import json
 import logging
 import os
@@ -29,14 +30,39 @@ PLAN_PATHS = {
 }
 MAX_PLAN_BYTES = 4096
 MAX_CAPTURE_MS = 60_000
+MAX_PLAN_WINDOW_MS = 160_000
 JOURNAL_SOCKET_PATH = "/run/systemd/journal/socket"
 MAX_CPU_DIAGNOSTIC_DATAGRAM_BYTES = 8192
 WORKLOAD = "authenticated_workspace_read_pair_v1"
 WORKLOAD_SSR_CAPACITY = "authenticated_workspace_read_capacity_v1"
 WORKLOAD_HTML_SSR_CAPACITY = "authenticated_html_ssr_capacity_v1"
+WORKLOAD_HTML_SSR_CAPACITY_120S = "authenticated_html_ssr_capacity_120s_v1"
+WORKLOAD_HTML_SSR_CPU_PROFILE_20S = "authenticated_html_ssr_cpu_profile_20s_v1"
+SUPPORTED_WORKLOADS = frozenset({
+    WORKLOAD,
+    WORKLOAD_SSR_CAPACITY,
+    WORKLOAD_HTML_SSR_CAPACITY,
+    WORKLOAD_HTML_SSR_CAPACITY_120S,
+    WORKLOAD_HTML_SSR_CPU_PROFILE_20S,
+})
+PROFILE_WORKLOADS = frozenset({WORKLOAD, WORKLOAD_HTML_SSR_CPU_PROFILE_20S})
+CPU_USAGE_PREARM_WORKLOADS = frozenset({
+    WORKLOAD_HTML_SSR_CAPACITY,
+    WORKLOAD_HTML_SSR_CAPACITY_120S,
+})
+HTML_REQUEST_PERF_WORKLOADS = frozenset({
+    WORKLOAD_HTML_SSR_CAPACITY_120S,
+    WORKLOAD_HTML_SSR_CPU_PROFILE_20S,
+})
+HTML_REQUEST_PERF_SAMPLE_SCHEME = "sha256-runid-requestid-1of8-v1"
 OFF_WINDOW_MS = 20_000
 IDLE_WINDOW_MS = 5_000
 ON_WINDOW_MS = 20_000
+ON_WINDOW_MS_BY_WORKLOAD = {workload: ON_WINDOW_MS for workload in SUPPORTED_WORKLOADS}
+ON_WINDOW_MS_BY_WORKLOAD[WORKLOAD_HTML_SSR_CAPACITY_120S] = 120_000
+PLAN_EXPIRY_GRACE_MS = {workload: 0 for workload in SUPPORTED_WORKLOADS}
+PLAN_EXPIRY_GRACE_MS[WORKLOAD_HTML_SSR_CAPACITY_120S] = 15_000
+PLAN_EXPIRY_GRACE_MS[WORKLOAD_HTML_SSR_CPU_PROFILE_20S] = 15_000
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RUN_RE = re.compile(r"^[0-9a-f]{32}$")
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,79}$")
@@ -149,6 +175,10 @@ class DiagnosticPlan:
         return None
 
 
+def _plan_expiry_ms(workload: str, on_end_ms: int) -> int:
+    return on_end_ms + PLAN_EXPIRY_GRACE_MS[workload]
+
+
 def parse_plan_payload(raw: bytes, *, expected_service: str) -> DiagnosticPlan:
     """Validate the exact closed plan schema and canonical JSON encoding."""
 
@@ -187,9 +217,7 @@ def parse_plan_payload(raw: bytes, *, expected_service: str) -> DiagnosticPlan:
     if not isinstance(release_slug, str) or SLUG_RE.fullmatch(release_slug) is None:
         raise ValueError("invalid release identity")
     if (not isinstance(payload["workload"], str)
-            or payload["workload"] not in {
-                WORKLOAD, WORKLOAD_SSR_CAPACITY, WORKLOAD_HTML_SSR_CAPACITY,
-            }):
+            or payload["workload"] not in SUPPORTED_WORKLOADS):
         raise ValueError("invalid workload")
 
     times: list[int] = []
@@ -201,13 +229,14 @@ def parse_plan_payload(raw: bytes, *, expected_service: str) -> DiagnosticPlan:
             raise ValueError("invalid window")
         times.append(value)
     off_start_ms, off_end_ms, on_start_ms, on_end_ms, expires_ms = times
+    workload = payload["workload"]
     if (not off_start_ms < off_end_ms <= on_start_ms < on_end_ms
             or off_end_ms - off_start_ms != OFF_WINDOW_MS
             or on_start_ms - off_end_ms != IDLE_WINDOW_MS
-            or on_end_ms - on_start_ms != ON_WINDOW_MS
-            or expires_ms != on_end_ms
-            or expires_ms - off_start_ms > MAX_CAPTURE_MS
-            or on_end_ms - on_start_ms > MAX_CAPTURE_MS):
+            or on_end_ms - on_start_ms != ON_WINDOW_MS_BY_WORKLOAD[workload]
+            or expires_ms != _plan_expiry_ms(workload, on_end_ms)
+            or expires_ms - off_start_ms > MAX_PLAN_WINDOW_MS
+            or (workload in PROFILE_WORKLOADS and on_end_ms - on_start_ms > MAX_CAPTURE_MS)):
         raise ValueError("window exceeds capture bound")
 
     raw_targets = payload["targets"]
@@ -337,6 +366,7 @@ def _start_cpu_usage_window(plan: DiagnosticPlan, phase: str, loop: Any) -> None
     _usage_windows_started.add(key)
     start_ms_target = plan.off_start_ms if phase == "off" else plan.on_start_ms
     end_ms_target = plan.off_end_ms if phase == "off" else plan.on_end_ms
+    expected_window_ms = end_ms_target - start_ms_target
     start_ms = time.time_ns() // 1_000_000
     start_lag_ms = start_ms - start_ms_target
     start_cpu_ns = time.process_time_ns()
@@ -365,9 +395,9 @@ def _start_cpu_usage_window(plan: DiagnosticPlan, phase: str, loop: Any) -> None
         timing_complete = bool(
             0 <= start_lag_ms <= CPU_WINDOW_TOLERANCE_MS
             and abs(end_lag_ms) <= CPU_WINDOW_TOLERANCE_MS
-            and 20_000 - CPU_WINDOW_TOLERANCE_MS
+            and expected_window_ms - CPU_WINDOW_TOLERANCE_MS
             <= window_ms
-            <= 20_000 + 2 * CPU_WINDOW_TOLERANCE_MS
+            <= expected_window_ms + 2 * CPU_WINDOW_TOLERANCE_MS
         )
         _emit_cpu_diagnostic_message(
             "cpu_diagnostic_usage service=api run_id=%s phase=%s window_ms=%s "
@@ -442,6 +472,7 @@ def read_process_plan(
     service: str,
     *,
     now_ms: int | None = None,
+    allow_html_request_drain: bool = False,
     pid: int | None = None,
     start_ticks: int | None = None,
     invocation_id: str | None = None,
@@ -470,9 +501,91 @@ def read_process_plan(
         )
         _plan_cache[service] = (cache_now, plan)
     current_ms = int(time.time_ns() // 1_000_000) if now_ms is None else now_ms
-    if plan is None or plan.phase_at(current_ms) is None:
+    if plan is None:
         return None
+    if plan.phase_at(current_ms) is None:
+        if (not allow_html_request_drain
+                or plan.workload not in HTML_REQUEST_PERF_WORKLOADS
+                or current_ms > plan.expires_at_ms):
+            return None
+        # Revalidate the same root-owned process-bound plan while evaluating
+        # its fixed ON phase. The request's trusted parent-start timestamp is
+        # checked by the caller; this only permits bounded plan lookup during
+        # the typed plan's post-ON logging grace.
+        drained_plan = _read_process_plan_uncached(
+            service, now_ms=current_ms, pid=pid, start_ticks=start_ticks,
+            invocation_id=invocation_id, release_identity=release_identity,
+            phase_at_ms=plan.on_start_ms,
+        )
+        if drained_plan != plan:
+            return None
     return plan
+
+
+def authorize_html_request_perf_capture(
+    scope: dict[str, Any],
+    *,
+    plan: DiagnosticPlan | None = None,
+    now_ms: int | None = None,
+) -> tuple[DiagnosticPlan | None, str | None, bool]:
+    """Authorize bounded request_perf capture for one validated HTML call.
+
+    The request headers only select a correlation candidate. Capture is enabled
+    only when the root-owned, service-bound plan independently authorizes the
+    matching run and exact ON phase.
+    """
+
+    if scope.get("type") != "http" or scope.get("method") != "GET":
+        return None, None, False
+    path = scope.get("path")
+    if not isinstance(path, str):
+        return None, None, False
+    is_auth_bootstrap = path == "/api/v1/auth/bootstrap"
+    pieces = path.strip("/").split("/")
+    is_workspace = (
+        len(pieces) == 5
+        and pieces[0] == "api"
+        and pieces[1] == "v1"
+        and pieces[2] == "tournaments"
+        and bool(SLUG_RE.fullmatch(pieces[3]))
+        and pieces[4] == "workspace"
+    )
+    if not (is_auth_bootstrap or is_workspace):
+        return None, None, False
+
+    trace_run_id = _header_from_scope(scope, b"x-platform-ssr-trace")
+    ssr_request_id = _header_from_scope(scope, b"x-platform-ssr-request-id")
+    request_id = _header_from_scope(scope, b"x-request-id")
+    if (trace_run_id is None or RUN_RE.fullmatch(trace_run_id) is None
+            or ssr_request_id is None or RUN_RE.fullmatch(ssr_request_id) is None
+            or request_id != ssr_request_id):
+        return None, None, False
+
+    if hashlib.sha256(f"{trace_run_id}:{ssr_request_id}".encode("ascii")).digest()[0] & 7:
+        return None, None, False
+
+    current_ms = int(time.time_ns() // 1_000_000) if now_ms is None else now_ms
+    parent_start_raw = _header_from_scope(scope, b"x-platform-ssr-request-start-ms")
+    if (parent_start_raw is None
+            or re.fullmatch(r"(?:0|[1-9][0-9]{0,12})", parent_start_raw) is None):
+        return None, None, False
+    parent_start_ms = int(parent_start_raw)
+    authorized_plan = plan
+    if authorized_plan is None or authorized_plan.run_id != trace_run_id:
+        authorized_plan = read_process_plan(
+            "api", now_ms=current_ms, allow_html_request_drain=True,
+        )
+    if (authorized_plan is None
+            or authorized_plan.run_id != trace_run_id
+            or authorized_plan.workload not in HTML_REQUEST_PERF_WORKLOADS
+            or not authorized_plan.on_start_ms <= parent_start_ms < authorized_plan.on_end_ms
+            or not (
+                authorized_plan.phase_at(current_ms) == "on"
+                or authorized_plan.on_end_ms <= current_ms <= authorized_plan.expires_at_ms
+            )
+            or current_ms > authorized_plan.expires_at_ms):
+        return None, None, False
+    return authorized_plan, "on", True
 
 
 def _read_process_plan_uncached(
@@ -543,7 +656,7 @@ def _read_process_plan_uncached(
     phase = plan.phase_at(phase_ms)
     if allow_prearm:
         lead_ms = plan.off_start_ms - current_ms
-        if (plan.workload != WORKLOAD_HTML_SSR_CAPACITY or phase is not None
+        if (plan.workload not in CPU_USAGE_PREARM_WORKLOADS or phase is not None
                 or not 0 < lead_ms <= API_CPU_PREARM_LEAD_MS):
             return None
     elif phase is None:
@@ -553,7 +666,7 @@ def _read_process_plan_uncached(
     if (type(expiry_tolerance_ms) is not int or expiry_tolerance_ms < 0
             or (expiry_tolerance_ms and phase_at_ms is None)
             or current_ms > plan.expires_at_ms + expiry_tolerance_ms
-            or plan.expires_at_ms - plan.off_start_ms > MAX_CAPTURE_MS):
+            or plan.expires_at_ms - plan.off_start_ms > MAX_PLAN_WINDOW_MS):
         return None
     expected_pid = os.getpid() if pid is None else pid
     expected_ticks = _read_current_start_ticks() if start_ticks is None else start_ticks
@@ -633,7 +746,7 @@ def _prearm_cpu_usage_windows(plan: DiagnosticPlan, loop: Any, *, now_ms: int | 
 
     current_ms = int(time.time_ns() // 1_000_000) if now_ms is None else now_ms
     lead_ms = plan.off_start_ms - current_ms
-    if (plan.workload != WORKLOAD_HTML_SSR_CAPACITY
+    if (plan.workload not in CPU_USAGE_PREARM_WORKLOADS
             or not 0 < lead_ms <= API_CPU_PREARM_LEAD_MS):
         return
     _schedule_cpu_usage_window(plan, "off", loop, now_ms=current_ms)
@@ -649,9 +762,17 @@ _usage_windows_scheduled: set[tuple[str, str]] = set()
 # Only these repository call labels may leave the process. Everything else is
 # reduced to one of the fixed runtime categories or `other`.
 API_FUNCTION_ALLOWLIST = frozenset({
+    "get_auth_bootstrap",
+    "build_auth_bootstrap",
     "get_tournament_workspace",
     "get_tournament_workspace_by_slug",
     "workspace_conditional_preflight",
+    "ensure_workspace_private_membership",
+    "ensure_tournament_workspace_visible",
+    "build_tournament_workspace_detail_bracket_response",
+    "build_tournament_workspace_bracket_summary_response",
+    "_workspace_response_etag",
+    "_serialized_model_response",
     "get_current_user",
     "get_current_user_optional",
     "get_server_request_correlation_headers",
@@ -757,13 +878,13 @@ class ApiCpuDiagnostic:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return plan, phase
-        if phase == "off" and plan.workload == WORKLOAD_HTML_SSR_CAPACITY:
+        if phase == "off" and plan.workload in CPU_USAGE_PREARM_WORKLOADS:
             _schedule_cpu_usage_window(plan, "on", loop, now_ms=now_ms)
         _start_cpu_usage_window(plan, phase, loop)
         # HTML capacity diagnostics need the same run/phase correlation and
         # low-cost CPU usage window, but never enable the expensive cProfile
         # capture reserved for the dedicated CPU-pair workload.
-        if plan.workload != WORKLOAD:
+        if plan.workload not in PROFILE_WORKLOADS:
             return plan, phase
         if phase == "off" or plan.run_id in _consumed_run_ids or _active_profile is not None:
             return plan, phase

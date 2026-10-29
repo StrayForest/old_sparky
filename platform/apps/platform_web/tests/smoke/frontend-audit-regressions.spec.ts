@@ -4,6 +4,12 @@ import { resolve } from "node:path";
 import { expect, test } from "@playwright/test";
 import { NextRequest } from "next/server";
 import { getTournamentWorkspace, PlatformApiError } from "../../lib/platform-api";
+import { categoryForFrame } from "../../lib/cpu-profile-categories.mjs";
+import {
+  htmlSsrCaptureDigest,
+  isHtmlSsrCaptureEligible,
+  SSR_CAPTURE_SAMPLE_SCHEME,
+} from "../../lib/ssr-capture-sampling.mjs";
 import { cancelServerAuthFetchTerminalResponse } from "../../lib/server-fetch-response";
 import { formatWorkspaceApiErrorDiagnostic } from "../../lib/ssr-error-diagnostic";
 import { hasAuthorizedDiagnosticRunMarker } from "../../lib/performance-diagnostic-marker";
@@ -464,6 +470,7 @@ test("public timeout metadata cannot promote SSR trace sampling", () => {
       "x-platform-ssr-trace": "1",
       "x-platform-ssr-request-id": "forged-request-id",
       "x-platform-ssr-cf-ray": "forged-cf-ray",
+      "x-platform-ssr-request-start-ms": "1700000000000",
       "x-platform-timeout-diagnostic-id": "tdiag-123-00001",
     };
     const response = proxy(new NextRequest("https://old-sparky.com/tournaments/fixture", {
@@ -473,6 +480,11 @@ test("public timeout metadata cannot promote SSR trace sampling", () => {
     expect(response.headers.get("x-middleware-request-x-request-id")).toBe("nginx-request-id");
     expect(response.headers.get("x-middleware-request-x-platform-ssr-request-id")).toBeNull();
     expect(response.headers.get("x-middleware-request-x-platform-ssr-cf-ray")).toBeNull();
+    const untrustedRequestStart = Number(
+      response.headers.get("x-middleware-request-x-platform-ssr-request-start-ms"),
+    );
+    expect(Number.isSafeInteger(untrustedRequestStart)).toBe(true);
+    expect(untrustedRequestStart).toBeGreaterThan(1_700_000_000_000);
     expect(response.headers.get("x-middleware-request-x-platform-timeout-diagnostic-id"))
       .toBeNull();
 
@@ -502,10 +514,18 @@ test("only a plan-shaped internal trace marker reaches server rendering", () => 
   try {
     const runId = "0123456789abcdef0123456789abcdef";
     const accepted = proxy(new NextRequest("https://old-sparky.com/tournaments/fixture", {
-      headers: { "x-platform-ssr-trace": runId },
+      headers: {
+        "x-platform-ssr-trace": runId,
+        "x-platform-ssr-request-start-ms": "1",
+      },
     }));
     expect(accepted.headers.get("x-middleware-request-x-platform-ssr-trace")).toBe(runId);
     expect(accepted.headers.get("x-platform-ssr-trace")).toBeNull();
+    const trustedRequestStart = Number(
+      accepted.headers.get("x-middleware-request-x-platform-ssr-request-start-ms"),
+    );
+    expect(Number.isSafeInteger(trustedRequestStart)).toBe(true);
+    expect(trustedRequestStart).toBeGreaterThan(1);
 
     const malformed = proxy(new NextRequest("https://old-sparky.com/tournaments/fixture", {
       headers: { "x-platform-ssr-trace": `${runId}extra` },
@@ -531,13 +551,77 @@ test("workspace CPU diagnostics require an exact private run marker", () => {
   expect(planModule).toContain('const WORKLOAD_HTML_SSR_CAPACITY = "authenticated_html_ssr_capacity_v1";');
   expect(planModule).toContain("plan.workload !== WORKLOAD_HTML_SSR_CAPACITY");
   expect(planModule).toContain("&& plan.workload !== WORKLOAD_HTML_SSR_CAPACITY");
-  expect(planModule).toContain("plan.workload === WORKLOAD_CPU_PAIR && phase === \"on\"");
+  expect(planModule).toContain('const WORKLOAD_HTML_SSR_CAPACITY_120S = "authenticated_html_ssr_capacity_120s_v1";');
+  expect(planModule).toContain('const WORKLOAD_HTML_SSR_CPU_PROFILE_20S = "authenticated_html_ssr_cpu_profile_20s_v1";');
+  expect(planModule).toContain("const expectedOnWindow = plan.workload === WORKLOAD_HTML_SSR_CAPACITY_120S");
+  expect(planModule).toContain("const expectedExpiry = onEnd + (typedHtmlWorkload ? 15_000 : 0)");
+  expect(planModule).toContain("|| expires !== expectedExpiry");
+  expect(planModule).toContain("HTML_CAPACITY_ON_WINDOW_MS = 120_000");
+  expect(planModule).toContain("plan.workload === WORKLOAD_CPU_PAIR || plan.workload === WORKLOAD_HTML_SSR_CPU_PROFILE_20S");
   expect(planModule).toContain("hasAuthorizedDiagnosticRunMarker(incomingTrace, plan.run_id)");
   expect(planModule.indexOf("if (!hasAuthorizedDiagnosticRunMarker(incomingTrace, plan.run_id))"))
     .toBeLessThan(planModule.indexOf("diagnosticStorage.run({ plan, phase }, operation)"));
   expect(planModule).toContain("scheduleAuthorizedWorkspaceCpuWindowEdges(");
   expect(planModule.indexOf("scheduleAuthorizedWorkspaceCpuWindowEdges("))
     .toBeLessThan(planModule.indexOf("diagnosticPrearmStorage.run(freshPlan, operation)"));
+  const rootLayout = source("app/layout.tsx");
+  const observability = source("lib/server-ssr-observability.ts");
+  const streamGuard = source("server-shutdown-guard.cjs");
+  expect(rootLayout).toContain("return runWithSsrTrace(requestHeaders, async () => {");
+  expect(rootLayout.indexOf("await connection()")).toBeLessThan(rootLayout.indexOf("performance.now()"));
+  expect(rootLayout.indexOf("const [requestHeaders, requestCookies]")).toBeLessThan(rootLayout.indexOf("return runWithSsrTrace("));
+  expect(rootLayout).toContain('measureSsrStage("auth_bootstrap"');
+  expect(rootLayout).not.toContain("isSsrDiagnosticsEnabled");
+  expect(observability).toContain("runWithSsrDiagnosticPlan(requestHeaders, async () => {");
+  expect(observability).toContain("if (!enabled && !hasDiagnosticCandidate) {");
+  expect(observability.indexOf("if (!enabled && !hasDiagnosticCandidate)")).toBeLessThan(
+    observability.indexOf("return runWithSsrDiagnosticPlan(requestHeaders, async () => {")
+  );
+  expect(observability).toContain('requestHeaders.get("x-platform-ssr-trace")');
+  expect(observability).toContain("isCurrentTypedHtmlSsrDiagnosticPlan()");
+  expect(observability).toContain("trace.typedDiagnosticPlan\n      && trace.diagnosticRunId !== null\n      && trace.requestStartedAtMs !== null");
+  expect(observability).toContain("correlationHeaders.set(SSR_REQUEST_START_HEADER, String(trace.requestStartedAtMs))");
+  expect(planModule).toContain("export function isCurrentTypedHtmlSsrDiagnosticPlan(): boolean");
+  expect(streamGuard).toContain('const captureSampleScheme = "sha256-runid-requestid-1of8-v1";');
+  expect(streamGuard).toContain("const maxRowsPerPlan = 6_000;");
+  expect(streamGuard).toContain("if (planSelection && !planSelection.captureEligible) return false;");
+  expect(streamGuard).toContain('setHeader("x-platform-ssr-request-id", entry.requestId)');
+  expect(streamGuard).toContain("ssr_stream_capture_coverage scheme=${captureSampleScheme}");
+  expect(observability).toContain("current_diagnostic_run_id() === null");
+  expect(planModule).toContain("plan.workload !== WORKLOAD_HTML_SSR_CAPACITY_120S");
+  expect(planModule).toContain("plan.workload !== WORKLOAD_HTML_SSR_CPU_PROFILE_20S");
+});
+
+test("web CPU profile categories classify route, React render, chunks, and JSON by path", () => {
+  const routeModule = "/srv/release/apps/platform_web/.next/server/app/(site)/tournaments/[slug]/page.js";
+  expect(categoryForFrame(routeModule, "")).toBe("repo.ssr_route_module");
+  expect(categoryForFrame(routeModule, "e")).toBe("repo.ssr_route_module");
+  expect(categoryForFrame(routeModule, "getTournamentWorkspace")).toBe("repo.workspace_api_fetch");
+  expect(categoryForFrame(
+    "/srv/release/apps/platform_web/node_modules/next/dist/compiled/react-server-dom-webpack/cjs/server.node.js",
+    "",
+  )).toBe("react_server_render");
+  expect(categoryForFrame(
+    "/srv/release/apps/platform_web/node_modules/react-dom/cjs/react-dom-server.node.production.js",
+    "",
+  )).toBe("react_server_render");
+  expect(categoryForFrame("/srv/release/apps/platform_web/.next/server/chunks/143.js", "")).toBe("compiled_server_chunk");
+  expect(categoryForFrame("node:internal/json_parse", "")).toBe("serialization_validation");
+  expect(categoryForFrame("/srv/release/apps/platform_web/.next/server/app/layout.js", "")).toBe("compiled_server_chunk");
+});
+
+test("typed HTML capture sampling matches the fixed cross-service SHA-256 vectors", () => {
+  const runId = "0123456789abcdef0123456789abcdef";
+  const eligibleRequestId = "00000000000000000000000000000002";
+  const ineligibleRequestId = "11111111111111111111111111111111";
+  expect(SSR_CAPTURE_SAMPLE_SCHEME).toBe("sha256-runid-requestid-1of8-v1");
+  expect(htmlSsrCaptureDigest(runId, eligibleRequestId))
+    .toBe("a078d044988363164c156d124496875ff00154849f1e9bd69494d0d35c1e5543");
+  expect(isHtmlSsrCaptureEligible(runId, eligibleRequestId)).toBe(true);
+  expect(htmlSsrCaptureDigest(runId, ineligibleRequestId))
+    .toBe("3292b6e9f49cf13f86d5fa9119fb018d2de5d94882332e519636f1454bbe5380");
+  expect(isHtmlSsrCaptureEligible(runId, ineligibleRequestId)).toBe(false);
+  expect(htmlSsrCaptureDigest(runId.toUpperCase(), eligibleRequestId)).toBeNull();
 });
 
 test("web CPU prearm schedules exact OFF/ON edges once and rejects stale or late starts", () => {
@@ -720,6 +804,7 @@ test("tournament workspace timing wraps the existing opt-in SSR fetch", () => {
   expect(detailPage).toContain("const ssrTraceSampled = await isSsrTraceSampled();");
   expect(detailPage).toContain('from "@/lib/performance-diagnostic-plan"');
   expect(detailPage).toContain("getServerRequestCorrelationHeaders");
+  expect(detailPage).toContain("(await getServerRequestCorrelationHeaders()).forEach");
   expect(detailPage).toContain("workspaceHeaders[name] = value;");
   expect(detailPage).toContain('? measureSsrStage("tournament_workspace", () =>');
   expect(detailPage).toContain("const workspace = await (ssrTraceSampled");
@@ -739,6 +824,7 @@ test("tournament workspace timing wraps the existing opt-in SSR fetch", () => {
   expect(api).toContain("ServerInternalReadQueueError");
   expect(api).toContain('{ code: "server_read_capacity" }');
   expect(auth.match(/runWithServerInternalRead\(/gu)).toHaveLength(2);
+  expect(auth.match(/getServerRequestCorrelationHeaders\(\)/gu)).toHaveLength(2);
   expect(auth).toContain("await cancelServerAuthBody(response)");
   expect(auth).toContain("cancelServerAuthFetchTerminalResponse(response as Response, fetchController)");
   expect(auth).toContain("signal: AbortSignal.any([controller.signal, timeout])");
