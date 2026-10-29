@@ -2604,9 +2604,17 @@ def _worker_report_matches(payload: Any, capacity_config: Mapping[str, Any]) -> 
     ))
     new_shapes = tuple(frozenset(shape) for shape in (
         new_fields, new_fields - {"process_cpu_windows"},
+        new_fields - {"client_join_request_ids"},
+        new_fields - {"process_cpu_windows", "client_join_request_ids"},
         new_control_fields, new_control_fields - {"process_cpu_windows"},
+        new_control_fields - {"client_join_request_ids"},
+        new_control_fields - {"process_cpu_windows", "client_join_request_ids"},
         new_warmup_fields, new_warmup_fields - {"process_cpu_windows"},
+        new_warmup_fields - {"client_join_request_ids"},
+        new_warmup_fields - {"process_cpu_windows", "client_join_request_ids"},
         new_warmup_control_fields, new_warmup_control_fields - {"process_cpu_windows"},
+        new_warmup_control_fields - {"client_join_request_ids"},
+        new_warmup_control_fields - {"process_cpu_windows", "client_join_request_ids"},
     ))
     legacy_failure_evidence = _normalize_failure_evidence_fields(
         payload, legacy_shapes=legacy_shapes, current_shapes=new_shapes,

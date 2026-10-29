@@ -1485,6 +1485,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         self.assertFalse(capacity_diagnostic._worker_report_matches(callback_abort, config))
         pre_request_abort = through_worker_entry(callback_abort)
         self.assertEqual(pre_request_abort["observed_duration_ms"], 0)
+        self.assertIn("request_window_evidence", pre_request_abort)
+        self.assertNotIn("client_join_request_ids", pre_request_abort)
         self.assertTrue(
             capacity_diagnostic._worker_report_matches(pre_request_abort, config)
         )
