@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-10-25
+- Last reviewed: 2026-10-29
 
 Read this page for live pins, pending release work, open QA gates and hard
 operational limits. Product contracts, procedures and detailed run evidence
@@ -10,19 +10,15 @@ belong in the linked owner documents below.
 
 ## Live and pending state
 
-- Production is live on source `4df479c728b02a3ee92585572e28c1cb96890f80`;
-  previous is `d89dc2e1dda43139d7fd70ad6f4aa355e05eaebf`. Exact-SHA Security
-  [40152454569/1](https://github.com/StrayForest/old_sparky/actions/runs/40152454569),
-  its source-bound backup
-  [40152477239/1](https://github.com/StrayForest/old_sparky/actions/runs/40152477239),
-  natural deployment parent
-  [40153282378/1](https://github.com/StrayForest/old_sparky/actions/runs/40153282378),
-  and automatic deployment
-  [40153590789/1](https://github.com/StrayForest/old_sparky/actions/runs/40153590789)
-  passed. The 02:38:07Z post-maintenance check confirmed these pointers, live and
-  ready API and web endpoints, active API/web/worker/Nginx services with zero
-  restarts, no jobs or locks, and `8,603,553,792` bytes free. This point-in-time
-  sample does not establish ongoing cleanup or capacity headroom.
+- The latest recorded production state is source
+  `9cbb73b930b71689843f58eb7b5492789f865ca1` with A restored by automatic
+  deployment
+  [40788852387](https://github.com/StrayForest/old_sparky/actions/runs/40788852387).
+  The last retained status observation at `2026-10-29T04:28Z` recorded API `2`,
+  web `1`, and admission `24` per worker across `8` workers. This timestamped
+  observation is not a fresh health check; see the
+  [performance evidence](../performance/README.md#ssr-c32-comparison-checkpoint-2026-10-29)
+  for the comparison outcome and limits.
 - Source-bound backups must have exactly one producer run ID per Security
   run, attempt and SHA. Failed or cancelled IDs count; multiple IDs make that
   proof ambiguous. Follow the [backup and restore runbook](backup-restore-runbook.md).
@@ -40,9 +36,9 @@ belong in the linked owner documents below.
   was deleted; one live-QA runtime remains. Free space after the final check
   is `8,603,553,792` bytes (about 21.5%).
   Endpoints and services are healthy, no jobs or locks remain, and both expired
-  SSR plans are absent. The maintenance timer is active and persistent; its
-  next trigger is 2026-10-26 04:20:39 EET. This is a successful bounded pass,
-  not a long-term capacity guarantee.
+  SSR plans are absent. The maintenance timer was active and persistent for
+  that run; its present state is not verified here. This is a successful
+  bounded pass, not a long-term capacity guarantee.
 - Bounded storage work reclaimed `276,296,431` bytes from exact duplicate
   shared build artifacts and about `1.15 GB` from an unreferenced LiveQA
   provider payload. The protected raw recovery archive, pinned backups, and
@@ -56,21 +52,17 @@ belong in the linked owner documents below.
   returned `20,000/20,000` HTTP 200 responses but failed its logical SLO.
   Fixture cleanup passed; exact profile and comparison evidence live in the
   [performance reference](../performance/README.md#authenticated-page-load-comparison-2026-10-24).
-- Latest SSR attempt
-  [40154266667/1](https://github.com/StrayForest/old_sparky/actions/runs/40154266667)
-  on source `4df479c728b02a3ee92585572e28c1cb96890f80` stopped at namespace
-  startup with exit 125 and `startup_failure_stage=unknown`; the inner worker
-  and client did not run. All credits are false. Exact stop passed in
-  [40154578267/1](https://github.com/StrayForest/old_sparky/actions/runs/40154578267),
-  while its normalization step failed because no CPU proof existed. Exact
-  fixture cleanup
-  [40154775260/1](https://github.com/StrayForest/old_sparky/actions/runs/40154775260)
-  passed, removing 14 fixture users and one tournament while preserving the
-  control account. Canonical cleanup removed both expired plans; both plan
-  files are absent. The precise startup cause remains unproven, so this does
-  not establish a performance result or capacity limit. See the
-  [performance reference](../performance/README.md) for bounded failure
-  evidence and cleanup ownership.
+- The SSR C32 comparison on source `9cbb73b930b71689843f58eb7b5492789f865ca1`
+  completed four accepted A1/B1/A2/B2 rows, together `2,484/2,484` HTTP 200
+  responses. B did not meet the pairwise improvement threshold. The final
+  automatic deployment
+  [40788852387](https://github.com/StrayForest/old_sparky/actions/runs/40788852387)
+  restored A. The last retained status observation at `2026-10-29T04:28Z`
+  recorded API `2`, web `1`, and admission `24` per worker across `8` workers;
+  this is not a fresh health check. Offline analysis continues. No further A/B
+  load is authorized, C64 is forbidden, and these rows do not establish a
+  capacity ceiling. See the [performance reference](../performance/README.md#ssr-c32-comparison-checkpoint-2026-10-29)
+  for the evidence summary.
 - The installed canonical content sample on e920 exited successfully. This is
   not a new full GitHub content-diagnostics result; details were lost from its
   bounded prefix. Earlier full diagnostic [40113453588](https://github.com/StrayForest/old_sparky/actions/runs/40113453588)

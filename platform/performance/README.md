@@ -2,13 +2,78 @@
 
 - Status: Active reference
 - Owner: Platform performance
-- Last reviewed: 2026-10-25
+- Last reviewed: 2026-10-29
 
 The top-level JSON files in `profiles/` are the only authored canonical load
 contracts (schema 2). `tools/platform_load.py` validates, fingerprints and
 dispatches them; `tools/platform_external_load.py` remains the external HTTP
 implementation detail. `tools/platform_load_acceptance.py` owns the shared
 SLO, capacity, spike and stress decisions.
+
+## SSR C32 comparison checkpoint (2026-10-29)
+
+The retained comparison contains four accepted rows in the A1/B1/A2/B2
+sequence. Together they completed `2,484/2,484` HTTP 200 responses: A1 `616`,
+B1 `648`, A2 `600`, and B2 `620`. The B candidate did not meet the required
+pairwise improvement threshold, so the comparison does not show a performance
+gain. No capacity ceiling can be inferred from these rows.
+
+For the accepted 20-second request windows, host CPU samples were filtered to
+the report's actual request start/finish timestamps (19/18/19 one-second
+samples for A1/B1/A2/B2). Mean CPU use on host CPUs 0/1 was 91.3/90.5% for A1,
+93.5/93.5% for B1, 90.4/89.0% for A2, and 91.3/90.1% for B2. Per-core maxima
+were 100% for A1/B1/A2 and 99.1% for B2; steal was zero in all four windows.
+These short observations show CPU-heavy plateaus, not sustained utilization
+or an absolute capacity limit. The API process group plus web process used
+about `1.4` CPU cores across the four windows; the API row sums two workers
+and retains only minimum/maximum worker durations, so this is approximate and
+does not represent total host CPU. PostgreSQL used about `0.11` CPU cores. API
+and web were the main measured process CPU consumers.
+
+SSR sampling recorded `638/674/624/652` requests for A1/B1/A2/B2, with
+`626/670/624/641` page-stage rows. `workspace_http_fetch` p95 was
+`402/395/401/408 ms`; JSON parse was `0.85/1.22/0.98/1.24 ms` and projection
+was `0.15/0.12/0.11/0.09 ms`. JSON parsing and projection were small in these
+samples. These nested SSR stage times are broad aggregates, not active-window
+request percentiles or CPU durations. No SSR auth-bootstrap stage,
+root-layout/React tail duration, or function-level profile was captured;
+broader API diagnostics record auth-bootstrap separately. API
+request-performance recorded `147/161/148/153` samples, with only `66–80`
+partial SSR joins; B2's API samples split into `80` workspace and `73`
+auth-bootstrap rows. These records are not timestamped to the active request
+window. No CPU stacks, event-loop samples, or GC samples were captured. The B
+transport selector applies to `/auth/bootstrap`; the tournament workspace
+request remains on the shared `platformFetch` path. The evidence does not
+justify a workspace transport change or another code-level fix.
+
+The PostgreSQL observer uses top-500 `pg_stat_statements` snapshots and maps
+nonnumeric or null query IDs to the shared `other` sentinel. Distinct statements
+can therefore collide in the query-ID-keyed delta, making those rows
+unattributable as per-query interval costs. A future observer correction
+should preserve statement identity or mark/drop unmatched deltas instead of
+presenting cumulative counters as valid interval values. This is a diagnostic
+correctness limitation, not evidence of an application bottleneck; no code
+change is proposed at this stage.
+
+Private analysis reference: `retained-resource-attribution-20261029.md`,
+SHA-256 `612026f8cde27f2a5b977866d6e0ccae442497e15ece36dedc18f645e8a109c9`.
+The report remains outside this repository.
+
+The next useful measurement would be an unchanged A/fetch C32 run of about two
+minutes with predeclared acceptance and phase-aligned host/process CPU, SSR
+stages, and per-request API pool-acquire/hold timings. A reviewed CPU profile
+would need to be armed for the same SSR workload. This is a proposal for a
+separately authorized follow-up; no additional A/B load is authorized by this
+checkpoint. These results support no code-level fix target.
+
+After B2, the production runtime was restored to A. The final automatic
+deployment was run [`40788852387`](https://github.com/StrayForest/old_sparky/actions/runs/40788852387).
+The last retained status observation, at `2026-10-29T04:28Z`, recorded A
+restored with API `2`, web `1`, and admission `24` per worker across `8`
+workers. This is a timestamped observation, not a fresh health check. No
+additional A/B load is authorized while offline analysis continues; C64 is
+forbidden. See [current state](../docs/CURRENT.md) for the concise operational
+status.
 
 ## Authenticated-page load comparison (2026-10-24)
 
