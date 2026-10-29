@@ -587,7 +587,9 @@ test("workspace CPU diagnostics require an exact private run marker", () => {
   expect(streamGuard).toContain("if (planSelection && !planSelection.captureEligible) return false;");
   expect(streamGuard).toContain('setHeader("x-platform-ssr-request-id", entry.requestId)');
   expect(streamGuard).toContain("ssr_stream_capture_coverage scheme=${captureSampleScheme}");
-  expect(observability).toContain("current_diagnostic_run_id() === null");
+  expect(observability).toContain("current_diagnostic_run_id()");
+  expect(observability).toContain("currentTypedHtmlSsrDiagnosticExpiryMs()");
+  expect(observability).toContain("trace.typedDiagnosticPlan");
   expect(planModule).toContain("plan.workload !== WORKLOAD_HTML_SSR_CAPACITY_120S");
   expect(planModule).toContain("plan.workload !== WORKLOAD_HTML_SSR_CPU_PROFILE_20S");
 });
@@ -890,7 +892,8 @@ test("workspace API error diagnostics emit only bounded status and correlation f
   expect(observability).toContain(
     'process.env.PLATFORM_SSR_WORKSPACE_ERROR_DIAGNOSTIC === "true"',
   );
-  expect(observability).toContain("current_diagnostic_run_id() === null");
+  expect(observability).toContain("current_diagnostic_run_id()");
+  expect(observability).toContain("traceStorage.getStore()?.typedDiagnosticPlan !== true");
   expect(observability).toContain("diagnostic_run_id=${trace.diagnosticRunId}");
   expect(detailPage).toContain("await recordSsrWorkspaceApiError(error.status)");
   expect(detailPage).toContain("throw error;");

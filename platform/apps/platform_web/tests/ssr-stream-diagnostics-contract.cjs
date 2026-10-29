@@ -47,7 +47,24 @@ function fixtureSource({ disabled, diagnosticMarker, planSelection }) {
     .digest()[0] & 7) === 0;
   const requestMarker = planSelection ? planRunId : (diagnosticMarker ? "1" : "");
   const registration = planSelection === "valid" || planSelection === "unsampled"
-    ? `if (!selectPlanRequest({requestId: "${requestId}", runId: "${planRunId}", expiresAtMs: Date.now() + 10_000, captureEligible: ${captureEligible}})) throw new Error("validated request was not selected");`
+    ? `const selectorExpiresAtMs = Date.now() + 10_000;
+  const selectorCaptureEligible = ${captureEligible};
+  if (!selectPlanRequest({requestId: "${requestId}", runId: "${planRunId}", expiresAtMs: selectorExpiresAtMs, captureEligible: selectorCaptureEligible})) {
+    const expectedCaptureEligible = (process.getBuiltinModule("node:crypto")
+      .createHash("sha256")
+      .update("${planRunId}:${requestId}", "ascii")
+      .digest()[0] & 7) === 0;
+    const now = Date.now();
+    throw new Error("validated request was not selected: " + JSON.stringify({
+      traceCandidate: /^[0-9a-f]{32}$/.test(request.headers["x-platform-ssr-trace"] || ""),
+      traceRunMatches: request.headers["x-platform-ssr-trace"] === "${planRunId}",
+      requestIdMatches: request.headers["x-request-id"] === "${requestId}",
+      expiryWithinBounds: Number.isSafeInteger(selectorExpiresAtMs)
+        && selectorExpiresAtMs > now && selectorExpiresAtMs - now <= 160_000,
+      captureEligibilityMatches: selectorCaptureEligible === expectedCaptureEligible,
+      requestStartSet: Boolean(request[Symbol.for("old-sparky.ssr-request-start")]),
+    }));
+  }`
     : planSelection === "wrong-request"
       ? `globalThis[Symbol.for("old-sparky.ssr-stream-selector")]({requestId: "${"e".repeat(32)}", runId: "${planRunId}", expiresAtMs: Date.now() + 10_000});`
       : planSelection === "wrong-run"
@@ -76,8 +93,8 @@ const server = http.createServer((request, response) => {
     response.end();
     return;
   }
-  console.log("request_start_marker=" + (request[Symbol.for("old-sparky.ssr-request-start")] ? "set" : "none"));
   ${registration}
+  console.log("request_start_marker=" + (request[Symbol.for("old-sparky.ssr-request-start")] ? "set" : "none"));
   response.writeHead(200, {"content-type": "text/html"});
   ${disabled ? 'response.end("<html></html>");' : 'response.write("<html>"); response.end("</html>");'}
 });

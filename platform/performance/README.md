@@ -71,8 +71,10 @@ plan `authenticated_html_ssr_capacity_120s_v1` runs OFF 20 seconds, GAP 5
 seconds, and ON 120 seconds without profiling. After a five-second quiet gap,
 the separate `authenticated_html_ssr_cpu_profile_20s_v1` plan runs OFF 20
 seconds, GAP 5 seconds, and ON 20 seconds with V8/Python profiling; that
-profiled phase earns no capacity credit. The legacy plan's 20-second expiry
-remains unchanged; the new plan expires 15 seconds after ON ends. At the web,
+profiled phase is attribution-only. Its latency and CPU values earn no capacity
+credit, and profiler overhead is not separately estimated. The legacy plan's
+20-second expiry remains unchanged; the new plan expires 15 seconds after ON
+ends. At the web,
 API and client boundaries, deterministic request selection hashes ASCII
 `run_id:request_id` with SHA-256 and selects one in eight from the low three
 bits. Each parent-plan cap is 1,000 requests. Correlation covers the full
@@ -81,8 +83,22 @@ requests; phase-scoped API events join one-to-many to requests using private
 identifiers, which are not included in public summaries. Measured phases total
 195 seconds, plus about 52 seconds of lead per plan, preparation, draining, and
 canonical cleanup under a 600-second outer deadline. C64 remains forbidden.
-These measurements do not establish a capacity ceiling or a proven application
-fix target.
+Interpret a capacity result only when the full planned ON cohort completes
+with all HTTP 200s, zero errors, complete request identity/timing and CPU/memory
+evidence, and canonical cleanup passes; otherwise classify it inconclusive or
+aborted. Treat the 120-second ON phase descriptively: report full-window
+latency/error and CPU aggregates, and an interval trend only when timestamped
+samples are available. Current typed telemetry has aggregate OFF/ON CPU rows,
+not first/last 20-second CPU subwindows. These results are not an SLO. The origin guard samples the
+`deadlock-web.service` cgroup every 250 ms, requires its fixed 1 GiB memory
+limit and identity, and aborts at 768 MiB current usage, any increase in
+`high`, `max`, `oom`, `oom_kill` or `oom_group_kill` counters, or a collection
+or identity failure. Each client request has a 5-second timeout; a failed
+response aborts the phase. The supervisor ceilings are 225 seconds for the
+120-second plan and 125 seconds for the 20-second plan. Swap is not measured
+or guarded by this experiment; cgroup identity checks do not make it a swap
+test. These measurements do not establish an SLO, an absolute capacity ceiling,
+an optimal architecture, or a proven application fix target.
 The run remains blocked until the production disk admission requirement in
 [current state](../docs/CURRENT.md) is satisfied; no deployment or load run is
 currently authorized.
