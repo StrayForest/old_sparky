@@ -1185,7 +1185,9 @@ def _quality_gate(
     }
 
 
-def _validate_usage_summary(value: Any) -> dict[str, Any] | None:
+def _validate_usage_summary(
+    value: Any, *, allow_projected_memory_rows: bool = False,
+) -> dict[str, Any] | None:
     """Validate the closed root-controller CPU summary without retaining identities."""
 
     from math import isfinite
@@ -1609,12 +1611,30 @@ def _validate_usage_summary(value: Any) -> dict[str, Any] | None:
     memory_rows = value["memory_rows"]
     if memory_rows and len(memory_rows) != 2:
         return None
+    memory_rows_projected = bool(memory_rows) and all(
+        isinstance(row, dict) and "run_id" not in row for row in memory_rows
+    )
+    memory_rows_raw = all(
+        isinstance(row, dict) and "run_id" in row for row in memory_rows
+    )
+    if memory_rows and (
+        not memory_rows_raw
+        and not (allow_projected_memory_rows and memory_rows_projected)
+    ):
+        return None
     clean_memory: list[dict[str, Any]] = []
     for row, phase in zip(memory_rows, ("off", "on")):
+        expected_memory_fields = (
+            MEMORY_ROW_FIELDS - {"run_id"}
+            if memory_rows_projected else MEMORY_ROW_FIELDS
+        )
         if (
-            not isinstance(row, dict) or set(row) != MEMORY_ROW_FIELDS
+            not isinstance(row, dict) or set(row) != expected_memory_fields
             or row.get("service") != "web" or row.get("phase") != phase
-            or not isinstance(row.get("run_id"), str) or not RUN_ID_RE.fullmatch(row["run_id"])
+            or (not memory_rows_projected and (
+                not isinstance(row.get("run_id"), str)
+                or not RUN_ID_RE.fullmatch(row["run_id"])
+            ))
             or row.get("expected_targets") != 1
             or type(row.get("observed_targets")) is not int or row["observed_targets"] not in {0, 1}
             or type(row.get("event_count")) is not int or not 0 <= row["event_count"] <= 8

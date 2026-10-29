@@ -572,11 +572,11 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
 
         wire_prefix = capacity_diagnostic.REMOTE_WATCH_PREFIX
         first_wire = wire_prefix + json.dumps(
-            {"sequence": 1, "padding": "x" * 300}, sort_keys=True,
+            {"sequence": 1, "padding": "x" * 600}, sort_keys=True,
             separators=(",", ":"),
         ).encode("ascii") + b"\n"
         second_wire = wire_prefix + json.dumps(
-            {"sequence": 2, "padding": "y" * 300}, sort_keys=True,
+            {"sequence": 2, "padding": "y" * 600}, sort_keys=True,
             separators=(",", ":"),
         ).encode("ascii") + b"\n"
         combined_wire = first_wire + second_wire
@@ -727,6 +727,42 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             + json.dumps(terminal_sample, sort_keys=True, separators=(",", ":")).encode("ascii")
             + b"\n"
         )
+        self.assertLessEqual(len(terminal_wire) - 1, capacity_diagnostic.REMOTE_ROW_CAP)
+        max_counter = 18_446_744_073_709_551_615
+        widest_closed_row = {
+            **terminal_sample,
+            "sequence": 600,
+            "elapsed_ms": 145_000,
+            "phase": "abort",
+            "sampled_at_ms": 9_999_999_999_999,
+            "plan_off_start_ms": 9_999_999_854_999,
+            "plan_on_start_ms": 9_999_999_879_999,
+            "plan_on_end_ms": 9_999_999_999_999,
+            "decision": "abort",
+            "reason": "memory_event",
+            "memory_current_bytes": 800_000_000,
+            "memory_peak_bytes": max_counter,
+            "memory_events_delta": {key: max_counter for key in (
+                "low", "high", "max", "oom", "oom_kill", "oom_group_kill",
+            )},
+            "target_pid": 4_194_303,
+            "target_start_ticks": max_counter,
+            "target_invocation_id": "a" * 36,
+        }
+        widest_wire = (
+            wire_prefix
+            + json.dumps(widest_closed_row, sort_keys=True, separators=(",", ":")).encode("ascii")
+            + b"\n"
+        )
+        self.assertLessEqual(len(widest_wire) - 1, capacity_diagnostic.REMOTE_ROW_CAP)
+        widest_row_watcher = watcher_with_chunk()
+        widest_row_watcher.expected_plan = (
+            widest_closed_row["plan_off_start_ms"],
+            widest_closed_row["plan_on_start_ms"],
+            widest_closed_row["plan_on_end_ms"],
+        )
+        with patch.object(capacity_diagnostic, "write_control"):
+            widest_row_watcher._accept(widest_closed_row)
 
         def consume_terminal_then_tail(chunks: list[bytes]):
             trailing = watcher_with_chunk()
@@ -2385,35 +2421,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "remote_plan_cleanup": "complete",
         }
         projector = capacity_diagnostic._project_capacity_report
-        rejection_line: int | None = None
-        previous_trace = sys.gettrace()
-        previous_frame_traces = {}
-
-        def capture_projection_line(frame, event, _arg):
-            nonlocal rejection_line
-            if frame.f_code is projector.__code__ and event == "line":
-                rejection_line = frame.f_lineno
-            frame_key = id(frame)
-            if event == "call":
-                next_prior = previous_trace(frame, event, _arg) if previous_trace is not None else None
-            else:
-                prior = previous_frame_traces.get(frame_key)
-                next_prior = prior(frame, event, _arg) if prior is not None else None
-            if event == "return" or next_prior is None:
-                previous_frame_traces.pop(frame_key, None)
-            else:
-                previous_frame_traces[frame_key] = next_prior
-            return capture_projection_line
-
-        try:
-            sys.settrace(capture_projection_line)
-            projected_report = projector(report)
-        finally:
-            sys.settrace(previous_trace)
-        self.assertIsNotNone(
-            projected_report,
-            f"closed report projector rejected fixture near source line {rejection_line}",
-        )
+        self.assertIsNotNone(projector(report))
         self.assertEqual(capacity_diagnostic.evaluate_capacity_report(
             report, source_sha="b" * 40, app_target_sha="c" * 40,
             run_id="12345", attempt="1", manifest_sha256="e" * 64,
@@ -4528,6 +4536,18 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertIsNotNone(validated_cleanup)
             self.assertEqual(len(validated_cleanup["memory_rows"]), 2)
             self.assertEqual(validated_cleanup["memory_rows"][1]["sample_count"], 5)
+            self.assertEqual(validated_cleanup["profile_status"], "complete")
+            self.assertIsNone(cpu_pair._validate_usage_summary(validated_cleanup))
+            revalidated_cleanup = cpu_pair._validate_usage_summary(
+                validated_cleanup, allow_projected_memory_rows=True,
+            )
+            self.assertIsNotNone(revalidated_cleanup)
+            self.assertEqual(revalidated_cleanup["profile_status"], "complete")
+            mixed_memory_identity = json.loads(json.dumps(validated_cleanup))
+            mixed_memory_identity["memory_rows"][0]["run_id"] = "a" * 32
+            self.assertIsNone(cpu_pair._validate_usage_summary(
+                mixed_memory_identity, allow_projected_memory_rows=True,
+            ))
             capacity_telemetry = capacity_diagnostic._project_server_telemetry(validated_cleanup)
             self.assertEqual(capacity_telemetry["node_memory_status"], "complete")
             self.assertEqual(capacity_telemetry["cgroup_memory_status"], "unknown")
@@ -4887,7 +4907,9 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "off_end_ms": 120_000,
             "on_start_ms": 125_000,
             "on_end_ms": 145_000,
-            "expires_at_ms": 160_000,
+            "expires_at_ms": capacity_diagnostic._plan_expiry_ms(
+                capacity_diagnostic.HTML_WORKLOAD, 145_000,
+            ),
         })
         prearm_plan = parse_plan_payload(
             _canonical_payload(prearm_payload), expected_service="api",
@@ -6173,7 +6195,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 "api", now_ms=146_001, allow_html_request_drain=True,
             )
         outside_parent = [
-            (name, b"145999" if name == b"x-platform-ssr-request-start-ms" else value)
+            (name, b"146000" if name == b"x-platform-ssr-request-start-ms" else value)
             for name, value in headers
         ]
         self.assertEqual(

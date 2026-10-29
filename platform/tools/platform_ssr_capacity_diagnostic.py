@@ -95,12 +95,13 @@ CONTROL_BASENAME = "capacity-control.json"
 REMOTE_WATCH_PREFIX = b"CAPACITY_MEMORY_GUARD "
 REMOTE_WATCH_ERROR_PREFIX = b"CAPACITY_MEMORY_GUARD_ERROR "
 # Bound 145s of plan sampling to 600 rows at 250ms, plus terminal margin.
-# The parent caps each complete prefixed wire line at 600 bytes; this remains
-# comfortably within the cumulative 2MiB cap.
+# A maximum-width closed row (64-bit counters, 13-digit millisecond timestamps,
+# PID/start ticks and UUID) remains below the parent's 1KiB per-line cap; the
+# producer's independent line cap is 2KiB. The cumulative cap remains 2MiB.
 REMOTE_WATCH_CAP = 2 * 1024 * 1024
 MAX_SSR_JOIN_REQUEST_IDS = 1_000
 SSR_JOIN_SAMPLE_SCHEME = "sha256-runid-requestid-1of8-v1"
-REMOTE_ROW_CAP = 600
+REMOTE_ROW_CAP = 1_024
 MEMORY_OBSERVER_FAILURE_STAGES = frozenset({
     "ssh_material_validation", "ssh_spawn", "input_write", "first_row_read",
     "row_decode", "row_accept", "thread_start", "sample_loop",
@@ -3407,7 +3408,12 @@ def _project_server_telemetry(
                 from tools import platform_cpu_diagnostic_pair as cpu_pair
             except ModuleNotFoundError:
                 import platform_cpu_diagnostic_pair as cpu_pair  # type: ignore[no-redef]
-            validated = cpu_pair._validate_usage_summary(summary)
+            # `_ssh_plan` already validated and bound this summary. Its closed
+            # projection strips memory-row run IDs, so permit that exact
+            # projected shape only at this in-process boundary.
+            validated = cpu_pair._validate_usage_summary(
+                summary, allow_projected_memory_rows=True,
+            )
             if validated is None:
                 profile_projection = {
                     "profile_status": "incomplete",
@@ -4148,6 +4154,8 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
             ({"warmup_failure"} if has_warmup_failure else set())
             | ({"control_failure_reason"} if has_control_failure_reason else set())
         )
+        if legacy_failure_evidence is True and "request_window_evidence" not in worker:
+            expected_final_worker = expected_final_worker - {"request_window_evidence"}
         if has_warmup_failure:
             worker = {
                 **worker,
