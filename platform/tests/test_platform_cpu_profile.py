@@ -757,6 +757,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         )
         self.assertLessEqual(len(widest_wire) - 1, capacity_diagnostic.REMOTE_ROW_CAP)
         widest_row_watcher = watcher_with_chunk()
+        widest_row_watcher.sequence = widest_closed_row["sequence"] - 1
         widest_row_watcher.workload = capacity_diagnostic.HTML_CAPACITY_120S_WORKLOAD
         widest_row_watcher.expected_plan = (
             widest_closed_row["plan_off_start_ms"],
@@ -1999,7 +2000,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 patch.object(capacity_diagnostic.time, "sleep", side_effect=advance) as fake_sleep,
             ):
                 capacity_diagnostic._wait_for_remote_plan_expiry(
-                    1_097_000, plan_created_at_ms=1_000_000,
+                    1_097_000, workload=capacity_diagnostic.WORKLOAD,
+                    plan_created_at_ms=1_000_000,
                     plan_created_monotonic=50.0,
                 )
             self.assertLessEqual(sum(call.args[0] for call in fake_sleep.call_args_list), 106.1)
@@ -2018,7 +2020,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 patch.object(capacity_diagnostic.time, "sleep") as no_sleep,
             ):
                 capacity_diagnostic._wait_for_remote_plan_expiry(
-                    1_097_000, plan_created_at_ms=1_000_000,
+                    1_097_000, workload=capacity_diagnostic.WORKLOAD,
+                    plan_created_at_ms=1_000_000,
                     plan_created_monotonic=50.0,
                 )
             no_sleep.assert_not_called()
