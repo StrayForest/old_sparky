@@ -731,6 +731,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         max_counter = 18_446_744_073_709_551_615
         widest_closed_row = {
             **terminal_sample,
+            "workload": capacity_diagnostic.HTML_CAPACITY_120S_WORKLOAD,
             "sequence": 600,
             "elapsed_ms": 145_000,
             "phase": "abort",
@@ -756,6 +757,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         )
         self.assertLessEqual(len(widest_wire) - 1, capacity_diagnostic.REMOTE_ROW_CAP)
         widest_row_watcher = watcher_with_chunk()
+        widest_row_watcher.workload = capacity_diagnostic.HTML_CAPACITY_120S_WORKLOAD
         widest_row_watcher.expected_plan = (
             widest_closed_row["plan_off_start_ms"],
             widest_closed_row["plan_on_start_ms"],
@@ -1904,6 +1906,9 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     "release_slug": "release-test", "off_start_ms": 100_000,
                     "off_end_ms": 120_000, "on_start_ms": 125_000,
                     "on_end_ms": 145_000,
+                    "expires_at_ms": capacity_diagnostic._plan_expiry_ms(
+                        capacity_diagnostic.WORKLOAD, 145_000,
+                    ),
                 }, lifecycle)
 
             def fake_cleanup(_args, _host, _user, _config, _key, payload, lifecycle, **_kwargs):

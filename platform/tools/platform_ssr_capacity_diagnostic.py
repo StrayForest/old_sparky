@@ -1333,7 +1333,7 @@ def _normalize_failure_evidence_fields(
         return True
     if shape in current_shapes:
         if payload.get("failure_evidence_status") == "available":
-            return False
+            return False if "request_window_evidence" in payload else None
         if (payload.get("failure_evidence_status") == "unavailable"
                 and payload.get("failure_evidence") is None
                 and payload.get("actual_on_request_started_at_utc") is None
@@ -4126,12 +4126,17 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
             legacy_warmup_control_worker,
             legacy_warmup_control_worker - {"process_cpu_windows"},
         ))
-        current_shapes = tuple(frozenset(shape) for shape in (
+        current_shape_bases = tuple(frozenset(shape) for shape in (
             expected_worker, expected_worker - {"process_cpu_windows"},
             control_diagnostic_worker, control_diagnostic_worker - {"process_cpu_windows"},
             warmup_worker, warmup_worker - {"process_cpu_windows"},
             warmup_control_worker, warmup_control_worker - {"process_cpu_windows"},
         ))
+        current_shapes = current_shape_bases + tuple(
+            shape - {"request_window_evidence"}
+            for shape in current_shape_bases
+            if "request_window_evidence" in shape
+        )
         legacy_failure_evidence = _normalize_failure_evidence_fields(
             worker, legacy_shapes=legacy_shapes, current_shapes=current_shapes,
         )
