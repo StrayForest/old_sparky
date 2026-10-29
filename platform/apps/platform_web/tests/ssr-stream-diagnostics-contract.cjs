@@ -112,7 +112,7 @@ server.listen(0, "127.0.0.1", () => {
       "cf-ray": "ray-1",
       ${diagnosticMarker || planSelection ? [
         '"x-platform-timeout-diagnostic-id": "tdiag-123-00001",',
-        '"x-platform-ssr-trace": "${requestMarker}",',
+        '"x-platform-ssr-trace": "' + requestMarker + '",',
         '"x-platform-ssr-request-id": "forged-request-id",',
         '"x-platform-ssr-cf-ray": "forged-cf-ray",',
         '"x-platform-ssr-proxy-start-ms": "1",',
