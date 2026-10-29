@@ -152,7 +152,9 @@ def main() -> int:
             watcher=_SyntheticWatcher(),
             hide_ssh_material=lambda: None,
             restore_ssh_material=lambda: None,
-            maximum_runtime_seconds=12.0,
+            maximum_runtime_seconds=capacity.WORKER_RUNTIME_SECONDS_BY_WORKLOAD[
+                capacity.WORKLOAD
+            ],
             on_start_ms=capacity.ON_WINDOW_MS + 5_000,
             on_end_ms=capacity.ON_WINDOW_MS * 2 + 5_000,
         )

@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
 import unittest
 
-from tools.platform_ssr_request_correlation import (
-    is_eligible_response_id,
-    response_id_selection_digest,
+from tools.platform_cpu_diagnostic_plan import (
+    is_ssr_response_id_eligible as is_eligible_response_id,
+    ssr_request_response_id_selection_digest as response_id_selection_digest,
     summarize_ssr_request_correlation,
 )
 
@@ -97,6 +102,108 @@ def summarize(**overrides: object) -> dict[str, object]:
 
 
 class SsrRequestCorrelationTests(unittest.TestCase):
+    def test_pinned_plan_correlation_runs_from_isolated_single_file_copy(self) -> None:
+        plan_source = (
+            Path(__file__).resolve().parents[1]
+            / "tools"
+            / "platform_cpu_diagnostic_plan.py"
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            isolated_plan = Path(temporary_directory) / "platform_cpu_diagnostic_plan.py"
+            shutil.copyfile(plan_source, isolated_plan)
+            script = r"""
+import importlib.util
+import sys
+from datetime import datetime, timezone
+
+spec = importlib.util.spec_from_file_location("isolated_plan", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+summary = module.summarize_ssr_request_correlation(
+    selected_request_ids=[], submitted_html_count=0, valid_response_id_count=0,
+    eligible_response_id_count=0,
+    selection_scheme="sha256-runid-requestid-1of8-v1",
+    run_id="0123456789abcdef0123456789abcdef", phase="on",
+    window_start_utc="2026-10-29T12:00:00+00:00",
+    window_end_utc="2026-10-29T12:00:15+00:00",
+    nginx_rows=[], ssr_rows=[], stream_rows=[], api_rows=[],
+)
+assert summary["schema_version"] == 1
+
+request_id = "00000000000000000000000000000002"
+run_id = "0123456789abcdef0123456789abcdef"
+start_ms = int(datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)
+event_time = datetime.fromtimestamp((start_ms + 100) / 1000, timezone.utc).isoformat()
+event_us = str((start_ms + 100) * 1000)
+api_messages = [
+    "request_perf request_id=" + request_id + " path=/api/v1/auth/bootstrap "
+    "total_ms=22 sql_ms=3 max_sql_ms=2 pool_checkout_wait_ms=0.5 "
+    "pool_connection_hold_ms=4 compute_ms=8 sql_count=1",
+    "request_perf request_id=" + request_id + " path=/api/v1/tournaments/t/workspace "
+    "total_ms=41 sql_ms=9 max_sql_ms=6 pool_checkout_wait_ms=1 "
+    "pool_connection_hold_ms=12 compute_ms=16 sql_count=2",
+]
+web_messages = [
+    "ssr_perf diagnostic_run_id=" + run_id + " request_id=" + request_id
+    + " stage=page_component duration_ms=80",
+    "ssr_perf diagnostic_run_id=" + run_id + " request_id=" + request_id
+    + " stage=tournament_workspace duration_ms=30",
+]
+web_messages += [
+    "ssr_stream request_id=" + request_id + " stage=" + stage + " elapsed_ms=" + str(index)
+    for index, stage in enumerate((
+        "request_start", "response_stream_start", "first_body_write_attempt",
+        "response_finish", "response_close", "response_error",
+    ), 1)
+]
+web_messages.append(
+    "ssr_stream_capture_coverage scheme=sha256-runid-requestid-1of8-v1 "
+    "run_id=" + run_id + " eligible=1 retained=1 lost=0 rows=6 lost_rows=0 status=complete"
+)
+def records(messages):
+    return [{"MESSAGE": message, "__REALTIME_TIMESTAMP": event_us} for message in messages]
+
+module._bounded_capacity_journal_rows = lambda service, *args, **kwargs: (
+    records(api_messages if service == "api" else web_messages), False
+)
+module._bounded_nginx_rows = lambda *args, **kwargs: ([{
+    "request_id": request_id, "time": event_time, "request_time": "0.09",
+    "cf_ray": "safe-ray",
+}], False)
+plan = {
+    "run_id": run_id, "workload": "authenticated_html_ssr_capacity_120s_v1",
+    "on_start_ms": start_ms, "on_end_ms": start_ms + 120000,
+    "expires_at_ms": start_ms + 135000,
+}
+correlated = module._capacity_request_telemetry(
+    {"api": dict(plan), "web": dict(plan)},
+    selected_request_ids=[request_id],
+    cohort_counts={
+        "submitted_html_count": 1, "valid_response_id_count": 1,
+        "missing_response_id_count": 0, "duplicate_response_id_count": 0,
+        "malformed_response_id_count": 0, "eligible_response_id_count": 1,
+        "retained_sample_count": 1,
+        "sample_scheme": "sha256-runid-requestid-1of8-v1",
+        "sample_cap_truncated": False,
+    },
+)
+assert correlated["join"]["matched_api_rows"] == 2
+assert correlated["timing_ms"]["api_request_by_route"]["auth_bootstrap"]["total_ms"]["count"] == 1
+assert correlated["timing_ms"]["api_request_by_route"]["tournament_workspace"]["total_ms"]["count"] == 1
+assert correlated["timing_ms"]["ssr_stage"]["page_component"]["count"] == 1
+assert correlated["timing_ms"]["ssr_stream_milestone_elapsed_ms"]["request_start"]["count"] == 1
+assert correlated["ssr_stream_coverage"]["capture_status"] == "complete"
+print("ok")
+"""
+            completed = subprocess.run(
+                [sys.executable, "-I", "-c", script, str(isolated_plan)],
+                cwd=temporary_directory,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(completed.stdout.strip(), "ok")
+
     def test_one_html_parent_joins_all_api_calls_and_ssr_stages(self) -> None:
         report = summarize()
 

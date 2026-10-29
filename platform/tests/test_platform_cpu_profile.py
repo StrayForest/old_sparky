@@ -6220,7 +6220,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         self.assertFalse(record("ssr_stream request_id=x", run_id=run_id, coverage=coverage))
 
     def test_ssr_request_correlation_projection_retains_only_closed_aggregates(self) -> None:
-        from tools import platform_ssr_request_correlation as correlation
+        from tools import platform_cpu_diagnostic_plan as correlation
 
         request_id = "00000000000000000000000000000002"
         event_at = "2026-10-29T12:00:01+00:00"
