@@ -572,11 +572,11 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
 
         wire_prefix = capacity_diagnostic.REMOTE_WATCH_PREFIX
         first_wire = wire_prefix + json.dumps(
-            {"sequence": 1, "padding": "x" * 1100}, sort_keys=True,
+            {"sequence": 1, "padding": "x" * 300}, sort_keys=True,
             separators=(",", ":"),
         ).encode("ascii") + b"\n"
         second_wire = wire_prefix + json.dumps(
-            {"sequence": 2, "padding": "y" * 1100}, sort_keys=True,
+            {"sequence": 2, "padding": "y" * 300}, sort_keys=True,
             separators=(",", ":"),
         ).encode("ascii") + b"\n"
         combined_wire = first_wire + second_wire
@@ -2384,7 +2384,36 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "generator_cpu_evidence": "measured",
             "remote_plan_cleanup": "complete",
         }
-        self.assertIsNotNone(capacity_diagnostic._project_capacity_report(report))
+        projector = capacity_diagnostic._project_capacity_report
+        rejection_line: int | None = None
+        previous_trace = sys.gettrace()
+        previous_frame_traces = {}
+
+        def capture_projection_line(frame, event, _arg):
+            nonlocal rejection_line
+            if frame.f_code is projector.__code__ and event == "line":
+                rejection_line = frame.f_lineno
+            frame_key = id(frame)
+            if event == "call":
+                next_prior = previous_trace(frame, event, _arg) if previous_trace is not None else None
+            else:
+                prior = previous_frame_traces.get(frame_key)
+                next_prior = prior(frame, event, _arg) if prior is not None else None
+            if event == "return" or next_prior is None:
+                previous_frame_traces.pop(frame_key, None)
+            else:
+                previous_frame_traces[frame_key] = next_prior
+            return capture_projection_line
+
+        try:
+            sys.settrace(capture_projection_line)
+            projected_report = projector(report)
+        finally:
+            sys.settrace(previous_trace)
+        self.assertIsNotNone(
+            projected_report,
+            f"closed report projector rejected fixture near source line {rejection_line}",
+        )
         self.assertEqual(capacity_diagnostic.evaluate_capacity_report(
             report, source_sha="b" * 40, app_target_sha="c" * 40,
             run_id="12345", attempt="1", manifest_sha256="e" * 64,
@@ -2885,9 +2914,13 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     "stdout_shape": "prepared_marker", "child_state": "reaped",
                 },
             })
+            on_end_ms = off_start + 45_000
             return ({
                 "off_start_ms": off_start, "off_end_ms": off_start + 20_000,
-                "on_start_ms": off_start + 25_000, "on_end_ms": off_start + 45_000,
+                "on_start_ms": off_start + 25_000, "on_end_ms": on_end_ms,
+                "expires_at_ms": capacity_diagnostic._plan_expiry_ms(
+                    capacity_diagnostic.HTML_WORKLOAD, on_end_ms,
+                ),
                 "release_slug": "test-release",
             }, lifecycle)
 
@@ -4162,6 +4195,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             off_end_ms=71_000,
             on_start_ms=76_000,
             on_end_ms=96_000,
+            workload=diagnostic_plan_tool.WORKLOAD,
         )
         _validate_windows(approved, now_ms=1_000)
         lead_min = Namespace(
@@ -4169,6 +4203,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             off_end_ms=66_000,
             on_start_ms=71_000,
             on_end_ms=91_000,
+            workload=diagnostic_plan_tool.WORKLOAD,
         )
         _validate_windows(lead_min, now_ms=1_000)
         lead_max = Namespace(
@@ -4176,6 +4211,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             off_end_ms=81_000,
             on_start_ms=86_000,
             on_end_ms=106_000,
+            workload=diagnostic_plan_tool.WORKLOAD,
         )
         _validate_windows(lead_max, now_ms=1_000)
         with self.assertRaises(PlanError):
@@ -4408,6 +4444,13 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 "repo.get_auth_bootstrap", "repo.get_current_user",
             ],
         )
+        producer_categories = (
+            diagnostic_plan_tool.API_PROFILE_CATEGORIES
+            | diagnostic_plan_tool.WEB_PROFILE_CATEGORIES
+        )
+        self.assertTrue(producer_categories.issubset(remote_dispatch.CPU_PROFILE_CATEGORIES))
+        self.assertTrue(producer_categories.issubset(cpu_pair.PROFILE_CATEGORIES))
+        self.assertNotIn("raw_function_name", remote_dispatch.CPU_PROFILE_CATEGORIES)
         self.assertEqual(web_profile["timer"], "v8_cpu")
         self.assertEqual(web_profile["sample_count"], 5)
         self.assertEqual(web_profile["total_cpu_us"], 300)
@@ -4844,7 +4887,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "off_end_ms": 120_000,
             "on_start_ms": 125_000,
             "on_end_ms": 145_000,
-            "expires_at_ms": 145_000,
+            "expires_at_ms": 160_000,
         })
         prearm_plan = parse_plan_payload(
             _canonical_payload(prearm_payload), expected_service="api",
@@ -6069,6 +6112,21 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 authorize_html_request_perf_capture(scope, plan=plan, now_ms=26_001),
                 (plan, "on", True),
             )
+        for duplicated_name in (
+            b"x-platform-ssr-trace", b"x-platform-ssr-request-id",
+            b"x-request-id", b"x-platform-ssr-request-start-ms",
+        ):
+            duplicated = [*headers, (duplicated_name, next(
+                value for name, value in headers if name == duplicated_name
+            ))]
+            with self.subTest(duplicated_header=duplicated_name):
+                self.assertEqual(
+                    authorize_html_request_perf_capture(
+                        {"type": "http", "method": "GET", "path": "/api/v1/auth/bootstrap", "headers": duplicated},
+                        plan=plan, now_ms=26_001,
+                    ),
+                    (None, None, False),
+                )
         for scope in (
             {"type": "http", "method": "POST", "path": "/api/v1/auth/bootstrap", "headers": headers},
             {"type": "http", "method": "GET", "path": "/api/v1/users/me", "headers": headers},
@@ -6269,6 +6327,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         self.assertIsNotNone(projected)
         self.assertEqual(projected["summary"]["join"]["matched_api_rows"], 1)
         self.assertEqual(
+            projected["summary"]["coverage"]["selection_rank_proof"],
+            "all_eligible_ids_selected",
+        )
+        self.assertEqual(
             projected["summary"]["timing_ms"]["ssr_stage"]["page_component"]["p50_ms"],
             40.0,
         )
@@ -6286,6 +6348,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         with_raw_id = json.loads(json.dumps(projected))
         with_raw_id["summary"]["unexpected_request_id"] = request_id
         self.assertIsNone(capacity_diagnostic._project_request_correlation(with_raw_id))
+        for invalid_proof in ("raw_request_ids", ["all_eligible_ids_selected"]):
+            with_invalid_proof = json.loads(json.dumps({"status": "complete", "summary": summary}))
+            with_invalid_proof["summary"]["coverage"]["selection_rank_proof"] = invalid_proof
+            self.assertIsNone(capacity_diagnostic._project_request_correlation(with_invalid_proof))
 
     async def test_plan_bound_request_perf_capture_overrides_disabled_sampling_safely(self) -> None:
         from python_packages.platform_infra.performance import RequestPerformanceMiddleware
@@ -6318,13 +6384,26 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         async def receive():
             return {"type": "http.request", "body": b"", "more_body": False}
 
+        async def send(message):
+            sent.append(message)
+
         with (
             patch("python_packages.platform_infra.performance.ApiCpuDiagnostic.activate_for_scope", return_value=(None, None)),
             patch("python_packages.platform_infra.performance.authorize_html_request_perf_capture", return_value=(plan, "on", True)),
-            patch("python_packages.platform_infra.performance.get_settings", return_value=SimpleNamespace(platform_perf_log_enabled=False)),
+            patch(
+                "python_packages.platform_infra.performance.get_settings",
+                return_value=SimpleNamespace(
+                    platform_perf_log_enabled=False,
+                    platform_perf_auth_bootstrap_log_enabled=False,
+                    platform_perf_log_mutations=False,
+                    platform_perf_slow_request_ms=10_000,
+                    platform_perf_slow_db_ms=10_000,
+                    platform_perf_sql_count_threshold=100,
+                ),
+            ),
             patch("python_packages.platform_infra.performance.logger.info") as info,
         ):
-            await RequestPerformanceMiddleware(App())(scope, receive, sent.append)
+            await RequestPerformanceMiddleware(App())(scope, receive, send)
         self.assertEqual(len(sent), 2)
         info.assert_called_once()
         self.assertIn("request_perf request_id=%s", info.call_args.args[0])
@@ -6471,16 +6550,20 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertEqual(list(Path(temporary_dir).iterdir()), [])
 
     def test_ssr_capacity_request_cohort_keeps_drained_failures_and_marks_bad_edges(self) -> None:
+        run_id = "0123456789abcdef0123456789abcdef"
+        eligible_on_time_id = "00000000000000000000000000000002"
+        eligible_drained_id = "00000000000000000000000000000005"
+        ineligible_id = "00000000000000000000000000000001"
         results = [
             SimpleNamespace(
                 started_at_utc="2026-10-29T12:00:00.000+00:00",
                 finished_at_utc="2026-10-29T12:00:01.000+00:00",
-                cf_ray="edge-a", ssr_request_id="a" * 32,
+                cf_ray="edge-a", ssr_request_id=eligible_on_time_id,
             ),
             SimpleNamespace(
                 started_at_utc="2026-10-29T12:00:09.000+00:00",
                 finished_at_utc="2026-10-29T12:00:12.500+00:00",
-                cf_ray="edge-b", ssr_request_id="b" * 32,
+                cf_ray="edge-b", ssr_request_id=eligible_drained_id,
                 status=503, ok=False,
             ),
             SimpleNamespace(
@@ -6489,23 +6572,39 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 status=0, ok=False,
             ),
             SimpleNamespace(
+                started_at_utc="2026-10-29T12:00:09.750+00:00",
+                finished_at_utc="2026-10-29T12:00:09.850+00:00",
+                cf_ray="edge-c", ssr_request_id=ineligible_id,
+            ),
+            SimpleNamespace(
                 started_at_utc="2026-10-29T12:00:10.000+00:00",
                 finished_at_utc="2026-10-29T12:00:10.100+00:00",
-                cf_ray="edge-c", ssr_request_id="c" * 32,
+                cf_ray="edge-outside", ssr_request_id="00000000000000000000000000000006",
             ),
         ]
         window_start_ms = int(datetime.fromisoformat("2026-10-29T12:00:00+00:00").timestamp() * 1000)
         selected, evidence = capacity_diagnostic._phase_request_window_evidence(
             results, start_ms=window_start_ms, end_ms=window_start_ms + 10_000,
+            run_id=run_id,
         )
-        self.assertEqual(len(selected), 3)
-        self.assertEqual(evidence["started_in_window_count"], 3)
+        self.assertEqual(len(selected), 4)
+        self.assertEqual(evidence["started_in_window_count"], 4)
         self.assertEqual(evidence["started_outside_window_count"], 1)
-        self.assertEqual(evidence["completed_by_window_end_count"], 1)
+        self.assertEqual(evidence["completed_by_window_end_count"], 2)
         self.assertEqual(evidence["drain_completed_after_window_count"], 1)
         self.assertEqual(evidence["missing_finish_timestamp_count"], 1)
+        self.assertEqual(evidence["ssr_request_id_singleton_count"], 3)
+        self.assertEqual(evidence["ssr_request_id_missing_count"], 1)
+        self.assertEqual(
+            evidence["started_in_window_count"],
+            evidence["ssr_request_id_singleton_count"]
+            + evidence["ssr_request_id_missing_count"]
+            + evidence["ssr_request_id_duplicate_count"]
+            + evidence["ssr_request_id_malformed_count"],
+        )
+        self.assertEqual(evidence["eligible_response_id_count"], 2)
         self.assertEqual(evidence["status"], "incomplete")
         ids = capacity_diagnostic._selected_ssr_join_request_ids(
-            selected, "d" * 32,
+            selected, run_id,
         )
-        self.assertEqual(ids, ["a" * 32, "b" * 32])
+        self.assertEqual(ids, [eligible_on_time_id, eligible_drained_id])

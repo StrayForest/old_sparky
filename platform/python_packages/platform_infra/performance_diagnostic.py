@@ -419,11 +419,19 @@ def _start_cpu_usage_window(plan: DiagnosticPlan, phase: str, loop: Any) -> None
 
 
 def _header_from_scope(scope: dict[str, Any], name: bytes) -> str | None:
+    found: bytes | None = None
     for raw_name, raw_value in scope.get("headers") or []:
         if raw_name.lower() == name:
-            value = raw_value.decode("ascii", errors="ignore").strip()
-            return value[:80] if value else None
-    return None
+            # Security/correlation headers must have exactly one authority.
+            # ASGI preserves duplicate headers, so taking the first value would
+            # silently accept a conflicting later marker.
+            if found is not None:
+                return None
+            found = raw_value
+    if found is None:
+        return None
+    value = found.decode("ascii", errors="ignore").strip()
+    return value[:80] if value else None
 
 
 def _read_release_identity() -> tuple[str, str] | None:

@@ -206,11 +206,18 @@ CPU_MEMORY_METRIC_FIELDS = CPU_MEMORY_ROW_FIELDS - {
 }
 CPU_PROFILE_CATEGORIES = {
     "repo.get_tournament_workspace", "repo.get_tournament_workspace_by_slug",
-    "repo.workspace_conditional_preflight", "repo.get_current_user",
+    "repo.get_auth_bootstrap", "repo.build_auth_bootstrap",
+    "repo.workspace_conditional_preflight", "repo.ensure_workspace_private_membership",
+    "repo.ensure_tournament_workspace_visible",
+    "repo.build_tournament_workspace_detail_bracket_response",
+    "repo.build_tournament_workspace_bracket_summary_response",
+    "repo._workspace_response_etag", "repo._serialized_model_response",
+    "repo.get_current_user",
     "repo.get_current_user_optional", "repo.get_server_request_correlation_headers",
     "repo.run_with_ssr_trace", "repo.workspace_api_fetch", "repo.workspace_page",
     "orm_result", "db_driver", "async_event_loop", "serialization_validation",
-    "crypto", "web_framework", "http_client", "other",
+    "crypto", "web_framework", "http_client", "react_server_render",
+    "repo.ssr_route_module", "compiled_server_chunk", "other",
 }
 TRUSTED_LIVE_ROOT = Path("/root/.oldsparky/liveqa")
 TRUSTED_LIVE_LAUNCH = TRUSTED_LIVE_ROOT / "platform_live_launch_trusted.sh"

@@ -95,7 +95,7 @@ CONTROL_BASENAME = "capacity-control.json"
 REMOTE_WATCH_PREFIX = b"CAPACITY_MEMORY_GUARD "
 REMOTE_WATCH_ERROR_PREFIX = b"CAPACITY_MEMORY_GUARD_ERROR "
 # Bound 145s of plan sampling to 600 rows at 250ms, plus terminal margin.
-# The parent caps each complete prefixed wire line at 2048 bytes; this remains
+# The parent caps each complete prefixed wire line at 600 bytes; this remains
 # comfortably within the cumulative 2MiB cap.
 REMOTE_WATCH_CAP = 2 * 1024 * 1024
 MAX_SSR_JOIN_REQUEST_IDS = 1_000
@@ -3283,13 +3283,19 @@ def _project_request_correlation(value: Any) -> dict[str, Any] | None:
                 return None
 
     coverage_fields = {
-        "complete", "full_cohort", "source_rows_truncated", "source_input_rows",
-        "source_rejections", "cf_ray_fallback_enabled",
+        "complete", "scope", "selection_rank_proof", "full_cohort",
+        "source_rows_truncated", "source_input_rows", "source_rejections",
+        "cf_ray_fallback_enabled",
     }
     coverage = summary.get("coverage")
     sources = {"nginx", "ssr", "stream", "api"}
     if (not isinstance(coverage, dict) or set(coverage) != coverage_fields
             or type(coverage.get("complete")) is not bool
+            or coverage.get("scope") != "selected_sample_only"
+            or coverage.get("selection_rank_proof") not in (
+                "all_eligible_ids_selected",
+                "producer_asserted_not_verifiable_from_selected_ids",
+            )
             or type(coverage.get("full_cohort")) is not bool
             or coverage.get("cf_ray_fallback_enabled") is not False
             or not isinstance(coverage.get("source_rows_truncated"), dict)
