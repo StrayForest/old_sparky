@@ -371,18 +371,14 @@ map to `other`.
 Run sequencing is deliberately three-step:
 
 1. Record the current release, runtime profile and `MemoryMax`; keep the
-   pre-window profile active for the minimal contour. Run the external workflow
-   with the dedicated timeout confirmation:
-
-   ```bash
-   gh workflow run platform-production-external-load.yml \
-     --repo StrayForest/old_sparky --ref dev \
-     -f confirmation=RUN-PRODUCTION-TIMEOUT-DIAGNOSTICS \
-     -f control_email=<existing-production-account-email> \
-     -f profile_id=authenticated-page-load-v1 \
-     -f timeout_diagnostics=true
-   gh run watch <diagnostic-run-id> --repo StrayForest/old_sparky --exit-status
-   ```
+   pre-window profile active for the minimal contour. Dispatch
+   `platform-production-external-load.yml` using the stdin-only JSON pattern
+   from the [SSR capacity diagnostic runbook](ssr-capacity-diagnostic-runbook.md)
+   with `confirmation=RUN-PRODUCTION-TIMEOUT-DIAGNOSTICS`,
+   `profile_id=authenticated-page-load-v1`, and `timeout_diagnostics=true`;
+   keep the other diagnostic flags false. Reconcile the exact run ID, attempt
+   and head SHA, then run `gh run watch <exact-run-id> --repo
+   StrayForest/old_sparky --exit-status`.
 
    Do not enable `web-ssr-diagnostics` for this first pass: its marked-request
    trace adds per-request SSR/API/event-loop logging and can change the failure
@@ -451,23 +447,14 @@ unmanaged Node binary.
 
 Run the two normal external-load workflow windows sequentially:
 
-```bash
-gh workflow run platform-production-external-load.yml \
-  --repo StrayForest/old_sparky --ref dev \
-  -f confirmation=RUN-PRODUCTION-EXTERNAL-LOAD \
-  -f control_email=<existing-production-account-email> \
-  -f profile_id=authenticated-page-load-v1 \
-  -f timeout_diagnostics=false
-gh run watch <v1-run-id> --repo StrayForest/old_sparky --exit-status
-
-gh workflow run platform-production-external-load.yml \
-  --repo StrayForest/old_sparky --ref dev \
-  -f confirmation=RUN-PRODUCTION-EXTERNAL-LOAD \
-  -f control_email=<existing-production-account-email> \
-  -f profile_id=authenticated-page-load-v2 \
-  -f timeout_diagnostics=false
-gh run watch <v2-run-id> --repo StrayForest/old_sparky --exit-status
-```
+Dispatch `profile_id=authenticated-page-load-v1` with
+`timeout_diagnostics=false` using the stdin-only JSON pattern in the
+[SSR capacity diagnostic runbook](ssr-capacity-diagnostic-runbook.md). Reconcile
+that exact workflow run, attempt and head SHA and wait for it with
+`gh run watch <exact-v1-run-id> --repo StrayForest/old_sparky --exit-status`.
+Only after it finishes, dispatch `profile_id=authenticated-page-load-v2` with
+the same confirmation and `timeout_diagnostics=false`; reconcile and watch its
+exact run in the same way. Enter the control account only at the hidden prompt.
 
 The workflow owns fixture creation and exact cleanup. If either window has
 unexpected statuses, client errors, a web restart, incomplete observer data or

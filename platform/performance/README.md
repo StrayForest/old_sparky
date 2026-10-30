@@ -66,91 +66,11 @@ Private analysis reference: `retained-resource-attribution-20261029.md`,
 SHA-256 `612026f8cde27f2a5b977866d6e0ccae442497e15ece36dedc18f645e8a109c9`.
 The report remains outside this repository.
 
-Offline analysis is complete. After implementation and evidence review, the
-next authorized measurement is the strict composite contract
-`authenticated_html_ssr_capacity_120s_plus_cpu_profile_20s_v1`: the same
-authenticated HTML fixture, A/fetch path, API 2/web 1, admission 24 with at most
-8 waiters per API worker, C32 concurrency, and 14-actor fixture. Its capacity
-plan `authenticated_html_ssr_capacity_120s_v1` runs OFF 20 seconds, GAP 5
-seconds, and ON 120 seconds without profiling. After a five-second quiet gap,
-the separate `authenticated_html_ssr_cpu_profile_20s_v1` plan runs OFF 20
-seconds, GAP 5 seconds, and ON 20 seconds with V8/Python profiling; that
-profiled phase is attribution-only. Its latency and CPU values earn no capacity
-credit, and profiler overhead is not separately estimated. The legacy plan's
-20-second expiry remains unchanged; the new plan expires 15 seconds after ON
-ends. At the web,
-API and client boundaries, deterministic request selection hashes ASCII
-`run_id:request_id` with SHA-256 and selects one in eight from the low three
-bits. Each parent-plan cap is 1,000 requests. Correlation covers the full
-submitted ON-start HTTP cohort, including late, failed and drain-completed
-requests; phase-scoped API events join one-to-many to requests using private
-identifiers, which are not included in public summaries. Measured phases total
-195 seconds, plus about 52 seconds of lead per plan, preparation, draining, and
-canonical cleanup under a 600-second outer deadline. C64 remains forbidden.
-Interpret a capacity result only when the full planned ON cohort completes
-with all HTTP 200s, zero errors, complete request identity/timing and CPU/memory
-evidence, and canonical cleanup passes; otherwise classify it inconclusive or
-aborted. Treat the 120-second ON phase descriptively: report full-window
-latency/error and CPU aggregates, and an interval trend only when timestamped
-samples are available. Current typed telemetry has aggregate OFF/ON CPU rows,
-not first/last 20-second CPU subwindows. These results are not an SLO. The origin guard samples the
-`deadlock-web.service` cgroup every 250 ms, requires its fixed 1 GiB memory
-limit and identity, and aborts at 768 MiB current usage, any increase in
-`high`, `max`, `oom`, `oom_kill` or `oom_group_kill` counters, or a collection
-or identity failure. Each client request has a 5-second timeout; a failed
-response aborts the phase. The supervisor ceilings are 225 seconds for the
-120-second plan and 125 seconds for the 20-second plan. Swap is not measured
-or guarded by this experiment; cgroup identity checks do not make it a swap
-test. These measurements do not establish an SLO, an absolute capacity ceiling,
-an optimal architecture, or a proven application fix target.
-
-The report/fingerprint correction is hosted-runner code: the external-load
-workflow executes it from the exact reviewed `TARGET_SHA`, while its verified
-no-op source receipt independently binds `APP_TARGET_SHA` to the active
-production release. For this diagnostic-only change, the intended binding keeps
-the app on A at `440f1c5d03fb031e0b598aa4b159179bed20a19f` and uses the pinned
-host-tools generation unchanged. Do not equate the runner SHA and app SHA or
-override either identity. If an application/runtime path is co-changed, the
-classifier makes the full route deployable and the no-op binding is unavailable;
-that path requires its normal deployment and exact-source checks before the
-measurement.
-
-The first PR #331 deployment attempt reached only `7361e4668e946f1634c9ce208f79c0a884fb696b`;
-its Security run
-[`41012116515`](https://github.com/StrayForest/old_sparky/actions/runs/41012116515)
-and backup run
-[`41012142776`](https://github.com/StrayForest/old_sparky/actions/runs/41012142776)
-were cancelled before production backup creation or deployment. The later
-proven-venv policy correction merged as `440f1c5d03fb031e0b598aa4b159179bed20a19f`.
-Its exact-SHA Security run
-[`41014443027`](https://github.com/StrayForest/old_sparky/actions/runs/41014443027),
-source-bound TMPFS backup
-[`41014467427`](https://github.com/StrayForest/old_sparky/actions/runs/41014467427),
-and automatic deployment
-[`41017191006`](https://github.com/StrayForest/old_sparky/actions/runs/41017191006)
-passed. Production is now on A at `440f1c5d03fb031e0b598aa4b159179bed20a19f`;
-the report/fingerprint correction described above remains runner-only source
-code and has not been deployed. Its measurement still requires the exact
-current-source no-op binding, the existing production preflight, readiness and
-resource gates, and exact fixture cleanup. A failed venv proof stops before
-venv mutation.
-
-The `6,369,557,555`-byte admission cited in [current state](../docs/CURRENT.md)
-belongs to full backup maintenance with its pinned 576 MiB ext4 scratch image;
-it is not a blanket load-diagnostic gate. The default TMPFS backup path has a
-different admission: the filesystem floor plus 256 MiB lead and actual archive
-growth, along with restore/Alembic, scratch-cleanup and host-memory checks. The
-cancelled backup run establishes no pass for those guards. Evaluate the load
-diagnostic under its own current production preflight and resource gates; do
-not infer its admission solely from the full-maintenance ext4 failure.
-
-After B2, the production runtime was restored to A. The final deployment was
-run [`40788852387`](https://github.com/StrayForest/old_sparky/actions/runs/40788852387).
-The last retained status observation, at `2026-10-29T04:28Z`, recorded A
-restored with API `2`, web `1`, and authenticated-read admission concurrency
-`24` with a maximum of `8` waiters per API worker. It is timestamped, not a
-fresh health check. Later storage and maintenance readiness findings are owned
-by [current state](../docs/CURRENT.md).
+The zero-credit production SSR composite is operated through the
+[SSR capacity diagnostic runbook](../docs/ssr-capacity-diagnostic-runbook.md).
+It defines the source-bound release preconditions, exact dispatch and
+completion gates, and abort/cleanup steps. Do not treat an envelope completion
+marker as proof that both phases or the fixture cleanup completed.
 
 ## Authenticated-page load comparison (2026-10-24)
 

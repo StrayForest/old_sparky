@@ -44,6 +44,12 @@
 
 ## Change and verification rules
 
+- For every fix, update the affected operational instructions or scripts in
+  the same change before declaring it done. Replace obsolete commands and
+  steps rather than appending a postmortem. Keep operational runbooks actionable
+  with exact commands, required inputs and source bindings, validation and
+  success criteria, and abort and cleanup steps; omit investigation history
+  and implementation chronology.
 - Define behavior, owner layer, permissions, data impact, rollback risk and
   focused tests before changing behavior. Put test placement and gate ownership
   in `platform/docs/test-suite-governance.md`.
