@@ -1281,6 +1281,24 @@ def _validate_usage_summary(
                     or raw_summary.get("schema_version") != 1
                     or raw_summary.get("phase") != "on"):
                 return None
+            coverage_fields = {
+                "complete", "scope", "selection_rank_proof", "full_cohort",
+                "source_rows_truncated", "source_input_rows", "source_rejections",
+                "cf_ray_fallback_enabled",
+            }
+            coverage = raw_summary.get("coverage")
+            if (not isinstance(coverage, dict) or set(coverage) != coverage_fields
+                    or type(coverage.get("complete")) is not bool
+                    or coverage.get("scope") != "selected_sample_only"
+                    or not isinstance(coverage.get("selection_rank_proof"), str)
+                    or coverage["selection_rank_proof"] not in {
+                        "all_eligible_ids_selected",
+                        "producer_asserted_not_verifiable_from_selected_ids",
+                    }
+                    or type(coverage.get("full_cohort")) is not bool
+                    or type(coverage.get("cf_ray_fallback_enabled")) is not bool
+                    or coverage["cf_ray_fallback_enabled"] is not False):
+                return None
 
             cohort_fields = {
                 "submitted_html_requests", "valid_response_ids", "eligible_response_ids",
@@ -1316,6 +1334,11 @@ def _validate_usage_summary(
                     or cohort["selected_sample_received"] > cohort["selected_sample_limit"]
                     or cohort["selected_sample_expected"] != min(
                         cohort["eligible_response_ids"], cohort["selected_sample_limit"],
+                    )
+                    or coverage["selection_rank_proof"] != (
+                        "all_eligible_ids_selected"
+                        if cohort["eligible_response_ids"] <= cohort["selected_sample_limit"]
+                        else "producer_asserted_not_verifiable_from_selected_ids"
                     )):
                 return None
 
@@ -1412,17 +1435,6 @@ def _validate_usage_summary(
                                  for field, count in route_value.items())):
                         return None
 
-            coverage_fields = {
-                "complete", "full_cohort", "source_rows_truncated", "source_input_rows",
-                "source_rejections", "cf_ray_fallback_enabled",
-            }
-            coverage = raw_summary.get("coverage")
-            if (not isinstance(coverage, dict) or set(coverage) != coverage_fields
-                    or type(coverage.get("complete")) is not bool
-                    or type(coverage.get("full_cohort")) is not bool
-                    or type(coverage.get("cf_ray_fallback_enabled")) is not bool
-                    or coverage["cf_ray_fallback_enabled"] is not False):
-                return None
             sources = {"nginx", "ssr", "stream", "api"}
             truncated = coverage.get("source_rows_truncated")
             row_counts = coverage.get("source_input_rows")
