@@ -64,6 +64,28 @@ def serialized(value: object) -> str:
     return json.dumps(value, sort_keys=True, ensure_ascii=True)
 
 
+def statement_snapshot(
+    rows: list[dict[str, object]],
+    *,
+    complete: bool = True,
+    truncated: bool = False,
+    total_rows: int | None = None,
+    unknown_identity_groups: int = 0,
+    stats_reset: str = "2026-10-01T00:00:00+00:00",
+    dealloc: int = 0,
+) -> dict[str, object]:
+    return {
+        "available": True,
+        "complete": complete,
+        "truncated": truncated,
+        "total_rows": len(rows) if total_rows is None else total_rows,
+        "unknown_identity_groups": unknown_identity_groups,
+        "stats_reset": stats_reset,
+        "dealloc": dealloc,
+        "rows": rows,
+    }
+
+
 class EvidencePrivacyTests(unittest.TestCase):
     def test_ssr_substage_metrics_keep_only_closed_stage_names(self) -> None:
         public = project_public_artifact(
@@ -1334,28 +1356,206 @@ class EvidencePrivacyTests(unittest.TestCase):
 
     def test_postgres_statement_delta_drops_raw_query_literals(self) -> None:
         raw_query = "SELECT email FROM users WHERE password='secret-password'"
+        row = {
+            "queryid": "42",
+            "query": raw_query,
+            "calls": 1,
+            "total_exec_ms": 1.0,
+            "mean_exec_ms": 1.0,
+            "rows": 1,
+            "shared_blks_hit": 2,
+            "shared_blks_read": 0,
+            "temp_blks_written": 0,
+        }
         before = {
-            "available": True,
-            "rows": [{
-                "queryid": "42",
-                "query": raw_query,
-                "calls": 1,
-                "total_exec_ms": 1.0,
-                "mean_exec_ms": 1.0,
-                "rows": 1,
-                "shared_blks_hit": 2,
-                "shared_blks_read": 0,
-                "temp_blks_written": 0,
-            }],
+            **statement_snapshot([row]),
         }
         after = {
-            "available": True,
-            "rows": [{**before["rows"][0], "calls": 2, "total_exec_ms": 3.5}],
+            **statement_snapshot([{**row, "calls": 2, "total_exec_ms": 3.5}]),
         }
         output = serialized(postgres_statement_delta(before, after))
         self.assertNotIn(raw_query.lower(), output.lower())
         self.assertNotIn("query\":", output.lower())
         self.assertIn("\"queryid\": \"42\"", output)
+        self.assertIn("\"complete\": true", output)
+
+    def test_postgres_statement_delta_preserves_signed_numeric_ids(self) -> None:
+        before_row = {
+            "queryid": "-42",
+            "calls": 3,
+            "total_exec_ms": 8.0,
+            "rows": 5,
+            "shared_blks_hit": 7,
+            "shared_blks_read": 2,
+            "temp_blks_written": 1,
+        }
+        after_row = {
+            **before_row,
+            "calls": 5,
+            "total_exec_ms": 14.5,
+            "rows": 8,
+            "shared_blks_hit": 12,
+            "shared_blks_read": 3,
+            "temp_blks_written": 4,
+        }
+        delta = postgres_statement_delta(
+            statement_snapshot([before_row]),
+            statement_snapshot([after_row]),
+        )
+        self.assertTrue(delta["available"])
+        self.assertEqual(delta["rows"][0]["queryid"], "-42")
+        self.assertEqual(delta["rows"][0]["calls"], 2)
+        self.assertEqual(delta["rows"][0]["total_exec_ms"], 6.5)
+        self.assertEqual(delta["rows"][0]["rows"], 3)
+        self.assertEqual(delta["rows"][0]["temp_blks_written"], 3)
+
+    def test_postgres_statement_delta_does_not_merge_unknown_identity_sentinels(self) -> None:
+        before_rows = [
+            {"queryid": "other", "calls": 5, "total_exec_ms": 10.0},
+            {"queryid": "other", "calls": 9, "total_exec_ms": 30.0},
+            {"queryid": "7", "calls": 1, "total_exec_ms": 1.0},
+        ]
+        after_rows = [
+            {"queryid": "other", "calls": 12, "total_exec_ms": 40.0},
+            {"queryid": "other", "calls": 10, "total_exec_ms": 32.0},
+            {"queryid": "7", "calls": 3, "total_exec_ms": 5.0},
+            {"queryid": "8", "calls": 1, "total_exec_ms": 4.0},
+        ]
+        before = statement_snapshot(
+            before_rows,
+            complete=False,
+            total_rows=3,
+            unknown_identity_groups=0,
+        )
+        after = statement_snapshot(
+            after_rows,
+            complete=False,
+            total_rows=4,
+            unknown_identity_groups=0,
+        )
+        delta = postgres_statement_delta(before, after)
+        self.assertTrue(delta["available"])
+        self.assertFalse(delta["complete"])
+        self.assertEqual(delta["unknown_identity_groups"], 4)
+        self.assertEqual(delta["before_unknown_identity_groups"], 2)
+        self.assertEqual(delta["after_unknown_identity_groups"], 2)
+        self.assertEqual(delta["excluded_after_only_rows"], 1)
+        self.assertEqual([row["queryid"] for row in delta["rows"]], ["7"])
+        self.assertEqual(delta["rows"][0]["calls"], 2)
+
+    def test_postgres_statement_delta_excludes_after_only_from_truncated_baseline(self) -> None:
+        before = statement_snapshot(
+            [{"queryid": "7", "calls": 1, "total_exec_ms": 1.0}],
+            complete=False,
+            truncated=True,
+            total_rows=501,
+        )
+        after = statement_snapshot(
+            [
+                {"queryid": "7", "calls": 2, "total_exec_ms": 2.0},
+                {"queryid": "8", "calls": 4, "total_exec_ms": 8.0},
+            ],
+            complete=False,
+            truncated=True,
+            total_rows=501,
+        )
+        delta = postgres_statement_delta(before, after)
+        self.assertTrue(delta["available"])
+        self.assertFalse(delta["complete"])
+        self.assertEqual(delta["after_only_rows"], 1)
+        self.assertEqual(delta["excluded_after_only_rows"], 1)
+        self.assertEqual([row["queryid"] for row in delta["rows"]], ["7"])
+
+    def test_postgres_statement_delta_allows_after_only_with_complete_baseline(self) -> None:
+        before = statement_snapshot(
+            [{"queryid": "7", "calls": 1, "total_exec_ms": 1.0}],
+        )
+        after = statement_snapshot(
+            [
+                {"queryid": "7", "calls": 2, "total_exec_ms": 2.0},
+                {"queryid": "8", "calls": 3, "total_exec_ms": 6.0},
+            ],
+            total_rows=2,
+        )
+        delta = postgres_statement_delta(before, after)
+        self.assertTrue(delta["available"])
+        self.assertTrue(delta["complete"])
+        self.assertEqual(delta["after_only_rows"], 1)
+        self.assertEqual(delta["excluded_after_only_rows"], 0)
+        self.assertEqual([row["queryid"] for row in delta["rows"]], ["8", "7"])
+        self.assertEqual(delta["rows"][0]["calls"], 3)
+        self.assertEqual(delta["rows"][0]["total_exec_ms"], 6.0)
+
+    def test_postgres_statement_delta_accepts_exactly_500_complete_rows(self) -> None:
+        before_rows = [
+            {"queryid": str(queryid), "calls": 1, "total_exec_ms": 1.0}
+            for queryid in range(500)
+        ]
+        after_rows = [
+            {"queryid": str(queryid), "calls": 2, "total_exec_ms": 2.0}
+            for queryid in range(500)
+        ]
+        before = statement_snapshot(before_rows, total_rows=500)
+        after = statement_snapshot(after_rows, total_rows=500)
+        delta = postgres_statement_delta(before, after)
+        self.assertTrue(delta["available"])
+        self.assertTrue(delta["complete"])
+        self.assertEqual(delta["matched_rows"], 500)
+
+    def test_postgres_statement_delta_fails_closed_on_reset_eviction_or_regression(self) -> None:
+        row = {"queryid": "7", "calls": 2, "total_exec_ms": 4.0}
+        before = statement_snapshot([row])
+        reset = statement_snapshot([row], stats_reset="2026-10-02T00:00:00+00:00")
+        evicted = statement_snapshot([row], dealloc=1)
+        regressed = statement_snapshot([{**row, "calls": 1}])
+        missing_reset = statement_snapshot([row])
+        missing_reset.pop("stats_reset")
+        for after in (reset, evicted, regressed, missing_reset):
+            with self.subTest(after=after):
+                result = postgres_statement_delta(before, after)
+                self.assertFalse(result["available"])
+                self.assertEqual(result["rows"], [])
+
+    def test_statement_projection_keeps_only_safe_coverage_metadata(self) -> None:
+        projected = project_public_artifact(
+            "server_observability",
+            {
+                "postgres_stat_statements": {
+                    "delta": {
+                        "available": True,
+                        "complete": False,
+                        "reason": "partial_coverage",
+                        "matched_rows": 4,
+                        "after_only_rows": 2,
+                        "excluded_after_only_rows": 2,
+                        "unknown_identity_groups": 3,
+                        "before_unknown_identity_groups": 1,
+                        "after_unknown_identity_groups": 2,
+                        "before_truncated": True,
+                        "after_truncated": False,
+                        "ambiguous_rows": 1,
+                        "stats_reset": "internal timestamp",
+                        "raw_role": "operator@example.test",
+                        "rows": [{
+                            "queryid": "-42",
+                            "calls": 1,
+                            "total_exec_ms": 2.0,
+                            "query": "SELECT secret",
+                        }],
+                    }
+                }
+            },
+        )
+        statement_delta = projected["postgres_stat_statements"]["delta"]
+        self.assertEqual(statement_delta["reason"], "partial_coverage")
+        self.assertEqual(statement_delta["excluded_after_only_rows"], 2)
+        self.assertTrue(statement_delta["before_truncated"])
+        self.assertEqual(statement_delta["before_unknown_identity_groups"], 1)
+        self.assertEqual(statement_delta["rows"][0]["queryid"], "-42")
+        output = serialized(projected)
+        self.assertNotIn("internal timestamp", output)
+        self.assertNotIn("operator@example.test", output)
+        self.assertNotIn("SELECT secret", output)
 
     def test_observer_source_has_no_raw_postgres_query_projection(self) -> None:
         source = (
@@ -1365,6 +1565,9 @@ class EvidencePrivacyTests(unittest.TestCase):
         self.assertNotIn("activity.query", source)
         self.assertNotIn("pg_stat_statements.query", source)
         self.assertNotIn("'active_query_samples'", source)
+        self.assertIn("GROUP BY queryid", source)
+        self.assertIn("pg_stat_statements_info", source)
+        self.assertIn("LIMIT 501", source)
 
     def test_observer_timeline_drops_backend_names_and_process_ids(self) -> None:
         waits = _safe_postgres_wait_snapshot(

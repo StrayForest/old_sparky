@@ -206,11 +206,18 @@ CPU_MEMORY_METRIC_FIELDS = CPU_MEMORY_ROW_FIELDS - {
 }
 CPU_PROFILE_CATEGORIES = {
     "repo.get_tournament_workspace", "repo.get_tournament_workspace_by_slug",
-    "repo.workspace_conditional_preflight", "repo.get_current_user",
+    "repo.get_auth_bootstrap", "repo.build_auth_bootstrap",
+    "repo.workspace_conditional_preflight", "repo.ensure_workspace_private_membership",
+    "repo.ensure_tournament_workspace_visible",
+    "repo.build_tournament_workspace_detail_bracket_response",
+    "repo.build_tournament_workspace_bracket_summary_response",
+    "repo._workspace_response_etag", "repo._serialized_model_response",
+    "repo.get_current_user",
     "repo.get_current_user_optional", "repo.get_server_request_correlation_headers",
     "repo.run_with_ssr_trace", "repo.workspace_api_fetch", "repo.workspace_page",
     "orm_result", "db_driver", "async_event_loop", "serialization_validation",
-    "crypto", "web_framework", "http_client", "other",
+    "crypto", "web_framework", "http_client", "react_server_render",
+    "repo.ssr_route_module", "compiled_server_chunk", "other",
 }
 TRUSTED_LIVE_ROOT = Path("/root/.oldsparky/liveqa")
 TRUSTED_LIVE_LAUNCH = TRUSTED_LIVE_ROOT / "platform_live_launch_trusted.sh"
@@ -909,19 +916,26 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
         helper_payload = {key: value for key, value in payload.items() if key != "operation"}
     elif operation == "cleanup":
         helper_command = "cleanup-stdin"
-        expected_keys = {
+        cleanup_expected_keys = {
             "status", "service_count", "usage_status", "usage_reason", "usage_rows",
             "profile_status", "profile_reason", "profile_rows", "memory_status",
             "memory_reason", "cgroup_memory_status", "cgroup_memory_reason", "memory_rows",
         }
-        helper_payload = {"schema": payload["schema"], "run_id": payload["run_id"]}
+        expected_keys = cleanup_expected_keys
+        helper_payload = {
+            "schema": payload["schema"], "run_id": payload["run_id"],
+            **({"client_request_ids": payload["client_request_ids"]}
+               if "client_request_ids" in payload else {}),
+            **({"client_cohort_counts": payload["client_cohort_counts"]}
+               if "client_cohort_counts" in payload else {}),
+        }
     else:
         return 2
     helper_payload = {"schema": helper_payload["schema"], **helper_payload}
     child_input = json.dumps(
         helper_payload, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")
     ).encode("ascii") + b"\n"
-    if len(child_input) > 4096:
+    if len(child_input) > 64 * 1024:
         return 2
     try:
         process = subprocess.Popen(  # nosec B603
@@ -1010,9 +1024,49 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
             )
         else:
             failure_stage = "response_summary"
+            has_request_telemetry = isinstance(result, dict) and "request_telemetry" in result
+            expected_cleanup_keys = cleanup_expected_keys | (
+                {"request_telemetry"} if has_request_telemetry else set()
+            )
+            result_keys_valid = (
+                isinstance(result, dict)
+                and set(result) == expected_cleanup_keys
+                and has_request_telemetry == ("client_request_ids" in payload)
+            )
+            request_telemetry = result.get("request_telemetry") if isinstance(result, dict) else None
+            request_telemetry_valid = (
+                not has_request_telemetry
+                or (
+                    isinstance(request_telemetry, dict)
+                    and set(request_telemetry) == {"status", "summary"}
+                    and request_telemetry.get("status") in {"complete", "incomplete"}
+                    and (
+                        request_telemetry.get("summary") is None
+                        and request_telemetry.get("status") == "incomplete"
+                        or (
+                            isinstance(request_telemetry.get("summary"), dict)
+                            and set(request_telemetry["summary"]) == {
+                                "schema_version", "phase", "cohort", "join",
+                                "timing_ms", "coverage", "ssr_stream_coverage",
+                            }
+                            and isinstance(request_telemetry["summary"].get("coverage"), dict)
+                            and isinstance(request_telemetry["summary"].get("ssr_stream_coverage"), dict)
+                            and (
+                                request_telemetry.get("status") == "incomplete"
+                                or (
+                                    request_telemetry.get("status") == "complete"
+                                    and request_telemetry["summary"]["coverage"].get("complete") is True
+                                    and request_telemetry["summary"]["ssr_stream_coverage"].get("status") == "none"
+                                )
+                            )
+                        )
+                    )
+                )
+            )
             if (
                 not isinstance(result, dict)
-                or set(result) != expected_keys
+                or not result_keys_valid
+                or not request_telemetry_valid
                 or result.get("status") != "expired_plans_removed"
                 or type(result.get("service_count")) is not int
                 or result["service_count"] not in {0, 1, 2}
@@ -1296,6 +1350,8 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                 "cgroup_memory_reason": result["cgroup_memory_reason"],
                 "memory_rows": projected_memory,
             }
+            if has_request_telemetry:
+                cleanup_projection["request_telemetry"] = request_telemetry
             marker = "CPU_DIAGNOSTIC_PLAN " + json.dumps(
                 cleanup_projection, ensure_ascii=True, allow_nan=False,
                 sort_keys=True, separators=(",", ":"),
@@ -3098,6 +3154,7 @@ def _external_fixture(
         "cpu_diagnostic_only_v1",
         "ssr_capacity_diagnostic_v1",
         "ssr_html_capacity_diagnostic_v1",
+        "ssr_html_capacity_composite_diagnostic_v1",
     }:
         return 2
     arguments = [
@@ -3117,6 +3174,7 @@ def _external_fixture(
         "cpu_diagnostic_only_v1",
         "ssr_capacity_diagnostic_v1",
         "ssr_html_capacity_diagnostic_v1",
+        "ssr_html_capacity_composite_diagnostic_v1",
     }:
         arguments.extend(("--fixture-kind", fixture_kind))
     if (

@@ -1883,6 +1883,9 @@ class RequestResult:
     html_page_marker_ok: bool | None = None
     time_to_first_byte_ms: float | None = None
     cf_ray: str | None = None
+    # Transient server-generated join token; never include it in a report.
+    ssr_request_id: str | None = None
+    ssr_request_id_malformed: bool = False
     cf_error_type: str | None = None
     cf_error_origin: str | None = None
     retry_after: str | None = None
@@ -3577,6 +3580,22 @@ def _page_request_http11_keepalive(
                 else None
             ),
             cf_ray=response.headers.get("cf-ray") or None,
+            ssr_request_id=(
+                response.headers.get("x-platform-ssr-request-id")
+                if capture_timestamps
+                and re.fullmatch(
+                    r"[0-9a-f]{32}",
+                    response.headers.get("x-platform-ssr-request-id", ""),
+                ) else None
+            ),
+            ssr_request_id_malformed=(
+                capture_timestamps
+                and bool(response.headers.get("x-platform-ssr-request-id", ""))
+                and re.fullmatch(
+                    r"[0-9a-f]{32}",
+                    response.headers.get("x-platform-ssr-request-id", ""),
+                ) is None
+            ),
             cf_error_type=cf_error_type,
             cf_error_origin=cf_error_origin,
             retry_after=retry_after,
@@ -3930,9 +3949,10 @@ def run_authenticated_workspace_capacity_phase(
             or not 1 <= max_supported_concurrency <= 64
             or type(concurrency) is not int or not 1 <= concurrency <= max_supported_concurrency
             or type(duration_seconds) not in (int, float)
-            or isinstance(duration_seconds, bool) or duration_seconds != 20
+            or isinstance(duration_seconds, bool)
+            or duration_seconds not in {20, 120}
             or type(start_at_epoch_ms) is not int or type(end_at_epoch_ms) is not int
-            or end_at_epoch_ms - start_at_epoch_ms != 20_000
+            or end_at_epoch_ms - start_at_epoch_ms != int(duration_seconds * 1000)
             or type(timeout) not in (int, float) or isinstance(timeout, bool)
             or not 0 < timeout <= 30
             or window_end_callback is not None and not callable(window_end_callback)):

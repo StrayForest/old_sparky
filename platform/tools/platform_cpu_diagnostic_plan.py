@@ -9,8 +9,12 @@ live service identities and the active release are bound to the request.
 from __future__ import annotations
 
 import argparse
+from collections import Counter, defaultdict
+from datetime import UTC, datetime
 import hashlib
+import itertools
 import json
+import math
 import os
 from pathlib import Path
 import pwd
@@ -22,7 +26,8 @@ import stat
 import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, Iterable, Mapping
+from urllib.parse import urlsplit
 import uuid
 
 
@@ -33,12 +38,23 @@ PLAN_NAMES = {
     "web": "performance-diagnostic-plan.web.json",
 }
 MAX_PLAN_BYTES = 4096
-MAX_REQUEST_BYTES = 4096
-MAX_TOTAL_WINDOW_MS = 60_000
+MAX_REQUEST_BYTES = 64 * 1024
+MAX_TOTAL_WINDOW_MS = 145_000
+PLAN_EXPIRY_GRACE_MS = 15_000
 MAX_JOURNAL_BYTES = 1_048_576
 MAX_JOURNAL_LINE_BYTES = 16_384
-MAX_JOURNAL_ROWS = 128
+MAX_JOURNAL_ROWS = 640
 JOURNAL_TIMEOUT_SECONDS = 3
+CAPACITY_JOURNAL_TIMEOUT_SECONDS = 12
+CAPACITY_JOURNAL_BYTES = 8 * 1024 * 1024
+CAPACITY_JOURNAL_LINE_BYTES = 64 * 1024
+CAPACITY_JOURNAL_ROWS = 50_000
+CAPACITY_NGINX_BYTES = 32 * 1024 * 1024
+CAPACITY_NGINX_ROWS = 50_000
+CAPACITY_NGINX_FILES = 8
+CAPACITY_REQUEST_SAMPLE_LIMIT = 1_000
+CAPACITY_CAPTURE_DRAIN_MS = 15_000
+NGINX_ACCESS_LOG = Path("/var/log/nginx/platform-access.log")
 MAX_SAMPLES_PROFILE = 1200
 MEMORY_SAMPLE_COUNT = 5
 SSR_CAPACITY_MEMORY_MAX_BYTES = 1_073_741_824
@@ -49,11 +65,33 @@ MAX_PLAN_LEAD_MS = 60_000
 WORKLOAD = "authenticated_workspace_read_pair_v1"
 CAPACITY_WORKLOAD = "authenticated_workspace_read_capacity_v1"
 HTML_CAPACITY_WORKLOAD = "authenticated_html_ssr_capacity_v1"
-SUPPORTED_WORKLOADS = frozenset({WORKLOAD, CAPACITY_WORKLOAD, HTML_CAPACITY_WORKLOAD})
-MEMORY_WATCH_WORKLOADS = frozenset({CAPACITY_WORKLOAD, HTML_CAPACITY_WORKLOAD})
+HTML_CAPACITY_120S_WORKLOAD = "authenticated_html_ssr_capacity_120s_v1"
+HTML_CPU_PROFILE_20S_WORKLOAD = "authenticated_html_ssr_cpu_profile_20s_v1"
+SUPPORTED_WORKLOADS = frozenset({
+    WORKLOAD,
+    CAPACITY_WORKLOAD,
+    HTML_CAPACITY_WORKLOAD,
+    HTML_CAPACITY_120S_WORKLOAD,
+    HTML_CPU_PROFILE_20S_WORKLOAD,
+})
+MEMORY_WATCH_WORKLOADS = frozenset({
+    CAPACITY_WORKLOAD,
+    HTML_CAPACITY_WORKLOAD,
+    HTML_CAPACITY_120S_WORKLOAD,
+    HTML_CPU_PROFILE_20S_WORKLOAD,
+})
 OFF_WINDOW_MS = 20_000
 IDLE_WINDOW_MS = 5_000
 ON_WINDOW_MS = 20_000
+ON_WINDOW_MS_BY_WORKLOAD = {
+    workload: ON_WINDOW_MS for workload in SUPPORTED_WORKLOADS
+}
+ON_WINDOW_MS_BY_WORKLOAD[HTML_CAPACITY_120S_WORKLOAD] = 120_000
+PLAN_EXPIRY_GRACE_MS_BY_WORKLOAD = {
+    workload: 0 for workload in SUPPORTED_WORKLOADS
+}
+PLAN_EXPIRY_GRACE_MS_BY_WORKLOAD[HTML_CAPACITY_120S_WORKLOAD] = PLAN_EXPIRY_GRACE_MS
+PLAN_EXPIRY_GRACE_MS_BY_WORKLOAD[HTML_CPU_PROFILE_20S_WORKLOAD] = PLAN_EXPIRY_GRACE_MS
 RUN_RE = re.compile(r"^[0-9a-f]{32}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,79}$")
@@ -111,12 +149,62 @@ def _read_request(command: str, stream: Any = None) -> argparse.Namespace:
             key: payload[key] for key in expected - {"schema"}
         })
     if command == "cleanup-stdin":
-        if (set(payload) != {"schema", "run_id"}
+        base_fields = {"schema", "run_id"}
+        correlation_fields = {"client_request_ids", "client_cohort_counts"}
+        if (set(payload) not in (base_fields, base_fields | correlation_fields)
                 or type(payload.get("schema")) is not int or payload.get("schema") != 1
                 or not isinstance(payload.get("run_id"), str)
                 or RUN_RE.fullmatch(payload["run_id"]) is None):
             raise PlanError("cleanup request fields are invalid")
-        return argparse.Namespace(command="cleanup", run_id=payload["run_id"])
+        request_ids = payload.get("client_request_ids")
+        if "client_request_ids" in payload and (
+            not isinstance(request_ids, list) or len(request_ids) > 1_000
+            or any(not isinstance(value, str) or RUN_RE.fullmatch(value) is None
+                   for value in request_ids)
+            or len(set(request_ids)) != len(request_ids)
+            or request_ids != sorted(request_ids)
+        ):
+            raise PlanError("cleanup request correlation IDs are invalid")
+        cohort_counts = payload.get("client_cohort_counts")
+        if "client_request_ids" in payload:
+            expected_counts = {
+                "submitted_html_count", "valid_response_id_count",
+                "missing_response_id_count", "duplicate_response_id_count",
+                "malformed_response_id_count", "eligible_response_id_count",
+                "retained_sample_count", "sample_scheme", "sample_cap_truncated",
+            }
+            if (not isinstance(cohort_counts, dict) or set(cohort_counts) != expected_counts
+                    or any(type(cohort_counts[key]) is not int or cohort_counts[key] < 0
+                           or cohort_counts[key] > 100_000 for key in expected_counts - {
+                               "sample_scheme", "sample_cap_truncated",
+                           })
+                    or cohort_counts.get("sample_scheme") != "sha256-runid-requestid-1of8-v1"
+                    or type(cohort_counts.get("sample_cap_truncated")) is not bool
+                    or sum(cohort_counts[key] for key in {
+                        "valid_response_id_count", "missing_response_id_count",
+                        "duplicate_response_id_count", "malformed_response_id_count",
+                    })
+                    != cohort_counts["submitted_html_count"]
+                    or cohort_counts["eligible_response_id_count"] > cohort_counts["valid_response_id_count"]
+                    or cohort_counts["retained_sample_count"] != len(request_ids)
+                    or len(request_ids) != min(
+                        cohort_counts["eligible_response_id_count"], CAPACITY_REQUEST_SAMPLE_LIMIT,
+                    )
+                    or cohort_counts["sample_cap_truncated"] != (
+                        cohort_counts["eligible_response_id_count"] > CAPACITY_REQUEST_SAMPLE_LIMIT
+                    )
+                    or any(
+                        hashlib.sha256(f"{payload['run_id']}:{item}".encode("ascii")).digest()[0] & 7
+                        for item in request_ids
+                    )):
+                raise PlanError("cleanup request cohort counts are invalid")
+        elif "client_cohort_counts" in payload:
+            raise PlanError("cleanup request cohort counts are unbound")
+        return argparse.Namespace(
+            command="cleanup", run_id=payload["run_id"],
+            client_request_ids=request_ids,
+            client_cohort_counts=cohort_counts,
+        )
     if command == "memory-watch-stdin":
         if (set(payload) != {"schema", "run_id", "source_sha", "workload"}
                 or type(payload.get("schema")) is not int or payload.get("schema") != 1
@@ -413,11 +501,12 @@ def _validate_windows(args: argparse.Namespace, *, now_ms: int) -> None:
     if (
         args.off_end_ms - args.off_start_ms != OFF_WINDOW_MS
         or args.on_start_ms - args.off_end_ms != IDLE_WINDOW_MS
-        or args.on_end_ms - args.on_start_ms != ON_WINDOW_MS
+        or args.on_end_ms - args.on_start_ms
+        != ON_WINDOW_MS_BY_WORKLOAD.get(args.workload)
     ):
         raise PlanError("diagnostic windows do not match the fixed workload")
     if args.on_end_ms - args.off_start_ms > MAX_TOTAL_WINDOW_MS:
-        raise PlanError("diagnostic window exceeds 60-second cap")
+        raise PlanError("diagnostic window exceeds workload cap")
     lead_ms = args.off_start_ms - now_ms
     if not MIN_PLAN_LEAD_MS <= lead_ms <= MAX_PLAN_LEAD_MS:
         raise PlanError("diagnostic plan lead time is outside the fixed preparation window")
@@ -573,7 +662,7 @@ def prepare(args: argparse.Namespace) -> dict[str, object]:
             "off_end_ms": args.off_end_ms,
             "on_start_ms": args.on_start_ms,
             "on_end_ms": args.on_end_ms,
-            "expires_at_ms": args.on_end_ms,
+            "expires_at_ms": _plan_expiry_ms(args.on_end_ms, args.workload),
         }
         for service, targets in (("api", api_targets), ("web", web_targets)):
             payload = {**common, "targets": targets}
@@ -642,6 +731,14 @@ def _journal_command(plan: dict[str, Any], service: str) -> list[str]:
         f"--unit={unit}", "--grep=cpu_diagnostic_", "--case-sensitive=yes",
         f"_SYSTEMD_INVOCATION_ID={invocation.lower()}",
     ]
+
+
+def _plan_on_window_ms(workload: str) -> int | None:
+    return ON_WINDOW_MS_BY_WORKLOAD.get(workload)
+
+
+def _plan_expiry_ms(on_end_ms: int, workload: str) -> int:
+    return on_end_ms + PLAN_EXPIRY_GRACE_MS_BY_WORKLOAD[workload]
 
 
 def _terminate_journal(process: subprocess.Popen[bytes]) -> None:
@@ -770,6 +867,599 @@ def _journal_rows(plans: dict[str, dict[str, Any]]) -> tuple[str, list[dict[str,
     return "complete", all_rows
 
 
+def _journal_epoch(milliseconds: int) -> str:
+    return f"@{milliseconds / 1000:.3f}"
+
+
+def _bounded_capacity_journal_rows(
+    service: str,
+    plan: dict[str, Any],
+    *,
+    since_ms: int,
+    until_ms: int,
+    markers: tuple[str, ...],
+) -> tuple[list[dict[str, Any]], bool]:
+    """Read a bounded exact-invocation journal slice for SSR/API joins."""
+
+    targets = plan.get("targets")
+    invocation = targets[0].get("invocation_id") if isinstance(targets, list) and targets and isinstance(targets[0], dict) else None
+    if (service not in PLAN_NAMES or not isinstance(invocation, str)
+            or INVOCATION_RE.fullmatch(invocation) is None
+            or type(since_ms) is not int or type(until_ms) is not int
+            or not 0 <= since_ms < until_ms
+            or until_ms - since_ms > MAX_TOTAL_WINDOW_MS + CAPACITY_CAPTURE_DRAIN_MS + 5_000
+            or not markers or any(not re.fullmatch(r"[a-z_]+", marker) for marker in markers)):
+        return [], True
+    marker_expression = "|".join(markers)
+    command = [
+        "/usr/bin/journalctl", "--no-pager", "--quiet", "--output=json",
+        "--output-fields=MESSAGE,_PID,_SYSTEMD_UNIT,_SYSTEMD_INVOCATION_ID,_SYSTEMD_CGROUP,__REALTIME_TIMESTAMP",
+        "--since", _journal_epoch(since_ms), "--until", _journal_epoch(until_ms),
+        f"--unit=deadlock-{service}.service", f"--grep={marker_expression}",
+        "--case-sensitive=yes", f"_SYSTEMD_INVOCATION_ID={invocation.lower()}",
+    ]
+    try:
+        process = subprocess.Popen(
+            command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True,
+            env={"LANG": "C", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "TZ": "UTC"},
+        )
+    except OSError:
+        return [], True
+    assert process.stdout is not None
+    fd = process.stdout.fileno()
+    selector = selectors.DefaultSelector()
+    pending = bytearray()
+    rows: list[dict[str, Any]] = []
+    bytes_read = 0
+    deadline = time.monotonic() + CAPACITY_JOURNAL_TIMEOUT_SECONDS
+    truncated = False
+    eof = False
+    try:
+        os.set_blocking(fd, False)
+        selector.register(fd, selectors.EVENT_READ)
+        while process.poll() is None or not eof:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                truncated = True
+                break
+            for event, _mask in selector.select(min(remaining, 0.1)):
+                try:
+                    chunk = os.read(event.fd, 32_768)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(event.fd)
+                    eof = True
+                    break
+                bytes_read += len(chunk)
+                if bytes_read > CAPACITY_JOURNAL_BYTES:
+                    truncated = True
+                    break
+                pending.extend(chunk)
+                while True:
+                    newline = pending.find(b"\n")
+                    if newline < 0:
+                        if len(pending) > CAPACITY_JOURNAL_LINE_BYTES:
+                            truncated = True
+                        break
+                    if newline > CAPACITY_JOURNAL_LINE_BYTES:
+                        truncated = True
+                        del pending[: newline + 1]
+                        continue
+                    line = bytes(pending[:newline])
+                    del pending[: newline + 1]
+                    try:
+                        row = json.loads(line.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+                    except (UnicodeError, json.JSONDecodeError, PlanError):
+                        truncated = True
+                        continue
+                    if not isinstance(row, dict):
+                        truncated = True
+                        continue
+                    rows.append(row)
+                    if len(rows) > CAPACITY_JOURNAL_ROWS:
+                        truncated = True
+                        break
+                if truncated:
+                    break
+            if truncated:
+                break
+        if process.poll() is None:
+            _terminate_journal(process)
+        try:
+            child_status = process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            _terminate_journal(process)
+            child_status = process.poll()
+        if child_status != 0 or pending:
+            truncated = True
+    finally:
+        selector.close()
+        process.stdout.close()
+        if process.poll() is None:
+            _terminate_journal(process)
+        pending[:] = b"\0" * len(pending)
+    return rows[:CAPACITY_JOURNAL_ROWS], truncated
+
+
+def _iter_file_lines_reverse(
+    handle: Any, *, maximum_bytes: int, scan_state: dict[str, Any],
+):
+    handle.seek(0, os.SEEK_END)
+    position = handle.tell()
+    read_bytes = 0
+    remainder = b""
+    while position > 0 and read_bytes < maximum_bytes:
+        take = min(64 * 1024, position, maximum_bytes - read_bytes)
+        position -= take
+        handle.seek(position)
+        chunk = handle.read(take)
+        read_bytes += len(chunk)
+        scan_state["bytes"] = read_bytes
+        pieces = (chunk + remainder).split(b"\n")
+        remainder = pieces[0]
+        for line in reversed(pieces[1:]):
+            if line:
+                yield line
+    if position == 0 and remainder:
+        yield remainder
+    scan_state["truncated"] = position > 0
+
+
+def _bounded_nginx_rows(
+    request_ids: set[str], *, since_ms: int, until_ms: int,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Read only a bounded reverse tail of Nginx JSON access logs."""
+
+    if not request_ids:
+        return [], False
+    paths = [NGINX_ACCESS_LOG]
+    try:
+        rotated = [
+            path for path in NGINX_ACCESS_LOG.parent.glob(f"{NGINX_ACCESS_LOG.name}.*")
+            if re.fullmatch(re.escape(NGINX_ACCESS_LOG.name) + r"\.[1-9][0-9]*", path.name)
+        ]
+        rotated.sort(key=lambda path: int(path.name.rsplit(".", 1)[1]))
+    except OSError:
+        return [], True
+    paths.extend(rotated[:CAPACITY_NGINX_FILES - 1])
+    truncated = len(rotated) >= CAPACITY_NGINX_FILES
+    rows: list[dict[str, Any]] = []
+    bytes_seen = 0
+    start = datetime.fromtimestamp(since_ms / 1000, tz=UTC)
+    end = datetime.fromtimestamp(until_ms / 1000, tz=UTC)
+    stop = False
+    for path in paths:
+        if stop or bytes_seen >= CAPACITY_NGINX_BYTES:
+            truncated = True
+            break
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            with os.fdopen(fd, "rb", closefd=True) as handle:
+                before = os.fstat(handle.fileno())
+                if not stat.S_ISREG(before.st_mode):
+                    truncated = True
+                    continue
+                line_count = 0
+                scan_state: dict[str, Any] = {"bytes": 0, "truncated": False}
+                for item in _iter_file_lines_reverse(
+                    handle, maximum_bytes=CAPACITY_NGINX_BYTES - bytes_seen,
+                    scan_state=scan_state,
+                ):
+                    line_count += 1
+                    if line_count > CAPACITY_NGINX_ROWS:
+                        truncated = True
+                        stop = True
+                        break
+                    try:
+                        record = json.loads(item.decode("utf-8"))
+                    except (UnicodeError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(record, dict):
+                        continue
+                    timestamp = _capacity_correlation_nginx_timestamp(record.get("time"))
+                    if timestamp is None:
+                        continue
+                    if timestamp < start:
+                        stop = True
+                        break
+                    if timestamp > end or record.get("request_id") not in request_ids:
+                        continue
+                    rows.append(record)
+                    if len(rows) > CAPACITY_NGINX_ROWS:
+                        truncated = True
+                        stop = True
+                        break
+                bytes_seen += int(scan_state.get("bytes", 0))
+                if scan_state.get("truncated") is True:
+                    truncated = True
+                after = os.fstat(handle.fileno())
+                current = os.stat(path, follow_symlinks=False)
+                if ((before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+                        or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)):
+                    truncated = True
+        except OSError:
+            truncated = True
+    return rows[:CAPACITY_NGINX_ROWS], truncated
+
+
+def _event_timestamp(record: dict[str, Any]) -> str | None:
+    raw = record.get("__REALTIME_TIMESTAMP")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if value < 0:
+        return None
+    try:
+        return datetime.fromtimestamp(value / 1_000_000, tz=UTC).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _message_text(record: dict[str, Any]) -> str | None:
+    message = record.get("MESSAGE")
+    if not isinstance(message, str):
+        return None
+    if message.startswith("{"):
+        try:
+            wrapped = json.loads(message)
+        except (json.JSONDecodeError, UnicodeError):
+            return None
+        if isinstance(wrapped, dict):
+            message = wrapped.get("message")
+    return message if isinstance(message, str) else None
+
+
+def _record_ssr_stream_coverage(
+    message: str, *, run_id: str, coverage: dict[str, int],
+) -> bool:
+    """Consume one bounded plan coverage marker; reject unknown shapes visibly."""
+
+    capture_name = "ssr_stream_capture_coverage"
+    capture_prefix = capture_name + " "
+    if message.startswith(capture_name):
+        fields: dict[str, str] = {}
+        tokens = message[len(capture_prefix):].split() if message.startswith(capture_prefix) else ()
+        for token in tokens:
+            if token.count("=") != 1:
+                fields = {}
+                break
+            key, value = token.split("=", 1)
+            if key in fields:
+                fields = {}
+                break
+            fields[key] = value
+        expected = {
+            "scheme", "run_id", "eligible", "retained", "lost", "rows",
+            "lost_rows", "status",
+        }
+        if set(fields) != expected or fields.get("run_id") != run_id:
+            coverage["capture_malformed_records"] += 1
+            return True
+        if fields.get("scheme") != "sha256-runid-requestid-1of8-v1":
+            coverage["capture_malformed_records"] += 1
+            return True
+        try:
+            values = {
+                key: int(fields[key])
+                for key in ("eligible", "retained", "lost", "rows", "lost_rows")
+            }
+        except ValueError:
+            coverage["capture_malformed_records"] += 1
+            return True
+        if (any(value < 0 or value > 1_000_000 for value in values.values())
+                or values["rows"] > 6_000
+                or values["eligible"] != values["retained"] + values["lost"]
+                or fields["status"] not in {"complete", "truncated"}
+                or (fields["status"] == "complete" and (
+                    values["lost"] != 0 or values["lost_rows"] != 0
+                ))
+                or (fields["status"] == "truncated" and (
+                    values["lost"] == 0 and values["lost_rows"] == 0
+                ))):
+            coverage["capture_malformed_records"] += 1
+            return True
+        coverage["capture_marker_records"] += 1
+        for source_key, target_key in (
+            ("eligible", "capture_eligible_requests"),
+            ("retained", "capture_retained_requests"),
+            ("lost", "capture_lost_requests"),
+            ("rows", "capture_rows"),
+            ("lost_rows", "capture_lost_rows"),
+        ):
+            coverage[target_key] += values[source_key]
+        if fields["status"] == "truncated":
+            coverage["capture_truncated_records"] += 1
+        return True
+
+    coverage_name = "ssr_stream_coverage"
+    prefix = coverage_name + " "
+    if not message.startswith(coverage_name):
+        return False
+    fields: dict[str, str] = {}
+    tokens = message[len(prefix):].split() if message.startswith(prefix) else ()
+    for token in tokens:
+        if token.count("=") != 1:
+            fields = {}
+            break
+        key, value = token.split("=", 1)
+        if key in fields:
+            fields = {}
+            break
+        fields[key] = value
+    if fields.get("run_id") != run_id or fields.get("status") != "truncated":
+        coverage["malformed_records"] += 1
+        return True
+    if set(fields) == {
+        "run_id", "selector_overflow", "selector_overflow_unattributed", "status",
+    }:
+        try:
+            overflow = int(fields["selector_overflow"])
+            unattributed = int(fields["selector_overflow_unattributed"])
+        except (KeyError, ValueError):
+            coverage["malformed_records"] += 1
+            return True
+        if not (0 <= overflow <= 1_000_000 and 0 <= unattributed <= 1_000_000):
+            coverage["malformed_records"] += 1
+            return True
+        coverage["records"] += 1
+        coverage["selector_overflow"] += overflow
+        coverage["selector_overflow_unattributed"] += unattributed
+        coverage["truncated_records"] += 1
+        return True
+    if set(fields) == {"run_id", "rows", "status"}:
+        try:
+            capped_rows = int(fields["rows"])
+        except (KeyError, ValueError):
+            coverage["malformed_records"] += 1
+            return True
+        if not 1 <= capped_rows <= 1_000_000:
+            coverage["malformed_records"] += 1
+            return True
+        coverage["records"] += 1
+        coverage["row_cap_records"] += 1
+        coverage["row_cap_rows"] += capped_rows
+        coverage["truncated_records"] += 1
+        return True
+    coverage["malformed_records"] += 1
+    return True
+
+
+def _capacity_request_telemetry(
+    plans: dict[str, dict[str, Any]],
+    *,
+    selected_request_ids: list[str],
+    cohort_counts: dict[str, int],
+) -> dict[str, Any]:
+    """Join a bounded client-ID sample to phase-scoped Nginx/SSR/API events."""
+
+    if set(plans) != {"api", "web"}:
+        raise PlanError("capacity correlation plans are incomplete")
+    api_plan, web_plan = plans["api"], plans["web"]
+    run_id = web_plan.get("run_id")
+    workload = web_plan.get("workload")
+    if (not isinstance(run_id, str) or not RUN_RE.fullmatch(run_id)
+            or workload not in {HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD}
+            or api_plan.get("run_id") != run_id
+            or api_plan.get("workload") != workload
+            or api_plan.get("on_start_ms") != web_plan.get("on_start_ms")
+            or api_plan.get("on_end_ms") != web_plan.get("on_end_ms")
+            or not isinstance(selected_request_ids, list)
+            or len(selected_request_ids) > CAPACITY_REQUEST_SAMPLE_LIMIT
+            or any(not isinstance(value, str) or not RUN_RE.fullmatch(value)
+                   for value in selected_request_ids)
+            or len(set(selected_request_ids)) != len(selected_request_ids)
+            or selected_request_ids != sorted(selected_request_ids)):
+        raise PlanError("capacity correlation identity is invalid")
+    counts_fields = {
+        "submitted_html_count", "valid_response_id_count",
+        "missing_response_id_count", "duplicate_response_id_count",
+        "malformed_response_id_count",
+        "eligible_response_id_count", "retained_sample_count",
+        "sample_scheme", "sample_cap_truncated",
+    }
+    if (set(cohort_counts) != counts_fields
+            or any(type(cohort_counts[key]) is not int or cohort_counts[key] < 0
+                   or cohort_counts[key] > 100_000 for key in counts_fields - {
+                       "sample_scheme", "sample_cap_truncated",
+                   })
+            or cohort_counts.get("sample_scheme") != "sha256-runid-requestid-1of8-v1"
+            or type(cohort_counts.get("sample_cap_truncated")) is not bool
+            or sum(cohort_counts[key] for key in {
+                "valid_response_id_count", "missing_response_id_count",
+                "duplicate_response_id_count", "malformed_response_id_count",
+            })
+            != cohort_counts["submitted_html_count"]
+            or cohort_counts["eligible_response_id_count"] > cohort_counts["valid_response_id_count"]
+            or cohort_counts["retained_sample_count"] != len(selected_request_ids)
+            or len(selected_request_ids) != min(
+                cohort_counts["eligible_response_id_count"], CAPACITY_REQUEST_SAMPLE_LIMIT,
+            )
+            or cohort_counts["sample_cap_truncated"] != (
+                cohort_counts["eligible_response_id_count"] > CAPACITY_REQUEST_SAMPLE_LIMIT
+            )):
+        raise PlanError("capacity correlation cohort is invalid")
+    start_ms = web_plan["on_start_ms"]
+    end_ms = web_plan["on_end_ms"]
+    capture_end_ms = min(
+        web_plan["expires_at_ms"],
+        end_ms + CAPACITY_CAPTURE_DRAIN_MS,
+    )
+    start_utc = datetime.fromtimestamp(start_ms / 1000, tz=UTC).isoformat()
+    end_utc = datetime.fromtimestamp(capture_end_ms / 1000, tz=UTC).isoformat()
+    selected_set = set(selected_request_ids)
+    api_raw, api_truncated = _bounded_capacity_journal_rows(
+        "api", api_plan, since_ms=max(0, start_ms - 1_000),
+        until_ms=capture_end_ms,
+        markers=("request_perf", "ssr_api_request_perf_coverage"),
+    )
+    web_raw, web_truncated = _bounded_capacity_journal_rows(
+        "web", web_plan, since_ms=max(0, start_ms - 1_000),
+        until_ms=capture_end_ms, markers=(
+            "ssr_perf", "ssr_stream", "ssr_stream_coverage",
+            "ssr_stream_capture_coverage",
+        ),
+    )
+    nginx_raw, nginx_truncated = _bounded_nginx_rows(
+        selected_set, since_ms=max(0, start_ms - 1_000), until_ms=capture_end_ms,
+    )
+    def context(event_at_utc: str, request_id: str) -> dict[str, str]:
+        return {
+            "run_id": run_id, "phase": "on", "window_start_utc": start_utc,
+            "window_end_utc": end_utc, "event_at_utc": event_at_utc,
+            "request_id": request_id,
+        }
+
+    api_rows: list[dict[str, Any]] = []
+    api_capture_truncated = False
+    for raw in api_raw:
+        message = _message_text(raw)
+        event_at = _event_timestamp(raw)
+        if message is None or event_at is None:
+            continue
+        if message.startswith("ssr_api_request_perf_coverage"):
+            # This marker is emitted only when the fixed per-process cap is
+            # reached. Any unknown form also invalidates source completeness.
+            api_capture_truncated = True
+            continue
+        parsed = _capacity_correlation_parse_request_perf(message)
+        if not isinstance(parsed, dict) or parsed.get("request_id") not in selected_set:
+            continue
+        request_id = parsed["request_id"]
+        route = _capacity_correlation_safe_route_class(
+            parsed.get("path") or parsed.get("route") or ""
+        )
+        row: dict[str, Any] = {
+            **context(event_at, request_id),
+            "route_class": route if route in {"auth_bootstrap", "tournament_workspace"} else "other",
+        }
+        for field in (
+            "total_ms", "sql_ms", "max_sql_ms", "pool_checkout_wait_ms",
+            "pool_connection_hold_ms", "compute_ms", "sql_count",
+        ):
+            value = parsed.get(field)
+            if type(value) in (int, float) and not isinstance(value, bool):
+                row[field] = value
+        api_rows.append(row)
+
+    ssr_rows: list[dict[str, Any]] = []
+    stream_rows: list[dict[str, Any]] = []
+    stream_coverage = {
+        "records": 0, "selector_overflow": 0,
+        "selector_overflow_unattributed": 0, "row_cap_records": 0,
+        "row_cap_rows": 0, "truncated_records": 0,
+        "malformed_records": 0, "capture_marker_records": 0,
+        "capture_eligible_requests": 0, "capture_retained_requests": 0,
+        "capture_lost_requests": 0, "capture_rows": 0,
+        "capture_lost_rows": 0, "capture_truncated_records": 0,
+        "capture_malformed_records": 0,
+    }
+    for raw in web_raw:
+        message = _message_text(raw)
+        event_at = _event_timestamp(raw)
+        if message is None or event_at is None:
+            continue
+        if _record_ssr_stream_coverage(message, run_id=run_id, coverage=stream_coverage):
+            continue
+        parsed = _capacity_correlation_parse_ssr_perf(message)
+        if parsed is not None:
+            if parsed.get("diagnostic_run_id") != run_id or parsed.get("request_id") not in selected_set:
+                continue
+            request_id = parsed["request_id"]
+            stage = _capacity_correlation_safe_stage(parsed.get("stage"))
+            duration = parsed.get("duration_ms")
+            if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+                ssr_rows.append({
+                    **context(event_at, request_id),
+                    "stage": stage, "duration_ms": duration,
+                })
+            continue
+        parsed_stream = _capacity_correlation_parse_ssr_stream(message)
+        if parsed_stream is not None and parsed_stream.get("request_id") in selected_set:
+            request_id = parsed_stream["request_id"]
+            stage = _capacity_correlation_safe_stage(parsed_stream.get("stage"))
+            elapsed = parsed_stream.get("elapsed_ms")
+            if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool):
+                stream_rows.append({
+                    **context(event_at, request_id),
+                    "stage": stage, "elapsed_ms": elapsed,
+                })
+
+    nginx_rows: list[dict[str, Any]] = []
+    for raw in nginx_raw:
+        request_id = raw.get("request_id")
+        if not isinstance(request_id, str) or request_id not in selected_set:
+            continue
+        timestamp = _capacity_correlation_nginx_timestamp(raw.get("time"))
+        if timestamp is None:
+            continue
+        request_seconds = raw.get("request_time")
+        try:
+            request_ms = float(request_seconds) * 1000
+        except (TypeError, ValueError, OverflowError):
+            request_ms = None
+        nginx_rows.append({
+            **context(timestamp.isoformat(), request_id),
+            "request_time_ms": request_ms,
+            "cf_ray": raw.get("cf_ray"),
+        })
+
+    rows_truncated = {
+        "nginx": nginx_truncated,
+        "ssr": web_truncated,
+        "stream": web_truncated,
+        "api": api_truncated or api_capture_truncated,
+    }
+    result = summarize_ssr_request_correlation(
+        selected_request_ids=selected_request_ids,
+        submitted_html_count=cohort_counts["submitted_html_count"],
+        valid_response_id_count=cohort_counts["valid_response_id_count"],
+        missing_response_id_count=cohort_counts["missing_response_id_count"],
+        duplicate_response_id_count=cohort_counts["duplicate_response_id_count"],
+        malformed_response_id_count=cohort_counts["malformed_response_id_count"],
+        selection_scheme=cohort_counts["sample_scheme"],
+        eligible_response_id_count=cohort_counts["eligible_response_id_count"],
+        run_id=run_id, phase="on",
+        window_start_utc=start_utc, window_end_utc=end_utc,
+        nginx_rows=nginx_rows, ssr_rows=ssr_rows, stream_rows=stream_rows,
+        api_rows=api_rows,
+        rows_truncated=rows_truncated,
+        max_rows=CAPACITY_JOURNAL_ROWS,
+        sample_limit=CAPACITY_REQUEST_SAMPLE_LIMIT,
+        cf_ray_fallback_proven=False,
+    )
+    result["ssr_stream_coverage"] = {
+        **stream_coverage,
+        "capture_status": (
+            "incomplete" if stream_coverage["capture_malformed_records"]
+            else "missing" if stream_coverage["capture_marker_records"] == 0
+            else "incomplete" if (
+                stream_coverage["capture_marker_records"] != 1
+                or stream_coverage["capture_truncated_records"]
+                or stream_coverage["capture_malformed_records"]
+            ) else "complete"
+        ),
+        "status": (
+            "incomplete"
+            if (stream_coverage["truncated_records"]
+                or stream_coverage["malformed_records"]
+                or stream_coverage["capture_marker_records"] != 1
+                or stream_coverage["capture_truncated_records"]
+                or stream_coverage["capture_malformed_records"])
+            else "none"
+        ),
+    }
+    if (stream_coverage["truncated_records"] or stream_coverage["malformed_records"]
+            or stream_coverage["capture_marker_records"] != 1
+            or stream_coverage["capture_truncated_records"]
+            or stream_coverage["capture_malformed_records"]):
+        result["coverage"]["complete"] = False
+        result["coverage"]["full_cohort"] = False
+    return result
+
+
 USAGE_MESSAGE_RE = re.compile(
     r"^cpu_diagnostic_usage service=(api|web) run_id=([0-9a-f]{32}) "
     r"phase=(off|on) window_ms=([0-9]{1,8}) cpu_ns=([0-9]{1,20}) "
@@ -812,14 +1502,20 @@ NODE_MEMORY_INTEGER_FIELDS = NODE_MEMORY_FIELDS - {
 }
 API_PROFILE_CATEGORIES = frozenset({
     "other", "serialization_validation", "orm_result", "db_driver",
-    "async_event_loop", "crypto", "repo.get_tournament_workspace",
+    "async_event_loop", "crypto", "repo.get_auth_bootstrap", "repo.build_auth_bootstrap",
+    "repo.get_tournament_workspace",
     "repo.get_tournament_workspace_by_slug", "repo.workspace_conditional_preflight",
+    "repo.ensure_workspace_private_membership", "repo.ensure_tournament_workspace_visible",
+    "repo.build_tournament_workspace_detail_bracket_response",
+    "repo.build_tournament_workspace_bracket_summary_response",
+    "repo._workspace_response_etag", "repo._serialized_model_response",
     "repo.get_current_user", "repo.get_current_user_optional",
     "repo.get_server_request_correlation_headers", "repo.run_with_ssr_trace",
 })
 WEB_PROFILE_CATEGORIES = frozenset({
     "other", "web_framework", "serialization_validation", "async_event_loop",
     "http_client", "crypto", "repo.workspace_api_fetch", "repo.workspace_page",
+    "react_server_render", "repo.ssr_route_module", "compiled_server_chunk",
 })
 
 
@@ -1034,6 +1730,7 @@ def _usage_summary(
     expected_units = {"api": "deadlock-api.service", "web": "deadlock-web.service"}
     expected_cgroups = {service: f"/system.slice/{unit}" for service, unit in expected_units.items()}
     run_id = str(plans["api"]["run_id"])
+    workload = str(plans["api"].get("workload"))
     for record in records:
         message: Any = record.get("MESSAGE")
         if not isinstance(message, str):
@@ -1139,10 +1836,12 @@ def _usage_summary(
                         if categories is not None else 0
                     )
                     timer = "v8_cpu"
-                end_lag_ms = start_lag_ms + elapsed_ms - ON_WINDOW_MS
+                profile_window_ms = _plan_on_window_ms(workload)
+                end_lag_ms = start_lag_ms + elapsed_ms - profile_window_ms
                 if (categories is None or total_cpu_us < 0 or total_cpu_us > 60_000_000
                         or not 0 <= start_lag_ms <= 250
-                        or not 19_750 <= elapsed_ms <= 20_500
+                        or profile_window_ms is None
+                        or not profile_window_ms - 250 <= elapsed_ms <= profile_window_ms + 500
                         or not -250 <= end_lag_ms <= 250
                         or total_cpu_us > (elapsed_ms + 250) * 1000
                         or (timer == "v8_cpu" and (sample_count is None or sample_count <= 0
@@ -1187,6 +1886,9 @@ def _usage_summary(
     for service in ("api", "web"):
         expected_count = len(targets[service])
         for phase in ("off", "on"):
+            expected_window_ms = (
+                OFF_WINDOW_MS if phase == "off" else _plan_on_window_ms(workload)
+            )
             selected = [
                 rows_for_target
                 for (event_service, _pid, event_phase), rows_for_target in events.items()
@@ -1205,7 +1907,10 @@ def _usage_summary(
                 and all(
                     0 <= item["start_lag_ms"] <= 250
                     and abs(item["end_lag_ms"]) <= 250
-                    and 19_750 <= item["window_ms"] <= 20_500
+                    and expected_window_ms is not None
+                    and expected_window_ms - 250
+                    <= item["window_ms"]
+                    <= expected_window_ms + 500
                     for item in flat
                 )
             )
@@ -1247,6 +1952,9 @@ def _usage_summary(
     profile_complete = profile_reason == "none"
     for service in ("api", "web"):
         expected_count = len(targets[service])
+        expected_profile_count = expected_count if workload in {
+            WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD,
+        } else 0
         selected = [
             rows_for_target
             for (event_service, _pid), rows_for_target in profiles.items()
@@ -1257,17 +1965,22 @@ def _usage_summary(
         duplicate_count = sum(max(0, len(values) - 1) for values in selected)
         flat_profiles = [item for values in selected for item in values]
         row_complete = (
-            len(selected) == expected_count
-            and event_count == expected_count
-            and observed_count == expected_count
+            len(selected) == expected_profile_count
+            and event_count == expected_profile_count
+            and observed_count == expected_profile_count
             and duplicate_count == 0
             and all(item["timer"] == ("thread_cpu" if service == "api" else "v8_cpu")
                     for item in flat_profiles)
             and all(0 <= item["start_lag_ms"] <= 250 for item in flat_profiles)
-            and all(19_750 <= item["elapsed_ms"] <= 20_500 for item in flat_profiles)
+            and all(
+                int(_plan_on_window_ms(workload) or 0) - 250
+                <= item["elapsed_ms"]
+                <= int(_plan_on_window_ms(workload) or 0) + 500
+                for item in flat_profiles
+            )
             and all(-250 <= item["end_lag_ms"] <= 250 for item in flat_profiles)
         )
-        if event_count < expected_count and profile_reason == "none":
+        if event_count < expected_profile_count and profile_reason == "none":
             profile_reason = "missing"
         elif duplicate_count and profile_reason == "none":
             profile_reason = "duplicate"
@@ -1445,10 +2158,11 @@ def cleanup(args: argparse.Namespace) -> dict[str, object]:
                     or payload.get("schema") != 1
                     or not isinstance(payload.get("workload"), str)
                     or payload.get("workload") not in SUPPORTED_WORKLOADS
-                    or payload.get("expires_at_ms") != payload.get("on_end_ms")
                     or any(type(payload.get(key)) is not int for key in (
                         "off_start_ms", "off_end_ms", "on_start_ms", "on_end_ms", "expires_at_ms"
-                    ))):
+                    ))
+                    or payload.get("expires_at_ms")
+                    != _plan_expiry_ms(payload["on_end_ms"], payload["workload"])):
                 raise PlanError("existing plan identity does not match cleanup request")
             if (not RUN_RE.fullmatch(payload.get("run_id", ""))
                     or not SHA_RE.fullmatch(payload.get("source_sha", ""))
@@ -1554,6 +2268,29 @@ def cleanup(args: argparse.Namespace) -> dict[str, object]:
                 "memory_rows": [],
             }
 
+        request_telemetry: dict[str, Any] | None = None
+        if getattr(args, "client_request_ids", None) is not None:
+            try:
+                if not isinstance(args.client_cohort_counts, dict):
+                    raise PlanError("request cohort is unavailable")
+                summary = _capacity_request_telemetry(
+                    plans,
+                    selected_request_ids=args.client_request_ids,
+                    cohort_counts=args.client_cohort_counts,
+                )
+                request_telemetry = {
+                    "status": (
+                        "complete" if summary.get("coverage", {}).get("complete") is True
+                        else "incomplete"
+                    ),
+                    "summary": summary,
+                }
+            except Exception:
+                request_telemetry = {
+                    "status": "incomplete",
+                    "summary": None,
+                }
+
         # Plan removal remains an exact, separately verified operation even
         # when the diagnostic journal was incomplete or unavailable.
         for service, name in PLAN_NAMES.items():
@@ -1573,11 +2310,14 @@ def cleanup(args: argparse.Namespace) -> dict[str, object]:
         os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
-    return {
+    result = {
         "status": "expired_plans_removed",
         "service_count": len(removed),
         **usage,
     }
+    if request_telemetry is not None:
+        result["request_telemetry"] = request_telemetry
+    return result
 
 
 def _read_cgroup_pseudo(path: Path, *, maximum: int) -> str:
@@ -1630,18 +2370,21 @@ def _capacity_plan_identity(
             or plan.get("run_id") != run_id or plan.get("source_sha") != source_sha
             or not isinstance(plan.get("workload"), str)
             or plan.get("workload") not in MEMORY_WATCH_WORKLOADS
-            or plan.get("expires_at_ms") != plan.get("on_end_ms")
             or any(type(plan.get(key)) is not int for key in (
                 "off_start_ms", "off_end_ms", "on_start_ms", "on_end_ms", "expires_at_ms"
-            ))):
+            ))
+            or plan.get("expires_at_ms")
+            != _plan_expiry_ms(plan["on_end_ms"], plan["workload"])):
         raise PlanError("capacity watch plan binding failed")
     if (plan["off_start_ms"] >= plan["off_end_ms"]
             or plan["off_end_ms"] >= plan["on_start_ms"]
             or plan["on_start_ms"] >= plan["on_end_ms"]
             or plan["off_end_ms"] - plan["off_start_ms"] != OFF_WINDOW_MS
             or plan["on_start_ms"] - plan["off_end_ms"] != IDLE_WINDOW_MS
-            or plan["on_end_ms"] - plan["on_start_ms"] != ON_WINDOW_MS
-            or plan["expires_at_ms"] != plan["on_end_ms"]):
+            or plan["on_end_ms"] - plan["on_start_ms"]
+            != ON_WINDOW_MS_BY_WORKLOAD.get(str(plan["workload"]))
+            or plan["expires_at_ms"]
+            != _plan_expiry_ms(plan["on_end_ms"], str(plan["workload"]))):
         raise PlanError("capacity watch plan timing is invalid")
     web_unit = _systemd_unit("web")
     targets = _service_targets("web", web_unit)
@@ -1780,6 +2523,712 @@ def _parser() -> argparse.ArgumentParser:
     subparsers.add_parser("memory-watch-stdin")
     return parser
 
+
+# Bounded HTML-to-server correlation used by the sealed diagnostic plan.
+_CAPACITY_CORR_REQUEST_PERF_RE = re.compile(r"\brequest_perf\b(?P<body>.*)$")
+_CAPACITY_CORR_SSR_PERF_RE = re.compile(r"\bssr_perf\b(?P<body>.*)$")
+_CAPACITY_CORR_SSR_STREAM_RE = re.compile(r"\bssr_stream\b(?P<body>.*)$")
+_CAPACITY_CORR_SAFE_STAGES = frozenset(
+    {
+        "http_request_start", "auth_bootstrap", "auth_bootstrap_fetch",
+        "auth_http_fetch", "auth_body_parse", "auth_projection", "auth_session",
+        "tournament_detail", "tournament_detail_data_ready", "tournament_workspace",
+        "internal_read_admission_wait", "workspace_http_fetch", "workspace_body_parse",
+        "workspace_projection", "proxy_start", "proxy_to_root_layout_start",
+        "request_to_proxy", "request_start", "root_layout_start", "root_layout",
+        "ready_check", "ready_vote", "assignment", "page_component",
+        "response_stream_start", "first_body_write_attempt", "response_finish",
+        "response_close", "response_error", "response", "other",
+    }
+)
+
+
+def _capacity_correlation_parse_fields(
+    line: str, expression: re.Pattern[str],
+) -> dict[str, str] | None:
+    match = expression.search(line)
+    if match is None:
+        return None
+    values: dict[str, str] = {}
+    for token in match.group("body").strip().split():
+        if "=" in token:
+            key, raw_value = token.split("=", 1)
+            values[key] = raw_value
+    return values
+
+
+def _capacity_correlation_parse_request_perf(line: str) -> dict[str, Any] | None:
+    values: dict[str, Any] | None = _capacity_correlation_parse_fields(
+        line, _CAPACITY_CORR_REQUEST_PERF_RE,
+    )
+    if values is None:
+        return None
+    for key, caster in (
+        ("total_ms", float), ("sql_ms", float), ("max_sql_ms", float),
+        ("pool_checkout_wait_ms", float), ("pool_connection_hold_ms", float),
+        ("compute_ms", float), ("sql_count", int),
+    ):
+        if key in values:
+            try:
+                values[key] = caster(values[key])
+            except ValueError:
+                pass
+    return values
+
+
+def _capacity_correlation_parse_ssr_perf(line: str) -> dict[str, Any] | None:
+    values: dict[str, Any] | None = _capacity_correlation_parse_fields(
+        line, _CAPACITY_CORR_SSR_PERF_RE,
+    )
+    if values is None:
+        return None
+    for key in ("start_ms", "end_ms", "duration_ms"):
+        if key not in values:
+            continue
+        try:
+            values[key] = float(values[key])
+        except ValueError:
+            pass
+    if any(
+        isinstance(values.get(key), float) and not math.isfinite(values[key])
+        for key in ("start_ms", "end_ms", "duration_ms")
+    ):
+        return None
+    if not values.get("request_id") or not values.get("stage"):
+        return None
+    return values
+
+
+def _capacity_correlation_parse_ssr_stream(line: str) -> dict[str, Any] | None:
+    values: dict[str, Any] | None = _capacity_correlation_parse_fields(
+        line, _CAPACITY_CORR_SSR_STREAM_RE,
+    )
+    if values is None:
+        return None
+    for key in (
+        "elapsed_ms", "status", "active_requests", "writable_finished",
+        "write_count", "body_bytes", "response_error",
+    ):
+        if key not in values:
+            continue
+        try:
+            values[key] = float(values[key]) if key == "elapsed_ms" else int(values[key])
+        except ValueError:
+            pass
+    if (
+        isinstance(values.get("elapsed_ms"), float)
+        and not math.isfinite(values["elapsed_ms"])
+    ):
+        return None
+    if (
+        not values.get("request_id") or not values.get("stage")
+        or not isinstance(values.get("elapsed_ms"), (int, float))
+    ):
+        return None
+    return values
+
+
+def _capacity_correlation_safe_route_class(path: object) -> str:
+    if not isinstance(path, str):
+        return "other"
+    candidate = path.split("?", 1)[0].split("#", 1)[0]
+    if "://" in candidate:
+        try:
+            candidate = urlsplit(candidate).path
+        except ValueError:
+            return "other"
+    candidate = candidate.strip().lstrip("/")
+    if candidate.startswith("api/v1/"):
+        candidate = candidate[7:]
+    elif candidate == "api/v1":
+        candidate = ""
+    if candidate == "auth/bootstrap":
+        return "auth_bootstrap"
+    if re.fullmatch(r"tournaments/[^/]+/workspace", candidate):
+        return "tournament_workspace"
+    return "other"
+
+
+def _capacity_correlation_safe_stage(value: object) -> str:
+    stage = str(value or "").strip().lower().replace("-", "_")
+    return stage if stage in _CAPACITY_CORR_SAFE_STAGES else "other"
+
+
+def _capacity_correlation_nginx_timestamp(raw_value: object) -> datetime | None:
+    if not isinstance(raw_value, str):
+        return None
+    try:
+        value = datetime.fromisoformat(raw_value)
+    except ValueError:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+_SSR_CORR_REQUEST_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_SSR_CORR_SAFE_CONTEXT_RE = re.compile(r"^[A-Za-z0-9._-]{1,96}$")
+_SSR_CORR_CF_RAY_RE = re.compile(r"^[A-Za-z0-9.-]{1,128}$")
+_SSR_CORR_DEFAULT_MAX_ROWS = 200_000
+_SSR_CORR_DEFAULT_SAMPLE_LIMIT = 1_000
+_SSR_CORR_MAX_METRIC_VALUE = 1_000_000_000.0
+_SSR_CORR_SELECTION_SCHEME = "sha256-runid-requestid-1of8-v1"
+_SSR_CORR_KNOWN_SSR_STAGES = frozenset(
+    {
+        "auth_bootstrap_fetch",
+        "tournament_workspace",
+        "tournament_detail_data_ready",
+        "http_request_start",
+        "root_layout",
+        "page_component",
+        "page_render",
+        "proxy_start",
+        "proxy_to_root_layout_start",
+        "request_to_proxy",
+    }
+)
+_SSR_CORR_KNOWN_STREAM_MILESTONES = frozenset(
+    {
+        "request_start",
+        "response_stream_start",
+        "first_body_write_attempt",
+        "response_finish",
+        "response_close",
+        "response_error",
+    }
+)
+_SSR_CORR_KNOWN_API_ROUTES = frozenset({"auth_bootstrap", "tournament_workspace"})
+
+
+def _ssr_corr_finite_nonnegative(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number) or number < 0 or number > _SSR_CORR_MAX_METRIC_VALUE:
+        return None
+    return number
+
+
+def _ssr_corr_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value or len(value) > 64:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed
+
+
+def _ssr_corr_metric(values: list[float]) -> dict[str, float | int | None]:
+    if not values:
+        return {
+            "count": 0,
+            "avg_ms": None,
+            "p50_ms": None,
+            "p95_ms": None,
+            "p99_ms": None,
+            "max_ms": None,
+        }
+    ordered = sorted(values)
+
+    def percentile(percent: float) -> float:
+        rank = (len(ordered) - 1) * percent / 100
+        lower = int(rank)
+        upper = min(lower + 1, len(ordered) - 1)
+        weight = rank - lower
+        return ordered[lower] * (1 - weight) + ordered[upper] * weight
+
+    return {
+        "count": len(ordered),
+        "avg_ms": round(sum(ordered) / len(ordered), 3),
+        "p50_ms": round(percentile(50), 3),
+        "p95_ms": round(percentile(95), 3),
+        "p99_ms": round(percentile(99), 3),
+        "max_ms": round(ordered[-1], 3),
+    }
+
+
+def _ssr_corr_scalar_metric(values: list[float]) -> dict[str, float | int | None]:
+    """Summarize dimensionless SQL-count values without millisecond labels."""
+
+    if not values:
+        return {
+            "count": 0,
+            "avg": None,
+            "p50": None,
+            "p95": None,
+            "p99": None,
+            "max": None,
+        }
+    ordered = sorted(values)
+
+    def percentile(percent: float) -> float:
+        rank = (len(ordered) - 1) * percent / 100
+        lower = int(rank)
+        upper = min(lower + 1, len(ordered) - 1)
+        weight = rank - lower
+        return ordered[lower] * (1 - weight) + ordered[upper] * weight
+
+    return {
+        "count": len(ordered),
+        "avg": round(sum(ordered) / len(ordered), 3),
+        "p50": round(percentile(50), 3),
+        "p95": round(percentile(95), 3),
+        "p99": round(percentile(99), 3),
+        "max": round(ordered[-1], 3),
+    }
+
+
+def _ssr_corr_bounded_rows(
+    rows: Iterable[Mapping[str, Any]], limit: int
+) -> tuple[list[Mapping[str, Any]], bool]:
+    selected = list(itertools.islice(iter(rows), limit + 1))
+    truncated = len(selected) > limit
+    return selected[:limit], truncated
+
+
+def _ssr_corr_context_valid(
+    row: Mapping[str, Any],
+    *,
+    run_id: str,
+    phase: str,
+    window_start: datetime,
+    window_end: datetime,
+) -> tuple[bool, str]:
+    if row.get("run_id") != run_id or row.get("phase") != phase:
+        return False, "context_mismatch"
+    if row.get("window_start_utc") != window_start.isoformat() or row.get(
+        "window_end_utc"
+    ) != window_end.isoformat():
+        # Accept the caller's equivalent Z spelling only after parsing it.
+        row_start = _ssr_corr_timestamp(row.get("window_start_utc"))
+        row_end = _ssr_corr_timestamp(row.get("window_end_utc"))
+        if row_start != window_start or row_end != window_end:
+            return False, "context_mismatch"
+    event_time = _ssr_corr_timestamp(row.get("event_at_utc"))
+    if event_time is None:
+        return False, "missing_or_invalid_timestamp"
+    if event_time < window_start or event_time > window_end:
+        return False, "outside_window"
+    return True, "ok"
+
+
+def _ssr_corr_safe_count(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def ssr_request_response_id_selection_digest(run_id: str, request_id: str) -> str | None:
+    """Return the full SHA-256 rank for an eligible-format response ID."""
+
+    if (
+        not isinstance(run_id, str)
+        or not isinstance(request_id, str)
+        or not _SSR_CORR_REQUEST_ID_RE.fullmatch(request_id)
+    ):
+        return None
+    try:
+        raw = f"{run_id}:{request_id}".encode("ascii")
+    except UnicodeEncodeError:
+        return None
+    return hashlib.sha256(raw).hexdigest()
+
+
+def is_ssr_response_id_eligible(run_id: str, request_id: str) -> bool:
+    """Apply the shared deterministic 1-in-8 diagnostic sampling predicate."""
+
+    digest = ssr_request_response_id_selection_digest(run_id, request_id)
+    return digest is not None and (int(digest[:2], 16) & 7) == 0
+
+
+def summarize_ssr_request_correlation(
+    *,
+    selected_request_ids: Iterable[object],
+    submitted_html_count: int,
+    valid_response_id_count: int,
+    eligible_response_id_count: int,
+    selection_scheme: str,
+    missing_response_id_count: int | None = None,
+    duplicate_response_id_count: int = 0,
+    malformed_response_id_count: int = 0,
+    run_id: str,
+    phase: str,
+    window_start_utc: str,
+    window_end_utc: str,
+    nginx_rows: Iterable[Mapping[str, Any]],
+    ssr_rows: Iterable[Mapping[str, Any]],
+    stream_rows: Iterable[Mapping[str, Any]],
+    api_rows: Iterable[Mapping[str, Any]],
+    rows_truncated: bool | Mapping[str, bool] = False,
+    max_rows: int = _SSR_CORR_DEFAULT_MAX_ROWS,
+    sample_limit: int = _SSR_CORR_DEFAULT_SAMPLE_LIMIT,
+    cf_ray_fallback_proven: bool = False,
+) -> dict[str, Any]:
+    """Join sampled HTML requests to Nginx, SSR, and all matching API calls.
+
+    Each source row must carry ``run_id``, ``phase``, ``window_start_utc``,
+    ``window_end_utc`` and an aware ``event_at_utc``. Request IDs are strict
+    lowercase 32-hex tokens. CF-Ray fallback is disabled unless its exact
+    equality contract has been independently established by the caller.
+
+    The ``selected_request_ids`` iterable is expected to be the caller's
+    deterministic lowest-rank sample across all eligible singleton response
+    IDs, regardless of outcome or latency. The helper validates each selected
+    ID against the shared 1-in-8 predicate, but cannot independently prove the
+    producer selected the globally lowest ranks when the eligible population
+    exceeds ``sample_limit``. Rows are bounded again here even if collection
+    already applied a limit. Timing rows outside the capture window or without
+    a valid timestamp are excluded from joins and reduce coverage. Stream
+    offsets are separate from SSR stage durations; a first-body-write attempt
+    is not evidence that bytes reached the client. The caller supplies
+    ``valid_response_id_count`` as the number of IDs belonging to exactly one
+    client request; every request involved in a duplicate-ID group belongs in
+    ``duplicate_response_id_count`` and is excluded from the selected sample.
+    """
+
+    if not isinstance(run_id, str) or not _SSR_CORR_SAFE_CONTEXT_RE.fullmatch(run_id):
+        raise ValueError("run_id is invalid")
+    if not isinstance(phase, str) or not _SSR_CORR_SAFE_CONTEXT_RE.fullmatch(phase):
+        raise ValueError("phase is invalid")
+    if selection_scheme != _SSR_CORR_SELECTION_SCHEME:
+        raise ValueError("selection_scheme is unsupported")
+    if not isinstance(max_rows, int) or isinstance(max_rows, bool) or max_rows < 1:
+        raise ValueError("max_rows must be positive")
+    if not isinstance(sample_limit, int) or isinstance(sample_limit, bool) or sample_limit < 1:
+        raise ValueError("sample_limit must be positive")
+    submitted = _ssr_corr_safe_count(submitted_html_count)
+    valid_ids = _ssr_corr_safe_count(valid_response_id_count)
+    eligible_ids = _ssr_corr_safe_count(eligible_response_id_count)
+    duplicate_ids = _ssr_corr_safe_count(duplicate_response_id_count)
+    malformed_ids = _ssr_corr_safe_count(malformed_response_id_count)
+    if (
+        submitted is None
+        or valid_ids is None
+        or eligible_ids is None
+        or duplicate_ids is None
+        or malformed_ids is None
+        or eligible_ids > valid_ids
+        or valid_ids + duplicate_ids + malformed_ids > submitted
+    ):
+        raise ValueError("cohort counts are invalid")
+    missing_ids = (
+        submitted - valid_ids - duplicate_ids - malformed_ids
+        if missing_response_id_count is None
+        else _ssr_corr_safe_count(missing_response_id_count)
+    )
+    if (
+        missing_ids is None
+        or valid_ids + missing_ids + duplicate_ids + malformed_ids != submitted
+    ):
+        raise ValueError("cohort response-ID counts must cover every submitted request")
+    window_start = _ssr_corr_timestamp(window_start_utc)
+    window_end = _ssr_corr_timestamp(window_end_utc)
+    if window_start is None or window_end is None or window_end < window_start:
+        raise ValueError("capture window is invalid")
+
+    raw_sample, selected_truncated = _ssr_corr_bounded_rows(selected_request_ids, sample_limit + 1)
+    selected_truncated = selected_truncated or len(raw_sample) > sample_limit
+    raw_sample = raw_sample[:sample_limit]
+    selected_ids: set[str] = set()
+    malformed_sample_ids = 0
+    ineligible_sample_ids = 0
+    duplicate_sample_ids = 0
+    for value in raw_sample:
+        if not isinstance(value, str) or not _SSR_CORR_REQUEST_ID_RE.fullmatch(value):
+            malformed_sample_ids += 1
+            continue
+        if not is_ssr_response_id_eligible(run_id, value):
+            ineligible_sample_ids += 1
+            continue
+        if value in selected_ids:
+            duplicate_sample_ids += 1
+            continue
+        selected_ids.add(value)
+
+    expected_sample_count = min(eligible_ids, sample_limit)
+    sample_complete = (
+        not selected_truncated
+        and len(selected_ids) == expected_sample_count
+        and malformed_sample_ids == 0
+        and ineligible_sample_ids == 0
+        and duplicate_sample_ids == 0
+    )
+
+    sources = {
+        "nginx": nginx_rows,
+        "ssr": ssr_rows,
+        "stream": stream_rows,
+        "api": api_rows,
+    }
+    bounded: dict[str, list[Mapping[str, Any]]] = {}
+    source_truncated: dict[str, bool] = {}
+    source_rejections: dict[str, Counter[str]] = {}
+    for name, rows in sources.items():
+        bounded[name], local_truncated = _ssr_corr_bounded_rows(rows, max_rows)
+        declared = (
+            bool(rows_truncated.get(name, False))
+            if isinstance(rows_truncated, Mapping)
+            else bool(rows_truncated)
+        )
+        source_truncated[name] = local_truncated or declared
+        source_rejections[name] = Counter()
+
+    valid_rows: dict[str, list[Mapping[str, Any]]] = {name: [] for name in sources}
+    for name, rows in bounded.items():
+        for row in rows:
+            valid, reason = _ssr_corr_context_valid(
+                row,
+                run_id=run_id,
+                phase=phase,
+                window_start=window_start,
+                window_end=window_end,
+            )
+            if not valid:
+                source_rejections[name][reason] += 1
+                continue
+            request_id = row.get("request_id")
+            if not isinstance(request_id, str) or not _SSR_CORR_REQUEST_ID_RE.fullmatch(request_id):
+                source_rejections[name]["malformed_request_id"] += 1
+                continue
+            valid_rows[name].append(row)
+
+    nginx_by_id: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in valid_rows["nginx"]:
+        nginx_by_id[str(row["request_id"])].append(row)
+    duplicate_nginx_ids = sum(1 for rows in nginx_by_id.values() if len(rows) > 1)
+
+    ssr_by_id: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in valid_rows["ssr"]:
+        ssr_by_id[str(row["request_id"])].append(row)
+
+    stream_by_id: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in valid_rows["stream"]:
+        stream_by_id[str(row["request_id"])].append(row)
+
+    api_by_id: dict[str, list[tuple[int, Mapping[str, Any]]]] = defaultdict(list)
+    api_by_cf_ray: dict[str, list[tuple[int, Mapping[str, Any]]]] = defaultdict(list)
+    for index, row in enumerate(valid_rows["api"]):
+        api_by_id[str(row["request_id"])].append((index, row))
+        cf_ray = row.get("cf_ray")
+        if isinstance(cf_ray, str) and _SSR_CORR_CF_RAY_RE.fullmatch(cf_ray):
+            api_by_cf_ray[cf_ray].append((index, row))
+
+    matched_nginx_ids: set[str] = set()
+    matched_ssr_ids: set[str] = set()
+    matched_stream_ids: set[str] = set()
+    matched_api_indexes: set[int] = set()
+    matched_api_parent_ids: set[str] = set()
+    matched_api_associations = 0
+    api_join_by_request_id = 0
+    api_join_by_cf_ray = 0
+    nginx_times: list[float] = []
+    ssr_by_stage: dict[str, list[float]] = defaultdict(list)
+    stream_by_milestone: dict[str, list[float]] = defaultdict(list)
+    stream_milestone_missing: Counter[str] = Counter()
+    stream_milestone_unknown = 0
+    api_by_route: dict[str, dict[str, list[float]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    api_route_row_count: Counter[str] = Counter()
+    api_metric_missing: dict[str, Counter[str]] = defaultdict(Counter)
+    for request_id in selected_ids:
+        parents = nginx_by_id.get(request_id, [])
+        if len(parents) != 1:
+            continue
+        matched_nginx_ids.add(request_id)
+        parent = parents[0]
+        request_time = _ssr_corr_finite_nonnegative(parent.get("request_time_ms"))
+        if request_time is not None:
+            nginx_times.append(request_time)
+
+        ssr_events = ssr_by_id.get(request_id, [])
+        stream_events = stream_by_id.get(request_id, [])
+        if stream_events:
+            matched_stream_ids.add(request_id)
+        if ssr_events or stream_events:
+            matched_ssr_ids.add(request_id)
+        for event in stream_events:
+            milestone = event.get("stage")
+            if not isinstance(milestone, str) or milestone not in _SSR_CORR_KNOWN_STREAM_MILESTONES:
+                stream_milestone_unknown += 1
+                continue
+            offset = _ssr_corr_finite_nonnegative(event.get("elapsed_ms"))
+            if offset is None:
+                stream_milestone_missing[milestone] += 1
+            else:
+                stream_by_milestone[milestone].append(offset)
+        if ssr_events:
+            for event in ssr_events:
+                stage = event.get("stage")
+                duration = _ssr_corr_finite_nonnegative(event.get("duration_ms"))
+                if isinstance(stage, str) and stage in _SSR_CORR_KNOWN_SSR_STAGES and duration is not None:
+                    ssr_by_stage[stage].append(duration)
+
+        # Require the client→SSR edge before accepting the SSR→API edge.
+        if not ssr_events and not stream_events:
+            continue
+
+        api_events = api_by_id.get(request_id, [])
+        if api_events:
+            api_join_by_request_id += len(api_events)
+        elif cf_ray_fallback_proven:
+            cf_ray = parent.get("cf_ray")
+            if isinstance(cf_ray, str) and _SSR_CORR_CF_RAY_RE.fullmatch(cf_ray):
+                api_events = api_by_cf_ray.get(cf_ray, [])
+                if api_events:
+                    api_join_by_cf_ray += len(api_events)
+        if api_events:
+            matched_api_parent_ids.add(request_id)
+            matched_api_associations += len(api_events)
+        for api_index, event in api_events:
+            matched_api_indexes.add(api_index)
+            route = event.get("route_class")
+            route_key = route if isinstance(route, str) and route in _SSR_CORR_KNOWN_API_ROUTES else "other"
+            api_route_row_count[route_key] += 1
+            for field in (
+                "total_ms",
+                "sql_ms",
+                "max_sql_ms",
+                "pool_checkout_wait_ms",
+                "pool_connection_hold_ms",
+                "compute_ms",
+                "sql_count",
+            ):
+                value = _ssr_corr_finite_nonnegative(event.get(field))
+                if (
+                    field == "sql_count"
+                    and value is not None
+                    and not value.is_integer()
+                ):
+                    value = None
+                if value is None:
+                    api_metric_missing[route_key][field] += 1
+                else:
+                    api_by_route[route_key][field].append(value)
+
+    source_input_rows = {name: len(rows) for name, rows in bounded.items()}
+    all_sources_complete = not any(source_truncated.values())
+    all_context_rows_valid = all(not counts for counts in source_rejections.values())
+    full_sample_coverage = (
+        sample_complete
+        and all_sources_complete
+        and all_context_rows_valid
+        and len(matched_nginx_ids) == len(selected_ids)
+        and len(matched_ssr_ids) == len(selected_ids)
+        and len(matched_stream_ids) == len(selected_ids)
+        and len(matched_api_parent_ids) == len(selected_ids)
+        and not stream_milestone_missing
+        and stream_milestone_unknown == 0
+    )
+    valid_id_coverage = (100.0 * valid_ids / submitted) if submitted else 0.0
+
+    return {
+        "schema_version": 1,
+        "phase": phase,
+        "cohort": {
+            "submitted_html_requests": submitted,
+            "valid_response_ids": valid_ids,
+            "eligible_response_ids": eligible_ids,
+            "missing_response_ids": missing_ids,
+            "duplicate_response_ids": duplicate_ids,
+            "malformed_response_ids": malformed_ids,
+            "valid_response_id_coverage_percent": round(valid_id_coverage, 3),
+            "selected_sample_limit": sample_limit,
+            "selection_scheme": selection_scheme,
+            "selected_sample_expected": expected_sample_count,
+            "selected_sample_received": len(raw_sample),
+            "selected_sample_valid": len(selected_ids),
+            "selected_sample_malformed_ids": malformed_sample_ids,
+            "selected_sample_ineligible_ids": ineligible_sample_ids,
+            "selected_sample_duplicate_ids": duplicate_sample_ids,
+            "selected_sample_complete": sample_complete,
+        },
+        "join": {
+            "matched_nginx_parents": len(matched_nginx_ids),
+            "matched_ssr_parents": len(matched_ssr_ids),
+            "matched_stream_parents": len(matched_stream_ids),
+            "matched_api_rows": matched_api_associations,
+            "matched_api_by_request_id": api_join_by_request_id,
+            "matched_api_by_cf_ray": api_join_by_cf_ray,
+            "unmatched_selected_to_nginx": len(selected_ids - matched_nginx_ids),
+            "unmatched_selected_to_ssr": len(matched_nginx_ids - matched_ssr_ids),
+            "unmatched_selected_to_stream": len(matched_nginx_ids - matched_stream_ids),
+            "unmatched_selected_to_api": len(matched_nginx_ids - matched_api_parent_ids),
+            "orphan_ssr_rows": sum(
+                1 for row in valid_rows["ssr"] if str(row["request_id"]) not in matched_nginx_ids
+            ),
+            "orphan_stream_rows": sum(
+                1 for row in valid_rows["stream"] if str(row["request_id"]) not in matched_nginx_ids
+            ),
+            "orphan_api_rows": len(valid_rows["api"]) - len(matched_api_indexes),
+            "duplicate_nginx_request_ids": duplicate_nginx_ids,
+        },
+        "timing_ms": {
+            "nginx_request": _ssr_corr_metric(nginx_times),
+            "ssr_stage": {
+                stage: _ssr_corr_metric(values)
+                for stage, values in sorted(ssr_by_stage.items())
+            },
+            "ssr_stream_milestone_elapsed_ms": {
+                milestone: _ssr_corr_metric(stream_by_milestone.get(milestone, []))
+                for milestone in sorted(_SSR_CORR_KNOWN_STREAM_MILESTONES)
+            },
+            "stream_milestone_missing_or_invalid": dict(
+                sorted(stream_milestone_missing.items())
+            ),
+            "stream_milestone_unknown_rows": stream_milestone_unknown,
+            "api_request_by_route": {
+                route: {
+                    field: (
+                        _ssr_corr_scalar_metric(values)
+                        if field == "sql_count"
+                        else _ssr_corr_metric(values)
+                    )
+                    for field in (
+                        "total_ms",
+                        "sql_ms",
+                        "max_sql_ms",
+                        "pool_checkout_wait_ms",
+                        "pool_connection_hold_ms",
+                        "compute_ms",
+                        "sql_count",
+                    )
+                    for values in (metrics.get(field, []),)
+                }
+                for route in sorted(set(api_route_row_count) | set(api_by_route))
+                for metrics in (api_by_route.get(route, {}),)
+            },
+            "api_request_rows_by_route": dict(sorted(api_route_row_count.items())),
+            "api_metric_missing_or_invalid_by_route": {
+                route: dict(sorted(fields.items()))
+                for route, fields in sorted(api_metric_missing.items())
+            },
+        },
+        "coverage": {
+            "complete": full_sample_coverage,
+            "scope": "selected_sample_only",
+            "selection_rank_proof": (
+                "all_eligible_ids_selected"
+                if eligible_ids <= sample_limit
+                else "producer_asserted_not_verifiable_from_selected_ids"
+            ),
+            "full_cohort": (
+                full_sample_coverage
+                and len(selected_ids) == submitted
+                and valid_ids == submitted
+            ),
+            "source_rows_truncated": source_truncated,
+            "source_input_rows": source_input_rows,
+            "source_rejections": {
+                name: dict(sorted(counts.items()))
+                for name, counts in source_rejections.items()
+            },
+            "cf_ray_fallback_enabled": bool(cf_ray_fallback_proven),
+        },
+    }
 
 def main(argv: list[str] | None = None) -> int:
     try:

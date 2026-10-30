@@ -12,10 +12,14 @@ from uuid import uuid4
 from sqlalchemy import event
 
 from python_packages.platform_infra.config import get_settings
-from python_packages.platform_infra.performance_diagnostic import ApiCpuDiagnostic
+from python_packages.platform_infra.performance_diagnostic import (
+    ApiCpuDiagnostic,
+    authorize_html_request_perf_capture,
+)
 
 logger = logging.getLogger("platform.performance")
 REQUEST_PERF_SAMPLE_INTERVAL = 16
+HTML_DIAGNOSTIC_REQUEST_PERF_ROWS_PER_PROCESS = 2_500
 QA_PHASE_RE = re.compile(
     r"^(?:write|browser|scale|qa|lifecycle|mass|registration|ready|captain|"
     r"auto|assignment|post|teammate|opponent|bracket|mixed|tournament|"
@@ -95,6 +99,8 @@ class RequestPerformanceMetrics:
     ready_vote_spans: dict[str, float] = field(default_factory=dict)
     diagnostic_run_id: str | None = None
     diagnostic_phase: str | None = None
+    diagnostic_request_perf_capture: bool = False
+    diagnostic_plan_bound: bool = False
 
 
 _current_metrics: ContextVar[RequestPerformanceMetrics | None] = ContextVar(
@@ -487,6 +493,27 @@ class RequestPerformanceMiddleware:
         # successful fast requests are sampled without consulting identity,
         # route, or request headers.
         self._completed_request_count = 0
+        self._diagnostic_capture_run_id: str | None = None
+        self._diagnostic_capture_rows = 0
+        self._diagnostic_capture_truncated = False
+
+    def _claim_diagnostic_capture_row(self, run_id: str | None) -> bool:
+        if run_id is None:
+            return False
+        if self._diagnostic_capture_run_id != run_id:
+            self._diagnostic_capture_run_id = run_id
+            self._diagnostic_capture_rows = 0
+            self._diagnostic_capture_truncated = False
+        if self._diagnostic_capture_rows < HTML_DIAGNOSTIC_REQUEST_PERF_ROWS_PER_PROCESS:
+            self._diagnostic_capture_rows += 1
+            return True
+        if not self._diagnostic_capture_truncated:
+            self._diagnostic_capture_truncated = True
+            logger.warning(
+                "ssr_api_request_perf_coverage run_id=%s status=truncated",
+                run_id,
+            )
+        return False
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope["type"] != "http":
@@ -494,8 +521,18 @@ class RequestPerformanceMiddleware:
             return
 
         diagnostic_plan, diagnostic_phase = ApiCpuDiagnostic.activate_for_scope(scope)
+        request_perf_plan, request_perf_phase, request_perf_eligible = authorize_html_request_perf_capture(
+            scope, plan=diagnostic_plan,
+        )
+        if request_perf_plan is not None:
+            diagnostic_plan = request_perf_plan
+            diagnostic_phase = request_perf_phase
         settings = get_settings()
-        if not settings.platform_perf_log_enabled:
+        diagnostic_capture_slot = (
+            self._claim_diagnostic_capture_row(request_perf_plan.run_id)
+            if request_perf_eligible and request_perf_plan is not None else False
+        )
+        if not settings.platform_perf_log_enabled and not diagnostic_capture_slot:
             await self.app(scope, receive, send)
             return
 
@@ -505,17 +542,26 @@ class RequestPerformanceMiddleware:
                 diagnostic_plan.run_id if diagnostic_plan is not None else None
             ),
         )
+        if request_perf_eligible:
+            # The SSR request ID is sufficient for the private exact join;
+            # avoid adding client fingerprints or edge correlation tokens.
+            cf_ray = None
         token = start_request_metrics(
             method=str(scope.get("method") or "GET"),
             path=str(scope.get("path") or ""),
             qa_phase=qa_phase_from_scope(scope),
             request_id=request_id,
             cf_ray=cf_ray,
-            client_fingerprint=_client_fingerprint(scope),
+            client_fingerprint=(
+                None if request_perf_eligible else _client_fingerprint(scope)
+            ),
             diagnostic_run_id=diagnostic_plan.run_id if diagnostic_plan is not None else None,
             diagnostic_phase=diagnostic_phase,
         )
         metrics = current_request_metrics()
+        if metrics is not None:
+            metrics.diagnostic_request_perf_capture = diagnostic_capture_slot
+            metrics.diagnostic_plan_bound = request_perf_plan is not None
         status_code = 500
 
         async def send_wrapper(message: dict[str, Any]) -> None:
@@ -605,11 +651,16 @@ class RequestPerformanceMiddleware:
                 )
             )
         )
-        should_log = policy_triggered or interval_sampled
+        should_log = (
+            policy_triggered or interval_sampled
+            or metrics.diagnostic_request_perf_capture
+        )
         if not should_log:
             return
 
-        if policy_triggered and interval_sampled:
+        if metrics.diagnostic_request_perf_capture:
+            selection_reason = "diagnostic_plan"
+        elif policy_triggered and interval_sampled:
             selection_reason = "trigger_and_interval"
         elif policy_triggered:
             selection_reason = "trigger"
@@ -617,6 +668,12 @@ class RequestPerformanceMiddleware:
             selection_reason = "interval"
 
         log_method = logger.warning if status_code >= 500 else logger.info
+        safe_diagnostic_path = route_path
+        if metrics.diagnostic_plan_bound:
+            if str(route_path).endswith("/auth/bootstrap"):
+                safe_diagnostic_path = "/api/v1/auth/bootstrap"
+            elif str(route_path).endswith("/workspace"):
+                safe_diagnostic_path = "/api/v1/tournaments/{slug}/workspace"
         log_method(
             "request_perf request_id=%s method=%s path=%s route=%s status=%s "
             "total_ms=%.2f request_ms=%.2f sql_ms=%.2f db_sql_ms=%.2f "
@@ -661,8 +718,8 @@ class RequestPerformanceMiddleware:
             "request_perf_sample_interval=%s%s",
             metrics.request_id,
             metrics.method,
-            metrics.path,
-            route_path,
+            safe_diagnostic_path if metrics.diagnostic_plan_bound else metrics.path,
+            safe_diagnostic_path,
             status_code,
             total_ms,
             total_ms,

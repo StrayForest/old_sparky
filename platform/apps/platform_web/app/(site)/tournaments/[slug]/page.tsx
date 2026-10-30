@@ -59,11 +59,9 @@ export default async function TournamentDetailPage({
       const workspaceHeaders: Record<string, string> = cookieHeader
         ? { cookie: cookieHeader }
         : {};
-      if (ssrTraceSampled) {
-        (await getServerRequestCorrelationHeaders()).forEach((value, name) => {
-          workspaceHeaders[name] = value;
-        });
-      }
+      (await getServerRequestCorrelationHeaders()).forEach((value, name) => {
+        workspaceHeaders[name] = value;
+      });
       Object.assign(
         workspaceHeaders,
         withWorkspaceDiagnosticPrearmHeader(

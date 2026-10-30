@@ -32,11 +32,6 @@ function ssrDiagnosticsEnabled(): boolean {
   return process.env.PLATFORM_SSR_PERF_LOG_ENABLED === "true";
 }
 
-function safeEpochMilliseconds(value: string | null): number | null {
-  const parsed = Number(value);
-  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
-}
-
 function contentSecurityPolicy(nonce: string): string {
   return [
     "default-src 'none'",
@@ -85,14 +80,18 @@ export function proxy(request: NextRequest) {
     // internal marker can enable trace or CPU diagnostics. Keep the existing
     // header name and never return the marker to the browser.
     requestHeaders.set(SSR_TRACE_HEADER, diagnosticRunId);
+    // The Node stream guard's earlier value is not carried through this public
+    // header boundary. Generate the trusted parent start here after stripping
+    // caller input, and reuse it for the proxy boundary.
+    const proxyStartMs = Date.now();
+    requestHeaders.set(SSR_REQUEST_START_HEADER, String(proxyStartMs));
+    requestHeaders.set(SSR_PROXY_START_HEADER, String(proxyStartMs));
   } else if (ssrDiagnosticsEnabled()) {
     const sampleKey = request.headers.get("x-request-id")
       || request.headers.get("cf-ray")
       || "unknown";
-    const requestStartedAtMs = safeEpochMilliseconds(
-      request.headers.get(SSR_REQUEST_START_HEADER)
-    ) ?? Date.now();
-    const proxyStartedAtMs = Date.now();
+    const requestStartedAtMs = Date.now();
+    const proxyStartedAtMs = requestStartedAtMs;
     requestHeaders.set(
       SSR_TRACE_HEADER,
       sampleRequest(sampleKey, boundedSampleRate()) ? "1" : "0"

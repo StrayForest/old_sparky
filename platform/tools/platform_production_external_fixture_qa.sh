@@ -173,7 +173,8 @@ fi
 if [[ -n "$fixture_kind" && "$fixture_kind" != "external_load" \
   && "$fixture_kind" != "cpu_diagnostic_only_v1" \
   && "$fixture_kind" != "ssr_capacity_diagnostic_v1" \
-  && "$fixture_kind" != "ssr_html_capacity_diagnostic_v1" ]]; then
+  && "$fixture_kind" != "ssr_html_capacity_diagnostic_v1" \
+  && "$fixture_kind" != "ssr_html_capacity_composite_diagnostic_v1" ]]; then
   echo "Fixture kind is invalid." >&2
   exit 1
 fi
@@ -275,7 +276,8 @@ validate_fixture_confirmation() {
     "$EXTERNAL_CONFIRMATION:external_load"|"$TIMEOUT_DIAGNOSTICS_CONFIRMATION:external_load"|\
       "$CPU_DIAGNOSTIC_CONFIRMATION:cpu_diagnostic_only_v1"|\
       "$SSR_CAPACITY_CONFIRMATION:ssr_capacity_diagnostic_v1"|\
-      "$SSR_CAPACITY_CONFIRMATION:ssr_html_capacity_diagnostic_v1") ;;
+      "$SSR_CAPACITY_CONFIRMATION:ssr_html_capacity_diagnostic_v1"|\
+      "$SSR_CAPACITY_CONFIRMATION:ssr_html_capacity_composite_diagnostic_v1") ;;
     *)
       echo "Fixture kind does not match its diagnostic confirmation." >&2
       return 1
@@ -353,7 +355,8 @@ export_created=1
 validate_fixture_confirmation || exit 1
 if [[ "$fixture_kind" == "cpu_diagnostic_only_v1" \
   || "$fixture_kind" == "ssr_capacity_diagnostic_v1" \
-  || "$fixture_kind" == "ssr_html_capacity_diagnostic_v1" ]] \
+  || "$fixture_kind" == "ssr_html_capacity_diagnostic_v1" \
+  || "$fixture_kind" == "ssr_html_capacity_composite_diagnostic_v1" ]] \
   && [[ -z "$run_attempt" || -z "$input_handoff_sha256" ]]; then
   echo "Typed diagnostic fixture binding is incomplete." >&2
   exit 1
@@ -500,7 +503,8 @@ if [[ "$qa_status" == "0" && -s "$external_vote_manifest" ]]; then
     "$external_vote_manifest" "$export_dir/manifest.json"
   if [[ "$fixture_kind" == "cpu_diagnostic_only_v1" \
     || "$fixture_kind" == "ssr_capacity_diagnostic_v1" \
-    || "$fixture_kind" == "ssr_html_capacity_diagnostic_v1" ]]; then
+    || "$fixture_kind" == "ssr_html_capacity_diagnostic_v1" \
+    || "$fixture_kind" == "ssr_html_capacity_composite_diagnostic_v1" ]]; then
     /usr/bin/python3.12 -I -B - \
       "$run_root" "$external_vote_manifest" "$run_id" "$run_attempt" \
       "$target_sha" "$app_target_sha" "$input_handoff_sha256" "$fixture_kind" <<'PY' || {
@@ -524,6 +528,7 @@ if (
         "cpu_diagnostic_only_v1",
         "ssr_capacity_diagnostic_v1",
         "ssr_html_capacity_diagnostic_v1",
+        "ssr_html_capacity_composite_diagnostic_v1",
     }
 ):
     raise SystemExit(1)

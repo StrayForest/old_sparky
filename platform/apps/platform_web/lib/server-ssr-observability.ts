@@ -4,7 +4,13 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { headers } from "next/headers";
 import { cache } from "react";
 import { formatWorkspaceApiErrorDiagnostic } from "@/lib/ssr-error-diagnostic";
-import { current_diagnostic_run_id } from "@/lib/performance-diagnostic-plan";
+import { isHtmlSsrCaptureEligible } from "@/lib/ssr-capture-sampling.mjs";
+import {
+  current_diagnostic_run_id,
+  currentTypedHtmlSsrDiagnosticExpiryMs,
+  isCurrentTypedHtmlSsrDiagnosticPlan,
+  runWithSsrDiagnosticPlan,
+} from "@/lib/performance-diagnostic-plan";
 import type { ServerInternalReadAdmissionObserver } from "@/lib/server-internal-read-scheduler";
 
 type SsrTrace = {
@@ -12,6 +18,8 @@ type SsrTrace = {
   cfRay: string;
   sampled: boolean;
   diagnosticRunId: string | null;
+  typedDiagnosticPlan: boolean;
+  diagnosticExpiresAtMs: number | null;
   startedAt: number;
   rootStartedAtMs: number;
   requestStartedAtMs: number | null;
@@ -35,12 +43,11 @@ const SSR_REQUEST_START_HEADER = "x-platform-ssr-request-start-ms";
 type RequestHeaderSource = Pick<Headers, "get">;
 const traceStorage = new AsyncLocalStorage<SsrTrace>();
 
-export function isSsrDiagnosticsEnabled(): boolean {
-  return enabled;
-}
-
 export function isSsrObservabilityActive(): boolean {
-  return enabled || current_diagnostic_run_id() !== null;
+  return enabled
+    || current_diagnostic_run_id() !== null
+    || isCurrentTypedHtmlSsrDiagnosticPlan()
+    || traceStorage.getStore()?.typedDiagnosticPlan === true;
 }
 
 export async function getSsrAdmissionStageObserver(): Promise<
@@ -50,7 +57,8 @@ export async function getSsrAdmissionStageObserver(): Promise<
     return undefined;
   }
   const trace = await getSsrTrace();
-  if (!trace?.sampled) {
+  if (!trace?.sampled
+      || (trace.diagnosticExpiresAtMs !== null && Date.now() > trace.diagnosticExpiresAtMs)) {
     return undefined;
   }
   return (waitMs, outcome) => recordSsrStage(
@@ -67,7 +75,8 @@ export async function getSsrAuthBodyParseObserver(): Promise<
     return undefined;
   }
   const trace = await getSsrTrace();
-  if (!trace?.sampled) {
+  if (!trace?.sampled
+      || (trace.diagnosticExpiresAtMs !== null && Date.now() > trace.diagnosticExpiresAtMs)) {
     return undefined;
   }
   return (durationMs, outcome) => recordSsrStage(
@@ -78,10 +87,9 @@ export async function getSsrAuthBodyParseObserver(): Promise<
 }
 
 export async function isSsrTraceSampled(): Promise<boolean> {
-  if (!enabled && current_diagnostic_run_id() === null) {
-    return false;
-  }
-  return (await getSsrTrace())?.sampled ?? false;
+  const trace = await getSsrTrace();
+  return Boolean(trace?.sampled
+    && (trace.diagnosticExpiresAtMs === null || Date.now() <= trace.diagnosticExpiresAtMs));
 }
 
 function boundedNumber(
@@ -116,9 +124,13 @@ function createTrace(
   requestHeaders: RequestHeaderSource
 ): SsrTrace {
   const diagnosticRunId = current_diagnostic_run_id();
+  const typedDiagnosticPlan = isCurrentTypedHtmlSsrDiagnosticPlan();
+  const requestId = safeToken(requestHeaders.get("x-request-id"), "unknown");
   const traceMarker = requestHeaders.get(SSR_TRACE_HEADER);
   const sampled = diagnosticRunId !== null
-    ? true
+    ? typedDiagnosticPlan
+      ? isHtmlSsrCaptureEligible(diagnosticRunId, requestId)
+      : true
     : traceMarker === "1"
     ? true
     : traceMarker === "0"
@@ -126,10 +138,12 @@ function createTrace(
       : Math.random() < sampleRate;
   return {
     // Nginx owns request_id. Public timeout metadata never enters this trace.
-    requestId: safeToken(requestHeaders.get("x-request-id"), "unknown"),
+    requestId,
     cfRay: safeToken(requestHeaders.get("cf-ray"), "unknown"),
     sampled,
     diagnosticRunId,
+    typedDiagnosticPlan,
+    diagnosticExpiresAtMs: currentTypedHtmlSsrDiagnosticExpiryMs(),
     startedAt,
     rootStartedAtMs,
     requestStartedAtMs: epochMilliseconds(requestHeaders.get(SSR_REQUEST_START_HEADER)),
@@ -142,12 +156,12 @@ function createTrace(
 // then lets descendant Server Components reuse the same safe trace if React
 // resumes them outside that callback.
 const getSsrTrace = cache(async (): Promise<SsrTrace | null> => {
-  if (!enabled && current_diagnostic_run_id() === null) {
-    return null;
-  }
   const inheritedTrace = traceStorage.getStore();
   if (inheritedTrace) {
     return inheritedTrace;
+  }
+  if (!isSsrObservabilityActive()) {
+    return null;
   }
   let requestHeaders: Awaited<ReturnType<typeof headers>> | null = null;
   try {
@@ -160,25 +174,48 @@ const getSsrTrace = cache(async (): Promise<SsrTrace | null> => {
 });
 
 export async function runWithSsrTrace<T>(
-  startedAt: number,
-  rootStartedAtMs: number,
   requestHeaders: RequestHeaderSource,
   operation: () => Promise<T>
 ): Promise<T> {
-  if (!enabled || traceStorage.getStore()) {
+  if (traceStorage.getStore()) {
     return operation();
   }
-  const trace = createTrace(startedAt, rootStartedAtMs, requestHeaders);
-  return traceStorage.run(trace, async () => {
-    // Seed React's request-local cache while the trace context is available.
-    await getSsrTrace();
+  const hasDiagnosticCandidate = /^[0-9a-f]{32}$/u.test(
+    requestHeaders.get("x-platform-ssr-trace") ?? "",
+  );
+  if (!enabled && !hasDiagnosticCandidate) {
     return operation();
+  }
+  return runWithSsrDiagnosticPlan(requestHeaders, async () => {
+    if (!isSsrObservabilityActive()) {
+      return operation();
+    }
+    // Start clocks only after the server has activated observability or
+    // validated the private diagnostic plan. Ordinary requests stay unmeasured.
+    const typedPlan = isCurrentTypedHtmlSsrDiagnosticPlan();
+    const diagnosticRunId = current_diagnostic_run_id();
+    const requestId = safeToken(requestHeaders.get("x-request-id"), "unknown");
+    const captureSelected = typedPlan
+      && diagnosticRunId !== null
+      && isHtmlSsrCaptureEligible(diagnosticRunId, requestId);
+    const startedAt = typedPlan && !captureSelected ? 0 : performance.now();
+    const rootStartedAtMs = typedPlan && !captureSelected ? 0 : Date.now();
+    const trace = createTrace(startedAt, rootStartedAtMs, requestHeaders);
+    return traceStorage.run(trace, async () => {
+      // Seed React's request-local cache while the trace context is available.
+      await getSsrTrace();
+      return operation();
+    });
   });
 }
 
 export async function getServerRequestCorrelationHeaders(): Promise<Headers> {
   const trace = await getSsrTrace();
-  if (!trace?.sampled) {
+  if (!trace
+      || (!trace.sampled && !trace.typedDiagnosticPlan)
+      || (trace.typedDiagnosticPlan && trace.diagnosticRunId === null)
+      || (trace.typedDiagnosticPlan && trace.diagnosticExpiresAtMs === null)
+      || (trace.diagnosticExpiresAtMs !== null && Date.now() > trace.diagnosticExpiresAtMs)) {
     return new Headers();
   }
 
@@ -196,6 +233,11 @@ export async function getServerRequestCorrelationHeaders(): Promise<Headers> {
     }
   }
   correlationHeaders.set(SSR_TRACE_HEADER, trace.diagnosticRunId ?? "1");
+  if (trace.typedDiagnosticPlan
+      && trace.diagnosticRunId !== null
+      && trace.requestStartedAtMs !== null) {
+    correlationHeaders.set(SSR_REQUEST_START_HEADER, String(trace.requestStartedAtMs));
+  }
   return correlationHeaders;
 }
 
@@ -207,7 +249,8 @@ function recordSsrSpan(
   durationMs: number,
   outcome: "ok" | "error"
 ): void {
-  if (!trace.sampled) {
+  if (!trace.sampled
+      || (trace.diagnosticExpiresAtMs !== null && Date.now() > trace.diagnosticExpiresAtMs)) {
     return;
   }
   const safeStage = safeToken(stage, "unknown");
@@ -225,13 +268,15 @@ export async function recordSsrStage(
   durationMs: number,
   outcome: "ok" | "error" = "ok"
 ): Promise<void> {
-  if (!enabled && current_diagnostic_run_id() === null) {
+  if (!isSsrObservabilityActive()) {
     return;
   }
   const trace = await getSsrTrace();
   if (!trace) {
     return;
   }
+  if (!trace.sampled
+      || (trace.diagnosticExpiresAtMs !== null && Date.now() > trace.diagnosticExpiresAtMs)) return;
   const endMs = Math.max(0, performance.now() - trace.startedAt);
   const boundedDurationMs = Math.max(0, Number(durationMs) || 0);
   recordSsrSpan(
@@ -249,13 +294,15 @@ export async function recordSsrPoint(
   offsetMs?: number,
   outcome: "ok" | "error" = "ok"
 ): Promise<void> {
-  if (!enabled && current_diagnostic_run_id() === null) {
+  if (!isSsrObservabilityActive()) {
     return;
   }
   const trace = await getSsrTrace();
   if (!trace) {
     return;
   }
+  if (!trace.sampled
+      || (trace.diagnosticExpiresAtMs !== null && Date.now() > trace.diagnosticExpiresAtMs)) return;
   const pointMs = offsetMs === undefined
     ? Math.max(0, performance.now() - trace.startedAt)
     : Math.max(0, offsetMs);
@@ -264,11 +311,14 @@ export async function recordSsrPoint(
 
 export async function recordSsrWorkspaceApiError(status: number): Promise<void> {
   const diagnosticRunId = current_diagnostic_run_id();
-  if (diagnosticRunId === null && (!enabled || !workspaceErrorDiagnosticEnabled)) {
+  if (diagnosticRunId === null
+      && traceStorage.getStore()?.typedDiagnosticPlan !== true
+      && (!enabled || !workspaceErrorDiagnosticEnabled)) {
     return;
   }
   const trace = await getSsrTrace();
-  if (!trace?.sampled) {
+  if (!trace?.sampled
+      || (trace.diagnosticExpiresAtMs !== null && Date.now() > trace.diagnosticExpiresAtMs)) {
     return;
   }
   const record = formatWorkspaceApiErrorDiagnostic({
@@ -284,7 +334,8 @@ export async function recordSsrWorkspaceApiError(status: number): Promise<void> 
 
 export async function recordSsrRequestTimeline(): Promise<void> {
   const trace = await getSsrTrace();
-  if (!trace || !trace.sampled) {
+  if (!trace || !trace.sampled
+      || (trace.diagnosticExpiresAtMs !== null && Date.now() > trace.diagnosticExpiresAtMs)) {
     return;
   }
   const requestOffsetMs = trace.requestStartedAtMs === null
@@ -337,7 +388,16 @@ export async function measureSsrStage<T>(
   stage: string,
   operation: () => Promise<T>
 ): Promise<T> {
-  if (!enabled && current_diagnostic_run_id() === null) {
+  if (!isSsrObservabilityActive()) {
+    return operation();
+  }
+  if (traceStorage.getStore()?.sampled === false) {
+    return operation();
+  }
+  const trace = traceStorage.getStore();
+  if (trace?.diagnosticExpiresAtMs !== null
+      && trace?.diagnosticExpiresAtMs !== undefined
+      && Date.now() > trace.diagnosticExpiresAtMs) {
     return operation();
   }
   const startedAt = performance.now();

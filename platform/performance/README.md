@@ -2,13 +2,118 @@
 
 - Status: Active reference
 - Owner: Platform performance
-- Last reviewed: 2026-10-25
+- Last reviewed: 2026-10-29
 
 The top-level JSON files in `profiles/` are the only authored canonical load
 contracts (schema 2). `tools/platform_load.py` validates, fingerprints and
 dispatches them; `tools/platform_external_load.py` remains the external HTTP
 implementation detail. `tools/platform_load_acceptance.py` owns the shared
 SLO, capacity, spike and stress decisions.
+
+## SSR C32 comparison checkpoint (2026-10-29)
+
+The retained comparison contains four accepted rows in the A1/B1/A2/B2
+sequence. Together they completed `2,484/2,484` HTTP 200 responses: A1 `616`,
+B1 `648`, A2 `600`, and B2 `620`. The B candidate did not meet the required
+pairwise improvement threshold, so the comparison does not show a performance
+gain. No capacity ceiling can be inferred from these rows.
+The final B2 run [40786898526](https://github.com/StrayForest/old_sparky/actions/runs/40786898526)
+generated `620` HTML requests in its SSR-capacity diagnostic; its regular
+external client job was skipped and exact fixture cleanup passed.
+
+For the accepted 20-second request windows, host CPU samples were filtered to
+the report's actual request start/finish timestamps (19/18/19 one-second
+samples for A1/B1/A2/B2). Mean CPU use on host CPUs 0/1 was 91.3/90.5% for A1,
+93.5/93.5% for B1, 90.4/89.0% for A2, and 91.3/90.1% for B2. Per-core maxima
+were 100% for A1/B1/A2 and 99.1% for B2; steal was zero in all four windows.
+These short observations show CPU-heavy plateaus, not sustained utilization
+or an absolute capacity limit. The API process group plus web process used
+about `1.4` CPU cores across the four windows; the API row sums two workers
+and retains only minimum/maximum worker durations, so this is approximate and
+does not represent total host CPU. PostgreSQL used about `0.11` CPU cores. API
+and web were the main measured process CPU consumers.
+
+SSR sampling recorded `638/674/624/652` requests for A1/B1/A2/B2, with
+`626/670/624/641` page-stage rows. `workspace_http_fetch` p95 was
+`402/395/401/408 ms`; JSON parse was `0.85/1.22/0.98/1.24 ms` and projection
+was `0.15/0.12/0.11/0.09 ms`. JSON parsing and projection were small in these
+samples. These nested SSR stage times are broad aggregates, not active-window
+request percentiles or CPU durations. No SSR auth-bootstrap stage,
+root-layout/React tail duration, or function-level profile was captured;
+broader API diagnostics record auth-bootstrap separately. API
+request-performance recorded `147/161/148/153` samples, with only `66–80`
+partial SSR joins; B2's API samples split into `80` workspace and `73`
+auth-bootstrap rows. These records are not timestamped to the active request
+window. No CPU stacks, event-loop samples, or GC samples were captured. The B
+transport selector applies to `/auth/bootstrap`; the tournament workspace
+request remains on the shared `platformFetch` path. The evidence does not
+justify a workspace transport change or another code-level fix.
+
+The retained A1/B1/A2/B2 PostgreSQL observer artifacts were collected before the
+query-identity correction. That collector mapped null or nonnumeric query IDs to
+a shared `other` identifier, so distinct statements could collide in their
+query-ID-keyed deltas; those historical rows are not per-statement interval
+costs and are not retroactively revalidated by this change. The reviewed
+candidate collector retains validated numeric `queryid` values, excludes
+invalid or ambiguous identities instead of merging them, and marks coverage
+incomplete when the top-500 snapshot or unknown identities prevent a complete
+pairing.
+The public `other` query category is a category label, not an identifier. This
+candidate fix has not been deployed; it improves observer correctness but does
+not prove an application bottleneck or a specific performance gain.
+
+Private analysis reference: `retained-resource-attribution-20261029.md`,
+SHA-256 `612026f8cde27f2a5b977866d6e0ccae442497e15ece36dedc18f645e8a109c9`.
+The report remains outside this repository.
+
+Offline analysis is complete. After implementation and evidence review, the
+next authorized measurement is the strict composite contract
+`authenticated_html_ssr_capacity_120s_plus_cpu_profile_20s_v1`: the same
+authenticated HTML fixture, A/fetch path, API 2/web 1, admission 24 with at most
+8 waiters per API worker, C32 concurrency, and 14-actor fixture. Its capacity
+plan `authenticated_html_ssr_capacity_120s_v1` runs OFF 20 seconds, GAP 5
+seconds, and ON 120 seconds without profiling. After a five-second quiet gap,
+the separate `authenticated_html_ssr_cpu_profile_20s_v1` plan runs OFF 20
+seconds, GAP 5 seconds, and ON 20 seconds with V8/Python profiling; that
+profiled phase is attribution-only. Its latency and CPU values earn no capacity
+credit, and profiler overhead is not separately estimated. The legacy plan's
+20-second expiry remains unchanged; the new plan expires 15 seconds after ON
+ends. At the web,
+API and client boundaries, deterministic request selection hashes ASCII
+`run_id:request_id` with SHA-256 and selects one in eight from the low three
+bits. Each parent-plan cap is 1,000 requests. Correlation covers the full
+submitted ON-start HTTP cohort, including late, failed and drain-completed
+requests; phase-scoped API events join one-to-many to requests using private
+identifiers, which are not included in public summaries. Measured phases total
+195 seconds, plus about 52 seconds of lead per plan, preparation, draining, and
+canonical cleanup under a 600-second outer deadline. C64 remains forbidden.
+Interpret a capacity result only when the full planned ON cohort completes
+with all HTTP 200s, zero errors, complete request identity/timing and CPU/memory
+evidence, and canonical cleanup passes; otherwise classify it inconclusive or
+aborted. Treat the 120-second ON phase descriptively: report full-window
+latency/error and CPU aggregates, and an interval trend only when timestamped
+samples are available. Current typed telemetry has aggregate OFF/ON CPU rows,
+not first/last 20-second CPU subwindows. These results are not an SLO. The origin guard samples the
+`deadlock-web.service` cgroup every 250 ms, requires its fixed 1 GiB memory
+limit and identity, and aborts at 768 MiB current usage, any increase in
+`high`, `max`, `oom`, `oom_kill` or `oom_group_kill` counters, or a collection
+or identity failure. Each client request has a 5-second timeout; a failed
+response aborts the phase. The supervisor ceilings are 225 seconds for the
+120-second plan and 125 seconds for the 20-second plan. Swap is not measured
+or guarded by this experiment; cgroup identity checks do not make it a swap
+test. These measurements do not establish an SLO, an absolute capacity ceiling,
+an optimal architecture, or a proven application fix target.
+The run remains blocked until the production disk admission requirement in
+[current state](../docs/CURRENT.md) is satisfied; no deployment or load run is
+currently authorized.
+
+After B2, the production runtime was restored to A. The final deployment was
+run [`40788852387`](https://github.com/StrayForest/old_sparky/actions/runs/40788852387).
+The last retained status observation, at `2026-10-29T04:28Z`, recorded A
+restored with API `2`, web `1`, and authenticated-read admission concurrency
+`24` with a maximum of `8` waiters per API worker. It is timestamped, not a
+fresh health check. Later storage and maintenance readiness findings are owned
+by [current state](../docs/CURRENT.md).
 
 ## Authenticated-page load comparison (2026-10-24)
 

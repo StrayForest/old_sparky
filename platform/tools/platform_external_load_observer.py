@@ -1101,34 +1101,75 @@ async def postgres_statement_snapshot() -> dict[str, object]:
                 await db_session.execute(
                     text(
                         """
-                        SELECT
-                            queryid::text AS queryid,
-                            calls::bigint AS calls,
-                            total_exec_time::double precision AS total_exec_ms,
-                            mean_exec_time::double precision AS mean_exec_ms,
-                            rows::bigint AS rows,
-                            shared_blks_hit::bigint AS shared_blks_hit,
-                            shared_blks_read::bigint AS shared_blks_read,
-                            temp_blks_written::bigint AS temp_blks_written
-                        FROM pg_stat_statements
-                        WHERE dbid = (
-                            SELECT oid FROM pg_database WHERE datname = current_database()
+                        WITH statement_rows AS (
+                            SELECT
+                                queryid,
+                                SUM(calls)::bigint AS calls,
+                                SUM(total_exec_time)::double precision AS total_exec_ms,
+                                SUM(rows)::bigint AS rows,
+                                SUM(shared_blks_hit)::bigint AS shared_blks_hit,
+                                SUM(shared_blks_read)::bigint AS shared_blks_read,
+                                SUM(temp_blks_written)::bigint AS temp_blks_written
+                            FROM pg_stat_statements
+                            WHERE dbid = (
+                                SELECT oid FROM pg_database WHERE datname = current_database()
+                            )
+                            GROUP BY queryid
+                        ), ranked_rows AS (
+                            SELECT
+                                *,
+                                COUNT(*) OVER () AS total_rows,
+                                COUNT(*) FILTER (WHERE queryid IS NULL) OVER ()
+                                    AS unknown_identity_groups
+                            FROM statement_rows
+                            ORDER BY total_exec_ms DESC NULLS LAST
+                            LIMIT 501
                         )
-                        ORDER BY total_exec_time DESC
-                        LIMIT 500
+                        SELECT
+                            ranked_rows.queryid::text AS queryid,
+                            ranked_rows.calls,
+                            ranked_rows.total_exec_ms,
+                            CASE WHEN ranked_rows.calls > 0
+                                THEN ranked_rows.total_exec_ms / ranked_rows.calls
+                                ELSE 0
+                            END AS mean_exec_ms,
+                            ranked_rows.rows,
+                            ranked_rows.shared_blks_hit,
+                            ranked_rows.shared_blks_read,
+                            ranked_rows.temp_blks_written,
+                            ranked_rows.total_rows,
+                            ranked_rows.unknown_identity_groups,
+                            pg_stat_statements_info.stats_reset::text AS stats_reset,
+                            pg_stat_statements_info.dealloc::bigint AS dealloc
+                        FROM pg_stat_statements_info
+                        LEFT JOIN ranked_rows ON TRUE
+                        ORDER BY ranked_rows.total_exec_ms DESC NULLS LAST
                         """
                     )
                 )
             ).mappings().all()
-        selected = []
+        selected: list[dict[str, object]] = []
+        total_rows = 0
+        unknown_identity_groups = 0
+        stats_reset = None
+        dealloc = None
         for row in rows:
+            if row.get("stats_reset") is not None:
+                stats_reset = str(row["stats_reset"])
+            if row.get("dealloc") is not None:
+                dealloc = int(row["dealloc"])
+            if row.get("total_rows") is not None:
+                total_rows = int(row["total_rows"])
+            if row.get("unknown_identity_groups") is not None:
+                unknown_identity_groups = int(row["unknown_identity_groups"])
+            queryid = row.get("queryid")
+            if queryid is None or re.fullmatch(r"-?[0-9]+", str(queryid)) is None:
+                continue
+            if len(selected) >= 500:
+                continue
             selected.append(
                 {
-                    "queryid": (
-                        str(row["queryid"])
-                        if re.fullmatch(r"-?[0-9]+", str(row.get("queryid") or ""))
-                        else "other"
-                    ),
+                    "queryid": str(queryid),
                     "query_category": safe_query_category("other"),
                     "backend": "postgres",
                     "calls": int(row["calls"] or 0),
@@ -1140,7 +1181,21 @@ async def postgres_statement_snapshot() -> dict[str, object]:
                     "temp_blks_written": int(row["temp_blks_written"] or 0),
                 }
             )
-        return {"available": True, "rows": selected}
+        truncated = total_rows > 500
+        snapshot = {
+            "available": stats_reset is not None and dealloc is not None,
+            "rows": selected,
+            "stats_reset": stats_reset,
+            "dealloc": dealloc,
+            "total_rows": total_rows,
+            "truncated": truncated,
+            "unknown_identity_groups": unknown_identity_groups,
+            "complete": not truncated and unknown_identity_groups == 0,
+        }
+        if not snapshot["available"]:
+            snapshot["error_class"] = "other"
+            snapshot["reason"] = "reset_metadata_unavailable"
+        return snapshot
     except Exception as exc:
         return {"available": False, "error_class": safe_error_class(type(exc).__name__), "rows": []}
 
@@ -1383,42 +1438,170 @@ def postgres_statement_delta(
     after: dict[str, object],
 ) -> dict[str, object]:
     if not before.get("available") or not after.get("available"):
-        return {"available": False, "rows": []}
-    before_rows = {
-        str(row["queryid"]): row
-        for row in before.get("rows", [])
-        if isinstance(row, dict)
-    }
+        return {"available": False, "complete": False, "reason": "snapshot_unavailable", "rows": []}
+    before_reset = before.get("stats_reset")
+    after_reset = after.get("stats_reset")
+    if not isinstance(before_reset, str) or not isinstance(after_reset, str):
+        return {
+            "available": False,
+            "complete": False,
+            "reason": "reset_metadata_unavailable",
+            "rows": [],
+        }
+    if before_reset != after_reset:
+        return {"available": False, "complete": False, "reason": "statistics_reset", "rows": []}
+    before_dealloc = safe_int(before.get("dealloc"))
+    after_dealloc = safe_int(after.get("dealloc"))
+    if before_dealloc is None or after_dealloc is None:
+        return {
+            "available": False,
+            "complete": False,
+            "reason": "deallocation_metadata_unavailable",
+            "rows": [],
+        }
+    if after_dealloc < before_dealloc:
+        return {"available": False, "complete": False, "reason": "counter_regression", "rows": []}
+    if after_dealloc > before_dealloc:
+        return {"available": False, "complete": False, "reason": "statement_eviction", "rows": []}
+
+    def index_rows(
+        snapshot: dict[str, object],
+    ) -> tuple[dict[str, dict[str, object]], int, int]:
+        candidates: dict[str, list[dict[str, object]]] = defaultdict(list)
+        invalid = 0
+        for row in snapshot.get("rows", []):
+            if not isinstance(row, dict):
+                invalid += 1
+                continue
+            queryid = row.get("queryid")
+            normalized_queryid = _valid_queryid(queryid)
+            if normalized_queryid is None:
+                invalid += 1
+                continue
+            candidates[normalized_queryid].append(row)
+        indexed = {key: values[0] for key, values in candidates.items() if len(values) == 1}
+        ambiguous = sum(len(values) for values in candidates.values() if len(values) > 1)
+        return indexed, ambiguous, invalid
+
+    before_rows, before_ambiguous, before_invalid = index_rows(before)
+    after_rows, after_ambiguous, after_invalid = index_rows(after)
+    before_unknown = max(0, safe_int(before.get("unknown_identity_groups")) or 0) + before_invalid
+    after_unknown = max(0, safe_int(after.get("unknown_identity_groups")) or 0) + after_invalid
+    before_complete = (
+        before.get("complete") is True
+        and before.get("truncated") is False
+        and before_unknown == 0
+        and before_ambiguous == 0
+    )
+    before_total = safe_int(before.get("total_rows"))
+    before_complete = before_complete and before_total is not None and before_total == (
+        len(before_rows) + before_unknown
+    )
+
     delta_rows = []
-    for row in after.get("rows", []):
-        if not isinstance(row, dict):
-            continue
-        key = str(row["queryid"])
-        previous = before_rows.get(key, {})
-        calls = max(0, int(row.get("calls", 0)) - int(previous.get("calls", 0)))
-        total_ms = max(
-            0.0,
-            float(row.get("total_exec_ms", 0)) - float(previous.get("total_exec_ms", 0)),
-        )
+    after_only_rows = 0
+    excluded_after_only_rows = 0
+    matched_rows = 0
+    counter_fields = (
+        "calls",
+        "total_exec_ms",
+        "rows",
+        "shared_blks_hit",
+        "shared_blks_read",
+        "temp_blks_written",
+    )
+    for key, row in after_rows.items():
+        previous = before_rows.get(key)
+        if previous is None:
+            after_only_rows += 1
+            if not before_complete:
+                excluded_after_only_rows += 1
+                continue
+            previous = {}
+        else:
+            matched_rows += 1
+        deltas: dict[str, int | float] = {}
+        for field in counter_fields:
+            current = row.get(field, 0)
+            prior = previous.get(field, 0)
+            try:
+                current_number = float(current) if field == "total_exec_ms" else int(current)
+                prior_number = float(prior) if field == "total_exec_ms" else int(prior)
+            except (TypeError, ValueError, OverflowError):
+                return {
+                    "available": False,
+                    "complete": False,
+                    "reason": "counter_unavailable",
+                    "rows": [],
+                }
+            if current_number < prior_number:
+                return {
+                    "available": False,
+                    "complete": False,
+                    "reason": "counter_regression",
+                    "rows": [],
+                }
+            deltas[field] = current_number - prior_number
+        calls = int(deltas["calls"])
+        total_ms = float(deltas["total_exec_ms"])
         if calls == 0 and total_ms == 0:
             continue
         delta = {
-            "queryid": (
-                str(row.get("queryid"))
-                if re.fullmatch(r"-?[0-9]+", str(row.get("queryid") or ""))
-                else "other"
-            ),
+            "queryid": key,
             "query_category": safe_query_category(row.get("query_category")),
             "backend": "postgres",
             "calls": calls,
             "total_exec_ms": round(total_ms, 6),
             "mean_exec_ms": round(total_ms / calls, 6) if calls else 0.0,
         }
-        for field in ("rows", "shared_blks_hit", "shared_blks_read", "temp_blks_written"):
-            delta[field] = max(0, int(row.get(field, 0)) - int(previous.get(field, 0)))
+        for field in counter_fields[2:]:
+            delta[field] = int(deltas[field])
         delta_rows.append(delta)
     delta_rows.sort(key=lambda row: float(row["total_exec_ms"]), reverse=True)
-    return {"available": True, "rows": delta_rows}
+    after_truncated = after.get("truncated") is True
+    after_ambiguous = after_ambiguous > 0
+    after_total = safe_int(after.get("total_rows"))
+    after_complete = (
+        after.get("complete") is True
+        and not after_truncated
+        and after_unknown == 0
+        and not after_ambiguous
+        and after_total is not None
+        and after_total == len(after_rows) + after_unknown
+    )
+    complete = (
+        before_complete
+        and after_complete
+        and excluded_after_only_rows == 0
+    )
+    return {
+        "available": True,
+        "complete": complete,
+        "reason": "complete" if complete else "partial_coverage",
+        "rows": delta_rows,
+        "matched_rows": matched_rows,
+        "after_only_rows": after_only_rows,
+        "excluded_after_only_rows": excluded_after_only_rows,
+        "unknown_identity_groups": before_unknown + after_unknown,
+        "before_unknown_identity_groups": before_unknown,
+        "after_unknown_identity_groups": after_unknown,
+        "before_truncated": before.get("truncated") is True,
+        "after_truncated": after_truncated,
+        "ambiguous_rows": before_ambiguous + after_ambiguous,
+    }
+
+
+def _valid_queryid(value: object) -> str | None:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return None
+    raw = str(value)
+    if re.fullmatch(r"-?[0-9]{1,19}", raw) is None:
+        return None
+    try:
+        number = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return str(number) if -(2**63) <= number <= (2**63 - 1) else None
 
 
 _SAFE_PROCESS_LABELS = frozenset(
