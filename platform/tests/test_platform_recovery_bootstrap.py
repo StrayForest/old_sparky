@@ -50,6 +50,7 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         ".github/workflows/platform-production-recovery-bootstrap-publish.yml",
         ".github/workflows/platform-production-release-abort.yml",
         ".github/workflows/platform-production-release-recover.yml",
+        ".github/workflows/platform-production-retained-load-abort.yml",
         "platform/contracts/host_tools_pin.json",
         "platform/alembic/env.py",
         "platform/deploy/systemd/deadlock-cloudflare-ips.service",
@@ -67,6 +68,7 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/tests/test_platform_db.py",
         "platform/tests/test_platform_recovery_bootstrap.py",
         "platform/tests/test_platform_recovery_workflow_caller.py",
+        "platform/tests/test_platform_secret_artifact_boundary.py",
         "platform/tests/test_platform_release_audit_hardening.py",
         "platform/tests/test_platform_release_build_contract.py",
         "platform/tests/test_platform_release_build_diagnostics.py",
@@ -79,6 +81,7 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/tests/test_platform_cloudflare_ips.py",
         "platform/tests/test_platform_install_nginx.py",
         "platform/tools/platform_abort_retained_only.sh",
+        "platform/tools/platform_abort_retained_load.py",
         "platform/tools/platform_build_live_qa_runtime.py",
         "platform/tools/platform_install_nginx.py",
         "platform/tools/platform_install_logging.sh",
@@ -112,9 +115,9 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/python_packages/platform_infra/db.py",
     }
 )
-RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 67
+RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 70
 RECOVERY_BOOTSTRAP_PATCH_FILE_DIGEST = (
-    "523c8876a083c34a3b5a3aa5b040825b194b5ed3c55327f55d99ba86572f7d4e"
+    "2c2d23737deaa35e82c0ecfdeef6c4d7436203588ecced8723956fdf948a6d22"
 )
 
 # These paths are deliberately present in the recovery route allowlist but are

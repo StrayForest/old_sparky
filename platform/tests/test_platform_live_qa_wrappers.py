@@ -4638,7 +4638,15 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("      load_run_attempt:", abort)
         self.assertIn("LOAD_RUN_ATTEMPT: ${{ inputs.load_run_attempt }}", abort)
-        self.assertIn('"$QA_CONFIRMATION" "$TARGET_SHA" "$LOAD_RUN_ID" "$LOAD_RUN_ATTEMPT"', abort)
+        remote_invocation = abort.split("sudo -n -- /usr/bin/bash -s --", 1)[1]
+        remote_invocation = remote_invocation.split("<<'REMOTE'", 1)[0]
+        normalized_invocation = " ".join(remote_invocation.replace("\\\n", " ").split())
+        self.assertIn(
+            '"$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$HELPER_SHA256" '
+            '"$HELPER_SOURCE_SHA" "$TARGET_SHA" "$LOAD_RUN_ID" '
+            '"$LOAD_RUN_ATTEMPT" "$QA_CONFIRMATION"',
+            normalized_invocation,
+        )
         for source, marker, next_step, fields in (
             (
                 external,
