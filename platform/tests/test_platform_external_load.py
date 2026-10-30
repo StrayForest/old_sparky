@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stdout
+import argparse
 import http.client
 import gzip
 import json
+from io import BytesIO, StringIO
+import textwrap
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
@@ -20,7 +23,11 @@ from urllib.error import HTTPError
 from unittest.mock import Mock, patch
 
 import tools.platform_external_load as external_load
+import tools.platform_cpu_diagnostic_pair as cpu_diagnostic_pair
 import tools.platform_ssr_capacity_diagnostic as capacity_diagnostic
+import tools.platform_workflow_remote_dispatch as remote_dispatch
+import tools.platform_workflow_input_guard as workflow_input_guard
+from tools import platform_cpu_diagnostic_plan as cpu_plan
 from tools.platform_evidence_sanitizer import project_public_artifact
 from tools.platform_external_load import (
     ExternalLoadError,
@@ -181,6 +188,620 @@ def load_manifest_from_payload(
 
 
 class ExternalLoadTests(unittest.TestCase):
+    def test_dispatcher_projects_typed_120s_memory_rows_and_rejects_wrong_window(self) -> None:
+        for workload, on_window_ms in (
+            (capacity_diagnostic.HTML_CAPACITY_120S_WORKLOAD, 120_000),
+            (capacity_diagnostic.HTML_CPU_PROFILE_20S_WORKLOAD, 20_000),
+        ):
+            with self.subTest(workload=workload):
+                off_start_ms = 1_000_000
+                plan = {
+                    "off_start_ms": off_start_ms, "off_end_ms": off_start_ms + 20_000,
+                    "on_start_ms": off_start_ms + 25_000,
+                    "on_end_ms": off_start_ms + 25_000 + on_window_ms,
+                }
+
+                def row_source(*, wrong_window: bool) -> str:
+                    return f"#!{sys.executable}\n" + textwrap.dedent(f"""\
+                        import json, sys
+                        request = json.loads(sys.stdin.buffer.readline())
+                        prefix = {remote_dispatch.CAPACITY_MEMORY_WATCH_ROW_PREFIX!r}
+                        plan = {plan!r}
+                        timestamps = [plan["on_start_ms"] + min(20_000, {on_window_ms - 1}), plan["on_end_ms"]]
+                        for sequence, sampled_at in enumerate(timestamps, start=1):
+                            complete = sequence == 2
+                            end = plan["on_end_ms"] - (1 if {wrong_window!r} else 0)
+                            row = {{
+                                "schema": 1, "run_id": request["run_id"],
+                                "source_sha": request["source_sha"], "workload": request["workload"],
+                                "sequence": sequence,
+                                "elapsed_ms": sampled_at - plan["off_start_ms"],
+                                "phase": "complete" if complete else "on",
+                                "sampled_at_ms": sampled_at,
+                                "plan_off_start_ms": plan["off_start_ms"],
+                                "plan_on_start_ms": plan["on_start_ms"], "plan_on_end_ms": end,
+                                "decision": "complete" if complete else "continue",
+                                "reason": "none", "memory_current_bytes": 1024,
+                                "memory_peak_bytes": 2048, "memory_max_bytes": 1073741824,
+                                "memory_events_delta": {{
+                                    "low": 0, "high": 0, "max": 0, "oom": 0,
+                                    "oom_kill": 0, "oom_group_kill": 0,
+                                }},
+                                "target_pid": 345, "target_start_ticks": 12345,
+                                "target_invocation_id": "c" * 32, "identity_status": "complete",
+                            }}
+                            sys.stdout.write(prefix + json.dumps(row, sort_keys=True, separators=(",", ":")) + "\\n")
+                        sys.stdout.flush()
+                    """)
+
+                payload = {
+                    "schema": 1, "operation": "memory-watch", "run_id": "a" * 32,
+                    "source_sha": "b" * 40, "workload": workload,
+                    "observer_deadline_ms": time.time_ns() // 1_000_000 + 60_000,
+                }
+                with tempfile.TemporaryDirectory(prefix="typed-memory-dispatch-") as temporary:
+                    helper = Path(temporary) / "fake-sudo"
+                    for wrong_window, expected_status in ((False, 0), (True, 2)):
+                        helper.write_text(row_source(wrong_window=wrong_window), encoding="utf-8")
+                        helper.chmod(0o700)
+                        output = StringIO()
+                        with (
+                            patch.object(remote_dispatch, "_trusted_python_helper", return_value=True),
+                            patch.object(remote_dispatch, "SUDO", str(helper)),
+                            redirect_stdout(output),
+                        ):
+                            status = remote_dispatch._run_cpu_diagnostic_memory_watch(payload)
+                        self.assertEqual(status, expected_status)
+                        lines = output.getvalue().splitlines()
+                        if wrong_window:
+                            self.assertTrue(lines[-1].startswith(
+                                remote_dispatch.CAPACITY_MEMORY_WATCH_ERROR_PREFIX,
+                            ))
+                            marker = json.loads(
+                                lines[-1][len(remote_dispatch.CAPACITY_MEMORY_WATCH_ERROR_PREFIX):],
+                            )
+                            self.assertEqual(marker, {
+                                "schema": 1, "stage": "row_protocol", "reason": "malformed",
+                            })
+                        else:
+                            self.assertEqual(len(lines), 2)
+                            projected = [json.loads(
+                                line[len(remote_dispatch.CAPACITY_MEMORY_WATCH_ROW_PREFIX):],
+                            ) for line in lines]
+                            self.assertEqual(
+                                projected[0]["plan_on_end_ms"] - plan["on_start_ms"],
+                                on_window_ms,
+                            )
+                            self.assertEqual(projected[-1]["phase"], "complete")
+
+    def test_typed_ssr_plan_producer_payloads_match_host_input_guard(self) -> None:
+        workloads = (
+            (capacity_diagnostic.HTML_CAPACITY_120S_WORKLOAD, 120_000),
+            (capacity_diagnostic.HTML_CPU_PROFILE_20S_WORKLOAD, 20_000),
+        )
+        for workload, expected_on_ms in workloads:
+            with self.subTest(workload=workload):
+                captured: list[dict[str, object]] = []
+
+                def accept_plan(_args, _host, _user, _config, _key, plan, _lifecycle):
+                    captured.append(dict(plan))
+                    return True, "release-" + "a" * 12, None
+
+                with (
+                    patch.object(cpu_diagnostic_pair, "_ssh_plan", side_effect=accept_plan),
+                    patch.object(capacity_diagnostic.time, "monotonic", return_value=26.0),
+                ):
+                    prepared_plan, lifecycle = capacity_diagnostic._prepare_remote_capacity_plan(
+                        host="example.invalid", user="tester", config=Path("/tmp/ssh/config"),
+                        key=Path("/tmp/ssh/id_ed25519"), run_id="a" * 32,
+                        source_sha="b" * 40, now_ms=1_000_000,
+                        plan_created_monotonic=1.0, workload=workload,
+                    )
+                self.assertEqual(
+                    prepared_plan["remote_clock_lag_bound_ms"],
+                    capacity_diagnostic.MAX_REMOTE_CLOCK_LAG_WITHOUT_ROUNDTRIP_MS + 25_000,
+                )
+                self.assertEqual(capacity_diagnostic.MAX_PLAN_PREPARE_ROUNDTRIP_MS, 79_000)
+                self.assertEqual(capacity_diagnostic.MAX_REMOTE_CLOCK_LAG_BOUND_MS, 87_000)
+                self.assertEqual(capacity_diagnostic.COMPOSITE_PLAN_CLEANUP_TIMEOUT_SECONDS, 26)
+                self.assertEqual(capacity_diagnostic.COMPOSITE_CAPACITY_PHASE_WORST_CASE_SECONDS, 330)
+                self.assertEqual(capacity_diagnostic.COMPOSITE_CPU_PROFILE_PHASE_WORST_CASE_SECONDS, 230)
+                self.assertEqual(capacity_diagnostic.COMPOSITE_REQUIRED_BEFORE_CAPACITY_SECONDS, 565)
+                self.assertTrue(capacity_diagnostic._composite_wall_budget_sufficient(600.0, 35.0, 565.0))
+                self.assertFalse(capacity_diagnostic._composite_wall_budget_sufficient(600.0, 36.0, 565.0))
+                self.assertTrue(capacity_diagnostic._composite_wall_budget_sufficient(600.0, 370.0, 230.0))
+                self.assertFalse(capacity_diagnostic._composite_wall_budget_sufficient(600.0, 370.001, 230.0))
+                gap_sleep = capacity_diagnostic.COMPOSITE_QUIESCENT_GAP_SECONDS
+                with (
+                    patch.object(
+                        capacity_diagnostic.time, "monotonic", side_effect=(365.0, 370.0),
+                    ),
+                    patch.object(capacity_diagnostic.time, "sleep") as sleep_gap,
+                ):
+                    self.assertTrue(capacity_diagnostic._composite_wait_for_profile_gap(600.0))
+                sleep_gap.assert_called_once_with(gap_sleep)
+                with (
+                    patch.object(
+                        capacity_diagnostic.time, "monotonic", side_effect=(365.0, 371.0),
+                    ),
+                    patch.object(capacity_diagnostic.time, "sleep") as sleep_overshoot,
+                ):
+                    self.assertFalse(capacity_diagnostic._composite_wait_for_profile_gap(600.0))
+                sleep_overshoot.assert_called_once_with(gap_sleep)
+
+                late_lifecycle: dict[str, object] = {}
+                with (
+                    patch.object(
+                        cpu_diagnostic_pair, "_ssh_plan",
+                        return_value=(True, "release-" + "a" * 12, None),
+                    ),
+                    patch.object(capacity_diagnostic.time, "monotonic", return_value=81.0),
+                ):
+                    with self.assertRaises(capacity_diagnostic._RemoteCapacityPlanError) as refused:
+                        capacity_diagnostic._prepare_remote_capacity_plan(
+                            host="example.invalid", user="tester", config=Path("/tmp/ssh/config"),
+                            key=Path("/tmp/ssh/id_ed25519"), run_id="a" * 32,
+                            source_sha="b" * 40, now_ms=1_000_000,
+                            plan_created_monotonic=1.0, workload=workload,
+                            lifecycle=late_lifecycle,
+                        )
+                self.assertEqual(refused.exception.remote_clock_lag_bound_ms, 88_000)
+                late_wait_clock = [81.0]
+                late_wait_calls: list[float] = []
+
+                def advance_late_wait(seconds: float) -> None:
+                    late_wait_calls.append(seconds)
+                    late_wait_clock[0] += seconds
+
+                if workload == capacity_diagnostic.HTML_CAPACITY_120S_WORKLOAD:
+                    # RTT=80s makes the expiry target 301s after plan creation,
+                    # beyond the absolute 300s cap. Refuse cleanup wait instead
+                    # of extending the phase/composite deadline.
+                    with (
+                        patch.object(
+                            capacity_diagnostic.time, "monotonic",
+                            side_effect=lambda: late_wait_clock[0],
+                        ),
+                        patch.object(
+                            capacity_diagnostic.time, "sleep", side_effect=advance_late_wait,
+                        ),
+                        self.assertRaises(TimeoutError),
+                    ):
+                        capacity_diagnostic._wait_for_remote_plan_expiry(
+                            refused.exception.expires_at_ms,
+                            workload=workload,
+                            plan_created_at_ms=1_000_000,
+                            plan_created_monotonic=1.0,
+                            remote_clock_lag_bound_ms=refused.exception.remote_clock_lag_bound_ms,
+                        )
+                    self.assertEqual(late_wait_calls, [])
+                else:
+                    with (
+                        patch.object(
+                            capacity_diagnostic.time, "monotonic",
+                            side_effect=lambda: late_wait_clock[0],
+                        ),
+                        patch.object(
+                            capacity_diagnostic.time, "sleep", side_effect=advance_late_wait,
+                        ),
+                    ):
+                        capacity_diagnostic._wait_for_remote_plan_expiry(
+                            refused.exception.expires_at_ms,
+                            workload=workload,
+                            plan_created_at_ms=1_000_000,
+                            plan_created_monotonic=1.0,
+                            remote_clock_lag_bound_ms=refused.exception.remote_clock_lag_bound_ms,
+                        )
+                    expected_late_wait = (
+                        refused.exception.expires_at_ms - 1_000_000
+                        + max(
+                            capacity_diagnostic.PLAN_EXPIRY_SKEW_MARGIN_MS,
+                            refused.exception.remote_clock_lag_bound_ms + 1_000,
+                        )
+                        - 80_000
+                    ) / 1_000
+                    self.assertAlmostEqual(sum(late_wait_calls), expected_late_wait, delta=0.01)
+
+                self.assertTrue(lifecycle["closed"])
+                self.assertEqual(len(captured), 1)
+                payload = workflow_input_guard.validate_cpu_diagnostic_payload(captured[0])
+                self.assertEqual(payload["workload"], workload)
+                self.assertEqual(payload["off_end_ms"] - payload["off_start_ms"], 20_000)
+                self.assertEqual(payload["on_start_ms"] - payload["off_end_ms"], 5_000)
+                self.assertEqual(payload["on_end_ms"] - payload["on_start_ms"], expected_on_ms)
+                self.assertEqual(payload["on_end_ms"] - payload["off_start_ms"], 25_000 + expected_on_ms)
+
+                with self.assertRaises(workflow_input_guard.WorkflowInputError):
+                    workflow_input_guard.validate_cpu_diagnostic_payload({
+                        **payload, "workload": "unknown_typed_workload_v1",
+                    })
+                with self.assertRaises(workflow_input_guard.WorkflowInputError):
+                    workflow_input_guard.validate_cpu_diagnostic_payload({
+                        **payload, "on_end_ms": payload["on_end_ms"] - 1,
+                    })
+
+                now_ms = payload["off_start_ms"] - 60_000
+                plan_args = argparse.Namespace(
+                    workload=workload, off_start_ms=payload["off_start_ms"],
+                    off_end_ms=payload["off_end_ms"], on_start_ms=payload["on_start_ms"],
+                    on_end_ms=payload["on_end_ms"],
+                )
+                cpu_plan._validate_windows(plan_args, now_ms=now_ms)
+                with self.assertRaises(cpu_plan.PlanError):
+                    cpu_plan._validate_windows(plan_args, now_ms=now_ms - 1)
+                with self.assertRaises(cpu_plan.PlanError):
+                    cpu_plan._validate_windows(
+                        argparse.Namespace(**{
+                            **vars(plan_args), "on_end_ms": plan_args.on_end_ms - 1,
+                        }),
+                        now_ms=now_ms,
+                    )
+
+                worker_start_ms = 1_025_000
+                worker_deadline_ms = worker_start_ms + (
+                    capacity_diagnostic.WORKER_RUNTIME_SECONDS_BY_WORKLOAD[workload] - 2
+                ) * 1_000
+                watcher = capacity_diagnostic._RemoteMemoryWatcher(
+                    ssh_host="example.invalid", ssh_user="tester",
+                    ssh_config=Path("/tmp/ssh/config"), ssh_key=Path("/tmp/ssh/key"),
+                    control_path=Path("/tmp/control.json"), binding={},
+                    run_id="a" * 32, source_sha="b" * 40,
+                    expected_plan=(
+                        payload["off_start_ms"], payload["on_start_ms"], payload["on_end_ms"],
+                    ),
+                    workload=workload,
+                    worker_deadline_unix_ms=worker_deadline_ms,
+                    remote_clock_lag_bound_ms=prepared_plan["remote_clock_lag_bound_ms"],
+                )
+                memory_request = watcher._memory_watch_request()
+                self.assertGreaterEqual(
+                    memory_request["observer_deadline_ms"], payload["on_end_ms"] + 1_000,
+                )
+                self.assertLessEqual(
+                    memory_request["observer_deadline_ms"],
+                    watcher.worker_deadline_unix_ms
+                    - capacity_diagnostic.MEMORY_WATCH_PROCESS_GROUP_TERMINATION_RESERVE_MS
+                    - prepared_plan["remote_clock_lag_bound_ms"]
+                    - capacity_diagnostic.MEMORY_WATCH_LOCAL_RESPONSE_RESERVE_MS,
+                )
+                remote_clock_ms = (
+                    worker_start_ms - prepared_plan["remote_clock_lag_bound_ms"]
+                )
+                remote_remaining_ms = memory_request["observer_deadline_ms"] - remote_clock_ms
+                self.assertGreater(remote_remaining_ms, 0)
+                self.assertLessEqual(
+                    remote_remaining_ms,
+                    remote_dispatch.CAPACITY_MEMORY_WATCH_TIMEOUT_SECONDS_BY_WORKLOAD.get(
+                        workload, remote_dispatch.CAPACITY_MEMORY_WATCH_TIMEOUT_SECONDS,
+                    ) * 1_000,
+                )
+                self.assertLessEqual(
+                    remote_remaining_ms
+                    + capacity_diagnostic.MEMORY_WATCH_PROCESS_GROUP_TERMINATION_RESERVE_MS
+                    + capacity_diagnostic.MEMORY_WATCH_LOCAL_RESPONSE_RESERVE_MS
+                    + int(max(
+                        capacity_diagnostic.load_runtime.DEFAULT_TERM_GRACE_SECONDS
+                        + max(
+                            0.1,
+                            capacity_diagnostic.load_runtime.DEFAULT_POLL_SECONDS * 4.0,
+                        ),
+                        capacity_diagnostic.load_runtime.DEFAULT_TERM_GRACE_SECONDS
+                        + capacity_diagnostic.load_runtime.MIN_NAMESPACE_REAP_GRACE_SECONDS,
+                    ) * 1_000),
+                    capacity_diagnostic.WORKER_RUNTIME_SECONDS_BY_WORKLOAD[workload] * 1_000,
+                )
+                insufficient = capacity_diagnostic._RemoteMemoryWatcher(
+                    ssh_host="example.invalid", ssh_user="tester",
+                    ssh_config=Path("/tmp/ssh/config"), ssh_key=Path("/tmp/ssh/key"),
+                    control_path=Path("/tmp/control.json"), binding={},
+                    run_id="a" * 32, source_sha="b" * 40,
+                    expected_plan=(
+                        payload["off_start_ms"], payload["on_start_ms"], payload["on_end_ms"],
+                    ),
+                    workload=workload,
+                    worker_deadline_unix_ms=payload["on_end_ms"] + 40_999,
+                    remote_clock_lag_bound_ms=28_000,
+                )
+                with self.assertRaisesRegex(ValueError, "no bounded terminal window"):
+                    insufficient._memory_watch_request()
+                if workload == capacity_diagnostic.HTML_CAPACITY_120S_WORKLOAD:
+                    fake_monotonic = [10.0]
+
+                    def advance_wait(seconds: float) -> None:
+                        fake_monotonic[0] += seconds
+
+                    wait_calls: list[float] = []
+
+                    def record_wait(seconds: float) -> None:
+                        wait_calls.append(seconds)
+                        advance_wait(seconds)
+
+                    plan_expiry = (
+                        1_000_000
+                        + capacity_diagnostic._plan_expiry_horizon_ms(workload)
+                    )
+                    with (
+                        patch.object(
+                            capacity_diagnostic.time, "monotonic",
+                            side_effect=lambda: fake_monotonic[0],
+                        ),
+                        patch.object(capacity_diagnostic.time, "sleep", side_effect=record_wait),
+                    ):
+                        capacity_diagnostic._wait_for_remote_plan_expiry(
+                            plan_expiry,
+                            workload=workload,
+                            plan_created_at_ms=1_000_000,
+                            plan_created_monotonic=10.0,
+                            remote_clock_lag_bound_ms=prepared_plan[
+                                "remote_clock_lag_bound_ms"
+                            ],
+                        )
+                    self.assertAlmostEqual(sum(wait_calls), 246.0, delta=0.01)
+                    with (
+                        patch.object(capacity_diagnostic.time, "monotonic", return_value=10.0),
+                        patch.object(capacity_diagnostic.time, "sleep") as no_sleep,
+                    ):
+                        with self.assertRaises(TimeoutError):
+                            capacity_diagnostic._wait_for_remote_plan_expiry(
+                                plan_expiry,
+                                workload=workload,
+                                plan_created_at_ms=1_000_000,
+                                plan_created_monotonic=10.0,
+                                remote_clock_lag_bound_ms=100_000,
+                            )
+                    no_sleep.assert_not_called()
+                    # At the admitted T=79s boundary the expiry target is
+                    # exactly plan+300s. A capacity worker can finish later
+                    # (prepare+225s=304s), in which case no wait is needed and
+                    # cleanup must proceed immediately.
+                    with (
+                        patch.object(capacity_diagnostic.time, "monotonic", return_value=305.0),
+                        patch.object(capacity_diagnostic.time, "sleep") as no_sleep,
+                    ):
+                        capacity_diagnostic._wait_for_remote_plan_expiry(
+                            plan_expiry,
+                            workload=workload,
+                            plan_created_at_ms=1_000_000,
+                            plan_created_monotonic=1.0,
+                            remote_clock_lag_bound_ms=87_000,
+                        )
+                    no_sleep.assert_not_called()
+                self.assertEqual(
+                    workflow_input_guard.validate_ssr_capacity_memory_watch_payload(memory_request),
+                    memory_request,
+                )
+                helper_payload = {
+                    key: memory_request[key]
+                    for key in ("schema", "run_id", "source_sha", "workload")
+                }
+                parsed_memory_request = cpu_plan._read_request(
+                    "memory-watch-stdin",
+                    BytesIO(json.dumps(
+                        helper_payload, sort_keys=True, separators=(",", ":"),
+                    ).encode("ascii") + b"\n"),
+                )
+                self.assertEqual(parsed_memory_request.workload, workload)
+
+                on_start = payload["on_start_ms"]
+                on_end = payload["on_end_ms"]
+                sample_times = (min(on_start + 20_000, on_end - 1), on_end)
+                for sequence, sampled_at in enumerate(sample_times, start=1):
+                    complete = sampled_at == on_end
+                    row = {
+                        "schema": 1, "run_id": "a" * 32, "source_sha": "b" * 40,
+                        "workload": workload, "sequence": sequence,
+                        "elapsed_ms": sampled_at - payload["off_start_ms"],
+                        "phase": "complete" if complete else "on",
+                        "sampled_at_ms": sampled_at,
+                        "plan_off_start_ms": payload["off_start_ms"],
+                        "plan_on_start_ms": on_start, "plan_on_end_ms": on_end,
+                        "decision": "complete" if complete else "continue",
+                        "reason": "none", "memory_current_bytes": 1024,
+                        "memory_peak_bytes": 2048,
+                        "memory_max_bytes": cpu_plan.SSR_CAPACITY_MEMORY_MAX_BYTES,
+                        "memory_events_delta": {
+                            "low": 0, "high": 0, "max": 0, "oom": 0,
+                            "oom_kill": 0, "oom_group_kill": 0,
+                        },
+                        "target_pid": 345, "target_start_ticks": 12345,
+                        "target_invocation_id": "c" * 32, "identity_status": "complete",
+                    }
+                    with patch.object(capacity_diagnostic, "write_control"):
+                        watcher._accept(row)
+                self.assertTrue(watcher.terminal)
+                self.assertEqual(watcher.terminal_decision, "complete")
+
+    def test_typed_memory_watch_timeout_stays_inside_parent_budget(self) -> None:
+        self.assertEqual(
+            remote_dispatch.CAPACITY_MEMORY_WATCH_TIMEOUT_SECONDS_BY_WORKLOAD[
+                capacity_diagnostic.HTML_CAPACITY_120S_WORKLOAD
+            ],
+            225 - 2 - 10 - 6,
+        )
+        self.assertEqual(
+            60 + 20 + 5 + 120,
+            205,
+        )
+        self.assertEqual(
+            remote_dispatch.CAPACITY_MEMORY_WATCH_TYPED_120S_TIMEOUT_SECONDS
+            + 2 * remote_dispatch.CHILD_TERMINATION_GRACE_SECONDS
+            + capacity_diagnostic.MEMORY_WATCH_LOCAL_RESPONSE_RESERVE_MS / 1_000 + 2,
+            225,
+        )
+        self.assertEqual(remote_dispatch.CAPACITY_MEMORY_WATCH_TIMEOUT_SECONDS, 130)
+        profile_timeout = remote_dispatch.CAPACITY_MEMORY_WATCH_TIMEOUT_SECONDS_BY_WORKLOAD[
+            capacity_diagnostic.HTML_CPU_PROFILE_20S_WORKLOAD
+        ]
+        self.assertEqual(profile_timeout, 125 - 2 - 10 - 6)
+        self.assertLessEqual(
+            profile_timeout + 2 * remote_dispatch.CHILD_TERMINATION_GRACE_SECONDS
+            + capacity_diagnostic.MEMORY_WATCH_LOCAL_RESPONSE_RESERVE_MS / 1_000 + 2,
+            capacity_diagnostic.WORKER_RUNTIME_SECONDS_BY_WORKLOAD[
+                capacity_diagnostic.HTML_CPU_PROFILE_20S_WORKLOAD
+            ],
+        )
+        self.assertEqual(
+            capacity_diagnostic.ON_WINDOW_MS_BY_WORKLOAD[
+                capacity_diagnostic.HTML_CPU_PROFILE_20S_WORKLOAD
+            ],
+            20_000,
+        )
+        refused_output = StringIO()
+        with (
+            patch.object(remote_dispatch, "_trusted_python_helper", return_value=True),
+            patch.object(remote_dispatch.subprocess, "Popen") as unexpected_spawn,
+            patch.object(remote_dispatch.time, "time_ns", return_value=1_000_000_000_000),
+            redirect_stdout(refused_output),
+        ):
+            refused_status = remote_dispatch._run_cpu_diagnostic_memory_watch({
+                "schema": 1, "operation": "memory-watch", "run_id": "a" * 32,
+                "source_sha": "b" * 40,
+                "workload": capacity_diagnostic.HTML_CPU_PROFILE_20S_WORKLOAD,
+                "observer_deadline_ms": 1_000_000 + (profile_timeout + 1) * 1_000,
+            })
+        self.assertEqual(refused_status, 2)
+        unexpected_spawn.assert_not_called()
+
+        class FakeStream:
+            def write(self, _payload):
+                return None
+
+            def flush(self):
+                return None
+
+            def close(self):
+                return None
+
+            def fileno(self):
+                return 47
+
+        class FakeSelector:
+            def register(self, *_args):
+                return None
+
+            def select(self, _timeout):
+                return []
+
+            def close(self):
+                return None
+
+        process = type("FakeProcess", (), {
+            "stdin": FakeStream(), "stdout": FakeStream(), "pid": 12345,
+            "poll": lambda _self: None,
+        })()
+        output = StringIO()
+        with (
+            patch.object(remote_dispatch, "_trusted_python_helper", return_value=True),
+            patch.object(remote_dispatch.subprocess, "Popen", return_value=process),
+            patch.object(remote_dispatch.selectors, "DefaultSelector", return_value=FakeSelector()),
+            patch.object(remote_dispatch.os, "set_blocking"),
+            patch.object(remote_dispatch.os, "pidfd_open", return_value=99),
+            patch.object(remote_dispatch.os, "close"),
+            patch.object(remote_dispatch.time, "monotonic", side_effect=[0.0, 207.0]),
+            patch.object(remote_dispatch.time, "time_ns", return_value=1_000_000_000_000),
+            patch.object(remote_dispatch, "_terminate_process_group") as terminate,
+            redirect_stdout(output),
+        ):
+            status = remote_dispatch._run_cpu_diagnostic_memory_watch({
+                "schema": 1, "operation": "memory-watch", "run_id": "a" * 32,
+                "source_sha": "b" * 40,
+                "workload": capacity_diagnostic.HTML_CAPACITY_120S_WORKLOAD,
+                "observer_deadline_ms": 1_000_000 + 207_000,
+            })
+        self.assertEqual(status, 2)
+        self.assertEqual(terminate.call_count, 1)
+        self.assertTrue(output.getvalue().startswith(
+            remote_dispatch.CAPACITY_MEMORY_WATCH_ERROR_PREFIX,
+        ))
+
+        # A descendant may keep the pipe open after the session leader exits.
+        # The retained pidfd still pins the owned process-group ID, so timeout
+        # cleanup must make the same single bounded group-termination attempt.
+        exited_leader = type("ExitedLeader", (), {
+            "stdin": FakeStream(), "stdout": FakeStream(), "pid": 12346,
+            "poll": lambda _self: 0,
+        })()
+        exited_output = StringIO()
+        with (
+            patch.object(remote_dispatch, "_trusted_python_helper", return_value=True),
+            patch.object(remote_dispatch.subprocess, "Popen", return_value=exited_leader),
+            patch.object(remote_dispatch.selectors, "DefaultSelector", return_value=FakeSelector()),
+            patch.object(remote_dispatch.os, "set_blocking"),
+            patch.object(remote_dispatch.os, "pidfd_open", return_value=100),
+            patch.object(remote_dispatch.os, "close"),
+            patch.object(remote_dispatch.time, "monotonic", side_effect=[0.0, 107.0]),
+            patch.object(remote_dispatch.time, "time_ns", return_value=1_000_000_000_000),
+            patch.object(remote_dispatch, "_terminate_process_group") as terminate_exited,
+            redirect_stdout(exited_output),
+        ):
+            status = remote_dispatch._run_cpu_diagnostic_memory_watch({
+                "schema": 1, "operation": "memory-watch", "run_id": "a" * 32,
+                "source_sha": "b" * 40,
+                "workload": capacity_diagnostic.HTML_CPU_PROFILE_20S_WORKLOAD,
+                "observer_deadline_ms": 1_000_000 + profile_timeout * 1_000,
+            })
+        self.assertEqual(status, 2)
+        self.assertEqual(terminate_exited.call_count, 1)
+        self.assertTrue(exited_output.getvalue().startswith(
+            remote_dispatch.CAPACITY_MEMORY_WATCH_ERROR_PREFIX,
+        ))
+
+        # If pidfd acquisition fails, terminate the new session before poll()
+        # can reap an already-exited leader and release its numeric PGID.
+        pidfd_failure_process = type("PidfdFailureProcess", (), {
+            "stdin": FakeStream(), "stdout": FakeStream(), "pid": 12347,
+        })()
+        pidfd_failure_process.poll = Mock(return_value=0)
+        pidfd_failure_output = StringIO()
+        with (
+            patch.object(remote_dispatch, "_trusted_python_helper", return_value=True),
+            patch.object(remote_dispatch.subprocess, "Popen", return_value=pidfd_failure_process),
+            patch.object(remote_dispatch.os, "pidfd_open", side_effect=OSError("unavailable")),
+            patch.object(remote_dispatch, "_terminate_process_group") as terminate_without_pidfd,
+            redirect_stdout(pidfd_failure_output),
+        ):
+            status = remote_dispatch._run_cpu_diagnostic_memory_watch({
+                "schema": 1, "operation": "memory-watch", "run_id": "a" * 32,
+                "source_sha": "b" * 40,
+                "workload": capacity_diagnostic.HTML_CPU_PROFILE_20S_WORKLOAD,
+                "observer_deadline_ms": time.time_ns() // 1_000_000 + 30_000,
+            })
+        self.assertEqual(status, 2)
+        terminate_without_pidfd.assert_called_once_with(pidfd_failure_process)
+        pidfd_failure_process.poll.assert_not_called()
+        self.assertTrue(pidfd_failure_output.getvalue().startswith(
+            remote_dispatch.CAPACITY_MEMORY_WATCH_ERROR_PREFIX,
+        ))
+
+        selector_failure_process = type("SelectorFailureProcess", (), {
+            "stdin": FakeStream(), "stdout": FakeStream(), "pid": 12348,
+            "poll": lambda _self: None,
+        })()
+        selector_failure_output = StringIO()
+        with (
+            patch.object(remote_dispatch, "_trusted_python_helper", return_value=True),
+            patch.object(remote_dispatch.subprocess, "Popen", return_value=selector_failure_process),
+            patch.object(remote_dispatch.selectors, "DefaultSelector", side_effect=OSError("EMFILE")),
+            patch.object(remote_dispatch.os, "pidfd_open", return_value=101),
+            patch.object(remote_dispatch.os, "close") as close_pidfd,
+            patch.object(remote_dispatch.time, "monotonic", return_value=0.0),
+            patch.object(remote_dispatch.time, "time_ns", return_value=1_000_000_000_000),
+            patch.object(remote_dispatch, "_terminate_process_group") as terminate_selector_error,
+            redirect_stdout(selector_failure_output),
+        ):
+            status = remote_dispatch._run_cpu_diagnostic_memory_watch({
+                "schema": 1, "operation": "memory-watch", "run_id": "a" * 32,
+                "source_sha": "b" * 40,
+                "workload": capacity_diagnostic.HTML_CPU_PROFILE_20S_WORKLOAD,
+                "observer_deadline_ms": 1_000_000 + 30_000,
+            })
+        self.assertEqual(status, 2)
+        terminate_selector_error.assert_called_once_with(selector_failure_process)
+        close_pidfd.assert_called_once_with(101)
+        self.assertTrue(selector_failure_output.getvalue().startswith(
+            remote_dispatch.CAPACITY_MEMORY_WATCH_ERROR_PREFIX,
+        ))
+
     def _assert_capacity_failure_evidence_is_bounded_closed_and_uses_observed_times(self) -> None:
         off = RequestResult(
             "off", "GET", "/private-fixture", 0, 5000.0, False, 0,
@@ -3748,6 +4369,382 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertEqual(set(phases), {"rate-1", "rate-1b"})
         self.assertEqual(phases["rate-1"]["logical"]["target_logical_actions_per_second"], 1)
         self.assertGreater(phases["rate-1"]["raw_http"]["attempts_per_second"], 0)
+
+
+    def test_typed_cpu_cleanup_summary_crosses_dispatch_parser_and_projection(self) -> None:
+        run_id = "a" * 32
+        source_sha = "b" * 40
+        release_slug = "gha-123456-1-bbbbbbbbbbbb"
+        targets = {
+            "api": [
+                {"service": "api", "pid": 101, "start_ticks": 11, "invocation_id": "c" * 32},
+                {"service": "api", "pid": 102, "start_ticks": 12, "invocation_id": "c" * 32},
+            ],
+            "web": [
+                {"service": "web", "pid": 201, "start_ticks": 21, "invocation_id": "d" * 32},
+            ],
+        }
+
+        def produce(workload: str) -> dict[str, object]:
+            on_window = cpu_plan._plan_on_window_ms(workload)
+            self.assertIsNotNone(on_window)
+            off_start, off_end = 1_000_000, 1_020_000
+            on_start, on_end = off_end + 5_000, off_end + 5_000 + int(on_window)
+            plans = {
+                service: {
+                    "run_id": run_id, "source_sha": source_sha,
+                    "release_slug": release_slug, "workload": workload,
+                    "off_start_ms": off_start, "off_end_ms": off_end,
+                    "on_start_ms": on_start, "on_end_ms": on_end,
+                    "targets": service_targets,
+                }
+                for service, service_targets in targets.items()
+            }
+            journal_rows: list[dict[str, str]] = []
+            for service, service_targets in targets.items():
+                unit = f"deadlock-{service}.service"
+                for target in service_targets:
+                    for phase in ("off", "on"):
+                        window = 20_000 if phase == "off" else int(on_window)
+                        timestamp_ms = off_start if phase == "off" else on_start
+                        usage_message = (
+                            "cpu_diagnostic_usage "
+                            f"service={service} run_id={run_id} phase={phase} "
+                            f"window_ms={window} cpu_ns={2_000_000_000 if phase == 'on' else 1_000_000_000} "
+                            "cpu_capacity_cpus=2.000000 start_lag_ms=10 end_lag_ms=5 "
+                            "timing_complete=true"
+                        )
+                        journal_rows.append({
+                            "MESSAGE": (json.dumps({"message": usage_message}, separators=(",", ":"))
+                                        if service == "api" else usage_message),
+                            "_PID": str(target["pid"]), "_SYSTEMD_UNIT": unit,
+                            "_SYSTEMD_INVOCATION_ID": str(target["invocation_id"]),
+                            "_SYSTEMD_CGROUP": f"/system.slice/{unit}",
+                            "__REALTIME_TIMESTAMP": str(timestamp_ms * 1000),
+                        })
+                    if workload in {cpu_plan.WORKLOAD, cpu_plan.HTML_CPU_PROFILE_20S_WORKLOAD}:
+                        if service == "api":
+                            profile = (
+                                "cpu_diagnostic_complete service=api "
+                                f"run_id={run_id} timer=thread_cpu start_lag_ms=0 "
+                                f"elapsed_ms={on_window} total_self_cpu_us=100 "
+                                "functions=repo.get_current_user:100:1"
+                            )
+                        else:
+                            profile = (
+                                "cpu_diagnostic_complete service=web "
+                                f"run_id={run_id} timer=v8_cpu start_lag_ms=0 "
+                                f"elapsed_ms={on_window} sample_interval_us=100000 "
+                                "sample_count=5 categories=repo.workspace_page:100:5"
+                            )
+                        journal_rows.append({
+                            "MESSAGE": json.dumps({"message": profile}, separators=(",", ":"))
+                            if service == "api" else profile,
+                            "_PID": str(target["pid"]), "_SYSTEMD_UNIT": unit,
+                            "_SYSTEMD_INVOCATION_ID": str(target["invocation_id"]),
+                            "_SYSTEMD_CGROUP": f"/system.slice/{unit}",
+                            "__REALTIME_TIMESTAMP": str(on_start * 1000 + 1_000_000),
+                        })
+
+            service_targets = {key: [dict(item) for item in value] for key, value in targets.items()}
+
+            def systemd_unit(service: str, *, timeout_seconds: int = 3) -> dict[str, str]:
+                self.assertEqual(timeout_seconds, 3)
+                return {
+                    "ActiveState": "active",
+                    "InvocationID": str(targets[service][0]["invocation_id"]),
+                    "MainPID": "100",
+                    "ControlGroup": f"/system.slice/deadlock-{service}.service",
+                }
+
+            with (
+                patch.object(cpu_plan, "_release_identity", return_value=(source_sha, release_slug)),
+                patch.object(cpu_plan, "_systemd_unit", side_effect=systemd_unit),
+                patch.object(cpu_plan, "_service_targets",
+                             side_effect=lambda service, _unit: service_targets[service]),
+                patch.object(cpu_plan, "_process_start_ticks",
+                             side_effect={101: 11, 102: 12, 201: 21}.get),
+                patch.object(cpu_plan, "_journal_rows", return_value=("complete", journal_rows)),
+            ):
+                result = cpu_plan._usage_summary(plans)
+            self.assertEqual(result["workload"], workload)
+            self.assertEqual(result["usage_status"], "complete", result)
+            self.assertEqual(result["profile_status"], "complete", result)
+            return {"status": "expired_plans_removed", "service_count": 2, **result}
+
+        def dispatch_and_parse(summary: dict[str, object], expected_workload: str):
+            with tempfile.TemporaryDirectory(prefix="cpu-summary-route-") as directory:
+                root = Path(directory)
+                summary_path = root / "summary.json"
+                summary_path.write_text(json.dumps(summary, sort_keys=True), encoding="ascii")
+                fake_sudo = root / "sudo-fixture"
+                fake_sudo.write_text(
+                    "#!/usr/bin/python3\nimport json,sys\nsys.stdin.read()\n"
+                    f"value=json.load(open({str(summary_path)!r}, encoding='ascii'))\n"
+                    "print('CPU_DIAGNOSTIC_PLAN ' + json.dumps(value, sort_keys=True, separators=(',', ':')))\n",
+                    encoding="ascii",
+                )
+                fake_sudo.chmod(0o700)
+                stdout = StringIO()
+                with (
+                    patch.object(remote_dispatch, "_trusted_python_helper", return_value=True),
+                    patch.object(remote_dispatch, "SUDO", str(fake_sudo)),
+                    redirect_stdout(stdout),
+                ):
+                    dispatch_status = remote_dispatch._run_cpu_diagnostic_plan({
+                        "operation": "cleanup", "schema": 1, "run_id": run_id,
+                    })
+            lifecycle: dict[str, object] = {}
+            read_fd, write_fd = os.pipe()
+            line = stdout.getvalue().encode("ascii")
+            os.write(write_fd, line)
+            os.close(write_fd)
+
+            class FakeSsh:
+                stdin = BytesIO()
+                stdout = os.fdopen(read_fd, "rb", buffering=0)
+                returncode = 0
+
+                @staticmethod
+                def poll():
+                    return 0
+
+            with (
+                patch.object(cpu_diagnostic_pair.subprocess, "Popen", return_value=FakeSsh()),
+                patch.object(cpu_diagnostic_pair, "_confirm_worker_closed"),
+            ):
+                parsed_ok, _slug, parsed = cpu_diagnostic_pair._ssh_plan(
+                    argparse.Namespace(), "host", "user", Path("ssh-config"), Path("key"),
+                    {"schema": 1, "operation": "cleanup", "run_id": run_id}, lifecycle,
+                    allow_noop_cleanup=True, expected_workload=expected_workload,
+                )
+            return dispatch_status, parsed_ok, parsed, lifecycle
+
+        capacity_summary = produce(cpu_plan.HTML_CAPACITY_120S_WORKLOAD)
+        dispatch_status, parsed_ok, parsed, lifecycle = dispatch_and_parse(
+            capacity_summary, cpu_plan.HTML_CAPACITY_120S_WORKLOAD,
+        )
+        self.assertEqual(dispatch_status, 0)
+        self.assertTrue(parsed_ok, lifecycle)
+        self.assertEqual(parsed["usage_rows"][1]["window_ms_min"], 120_000)
+        self.assertEqual(parsed["profile_rows"][0]["observed_targets"], 0)
+        self.assertEqual(parsed["profile_rows"][0]["total_cpu_us"], 0)
+        self.assertIsNone(parsed["profile_rows"][0]["elapsed_ms_min"])
+        telemetry = capacity_diagnostic._project_server_telemetry(
+            parsed,
+            expected_workload=cpu_plan.HTML_CAPACITY_120S_WORKLOAD,
+        )
+        self.assertEqual(telemetry["cpu_status"], "complete", telemetry)
+        self.assertTrue(capacity_diagnostic._cpu_usage_rows_are_valid(
+            telemetry["cpu_rows"], workload=cpu_plan.HTML_CAPACITY_120S_WORKLOAD,
+            require_complete=True,
+        ))
+        delta = cpu_diagnostic_pair._usage_delta_percentage_points(
+            parsed, expected_workload=cpu_plan.HTML_CAPACITY_120S_WORKLOAD,
+        )
+        self.assertAlmostEqual(delta["api"], -20 / 3)
+
+        # Feed the real cleanup-derived CPU rows into a complete typed120
+        # report and cross the production report projection/evaluator too.
+        workload = cpu_plan.HTML_CAPACITY_120S_WORKLOAD
+        phase_run_id = "d" * 32
+        manifest_sha = "e" * 64
+        node_integer_fields = (
+            "sample_count", "rss_min_bytes", "rss_max_bytes", "rss_mean_bytes",
+            "heap_total_min_bytes", "heap_total_max_bytes", "heap_total_mean_bytes",
+            "heap_used_min_bytes", "heap_used_max_bytes", "heap_used_mean_bytes",
+            "heap_limit_min_bytes", "heap_limit_max_bytes", "heap_limit_mean_bytes",
+            "external_min_bytes", "external_max_bytes", "external_mean_bytes",
+            "array_buffers_min_bytes", "array_buffers_max_bytes", "array_buffers_mean_bytes",
+            "sampled_window_start_elapsed_ms", "sampled_window_end_elapsed_ms",
+            "sampled_window_duration_ms", "cgroup_sample_count",
+            "cgroup_memory_current_start_bytes", "cgroup_memory_current_end_bytes",
+            "cgroup_memory_current_sampled_max_bytes", "cgroup_memory_peak_start_bytes",
+            "cgroup_memory_peak_end_bytes", "cgroup_memory_peak_sampled_max_bytes",
+            "memory_events_low_sampled_delta", "memory_events_high_sampled_delta",
+            "memory_events_max_sampled_delta", "memory_events_oom_sampled_delta",
+            "memory_events_oom_kill_sampled_delta", "memory_events_oom_group_kill_sampled_delta",
+            "gc_count", "gc_major_count", "gc_minor_count", "gc_incremental_count",
+            "gc_weakcb_count", "gc_other_count",
+        )
+        node_rows = [
+            {
+                **{
+                    field: (
+                        5 if field in {"sample_count", "cgroup_sample_count"}
+                        else 0 if field.startswith("memory_events_")
+                        or field.startswith("gc_") else 1
+                    )
+                    for field in node_integer_fields
+                },
+                "service": "web", "phase": phase, "status": "complete",
+                "gc_duration_ms": 1.0, "gc_status": "complete",
+                "cgroup_memory_status": "complete", "cgroup_memory_reason": "none",
+                "gc_overflow": False,
+            }
+            for phase in ("off", "on")
+        ]
+        complete_telemetry = {
+            **telemetry,
+            "node_memory_status": "complete", "node_memory_reason": "none",
+            "cgroup_memory_status": "complete", "cgroup_memory_reason": "none",
+            "node_memory_rows": node_rows,
+            "request_correlation": {"status": "incomplete", "summary": None},
+        }
+        typed_report = {
+            "schema": 1, "report_complete": True, "workload": workload,
+            "fixture_kind": capacity_diagnostic.HTML_FIXTURE_KIND,
+            "status": "complete", "passed": True,
+            "matrix_credit": False, "slo_credit": False, "diagnostic_credit": False,
+            "source_sha": source_sha, "app_target_sha": "f" * 40,
+            "external_run_id": "12345", "external_run_attempt": "1",
+            "run_id": phase_run_id,
+            "profile_digest": capacity_diagnostic.profile_digest(32, workload),
+            "fixture_manifest_sha256": manifest_sha, "fixture_manifest_bytes": 2048,
+            "fixture_tournaments": capacity_diagnostic.FIXTURE_TOURNAMENTS,
+            "fixture_users": capacity_diagnostic.FIXTURE_USERS,
+            "actors": capacity_diagnostic.FIXTURE_USERS,
+            "concurrency": 32, "max_inflight": 32,
+            "load_model": "closed_loop_best_effort", "window_ms": 120_000,
+            "namespace_closed": True,
+            "worker": {
+                "status": "complete", "submitted": 1, "completed": 1,
+                "http_status_counts": {"200": 1}, "error_counts": {},
+                "failure_evidence": None,
+                "actual_on_request_started_at_utc": None,
+                "actual_on_request_finished_at_utc": None,
+                "failure_evidence_status": "unavailable",
+                "latency_ms": {"sample_count": 1, "p50": 10.0, "p95": 10.0,
+                               "p99": 10.0, "max": 10.0},
+                "request_window_evidence": {
+                    "schema": 1, "window_start_ms": 10, "window_end_ms": 120_010,
+                    "request_start_basis": "client_actual_started_at_utc",
+                    "submitted_results": 1, "started_in_window_count": 1,
+                    "started_outside_window_count": 0, "missing_start_timestamp_count": 0,
+                    "missing_finish_timestamp_count": 0,
+                    "completed_by_window_end_count": 1, "drain_completed_after_window_count": 0,
+                    "cf_ray_present_count": 1, "cf_ray_missing_count": 0,
+                    "ssr_request_id_singleton_count": 1, "ssr_request_id_missing_count": 0,
+                    "ssr_request_id_duplicate_count": 0, "ssr_request_id_malformed_count": 0,
+                    "eligible_response_id_count": 1, "retained_sample_count": 1,
+                    "sample_scheme": capacity_diagnostic.SSR_JOIN_SAMPLE_SCHEME,
+                    "sample_cap_truncated": False, "status": "complete",
+                },
+                "resource_abort_reason": None, "on_window_start_ms": 10,
+                "on_window_end_ms": 120_010, "observed_duration_ms": 120_000,
+                "off_probe": {"submitted": 32, "completed": 32, "http_status": 200},
+                "max_inflight": 32, "fixture_manifest_bytes": 2048,
+                "response_bytes_total": 128,
+                "process_cpu_windows": [
+                    {"window": "off", "status": "complete", "cpu_ns": 4_000_000_000,
+                     "elapsed_ns": 20_000_000_000, "cores": 0.2},
+                    {"window": "on", "status": "complete", "cpu_ns": 24_000_000_000,
+                     "elapsed_ns": 120_000_000_000, "cores": 0.2},
+                ],
+            },
+            "memory_guard": {
+                "status": "complete", "samples": 5,
+                "current_min_bytes": 300_000_000, "current_max_bytes": 400_000_000,
+                "memory_peak_lifetime_max_bytes": 500_000_000,
+                "memory_events_sampled_max_delta": {
+                    key: 0 for key in ("low", "high", "max", "oom", "oom_kill", "oom_group_kill")
+                },
+                "target_identity_status": "complete", "terminal_decision": "complete",
+                "terminal_reason": "none", "ssh_material_restored": True,
+            },
+            "runner_headroom": {
+                "schema": 1, "status": "complete", "reason": "none",
+                "runner_environment": "github-hosted",
+                "identity": {key: True for key in (
+                    "outer_pid_namespace_matches_pid1", "outer_mount_namespace_matches_pid1",
+                    "outer_cgroup_namespace_matches_pid1", "target_cgroup_namespace_matches_outer",
+                    "target_mount_namespace_is_isolated", "target_pid_namespace_is_isolated",
+                    "global_cgroup2_mount", "workload_membership_matches_outer",
+                )},
+                "sample_count": 10, "window_seconds": 120.0,
+                "effective_cpu_capacity_cores": 4.0, "max_cgroup_cpu_usage_cores": 1.2,
+                "max_visible_throttled_periods_delta": 0, "window_scope": "on_window",
+                "window_start_offset_ms": 0, "window_end_offset_ms": 120_000,
+            },
+            "server_capacity_claim": None,
+            "server_capacity_claim_reason": "resource_correlation_not_provided",
+            "generator_cpu_evidence": "measured", "remote_plan_cleanup": "complete",
+            "server_telemetry": complete_telemetry,
+        }
+        projected_report = capacity_diagnostic._project_capacity_report(typed_report)
+        self.assertIsNotNone(
+            projected_report,
+            capacity_diagnostic._projection_rejection_reason(typed_report),
+        )
+        self.assertEqual(projected_report["server_telemetry"]["cpu_rows"], telemetry["cpu_rows"])
+        self.assertEqual(capacity_diagnostic.evaluate_capacity_report(
+            typed_report, source_sha=source_sha, app_target_sha="f" * 40,
+            run_id="12345", attempt="1", manifest_sha256=manifest_sha,
+            workload=workload,
+        ), "PASS")
+        self.assertFalse(capacity_diagnostic._cpu_usage_rows_are_valid(
+            telemetry["cpu_rows"], workload=cpu_plan.HTML_CPU_PROFILE_20S_WORKLOAD,
+            require_complete=True,
+        ))
+        wrong_projection = capacity_diagnostic._project_server_telemetry(
+            parsed, expected_workload=cpu_plan.HTML_CPU_PROFILE_20S_WORKLOAD,
+        )
+        self.assertEqual(wrong_projection["cpu_status"], "incomplete")
+        wrong_capacity_duration = json.loads(json.dumps(capacity_summary))
+        wrong_capacity_duration["usage_rows"][1]["window_ms_min"] = 20_000
+        wrong_capacity_duration["usage_rows"][1]["window_ms_max"] = 20_000
+        self.assertEqual(dispatch_and_parse(
+            wrong_capacity_duration, cpu_plan.HTML_CAPACITY_120S_WORKLOAD,
+        )[0], 2)
+
+        profile_summary = produce(cpu_plan.HTML_CPU_PROFILE_20S_WORKLOAD)
+        profile_route = dispatch_and_parse(profile_summary, cpu_plan.HTML_CPU_PROFILE_20S_WORKLOAD)
+        self.assertEqual(profile_route[0], 0)
+        self.assertTrue(profile_route[1], profile_route[3])
+        profile_telemetry = capacity_diagnostic._project_server_telemetry(
+            profile_route[2], include_cpu_profile=True,
+            expected_workload=cpu_plan.HTML_CPU_PROFILE_20S_WORKLOAD,
+        )
+        self.assertEqual(profile_telemetry["profile_status"], "complete")
+        self.assertEqual(profile_telemetry["profile_rows"][0]["elapsed_ms_min"], 20_000)
+        self.assertIsNone(cpu_diagnostic_pair._validate_usage_summary(
+            profile_summary, expected_workload=cpu_plan.WORKLOAD,
+        ))
+        wrong_profile_duration = json.loads(json.dumps(profile_summary))
+        wrong_profile_duration["usage_rows"][1]["window_ms_min"] = 120_000
+        wrong_profile_duration["usage_rows"][1]["window_ms_max"] = 120_000
+        self.assertIsNone(cpu_diagnostic_pair._validate_usage_summary(
+            wrong_profile_duration,
+            expected_workload=cpu_plan.HTML_CPU_PROFILE_20S_WORKLOAD,
+        ))
+        self.assertFalse(dispatch_and_parse(
+            profile_summary, cpu_plan.HTML_CAPACITY_120S_WORKLOAD,
+        )[1])
+
+        no_plan = {
+            "status": "expired_plans_removed", "service_count": 0, "workload": None,
+            "usage_status": "unavailable", "usage_reason": "missing", "usage_rows": [],
+            "profile_status": "unavailable", "profile_reason": "missing", "profile_rows": [],
+            "memory_status": "unavailable", "memory_reason": "unavailable", "memory_rows": [],
+            "cgroup_memory_status": "unknown", "cgroup_memory_reason": "hierarchy_unavailable",
+        }
+        noop = cpu_diagnostic_pair._validate_usage_summary(
+            no_plan, expected_workload=cpu_plan.HTML_CAPACITY_120S_WORKLOAD,
+            allow_noop_cleanup=True,
+        )
+        self.assertEqual(noop["usage_status"], "unavailable")
+        self.assertEqual(noop["workload"], None)
+        noop_route = dispatch_and_parse(no_plan, cpu_plan.HTML_CAPACITY_120S_WORKLOAD)
+        self.assertEqual(noop_route[0], 0)
+        self.assertTrue(noop_route[1], noop_route[3])
+        noop_telemetry = capacity_diagnostic._project_server_telemetry(
+            noop_route[2], expected_workload=cpu_plan.HTML_CAPACITY_120S_WORKLOAD,
+        )
+        self.assertEqual(noop_telemetry["cpu_status"], "unavailable")
+        self.assertFalse(capacity_diagnostic._cpu_usage_rows_are_valid(
+            noop_telemetry["cpu_rows"], workload=cpu_plan.HTML_CAPACITY_120S_WORKLOAD,
+            require_complete=True,
+        ))
 
 
 if __name__ == "__main__":

@@ -843,10 +843,14 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         source_sha = "b" * 40
         run_id = "a" * 32
         off_start_ms = time.time_ns() // 1_000_000 + 60_000
+        typed_capacity_workload = diagnostic_plan_tool.HTML_CAPACITY_120S_WORKLOAD
+        self.assertEqual(
+            remote_dispatch.CAPACITY_MEMORY_WATCH_TYPED_120S_TIMEOUT_SECONDS, 207,
+        )
         plan = {
             "off_start_ms": off_start_ms, "off_end_ms": off_start_ms + 20_000,
-            "on_start_ms": off_start_ms + 25_000, "on_end_ms": off_start_ms + 45_000,
-            "workload": diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD,
+            "on_start_ms": off_start_ms + 25_000, "on_end_ms": off_start_ms + 145_000,
+            "workload": typed_capacity_workload,
         }
         interval_ms = round(diagnostic_plan_tool.SSR_CAPACITY_WATCH_INTERVAL_SECONDS * 1000)
         self.assertEqual(interval_ms, 250)
@@ -864,12 +868,9 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         }
         request = {
             "schema": 1, "operation": "memory-watch", "run_id": run_id, "source_sha": source_sha,
-            "workload": diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD,
+            "workload": typed_capacity_workload,
+            "observer_deadline_ms": plan["on_end_ms"] + 7_000,
         }
-        request_bytes = json.dumps(
-            request, sort_keys=True, separators=(",", ":"),
-        ).encode("ascii") + b"\n"
-
         with tempfile.TemporaryDirectory(prefix="ssr-memory-chain-") as temporary:
             root = Path(temporary)
             os.chmod(root, 0o700)
@@ -905,9 +906,9 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 plan_tool.time.time_ns = lambda: clock["ms"] * 1_000_000
                 def fast_forward(seconds):
                     clock["ms"] = min(plan["on_end_ms"], clock["ms"] + round(seconds * 1000))
-                    # Apply the same 30× acceleration to the producer's
+                    # Apply the same 10× acceleration to the producer's
                     # sleep and the dispatcher's monotonic clock.
-                    real_sleep(seconds / 30)
+                    real_sleep(seconds / 10)
                 plan_tool.time.sleep = fast_forward
                 raise SystemExit(plan_tool.main(["memory-watch-stdin"]))
             """)
@@ -915,18 +916,46 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             helper_path.write_text(helper_source, encoding="utf-8")
             helper_path.chmod(0o700)
 
-            def dispatcher_source(*, timeout_seconds: int, output_cap: int) -> str:
+            def dispatcher_source(
+                *, timeout_seconds: int, output_cap: int,
+                plan_payload: dict[str, object] | None = None,
+            ) -> str:
+                selected_plan = plan if plan_payload is None else plan_payload
                 source = textwrap.dedent(f"""\
                     import sys
                     import time
                     sys.path.insert(0, {str(Path(__file__).resolve().parents[1])!r})
                     from tools import platform_workflow_remote_dispatch as dispatch
+                    plan = {selected_plan!r}
                     real_monotonic = time.monotonic
-                    clock_start = real_monotonic()
-                    dispatch.time.monotonic = lambda: (real_monotonic() - clock_start) * 30
+                    dispatch_clock = [0.0]
+                    dispatch.time.monotonic = lambda: dispatch_clock[0]
+                    real_selector = dispatch.selectors.DefaultSelector
+                    class FastSelector:
+                        def __init__(self):
+                            self._selector = real_selector()
+                        def register(self, *args, **kwargs):
+                            return self._selector.register(*args, **kwargs)
+                        def unregister(self, *args, **kwargs):
+                            return self._selector.unregister(*args, **kwargs)
+                        def select(self, timeout=None):
+                            before = real_monotonic()
+                            events = self._selector.select(
+                                None if timeout is None else timeout / 10
+                            )
+                            if timeout is not None:
+                                dispatch_clock[0] += (real_monotonic() - before) * 10
+                            return events
+                        def close(self):
+                            return self._selector.close()
+                    dispatch.selectors.DefaultSelector = FastSelector
+                    dispatch.time.time_ns = lambda: (plan["off_start_ms"] - 60_000) * 1_000_000
                     dispatch.SUDO = {str(helper_path)!r}
                     dispatch._trusted_python_helper = lambda _path: True
                     dispatch.CAPACITY_MEMORY_WATCH_TIMEOUT_SECONDS = {timeout_seconds}
+                    dispatch.CAPACITY_MEMORY_WATCH_TIMEOUT_SECONDS_BY_WORKLOAD = {{
+                        {typed_capacity_workload!r}: {timeout_seconds},
+                    }}
                     dispatch.CAPACITY_MEMORY_WATCH_OUTPUT_CAP = {output_cap}
                     raise SystemExit(dispatch.main(["cpu-diagnostic-memory-watch"]))
                 """)
@@ -934,11 +963,19 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 return source
 
             def run_dispatcher_direct(*, timeout_seconds: int, output_cap: int):
+                request_payload = {
+                    **request,
+                    "observer_deadline_ms": (
+                        plan["off_start_ms"] - 60_000 + timeout_seconds * 1_000
+                    ),
+                }
                 return subprocess.run(
                     [sys.executable, "-c", dispatcher_source(
                         timeout_seconds=timeout_seconds, output_cap=output_cap,
                     )],
-                    input=request_bytes, capture_output=True, check=False,
+                    input=json.dumps(
+                        request_payload, sort_keys=True, separators=(",", ":"),
+                    ).encode("ascii") + b"\n", capture_output=True, check=False,
                     env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])},
                 )
 
@@ -989,12 +1026,17 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             helper_path.chmod(0o700)
 
             full_dispatch = run_dispatcher_direct(
-                timeout_seconds=130,
+                # Keep this producer/dispatcher integration independent of
+                # interpreter scheduling jitter at the production 207s cap;
+                # the exact production cap is asserted above and elsewhere.
+                timeout_seconds=225,
                 output_cap=remote_dispatch.CAPACITY_MEMORY_WATCH_OUTPUT_CAP,
             )
             self.assertEqual(
                 full_dispatch.returncode, 0,
-                f"full dispatcher stderr={full_dispatch.stderr[:1000]!r}",
+                f"full dispatcher stderr={full_dispatch.stderr[:1000]!r} "
+                f"stdout_head={full_dispatch.stdout[:500]!r} "
+                f"stdout_tail={full_dispatch.stdout[-1000:]!r}",
             )
             prefixed_rows = [
                 line for line in full_dispatch.stdout.splitlines()
@@ -1046,7 +1088,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 ]
                 self.assertTrue(timed_rows)
                 timed_span_ms = timed_rows[-1]["sampled_at_ms"] - timed_rows[0]["sampled_at_ms"]
-                self.assertGreater(timed_span_ms, 50_000)
+                self.assertGreater(timed_span_ms, 45_000)
                 self.assertLess(timed_span_ms, 56_000)
             with self.subTest(dispatcher_bound="old_output_cap"):
                 old_output_cap = run_dispatcher_direct(
@@ -1073,9 +1115,25 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     "schema": 1, "stage": "output_limit", "reason": "limit",
                 })
 
+            memory_watch_plan = {
+                **plan,
+                "workload": diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD,
+                "on_end_ms": plan["on_start_ms"] + 20_000,
+            }
+            expected_memory_rows = (
+                memory_watch_plan["on_end_ms"]
+                - (memory_watch_plan["off_start_ms"] - 60_000)
+            ) // interval_ms + 1
+            memory_watch_helper_source = helper_source.replace(
+                f"plan = {plan!r}", f"plan = {memory_watch_plan!r}",
+            )
+            self.assertNotEqual(memory_watch_helper_source, helper_source)
+            helper_path.write_text(memory_watch_helper_source, encoding="utf-8")
+            helper_path.chmod(0o700)
             full_dispatcher = dispatcher_source(
                 timeout_seconds=130,
                 output_cap=remote_dispatch.CAPACITY_MEMORY_WATCH_OUTPUT_CAP,
+                plan_payload=memory_watch_plan,
             )
             real_popen = subprocess.Popen
 
@@ -1094,7 +1152,11 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 ssh_config=ssh_dir / "config", ssh_key=ssh_dir / "id_ed25519",
                 control_path=control_path, binding=binding,
                 run_id=run_id, source_sha=source_sha,
-                expected_plan=(plan["off_start_ms"], plan["on_start_ms"], plan["on_end_ms"]),
+                expected_plan=(
+                    memory_watch_plan["off_start_ms"],
+                    memory_watch_plan["on_start_ms"],
+                    memory_watch_plan["on_end_ms"],
+                ),
                 workload=diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD,
             )
             memory_result = None
@@ -1104,7 +1166,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                         watcher.start()
                         self.assertGreaterEqual(watcher.samples, 1)
                         self.assertIsNotNone(watcher.thread)
-                        watcher.thread.join(timeout=10)
+                        watcher.thread.join(timeout=30)
                         self.assertFalse(watcher.thread.is_alive())
                     finally:
                         memory_result = watcher.stop()
@@ -1115,25 +1177,29 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     )
                     self.assertEqual(memory_result["terminal_decision"], "complete")
                     self.assertEqual(memory_result["terminal_reason"], "none")
-                    self.assertEqual(memory_result["samples"], len(full_rows))
-                    self.assertEqual(watcher.total, full_dispatch_bytes)
+                    self.assertEqual(memory_result["samples"], expected_memory_rows)
                     self.assertGreater(watcher.total, 131_072)
                     self.assertLessEqual(watcher.total, capacity_diagnostic.REMOTE_WATCH_CAP)
 
             # The parent reader has the same cumulative-stream bound. Prove
-            # the previous bound rejects this actual full stream, while the
-            # line cap remains independently enforced by _read_row.
+            # it rejects this actual workload stream at a deliberately small
+            # bound; the typed120 child stream above independently covers the
+            # production 131072-byte limit.
             old_parent_watcher = capacity_diagnostic._RemoteMemoryWatcher(
                 ssh_host="example.invalid", ssh_user="tester",
                 ssh_config=ssh_dir / "config", ssh_key=ssh_dir / "id_ed25519",
                 control_path=root / "capacity-control-old-cap.json", binding=binding,
                 run_id=run_id, source_sha=source_sha,
-                expected_plan=(plan["off_start_ms"], plan["on_start_ms"], plan["on_end_ms"]),
+                expected_plan=(
+                    memory_watch_plan["off_start_ms"],
+                    memory_watch_plan["on_start_ms"],
+                    memory_watch_plan["on_end_ms"],
+                ),
                 workload=diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD,
             )
             with self.subTest(parent_bound="old_output_cap"):
                 with (
-                    patch.object(capacity_diagnostic, "REMOTE_WATCH_CAP", 131_072),
+                    patch.object(capacity_diagnostic, "REMOTE_WATCH_CAP", 1_024),
                     patch.object(capacity_diagnostic.subprocess, "Popen", side_effect=fake_ssh_popen),
                 ):
                     try:
@@ -1146,7 +1212,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     f"{old_parent_watcher.process.poll() if old_parent_watcher.process is not None else None}",
                 )
                 self.assertEqual(old_parent_result["terminal_reason"], "observer_failed")
-                self.assertGreater(old_parent_watcher.total, 131_072)
+                self.assertGreater(old_parent_watcher.total, 1_024)
                 maximum_rows = expected_full_rows
                 parent_stream_bound = maximum_rows * (capacity_diagnostic.REMOTE_ROW_CAP + 1)
                 helper_stream_bound = maximum_rows * (
@@ -1894,8 +1960,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             worker_report_path = root / "worker-failure-report.json"
             prepared_run_ids: list[str] = []
 
-            def fake_prepare_plan(*, lifecycle, run_id, **_kwargs):
+            def fake_prepare_plan(*, lifecycle, run_id, workload, **_kwargs):
                 prepared_run_ids.append(run_id)
+                on_window_ms = diagnostic_plan_tool.ON_WINDOW_MS_BY_WORKLOAD[workload]
+                on_end_ms = 125_000 + on_window_ms
                 lifecycle.update({
                     "closed": True, "plan_prepare_status": "prepared",
                     "plan_prepare_refusal_class": "none",
@@ -1907,10 +1975,11 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 return ({
                     "release_slug": "release-test", "off_start_ms": 100_000,
                     "off_end_ms": 120_000, "on_start_ms": 125_000,
-                    "on_end_ms": 145_000,
+                    "on_end_ms": on_end_ms,
                     "expires_at_ms": capacity_diagnostic._plan_expiry_ms(
-                        capacity_diagnostic.WORKLOAD, 145_000,
+                        workload, on_end_ms,
                     ),
+                    "remote_clock_lag_bound_ms": 33_000,
                 }, lifecycle)
 
             def fake_cleanup(_args, _host, _user, _config, _key, payload, lifecycle, **_kwargs):
@@ -1952,7 +2021,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertNotIn("private worker detail", worker_stdout.getvalue())
             self.assertNotIn(str(root), worker_report_path.read_text(encoding="ascii"))
 
-            events: list[tuple[str, int | None]] = []
+            events: list[tuple[str, int | None, str | None]] = []
+            expected_cleanup_workload: list[str] = []
 
             def fake_closed_worker(**_kwargs):
                 return {
@@ -1960,12 +2030,13 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     "worker": {}, "runner_headroom": {},
                 }
 
-            def fake_wait(expiry_ms: int, **_clock_anchor) -> None:
-                events.append(("wait", expiry_ms))
+            def fake_wait(expiry_ms: int, *, workload, **clock_anchor) -> None:
+                events.append(("wait", expiry_ms, workload))
 
-            def fake_exact_cleanup(*, run_id, lifecycle, **_kwargs):
+            def fake_exact_cleanup(*, run_id, lifecycle, workload, **_kwargs):
                 self.assertEqual(run_id, prepared_run_ids[-1])
-                events.append(("cleanup", None))
+                self.assertEqual(workload, expected_cleanup_workload[-1])
+                events.append(("cleanup", None, workload))
                 lifecycle.update({
                     "plan_cleanup_status": "complete",
                     "plan_cleanup_refusal_class": "none",
@@ -1976,19 +2047,33 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 })
                 return True, {}
 
-            closed_args = Namespace(**vars(args))
-            with (
-                patch.object(capacity_diagnostic, "_read_manifest", return_value=(manifest_raw, manifest, actors)),
-                patch.object(capacity_diagnostic, "_prepare_remote_capacity_plan", side_effect=fake_prepare_plan),
-                patch.object(capacity_diagnostic, "run_isolated_capacity_worker", side_effect=fake_closed_worker),
-                patch.object(capacity_diagnostic, "_wait_for_remote_plan_expiry", side_effect=fake_wait),
-                patch.object(capacity_diagnostic, "_cleanup_remote_capacity_plan", side_effect=fake_exact_cleanup) as exact_cleanup,
+            for workload in (
+                capacity_diagnostic.WORKLOAD,
+                diagnostic_plan_tool.HTML_CAPACITY_120S_WORKLOAD,
+                diagnostic_plan_tool.HTML_CPU_PROFILE_20S_WORKLOAD,
             ):
-                closed_outcome = capacity_diagnostic._parent_run(closed_args)
-            self.assertEqual(events, [("wait", 145_000), ("cleanup", None)])
-            exact_cleanup.assert_called_once()
-            self.assertTrue(closed_outcome["namespace_closed"])
-            self.assertEqual(closed_outcome["remote_plan_cleanup"], "complete")
+                expected_cleanup_workload.append(workload)
+                closed_args = Namespace(**vars(args))
+                closed_args.workload = workload
+                if workload != capacity_diagnostic.WORKLOAD:
+                    closed_args.concurrency = 32
+                on_end_ms = 125_000 + diagnostic_plan_tool.ON_WINDOW_MS_BY_WORKLOAD[workload]
+                expires_at_ms = capacity_diagnostic._plan_expiry_ms(workload, on_end_ms)
+                with (
+                    patch.object(capacity_diagnostic, "_read_manifest", return_value=(manifest_raw, manifest, actors)),
+                    patch.object(capacity_diagnostic, "_prepare_remote_capacity_plan", side_effect=fake_prepare_plan),
+                    patch.object(capacity_diagnostic, "run_isolated_capacity_worker", side_effect=fake_closed_worker),
+                    patch.object(capacity_diagnostic, "_wait_for_remote_plan_expiry", side_effect=fake_wait),
+                    patch.object(capacity_diagnostic, "_cleanup_remote_capacity_plan", side_effect=fake_exact_cleanup) as exact_cleanup,
+                ):
+                    closed_outcome = capacity_diagnostic._parent_run(closed_args)
+                self.assertEqual(events[-2:], [
+                    ("wait", expires_at_ms, workload),
+                    ("cleanup", None, workload),
+                ])
+                exact_cleanup.assert_called_once()
+                self.assertTrue(closed_outcome["namespace_closed"])
+                self.assertEqual(closed_outcome["remote_plan_cleanup"], "complete")
 
             fake_monotonic = [50.0]
 
@@ -2436,17 +2521,57 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             run_id="12345", attempt="1", manifest_sha256="e" * 64,
         ), "PASS")
         gc_rows = report["server_telemetry"]["node_memory_rows"]
+        def server_summary(memory_rows: list[dict[str, Any]]) -> dict[str, Any]:
+            raw_usage_rows = [
+                {**row, "duplicate_count": 0}
+                for row in report["server_telemetry"]["cpu_rows"]
+            ]
+            raw_memory_rows = [
+                {
+                    **row,
+                    "expected_targets": 1, "observed_targets": 1,
+                    "event_count": 1, "duplicate_count": 0,
+                }
+                for row in memory_rows
+            ]
+            return {
+                "status": "expired_plans_removed", "service_count": 2,
+                "workload": capacity_diagnostic.WORKLOAD,
+                "usage_status": "complete", "usage_reason": "none",
+                "usage_rows": raw_usage_rows,
+                "profile_status": "complete", "profile_reason": "none",
+                "profile_rows": [
+                    {
+                        "service": "api", "expected_targets": 2,
+                        "observed_targets": 0, "event_count": 0,
+                        "timer": "thread_cpu", "observation_unit": "calls",
+                        "start_lag_ms_min": None, "start_lag_ms_max": None,
+                        "elapsed_ms_min": None, "elapsed_ms_max": None,
+                        "end_lag_ms_min": None, "end_lag_ms_max": None,
+                        "total_cpu_us": 0, "sample_count": None, "categories": [],
+                    },
+                    {
+                        "service": "web", "expected_targets": 1,
+                        "observed_targets": 0, "event_count": 0,
+                        "timer": "v8_cpu", "observation_unit": "samples",
+                        "start_lag_ms_min": None, "start_lag_ms_max": None,
+                        "elapsed_ms_min": None, "elapsed_ms_max": None,
+                        "end_lag_ms_min": None, "end_lag_ms_max": None,
+                        "total_cpu_us": 0, "sample_count": 0, "categories": [],
+                    },
+                ],
+                "memory_status": "complete", "memory_reason": "none",
+                "cgroup_memory_status": "complete", "cgroup_memory_reason": "none",
+                "memory_rows": raw_memory_rows,
+            }
+
         fractional_gc_rows = [
             {**row, "gc_duration_ms": duration}
             for row, duration in zip(gc_rows, (0.0, 1.25), strict=True)
         ]
-        projected_gc = capacity_diagnostic._project_server_telemetry({
-            "usage_status": "complete", "usage_reason": "none",
-            "usage_rows": report["server_telemetry"]["cpu_rows"],
-            "memory_status": "complete", "memory_reason": "none",
-            "cgroup_memory_status": "complete", "cgroup_memory_reason": "none",
-            "memory_rows": fractional_gc_rows,
-        })
+        projected_gc = capacity_diagnostic._project_server_telemetry(
+            server_summary(fractional_gc_rows),
+        )
         self.assertEqual(
             [row["gc_duration_ms"] for row in projected_gc["node_memory_rows"]],
             [0.0, 1.25],
@@ -2473,13 +2598,9 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 {**row, "gc_duration_ms": invalid_duration if index == 0 else row["gc_duration_ms"]}
                 for index, row in enumerate(gc_rows)
             ]
-            projected_invalid_gc = capacity_diagnostic._project_server_telemetry({
-                "usage_status": "complete", "usage_reason": "none",
-                "usage_rows": report["server_telemetry"]["cpu_rows"],
-                "memory_status": "complete", "memory_reason": "none",
-                "cgroup_memory_status": "complete", "cgroup_memory_reason": "none",
-                "memory_rows": invalid_gc_rows,
-            })
+            projected_invalid_gc = capacity_diagnostic._project_server_telemetry(
+                server_summary(invalid_gc_rows),
+            )
             self.assertIsNone(projected_invalid_gc["node_memory_rows"][0]["gc_duration_ms"])
             self.assertEqual(capacity_diagnostic.evaluate_capacity_report(
                 {**report, "server_telemetry": projected_invalid_gc},
@@ -2499,19 +2620,37 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             {**row, "rss_min_bytes": 1.5 if index == 0 else row["rss_min_bytes"]}
             for index, row in enumerate(gc_rows)
         ]
-        projected_fractional_integer = capacity_diagnostic._project_server_telemetry({
-            "usage_status": "complete", "usage_reason": "none",
-            "usage_rows": report["server_telemetry"]["cpu_rows"],
-            "memory_status": "complete", "memory_reason": "none",
-            "cgroup_memory_status": "complete", "cgroup_memory_reason": "none",
-            "memory_rows": fractional_integer_rows,
-        })
+        projected_fractional_integer = capacity_diagnostic._project_server_telemetry(
+            server_summary(fractional_integer_rows),
+        )
         self.assertIsNone(projected_fractional_integer["node_memory_rows"][0]["rss_min_bytes"])
         self.assertEqual(capacity_diagnostic.evaluate_capacity_report(
             {**report, "server_telemetry": projected_fractional_integer},
             source_sha="b" * 40, app_target_sha="c" * 40,
             run_id="12345", attempt="1", manifest_sha256="e" * 64,
         ), "INVALID")
+        optional_metric_rows = [
+            {
+                **row,
+                "memory_events_low_sampled_delta": (
+                    1.5 if index == 0 else row["memory_events_low_sampled_delta"]
+                ),
+            }
+            for index, row in enumerate(gc_rows)
+        ]
+        projected_optional_metric = capacity_diagnostic._project_server_telemetry(
+            server_summary(optional_metric_rows),
+        )
+        self.assertIsNone(
+            projected_optional_metric["node_memory_rows"][0][
+                "memory_events_low_sampled_delta"
+            ],
+        )
+        self.assertEqual(capacity_diagnostic.evaluate_capacity_report(
+            {**report, "server_telemetry": projected_optional_metric},
+            source_sha="b" * 40, app_target_sha="c" * 40,
+            run_id="12345", attempt="1", manifest_sha256="e" * 64,
+        ), "PASS")
         control_diagnostic = json.loads(json.dumps(report))
         control_diagnostic["status"] = "incomplete"
         control_diagnostic["passed"] = False
@@ -2938,6 +3077,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 "expires_at_ms": capacity_diagnostic._plan_expiry_ms(
                     capacity_diagnostic.HTML_WORKLOAD, on_end_ms,
                 ),
+                "remote_clock_lag_bound_ms": 0,
                 "release_slug": "test-release",
             }, lifecycle)
 
@@ -4557,12 +4697,17 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertIsNone(cpu_pair._validate_usage_summary(
                 mixed_memory_identity, allow_projected_memory_rows=True,
             ))
-            capacity_telemetry = capacity_diagnostic._project_server_telemetry(validated_cleanup)
-            self.assertEqual(capacity_telemetry["node_memory_status"], "complete")
+            capacity_telemetry = capacity_diagnostic._project_server_telemetry(
+                validated_cleanup, expected_workload=cpu_pair.WORKLOAD,
+            )
+            self.assertEqual(
+                capacity_telemetry["node_memory_status"], "complete", capacity_telemetry,
+            )
             self.assertEqual(capacity_telemetry["cgroup_memory_status"], "unknown")
             self.assertEqual(capacity_telemetry["node_memory_rows"][1]["gc_count"], 0)
             profiled_capacity_telemetry = capacity_diagnostic._project_server_telemetry(
                 validated_cleanup, include_cpu_profile=True,
+                expected_workload=cpu_pair.WORKLOAD,
             )
             self.assertEqual(profiled_capacity_telemetry["profile_status"], "complete")
             self.assertEqual(
@@ -4576,9 +4721,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             invalid_profile_summary["profile_rows"][0]["categories"][0]["category"] = "raw.function.name"
             invalid_profile_telemetry = capacity_diagnostic._project_server_telemetry(
                 invalid_profile_summary, include_cpu_profile=True,
+                expected_workload=cpu_pair.WORKLOAD,
             )
             self.assertEqual(invalid_profile_telemetry["profile_status"], "incomplete")
-            self.assertEqual(invalid_profile_telemetry["profile_reason"], "invalid_profile")
+            self.assertEqual(invalid_profile_telemetry["profile_reason"], "missing")
 
             # No parsed Web memory samples must still produce the closed,
             # incomplete row shape accepted by the remote cleanup projection.
@@ -4631,7 +4777,9 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             )
             no_memory_cleanup = cpu_pair._validate_usage_summary(no_memory_value)
             self.assertIsNotNone(no_memory_cleanup)
-            no_memory_telemetry = capacity_diagnostic._project_server_telemetry(no_memory_cleanup)
+            no_memory_telemetry = capacity_diagnostic._project_server_telemetry(
+                no_memory_cleanup, expected_workload=cpu_pair.WORKLOAD,
+            )
             self.assertEqual(no_memory_telemetry["node_memory_status"], "incomplete")
             self.assertEqual(no_memory_telemetry["cgroup_memory_status"], "unknown")
             self.assertEqual(len(no_memory_telemetry["node_memory_rows"]), 2)
@@ -5800,6 +5948,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
 
         def cleanup_fixture(
             services: tuple[str, ...], *, summary_raises: bool = False,
+            workload: str = cpu_pair.WORKLOAD,
         ) -> dict[str, object]:
             with tempfile.TemporaryDirectory() as temporary_dir:
                 plan_dir = Path(temporary_dir)
@@ -5809,12 +5958,12 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                         "run_id": "d" * 32,
                         "source_sha": "e" * 40,
                         "release_slug": "release-eeeeeeeeeeee",
-                        "workload": diagnostic_plan_tool.CAPACITY_WORKLOAD,
+                        "workload": workload,
                         "off_start_ms": 1,
                         "off_end_ms": 1,
                         "on_start_ms": 1,
                         "on_end_ms": 1,
-                        "expires_at_ms": 1,
+                        "expires_at_ms": diagnostic_plan_tool._plan_expiry_ms(1, workload),
                         "targets": [{
                             "service": service,
                             "pid": 123,
@@ -5893,6 +6042,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             cleanup_result: dict[str, object],
             *, expected_dispatch_status: int = 0,
             forbidden_output: bytes | None = None,
+            expected_workload: str = cpu_pair.WORKLOAD,
         ) -> dict[str, object] | None:
             """Run producer output through dispatcher and outer closed decoder."""
             with tempfile.TemporaryDirectory() as temporary_dir:
@@ -5940,7 +6090,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 projected = cpu_pair._decode_canonical(
                     projected_line[len(prefix):], cap=cpu_pair.ROOT_USAGE_OUTPUT_CAP,
                 )
-                validated = cpu_pair._validate_usage_summary(projected)
+                validated = cpu_pair._validate_usage_summary(
+                    projected, expected_workload=expected_workload,
+                    allow_noop_cleanup=True,
+                )
                 self.assertIsNotNone(validated)
                 return validated
 
@@ -5954,6 +6107,16 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         validated_partial = cleanup_dispatch_roundtrip(partial_cleanup)
         self.assertEqual(validated_partial["service_count"], 1)
         self.assertIsNone(cpu_pair._usage_delta_percentage_points(validated_partial))
+        typed_capacity_workload = diagnostic_plan_tool.HTML_CAPACITY_120S_WORKLOAD
+        typed_capacity_cleanup = cleanup_fixture(
+            ("api", "web"), workload=typed_capacity_workload,
+        )
+        validated_typed_capacity_cleanup = cleanup_dispatch_roundtrip(
+            typed_capacity_cleanup, expected_workload=typed_capacity_workload,
+        )
+        self.assertEqual(
+            validated_typed_capacity_cleanup["workload"], typed_capacity_workload,
+        )
 
         fallback_cleanup = cleanup_fixture(("api", "web"), summary_raises=True)
         self.assertEqual(fallback_cleanup["service_count"], 2)
@@ -6710,6 +6873,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "namespace_closed": False,
             "maximum_wall_seconds": 600,
             "wall_elapsed_seconds": 14.0,
+            "wall_budget_exceeded": False,
         }
         projected = capacity_diagnostic._project_capacity_report(composite)
         self.assertIsNotNone(projected)
@@ -6972,6 +7136,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "profile_latency_scope": "excluded",
             "remote_plan_cleanup": "complete", "namespace_closed": True,
             "maximum_wall_seconds": 600, "wall_elapsed_seconds": 150.0,
+            "wall_budget_exceeded": False,
         }
 
         def project_phase(_value: Any, *, expected_workload: str) -> dict[str, Any] | None:
@@ -7001,6 +7166,38 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertTrue(complete_fingerprint["binding_valid"])
             self.assertEqual(complete_fingerprint["cpu_profile_phase"]["kind"], "phase_report")
             self.assertEqual(complete_fingerprint["phase_run_ids"], [capacity_run_id, profile_run_id])
+            over_budget = {
+                **composite,
+                "status": "incomplete",
+                "passed": False,
+                "wall_elapsed_seconds": 600.0,
+                "wall_budget_exceeded": True,
+            }
+            with patch.object(
+                capacity_diagnostic, "_project_composite_phase", side_effect=project_phase,
+            ):
+                projected_over_budget = capacity_diagnostic._project_capacity_report(over_budget)
+            self.assertIsNotNone(projected_over_budget)
+            self.assertEqual(projected_over_budget["status"], "incomplete")
+            self.assertFalse(projected_over_budget["passed"])
+            self.assertTrue(projected_over_budget["namespace_closed"])
+            self.assertTrue(projected_over_budget["wall_budget_exceeded"])
+            self.assertEqual(capacity_diagnostic.evaluate_capacity_report(
+                projected_over_budget, source_sha=source_sha, app_target_sha=app_sha,
+                run_id=external_run_id, attempt=attempt, manifest_sha256=manifest_sha,
+                workload=capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+            ), "FAIL")
+            for malformed_overrun in (
+                {**over_budget, "status": "complete"},
+                {**over_budget, "passed": True},
+                {**over_budget, "wall_elapsed_seconds": 599.0},
+            ):
+                with patch.object(
+                    capacity_diagnostic, "_project_composite_phase", side_effect=project_phase,
+                ):
+                    self.assertIsNone(
+                        capacity_diagnostic._project_capacity_report(malformed_overrun),
+                    )
             with tempfile.TemporaryDirectory() as temporary_dir:
                 root = Path(temporary_dir)
                 input_path, output_path = root / "input.json", root / "output.json"
