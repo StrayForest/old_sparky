@@ -100,7 +100,7 @@ def exact_roots(run_id: str) -> set[int]:
     """Find exact run-owned roots, including a reparented observer or setup child."""
     roots: set[int] = set()
     for pid in all_process_ids():
-        args = cmdline(pid)
+        args = [os.fsencode(argument) for argument in cmdline(pid)]
         if _is_run_owned_process(args, run_id):
             roots.add(pid)
     return roots
