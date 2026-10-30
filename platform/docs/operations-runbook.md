@@ -542,13 +542,12 @@ gh workflow run platform-production-retained-load-abort.yml \
 gh run watch <abort-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
-Typed CPU/SSR abort evidence binds run, attempt, source, fixture kind and
-manifest; it proves the exact supervisor stopped and shared lock cleared,
-records `namespace_closed: false`, and grants no performance credit.
+Typed CPU/SSR abort evidence binds run, attempt, source, fixture kind and manifest; it confirms the selected run-owned processes are absent and the shared lock is clear.
+For composite SSR, the reviewed `dev` workflow stages a digest-bound helper in root-owned `/run` while the app stays on target SHA.
+An already-absent receipt requires two clean scans for the exact supervisor, observer and run-root helper processes, exact exit evidence and a clear lock.
+The receipt keeps `namespace_closed: false`, grants no performance credit, and permits cleanup only after the workflow normalizer accepts it.
 
-If no final report exists, cleanup rebuilds from the matching durable
-`PreprodTestRun.report`, validates marker, email, tournament ownership and
-graph boundaries, and never counts recovered work as passed.
+If no final report exists, cleanup rebuilds from the matching durable `PreprodTestRun.report`, validates marker, email, tournament ownership and graph boundaries, and never counts recovered work as passed.
 
 Cleanup recovery rebuilds missing detail from exact `external-vote/external-vote.json` and validates it.
 External-vote is the transport directory; durable rows/manifests use `write-burst`, and rebuilt files keep that path.

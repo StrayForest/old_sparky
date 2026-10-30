@@ -19,10 +19,24 @@ import time
 # This CLI is executed with ``python -I`` by the production cleanup wrapper.
 # Isolated mode intentionally excludes the working directory and ambient
 # PYTHONPATH, so resolve only the immutable script's trusted sibling roots.
-PLATFORM_ROOT = Path(__file__).resolve().parents[1]
-TOOLS_ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(PLATFORM_ROOT))
-sys.path.insert(0, str(TOOLS_ROOT))
+ACTIVE_PLATFORM_ROOT = Path("/opt/oldsparky/platform/current")
+ACTIVE_TOOLS_ROOT = ACTIVE_PLATFORM_ROOT / "tools"
+SCRIPT_FILE = Path(__file__).resolve()
+IS_ROOT_STAGED_HELPER = (
+    SCRIPT_FILE.parent.parent == Path("/run")
+    and SCRIPT_FILE.parent.name.startswith("oldsparky-retained-abort-")
+)
+if IS_ROOT_STAGED_HELPER:
+    # The recovery workflow stages this exact digest-verified helper under a
+    # root-only /run directory. Its support modules stay bound to the active
+    # release, whose SHA is checked against the selected run before mutation.
+    sys.path.insert(0, str(ACTIVE_PLATFORM_ROOT))
+    sys.path.insert(0, str(ACTIVE_TOOLS_ROOT))
+else:
+    PLATFORM_ROOT = SCRIPT_FILE.parents[1]
+    TOOLS_ROOT = SCRIPT_FILE.parent
+    sys.path.insert(0, str(PLATFORM_ROOT))
+    sys.path.insert(0, str(TOOLS_ROOT))
 
 try:
     from tools.platform_evidence_sanitizer import project_public_artifact, sanitize_log_file
@@ -44,6 +58,7 @@ except ModuleNotFoundError:  # Direct execution from platform/tools.
 SCRIPT_PATHS = {
     "/opt/oldsparky/platform/current/tools/platform_production_external_fixture_qa.sh",
 }
+OBSERVER_PATH = "/opt/oldsparky/platform/current/tools/platform_external_load_observer.py"
 LOCK_PATH = "/run/lock/oldsparky-retained-load-matrix.lock"
 CONFIRMATION = "ABORT-PRODUCTION-RETAINED-LOAD"
 RELEASE_PATH = "/opt/oldsparky/platform/current/RELEASE.json"
@@ -56,6 +71,8 @@ RUN_ID_RE = re.compile(r"^[1-9][0-9]{0,31}$")
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--verify-no-active-run", metavar="LOAD_RUN_ID")
+    parser.add_argument("--recovery-workflow-sha")
+    parser.add_argument("--recovery-helper-sha256")
     parser.add_argument("confirmation", nargs="?")
     parser.add_argument("target_sha", nargs="?")
     parser.add_argument("load_run_id", nargs="?")
@@ -80,12 +97,28 @@ def all_process_ids() -> list[int]:
 
 
 def exact_roots(run_id: str) -> set[int]:
+    """Find exact run-owned roots, including a reparented observer or setup child."""
     roots: set[int] = set()
     for pid in all_process_ids():
         args = cmdline(pid)
-        if any(path in args for path in SCRIPT_PATHS) and run_id in args:
+        if _is_run_owned_process(args, run_id):
             roots.add(pid)
     return roots
+
+
+def _is_run_owned_process(args: list[bytes], run_id: str) -> bool:
+    """Match only fixed fixture/observer commands or the exact run export path."""
+
+    encoded_run_id = run_id.encode("ascii")
+    if any(os.fsencode(path) in args for path in SCRIPT_PATHS) and encoded_run_id in args:
+        return True
+    observer_path = os.fsencode(OBSERVER_PATH)
+    if observer_path in args:
+        for index, argument in enumerate(args[:-1]):
+            if argument == b"--external-run-id" and args[index + 1] == encoded_run_id:
+                return True
+    run_root = os.fsencode(str(RUN_ROOT_BASE / f"gha-{run_id}"))
+    return any(argument == run_root or argument.startswith(run_root + b"/") for argument in args)
 
 
 def children_by_parent() -> dict[int, list[int]]:
@@ -126,10 +159,41 @@ def alive(pids: set[int]) -> set[int]:
     return {pid for pid in pids if Path(f"/proc/{pid}").exists()}
 
 
-def signal_tree(pids: set[int], signum: signal.Signals) -> None:
+def _process_start_time(pid: int) -> int | None:
+    """Read Linux /proc stat start ticks to reject PID reuse before signaling."""
+
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RuntimeError("cannot revalidate exact retained-load process identity") from exc
+    return _start_ticks_from_stat(raw)
+
+
+def _start_ticks_from_stat(raw: bytes) -> int:
+    close = raw.rfind(b")")
+    fields = raw[close + 2 :].split() if close >= 0 else []
+    # The suffix begins at field 3 (state); starttime is field 22.
+    if len(fields) <= 19 or not fields[1].isdigit() or not fields[19].isdigit():
+        raise RuntimeError("exact retained-load process identity is malformed")
+    return int(fields[19])
+
+
+def signal_tree(
+    pids: set[int], identities: dict[int, int], signum: signal.Signals
+) -> None:
     for pid in sorted(pids, reverse=True):
         if pid == os.getpid():
             continue
+        expected_start = identities.get(pid)
+        if expected_start is None:
+            raise RuntimeError("exact retained-load process identity is unavailable")
+        actual_start = _process_start_time(pid)
+        if actual_start is None:
+            continue
+        if actual_start != expected_start:
+            raise RuntimeError("retained-load process identity changed before signal")
         try:
             os.kill(pid, signum)
         except ProcessLookupError:
@@ -325,6 +389,7 @@ ABORT_FIXTURE_KINDS = frozenset({
     "cpu_diagnostic_only_v1",
     "ssr_capacity_diagnostic_v1",
     "ssr_html_capacity_diagnostic_v1",
+    "ssr_html_capacity_composite_diagnostic_v1",
 })
 
 
@@ -415,40 +480,78 @@ def _diagnostic_abort_binding(
     return marker
 
 
-def _process_state(run_id: str) -> tuple[set[int], set[int], int]:
-    """Return exact supervisor roots/tree and count non-race proc read errors."""
+def _binding_matches_abort(
+    binding: dict[str, object] | None,
+    *,
+    run_id: str,
+    run_attempt: str,
+    target_sha: str,
+) -> bool:
+    return bool(
+        isinstance(binding, dict)
+        and binding.get("external_run_id") == run_id
+        and binding.get("external_run_attempt") == run_attempt
+        and binding.get("source_sha") == target_sha
+        and binding.get("app_target_sha") == target_sha
+        and binding.get("fixture_kind") in ABORT_FIXTURE_KINDS
+        and isinstance(binding.get("input_handoff_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", str(binding.get("input_handoff_sha256")))
+        is not None
+        and isinstance(binding.get("fixture_manifest_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", str(binding.get("fixture_manifest_sha256")))
+        is not None
+    )
+
+
+def _process_state(run_id: str) -> tuple[set[int], set[int], int, dict[int, int]]:
+    """Return exact run-owned process roots/tree and count non-race proc read errors."""
 
     pids = all_process_ids()
     roots: set[int] = set()
     parents: dict[int, list[int]] = {}
+    start_times: dict[int, int] = {}
     errors = 0
     for pid in pids:
         try:
-            args_raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-            args = [part for part in args_raw.split(b"\0") if part]
+            stat_before = Path(f"/proc/{pid}/stat").read_bytes()
         except FileNotFoundError:
             continue
         except OSError:
             errors += 1
             continue
-        if any(os.fsencode(path) in args for path in SCRIPT_PATHS) and run_id.encode("ascii") in args:
-            roots.add(pid)
         try:
-            raw = Path(f"/proc/{pid}/stat").read_bytes()
+            start_before = _start_ticks_from_stat(stat_before)
+        except RuntimeError:
+            errors += 1
+            continue
+        try:
+            args_raw = Path(f"/proc/{pid}/cmdline").read_bytes()
         except FileNotFoundError:
             continue
         except OSError:
             errors += 1
             continue
-        close = raw.rfind(b")")
-        if close < 0:
+        args = [part for part in args_raw.split(b"\0") if part]
+        try:
+            stat_after = Path(f"/proc/{pid}/stat").read_bytes()
+        except FileNotFoundError:
+            continue
+        except OSError:
             errors += 1
             continue
-        fields = raw[close + 2 :].split()
-        if len(fields) < 2 or not fields[1].isdigit():
+        try:
+            start_after = _start_ticks_from_stat(stat_after)
+        except RuntimeError:
             errors += 1
             continue
+        if start_before != start_after:
+            errors += 1
+            continue
+        fields = stat_after[stat_after.rfind(b")") + 2 :].split()
         parents.setdefault(int(fields[1]), []).append(pid)
+        start_times[pid] = start_after
+        if _is_run_owned_process(args, run_id):
+            roots.add(pid)
     tree = set(roots)
     pending = list(roots)
     while pending:
@@ -457,7 +560,7 @@ def _process_state(run_id: str) -> tuple[set[int], set[int], int]:
             if child not in tree:
                 tree.add(child)
                 pending.append(child)
-    return roots, tree, errors
+    return roots, tree, errors, {pid: start_times[pid] for pid in tree if pid in start_times}
 
 
 def _retained_lock_is_clear() -> bool:
@@ -488,13 +591,14 @@ def _retained_lock_is_clear() -> bool:
 
 def _supervisor_exit_code(run_id: str) -> int | None:
     directory = SUPERVISOR_EXPORT_BASE / f"{LOAD_PREFIX}{run_id}"
-    path = directory / "supervisor.exit"
+    name = "supervisor.exit"
+    directory_fd = -1
+    descriptor = -1
     try:
         artifact_identity = resolve_artifact_identity(require_root=True)
         expected_uid = artifact_identity.uid
         expected_gid = artifact_identity.gid
         parent = directory.lstat()
-        before = path.lstat()
         if (
             not stat.S_ISDIR(parent.st_mode)
             or stat.S_ISLNK(parent.st_mode)
@@ -502,14 +606,39 @@ def _supervisor_exit_code(run_id: str) -> int | None:
             or parent.st_gid != expected_gid
             or parent.st_nlink < 2
             or stat.S_IMODE(parent.st_mode) != 0o700
-            or not stat.S_ISREG(before.st_mode)
-            or before.st_nlink != 1
-            or stat.S_IMODE(before.st_mode) != 0o600
-            or not 1 <= before.st_size <= 4
         ):
             return None
-        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        directory_fd = os.open(
+            directory,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
         try:
+            opened_dir = os.fstat(directory_fd)
+            if (
+                not stat.S_ISDIR(opened_dir.st_mode)
+                or (opened_dir.st_dev, opened_dir.st_ino)
+                != (parent.st_dev, parent.st_ino)
+                or opened_dir.st_uid != expected_uid
+                or opened_dir.st_gid != expected_gid
+                or opened_dir.st_nlink < 2
+                or stat.S_IMODE(opened_dir.st_mode) != 0o700
+            ):
+                return None
+            before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_uid != expected_uid
+                or before.st_gid != expected_gid
+                or stat.S_IMODE(before.st_mode) != 0o600
+                or not 1 <= before.st_size <= 4
+            ):
+                return None
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
             opened = os.fstat(descriptor)
             if (
                 not stat.S_ISREG(opened.st_mode)
@@ -518,17 +647,36 @@ def _supervisor_exit_code(run_id: str) -> int | None:
                 or opened.st_gid != expected_gid
                 or opened.st_nlink != 1
                 or stat.S_IMODE(opened.st_mode) != 0o600
+                or opened.st_size != before.st_size
             ):
                 return None
             raw = os.read(descriptor, 5)
+            after = os.fstat(descriptor)
+            named_after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+                or (named_after.st_dev, named_after.st_ino)
+                != (opened.st_dev, opened.st_ino)
+            ):
+                return None
         finally:
-            os.close(descriptor)
+            if descriptor >= 0:
+                os.close(descriptor)
+                descriptor = -1
+            os.close(directory_fd)
+            directory_fd = -1
         if re.fullmatch(rb"(?:0|[1-9][0-9]{0,2})\n", raw) is None:
             return None
         status = int(raw[:-1])
         return status if status <= 255 else None
     except (OSError, ExportCleanupError):
         return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if directory_fd >= 0:
+            os.close(directory_fd)
 
 
 def export_abort_evidence(
@@ -643,10 +791,12 @@ def main() -> int:
             or args.target_sha is not None
             or args.load_run_id is not None
             or args.load_run_attempt is not None
+            or args.recovery_workflow_sha is not None
+            or args.recovery_helper_sha256 is not None
             or RUN_ID_RE.fullmatch(args.verify_no_active_run) is None
         ):
             raise SystemExit("exact retained-load activity check input is invalid")
-        roots, tree, scan_errors = _process_state(args.verify_no_active_run)
+        roots, tree, scan_errors, _identities = _process_state(args.verify_no_active_run)
         if scan_errors or roots or tree:
             raise SystemExit("exact retained-load activity could not be excluded")
         print("RETAINED_LOAD_ACTIVITY_CHECK schema=1 status=clear")
@@ -669,6 +819,22 @@ def main() -> int:
         raise SystemExit("load_run_id must be numeric")
     if re.fullmatch(r"[1-9][0-9]{0,8}", args.load_run_attempt) is None:
         raise SystemExit("load_run_attempt must be a positive decimal attempt")
+    if (args.recovery_workflow_sha is None) != (args.recovery_helper_sha256 is None):
+        raise SystemExit("source-bound recovery helper identity is incomplete")
+    if args.recovery_workflow_sha is not None:
+        if re.fullmatch(r"[0-9a-f]{40}", args.recovery_workflow_sha) is None:
+            raise SystemExit("recovery workflow SHA is invalid")
+        if re.fullmatch(r"[0-9a-f]{64}", args.recovery_helper_sha256 or "") is None:
+            raise SystemExit("recovery helper digest is invalid")
+        if IS_ROOT_STAGED_HELPER:
+            try:
+                helper_digest = hashlib.sha256(SCRIPT_FILE.read_bytes()).hexdigest()
+            except OSError as exc:
+                raise SystemExit("staged recovery helper is unavailable") from exc
+            if helper_digest != args.recovery_helper_sha256:
+                raise SystemExit("staged recovery helper digest mismatch")
+    elif IS_ROOT_STAGED_HELPER:
+        raise SystemExit("staged recovery helper identity is required")
 
     try:
         release_payload = Path(RELEASE_PATH).read_text(encoding="utf-8")
@@ -678,19 +844,76 @@ def main() -> int:
     if release_sha != args.target_sha:
         raise SystemExit("active production release does not match target_sha")
 
-    roots, tree, scan_errors_before = _process_state(args.load_run_id)
+    roots, tree, scan_errors_before, identities_before = _process_state(args.load_run_id)
     if not roots:
-        print(f"No exact retained-load supervisor found for load run {args.load_run_id}.")
+        # The exact supervisor may already be absent. Reconcile only the
+        # current source/run/manifest binding, two fresh process scans, the
+        # supervisor exit record, and the shared lock. Return the typed proof
+        # over authenticated SSH stdout; never write root evidence into the
+        # caller-owned /tmp export directory.
+        time.sleep(0.1)
+        roots_after, tree_after, scan_errors_after, _identities_after = _process_state(args.load_run_id)
+        binding = _diagnostic_abort_binding(
+            args.load_run_id, args.load_run_attempt, args.target_sha
+        )
+        exit_code = _supervisor_exit_code(args.load_run_id)
+        lock_clear = _retained_lock_is_clear()
+        if (
+            not _binding_matches_abort(
+                binding,
+                run_id=args.load_run_id,
+                run_attempt=args.load_run_attempt,
+                target_sha=args.target_sha,
+            )
+            or scan_errors_before != 0
+            or scan_errors_after != 0
+            or roots
+            or tree
+            or roots_after
+            or tree_after
+            or exit_code is None
+            or not lock_clear
+        ):
+            raise RuntimeError("exact retained-load abort reconciliation failed closed")
+        abort_only = {
+            "schema": 1,
+            "status": "safe_for_exact_fixture_cleanup",
+            "fixture_kind": binding["fixture_kind"],
+            "external_run_id": args.load_run_id,
+            "external_run_attempt": binding["external_run_attempt"],
+            "source_sha": binding["source_sha"],
+            "app_target_sha": binding["app_target_sha"],
+            "input_handoff_sha256": binding["input_handoff_sha256"],
+            "fixture_manifest_sha256": binding["fixture_manifest_sha256"],
+            "remote_stage": "supervisor_already_absent",
+            "supervisor_selector": "fixed_script_paths_run_root_and_run_id",
+            "supervisor_roots_before": 0,
+            "supervisor_tree_before": 0,
+            "supervisor_roots_after": 0,
+            "supervisor_descendants_after": 0,
+            "proc_read_errors": 0,
+            "supervisor_exit_code": exit_code,
+            "shared_lock_clear": True,
+            "namespace_closed": False,
+        }
+        if args.recovery_workflow_sha is not None:
+            abort_only["recovery_workflow_sha"] = args.recovery_workflow_sha
+            abort_only["recovery_helper_sha256"] = args.recovery_helper_sha256
+        receipt = json.dumps(
+            abort_only, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        )
+        print("Exact prior abort reconciled; no matching run-owned process remains.")
+        print(f"ABORT_ONLY_JSON={receipt}")
         return 0
     # Exact process identities are an in-memory abort capability.  Report
     # only bounded counts so even a caller that captures helper stdout cannot
     # turn it into a PID/process inventory.
-    print(f"Exact supervisor roots matched: {len(roots)}")
+    print(f"Exact run-owned roots matched: {len(roots)}")
     print(f"Exact process tree matched: {len(tree)} process(es)")
     snapshot = process_snapshot(tree)
     print("Exact process snapshot:")
     print(snapshot, end="" if snapshot.endswith("\n") else "\n")
-    signal_tree(tree, signal.SIGTERM)
+    signal_tree(tree, identities_before, signal.SIGTERM)
     deadline = time.monotonic() + 30.0
     remaining = alive(tree)
     while remaining and time.monotonic() < deadline:
@@ -698,14 +921,14 @@ def main() -> int:
         remaining = alive(tree)
     if remaining:
         print(f"Escalating SIGKILL for exact remaining process(es): {len(remaining)}")
-        signal_tree(remaining, signal.SIGKILL)
+        signal_tree(remaining, identities_before, signal.SIGKILL)
         time.sleep(0.5)
     remaining = alive(tree)
     if remaining:
         raise RuntimeError(
             f"exact retained-load processes remain: {len(remaining)}"
         )
-    roots_after, tree_after, scan_errors_after = _process_state(args.load_run_id)
+    roots_after, tree_after, scan_errors_after, _identities_after = _process_state(args.load_run_id)
     if roots_after:
         raise RuntimeError("an exact retained-load supervisor still exists after abort")
     binding = _diagnostic_abort_binding(args.load_run_id, args.load_run_attempt, args.target_sha)
@@ -732,7 +955,7 @@ def main() -> int:
             "input_handoff_sha256": binding["input_handoff_sha256"],
             "fixture_manifest_sha256": binding["fixture_manifest_sha256"],
             "remote_stage": "supervisor_terminated",
-            "supervisor_selector": "fixed_script_path_and_run_id",
+            "supervisor_selector": "fixed_script_paths_run_root_and_run_id",
             "supervisor_roots_before": len(roots),
             "supervisor_tree_before": len(tree),
             "supervisor_roots_after": len(roots_after),
@@ -742,6 +965,9 @@ def main() -> int:
             "shared_lock_clear": True,
             "namespace_closed": False,
         }
+        if args.recovery_workflow_sha is not None:
+            abort_only["recovery_workflow_sha"] = args.recovery_workflow_sha
+            abort_only["recovery_helper_sha256"] = args.recovery_helper_sha256
     export_dir = export_abort_evidence(args.load_run_id, snapshot, abort_only=abort_only)
     print(f"ABORT_EVIDENCE_EXPORT={export_dir}")
     print(f"ABORTED_PRODUCTION_RETAINED_LOAD={args.load_run_id}")

@@ -355,6 +355,30 @@ class SecretArtifactBoundaryTests(unittest.TestCase):
                         r"live_user_qa(?:\.sh|_mailbox_helper)|live_qa_mailbox_helper)",
                     )
 
+    def test_retained_abort_uses_only_digest_bound_helper_in_root_stage(self) -> None:
+        workflow = yaml.safe_load(
+            (WORKFLOW_ROOT / "platform-production-retained-load-abort.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        prepare = workflow["jobs"]["prepare-abort-helper"]
+        abort = workflow["jobs"]["abort"]
+        prepare_text = json.dumps(prepare, sort_keys=True)
+        abort_text = json.dumps(abort, sort_keys=True)
+        self.assertNotIn("environment", prepare)
+        self.assertIn("actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803", prepare_text)
+        self.assertIn("persist-credentials", prepare_text)
+        self.assertIn("false", prepare_text)
+        self.assertIn("sha256", prepare_text)
+        self.assertEqual(abort.get("needs"), "prepare-abort-helper")
+        self.assertNotIn("actions/checkout@", abort_text)
+        self.assertIn("actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53", abort_text)
+        self.assertIn("EXPECTED_HELPER_SHA256", abort_text)
+        self.assertIn("/run/oldsparky-retained-abort-", abort_text)
+        self.assertIn("/usr/bin/python3.12 -I -B", abort_text)
+        self.assertIn("cleanup_recovery_helper", abort_text)
+        self.assertIn("supervisor_already_absent", abort_text)
+
     def test_draft_release_is_a_digest_bound_data_only_consumer(self) -> None:
         source = (WORKFLOW_ROOT / "platform-draft-cloudflare.yml").read_text(
             encoding="utf-8"

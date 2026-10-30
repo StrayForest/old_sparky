@@ -28,10 +28,59 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  prepare-abort-helper:
+    name: Prepare digest-bound retained-load abort helper
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      helper_sha256: ${{ steps.helper.outputs.sha256 }}
+      source_sha: ${{ steps.helper.outputs.source_sha }}
+    steps:
+      - name: Require the reviewed dev workflow source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          test "$GITHUB_REF" = "refs/heads/dev"
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: Checkout the exact workflow source without credentials
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Pin the exact helper bytes
+        id: helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          helper="platform/tools/platform_abort_retained_load.py"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          test -f "$helper" && test ! -L "$helper"
+          test "$(stat -c '%F:%h' "$helper")" = "regular file:1"
+          test "$(stat -c '%s' "$helper")" -le 131072
+          digest="$(sha256sum "$helper" | awk '{print $1}')"
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          chmod 600 "$helper"
+          printf 'sha256=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          printf 'source_sha=%s\n' "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the single-file source-bound helper
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-retained-load-abort-helper-${{ github.run_id }}-${{ github.run_attempt }}
+          path: platform/tools/platform_abort_retained_load.py
+          if-no-files-found: error
+          retention-days: 1
+
   abort:
     name: Abort one exact retained-load process tree on production
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    needs: prepare-abort-helper
     environment: production
     env:
       QA_CONFIRMATION: ${{ inputs.confirmation }}
@@ -55,7 +104,73 @@ jobs:
           [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] \
             || { echo "target_sha must be a lowercase 40-character commit SHA." >&2; exit 1; }
 
+      - name: Download and verify the source-bound recovery helper
+        id: helper
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-retained-load-abort-helper-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/retained-load-abort-helper
+
+      - name: Validate the closed helper artifact
+        shell: bash
+        env:
+          EXPECTED_HELPER_SHA256: ${{ needs.prepare-abort-helper.outputs.helper_sha256 }}
+          EXPECTED_HELPER_SOURCE_SHA: ${{ needs.prepare-abort-helper.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/dev"
+          test "$EXPECTED_HELPER_SOURCE_SHA" = "$GITHUB_SHA"
+          [[ "$EXPECTED_HELPER_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          helper_dir="$RUNNER_TEMP/retained-load-abort-helper"
+          test "$(stat -c '%F:%a:%h' "$helper_dir")" = "directory:755:2"
+          /usr/bin/python3 -I -B - "$helper_dir" "$EXPECTED_HELPER_SHA256" <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+
+          directory = Path(sys.argv[1])
+          expected_sha = sys.argv[2]
+          entries = list(directory.iterdir())
+          if len(entries) != 1 or entries[0].name != "platform_abort_retained_load.py":
+              raise SystemExit("abort helper artifact member roster is invalid")
+          path = entries[0]
+          metadata = path.lstat()
+          if (
+              not stat.S_ISREG(metadata.st_mode)
+              or stat.S_ISLNK(metadata.st_mode)
+              or metadata.st_nlink != 1
+              or metadata.st_size <= 0
+              or metadata.st_size > 131072
+          ):
+              raise SystemExit("abort helper artifact member is unsafe")
+          descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+          try:
+              opened = os.fstat(descriptor)
+              if (opened.st_dev, opened.st_ino, opened.st_size) != (
+                  metadata.st_dev, metadata.st_ino, metadata.st_size
+              ):
+                  raise SystemExit("abort helper artifact changed during read")
+              digest = hashlib.sha256()
+              while chunk := os.read(descriptor, 65536):
+                  digest.update(chunk)
+              after = os.fstat(descriptor)
+              if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != (
+                  opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns
+              ):
+                  raise SystemExit("abort helper artifact changed during hashing")
+          finally:
+              os.close(descriptor)
+          if digest.hexdigest() != expected_sha:
+              raise SystemExit("abort helper artifact digest mismatch")
+          path.chmod(0o600)
+          if stat.S_IMODE(path.stat().st_mode) != 0o600:
+              raise SystemExit("abort helper artifact permissions are invalid")
+          PY
+
       - name: Configure production SSH
+        id: configure_ssh
         shell: bash
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
@@ -119,15 +234,43 @@ jobs:
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          HELPER_SHA256: ${{ needs.prepare-abort-helper.outputs.helper_sha256 }}
+          HELPER_SOURCE_SHA: ${{ needs.prepare-abort-helper.outputs.source_sha }}
         run: |
           set -euo pipefail
           artifact_dir="$RUNNER_TEMP/production-retained-abort-artifacts"
           install -d -m 700 "$artifact_dir"
+          helper_file="$RUNNER_TEMP/retained-load-abort-helper/platform_abort_retained_load.py"
           ssh_output_file="$artifact_dir/abort-raw.log"
-          canonical_log="$artifact_dir/canonical.log"
+          incoming="/tmp/oldsparky-retained-abort-helper-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.py"
+          stage="/run/oldsparky-retained-abort-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           umask 077
           : > "$ssh_output_file"
           chmod 600 "$ssh_output_file"
+          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,5}$ ]]
+          [[ "$LOAD_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$LOAD_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,8}$ ]]
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HELPER_SOURCE_SHA" = "$GITHUB_SHA" ]]
+          [[ "$HELPER_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          test "$(sha256sum "$helper_file" | awk '{print $1}')" = "$HELPER_SHA256"
+          ssh \
+            -F "$SSH_DIR/config" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            "test ! -e '$incoming' && test ! -L '$incoming' && test ! -e '$stage' && test ! -L '$stage'"
+          scp \
+            -F "$SSH_DIR/config" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -i "$SSH_DIR/id_ed25519" \
+            "$helper_file" "$PROD_SSH_USER@$PROD_SSH_HOST:$incoming"
+          ssh -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes \
+            -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" "chmod 600 '$incoming'"
           set +e
           ssh \
             -F "$SSH_DIR/config" \
@@ -138,9 +281,49 @@ jobs:
             -o ServerAliveCountMax=3 \
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            sudo -n -- /opt/oldsparky/platform/current/tools/platform_abort_retained_load.py \
-              "$QA_CONFIRMATION" "$TARGET_SHA" "$LOAD_RUN_ID" "$LOAD_RUN_ATTEMPT" \
-            > "$ssh_output_file" 2>&1
+            sudo -n -- /usr/bin/bash -s -- \
+              "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$HELPER_SHA256" \
+              "$HELPER_SOURCE_SHA" "$TARGET_SHA" "$LOAD_RUN_ID" \
+              "$LOAD_RUN_ATTEMPT" "$QA_CONFIRMATION" > "$ssh_output_file" 2>&1 <<'REMOTE'
+          set -Eeuo pipefail
+          workflow_run_id="${1:-}"
+          workflow_attempt="${2:-}"
+          helper_sha="${3:-}"
+          workflow_sha="${4:-}"
+          target_sha="${5:-}"
+          load_run_id="${6:-}"
+          load_run_attempt="${7:-}"
+          confirmation="${8:-}"
+          [[ "$workflow_run_id" =~ ^[1-9][0-9]{0,19}$ ]]
+          [[ "$workflow_attempt" =~ ^[1-9][0-9]{0,5}$ ]]
+          [[ "$helper_sha" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$workflow_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$target_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$load_run_id" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$load_run_attempt" =~ ^[1-9][0-9]{0,8}$ ]]
+          test "$confirmation" = ABORT-PRODUCTION-RETAINED-LOAD
+          test "$(id -u)" -eq 0
+          incoming="/tmp/oldsparky-retained-abort-helper-${workflow_run_id}-${workflow_attempt}.py"
+          stage="/run/oldsparky-retained-abort-${workflow_run_id}-${workflow_attempt}"
+          test ! -L /run
+          test "$(stat -c '%F:%u:%g:%a' /run)" = "directory:0:0:755"
+          caller_uid="${SUDO_UID:-0}"
+          caller_gid="${SUDO_GID:-0}"
+          [[ "$caller_uid" =~ ^[0-9]{1,10}$ && "$caller_gid" =~ ^[0-9]{1,10}$ ]]
+          test "$(stat -c '%F:%u:%g:%a:%h' "$incoming")" = "regular file:${caller_uid}:${caller_gid}:600:1"
+          test "$(stat -c '%s' "$incoming")" -le 131072
+          mkdir -m 0700 -- "$stage"
+          test "$(stat -c '%F:%u:%g:%a:%h' "$stage")" = "directory:0:0:700:2"
+          helper="$stage/platform_abort_retained_load.py"
+          test ! -e "$helper" && test ! -L "$helper"
+          /usr/bin/install -o root -g root -m 0500 -- "$incoming" "$helper"
+          test "$(stat -c '%F:%u:%g:%a:%h' "$helper")" = "regular file:0:0:500:1"
+          test "$(sha256sum "$helper" | awk '{print $1}')" = "$helper_sha"
+          /usr/bin/python3.12 -I -B "$helper" \
+            "$confirmation" "$target_sha" "$load_run_id" "$load_run_attempt" \
+            --recovery-workflow-sha "$workflow_sha" \
+            --recovery-helper-sha256 "$helper_sha"
+          REMOTE
           remote_status=$?
           set -e
           export_dir="$(sed -n 's/^ABORT_EVIDENCE_EXPORT=//p' "$ssh_output_file" | tail -n 1)"
@@ -167,8 +350,115 @@ jobs:
             copy_if_present server-observability.json
             copy_if_present matrix-summary.json
           fi
+          /usr/bin/python3 -I -B - "$ssh_output_file" "$artifact_dir/abort-only.json" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+
+          source, destination = (Path(value) for value in sys.argv[1:])
+          source_meta = source.lstat()
+          if (
+              not stat.S_ISREG(source_meta.st_mode)
+              or stat.S_ISLNK(source_meta.st_mode)
+              or source_meta.st_nlink != 1
+              or source_meta.st_size > 262144
+          ):
+              raise SystemExit("abort SSH response is unsafe")
+          raw = source.read_bytes()
+          rows = [line[len(b"ABORT_ONLY_JSON="):] for line in raw.splitlines()
+                  if line.startswith(b"ABORT_ONLY_JSON=")]
+          if len(rows) > 1:
+              raise SystemExit("multiple typed abort proofs were returned")
+          if rows:
+              if destination.exists() or destination.is_symlink():
+                  raise SystemExit("typed abort proof was both exported and returned")
+              proof_raw = rows[0]
+              if not proof_raw or len(proof_raw) > 16384:
+                  raise SystemExit("typed abort proof length is invalid")
+              def reject_duplicate_keys(pairs):
+                  result = {}
+                  for key, value in pairs:
+                      if key in result:
+                          raise ValueError
+                      result[key] = value
+                  return result
+              try:
+                  proof = json.loads(proof_raw.decode("ascii"), object_pairs_hook=reject_duplicate_keys)
+                  canonical = json.dumps(proof, ensure_ascii=True, allow_nan=False,
+                                         sort_keys=True, separators=(",", ":")).encode("ascii")
+              except (UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+                  raise SystemExit("typed abort proof is invalid")
+              if not isinstance(proof, dict) or canonical != proof_raw:
+                  raise SystemExit("typed abort proof is not canonical")
+              descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                                   os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+              try:
+                  metadata = os.fstat(descriptor)
+                  if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+                          or stat.S_IMODE(metadata.st_mode) != 0o600):
+                      raise SystemExit("typed abort proof output is unsafe")
+                  os.write(descriptor, proof_raw + b"\n")
+                  os.fsync(descriptor)
+              finally:
+                  os.close(descriptor)
+          PY
           echo "remote_status=$remote_status" >> "$GITHUB_OUTPUT"
           exit "$remote_status"
+
+      - name: Remove the exact temporary recovery helper stage
+        id: cleanup_recovery_helper
+        if: ${{ always() && steps.configure_ssh.outcome == 'success' }}
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,5}$ ]]
+          ssh \
+            -F "$SSH_DIR/config" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
+            -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            "sudo -n /usr/bin/bash -s -- $GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT" <<'REMOTE'
+          set -Eeuo pipefail
+          workflow_run_id="${1:-}"
+          workflow_attempt="${2:-}"
+          [[ "$workflow_run_id" =~ ^[1-9][0-9]{0,19}$ ]]
+          [[ "$workflow_attempt" =~ ^[1-9][0-9]{0,5}$ ]]
+          stage="/run/oldsparky-retained-abort-${workflow_run_id}-${workflow_attempt}"
+          incoming="/tmp/oldsparky-retained-abort-helper-${workflow_run_id}-${workflow_attempt}.py"
+          if [[ -e "$stage" || -L "$stage" ]]; then
+            test -d "$stage" && test ! -L "$stage"
+            test "$(stat -c '%F:%u:%g:%a:%h' "$stage")" = "directory:0:0:700:2"
+            shopt -s nullglob
+            entries=("$stage"/*)
+            if [[ ${#entries[@]} -eq 1 && "${entries[0]}" = "$stage/platform_abort_retained_load.py" ]]; then
+              test "$(stat -c '%F:%u:%g:%a:%h' "${entries[0]}")" = "regular file:0:0:500:1"
+              rm -- "${entries[0]}"
+            else
+              [[ ${#entries[@]} -eq 0 ]]
+            fi
+            rmdir -- "$stage"
+          fi
+          test ! -e "$stage" && test ! -L "$stage"
+          if [[ -e "$incoming" || -L "$incoming" ]]; then
+            test -f "$incoming" && test ! -L "$incoming"
+            caller_uid="${SUDO_UID:-0}"
+            caller_gid="${SUDO_GID:-0}"
+            [[ "$caller_uid" =~ ^[0-9]{1,10}$ && "$caller_gid" =~ ^[0-9]{1,10}$ ]]
+            test "$(stat -c '%F:%u:%g:%a:%h' "$incoming")" = "regular file:${caller_uid}:${caller_gid}:600:1"
+            rm -f -- "$incoming"
+          fi
+          test ! -e "$incoming" && test ! -L "$incoming"
+          REMOTE
 
       - name: Remove production SSH material
         id: cleanup_ssh
@@ -209,7 +499,10 @@ jobs:
         env:
           ABORT_REMOTE_STEP: ${{ steps.abort_remote.outcome }}
           ABORT_REMOTE_STATUS: ${{ steps.abort_remote.outputs.remote_status }}
+          ABORT_STAGE_CLEANUP_STEP: ${{ steps.cleanup_recovery_helper.outcome }}
           ABORT_SSH_CLEANUP_STEP: ${{ steps.cleanup_ssh.outcome }}
+          RECOVERY_WORKFLOW_SHA: ${{ github.sha }}
+          RECOVERY_HELPER_SHA256: ${{ needs.prepare-abort-helper.outputs.helper_sha256 }}
         run: |
           set +e
           /usr/bin/python3 - <<'PY'
@@ -233,6 +526,7 @@ jobs:
           fields = {
               "remote_step": classify("ABORT_REMOTE_STEP", {"success": "ok", "failure": "failed", "cancelled": "cancelled", "skipped": "skipped"}),
               "remote": classify("ABORT_REMOTE_STATUS", {"0": "ok", "1": "failed"}),
+              "stage_cleanup": classify("ABORT_STAGE_CLEANUP_STEP", {"success": "ok", "failure": "failed", "cancelled": "cancelled", "skipped": "skipped"}),
               "ssh_cleanup": classify("ABORT_SSH_CLEANUP_STEP", {"success": "ok", "failure": "failed", "cancelled": "cancelled", "skipped": "skipped"}),
               "raw_log": present("abort-raw.log"),
               "process_tree": present("abort-process-tree.txt"),
@@ -256,7 +550,10 @@ jobs:
         env:
           ABORT_REMOTE_STEP: ${{ steps.abort_remote.outcome }}
           ABORT_REMOTE_STATUS: ${{ steps.abort_remote.outputs.remote_status }}
+          ABORT_STAGE_CLEANUP_STEP: ${{ steps.cleanup_recovery_helper.outcome }}
           ABORT_SSH_CLEANUP_STEP: ${{ steps.cleanup_ssh.outcome }}
+          RECOVERY_WORKFLOW_SHA: ${{ github.sha }}
+          RECOVERY_HELPER_SHA256: ${{ needs.prepare-abort-helper.outputs.helper_sha256 }}
         run: |
           set -euo pipefail
           artifact_dir="$RUNNER_TEMP/production-retained-abort-artifacts"
@@ -448,6 +745,7 @@ jobs:
                   "supervisor_selector", "supervisor_roots_before", "supervisor_tree_before",
                   "supervisor_roots_after", "supervisor_descendants_after", "proc_read_errors",
                   "supervisor_exit_code", "shared_lock_clear", "namespace_closed",
+                  "recovery_workflow_sha", "recovery_helper_sha256",
               }
               if (
                   not isinstance(proof, dict)
@@ -459,6 +757,7 @@ jobs:
                       "cpu_diagnostic_only_v1",
                       "ssr_capacity_diagnostic_v1",
                       "ssr_html_capacity_diagnostic_v1",
+                      "ssr_html_capacity_composite_diagnostic_v1",
                   }
                   or proof.get("external_run_id") != run_id
                   or proof.get("external_run_attempt") != attempt
@@ -468,10 +767,26 @@ jobs:
                   or re.fullmatch(r"[0-9a-f]{64}", proof["input_handoff_sha256"]) is None
                   or not isinstance(proof.get("fixture_manifest_sha256"), str)
                   or re.fullmatch(r"[0-9a-f]{64}", proof["fixture_manifest_sha256"]) is None
-                  or proof.get("remote_stage") != "supervisor_terminated"
-                  or proof.get("supervisor_selector") != "fixed_script_path_and_run_id"
-                  or type(proof.get("supervisor_roots_before")) is not int or proof["supervisor_roots_before"] < 1
-                  or type(proof.get("supervisor_tree_before")) is not int or proof["supervisor_tree_before"] < 1
+                  or proof.get("remote_stage") not in {
+                      "supervisor_terminated", "supervisor_already_absent"
+                  }
+                  or proof.get("supervisor_selector") != "fixed_script_paths_run_root_and_run_id"
+                  or type(proof.get("supervisor_roots_before")) is not int
+                  or type(proof.get("supervisor_tree_before")) is not int
+                  or (
+                      proof.get("remote_stage") == "supervisor_terminated"
+                      and (
+                          proof["supervisor_roots_before"] < 1
+                          or proof["supervisor_tree_before"] < 1
+                      )
+                  )
+                  or (
+                      proof.get("remote_stage") == "supervisor_already_absent"
+                      and (
+                          proof["supervisor_roots_before"] != 0
+                          or proof["supervisor_tree_before"] != 0
+                      )
+                  )
                   or type(proof.get("supervisor_roots_after")) is not int or proof["supervisor_roots_after"] != 0
                   or type(proof.get("supervisor_descendants_after")) is not int or proof["supervisor_descendants_after"] != 0
                   or type(proof.get("proc_read_errors")) is not int or proof["proc_read_errors"] != 0
@@ -479,8 +794,14 @@ jobs:
                   or not 0 <= proof["supervisor_exit_code"] <= 255
                   or proof.get("shared_lock_clear") is not True
                   or proof.get("namespace_closed") is not False
+                  or proof.get("recovery_workflow_sha") != os.environ.get("RECOVERY_WORKFLOW_SHA")
+                  or re.fullmatch(
+                      r"[0-9a-f]{64}", str(proof.get("recovery_helper_sha256", ""))
+                  ) is None
+                  or proof.get("recovery_helper_sha256") != os.environ.get("RECOVERY_HELPER_SHA256")
                   or os.environ.get("ABORT_REMOTE_STEP") != "success"
                   or os.environ.get("ABORT_REMOTE_STATUS") != "0"
+                  or os.environ.get("ABORT_STAGE_CLEANUP_STEP") != "success"
                   or os.environ.get("ABORT_SSH_CLEANUP_STEP") != "success"
               ):
                   raise SystemExit("typed diagnostic abort proof binding or termination checks failed")
