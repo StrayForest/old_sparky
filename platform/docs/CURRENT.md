@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-10-29
+- Last reviewed: 2026-10-30
 
 Read this page for live pins, pending release work, open QA gates and hard
 operational limits. Product contracts, procedures and detailed run evidence
@@ -10,53 +10,42 @@ belong in the linked owner documents below.
 
 ## Live and pending state
 
-- The latest recorded production state is source
+- Production remains on source
   `9cbb73b930b71689843f58eb7b5492789f865ca1` with A restored by deployment
-  [40788852387](https://github.com/StrayForest/old_sparky/actions/runs/40788852387).
-  The last retained status observation at `2026-10-29T04:28Z` recorded API `2`,
-  web `1`, and authenticated-read admission concurrency `24` with a maximum of
-  `8` waiters per API worker. The fresh read-only storage diagnostic
-  [40822844997](https://github.com/StrayForest/old_sparky/actions/runs/40822844997)
-  confirmed the active and previous release pointers, running API/worker/web
-  services, and an unlocked retained-load lock at `05:20Z`. Direct metadata
-  inspection at `05:40Z` found no pending release-operation receipt and no
-  holder of the release or retained-load lock. At the fresh `06:03Z` disk
-  sample, free space was `6,047,199,232` bytes, conservative use was `84.86%`,
-  and headroom before the `85%` threshold was `51,110,503` bytes. The backup
-  directory has 61 archive/metadata pairs: 60 verified and one unverified.
-  The installed retention manifest protects 26 exact pairs (25 verified and
-  one unverified); all are older than the newest 15 verified pairs. With a new
-  verified backup, the installed `--backup-keep 15` setting would retain those
-  pins plus the newest 15 verified pairs and rotate 21 older unprotected
-  verified pairs. Generic 14-copy retention is a default, not this installed
-  manifest-backed override.
+  [40788852387](https://github.com/StrayForest/old_sparky/actions/runs/40788852387);
+  installed host-tools generation C4 is unchanged. PR #331's instrumentation
+  merged to `dev` as `7361e4668e946f1634c9ce208f79c0a884fb696b`, but has not
+  been deployed. Exact-SHA Security run
+  [41012116515](https://github.com/StrayForest/old_sparky/actions/runs/41012116515)
+  belongs to this source. Its source-bound TMPFS backup run
+  [41012142776](https://github.com/StrayForest/old_sparky/actions/runs/41012142776)
+  was cancelled before SSH or host-side creation; it created no backup and did
+  not start deployment. The reviewed policy correction for strict shared-venv
+  reuse is still pending; deployment must prove the active environment matches
+  the unchanged candidate dependency inputs. No requested production SSR
+  follow-up measurement has run on the merged instrumentation, and C4 remains
+  active.
 
-  The installed maintenance service failed at `2026-10-29T02:31Z` during
-  `scratch_image_admission`; its closed receipt recorded `6,006,538,240` bytes
-  free after the archive existed, below the required `6,241,124,352` bytes.
-  Cleanup was confirmed, no backup was published, and no scratch image or
-  temporary dump remains. The deployed restore path uses a fully allocated
-  576 MiB ext4 image and requires the 5 GiB free-space floor plus a 256 MiB
-  lead after allocation. Including the latest dump allocation of
-  `128,433,203` bytes, that stage requires `6,369,557,555` free bytes; the
-  `06:03Z` sample is short by `322,358,323` bytes, before any dump growth. No
-  canonical path rotates existing
-  backups without creating and verifying a new one. The two older release
-  trees previously counted as candidates are maintenance-protected pins; the
-  release-only dry run found zero candidates. The installed maintenance unit
-  configures a 90% used-space ceiling, while the operational admission check
-  used an 85% threshold. Treat this as unresolved policy drift; do not treat
-  the unit's 90% limit as approval to run maintenance. The operator disk-
-  capacity choice is pending: add about 1 GiB of provider disk, or request a
-  separately reviewed new rotation procedure. No canonical existing-backup-
-  only rotation route is available, and no deletion or maintenance action is
-  approved.
-  Production deployment and load measurement are currently blocked on satisfying
-  the disk admission requirement; do not start either while this shortfall
-  remains.
-  See the
-  [performance evidence](../performance/README.md#ssr-c32-comparison-checkpoint-2026-10-29)
-  for the comparison outcome and next diagnostic contract.
+  Read-only storage diagnostic
+  [41011834449](https://github.com/StrayForest/old_sparky/actions/runs/41011834449)
+  on `2026-10-30` failed at `backup_check` before retention/cache previews.
+  It recorded `5,904,621,568` bytes free, all three core services active with
+  zero restarts, and no lock holder. Backup evidence failed at phase `check`;
+  checksum, age, restore and Alembic fields were unavailable. Treat it as a
+  failed backup gate, not a fresh integrity pass.
+
+  The separate full-maintenance service failure on `2026-10-29T02:31Z` was at
+  `scratch_image_admission`: free space after the archive was
+  `6,006,538,240` bytes versus `6,241,124,352` required. That maintenance unit
+  pins a fully allocated 576 MiB ext4 image; including the prior 128,433,203-byte
+  dump estimate, its pre-dump threshold was `6,369,557,555` bytes. This is the
+  disk-image full-maintenance admission, not a blanket load-diagnostic gate.
+  The source-bound backup workflow defaults to TMPFS and does not allocate that
+  image, but still enforces the filesystem floor plus 256 MiB lead, archive
+  growth, restore/Alembic verification, scratch cleanup, and at least 1 GiB host
+  `MemAvailable` with swap disabled. The cancelled run proves none of those
+  backup guards passed. See the [backup and restore runbook](backup-restore-runbook.md)
+  and [deployment runbook](deployment-runbook.md) for their separate policies.
 - Source-bound backups must have exactly one producer run ID per Security
   run, attempt and SHA. Failed or cancelled IDs count; multiple IDs make that
   proof ambiguous. Follow the [backup and restore runbook](backup-restore-runbook.md).

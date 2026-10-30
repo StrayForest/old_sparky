@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform performance
-- Last reviewed: 2026-10-29
+- Last reviewed: 2026-10-30
 
 The top-level JSON files in `profiles/` are the only authored canonical load
 contracts (schema 2). `tools/platform_load.py` validates, fingerprints and
@@ -103,9 +103,28 @@ response aborts the phase. The supervisor ceilings are 225 seconds for the
 or guarded by this experiment; cgroup identity checks do not make it a swap
 test. These measurements do not establish an SLO, an absolute capacity ceiling,
 an optimal architecture, or a proven application fix target.
-The run remains blocked until the production disk admission requirement in
-[current state](../docs/CURRENT.md) is satisfied; no deployment or load run is
-currently authorized.
+PR #331's instrumentation merged to `dev` as `7361e4668e946f1634c9ce208f79c0a884fb696b`;
+production remains on A at `9cbb73b930b71689843f58eb7b5492789f865ca1`, and
+the instrumentation is not deployed. The exact-SHA Security run is
+[`41012116515`](https://github.com/StrayForest/old_sparky/actions/runs/41012116515),
+and source-bound TMPFS backup run
+[`41012142776`](https://github.com/StrayForest/old_sparky/actions/runs/41012142776)
+was cancelled before SSH or host-side creation, so no fresh backup was
+produced and deployment did not start. The next measurement waits for the
+reviewed strict shared-venv policy
+correction, the normal exact-SHA automatic deployment, a successful installer
+proof that the active venv matches the unchanged dependency inputs, and fresh
+backup, exact-source preflight, installed C4 readiness and authenticated
+readiness gates. A failed venv proof must stop before venv mutation.
+
+The `6,369,557,555`-byte admission cited in [current state](../docs/CURRENT.md)
+belongs to full backup maintenance with its pinned 576 MiB ext4 scratch image;
+it is not a blanket load-diagnostic gate. The default TMPFS backup path has a
+different admission: the filesystem floor plus 256 MiB lead and actual archive
+growth, along with restore/Alembic, scratch-cleanup and host-memory checks. The
+cancelled backup run establishes no pass for those guards. Evaluate the load
+diagnostic under its own current production preflight and resource gates; do
+not infer its admission solely from the full-maintenance ext4 failure.
 
 After B2, the production runtime was restored to A. The final deployment was
 run [`40788852387`](https://github.com/StrayForest/old_sparky/actions/runs/40788852387).
