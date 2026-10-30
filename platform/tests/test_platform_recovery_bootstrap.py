@@ -58,12 +58,14 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/docs/README.md",
         "platform/docs/adr/production-host-tools-provisioning.md",
         "platform/docs/adr/recovery-bootstrap-retained-abort.md",
+        "platform/performance/README.md",
         "platform/docs/deployment-runbook.md",
         "platform/docs/release-state-machine.md",
         "platform/docs/test-suite-governance.md",
         "platform/tests/test_platform_live_qa_runtime_install.py",
         "platform/tests/test_platform_live_qa_wrappers.py",
         "platform/tests/test_platform_ci_classifier.py",
+        "platform/tests/test_platform_cpu_profile.py",
         "platform/tests/test_platform_host_tools_bundle.py",
         "platform/tests/test_platform_db.py",
         "platform/tests/test_platform_recovery_bootstrap.py",
@@ -94,6 +96,7 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/tools/platform_maintenance_failure_evidence.py",
         "platform/tools/platform_decrypt_maintenance_evidence.py",
         "platform/tools/platform_release_retention.py",
+        "platform/tools/platform_ssr_capacity_diagnostic.py",
         "platform/tools/platform_tournament_list_read_model_recovery.py",
         "platform/tools/platform_release_restore_runtime.sh",
         "platform/tools/platform_production_deploy_supervisor.sh",
@@ -115,9 +118,9 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/python_packages/platform_infra/db.py",
     }
 )
-RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 70
+RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 73
 RECOVERY_BOOTSTRAP_PATCH_FILE_DIGEST = (
-    "2c2d23737deaa35e82c0ecfdeef6c4d7436203588ecced8723956fdf948a6d22"
+    "3eb04607a41a8cc6ad7c3da39f1bc2fecb151681b10d40ede212b1018d9773fb"
 )
 
 # These paths are deliberately present in the recovery route allowlist but are
@@ -127,6 +130,7 @@ RECOVERY_BOOTSTRAP_PATCH_FILE_DIGEST = (
 RECOVERY_BOOTSTRAP_ALLOWLIST_ONLY_FILES = frozenset(
     {
         "platform/tests/test_platform_live_qa_guard.py",
+        "platform/tests/test_platform_evidence_privacy.py",
         "platform/tools/platform_release_lock.sh",
         "platform/tests/test_platform_workflow_provenance.py",
         "platform/tools/platform_deploy_baseline.py",

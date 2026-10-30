@@ -437,6 +437,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
             "platform/tools/platform_abort_retained_load.py",
             "platform/tools/platform_ci_classifier.py",
             "platform/tests/test_platform_secret_artifact_boundary.py",
+            "platform/tests/test_platform_evidence_privacy.py",
             "platform/tests/test_platform_workflow_provenance.py",
         ]
         self.assertTrue(set(retained_abort_paths) <= RECOVERY_BOOTSTRAP_FILES)
@@ -450,6 +451,104 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertEqual(retained_abort_route["reason"], RECOVERY_BOOTSTRAP_REASON)
         self.assertFalse(retained_abort_route["deployable"])
         self.assertFalse(retained_abort_route["fallback"])
+        retained_abort_no_op = classify_cumulative_baseline(
+            retained_abort_route,
+            retained_abort_paths,
+            expected_target_sha=self.TARGET_SHA,
+        )
+        self.assertTrue(retained_abort_no_op["no_op"])
+        self.assertEqual(
+            validate_cumulative_reconcile_route(retained_abort_no_op),
+            {"no_op": True, "runtime_required": False},
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = self._write_production_classifier_archive(
+                Path(temporary), retained_abort_route
+            )
+            accepted = validate_production_classifier_manifest(
+                archive, target_sha=self.TARGET_SHA
+            )
+            self.assertEqual(accepted["reason"], RECOVERY_BOOTSTRAP_REASON)
+            self.assertFalse(accepted["deployable"])
+
+        hosted_ssr_diagnostic_paths = [
+            "platform/tools/platform_ssr_capacity_diagnostic.py",
+            "platform/tests/test_platform_cpu_profile.py",
+            "platform/tools/platform_test_catalog.py",
+            "platform/performance/README.md",
+        ]
+        self.assertTrue(set(hosted_ssr_diagnostic_paths) <= RECOVERY_BOOTSTRAP_FILES)
+        hosted_ssr_diagnostic = classify(
+            hosted_ssr_diagnostic_paths,
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(hosted_ssr_diagnostic["class"], "full")
+        self.assertEqual(hosted_ssr_diagnostic["reason"], RECOVERY_BOOTSTRAP_REASON)
+        self.assertFalse(hosted_ssr_diagnostic["runtime_sensitive"])
+        self.assertFalse(hosted_ssr_diagnostic["deployable"])
+        self.assertFalse(hosted_ssr_diagnostic["fallback"])
+        validate_manifest(hosted_ssr_diagnostic, expected_target_sha=self.TARGET_SHA)
+        hosted_noop = classify_cumulative_baseline(
+            hosted_ssr_diagnostic,
+            hosted_ssr_diagnostic["files"],
+            expected_target_sha=self.TARGET_SHA,
+        )
+        self.assertEqual(
+            validate_cumulative_reconcile_route(hosted_noop),
+            {"no_op": True, "runtime_required": False},
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = self._write_production_classifier_archive(
+                Path(temporary), hosted_ssr_diagnostic
+            )
+            accepted = validate_production_classifier_manifest(
+                archive, target_sha=self.TARGET_SHA,
+            )
+            self.assertEqual(accepted["reason"], RECOVERY_BOOTSTRAP_REASON)
+            self.assertFalse(accepted["deployable"])
+
+        for runtime_path, is_runtime_sensitive in (
+            ("platform/apps/platform_api/app/main.py", False),
+            ("platform/python_packages/platform_infra/config.py", True),
+        ):
+            with self.subTest(runtime_path=runtime_path):
+                mixed = classify(
+                    [*hosted_ssr_diagnostic_paths, runtime_path],
+                    event="push",
+                    target_sha=self.TARGET_SHA,
+                    branch="dev",
+                )
+                self.assertEqual(mixed["class"], "full")
+                self.assertNotEqual(mixed["reason"], RECOVERY_BOOTSTRAP_REASON)
+                self.assertEqual(mixed["runtime_sensitive"], is_runtime_sensitive)
+                self.assertTrue(mixed["deployable"])
+                self.assertFalse(mixed["fallback"])
+                validate_manifest(
+                    mixed,
+                    expected_target_sha=self.TARGET_SHA,
+                    require_deployable=True,
+                )
+                with self.assertRaisesRegex(
+                    ProvenanceError,
+                    "incremental manifest is not a full non-deployable source route",
+                ):
+                    classify_cumulative_baseline(
+                        mixed, mixed["files"], expected_target_sha=self.TARGET_SHA,
+                    )
+                with tempfile.TemporaryDirectory() as temporary:
+                    mixed_archive = self._write_production_classifier_archive(
+                        Path(temporary), mixed
+                    )
+                    validated_mixed = validate_production_classifier_manifest(
+                        mixed_archive,
+                        target_sha=self.TARGET_SHA,
+                    )
+                    self.assertTrue(validated_mixed["deployable"])
+                    self.assertEqual(
+                        validated_mixed["runtime_sensitive"], is_runtime_sensitive,
+                    )
 
         mixed = classify(
             [

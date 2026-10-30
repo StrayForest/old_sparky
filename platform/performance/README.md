@@ -103,19 +103,37 @@ response aborts the phase. The supervisor ceilings are 225 seconds for the
 or guarded by this experiment; cgroup identity checks do not make it a swap
 test. These measurements do not establish an SLO, an absolute capacity ceiling,
 an optimal architecture, or a proven application fix target.
-PR #331's instrumentation merged to `dev` as `7361e4668e946f1634c9ce208f79c0a884fb696b`;
-production remains on A at `9cbb73b930b71689843f58eb7b5492789f865ca1`, and
-the instrumentation is not deployed. The exact-SHA Security run is
-[`41012116515`](https://github.com/StrayForest/old_sparky/actions/runs/41012116515),
-and source-bound TMPFS backup run
+
+The report/fingerprint correction is hosted-runner code: the external-load
+workflow executes it from the exact reviewed `TARGET_SHA`, while its verified
+no-op source receipt independently binds `APP_TARGET_SHA` to the active
+production release. For this diagnostic-only change, the intended binding keeps
+the app on A at `440f1c5d03fb031e0b598aa4b159179bed20a19f` and uses the pinned
+host-tools generation unchanged. Do not equate the runner SHA and app SHA or
+override either identity. If an application/runtime path is co-changed, the
+classifier makes the full route deployable and the no-op binding is unavailable;
+that path requires its normal deployment and exact-source checks before the
+measurement.
+
+The first PR #331 deployment attempt reached only `7361e4668e946f1634c9ce208f79c0a884fb696b`;
+its Security run
+[`41012116515`](https://github.com/StrayForest/old_sparky/actions/runs/41012116515)
+and backup run
 [`41012142776`](https://github.com/StrayForest/old_sparky/actions/runs/41012142776)
-was cancelled before SSH or host-side creation, so no fresh backup was
-produced and deployment did not start. The next measurement waits for the
-reviewed strict shared-venv policy
-correction, the normal exact-SHA automatic deployment, a successful installer
-proof that the active venv matches the unchanged dependency inputs, and fresh
-backup, exact-source preflight, installed C4 readiness and authenticated
-readiness gates. A failed venv proof must stop before venv mutation.
+were cancelled before production backup creation or deployment. The later
+proven-venv policy correction merged as `440f1c5d03fb031e0b598aa4b159179bed20a19f`.
+Its exact-SHA Security run
+[`41014443027`](https://github.com/StrayForest/old_sparky/actions/runs/41014443027),
+source-bound TMPFS backup
+[`41014467427`](https://github.com/StrayForest/old_sparky/actions/runs/41014467427),
+and automatic deployment
+[`41017191006`](https://github.com/StrayForest/old_sparky/actions/runs/41017191006)
+passed. Production is now on A at `440f1c5d03fb031e0b598aa4b159179bed20a19f`;
+the report/fingerprint correction described above remains runner-only source
+code and has not been deployed. Its measurement still requires the exact
+current-source no-op binding, the existing production preflight, readiness and
+resource gates, and exact fixture cleanup. A failed venv proof stops before
+venv mutation.
 
 The `6,369,557,555`-byte admission cited in [current state](../docs/CURRENT.md)
 belongs to full backup maintenance with its pinned 576 MiB ext4 scratch image;

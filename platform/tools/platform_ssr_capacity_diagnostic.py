@@ -333,10 +333,28 @@ PARENT_FAILURE_STAGES = frozenset({
     "identity", "manifest_read", "binding", "remote_plan_prepare",
     "worker_supervision", "plan_cleanup", "report_write",
 })
+COMPOSITE_FAILURE_STAGES = frozenset({
+    "composite_manifest_read", "composite_capacity",
+    "composite_quiescent_gap", "composite_cpu_profile",
+})
 PARENT_ERROR_CLASSES = frozenset({
     "OSError", "ValueError", "KeyError", "TypeError", "RuntimeError",
     "PlanError", "UntrustedHelper", "unexpected",
 })
+
+
+def _parent_failure_stage_is_valid(stage: Any, workload: Any) -> bool:
+    return stage in PARENT_FAILURE_STAGES or (
+        workload == HTML_COMPOSITE_WORKLOAD and stage in COMPOSITE_FAILURE_STAGES
+    )
+
+
+def _parent_failure_profile_spec(workload: Any) -> tuple[str, frozenset[int], int]:
+    if workload == HTML_COMPOSITE_WORKLOAD:
+        return HTML_COMPOSITE_FIXTURE_KIND, frozenset({32}), FIXTURE_USERS
+    return _profile_spec(workload)
+
+
 SUPERVISOR_REPORT_ERROR_CLASSES = frozenset({
     "AttributeError", "NamespaceCapabilityError", "NamespaceIntegrityError",
     "OSError", "preflight_deadline_exceeded", "preflight_setup_deadline_exceeded",
@@ -3010,7 +3028,7 @@ def _parent_failure_receipt(
         "fixture_manifest_sha256": manifest_sha256,
         "fixture_manifest_bytes": manifest_bytes,
         "concurrency": concurrency, "namespace_closed": False,
-        "stage": stage if stage in PARENT_FAILURE_STAGES else "remote_plan_prepare",
+        "stage": stage if _parent_failure_stage_is_valid(stage, workload) else "remote_plan_prepare",
         "error_class": error_class if error_class in PARENT_ERROR_CLASSES else "unexpected",
         "plan_prepare_status": prepare_status if isinstance(prepare_status, str) and prepare_status in PLAN_PREPARE_STATUSES else "not_attempted",
         "plan_prepare_refusal_class": refusal_class if isinstance(refusal_class, str) and refusal_class in PLAN_REFUSAL_CLASSES else "none",
@@ -3035,7 +3053,7 @@ def _parent_failure_receipt(
     if cleanup_failure_detail is not None:
         result["plan_cleanup_failure_detail"] = cleanup_failure_detail
     if workload != WORKLOAD:
-        fixture_kind, _presets, _actors = _profile_spec(workload)
+        fixture_kind, _presets, _actors = _parent_failure_profile_spec(workload)
         result.update({"workload": workload, "fixture_kind": fixture_kind})
     return result
 
@@ -3060,7 +3078,7 @@ def _project_parent_failure_receipt(value: Any) -> dict[str, Any] | None:
         return None
     workload = value.get("workload", WORKLOAD)
     try:
-        expected_fixture_kind, expected_presets, _actor_count = _profile_spec(workload)
+        expected_fixture_kind, expected_presets, _actor_count = _parent_failure_profile_spec(workload)
     except ValueError:
         return None
     if {"workload", "fixture_kind"} <= set(value) and value.get("fixture_kind") != expected_fixture_kind:
@@ -3078,7 +3096,8 @@ def _project_parent_failure_receipt(value: Any) -> dict[str, Any] | None:
         or not isinstance(value.get("profile_digest"), str) or re.fullmatch(r"[0-9a-f]{64}", value["profile_digest"]) is None
         or type(value.get("concurrency")) is not int or value["concurrency"] not in expected_presets
         or value.get("namespace_closed") is not False
-        or not isinstance(value.get("stage"), str) or value["stage"] not in PARENT_FAILURE_STAGES
+        or not isinstance(value.get("stage"), str)
+        or not _parent_failure_stage_is_valid(value["stage"], workload)
         or not isinstance(value.get("error_class"), str) or value["error_class"] not in PARENT_ERROR_CLASSES
         or not isinstance(value.get("plan_prepare_status"), str) or value["plan_prepare_status"] not in PLAN_PREPARE_STATUSES
         or not isinstance(value.get("plan_prepare_refusal_class"), str) or value["plan_prepare_refusal_class"] not in PLAN_REFUSAL_CLASSES
@@ -3095,8 +3114,11 @@ def _project_parent_failure_receipt(value: Any) -> dict[str, Any] | None:
         and re.fullmatch(r"[0-9a-f]{64}", manifest_sha) is not None
         and type(manifest_bytes) is int and 0 < manifest_bytes <= 256 * 1024
     )
+    allowed_manifest_missing_stages = {"identity", "manifest_read"}
+    if workload == HTML_COMPOSITE_WORKLOAD:
+        allowed_manifest_missing_stages.add("composite_manifest_read")
     if not manifest_bound and not (
-        manifest_missing and value["stage"] in {"identity", "manifest_read"}
+        manifest_missing and value["stage"] in allowed_manifest_missing_stages
     ):
         return None
     if "plan_cleanup_failure_detail" in value:
@@ -3117,7 +3139,7 @@ def _project_parent_failure_receipt(value: Any) -> dict[str, Any] | None:
                     and (type(transport["return_code"]) is not int or not -255 <= transport["return_code"] <= 255))):
             return None
     try:
-        failure_presets = _profile_spec(value.get("workload", WORKLOAD))[1]
+        failure_presets = _parent_failure_profile_spec(value.get("workload", WORKLOAD))[1]
     except ValueError:
         return None
     if (value["concurrency"] not in failure_presets
@@ -3879,11 +3901,14 @@ def _parent_composite_run(
         "external_run_id": args.external_run_id,
         "external_run_attempt": args.external_run_attempt,
         "concurrency": args.concurrency,
-        "composite_run_id": os.urandom(16).hex(),
-        "composite_profile_digest": profile_digest(32, HTML_COMPOSITE_WORKLOAD),
+        "run_id": os.urandom(16).hex(),
+        "profile_digest": profile_digest(32, HTML_COMPOSITE_WORKLOAD),
     })
+    state["composite_run_id"] = state["run_id"]
+    state["composite_profile_digest"] = state["profile_digest"]
     manifest_raw, manifest, actors = _read_manifest(Path(args.manifest))
     manifest_sha = hashlib.sha256(manifest_raw).hexdigest()
+    state.update({"manifest_sha256": manifest_sha, "manifest_bytes": len(manifest_raw)})
     if (
         manifest.get("runner_sha") != args.source_sha
         or manifest.get("app_target_sha") != args.app_target_sha
@@ -4513,24 +4538,59 @@ def _project_composite_capacity_report(value: dict[str, Any]) -> dict[str, Any] 
         or len(run_ids) != len(digests)
     ):
         return None
-    capacity = _project_capacity_report(value.get("capacity_phase")) if value.get("capacity_phase") is not None else None
-    profile = _project_capacity_report(value.get("cpu_profile_phase")) if value.get("cpu_profile_phase") is not None else None
+    capacity = _project_composite_phase(
+        value.get("capacity_phase"), expected_workload=HTML_CAPACITY_120S_WORKLOAD,
+    ) if value.get("capacity_phase") is not None else None
+    profile = _project_composite_phase(
+        value.get("cpu_profile_phase"), expected_workload=HTML_CPU_PROFILE_20S_WORKLOAD,
+    ) if value.get("cpu_profile_phase") is not None else None
     if (value.get("capacity_phase") is not None and capacity is None
             or value.get("cpu_profile_phase") is not None and profile is None):
         return None
-    for phase, workload in ((capacity, HTML_CAPACITY_120S_WORKLOAD), (profile, HTML_CPU_PROFILE_20S_WORKLOAD)):
-        if phase is not None and (
-            phase.get("workload") != workload
-            or phase.get("source_sha") != value["source_sha"]
-            or phase.get("app_target_sha") != value["app_target_sha"]
-            or phase.get("external_run_id") != value["external_run_id"]
-            or phase.get("external_run_attempt") != value["external_run_attempt"]
-            or phase.get("fixture_manifest_sha256") != value["fixture_manifest_sha256"]
+    if profile is not None and (
+        capacity is None
+        or capacity.get("status") != "complete"
+        or capacity.get("namespace_closed") is not True
+        or capacity.get("remote_plan_cleanup") != "complete"
+    ):
+        return None
+    phase_values = (capacity, profile)
+    if any(phase is not None and (
+        phase.get("source_sha") != value["source_sha"]
+        or phase.get("app_target_sha") != value["app_target_sha"]
+        or phase.get("external_run_id") != value["external_run_id"]
+        or phase.get("external_run_attempt") != value["external_run_attempt"]
+        or phase.get("concurrency") != 32
+    ) for phase in phase_values):
+        return None
+    for phase in phase_values:
+        if phase is None:
+            continue
+        if phase.get("fixture_manifest_sha256") is None:
+            if (
+                phase.get("failure_only") is not True
+                or phase.get("stage") not in {"identity", "manifest_read"}
+                or phase.get("fixture_manifest_bytes") is not None
+            ):
+                return None
+        elif (
+            phase.get("fixture_manifest_sha256") != value["fixture_manifest_sha256"]
             or phase.get("fixture_manifest_bytes") != value["fixture_manifest_bytes"]
-            or phase.get("concurrency") != 32
         ):
             return None
-    if profile is not None:
+    same_fixture_manifest = all(
+        phase is not None
+        and phase.get("fixture_manifest_sha256") == value["fixture_manifest_sha256"]
+        and phase.get("fixture_manifest_bytes") == value["fixture_manifest_bytes"]
+        for phase in phase_values
+    )
+    if value["same_fixture_manifest"] is not same_fixture_manifest:
+        return None
+    expected_run_ids = [phase["run_id"] for phase in phase_values if phase is not None]
+    expected_profile_digests = [phase["profile_digest"] for phase in phase_values if phase is not None]
+    if run_ids != expected_run_ids or digests != expected_profile_digests:
+        return None
+    if profile is not None and profile.get("failure_only") is not True:
         profile.update({
             "attribution_only": True, "performance_credit": False,
             "capacity_quantile_member": False,
@@ -4556,6 +4616,35 @@ def _project_composite_capacity_report(value: dict[str, Any]) -> dict[str, Any] 
         "capacity_phase": capacity,
         "cpu_profile_phase": profile,
     }
+
+
+def _project_composite_phase(
+    value: Any, *, expected_workload: str,
+) -> dict[str, Any] | None:
+    """Project one composite phase as either a full report or a typed failure receipt."""
+
+    failure = _project_parent_failure_receipt(value)
+    if failure is not None:
+        try:
+            expected_fixture_kind = _profile_spec(expected_workload)[0]
+        except ValueError:
+            return None
+        if (
+            failure.get("workload") != expected_workload
+            or failure.get("fixture_kind") != expected_fixture_kind
+            or failure.get("status") != "incomplete"
+            or failure.get("passed") is not False
+            or failure.get("namespace_closed") is not False
+            or any(failure.get(key) is not False for key in (
+                "matrix_credit", "slo_credit", "diagnostic_credit",
+            ))
+        ):
+            return None
+        return failure
+    report = _project_capacity_report(value)
+    if report is None or report.get("workload") != expected_workload:
+        return None
+    return report
 
 
 def evaluate_capacity_report(
@@ -4938,6 +5027,11 @@ def _parent_failure_fingerprint(
 ) -> dict[str, Any]:
     """Project a capacity attempt into a bound, identity-free fingerprint."""
 
+    if outcome.get("workload") == HTML_COMPOSITE_WORKLOAD:
+        return _composite_parent_failure_fingerprint(
+            outcome, args=args, stage_state=stage_state,
+        )
+
     worker = outcome.get("worker")
     worker_summary: dict[str, Any] | None = None
     if isinstance(worker, Mapping):
@@ -5084,6 +5178,194 @@ def _parent_failure_fingerprint(
     if cleanup_failure_detail is not None:
         payload["cleanup"]["failure_detail"] = cleanup_failure_detail
     return payload
+
+
+def _composite_parent_failure_fingerprint(
+    outcome: Mapping[str, Any], *, args: argparse.Namespace,
+    stage_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Keep composite phase failures visible without projecting private phase data."""
+
+    invocation_workload = getattr(args, "workload", None)
+    invocation_source = getattr(args, "source_sha", None)
+    invocation_app = getattr(args, "app_target_sha", None)
+    invocation_run = getattr(args, "external_run_id", None)
+    invocation_attempt = getattr(args, "external_run_attempt", None)
+    invocation_concurrency = getattr(args, "concurrency", None)
+    outer_failure = _project_parent_failure_receipt(outcome)
+    projected_report = (
+        _project_composite_capacity_report(dict(outcome))
+        if outer_failure is None else None
+    )
+    invocation_is_closed = bool(
+        invocation_workload == HTML_COMPOSITE_WORKLOAD
+        and isinstance(invocation_source, str) and SHA_RE.fullmatch(invocation_source)
+        and isinstance(invocation_app, str) and SHA_RE.fullmatch(invocation_app)
+        and isinstance(invocation_run, str)
+        and re.fullmatch(r"[1-9][0-9]{0,31}", invocation_run)
+        and isinstance(invocation_attempt, str) and ATTEMPT_RE.fullmatch(invocation_attempt)
+        and type(invocation_concurrency) is int and invocation_concurrency == 32
+    )
+    bound_outcome = outer_failure if outer_failure is not None else projected_report
+    identity_matches = bool(invocation_is_closed and bound_outcome is not None and all((
+        bound_outcome.get("workload") == HTML_COMPOSITE_WORKLOAD,
+        bound_outcome.get("fixture_kind") == HTML_COMPOSITE_FIXTURE_KIND,
+        bound_outcome.get("source_sha") == invocation_source,
+        bound_outcome.get("app_target_sha") == invocation_app,
+        bound_outcome.get("external_run_id") == invocation_run,
+        bound_outcome.get("external_run_attempt") == invocation_attempt,
+        bound_outcome.get("concurrency") == invocation_concurrency,
+        bound_outcome.get("profile_digest") == profile_digest(32, HTML_COMPOSITE_WORKLOAD),
+        isinstance(bound_outcome.get("run_id"), str)
+        and RUN_RE.fullmatch(bound_outcome["run_id"]) is not None,
+    )))
+    if identity_matches:
+        for key, state_key in (("run_id", "run_id"),
+                               ("profile_digest", "profile_digest"),
+                               ("fixture_manifest_sha256", "manifest_sha256"),
+                               ("fixture_manifest_bytes", "manifest_bytes")):
+            state_value = stage_state.get(state_key)
+            if state_value is not None and bound_outcome.get(key) != state_value:
+                identity_matches = False
+                break
+    if identity_matches and outer_failure is None:
+        identity_matches = projected_report is not None
+    fingerprint_outcome: Mapping[str, Any] = (
+        bound_outcome if identity_matches and bound_outcome is not None else {}
+    )
+
+    def phase_summary(value: Any) -> dict[str, Any]:
+        failure = _project_parent_failure_receipt(value)
+        if failure is not None:
+            return {
+                "kind": "parent_failure_receipt",
+                "workload": failure["workload"],
+                "status": "incomplete",
+                "stage": failure["stage"],
+                "error_class": failure["error_class"],
+                "run_id": failure["run_id"],
+                "profile_digest": failure["profile_digest"],
+                "fixture_manifest_sha256": failure["fixture_manifest_sha256"],
+                "fixture_manifest_bytes": failure["fixture_manifest_bytes"],
+                "concurrency": failure["concurrency"],
+                "plan_prepare_status": failure["plan_prepare_status"],
+                "plan_prepare_refusal_class": failure["plan_prepare_refusal_class"],
+                "plan_cleanup_status": failure["plan_cleanup_status"],
+                "plan_cleanup_refusal_class": failure["plan_cleanup_refusal_class"],
+                "remote_plan_cleanup": failure["remote_plan_cleanup"],
+                "namespace_closed": False,
+            }
+        # The parent composite projector has already validated this nested
+        # phase. Re-projecting the annotated profiler phase would reject the
+        # attribution-only fields added by that projector.
+        report = value if isinstance(value, Mapping) else None
+        if report is not None and report.get("workload") in {
+            HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD,
+        }:
+            worker = report.get("worker")
+            worker_status = worker.get("status") if isinstance(worker, Mapping) else "missing"
+            if worker_status not in {"complete", "incomplete", "failed", "missing"}:
+                worker_status = "invalid"
+            return {
+                "kind": "phase_report",
+                "workload": report["workload"],
+                "status": report["status"],
+                "passed": report["passed"],
+                "run_id": report["run_id"],
+                "profile_digest": report["profile_digest"],
+                "fixture_manifest_sha256": report["fixture_manifest_sha256"],
+                "fixture_manifest_bytes": report["fixture_manifest_bytes"],
+                "concurrency": report["concurrency"],
+                "worker_status": worker_status,
+                "remote_plan_cleanup": report["remote_plan_cleanup"],
+                "namespace_closed": report["namespace_closed"],
+            }
+        return {"kind": "missing_or_invalid", "status": "unknown"}
+
+    selected_phase = fingerprint_outcome.get("stage") if outer_failure is not None and identity_matches else (
+        stage_state.get("parent_phase", stage_state.get("stage"))
+    )
+    allowed_composite_stages = {
+        "composite_manifest_read", "composite_capacity",
+        "composite_quiescent_gap", "composite_cpu_profile",
+        "report_write", "identity", "manifest_read", "binding",
+        "remote_plan_prepare", "worker_supervision", "runner_headroom",
+        "server_telemetry", "plan_cleanup",
+    }
+    if not isinstance(selected_phase, str) or selected_phase not in allowed_composite_stages:
+        selected_phase = "parent_outcome"
+    parent_error = (
+        outer_failure.get("error_class")
+        if outer_failure is not None and identity_matches else None
+    )
+    if parent_error not in PARENT_ERROR_CLASSES:
+        parent_error = None
+    parent_status = fingerprint_outcome.get("status")
+    if parent_status not in {"complete", "incomplete"}:
+        parent_status = "incomplete"
+    parent_passed = fingerprint_outcome.get("passed") is True and parent_status == "complete"
+    namespace_closed = fingerprint_outcome.get("namespace_closed")
+    if type(namespace_closed) is not bool:
+        namespace_closed = False
+    cleanup = fingerprint_outcome.get("remote_plan_cleanup")
+    if cleanup not in {"complete", "incomplete", "failed", "not_attempted"}:
+        cleanup = "incomplete"
+    source_sha = invocation_source if identity_matches else None
+    app_target_sha = invocation_app if identity_matches else None
+    external_run_id = invocation_run if identity_matches else None
+    external_run_attempt = invocation_attempt if identity_matches else None
+    run_id = fingerprint_outcome.get("run_id") if identity_matches else None
+    profile_digest_value = fingerprint_outcome.get("profile_digest") if identity_matches else None
+    manifest_sha = fingerprint_outcome.get("fixture_manifest_sha256") if identity_matches else None
+    manifest_bytes = fingerprint_outcome.get("fixture_manifest_bytes") if identity_matches else None
+    phase_run_ids = list(projected_report.get("phase_run_ids", [])) if identity_matches and projected_report else []
+    phase_profile_digests = list(projected_report.get("phase_profile_digests", [])) if identity_matches and projected_report else []
+    concurrency = invocation_concurrency if identity_matches else None
+    return {
+        "event": "ssr_capacity_composite_parent_fingerprint",
+        "binding_valid": identity_matches,
+        "diagnostic_only": True,
+        "status": "diagnostic_only",
+        "parent_status": parent_status,
+        "parent_passed": parent_passed,
+        "parent_phase": selected_phase,
+        "parent_error_class": parent_error,
+        "parent_exit_code": 0 if parent_passed else 2,
+        "parent_exit_code_basis": "derived_from_passed_outcome",
+        "passed": False,
+        "source_sha": source_sha,
+        "app_target_sha": app_target_sha,
+        "external_run_id": external_run_id,
+        "external_run_attempt": external_run_attempt,
+        "workload": HTML_COMPOSITE_WORKLOAD,
+        "fixture_kind": HTML_COMPOSITE_FIXTURE_KIND,
+        "run_id": run_id,
+        "profile_digest": profile_digest_value,
+        "fixture_manifest_sha256": manifest_sha,
+        "fixture_manifest_bytes": manifest_bytes,
+        "concurrency": concurrency,
+        "phase_run_ids": phase_run_ids,
+        "phase_profile_digests": phase_profile_digests,
+        "matrix_credit": False,
+        "slo_credit": False,
+        "diagnostic_credit": False,
+        "namespace_closed": namespace_closed,
+        "remote_plan_cleanup": cleanup,
+        "same_fixture_manifest": (
+            projected_report.get("same_fixture_manifest") is True
+            if identity_matches and projected_report is not None else False
+        ),
+        "capacity_phase": phase_summary(projected_report.get("capacity_phase"))
+        if identity_matches and projected_report is not None else {"kind": "missing_or_invalid", "status": "unknown"},
+        "cpu_profile_phase": phase_summary(projected_report.get("cpu_profile_phase"))
+        if identity_matches and projected_report is not None else {"kind": "missing_or_invalid", "status": "unknown"},
+        "plan_prepare_status": (
+            outer_failure["plan_prepare_status"] if outer_failure is not None and identity_matches else "not_attempted"
+        ),
+        "plan_cleanup_status": (
+            outer_failure["plan_cleanup_status"] if outer_failure is not None and identity_matches else "not_attempted"
+        ),
+    }
 
 
 def _write_parent_failure_fingerprint(
@@ -5292,7 +5574,9 @@ def main(argv: list[str] | None = None) -> int:
                 pass
     except Exception as exc:
         stage = stage_state.get("stage", "identity")
-        if not isinstance(stage, str) or stage not in PARENT_FAILURE_STAGES:
+        if not isinstance(stage, str) or not _parent_failure_stage_is_valid(
+            stage, stage_state.get("workload", getattr(args, "workload", WORKLOAD)),
+        ):
             stage = "identity"
         error_name = type(exc).__name__
         error_class = error_name if error_name in PARENT_ERROR_CLASSES else "unexpected"
@@ -5373,7 +5657,7 @@ def main(argv: list[str] | None = None) -> int:
             and isinstance(stage_state.get("profile_digest"), str)
             and re.fullmatch(r"[0-9a-f]{64}", stage_state["profile_digest"]) is not None
             and type(stage_state.get("concurrency", args.concurrency)) is int
-            and stage_state.get("concurrency", args.concurrency) in _profile_spec(
+            and stage_state.get("concurrency", args.concurrency) in _parent_failure_profile_spec(
                 stage_state.get("workload", getattr(args, "workload", WORKLOAD)),
             )[1]
         )
