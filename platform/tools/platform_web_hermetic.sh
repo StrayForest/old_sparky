@@ -78,3 +78,6 @@ PLATFORM_WEB_HERMETIC_BUILD_DIR="$BUILD_DIR" \
 PLAYWRIGHT_BROWSERS_PATH="$BUILD_DIR/browsers" \
 PLATFORM_WEB_HERMETIC_BUILD_DIR="$BUILD_DIR" \
   "$TOOLS_DIR/platform_web_npm.sh" run test:participant-progressive
+PLAYWRIGHT_BROWSERS_PATH="$BUILD_DIR/browsers" \
+PLATFORM_WEB_HERMETIC_BUILD_DIR="$BUILD_DIR" \
+  "$TOOLS_DIR/platform_web_npm.sh" run test:ssr-diagnostic-e2e

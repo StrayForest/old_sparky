@@ -14,6 +14,7 @@
     "start": "../../tools/platform_node.sh ./node_modules/next/dist/bin/next start -p 3000",
     "lint": "../../tools/platform_node.sh ./node_modules/eslint/bin/eslint.js .",
     "test:smoke": "../../tools/platform_node.sh ./node_modules/@playwright/test/cli.js test",
+    "test:ssr-diagnostic-e2e": "../../tools/platform_node.sh ./node_modules/@playwright/test/cli.js test --config=playwright.ssr-diagnostic.config.ts",
     "test:source-contract": "../../tools/platform_node.sh ./node_modules/@playwright/test/cli.js test --config=playwright.source-contract.config.ts",
     "test:hermetic": "../../tools/platform_web_hermetic.sh",
     "test:shutdown-guard": "../../tools/platform_node.sh tests/shutdown-guard-contract.cjs",
