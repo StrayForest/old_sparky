@@ -878,9 +878,11 @@ class HostToolsBundleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             runtime = Path(temporary) / "runtime"
             release = runtime / "releases" / "gha-35511236041-1-87547df2abd4"
+            active_tools = release / "tools"
             (runtime / "releases").mkdir(parents=True)
             (runtime / "shared").mkdir()
             release.mkdir()
+            active_tools.mkdir()
             receipt = _release_receipt(
                 release.name,
                 "87547df2abd4aa06a07f4dd4b4f730e9912707e1",
@@ -899,13 +901,19 @@ class HostToolsBundleTests(unittest.TestCase):
 
             with (
                 patch.object(dispatcher, "RUNTIME_ROOT", runtime),
+                patch.object(dispatcher, "ACTIVE_TOOLS_DIR", active_tools),
                 patch.object(
                     dispatcher,
                     "_stable_host_file",
                     return_value=(TOOLS_ROOT / "platform_validate_release_artifact.py").read_bytes(),
-                ),
+                ) as stable_host_file,
             ):
                 baseline = dispatcher._release_baseline()
+
+            stable_host_file.assert_called_once_with(
+                active_tools / "platform_validate_release_artifact.py",
+                mode=0o755,
+            )
 
             self.assertEqual(
                 set(baseline),
