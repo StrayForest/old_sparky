@@ -250,7 +250,7 @@ def validate_noop_receipt_document(
     if not isinstance(route, Mapping) or set(route) != route_keys:
         raise _fail("no-op receipt route schema is invalid")
     if route.get("no_op") is not True or route.get("runtime_required") is not False:
-        raise _fail("no-op receipt does not prove a completed non-runtime route")
+        raise _fail("no-op receipt does not prove a completed non-deployable route")
     manifest = route.get("cumulative_manifest")
     incremental = route.get("incremental_manifest")
     manifest_digest = route.get("cumulative_manifest_sha256")
@@ -270,7 +270,7 @@ def validate_noop_receipt_document(
     full_manifest = bool(
         manifest.get("class") == "full"
         and manifest.get("expected_gates") == list(FULL_GATE_IDS)
-        and manifest.get("runtime_sensitive") is False
+        and type(manifest.get("runtime_sensitive")) is bool
         and manifest.get("deployable") is False
     )
     if (
@@ -278,7 +278,7 @@ def validate_noop_receipt_document(
         or manifest.get("fallback") is not False
         or not (docs_only_manifest or full_manifest)
     ):
-        raise _fail("no-op receipt cumulative route is not a canonical non-runtime route")
+        raise _fail("no-op receipt cumulative route is not a canonical non-deployable route")
     try:
         from tools.platform_ci_classifier import validate_manifest
 
@@ -329,7 +329,7 @@ def build_noop_receipt_document(
     incremental_manifest: object,
     cumulative_result: object,
 ) -> dict[str, Any]:
-    """Build one receipt only for a canonical completed non-runtime no-op."""
+    """Build a receipt only for a canonical completed non-deployable no-op."""
 
     baseline = _validate_baseline_identity(baseline_identity)
     if not isinstance(cumulative_result, Mapping) or set(cumulative_result) != {"manifest", "no_op"}:
@@ -340,9 +340,9 @@ def build_noop_receipt_document(
         or not isinstance(manifest, Mapping)
         or manifest.get("target_sha") != runner_sha
         or manifest.get("deployable") is not False
-        or manifest.get("runtime_sensitive") is not False
+        or type(manifest.get("runtime_sensitive")) is not bool
     ):
-        raise _fail("no-op receipt may describe only a nondeployable non-runtime route")
+        raise _fail("no-op receipt may describe only a non-deployable canonical route")
     route_result = validate_cumulative_reconcile_route(cumulative_result)
     if route_result != {"no_op": True, "runtime_required": False}:
         raise _fail("no-op receipt cumulative route is not an exact no-op")

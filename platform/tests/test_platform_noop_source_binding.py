@@ -35,7 +35,12 @@ PLATFORM_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = PLATFORM_ROOT.parent
 sys.path.insert(0, str(PLATFORM_ROOT))
 
-from tools import platform_ci_classifier, platform_load, platform_noop_source_binding  # noqa: E402
+from tools import (  # noqa: E402
+    platform_ci_classifier,
+    platform_load,
+    platform_noop_source_binding,
+    platform_production_classifier_artifact,
+)
 from tools.platform_workflow_provenance import ProvenanceError  # noqa: E402
 from tools.platform_noop_source_binding import (  # noqa: E402
     RECEIPT_FILE,
@@ -63,6 +68,26 @@ ARTIFACT_ID = "456789"
 ARTIFACT_NAME = (
     f"platform-production-noop-source-receipt-{DEPLOY_RUN_ID}-{DEPLOY_ATTEMPT}"
 )
+RECOVERY_BOOTSTRAP_CUMULATIVE_PATHS = [
+    ".github/workflows/platform-production-retained-load-abort.yml",
+    "platform/docs/deployment-runbook.md",
+    "platform/docs/operations-runbook.md",
+    "platform/performance/README.md",
+    "platform/tests/test_platform_ci_classifier.py",
+    "platform/tests/test_platform_cpu_profile.py",
+    "platform/tests/test_platform_evidence_privacy.py",
+    "platform/tests/test_platform_live_qa_wrappers.py",
+    "platform/tests/test_platform_recovery_bootstrap.py",
+    "platform/tests/test_platform_secret_artifact_boundary.py",
+    "platform/tests/test_platform_workflow_provenance.py",
+    "platform/tools/platform_abort_retained_load.py",
+    "platform/tools/platform_ci_classifier.py",
+    "platform/tools/platform_noop_source_binding.py",
+    "platform/tools/platform_production_classifier_artifact.py",
+    "platform/tools/platform_ssr_capacity_diagnostic.py",
+    "platform/tools/platform_test_catalog.py",
+    "platform/tests/test_platform_noop_source_binding.py",
+]
 
 
 def _canonical_json(value: object) -> bytes:
@@ -316,6 +341,141 @@ class NoopSourceBindingTests(unittest.TestCase):
         self.assertEqual(binding["app_target_sha"], APP_SHA)
         self.assertEqual(binding["baseline_identity"], _baseline_identity())
         self.assertNotEqual(binding["runner_sha"], binding["app_target_sha"])
+
+    def test_runtime_sensitive_recovery_bootstrap_noop_roundtrips_runner_to_active_app(self) -> None:
+        incremental_files = [
+            "platform/tools/platform_noop_source_binding.py",
+            "platform/tools/platform_ci_classifier.py",
+            "platform/tools/platform_production_classifier_artifact.py",
+            "platform/tools/platform_test_catalog.py",
+            "platform/tests/test_platform_noop_source_binding.py",
+            "platform/tests/test_platform_recovery_bootstrap.py",
+            "platform/docs/deployment-runbook.md",
+        ]
+        incremental = platform_ci_classifier.classify(
+            incremental_files,
+            event="push",
+            branch="dev",
+            target_sha=RUNNER_SHA,
+            repository_ready=True,
+        )
+        cumulative_result = platform_noop_source_binding.classify_cumulative_baseline(
+            incremental,
+            RECOVERY_BOOTSTRAP_CUMULATIVE_PATHS,
+            expected_target_sha=RUNNER_SHA,
+        )
+        self.assertTrue(cumulative_result["no_op"])
+        self.assertTrue(cumulative_result["manifest"]["runtime_sensitive"])
+        self.assertFalse(cumulative_result["manifest"]["deployable"])
+        self.assertEqual(
+            platform_noop_source_binding.validate_cumulative_reconcile_route(
+                cumulative_result
+            ),
+            {"no_op": True, "runtime_required": False},
+        )
+        for manifest in (incremental, cumulative_result["manifest"]):
+            with tempfile.TemporaryDirectory(prefix="recovery-noop-classifier-") as directory:
+                archive_path = Path(directory) / "classifier.zip"
+                info = zipfile.ZipInfo("classifier-manifest.json")
+                info.create_system = 3
+                info.external_attr = (0o100600 & 0xFFFF) << 16
+                with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                    archive.writestr(info, _canonical_json(manifest))
+                self.assertEqual(
+                    platform_production_classifier_artifact.validate_manifest(
+                        archive_path,
+                        target_sha=RUNNER_SHA,
+                        require_recovery_bootstrap=True,
+                        require_runtime_sensitive=True,
+                    ),
+                    manifest,
+                )
+
+        document = platform_noop_source_binding.build_noop_receipt_document(
+            runner_sha=RUNNER_SHA,
+            production_deploy_run_id=DEPLOY_RUN_ID,
+            production_deploy_run_attempt=DEPLOY_ATTEMPT,
+            source_security_run_id=SECURITY_RUN_ID,
+            source_security_run_attempt=SECURITY_ATTEMPT,
+            autodeploy_run_id=AUTODEPLOY_RUN_ID,
+            autodeploy_run_attempt=AUTODEPLOY_ATTEMPT,
+            baseline_identity=_baseline_identity(),
+            incremental_manifest=incremental,
+            cumulative_result=cumulative_result,
+        )
+        artifact = _zip_receipt(document)
+        receipt_binding = validate_noop_receipt_artifact(
+            _artifact_metadata(artifact),
+            artifact,
+            **_expected_run_bindings(),
+            expected_artifact_id=ARTIFACT_ID,
+            expected_artifact_name=ARTIFACT_NAME,
+        )
+        active_binding = validate_active_source_binding(
+            runner_sha=RUNNER_SHA,
+            active_baseline=_baseline_identity(),
+            receipt_binding=receipt_binding,
+        )
+        handoff = validate_source_binding_handoff(
+            active_binding,
+            **_expected_noop_handoff_kwargs(active_binding),
+        )
+        self.assertEqual(handoff["runner_sha"], RUNNER_SHA)
+        self.assertEqual(handoff["app_target_sha"], APP_SHA)
+        self.assertEqual(handoff["binding_mode"], "verified-noop")
+        current_c_binding = validate_active_runtime_tuple(
+            handoff, _baseline_identity(), expected_runner_sha=RUNNER_SHA
+        )
+        self.assertEqual(current_c_binding["runner_sha"], RUNNER_SHA)
+        self.assertEqual(current_c_binding["app_target_sha"], APP_SHA)
+
+        cleanup_payload = platform_workflow_input_guard.validate_cleanup_payload(
+            {
+                "schema": 2,
+                "target_sha": RUNNER_SHA,
+                "control_email": "control@example.invalid",
+                "load_run_id": "567890",
+                "cleanup_run_id": "678901",
+                "source_binding": handoff,
+            }
+        )
+        app_sha, baseline, suffix = platform_workflow_remote_dispatch._source_binding_context(
+            cleanup_payload
+        )
+        self.assertEqual(app_sha, APP_SHA)
+        self.assertEqual(baseline, _baseline_identity())
+        self.assertEqual(suffix[0], "--source-binding-base64")
+        self.assertEqual(
+            json.loads(base64.b64decode(suffix[1], validate=True)), handoff
+        )
+
+        negative_changes = (
+            ("deployable", True),
+            ("fallback", True),
+            ("runtime_sensitive", "true"),
+            ("runtime_sensitive", False),
+            ("reason", "unreviewed route"),
+        )
+        for field, value in negative_changes:
+            candidate = copy.deepcopy(document)
+            candidate["route"]["cumulative_manifest"][field] = value  # type: ignore[index]
+            candidate["route"]["cumulative_manifest_sha256"] = hashlib.sha256(
+                _canonical_json(candidate["route"]["cumulative_manifest"])
+            ).hexdigest()  # type: ignore[index]
+            with self.subTest(field=field), self.assertRaises(ProvenanceError):
+                validate_noop_receipt_document(candidate, **_expected_run_bindings())
+
+        for extra_path in (
+            "platform/apps/platform_api/app/main.py",
+            "platform/tools/unlisted_recovery_helper.py",
+        ):
+            candidate = copy.deepcopy(document)
+            candidate["route"]["cumulative_manifest"]["files"].append(extra_path)  # type: ignore[index]
+            candidate["route"]["cumulative_manifest_sha256"] = hashlib.sha256(
+                _canonical_json(candidate["route"]["cumulative_manifest"])
+            ).hexdigest()  # type: ignore[index]
+            with self.subTest(extra_path=extra_path), self.assertRaises(ProvenanceError):
+                validate_noop_receipt_document(candidate, **_expected_run_bindings())
 
     def test_same_source_binding_needs_no_receipt_and_rejects_substitution(self) -> None:
         baseline = _baseline_identity()

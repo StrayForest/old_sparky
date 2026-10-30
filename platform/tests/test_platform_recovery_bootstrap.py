@@ -131,11 +131,13 @@ RECOVERY_BOOTSTRAP_ALLOWLIST_ONLY_FILES = frozenset(
     {
         "platform/tests/test_platform_live_qa_guard.py",
         "platform/tests/test_platform_evidence_privacy.py",
+        "platform/tests/test_platform_noop_source_binding.py",
         "platform/tools/platform_release_lock.sh",
         "platform/tests/test_platform_workflow_provenance.py",
         "platform/tools/platform_deploy_baseline.py",
         "platform/tools/platform_baseline_runtime_proof.py",
         "platform/tools/platform_host_tools_bundle.py",
+        "platform/tools/platform_noop_source_binding.py",
         "platform/tests/test_platform_release_active_artifact_proof.py",
         "platform/tools/platform_release_active_artifact_proof.py",
         "platform/tools/platform_release_capture_probe.py",
