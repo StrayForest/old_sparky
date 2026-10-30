@@ -6547,6 +6547,244 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             with_invalid_proof["summary"]["coverage"]["selection_rank_proof"] = invalid_proof
             self.assertIsNone(capacity_diagnostic._project_request_correlation(with_invalid_proof))
 
+        # Exercise the exact host producer coverage envelope through the
+        # remote dispatcher and the runner's closed cleanup-summary parser.
+        run_id = "a" * 32
+
+        def producer_request_telemetry(
+            workload: str,
+            selected_ids: list[str], cohort_counts: dict[str, object],
+        ) -> dict[str, object]:
+            on_end_ms = 146_000 if workload == diagnostic_plan_tool.HTML_CAPACITY_120S_WORKLOAD else 46_000
+            plans = {
+                service: {
+                    "run_id": run_id,
+                    "workload": workload,
+                    "on_start_ms": 26_000,
+                    "on_end_ms": on_end_ms,
+                    "expires_at_ms": on_end_ms + 15_000,
+                }
+                for service in ("api", "web")
+            }
+            with (
+                patch.object(
+                    diagnostic_plan_tool, "_bounded_capacity_journal_rows",
+                    return_value=([], False),
+                ),
+                patch.object(
+                    diagnostic_plan_tool, "_bounded_nginx_rows",
+                    return_value=([], False),
+                ),
+            ):
+                result = diagnostic_plan_tool._capacity_request_telemetry(
+                    plans,
+                    selected_request_ids=selected_ids,
+                    cohort_counts=cohort_counts,
+                )
+            return {
+                "status": "complete" if result["coverage"]["complete"] else "incomplete",
+                "summary": result,
+            }
+
+        def cleanup_summary(
+            workload: str, request_telemetry: dict[str, object],
+        ) -> dict[str, object]:
+            on_window_ms = cpu_pair.USAGE_WINDOW_MS_BY_WORKLOAD[workload]
+            usage_rows = []
+            for service, phase, targets in (
+                ("api", "off", 2), ("api", "on", 2),
+                ("web", "off", 1), ("web", "on", 1),
+            ):
+                window_ms = 20_000 if phase == "off" else on_window_ms
+                usage_rows.append({
+                    "service": service, "phase": phase,
+                    "expected_targets": targets, "observed_targets": targets,
+                    "event_count": targets, "cpu_ns": targets * window_ms * 1_000,
+                    "window_ms_min": window_ms, "window_ms_max": window_ms,
+                    "start_lag_ms_min": 0, "start_lag_ms_max": 0,
+                    "end_lag_ms_min": 0, "end_lag_ms_max": 0,
+                    "duplicate_count": 0, "timing_complete": True,
+                })
+            profile_rows = []
+            profiled = workload in cpu_pair.PROFILE_WORKLOADS
+            for service, targets, timer, unit, sample_count, category in (
+                ("api", 2, "thread_cpu", "calls", None, "repo.get_current_user"),
+                ("web", 1, "v8_cpu", "samples", 1, "repo.workspace_page"),
+            ):
+                profile_rows.append({
+                    "service": service, "expected_targets": targets,
+                    "observed_targets": targets if profiled else 0,
+                    "event_count": targets if profiled else 0,
+                    "timer": timer, "observation_unit": unit,
+                    "total_cpu_us": 100 if profiled else 0,
+                    "sample_count": sample_count if profiled else (None if service == "api" else 0),
+                    "start_lag_ms_min": 0 if profiled else None,
+                    "start_lag_ms_max": 0 if profiled else None,
+                    "elapsed_ms_min": on_window_ms if profiled else None,
+                    "elapsed_ms_max": on_window_ms if profiled else None,
+                    "end_lag_ms_min": 0 if profiled else None,
+                    "end_lag_ms_max": 0 if profiled else None,
+                    "categories": ([{
+                        "category": category, "cpu_us": 100,
+                        "observations": targets if service == "api" else 1,
+                    }] if profiled else []),
+                })
+            return {
+                "status": "expired_plans_removed", "service_count": 2,
+                "workload": workload,
+                "usage_status": "complete", "usage_reason": "none",
+                "usage_rows": usage_rows,
+                "profile_status": "complete", "profile_reason": "none",
+                "profile_rows": profile_rows,
+                "memory_status": "unavailable", "memory_reason": "unavailable",
+                "cgroup_memory_status": "unknown",
+                "cgroup_memory_reason": "hierarchy_unavailable", "memory_rows": [],
+                "request_telemetry": request_telemetry,
+            }
+
+        zero_counts: dict[str, object] = {
+            "submitted_html_count": 4_252, "valid_response_id_count": 0,
+            "missing_response_id_count": 4_252, "duplicate_response_id_count": 0,
+            "malformed_response_id_count": 0, "eligible_response_id_count": 0,
+            "retained_sample_count": 0,
+            "sample_scheme": "sha256-runid-requestid-1of8-v1",
+            "sample_cap_truncated": False,
+        }
+        sampled_id = next(
+            f"{index:032x}"
+            for index in range(1, 10_000)
+            if diagnostic_plan_tool.is_ssr_response_id_eligible(run_id, f"{index:032x}")
+        )
+        sampled_counts = {
+            **zero_counts,
+            "valid_response_id_count": 1,
+            "missing_response_id_count": 4_251,
+            "eligible_response_id_count": 1,
+            "retained_sample_count": 1,
+        }
+
+        def dispatch_and_validate(
+            workload: str,
+            result: dict[str, object], selected_ids: list[str],
+            cohort_counts: dict[str, object],
+        ) -> dict[str, object] | None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                result_path = root / "cleanup-summary.json"
+                result_path.write_text(
+                    json.dumps(result, sort_keys=True), encoding="ascii",
+                )
+                fake_sudo = root / "sudo-fixture"
+                fake_sudo.write_text(
+                    "#!/usr/bin/python3\n"
+                    "import json,sys\n"
+                    "sys.stdin.read()\n"
+                    f"value=json.load(open({str(result_path)!r}, encoding='ascii'))\n"
+                    "print('CPU_DIAGNOSTIC_PLAN ' + json.dumps(value, sort_keys=True, separators=(',', ':')))\n",
+                    encoding="ascii",
+                )
+                fake_sudo.chmod(0o700)
+                output = io.StringIO()
+                payload = {
+                    "operation": "cleanup", "schema": 1, "run_id": run_id,
+                    "client_request_ids": selected_ids,
+                    "client_cohort_counts": cohort_counts,
+                }
+                with (
+                    patch.object(remote_dispatch, "_trusted_python_helper", return_value=True),
+                    patch.object(remote_dispatch, "SUDO", str(fake_sudo)),
+                    redirect_stdout(output),
+                ):
+                    self.assertEqual(remote_dispatch._run_cpu_diagnostic_plan(payload), 0)
+                projected = json.loads(
+                    output.getvalue().strip().removeprefix("CPU_DIAGNOSTIC_PLAN ")
+                )
+                return cpu_pair._validate_usage_summary(
+                    projected, expected_workload=workload,
+                )
+
+        for workload in (
+            diagnostic_plan_tool.HTML_CAPACITY_120S_WORKLOAD,
+            diagnostic_plan_tool.HTML_CPU_PROFILE_20S_WORKLOAD,
+        ):
+            for selected_ids, counts in (([], zero_counts), ([sampled_id], sampled_counts)):
+                with self.subTest(workload=workload, selected_count=len(selected_ids)):
+                    produced = producer_request_telemetry(workload, selected_ids, counts)
+                    coverage = produced["summary"]["coverage"]
+                    self.assertEqual(coverage["scope"], "selected_sample_only")
+                    self.assertEqual(coverage["selection_rank_proof"], "all_eligible_ids_selected")
+                    parsed_cleanup = dispatch_and_validate(
+                        workload, cleanup_summary(workload, produced), selected_ids, counts,
+                    )
+                    self.assertIsNotNone(parsed_cleanup)
+                    self.assertEqual(
+                        parsed_cleanup["request_telemetry"]["summary"]["coverage"], coverage,
+                    )
+                    for field, invalid in (
+                        ("scope", "all_requests"),
+                        ("selection_rank_proof", "raw_request_ids"),
+                        ("selection_rank_proof", []),
+                        (
+                            "selection_rank_proof",
+                            "producer_asserted_not_verifiable_from_selected_ids",
+                        ),
+                    ):
+                        malformed = json.loads(json.dumps(cleanup_summary(workload, produced)))
+                        malformed["request_telemetry"]["summary"]["coverage"][field] = invalid
+                        self.assertIsNone(dispatch_and_validate(
+                            workload, malformed, selected_ids, counts,
+                        ))
+                    missing_scope = json.loads(json.dumps(cleanup_summary(workload, produced)))
+                    del missing_scope["request_telemetry"]["summary"]["coverage"]["scope"]
+                    self.assertIsNone(dispatch_and_validate(
+                        workload, missing_scope, selected_ids, counts,
+                    ))
+
+        selected_rank_ids: list[str] = []
+        for index in range(1, 100_000):
+            request_id = f"{index:032x}"
+            if diagnostic_plan_tool.is_ssr_response_id_eligible(run_id, request_id):
+                selected_rank_ids.append(request_id)
+                if len(selected_rank_ids) == diagnostic_plan_tool.CAPACITY_REQUEST_SAMPLE_LIMIT:
+                    break
+        self.assertEqual(
+            len(selected_rank_ids), diagnostic_plan_tool.CAPACITY_REQUEST_SAMPLE_LIMIT,
+        )
+        over_cap_counts = {
+            **zero_counts,
+            "submitted_html_count": 1_001,
+            "valid_response_id_count": 1_001,
+            "missing_response_id_count": 0,
+            "eligible_response_id_count": 1_001,
+            "retained_sample_count": len(selected_rank_ids),
+            "sample_cap_truncated": True,
+        }
+        over_cap_telemetry = producer_request_telemetry(
+            diagnostic_plan_tool.HTML_CAPACITY_120S_WORKLOAD,
+            selected_rank_ids, over_cap_counts,
+        )
+        over_cap_coverage = over_cap_telemetry["summary"]["coverage"]
+        self.assertEqual(
+            over_cap_coverage["selection_rank_proof"],
+            "producer_asserted_not_verifiable_from_selected_ids",
+        )
+        over_cap_workload = diagnostic_plan_tool.HTML_CAPACITY_120S_WORKLOAD
+        self.assertIsNotNone(dispatch_and_validate(
+            over_cap_workload,
+            cleanup_summary(over_cap_workload, over_cap_telemetry),
+            selected_rank_ids,
+            over_cap_counts,
+        ))
+        mismatched_rank = json.loads(json.dumps(cleanup_summary(
+            over_cap_workload, over_cap_telemetry,
+        )))
+        mismatched_rank["request_telemetry"]["summary"]["coverage"][
+            "selection_rank_proof"
+        ] = "all_eligible_ids_selected"
+        self.assertIsNone(dispatch_and_validate(
+            over_cap_workload, mismatched_rank, selected_rank_ids, over_cap_counts,
+        ))
+
     async def test_plan_bound_request_perf_capture_overrides_disabled_sampling_safely(self) -> None:
         from python_packages.platform_infra.performance import RequestPerformanceMiddleware
 

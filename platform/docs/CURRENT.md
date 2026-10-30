@@ -10,99 +10,30 @@ belong in the linked owner documents below.
 
 ## Live and pending state
 
-- Production remains on source
-  `9cbb73b930b71689843f58eb7b5492789f865ca1` with A restored by deployment
-  [40788852387](https://github.com/StrayForest/old_sparky/actions/runs/40788852387);
-  installed host-tools generation C4 is unchanged. PR #331's instrumentation
-  merged to `dev` as `7361e4668e946f1634c9ce208f79c0a884fb696b`, but has not
-  been deployed. Exact-SHA Security run
-  [41012116515](https://github.com/StrayForest/old_sparky/actions/runs/41012116515)
-  belongs to this source. Its source-bound TMPFS backup run
-  [41012142776](https://github.com/StrayForest/old_sparky/actions/runs/41012142776)
-  was cancelled before SSH or host-side creation; it created no backup and did
-  not start deployment. The reviewed policy correction for strict shared-venv
-  reuse is still pending; deployment must prove the active environment matches
-  the unchanged candidate dependency inputs. No requested production SSR
-  follow-up measurement has run on the merged instrumentation, and C4 remains
-  active.
-
-  Read-only storage diagnostic
-  [41011834449](https://github.com/StrayForest/old_sparky/actions/runs/41011834449)
-  on `2026-10-30` failed at `backup_check` before retention/cache previews.
-  It recorded `5,904,621,568` bytes free, all three core services active with
-  zero restarts, and no lock holder. Backup evidence failed at phase `check`;
-  checksum, age, restore and Alembic fields were unavailable. Treat it as a
-  failed backup gate, not a fresh integrity pass.
-
-  The separate full-maintenance service failure on `2026-10-29T02:31Z` was at
-  `scratch_image_admission`: free space after the archive was
-  `6,006,538,240` bytes versus `6,241,124,352` required. That maintenance unit
-  pins a fully allocated 576 MiB ext4 image; including the prior 128,433,203-byte
-  dump estimate, its pre-dump threshold was `6,369,557,555` bytes. This is the
-  disk-image full-maintenance admission, not a blanket load-diagnostic gate.
-  The source-bound backup workflow defaults to TMPFS and does not allocate that
-  image, but still enforces the filesystem floor plus 256 MiB lead, archive
-  growth, restore/Alembic verification, scratch cleanup, and at least 1 GiB host
-  `MemAvailable` with swap disabled. The cancelled run proves none of those
-  backup guards passed. See the [backup and restore runbook](backup-restore-runbook.md)
-  and [deployment runbook](deployment-runbook.md) for their separate policies.
-- Source-bound backups must have exactly one producer run ID per Security
-  run, attempt and SHA. Failed or cancelled IDs count; multiple IDs make that
-  proof ambiguous. Follow the [backup and restore runbook](backup-restore-runbook.md).
-- A prior canonical maintenance pass
-  [40150735297](https://github.com/StrayForest/old_sparky/actions/runs/40150735297)
-  succeeded. A daily maintenance attempt during deployment was refused by the
-  release lock and preserved its evidence. The backup-first post-QA canonical
-  run
-  [40154998086/1](https://github.com/StrayForest/old_sparky/actions/runs/40154998086)
-  passed on the active source: a fresh checksum-present v2 backup was
-  restore-verified, Alembic verified 36 restored tables, and protected-plus-
-  latest retention passed. Rotation removed four older archives and one
-  unprotected production release (`280,882,508` bytes); two releases remained
-  protected and six retained. No live-QA runtime or source release artifact
-  was deleted; one live-QA runtime remains. Free space after the final check
-  is `8,603,553,792` bytes (about 21.5%).
-  Endpoints and services are healthy, no jobs or locks remain, and both expired
-  SSR plans are absent. The maintenance timer was active and persistent for
-  that run; its present state is not verified here. This is a successful
-  bounded pass, not a long-term capacity guarantee.
-- Bounded storage work reclaimed `276,296,431` bytes from exact duplicate
-  shared build artifacts and about `1.15 GB` from an unreferenced LiveQA
-  provider payload. The protected raw recovery archive, pinned backups, and
-  private histories remain outside cleanup scope. Daily maintenance does not
-  prune provider payloads; installer retention owns that namespace.
+- Production app source is `94bc6671695533c4533a596341e192d982de310c`; installed
+  host-tools generation is `17d6a7ccb471c878e6d318142cb3acf4f1849ba7`. The
+  normal deployment and strict shared-venv reuse checks passed. Keep runner
+  source, app source and host-tools generation distinct in every receipt.
+- The latest SSR composite diagnostic is incomplete and earns no capacity,
+  SLO or matrix credit. Its exact fixture was closed by the canonical abort
+  and cleanup workflows; its report is not a passing measurement.
+- The runner parser correction for typed SSR plan cleanup summaries is in
+  review. SSR request-identity coverage also remains unresolved. Do not dispatch
+  another load until the correction passes exact-head CI, the required source
+  gates pass, and request-identity completion is verified. Use the
+  [SSR capacity diagnostic runbook](ssr-capacity-diagnostic-runbook.md) for
+  dispatch, completion, abort and cleanup.
+- Source-bound backup admission requires one successful producer bound to the
+  exact merged source SHA and Security run/attempt. Follow the
+  [backup and restore runbook](backup-restore-runbook.md).
 
 ## Open QA and cleanup gates
 
-- Authenticated-page load [40114878581](https://github.com/StrayForest/old_sparky/actions/runs/40114878581)
-  on source `70915e23fef5b225b6e272c0aeb50e0d2d253aec`
-  returned `20,000/20,000` HTTP 200 responses but failed its logical SLO.
-  Fixture cleanup passed; exact profile and comparison evidence live in the
-  [performance reference](../performance/README.md#authenticated-page-load-comparison-2026-10-24).
-- The SSR C32 comparison on source `9cbb73b930b71689843f58eb7b5492789f865ca1`
-  completed four accepted A1/B1/A2/B2 rows, together `2,484/2,484` HTTP 200
-  responses. Its final B2 run
-  [40786898526](https://github.com/StrayForest/old_sparky/actions/runs/40786898526)
-  generated `620` HTML requests in the SSR-capacity diagnostic; the regular
-  external client job was skipped and exact fixture cleanup passed. B did not
-  meet the pairwise improvement threshold. The final deployment
-  [40788852387](https://github.com/StrayForest/old_sparky/actions/runs/40788852387)
-  restored A. The last retained status observation at `2026-10-29T04:28Z`
-  recorded API `2`, web `1`, and authenticated-read admission concurrency `24`
-  with a maximum of `8` waiters per API worker; it is a timestamped observation,
-  not a fresh health check. Offline analysis is complete. After the diagnostic
-  implementation and evidence packet pass review, the next authorized
-  measurement is the unchanged A/fetch C32 composite in the performance
-  reference. C64 remains forbidden, and these comparison rows establish neither
-  a capacity ceiling nor an SLO result. See the
-  [performance reference](../performance/README.md#ssr-c32-comparison-checkpoint-2026-10-29)
-  for the evidence summary and contract.
-- The installed canonical content sample on e920 exited successfully. This is
-  not a new full GitHub content-diagnostics result; details were lost from its
-  bounded prefix. Earlier full diagnostic [40113453588](https://github.com/StrayForest/old_sparky/actions/runs/40113453588)
-  remains failed and is not superseded by that sample.
-- LivingInk Violet Russian ability descriptions are `4/4`. Broader
-  human-visible authentication and Turnstile QA remains **NOT RUN**.
+- The SSR composite remains incomplete pending the runner cleanup-summary
+  correction and verified request-identity coverage. A workload may not be
+  retried until its exact-run fixture is closed and all report/parser gates
+  pass. The diagnostic remains zero-credit even when complete; see the
+  [SSR capacity diagnostic runbook](ssr-capacity-diagnostic-runbook.md).
 
 ## Hard operational limits
 

@@ -40,6 +40,7 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | Services, storage, media and performance | [Operations runbook](operations-runbook.md) |
 | Host disk free-space thresholds | [Disk free-space policy](adr/disk-free-space-thresholds.md) and [operations runbook](operations-runbook.md) |
 | Retained-load cleanup and hermetic web verification | [Retained-load and web verification](retained-load-and-web-verification.md) |
+| Production SSR capacity diagnostic | [SSR capacity diagnostic runbook](ssr-capacity-diagnostic-runbook.md) |
 | Authenticated HTML transport / TTFB hops | [Performance transport runbook](performance-transport-runbook.md) |
 | Load profiles and performance evidence | [`platform/performance/README.md`](../performance/README.md) |
 | Security operations / CSP policy | [Security runbook](security-runbook.md) |

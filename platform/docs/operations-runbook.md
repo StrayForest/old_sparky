@@ -214,17 +214,12 @@ GitHub-hosted runner outside Cloudflare's origin network. It supports the
 current `ready-vote`, `read-mix` and authenticated `page-load` profiles and collects a
 parallel origin observer report. Temporary session/CSRF credentials are never
 published as an artifact.
-The [retained-load and web verification reference](retained-load-and-web-verification.md) documents the fail-closed barrier. `TARGET_SHA` is hosted-runner source; `APP_TARGET_SHA` is active app source.
-Differing SHAs require a verified no-op receipt; app/runtime changes cannot use it.
-
-```bash
-gh workflow run platform-production-external-load.yml \
-  --repo StrayForest/old_sparky --ref dev \
-  -f confirmation=RUN-PRODUCTION-EXTERNAL-LOAD \
-  -f control_email=<existing-production-account-email> \
-  -f profile_id=ready-vote-slo-v2
-gh run watch <load-run-id> --repo StrayForest/old_sparky --exit-status
-```
+The [SSR capacity diagnostic runbook](ssr-capacity-diagnostic-runbook.md)
+contains the exact zero-credit composite dispatch, source bindings, completion
+criteria, and abort/cleanup commands. It sends the control account through
+stdin; do not pass it in command arguments or environment variables. For all
+retained-load operations, keep hosted-runner source and active app source
+separate and satisfy the [retained-load cleanup contract](retained-load-and-web-verification.md).
 
 To locate the concurrency knee, select `read-mix-concurrency-ramp-v1`. It
 repeats the full 20,000-user route mix at concurrency 16, 32, 48, 64, 80, 96,
@@ -290,12 +285,21 @@ browser processes. The fixture supervisor creates marker-qualified public
 names; do not reuse a static tournament name between runs.
 
 ```bash
-gh workflow run platform-production-external-load.yml \
-  --repo StrayForest/old_sparky --ref dev \
-  -f confirmation=RUN-PRODUCTION-EXTERNAL-LOAD \
-  -f control_email=<existing-production-account-email> \
-  -f profile_id=read-mix-stress-v2
-gh run watch <load-run-id> --repo StrayForest/old_sparky --exit-status
+set -euo pipefail
+python3 - <<'PY' | gh api --repo StrayForest/old_sparky --method POST \
+  repos/StrayForest/old_sparky/actions/workflows/platform-production-external-load.yml/dispatches \
+  --input -
+import getpass
+import json
+import sys
+
+json.dump({"ref": "dev", "inputs": {
+    "confirmation": "RUN-PRODUCTION-EXTERNAL-LOAD",
+    "control_email": getpass.getpass("Control account email: "),
+    "profile_id": "read-mix-stress-v2",
+}}, sys.stdout, separators=(",", ":"))
+sys.stdout.write("\n")
+PY
 ```
 
 `read-mix-stress-v2` measures authenticated page/API reads and conditional
@@ -529,17 +533,9 @@ preflight/deploy chain; do not edit `.env.platform` by hand or use unlimited
 overflow. The load gate must not start until the active API/worker processes
 report the reviewed pool values.
 
-Canceling GitHub stops the SSH client, but detached work may continue for 180 minutes. The reviewed abort workflow stops only that load's supervisor tree and verifies active source and lock:
-
-```bash
-gh workflow run platform-production-retained-load-abort.yml \
-  --repo StrayForest/old_sparky --ref dev \
-  -f confirmation=ABORT-PRODUCTION-RETAINED-LOAD \
-  -f load_run_id=<canceled-load-run-id> -f load_run_attempt=<exact-attempt> \
-  -f target_sha=<active-production-source-sha> \
-  -f security_run_id=<successful-security-run-for-current-dev-sha> -f security_run_attempt=<exact-security-attempt>
-gh run watch <abort-run-id> --repo StrayForest/old_sparky --exit-status
-```
+Canceling a workflow does not prove the remote process tree stopped. Use the
+[SSR capacity diagnostic runbook](ssr-capacity-diagnostic-runbook.md) for the
+exact abort and cleanup request bodies, source identities and receipt gates.
 
 Validation binds the Security run/attempt and exact CI route to current `dev` SHA before helper creation. It accepts only trusted full routes (recovery-bootstrap, storage operations or deployable runtime); `target_sha` separately identifies the active production app source.
 The workflow resolves the runner SHA from the selected load run and attempt through the GitHub API, requiring the exact repository, external-load workflow, `workflow_dispatch` event and `dev` branch; operators do not supply a runner SHA. The helper binds that runner SHA and the separately checked active app SHA to the same root-owned marker and fixture manifest.
@@ -563,16 +559,9 @@ ownership fail closed; recovery never searches historical rows.
 
 The cleanup command delegates disposal and zero-residual checks to the [retained-load cleanup contract](#retained-load-cleanup-and-hermetic-web-verification); cross-loop asyncpg or Redis errors in a successful cleanup log are regressions.
 
-When the external load completes, clean only the exact load workflow run:
-
-```bash
-gh workflow run platform-production-retained-load-cleanup.yml \
-  --repo StrayForest/old_sparky --ref dev \
-  -f confirmation=DELETE-PRODUCTION-RETAINED-LOAD \
-  -f load_run_id=<load-run-id> \
-  -f control_email=<designated-control-account>
-gh run watch <cleanup-run-id> --repo StrayForest/old_sparky --exit-status
-```
+For composite SSR, follow the exact-run cleanup procedure in the
+[SSR capacity diagnostic runbook](ssr-capacity-diagnostic-runbook.md). Do not
+pass the control account through `gh workflow run -f` arguments.
 
 The cleanup supervisor holds the load host lock, validates production ownership, and delegates exact fixture/database/Redis checks to the [cleanup contract](#retained-load-cleanup-and-hermetic-web-verification) before removing matching reports. A missing run root with zero durable rows closes only when the current failed workflow attempt proves validation failed before fixture admission, all workload mutation steps were skipped, and exact host lock/process/path checks are clear; its receipt binds that attempt and source SHA and awards zero credit. Failed cleanup retains data; never run broad cleanup. A durable cleaned row permits exact-ID artifact removal only after provenance, empty-fixture and root ownership/mode/symlink checks; mixed state fails closed.
 
