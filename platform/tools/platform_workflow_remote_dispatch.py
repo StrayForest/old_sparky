@@ -591,7 +591,8 @@ def _parse_active_release_receipt(raw: bytes, *, release_slug: str) -> dict[str,
     """Validate the live receipt with the pinned artifact validator contract."""
 
     validator_path = ACTIVE_TOOLS_DIR / "platform_validate_release_artifact.py"
-    validator_source = _stable_host_file(validator_path, mode=0o555)
+    validator_mode = _active_release_validator_mode()
+    validator_source = _stable_host_file(validator_path, mode=validator_mode)
     if validator_source is None:
         raise OSError("pinned release validator is unavailable")
     namespace: dict[str, object] = {"__file__": str(validator_path), "__name__": "_pinned_release_validator"}
@@ -610,6 +611,32 @@ def _parse_active_release_receipt(raw: bytes, *, release_slug: str) -> dict[str,
     if not isinstance(parsed, dict):
         raise OSError("active release receipt is invalid")
     return parsed
+
+
+def _active_release_validator_mode() -> int:
+    """Return the exact validator mode for the fixed dispatcher installation.
+
+    The same dispatcher source is installed in three immutable contexts:
+    host-tools generations and the live-QA runtime use 0555 files, while app
+    release tools preserve their 0755 executable mode.  Select only those
+    canonical layouts and fail closed for every other path.
+    """
+
+    if (
+        ACTIVE_TOOLS_DIR.parent == HOST_TOOLS_ROOT
+        and HOST_GENERATION_RE.fullmatch(ACTIVE_TOOLS_DIR.name) is not None
+    ):
+        return 0o555
+    if ACTIVE_TOOLS_DIR == TRUSTED_LIVE_ROOT:
+        return 0o555
+    release = ACTIVE_TOOLS_DIR.parent
+    if (
+        ACTIVE_TOOLS_DIR.name == "tools"
+        and release.parent == RUNTIME_ROOT / "releases"
+        and RELEASE_SLUG_RE.fullmatch(release.name) is not None
+    ):
+        return 0o755
+    raise OSError("active release validator context is invalid")
 
 
 def _release_baseline() -> dict[str, object]:
