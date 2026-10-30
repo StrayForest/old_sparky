@@ -3620,6 +3620,43 @@ def _project_server_telemetry(
         "profile_rows": [],
     }
     if isinstance(summary, dict):
+        # Keep malformed scalar fields local to their projected value. Required
+        # metrics still make a complete report fail evaluation when null, while
+        # optional diagnostic fields may remain unavailable without erasing an
+        # otherwise sufficient report. The source-bound SSH parser stays strict.
+        input_memory_rows = summary.get("memory_rows")
+        if isinstance(input_memory_rows, list):
+            sanitized_memory_rows = []
+            memory_metric_fields = (
+                "sample_count", "rss_min_bytes", "rss_max_bytes", "rss_mean_bytes",
+                "heap_total_min_bytes", "heap_total_max_bytes", "heap_total_mean_bytes",
+                "heap_used_min_bytes", "heap_used_max_bytes", "heap_used_mean_bytes",
+                "heap_limit_min_bytes", "heap_limit_max_bytes", "heap_limit_mean_bytes",
+                "external_min_bytes", "external_max_bytes", "external_mean_bytes",
+                "array_buffers_min_bytes", "array_buffers_max_bytes", "array_buffers_mean_bytes",
+                "sampled_window_start_elapsed_ms", "sampled_window_end_elapsed_ms",
+                "sampled_window_duration_ms", "cgroup_sample_count",
+                "cgroup_memory_current_start_bytes", "cgroup_memory_current_end_bytes",
+                "cgroup_memory_current_sampled_max_bytes", "cgroup_memory_peak_start_bytes",
+                "cgroup_memory_peak_end_bytes", "cgroup_memory_peak_sampled_max_bytes",
+                "memory_events_low_sampled_delta", "memory_events_high_sampled_delta",
+                "memory_events_max_sampled_delta", "memory_events_oom_sampled_delta",
+                "memory_events_oom_kill_sampled_delta", "memory_events_oom_group_kill_sampled_delta",
+                "gc_count", "gc_major_count", "gc_minor_count", "gc_incremental_count",
+                "gc_weakcb_count", "gc_other_count",
+            )
+            for row in input_memory_rows:
+                if isinstance(row, dict):
+                    row = dict(row)
+                    duration = row.get("gc_duration_ms")
+                    if duration is not None and not _valid_gc_duration_ms(duration):
+                        row["gc_duration_ms"] = None
+                    for field in memory_metric_fields:
+                        item = row.get(field)
+                        if item is not None and (type(item) is not int or not 0 <= item <= 10**15):
+                            row[field] = None
+                sanitized_memory_rows.append(row)
+            summary = {**summary, "memory_rows": sanitized_memory_rows}
         try:
             from tools import platform_cpu_diagnostic_pair as cpu_pair
         except ModuleNotFoundError:
@@ -4851,17 +4888,22 @@ def _project_composite_capacity_report(value: dict[str, Any]) -> dict[str, Any] 
             "attribution_only": True, "performance_credit": False,
             "capacity_quantile_member": False,
         })
-    complete = bool(
+    phase_pair_closed = bool(
         capacity is not None and profile is not None
         and capacity.get("status") == "complete" and profile.get("status") == "complete"
         and capacity.get("remote_plan_cleanup") == "complete"
         and profile.get("remote_plan_cleanup") == "complete"
         and capacity.get("namespace_closed") is True
         and profile.get("namespace_closed") is True
+    )
+    complete = bool(
+        phase_pair_closed
         and value["same_fixture_manifest"] is True
         and len(run_ids) == 2 and len(set(run_ids)) == 2
+        and value["wall_budget_exceeded"] is False
     )
-    if (value["status"] == "complete") != complete or value["namespace_closed"] != complete:
+    if ((value["status"] == "complete") != complete
+            or value["namespace_closed"] != phase_pair_closed):
         return None
     if value["passed"] != bool(complete and capacity and capacity.get("passed") is True):
         return None
