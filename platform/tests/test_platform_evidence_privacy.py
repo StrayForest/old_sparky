@@ -226,7 +226,7 @@ class EvidencePrivacyTests(unittest.TestCase):
             output = StringIO()
             with (
                 mock.patch("tools.platform_abort_retained_load.os.geteuid", return_value=0),
-                mock.patch("tools.platform_abort_retained_load.Path.read_text", side_effect=read_release),
+                mock.patch("tools.platform_abort_retained_load.Path.read_text", autospec=True, side_effect=read_release),
                 mock.patch("tools.platform_abort_retained_load._process_state", side_effect=state_rows) as scans,
                 mock.patch("tools.platform_abort_retained_load._diagnostic_abort_binding", return_value=bound),
                 mock.patch("tools.platform_abort_retained_load._supervisor_exit_code", return_value=0),
@@ -269,7 +269,7 @@ class EvidencePrivacyTests(unittest.TestCase):
                 state_rows = options.get("states") or [(set(), set(), 0, {}), (set(), set(), 0, {})]
                 with (
                     mock.patch("tools.platform_abort_retained_load.os.geteuid", return_value=0),
-                    mock.patch("tools.platform_abort_retained_load.Path.read_text", side_effect=read_release),
+                    mock.patch("tools.platform_abort_retained_load.Path.read_text", autospec=True, side_effect=read_release),
                     mock.patch("tools.platform_abort_retained_load._process_state", side_effect=state_rows),
                     mock.patch("tools.platform_abort_retained_load._diagnostic_abort_binding", return_value=options.get("bound", binding)),
                     mock.patch("tools.platform_abort_retained_load._supervisor_exit_code", return_value=0),
@@ -306,7 +306,7 @@ class EvidencePrivacyTests(unittest.TestCase):
 
         with (
             mock.patch("tools.platform_abort_retained_load.os.geteuid", return_value=0),
-            mock.patch("tools.platform_abort_retained_load.Path.read_text", side_effect=read_release),
+            mock.patch("tools.platform_abort_retained_load.Path.read_text", autospec=True, side_effect=read_release),
             mock.patch(
                 "tools.platform_abort_retained_load._process_state",
                 side_effect=[({123}, {123, 124}, 0, {123: 1, 124: 2}), (set(), set(), 0, {})],
@@ -392,7 +392,7 @@ class EvidencePrivacyTests(unittest.TestCase):
 
         with (
             mock.patch("tools.platform_abort_retained_load.all_process_ids", return_value=[observer_pid, helper_pid]),
-            mock.patch("tools.platform_abort_retained_load.Path.read_bytes", side_effect=read_proc),
+            mock.patch("tools.platform_abort_retained_load.Path.read_bytes", autospec=True, side_effect=read_proc),
         ):
             roots, tree, errors, identities = abort_module._process_state(run_id)
         self.assertEqual(roots, {observer_pid, helper_pid})
