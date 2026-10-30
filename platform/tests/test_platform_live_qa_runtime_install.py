@@ -2761,6 +2761,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                     compile(dispatcher_source, str(dispatcher_path), "exec"),
                     dispatcher_namespace,
                 )
+                dispatcher_namespace["TRUSTED_LIVE_ROOT"] = trusted
                 parse_release = dispatcher_namespace["_parse_active_release_receipt"]
                 release_slug = "qa-test-20261009T000000Z"
                 release_receipt = {

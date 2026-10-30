@@ -1050,6 +1050,61 @@ class NoopSourceBindingTests(unittest.TestCase):
         executor.assert_not_called()
 
     def test_host_generation_without_binding_capability_fails_closed(self) -> None:
+        dispatcher = platform_workflow_remote_dispatch
+        validator_source = (
+            REPO_ROOT / "platform/tools/platform_validate_release_artifact.py"
+        ).read_bytes()
+        release_slug = "qa-test-20261009T000000Z"
+        release_receipt = {
+            "artifact_format_version": 1,
+            "release_slug": release_slug,
+            "built_at_utc": "20261009T000000Z",
+            "release_ref": "qa-test",
+            "source_git_commit": APP_SHA,
+            "python_requirements_file": "requirements-platform.txt",
+            "python_lock_file": "requirements-platform.lock.txt",
+            "python_freeze_file": "requirements-platform.freeze.txt",
+            "python_wheelhouse_dir": "wheelhouse",
+            "python_wheelhouse_manifest_file": "wheelhouse/WHEELHOUSE.sha256",
+            "web_package_lock_file": "apps/platform_web/package-lock.json",
+            "web_build_id": "test-build",
+            "node_version": "26.3.1",
+            "npm_version": "11.16.0",
+        }
+        raw_receipt = json.dumps(release_receipt).encode("ascii")
+        validator_reads: list[tuple[Path, int]] = []
+
+        def pinned_validator(path: Path, *, mode: int) -> bytes:
+            validator_reads.append((path, mode))
+            return validator_source
+
+        for tools_dir, expected_mode in (
+            (
+                dispatcher.HOST_TOOLS_ROOT / ("a" * 40),
+                0o555,
+            ),
+            (dispatcher.TRUSTED_LIVE_ROOT, 0o555),
+            (
+                dispatcher.RUNTIME_ROOT / "releases" / release_slug / "tools",
+                0o755,
+            ),
+        ):
+            with self.subTest(tools_dir=tools_dir), \
+                patch.object(dispatcher, "ACTIVE_TOOLS_DIR", tools_dir), \
+                patch.object(dispatcher, "_stable_host_file", side_effect=pinned_validator):
+                parsed = dispatcher._parse_active_release_receipt(
+                    raw_receipt, release_slug=release_slug
+                )
+                self.assertEqual(parsed["source_git_commit"], APP_SHA)
+                self.assertEqual(validator_reads[-1], (
+                    tools_dir / "platform_validate_release_artifact.py",
+                    expected_mode,
+                ))
+
+        with patch.object(dispatcher, "ACTIVE_TOOLS_DIR", Path("/tmp/untrusted/tools")):
+            with self.assertRaises(OSError):
+                dispatcher._active_release_validator_mode()
+
         manifest_bytes = b'{"schema":1}\n'
         legacy_capabilities = (
             b"capability=release_baseline\n"
