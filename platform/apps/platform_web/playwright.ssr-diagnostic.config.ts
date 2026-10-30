@@ -7,17 +7,20 @@ import { defineConfig, devices } from "@playwright/test";
 const webRoot = __dirname;
 const repositoryRoot = resolve(webRoot, "../../..");
 const preparedBuildDir = process.env.PLATFORM_WEB_HERMETIC_BUILD_DIR;
-const fixtureRoot = join(
-  tmpdir(),
-  `platform-ssr-diagnostic-e2e-${process.pid}-${randomUUID()}`,
-);
-const runId = randomBytes(16).toString("hex");
-const requestId = randomBytes(16).toString("hex");
-const invocationId = randomUUID();
+// Keep one identity if Playwright reloads this config in a child process.
+const fixtureRoot = process.env.PLATFORM_SSR_DIAGNOSTIC_FIXTURE_ROOT
+  ?? join(tmpdir(), `platform-ssr-diagnostic-e2e-${process.pid}-${randomUUID()}`);
+const runId = process.env.PLATFORM_SSR_DIAGNOSTIC_RUN_ID ?? randomBytes(16).toString("hex");
+const requestId = process.env.PLATFORM_SSR_DIAGNOSTIC_REQUEST_ID ?? randomBytes(16).toString("hex");
+const invocationId = process.env.PLATFORM_SSR_DIAGNOSTIC_INVOCATION_ID ?? randomUUID();
 const sourceSha = execFileSync("git", ["rev-parse", "HEAD"], {
   cwd: repositoryRoot,
   encoding: "ascii",
 }).trim();
+const inheritedSourceSha = process.env.PLATFORM_SSR_DIAGNOSTIC_SOURCE_SHA;
+if (inheritedSourceSha && inheritedSourceSha !== sourceSha) {
+  throw new Error("SSR diagnostic E2E source identity changed during config loading");
+}
 const fixturePreload = resolve(
   webRoot,
   "tests/support/ssr-diagnostic-plan-fixture.cjs",
@@ -29,6 +32,8 @@ const runtimeGuard = resolve(webRoot, "server-shutdown-guard.cjs");
 process.env.PLATFORM_SSR_DIAGNOSTIC_FIXTURE_ROOT = fixtureRoot;
 process.env.PLATFORM_SSR_DIAGNOSTIC_RUN_ID = runId;
 process.env.PLATFORM_SSR_DIAGNOSTIC_REQUEST_ID = requestId;
+process.env.PLATFORM_SSR_DIAGNOSTIC_INVOCATION_ID = invocationId;
+process.env.PLATFORM_SSR_DIAGNOSTIC_SOURCE_SHA = sourceSha;
 
 const standaloneServerCommand = [
   preparedBuildDir
@@ -89,6 +94,7 @@ export default defineConfig({
         PLATFORM_SSR_DIAGNOSTIC_FIXTURE_ROOT: fixtureRoot,
         PLATFORM_SSR_DIAGNOSTIC_RUN_ID: runId,
         PLATFORM_SSR_DIAGNOSTIC_REQUEST_ID: requestId,
+        PLATFORM_SSR_DIAGNOSTIC_INVOCATION_ID: invocationId,
         PLATFORM_SSR_DIAGNOSTIC_SOURCE_SHA: sourceSha,
       },
       url: "http://127.0.0.1:3100",
