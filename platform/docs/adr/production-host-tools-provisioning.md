@@ -11,10 +11,13 @@ The validator-mode correction uses source **A**
 `6eef68cea37eb78e174240547bcee4da08c11525d74ffa773154ab28485538c6`. The
 pull-request host-tools candidate remains evidence-only and is not a
 production provisioning source. The supported production bundle must come
-from the normal exact-source auto-parent after successful Security and the
-source-bound backup for B. Provision and self-test C before the automatic child can
-pass host readiness; until then the installed C4 remains active. This records
-source/pin intent, not installation or deployment proof.
+from the normal exact-source auto-parent after successful push Security and the
+source-bound backup for the final merged `dev` source SHA and its exact Security
+run/attempt. Here A is the host-tools source, B is its pin-only selector, and
+this follow-on documentation commit is D; neither B nor D substitutes for the
+final merged source identity. Provision and self-test C before the automatic
+child can pass host readiness; until then the installed C4 remains active.
+This records source/pin intent, not installation or deployment proof.
 
 Reviewed C `0150268ba93eaeb1358bb9c8399c643c7cda021c` adds backward-compatible optional fresh-venv evidence validation; pin P `cfde473dd2d5192b7845623e81ec46877890d6ae` records its exact 15-member closure. Exact-P2 `b0538937fde0029a854d2ab65d67b4a42354ad26` Security `39567825253/1` passed; preflight `39569921744/1` published the signed bundle before its expected missing-generation refusal. Approved root-console provisioning verified its provenance, atomically published all 17 immutable members and passed installed self-test; receipt SHA-256 is `654f5a4c1d7f7b7ed951ec0bf8802e78cc033dc05cdf824af5232acf9eff4eb4`. Repeat exact-P2 preflight `39570359528/1` passed immutable capabilities and production preflight. C4 remains preserved; application activation requires the subsequent exact-source release chain. The bounded authenticated-HTML diagnostic now uses source **C** `4ba220032cb1fba23a8b40c39258efb8dafa1a9c` and pin-only **P** `2f95edfc7b3e30d6758e74b913f6da9172564a45`; P selects C and records the exact modes/digests of the unchanged 15-member, four-component v4 closure, with only the dispatcher digest changed in this generation. C rejects duplicate correlation-authority headers and aligns typed coverage evidence; the dispatcher accepts the exact producer-approved CPU category enum union while rejecting unknown labels. Correlation and QA parsing remain sealed in the pinned plan with no extra helper dependency. Earlier run `40952242703` on superseded source `4617e3b377dc98d9b2284ef0764b8e9a570d25e2` passed host-tools preflight, web-quality and web-hermetic but recorded a backend DB-free failure before it was superseded. That result is historical; see [PR #331](https://github.com/StrayForest/old_sparky/pull/331) for current hosted-check status. These source commits are not installation evidence: the generation has not been provisioned or activated, and C4 remains the last provisioning generation recorded above.
 
