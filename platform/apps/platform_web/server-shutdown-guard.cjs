@@ -213,10 +213,16 @@ function registerValidatedPlanRequest(entry) {
     reportSelectorCoverage(entry.runId, entry.expiresAtMs);
     return false;
   }
-  selectedPlanRequests.set(entry.requestId, {
+  const selection = {
     runId: entry.runId,
     expiresAtMs: entry.expiresAtMs,
     captureEligible: entry.captureEligible,
+  };
+  selectedPlanRequests.set(entry.requestId, selection);
+  pending.response.once("close", () => {
+    if (selectedPlanRequests.get(entry.requestId) === selection) {
+      selectedPlanRequests.delete(entry.requestId);
+    }
   });
   if (coverage && entry.captureEligible) {
     coverage.retainedRequests = Math.min(1_000_000, coverage.retainedRequests + 1);
@@ -359,9 +365,6 @@ function attachResponseLifecycle(response) {
     }
     state.closeLogged = true;
     logStreamStage(response, "response_close");
-    const requestId = requestCorrelationId(requestFor(response));
-    selectedPlanRequests.delete(requestId);
-    pendingPlanRequests.delete(requestId);
     releaseRequest(response);
   });
   response.once("error", () => {

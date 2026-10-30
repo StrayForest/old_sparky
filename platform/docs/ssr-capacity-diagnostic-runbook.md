@@ -213,7 +213,24 @@ identities, and all of these conditions hold:
 - The unprofiled capacity phase completes its full 120-second ON window with
   every submitted request accounted for, successful HTTP status and HTML
   validation, complete required SSR request identity/timing and origin CPU
-  evidence, no abort, and successful plan cleanup.
+  evidence, no abort, and successful plan cleanup. Require exactly one raw
+  `ssr_stream_capture_coverage` record for the phase run with `status=complete`.
+  In the normalized `ssr_stream_coverage` summary require
+  `capture_marker_records=1`, `capture_status=complete`, and
+  `capture_eligible_requests=capture_retained_requests+capture_lost_requests`;
+  `capture_lost_requests`, `capture_lost_rows`, `capture_truncated_records`,
+  `capture_malformed_records`, `selector_overflow`,
+  `selector_overflow_unattributed`, `row_cap_records`, `row_cap_rows`,
+  `truncated_records` and `malformed_records` must all be zero. Missing,
+  duplicate, malformed, overflowed or truncated coverage is partial evidence
+  even when `report_complete` is true. The web selector releases its reservation
+  on that response's `close` event and only when the map still contains that
+  exact selection. Verify this contract when changing the guard:
+
+  ```bash
+  cd platform/apps/platform_web
+  npm run test:ssr-stream-diagnostics
+  ```
 - The separate profile phase completes its 20-second ON window against the
   same fixture manifest after the planned gap. Its profile data is attribution
   only; do not merge it into capacity-window latency or CPU results.

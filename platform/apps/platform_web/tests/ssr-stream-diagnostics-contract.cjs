@@ -9,6 +9,169 @@ const fixtureWatchdogMs = 3_000;
 const behaviorTimeoutMs = 5_000;
 const cleanupTimeoutMs = 1_000;
 
+function capacityCloseFixtureSource() {
+  return `
+const http = process.getBuiltinModule("node:http");
+const crypto = process.getBuiltinModule("node:crypto");
+const selectPlanRequest = globalThis[Symbol.for("old-sparky.ssr-stream-selector")];
+const runId = "0123456789abcdef0123456789abcdef";
+if (typeof selectPlanRequest !== "function") throw new Error("stream selector is unavailable");
+function captureEligible(requestId) {
+  return (crypto.createHash("sha256").update(runId + ":" + requestId, "ascii").digest()[0] & 7) === 0;
+}
+const noneligibleIds = [];
+let eligibleId = null;
+for (let candidate = 0; noneligibleIds.length < 128 || eligibleId === null; candidate += 1) {
+  const requestId = candidate.toString(16).padStart(32, "0");
+  if (captureEligible(requestId)) {
+    if (eligibleId === null) eligibleId = requestId;
+  } else if (noneligibleIds.length < 128) {
+    noneligibleIds.push(requestId);
+  }
+}
+const closedTags = new Set();
+const closeWaiters = new Map();
+function waitForClose(tag) {
+  if (closedTags.has(tag)) return Promise.resolve();
+  return new Promise((resolve) => closeWaiters.set(tag, resolve));
+}
+async function sendSelection(port, tag, requestId) {
+  const closed = waitForClose(tag);
+  const response = await fetch("http://127.0.0.1:" + port + "/select", {
+    headers: {
+      "x-request-id": requestId,
+      "x-platform-ssr-trace": runId,
+      "x-fixture-tag": tag,
+      accept: "text/html",
+    },
+  });
+  await response.text();
+  await closed;
+  return response.headers.get("x-fixture-selector-result");
+}
+const server = http.createServer((request, response) => {
+  const requestId = request.headers["x-request-id"];
+  const accepted = selectPlanRequest({
+    requestId,
+    runId,
+    expiresAtMs: Date.now() + 10_000,
+    captureEligible: captureEligible(requestId),
+  });
+  response.setHeader("x-fixture-selector-result", accepted ? "accepted" : "rejected");
+  response.once("close", () => {
+    const tag = request.headers["x-fixture-tag"];
+    closedTags.add(tag);
+    closeWaiters.get(tag)?.();
+    closeWaiters.delete(tag);
+  });
+  response.writeHead(200, { "content-type": "text/html" });
+  response.end("ok");
+});
+server.listen(0, "127.0.0.1", async () => {
+  const port = server.address().port;
+  try {
+    for (let index = 0; index < noneligibleIds.length; index += 1) {
+      const result = await sendSelection(port, "closed-noneligible-" + index, noneligibleIds[index]);
+      if (result !== "accepted") throw new Error("closed noneligible selection was refused at index " + index);
+    }
+    const eligibleResult = await sendSelection(port, "eligible-after-closed-noneligible", eligibleId);
+    if (eligibleResult !== "accepted") throw new Error("eligible selection was starved after closed noneligible responses");
+    const eligibleAgain = await sendSelection(port, "eligible-after-close", eligibleId);
+    if (eligibleAgain !== "accepted") throw new Error("eligible selection was not removed on response close");
+    console.log("closed_noneligible=128 eligible_after_close=accepted eligible_again=accepted");
+  } catch (error) {
+    console.error(error);
+    process.exitCode = 1;
+  } finally {
+    server.close();
+  }
+});
+`;
+}
+
+function duplicateSelectionCloseFixtureSource() {
+  return `
+const http = process.getBuiltinModule("node:http");
+const crypto = process.getBuiltinModule("node:crypto");
+const selectPlanRequest = globalThis[Symbol.for("old-sparky.ssr-stream-selector")];
+const firstRunId = "0123456789abcdef0123456789abcdef";
+const secondRunId = "fedcba9876543210fedcba9876543210";
+let requestId = null;
+if (typeof selectPlanRequest !== "function") throw new Error("stream selector is unavailable");
+for (let candidate = 0; requestId === null; candidate += 1) {
+  const candidateId = candidate.toString(16).padStart(32, "0");
+  const firstEligible = (crypto.createHash("sha256").update(firstRunId + ":" + candidateId, "ascii").digest()[0] & 7) === 0;
+  const secondEligible = (crypto.createHash("sha256").update(secondRunId + ":" + candidateId, "ascii").digest()[0] & 7) === 0;
+  if (firstEligible && secondEligible) {
+    requestId = candidateId;
+  }
+}
+let firstResponse = null;
+let secondResponse = null;
+let firstClosed = false;
+function finishSecond() {
+  if (!firstClosed || !secondResponse || secondResponse.headersSent) return;
+  secondResponse.writeHead(200, { "content-type": "text/html" });
+  secondResponse.end("second");
+}
+const server = http.createServer((request, response) => {
+  const tag = request.headers["x-fixture-tag"];
+  const runId = tag === "first" ? firstRunId : secondRunId;
+  const accepted = selectPlanRequest({
+    requestId,
+    runId,
+    expiresAtMs: Date.now() + 10_000,
+    captureEligible: true,
+  });
+  response.setHeader("x-fixture-selector-result", accepted ? "accepted" : "rejected");
+  if (tag === "first") {
+    firstResponse = response;
+    response.writeHead(200, { "content-type": "text/html" });
+    response.write("first-open");
+    response.once("close", () => {
+      firstClosed = true;
+      finishSecond();
+    });
+    return;
+  }
+  if (tag === "second") {
+    secondResponse = response;
+    firstResponse?.end("first-close");
+    finishSecond();
+    return;
+  }
+  response.writeHead(404);
+  response.end();
+});
+server.listen(0, "127.0.0.1", async () => {
+  const port = server.address().port;
+  try {
+    const commonHeaders = { "x-request-id": requestId, accept: "text/html" };
+    const first = await fetch("http://127.0.0.1:" + port + "/tournaments/private-slug", {
+      headers: { ...commonHeaders, "x-platform-ssr-trace": firstRunId, "x-fixture-tag": "first" },
+    });
+    if (first.status !== 200 || first.headers.get("x-fixture-selector-result") !== "accepted") {
+      throw new Error("first duplicate-id selection failed");
+    }
+    const firstBody = first.text();
+    const second = await fetch("http://127.0.0.1:" + port + "/tournaments/private-slug", {
+      headers: { ...commonHeaders, "x-platform-ssr-trace": secondRunId, "x-fixture-tag": "second" },
+    });
+    if (second.status !== 200 || second.headers.get("x-fixture-selector-result") !== "accepted") {
+      throw new Error("replacement duplicate-id selection failed");
+    }
+    await Promise.all([firstBody, second.text()]);
+    console.log("duplicate_id_replacement=accepted");
+  } catch (error) {
+    console.error(error);
+    process.exitCode = 1;
+  } finally {
+    server.close();
+  }
+});
+`;
+}
+
 function bounded(value) {
   return String(value || "").slice(0, 4_000);
 }
@@ -35,6 +198,8 @@ function signalProcessGroup(child, signal) {
 }
 
 function fixtureSource({ disabled, diagnosticMarker, planSelection }) {
+  if (planSelection === "capacity-close") return capacityCloseFixtureSource();
+  if (planSelection === "duplicate-id-close") return duplicateSelectionCloseFixtureSource();
   const planRunId = "0123456789abcdef0123456789abcdef";
   const requestId = planSelection === "valid"
     ? "00000000000000000000000000000002"
@@ -417,6 +582,23 @@ async function main() {
       || !unsampledPlanOutput.includes("client_join=11111111111111111111111111111111")
       || !unsampledPlanOutput.includes("request_start_marker=set")) {
     throw new Error("unsampled valid typed plan lost its response join or emitted stream rows");
+  }
+  const closedNoneligibleOutput = await runFixture("closed-noneligible-plan-capacity", {
+    disabled: true,
+    planSelection: "capacity-close",
+  });
+  if (!closedNoneligibleOutput.includes(
+    "closed_noneligible=128 eligible_after_close=accepted eligible_again=accepted",
+  )) {
+    throw new Error("closed noneligible plan entries consumed selector capacity");
+  }
+  const duplicateIdCloseOutput = await runFixture("duplicate-plan-id-close", {
+    disabled: true,
+    planSelection: "duplicate-id-close",
+  });
+  assertCount(duplicateIdCloseOutput, "stage=response_stream_start", 2, "duplicate-ID plan close");
+  if (!duplicateIdCloseOutput.includes("duplicate_id_replacement=accepted")) {
+    throw new Error("closing an older duplicate-ID response removed the newer selection");
   }
   for (const selection of ["wrong-request", "wrong-run", "expired"]) {
     const rejectedPlanOutput = await runFixture(`plan-${selection}`, {
