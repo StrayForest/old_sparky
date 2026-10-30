@@ -130,6 +130,7 @@ RECOVERY_BOOTSTRAP_PATCH_FILE_DIGEST = (
 RECOVERY_BOOTSTRAP_ALLOWLIST_ONLY_FILES = frozenset(
     {
         "platform/tests/test_platform_live_qa_guard.py",
+        "platform/tests/test_platform_evidence_privacy.py",
         "platform/tools/platform_release_lock.sh",
         "platform/tests/test_platform_workflow_provenance.py",
         "platform/tools/platform_deploy_baseline.py",

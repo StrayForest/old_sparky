@@ -437,6 +437,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
             "platform/tools/platform_abort_retained_load.py",
             "platform/tools/platform_ci_classifier.py",
             "platform/tests/test_platform_secret_artifact_boundary.py",
+            "platform/tests/test_platform_evidence_privacy.py",
             "platform/tests/test_platform_workflow_provenance.py",
         ]
         self.assertTrue(set(retained_abort_paths) <= RECOVERY_BOOTSTRAP_FILES)
@@ -450,6 +451,25 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertEqual(retained_abort_route["reason"], RECOVERY_BOOTSTRAP_REASON)
         self.assertFalse(retained_abort_route["deployable"])
         self.assertFalse(retained_abort_route["fallback"])
+        retained_abort_no_op = classify_cumulative_baseline(
+            retained_abort_route,
+            retained_abort_paths,
+            expected_target_sha=self.TARGET_SHA,
+        )
+        self.assertTrue(retained_abort_no_op["no_op"])
+        self.assertEqual(
+            validate_cumulative_reconcile_route(retained_abort_no_op),
+            {"no_op": True, "runtime_required": False},
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = self._write_production_classifier_archive(
+                Path(temporary), retained_abort_route
+            )
+            accepted = validate_production_classifier_manifest(
+                archive, target_sha=self.TARGET_SHA
+            )
+            self.assertEqual(accepted["reason"], RECOVERY_BOOTSTRAP_REASON)
+            self.assertFalse(accepted["deployable"])
 
         hosted_ssr_diagnostic_paths = [
             "platform/tools/platform_ssr_capacity_diagnostic.py",
