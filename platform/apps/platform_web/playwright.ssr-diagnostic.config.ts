@@ -1,11 +1,10 @@
 import { execFileSync } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join, resolve } from "node:path";
 import { defineConfig, devices } from "@playwright/test";
 
-const webRoot = dirname(fileURLToPath(import.meta.url));
+const webRoot = __dirname;
 const repositoryRoot = resolve(webRoot, "../../..");
 const preparedBuildDir = process.env.PLATFORM_WEB_HERMETIC_BUILD_DIR;
 const fixtureRoot = join(

@@ -1,5 +1,6 @@
 "use strict";
 
+/* eslint @typescript-eslint/no-require-imports: "off" -- This preload must stay CommonJS for Node's --require hook. */
 // Hermetic Next-server fixture. It maps only the production plan and release
 // identity paths to private temp files, while leaving the actual plan parser,
 // /proc identity checks, proxy, RootLayout and response guard untouched.
@@ -7,7 +8,6 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { tmpdir } = require("node:os");
 const { syncBuiltinESMExports } = require("node:module");
-const { randomUUID } = require("node:crypto");
 
 const FIXTURE_FLAG = "PLATFORM_SSR_DIAGNOSTIC_E2E_FIXTURE";
 const PLAN_DIR = "/run/oldsparky-platform";
