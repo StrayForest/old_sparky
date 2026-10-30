@@ -26,6 +26,16 @@ import platform_external_load as external_load  # noqa: E402
 import platform_load_runtime as load_runtime  # noqa: E402
 
 WORKLOAD = "authenticated_workspace_read_pair_v1"
+HTML_CAPACITY_120S_WORKLOAD = "authenticated_html_ssr_capacity_120s_v1"
+HTML_CPU_PROFILE_20S_WORKLOAD = "authenticated_html_ssr_cpu_profile_20s_v1"
+USAGE_WINDOW_MS_BY_WORKLOAD = {
+    WORKLOAD: 20_000,
+    "authenticated_workspace_read_capacity_v1": 20_000,
+    "authenticated_html_ssr_capacity_v1": 20_000,
+    HTML_CAPACITY_120S_WORKLOAD: 120_000,
+    HTML_CPU_PROFILE_20S_WORKLOAD: 20_000,
+}
+PROFILE_WORKLOADS = frozenset({WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD})
 TRACE_HEADER = "x-platform-ssr-trace"
 EXPECTED_USERS = 20_000
 EXPECTED_TOURNAMENTS = 40
@@ -116,9 +126,14 @@ PROFILE_CATEGORIES = frozenset({
 RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
-def _validate_profile_projection(value: Any) -> dict[str, Any] | None:
+def _validate_profile_projection(
+    value: Any, *, expected_workload: str = WORKLOAD,
+) -> dict[str, Any] | None:
     """Validate the fixed per-service CPU profile projection in a parent report."""
 
+    if not isinstance(expected_workload, str) or expected_workload not in PROFILE_WORKLOADS:
+        return None
+    expected_window_ms = USAGE_WINDOW_MS_BY_WORKLOAD[expected_workload]
     fields = {"profile_status", "profile_reason", "profile_rows"}
     if (not isinstance(value, dict) or set(value) != fields
             or value.get("profile_status") not in {"complete", "incomplete", "unavailable"}
@@ -193,7 +208,8 @@ def _validate_profile_projection(value: Any) -> dict[str, Any] | None:
             or not 0 <= row["start_lag_ms_min"] <= row["start_lag_ms_max"] <= 250
             or not isinstance(row["elapsed_ms_min"], int)
             or not isinstance(row["elapsed_ms_max"], int)
-            or not 19_750 <= row["elapsed_ms_min"] <= row["elapsed_ms_max"] <= 20_500
+            or not expected_window_ms - 250 <= row["elapsed_ms_min"]
+            <= row["elapsed_ms_max"] <= expected_window_ms + 500
             or not isinstance(row["end_lag_ms_min"], int)
             or not isinstance(row["end_lag_ms_max"], int)
             or not -250 <= row["end_lag_ms_min"] <= row["end_lag_ms_max"] <= 250
@@ -1186,17 +1202,24 @@ def _quality_gate(
 
 
 def _validate_usage_summary(
-    value: Any, *, allow_projected_memory_rows: bool = False,
+    value: Any, *, expected_workload: str = WORKLOAD,
+    allow_projected_memory_rows: bool = False, allow_noop_cleanup: bool = False,
 ) -> dict[str, Any] | None:
     """Validate the closed root-controller CPU summary without retaining identities."""
 
     from math import isfinite
 
+    if (not isinstance(expected_workload, str)
+            or expected_workload not in USAGE_WINDOW_MS_BY_WORKLOAD):
+        return None
     top_fields = {
         "status", "service_count", "usage_status", "usage_reason", "usage_rows",
         "profile_status", "profile_reason", "profile_rows", "memory_status",
         "memory_reason", "cgroup_memory_status", "cgroup_memory_reason", "memory_rows",
     }
+    has_workload = isinstance(value, dict) and "workload" in value
+    if has_workload:
+        top_fields.add("workload")
     has_request_telemetry = isinstance(value, dict) and "request_telemetry" in value
     if has_request_telemetry:
         top_fields.add("request_telemetry")
@@ -1226,6 +1249,16 @@ def _validate_usage_summary(
         }
         or not isinstance(value.get("memory_rows"), list)
     ):
+        return None
+    summary_workload = value.get("workload", WORKLOAD)
+    if summary_workload is None:
+        if not (allow_noop_cleanup and value["service_count"] in {0, 1}):
+            return None
+    elif (not isinstance(summary_workload, str)
+          or summary_workload not in USAGE_WINDOW_MS_BY_WORKLOAD
+          or summary_workload != expected_workload):
+        return None
+    if expected_workload != WORKLOAD and not has_workload:
         return None
     clean_request_telemetry: dict[str, Any] | None = None
     if has_request_telemetry:
@@ -1467,6 +1500,7 @@ def _validate_usage_summary(
         ):
             return None
         result = {
+            "workload": None if summary_workload is None else expected_workload,
             "status": value["status"], "service_count": value["service_count"],
             "usage_status": "unavailable", "usage_reason": "missing", "usage_rows": [],
             "profile_status": "unavailable", "profile_reason": "missing", "profile_rows": [],
@@ -1518,7 +1552,13 @@ def _validate_usage_summary(
             or row["timing_complete"] is not True
             or not isinstance(row["window_ms_min"], int)
             or not isinstance(row["window_ms_max"], int)
-            or not 19_750 <= row["window_ms_min"] <= row["window_ms_max"] <= 20_500
+            or not (
+                (20_000 if row["phase"] == "off"
+                 else USAGE_WINDOW_MS_BY_WORKLOAD[expected_workload]) - 250
+                <= row["window_ms_min"] <= row["window_ms_max"]
+                <= (20_000 if row["phase"] == "off"
+                    else USAGE_WINDOW_MS_BY_WORKLOAD[expected_workload]) + 500
+            )
             or not isinstance(row["start_lag_ms_min"], int)
             or not isinstance(row["start_lag_ms_max"], int)
             or not 0 <= row["start_lag_ms_min"] <= row["start_lag_ms_max"] <= 250
@@ -1583,7 +1623,27 @@ def _validate_usage_summary(
             return None
         profile_clean["categories"] = categories
         clean_profiles.append(profile_clean)
-    if value["profile_status"] == "complete" and (
+    if expected_workload not in PROFILE_WORKLOADS:
+        zero_profile = (
+            value["profile_status"] == "complete"
+            and value["profile_reason"] == "none"
+            and all(
+                row["expected_targets"] == (2 if row["service"] == "api" else 1)
+                and row["observed_targets"] == 0
+                and row["event_count"] == 0
+                and row["total_cpu_us"] == 0
+                and row["sample_count"] == (None if row["service"] == "api" else 0)
+                and row["categories"] == []
+                and all(row[field] is None for field in (
+                    "start_lag_ms_min", "start_lag_ms_max", "elapsed_ms_min",
+                    "elapsed_ms_max", "end_lag_ms_min", "end_lag_ms_max",
+                ))
+                for row in clean_profiles
+            )
+        )
+        if value["profile_status"] == "complete" and not zero_profile:
+            return None
+    if expected_workload in PROFILE_WORKLOADS and value["profile_status"] == "complete" and (
         value["profile_reason"] != "none"
         or any(
             row["observed_targets"] != row["expected_targets"]
@@ -1600,7 +1660,9 @@ def _validate_usage_summary(
             or not 0 <= row["start_lag_ms_min"] <= row["start_lag_ms_max"] <= 250
             or not isinstance(row["elapsed_ms_min"], int)
             or not isinstance(row["elapsed_ms_max"], int)
-            or not 19_750 <= row["elapsed_ms_min"] <= row["elapsed_ms_max"] <= 20_500
+            or not USAGE_WINDOW_MS_BY_WORKLOAD[expected_workload] - 250
+            <= row["elapsed_ms_min"] <= row["elapsed_ms_max"]
+            <= USAGE_WINDOW_MS_BY_WORKLOAD[expected_workload] + 500
             or not isinstance(row["end_lag_ms_min"], int)
             or not isinstance(row["end_lag_ms_max"], int)
             or not -250 <= row["end_lag_ms_min"] <= row["end_lag_ms_max"] <= 250
@@ -1676,6 +1738,7 @@ def _validate_usage_summary(
     ):
         return None
     result = {
+        "workload": None if summary_workload is None else expected_workload,
         "status": value["status"], "service_count": value["service_count"],
         "usage_status": value["usage_status"], "usage_reason": value["usage_reason"],
         "usage_rows": clean_rows,
@@ -1690,10 +1753,14 @@ def _validate_usage_summary(
     return result
 
 
-def _usage_delta_percentage_points(summary: dict[str, Any] | None) -> dict[str, float | None] | None:
+def _usage_delta_percentage_points(
+    summary: dict[str, Any] | None, *, expected_workload: str = WORKLOAD,
+) -> dict[str, float | None] | None:
     """Convert proven per-target process CPU time to service CPU percentage points."""
 
-    if summary is None or summary.get("usage_status") != "complete":
+    if (summary is None or summary.get("usage_status") != "complete"
+            or expected_workload not in USAGE_WINDOW_MS_BY_WORKLOAD
+            or summary.get("workload", WORKLOAD) != expected_workload):
         return None
     rows = summary.get("usage_rows")
     if not isinstance(rows, list) or len(rows) != 4:
@@ -1717,8 +1784,20 @@ def _usage_delta_percentage_points(summary: dict[str, Any] | None) -> dict[str, 
             or row["cpu_ns"] < 0
             or not isinstance(row.get("window_ms_min"), int)
             or not isinstance(row.get("window_ms_max"), int)
-            or not 19_750 <= row["window_ms_min"] <= 20_500
-            or not 19_750 <= row["window_ms_max"] <= 20_500
+            or not (
+                (20_000 if phase == "off"
+                 else USAGE_WINDOW_MS_BY_WORKLOAD[expected_workload]) - 250
+                <= row["window_ms_min"]
+                <= (20_000 if phase == "off"
+                    else USAGE_WINDOW_MS_BY_WORKLOAD[expected_workload]) + 500
+            )
+            or not (
+                (20_000 if phase == "off"
+                 else USAGE_WINDOW_MS_BY_WORKLOAD[expected_workload]) - 250
+                <= row["window_ms_max"]
+                <= (20_000 if phase == "off"
+                    else USAGE_WINDOW_MS_BY_WORKLOAD[expected_workload]) + 500
+            )
             or not isinstance(row.get("start_lag_ms_min"), int)
             or not isinstance(row.get("start_lag_ms_max"), int)
             or not 0 <= row["start_lag_ms_min"] <= row["start_lag_ms_max"] <= 250
@@ -1727,7 +1806,8 @@ def _usage_delta_percentage_points(summary: dict[str, Any] | None) -> dict[str, 
             or not -250 <= row["end_lag_ms_min"] <= row["end_lag_ms_max"] <= 250
         ):
             return None
-        values[(service, phase)] = row["cpu_ns"] / (LEG_MS * 1_000_000) * 100.0
+        window_ms = 20_000 if phase == "off" else USAGE_WINDOW_MS_BY_WORKLOAD[expected_workload]
+        values[(service, phase)] = row["cpu_ns"] / (window_ms * 1_000_000) * 100.0
     return {
         "api": values[("api", "on")] - values[("api", "off")],
         "web": values[("web", "on")] - values[("web", "off")],
@@ -2426,8 +2506,14 @@ def _ssh_plan(
     lifecycle: dict[str, Any],
     *,
     allow_noop_cleanup: bool = False,
+    expected_workload: str | None = None,
 ) -> tuple[bool, str | None, dict[str, Any] | None]:
     operation = payload.get("operation")
+    caller_workload = (
+        expected_workload
+        if expected_workload is not None
+        else payload.get("workload", WORKLOAD)
+    )
     status_key = "plan_prepare_status" if operation == "prepare" else "plan_cleanup_status"
     transport_key = "prepare_transport" if operation == "prepare" else "cleanup_transport"
     transport: dict[str, Any] = {
@@ -2441,6 +2527,11 @@ def _ssh_plan(
     )
     lifecycle[status_key] = "transport_failed"
     lifecycle[refusal_key] = "none"
+    if (not isinstance(caller_workload, str)
+            or caller_workload not in USAGE_WINDOW_MS_BY_WORKLOAD):
+        lifecycle[status_key] = "bad_protocol"
+        transport["stage"] = "protocol"
+        return False, None, None
     if operation == "cleanup":
         lifecycle["plan_cleanup_failure_detail"] = None
     lifecycle["last_command_returned"] = False
@@ -2575,7 +2666,11 @@ def _ssh_plan(
         except PairError:
             lifecycle[status_key] = "bad_protocol"
             return False, None, None
-        usage = _validate_usage_summary(usage_value)
+        usage = _validate_usage_summary(
+            usage_value,
+            expected_workload=caller_workload,
+            allow_noop_cleanup=allow_noop_cleanup,
+        )
         if usage is None or (usage["service_count"] == 0 and not allow_noop_cleanup):
             lifecycle[status_key] = "bad_protocol"
             transport["stdout_shape"] = "malformed"

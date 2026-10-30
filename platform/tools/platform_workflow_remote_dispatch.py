@@ -81,6 +81,9 @@ if _is_immutable_host_tools_dispatcher(Path(__file__)) and not _invoked_with_exp
 try:
     from platform_workflow_input_guard import (
         DELETE_CONFIRMATION,
+        CPU_DIAGNOSTIC_OFF_WINDOW_MS,
+        CPU_DIAGNOSTIC_GAP_WINDOW_MS,
+        CPU_DIAGNOSTIC_ON_WINDOW_MS_BY_WORKLOAD,
         WorkflowInputError,
         load_stdin_payload,
     )
@@ -88,6 +91,9 @@ except ModuleNotFoundError:  # Imported as ``tools.*`` by local tests.
     try:
         from tools.platform_workflow_input_guard import (
             DELETE_CONFIRMATION,
+            CPU_DIAGNOSTIC_OFF_WINDOW_MS,
+            CPU_DIAGNOSTIC_GAP_WINDOW_MS,
+            CPU_DIAGNOSTIC_ON_WINDOW_MS_BY_WORKLOAD,
             WorkflowInputError,
             load_stdin_payload,
         )
@@ -103,6 +109,11 @@ except ModuleNotFoundError:  # Imported as ``tools.*`` by local tests.
         guard_module = importlib.util.module_from_spec(guard_spec)
         guard_spec.loader.exec_module(guard_module)
         DELETE_CONFIRMATION = guard_module.DELETE_CONFIRMATION
+        CPU_DIAGNOSTIC_OFF_WINDOW_MS = guard_module.CPU_DIAGNOSTIC_OFF_WINDOW_MS
+        CPU_DIAGNOSTIC_GAP_WINDOW_MS = guard_module.CPU_DIAGNOSTIC_GAP_WINDOW_MS
+        CPU_DIAGNOSTIC_ON_WINDOW_MS_BY_WORKLOAD = (
+            guard_module.CPU_DIAGNOSTIC_ON_WINDOW_MS_BY_WORKLOAD
+        )
         WorkflowInputError = guard_module.WorkflowInputError
         load_stdin_payload = guard_module.load_stdin_payload
 
@@ -147,13 +158,33 @@ EXPORT_REMOVE_ERROR_CLASSES = frozenset({
     "worker_descriptors_unavailable", "worker_identity_malformed", "worker_identity_mismatch",
     "worker_identity_unavailable",
 })
-# The fixed 130-second observer horizon at 250ms/sample admits at most 520
-# intervals; allow two framing/terminal rows. Both raw helper bytes and the
-# separately counted projected stream are bounded by this cap; projection
-# reserves a fixed marker allowance and the parent has its own stream cap.
+# Legacy observer requests retain their 130-second deadline. The typed 120s
+# phase can span 60s plan lead + 20s OFF + 5s gap + 120s ON = 205s. The
+# producer caps its absolute deadline by the worker cutoff minus 10s for one
+# TERM/KILL group-cleanup attempt, 2s for local response handling, and the
+# remote-clock lag bound. The latter is 60s max validated plan lead minus the
+# producer's fixed 52s lead, plus the full measured prepare interval from the
+# pre-Popen plan timestamp through the validated response. It includes startup,
+# input-write, and response time; it is not truncated to the SSH read-loop
+# timeout. This keeps the remote helper's actual cutoff inside the worker's
+# monotonic budget even when the server clock lags. If the resulting terminal
+# window is insufficient, the worker receives a fail-closed control before its
+# first request. Local handling reserves 6s for the bounded wait/terminate path;
+# the supervisor reserves its own 2s teardown outside the worker deadline. No
+# timeout extends that budget. The resulting maximum observer timeouts are
+# 207s for capacity120 and107s for profile20. At 250ms/sample the capacity
+# timeout admits at most 828 intervals; allow terminal/framing rows. Both raw
+# helper bytes and projected output stay
+# bounded by this cap; projection also reserves the error marker.
 CAPACITY_MEMORY_WATCH_OUTPUT_CAP = 2 * 1024 * 1024
 CAPACITY_MEMORY_WATCH_LINE_CAP = 2048
 CAPACITY_MEMORY_WATCH_TIMEOUT_SECONDS = 130
+CAPACITY_MEMORY_WATCH_TYPED_120S_TIMEOUT_SECONDS = 225 - 2 - 10 - 6
+CAPACITY_MEMORY_WATCH_TYPED_PROFILE_TIMEOUT_SECONDS = 125 - 2 - 10 - 6
+CAPACITY_MEMORY_WATCH_TIMEOUT_SECONDS_BY_WORKLOAD = {
+    "authenticated_html_ssr_capacity_120s_v1": CAPACITY_MEMORY_WATCH_TYPED_120S_TIMEOUT_SECONDS,
+    "authenticated_html_ssr_cpu_profile_20s_v1": CAPACITY_MEMORY_WATCH_TYPED_PROFILE_TIMEOUT_SECONDS,
+}
 CAPACITY_MEMORY_WATCH_ERROR_RESERVE = 256
 CAPACITY_MEMORY_WATCH_ROW_PREFIX = "CAPACITY_MEMORY_GUARD "
 CAPACITY_MEMORY_WATCH_ERROR_PREFIX = "CAPACITY_MEMORY_GUARD_ERROR "
@@ -178,6 +209,20 @@ CPU_PROFILE_ROW_FIELDS = {
     "end_lag_ms_max", "categories",
 }
 CPU_PROFILE_CATEGORY_FIELDS = {"category", "cpu_us", "observations"}
+CPU_DIAGNOSTIC_USAGE_WINDOW_MS_BY_WORKLOAD = {
+    "authenticated_workspace_read_pair_v1": 20_000,
+    "authenticated_workspace_read_capacity_v1": 20_000,
+    "authenticated_html_ssr_capacity_v1": 20_000,
+    "authenticated_html_ssr_capacity_120s_v1": 120_000,
+    "authenticated_html_ssr_cpu_profile_20s_v1": 20_000,
+}
+CPU_DIAGNOSTIC_PROFILE_WORKLOADS = {
+    "authenticated_workspace_read_pair_v1",
+    "authenticated_html_ssr_cpu_profile_20s_v1",
+}
+CPU_DIAGNOSTIC_NO_PROFILE_WORKLOADS = (
+    set(CPU_DIAGNOSTIC_USAGE_WINDOW_MS_BY_WORKLOAD) - CPU_DIAGNOSTIC_PROFILE_WORKLOADS
+)
 CPU_MEMORY_ROW_FIELDS = {
     "service", "run_id", "phase", "expected_targets", "observed_targets",
     "event_count", "duplicate_count", "status", "gc_status", "gc_overflow",
@@ -944,7 +989,7 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
     elif operation == "cleanup":
         helper_command = "cleanup-stdin"
         cleanup_expected_keys = {
-            "status", "service_count", "usage_status", "usage_reason", "usage_rows",
+            "status", "service_count", "workload", "usage_status", "usage_reason", "usage_rows",
             "profile_status", "profile_reason", "profile_rows", "memory_status",
             "memory_reason", "cgroup_memory_status", "cgroup_memory_reason", "memory_rows",
         }
@@ -1097,6 +1142,13 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                 or result.get("status") != "expired_plans_removed"
                 or type(result.get("service_count")) is not int
                 or result["service_count"] not in {0, 1, 2}
+                or (result.get("workload") is not None
+                    and result.get("workload") not in CPU_DIAGNOSTIC_USAGE_WINDOW_MS_BY_WORKLOAD)
+                or (result["service_count"] == 2
+                    and result.get("workload") not in CPU_DIAGNOSTIC_USAGE_WINDOW_MS_BY_WORKLOAD)
+                or (result["service_count"] in {0, 1}
+                    and result.get("workload") is None
+                    and result["service_count"] != 0)
                 or result.get("usage_status") not in {"complete", "incomplete", "unavailable"}
                 or result.get("usage_reason") not in {
                     "none", "missing", "duplicate", "identity_changed", "journal_failed",
@@ -1194,7 +1246,13 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                     or row["timing_complete"] is not True
                     or type(row["window_ms_min"]) is not int
                     or type(row["window_ms_max"]) is not int
-                    or not 19_750 <= row["window_ms_min"] <= row["window_ms_max"] <= 20_500
+                    or not (
+                        (20_000 if row["phase"] == "off"
+                         else CPU_DIAGNOSTIC_USAGE_WINDOW_MS_BY_WORKLOAD[result["workload"]]) - 250
+                        <= row["window_ms_min"] <= row["window_ms_max"]
+                        <= (20_000 if row["phase"] == "off"
+                            else CPU_DIAGNOSTIC_USAGE_WINDOW_MS_BY_WORKLOAD[result["workload"]]) + 500
+                    )
                     or type(row["start_lag_ms_min"]) is not int
                     or type(row["start_lag_ms_max"]) is not int
                     or not 0 <= row["start_lag_ms_min"] <= row["start_lag_ms_max"] <= 250
@@ -1273,7 +1331,23 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                     "end_lag_ms_max": row["end_lag_ms_max"],
                     "categories": categories,
                 })
-            if result["profile_status"] == "complete" and (
+            if (result["profile_status"] == "complete"
+                    and result.get("workload") in CPU_DIAGNOSTIC_NO_PROFILE_WORKLOADS):
+                if (result["profile_reason"] != "none"
+                        or any(
+                            row["observed_targets"] != 0
+                            or row["event_count"] != 0
+                            or row["total_cpu_us"] != 0
+                            or row["sample_count"] != (None if row["service"] == "api" else 0)
+                            or row["categories"] != []
+                            or any(row[field] is not None for field in (
+                                "start_lag_ms_min", "start_lag_ms_max", "elapsed_ms_min",
+                                "elapsed_ms_max", "end_lag_ms_min", "end_lag_ms_max",
+                            ))
+                            for row in projected_profiles
+                        )):
+                    return emit_failure("profile_aggregate", process=process, output=output)
+            elif result["profile_status"] == "complete" and (
                 result["profile_reason"] != "none"
                 or len(projected_profiles) != 2
                 or any(
@@ -1286,7 +1360,9 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                     or not 0 <= row["start_lag_ms_min"] <= row["start_lag_ms_max"] <= 250
                     or type(row["elapsed_ms_min"]) is not int
                     or type(row["elapsed_ms_max"]) is not int
-                    or not 19_750 <= row["elapsed_ms_min"] <= row["elapsed_ms_max"] <= 20_500
+                    or not CPU_DIAGNOSTIC_USAGE_WINDOW_MS_BY_WORKLOAD[result["workload"]] - 250
+                    <= row["elapsed_ms_min"] <= row["elapsed_ms_max"]
+                    <= CPU_DIAGNOSTIC_USAGE_WINDOW_MS_BY_WORKLOAD[result["workload"]] + 500
                     or type(row["end_lag_ms_min"]) is not int
                     or type(row["end_lag_ms_max"]) is not int
                     or not -250 <= row["end_lag_ms_min"] <= row["end_lag_ms_max"] <= 250
@@ -1365,6 +1441,7 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
             cleanup_projection = {
                 "status": "expired_plans_removed",
                 "service_count": target_count,
+                "workload": result["workload"],
                 "usage_status": result["usage_status"],
                 "usage_reason": result["usage_reason"],
                 "usage_rows": projected_rows,
@@ -1400,9 +1477,22 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
 def _run_cpu_diagnostic_memory_watch(payload: dict[str, Any]) -> int:
     """Stream only the fixed, validated SSR cgroup memory-watch projection."""
 
-    def emit_failure(stage: str, reason: str, process=None) -> int:
-        if process is not None and process.poll() is None:
+    termination_attempted = False
+    process_group_identity_fd: int | None = None
+
+    def terminate_once(process) -> None:
+        nonlocal termination_attempted
+        if (not termination_attempted and process is not None
+                and (process.poll() is None or process_group_identity_fd is not None)):
+            termination_attempted = True
+            # Popen uses start_new_session=True, so its PID is the private
+            # process-group/session ID. Keep a pidfd open through this single
+            # killpg attempt; this prevents numeric PID/session reuse even if
+            # the leader exited while a descendant still owns stdout.
             _terminate_process_group(process)
+
+    def emit_failure(stage: str, reason: str, process=None) -> int:
+        terminate_once(process)
         if (stage, reason) not in CAPACITY_MEMORY_WATCH_FAILURE_PAIRS:
             stage, reason = "unknown", "unknown"
         marker = {"schema": 1, "stage": stage, "reason": reason}
@@ -1424,6 +1514,13 @@ def _run_cpu_diagnostic_memory_watch(payload: dict[str, Any]) -> int:
     child_input = json.dumps(
         helper_payload, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")
     ).encode("ascii") + b"\n"
+    maximum_timeout_seconds = CAPACITY_MEMORY_WATCH_TIMEOUT_SECONDS_BY_WORKLOAD.get(
+        payload["workload"], CAPACITY_MEMORY_WATCH_TIMEOUT_SECONDS,
+    )
+    remaining_deadline_ms = payload["observer_deadline_ms"] - time.time_ns() // 1_000_000
+    if not 0 < remaining_deadline_ms <= maximum_timeout_seconds * 1_000:
+        return emit_failure("helper_validation", "refused")
+    deadline = time.monotonic() + remaining_deadline_ms / 1000
     try:
         process = subprocess.Popen(  # nosec B603
             [SUDO, "-n", "--", SYSTEM_PYTHON, "-I", "-B",
@@ -1434,25 +1531,38 @@ def _run_cpu_diagnostic_memory_watch(payload: dict[str, Any]) -> int:
     except OSError:
         return emit_failure("helper_spawn", "spawn_error")
     assert process.stdin is not None and process.stdout is not None
-    selector = selectors.DefaultSelector()
+    try:
+        process_group_identity_fd = os.pidfd_open(process.pid, 0)
+    except (AttributeError, OSError):
+        # The child was started in a new session and no poll/wait has reaped
+        # it yet. Signal its original process group before any API call can
+        # reap the leader and free its numeric session ID; after this single
+        # attempt, report the bounded failure without retrying against a stale
+        # numeric ID.
+        termination_attempted = True
+        _terminate_process_group(process)
+        try:
+            process.stdin.close()
+            process.stdout.close()
+        except OSError:
+            pass
+        return emit_failure("helper_spawn", "spawn_error", process)
+    selector: selectors.BaseSelector | None = None
     pending = bytearray()
     total = 0
     projected_total = 0
     expected_sequence = 1
     terminal_seen = False
-    # Plans permit up to a 60-second lead before the 20-second OFF window,
-    # followed by a 5-second idle gap and 20-second ON window. Keep a fixed
-    # bounded margin beyond that 105-second maximum horizon; the parent
-    # namespace supervisor still has its shorter 150-second hard deadline.
-    deadline = time.monotonic() + CAPACITY_MEMORY_WATCH_TIMEOUT_SECONDS
-    stage = "input_write"
+    stage = "helper_read"
     try:
-        process.stdin.write(child_input)
-        process.stdin.flush()
-        process.stdin.close()
+        selector = selectors.DefaultSelector()
         descriptor = process.stdout.fileno()
         os.set_blocking(descriptor, False)
         selector.register(descriptor, selectors.EVENT_READ)
+        stage = "input_write"
+        process.stdin.write(child_input)
+        process.stdin.flush()
+        process.stdin.close()
         eof = False
         stage = "helper_read"
         while process.poll() is None or not eof:
@@ -1510,11 +1620,14 @@ def _run_cpu_diagnostic_memory_watch(payload: dict[str, Any]) -> int:
                             ))
                             or sample["plan_off_start_ms"] >= sample["plan_on_start_ms"]
                             or sample["plan_on_start_ms"] >= sample["plan_on_end_ms"]
-                            or sample["plan_on_start_ms"] - sample["plan_off_start_ms"] != 25_000
-                            or sample["plan_on_end_ms"] - sample["plan_on_start_ms"] != 20_000
+                            or sample["plan_on_start_ms"] - sample["plan_off_start_ms"]
+                            != CPU_DIAGNOSTIC_OFF_WINDOW_MS + CPU_DIAGNOSTIC_GAP_WINDOW_MS
+                            or sample["plan_on_end_ms"] - sample["plan_on_start_ms"]
+                            != CPU_DIAGNOSTIC_ON_WINDOW_MS_BY_WORKLOAD[payload["workload"]]
                             or sample["elapsed_ms"] != max(0, sample["sampled_at_ms"] - sample["plan_off_start_ms"])
                             or sample["phase"] != (
-                                "off" if sample["sampled_at_ms"] < sample["plan_off_start_ms"] + 20_000
+                                "off" if sample["sampled_at_ms"]
+                                < sample["plan_off_start_ms"] + CPU_DIAGNOSTIC_OFF_WINDOW_MS
                                 else "idle" if sample["sampled_at_ms"] < sample["plan_on_start_ms"]
                                 else "on" if sample["sampled_at_ms"] < sample["plan_on_end_ms"]
                                 else "complete" if sample.get("decision") == "complete"
@@ -1582,7 +1695,11 @@ def _run_cpu_diagnostic_memory_watch(payload: dict[str, Any]) -> int:
             process,
         )
     finally:
-        selector.close()
+        if selector is not None:
+            try:
+                selector.close()
+            except OSError:
+                pass
         try:
             process.stdout.close()
         except OSError:
@@ -1592,8 +1709,9 @@ def _run_cpu_diagnostic_memory_watch(payload: dict[str, Any]) -> int:
                 process.stdin.close()
             except OSError:
                 pass
-        if process.poll() is None:
-            _terminate_process_group(process)
+        terminate_once(process)
+        if process_group_identity_fd is not None:
+            os.close(process_group_identity_fd)
 
 
 def _run_live_user_qa_sudo(

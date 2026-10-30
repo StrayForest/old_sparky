@@ -60,6 +60,8 @@ CAPACITY_ERROR_CODES = frozenset({
 })
 FIXTURE_TOURNAMENTS = 1
 FIXTURE_USERS = 14
+OFF_WINDOW_MS = 20_000
+IDLE_WINDOW_MS = 5_000
 ON_WINDOW_MS = 20_000
 ON_WINDOW_MS_BY_WORKLOAD = {
     WORKLOAD: ON_WINDOW_MS,
@@ -73,6 +75,19 @@ PLAN_EXPIRY_GRACE_MS_BY_WORKLOAD = {
     HTML_CAPACITY_120S_WORKLOAD: PLAN_EXPIRY_GRACE_MS,
     HTML_CPU_PROFILE_20S_WORKLOAD: PLAN_EXPIRY_GRACE_MS,
 }
+MEMORY_WATCH_TERMINAL_GRACE_MS_BY_WORKLOAD = {
+    WORKLOAD: 25_000,
+    HTML_WORKLOAD: 25_000,
+    HTML_CAPACITY_120S_WORKLOAD: 7_000,
+    HTML_CPU_PROFILE_20S_WORKLOAD: 25_000,
+}
+MEMORY_WATCH_PROCESS_GROUP_TERMINATION_RESERVE_MS = 10_000
+MEMORY_WATCH_LOCAL_RESPONSE_RESERVE_MS = 6_000
+PLAN_START_LEAD_MS = 52_000
+MAX_VALIDATED_PLAN_LEAD_MS = 60_000
+MAX_REMOTE_CLOCK_LAG_WITHOUT_ROUNDTRIP_MS = (
+    MAX_VALIDATED_PLAN_LEAD_MS - PLAN_START_LEAD_MS
+)
 WORKER_RUNTIME_SECONDS_BY_WORKLOAD = {
     WORKLOAD: 150,
     HTML_WORKLOAD: 150,
@@ -94,7 +109,8 @@ FAILURE_TIMING_KEYS = frozenset({
 CONTROL_BASENAME = "capacity-control.json"
 REMOTE_WATCH_PREFIX = b"CAPACITY_MEMORY_GUARD "
 REMOTE_WATCH_ERROR_PREFIX = b"CAPACITY_MEMORY_GUARD_ERROR "
-# Bound 145s of plan sampling to 600 rows at 250ms, plus terminal margin.
+# Bound the maximum 60s plan lead plus 145s of sampling to 820 rows at 250ms,
+# plus terminal margin.
 # A maximum-width closed row (64-bit counters, 13-digit millisecond timestamps,
 # PID/start ticks and UUID) remains below the parent's 1KiB per-line cap; the
 # producer's independent line cap is 2KiB. The cumulative cap remains 2MiB.
@@ -132,11 +148,14 @@ REMOTE_WATCH_FAILURE_PAIRS = frozenset({
 CPU_EDGE_TOLERANCE_NS = 250_000_000
 CPU_WINDOW_TOLERANCE_NS = 500_000_000
 # The plan is accepted only when its +52s requested start is 45–60s ahead
-# remotely, which bounds host-minus-runner clock offset to [-8s, +7s]. Its expiry
-# is requested on_end (+97s from plan creation); add 8s for that offset and 1s
-# so the host's strict `expires_at_ms < now` cleanup guard is satisfied.
+# remotely. The maximum remote clock lag relative to the runner is therefore
+# 8s plus the full measured prepare roundtrip. Expiry cleanup waits that bound
+# plus 1s so the host's strict `expires_at_ms < now` guard is satisfied.
 PLAN_EXPIRY_SKEW_MARGIN_MS = 9_000
-PLAN_EXPIRY_WAIT_LIMIT_MS = 230_000
+# One remote-plan expiry wait is capped at half the composite's 600s runtime.
+# If measured skew+roundtrip requires more, skip explicit cleanup and let the
+# remote plan expire naturally rather than send cleanup before its TTL.
+PLAN_EXPIRY_WAIT_LIMIT_MS = 300_000
 SANITIZER_FAILURE_STAGES = frozenset({
     "manifest_read", "report_read", "report_projection", "report_binding", "output_write",
 })
@@ -398,6 +417,7 @@ class _RemoteCapacityPlanError(ValueError):
         expires_at_ms: int | None = None,
         plan_created_at_ms: int | None = None,
         plan_created_monotonic: float | None = None,
+        remote_clock_lag_bound_ms: int = 0,
     ) -> None:
         super().__init__("capacity plan preparation failed")
         self.lifecycle = dict(lifecycle)
@@ -405,6 +425,7 @@ class _RemoteCapacityPlanError(ValueError):
         self.expires_at_ms = expires_at_ms
         self.plan_created_at_ms = plan_created_at_ms
         self.plan_created_monotonic = plan_created_monotonic
+        self.remote_clock_lag_bound_ms = remote_clock_lag_bound_ms
 
 
 class _CapacitySanitizationError(ValueError):
@@ -422,6 +443,8 @@ class _RemoteMemoryWatcher:
         self, *, ssh_host: str, ssh_user: str, ssh_config: Path, ssh_key: Path,
         control_path: Path, binding: Mapping[str, Any], run_id: str, source_sha: str,
         expected_plan: tuple[int, int, int], workload: str = WORKLOAD,
+        worker_deadline_unix_ms: int | None = None,
+        remote_clock_lag_bound_ms: int = 0,
     ) -> None:
         self.ssh_host = ssh_host
         self.ssh_user = ssh_user
@@ -439,6 +462,8 @@ class _RemoteMemoryWatcher:
         self.sequence = 0
         self.expected_plan = expected_plan
         self.workload = workload
+        self.worker_deadline_unix_ms = worker_deadline_unix_ms
+        self.remote_clock_lag_bound_ms = remote_clock_lag_bound_ms
         self.expected_target: tuple[int, int, str] | None = None
         self.terminal = False
         self.terminal_decision: str | None = None
@@ -632,13 +657,15 @@ class _RemoteMemoryWatcher:
                 or type(row.get("plan_on_start_ms")) is not int
                 or type(row.get("plan_on_end_ms")) is not int
                 or row["plan_off_start_ms"] >= row["plan_on_start_ms"]
-                or row["plan_on_start_ms"] - row["plan_off_start_ms"] != 25_000
+                or row["plan_on_start_ms"] - row["plan_off_start_ms"]
+                != OFF_WINDOW_MS + IDLE_WINDOW_MS
                 or row["plan_on_end_ms"] - row["plan_on_start_ms"]
                 != ON_WINDOW_MS_BY_WORKLOAD[self.workload]
                 or row["elapsed_ms"] != max(0, row["sampled_at_ms"] - row["plan_off_start_ms"])
                 or row.get("phase") not in {"off", "idle", "on", "complete", "abort"}
                 or row["phase"] != (
-                    "off" if row["sampled_at_ms"] < row["plan_off_start_ms"] + 20_000
+                    "off" if row["sampled_at_ms"]
+                    < row["plan_off_start_ms"] + OFF_WINDOW_MS
                     else "idle" if row["sampled_at_ms"] < row["plan_on_start_ms"]
                     else "on" if row["sampled_at_ms"] < row["plan_on_end_ms"]
                     else "complete" if row.get("decision") == "complete"
@@ -749,11 +776,7 @@ class _RemoteMemoryWatcher:
             "/opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py",
             "cpu-diagnostic-memory-watch",
         ]
-        request = {
-            "schema": 1, "operation": "memory-watch",
-            "run_id": self.run_id, "source_sha": self.source_sha,
-            "workload": self.workload,
-        }
+        request = self._memory_watch_request()
         data = json.dumps(request, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
         self._set_stage("ssh_spawn")
         self.process = subprocess.Popen(
@@ -776,6 +799,31 @@ class _RemoteMemoryWatcher:
         self._set_stage("thread_start")
         self.thread = threading.Thread(target=self._consume, name="ssr-memory-watch", daemon=True)
         self.thread.start()
+
+    def _memory_watch_request(self) -> dict[str, Any]:
+        """Build the exact authenticated request consumed by both validators."""
+
+        terminal_grace_ms = MEMORY_WATCH_TERMINAL_GRACE_MS_BY_WORKLOAD[self.workload]
+        observer_deadline_ms = self.expected_plan[2] + terminal_grace_ms
+        if self.worker_deadline_unix_ms is not None:
+            if (type(self.remote_clock_lag_bound_ms) is not int
+                    or self.remote_clock_lag_bound_ms < 0):
+                raise ValueError("remote plan clock bound is invalid")
+            observer_deadline_ms = min(
+                observer_deadline_ms,
+                self.worker_deadline_unix_ms
+                - MEMORY_WATCH_PROCESS_GROUP_TERMINATION_RESERVE_MS
+                - self.remote_clock_lag_bound_ms
+                - MEMORY_WATCH_LOCAL_RESPONSE_RESERVE_MS,
+            )
+        if observer_deadline_ms < self.expected_plan[2] + 1_000:
+            raise ValueError("memory observer has no bounded terminal window")
+        return {
+            "schema": 1, "operation": "memory-watch",
+            "run_id": self.run_id, "source_sha": self.source_sha,
+            "workload": self.workload,
+            "observer_deadline_ms": observer_deadline_ms,
+        }
 
     def _consume(self) -> None:
         try:
@@ -911,6 +959,75 @@ def _plan_expiry_ms(workload: str, on_end_ms: int) -> int:
 def _plan_expiry_horizon_ms(workload: str) -> int:
     on_window_ms = ON_WINDOW_MS_BY_WORKLOAD[workload]
     return 52_000 + 20_000 + 5_000 + on_window_ms + PLAN_EXPIRY_GRACE_MS_BY_WORKLOAD.get(workload, 0)
+
+
+# The longest plan TTL is capacity120: 212s. The 300s hard expiry wait leaves
+# 9s for host lead skew + strict-expiry margin, so successful full prepare RTT
+# is capped at 79s before either typed phase can start.
+MAX_PLAN_PREPARE_ROUNDTRIP_MS = (
+    PLAN_EXPIRY_WAIT_LIMIT_MS
+    - _plan_expiry_horizon_ms(HTML_CAPACITY_120S_WORKLOAD)
+    - PLAN_EXPIRY_SKEW_MARGIN_MS
+)
+MAX_REMOTE_CLOCK_LAG_BOUND_MS = (
+    MAX_REMOTE_CLOCK_LAG_WITHOUT_ROUNDTRIP_MS + MAX_PLAN_PREPARE_ROUNDTRIP_MS
+)
+COMPOSITE_PLAN_CLEANUP_TIMEOUT_SECONDS = 26
+# Each cleanup can use the 20s SSH response window plus up to 6s to terminate
+# the owned local process group. At the 79s RTT cap, capacity takes at most
+# 330s and profile 230s, including their 225s/125s worker limits. The fixed
+# 5s gap leaves 35s of the outer 600s for setup and report projection.
+COMPOSITE_CAPACITY_PHASE_WORST_CASE_SECONDS = max(
+    MAX_PLAN_PREPARE_ROUNDTRIP_MS / 1_000
+    + WORKER_RUNTIME_SECONDS_BY_WORKLOAD[HTML_CAPACITY_120S_WORKLOAD],
+    (
+        _plan_expiry_horizon_ms(HTML_CAPACITY_120S_WORKLOAD)
+        + MAX_REMOTE_CLOCK_LAG_BOUND_MS + 1_000
+    ) / 1_000,
+) + COMPOSITE_PLAN_CLEANUP_TIMEOUT_SECONDS
+COMPOSITE_CPU_PROFILE_PHASE_WORST_CASE_SECONDS = max(
+    MAX_PLAN_PREPARE_ROUNDTRIP_MS / 1_000
+    + WORKER_RUNTIME_SECONDS_BY_WORKLOAD[HTML_CPU_PROFILE_20S_WORKLOAD],
+    (
+        _plan_expiry_horizon_ms(HTML_CPU_PROFILE_20S_WORKLOAD)
+        + MAX_REMOTE_CLOCK_LAG_BOUND_MS + 1_000
+    ) / 1_000,
+) + COMPOSITE_PLAN_CLEANUP_TIMEOUT_SECONDS
+COMPOSITE_QUIESCENT_GAP_SECONDS = 5
+COMPOSITE_REQUIRED_BEFORE_CAPACITY_SECONDS = (
+    COMPOSITE_CAPACITY_PHASE_WORST_CASE_SECONDS
+    + COMPOSITE_QUIESCENT_GAP_SECONDS
+    + COMPOSITE_CPU_PROFILE_PHASE_WORST_CASE_SECONDS
+)
+
+
+def _composite_wall_budget_sufficient(
+    deadline: float, now: float, required_seconds: float,
+) -> bool:
+    return (
+        all(type(value) in (int, float) and math.isfinite(value)
+            for value in (deadline, now, required_seconds))
+        and required_seconds >= 0
+        and deadline - now >= required_seconds
+    )
+
+
+def _composite_wait_for_profile_gap(deadline: float) -> bool:
+    """Wait the fixed gap only when the profile phase still fits afterward."""
+
+    if not _composite_wall_budget_sufficient(
+        deadline,
+        time.monotonic(),
+        COMPOSITE_CPU_PROFILE_PHASE_WORST_CASE_SECONDS
+        + COMPOSITE_QUIESCENT_GAP_SECONDS,
+    ):
+        return False
+    time.sleep(COMPOSITE_QUIESCENT_GAP_SECONDS)
+    return _composite_wall_budget_sufficient(
+        deadline,
+        time.monotonic(),
+        COMPOSITE_CPU_PROFILE_PHASE_WORST_CASE_SECONDS,
+    )
 
 
 def _capacity_error_code(result: Any) -> str:
@@ -2373,6 +2490,15 @@ def run_isolated_capacity_worker(
     hidden = {"value": False}
     wall_anchor_ms = time.time_ns() // 1_000_000
     monotonic_anchor = time.monotonic()
+    term_grace_seconds = load_runtime.DEFAULT_TERM_GRACE_SECONDS
+    poll_seconds = load_runtime.DEFAULT_POLL_SECONDS
+    supervisor_teardown_reserve_seconds = max(
+        term_grace_seconds + max(0.1, poll_seconds * 4.0),
+        term_grace_seconds + load_runtime.MIN_NAMESPACE_REAP_GRACE_SECONDS,
+    )
+    watcher.worker_deadline_unix_ms = wall_anchor_ms + int(
+        (maximum_runtime_seconds - supervisor_teardown_reserve_seconds) * 1000
+    )
     on_window_monotonic = (
         monotonic_anchor + (on_start_ms - wall_anchor_ms) / 1000,
         monotonic_anchor + (on_end_ms - wall_anchor_ms) / 1000,
@@ -2884,7 +3010,7 @@ def _prepare_remote_capacity_plan(
         from tools import platform_cpu_diagnostic_pair as cpu_pair
     except ModuleNotFoundError:  # direct execution from platform/tools
         import platform_cpu_diagnostic_pair as cpu_pair  # type: ignore[no-redef]
-    off_start = now_ms + 52_000
+    off_start = now_ms + PLAN_START_LEAD_MS
     on_window_ms = ON_WINDOW_MS_BY_WORKLOAD[workload]
     on_end_ms = off_start + 25_000 + on_window_ms
     expires_at_ms = _plan_expiry_ms(workload, on_end_ms)
@@ -2899,17 +3025,26 @@ def _prepare_remote_capacity_plan(
         "closed": True, "mux_off_enforced": False,
         "last_command_returned": False,
     })
+    def current_remote_clock_lag_bound_ms() -> tuple[int, int]:
+        roundtrip_ms = max(
+            0, math.ceil((time.monotonic() - plan_created_monotonic) * 1000),
+        )
+        return roundtrip_ms, MAX_REMOTE_CLOCK_LAG_WITHOUT_ROUNDTRIP_MS + roundtrip_ms
+
     try:
         prepared, release_slug, summary = cpu_pair._ssh_plan(
             argparse.Namespace(), host, user, config, key, plan, lifecycle,
         )
     except Exception as exc:
+        prepare_roundtrip_ms, remote_clock_lag_bound_ms = current_remote_clock_lag_bound_ms()
         error_class = type(exc).__name__
         raise _RemoteCapacityPlanError(
             lifecycle, error_class, expires_at_ms=expires_at_ms,
             plan_created_at_ms=now_ms,
             plan_created_monotonic=plan_created_monotonic,
+            remote_clock_lag_bound_ms=remote_clock_lag_bound_ms,
         ) from None
+    prepare_roundtrip_ms, remote_clock_lag_bound_ms = current_remote_clock_lag_bound_ms()
     if (not prepared or not isinstance(release_slug, str)
             or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", release_slug) is None
             or summary is not None):
@@ -2923,14 +3058,34 @@ def _prepare_remote_capacity_plan(
             ),
             plan_created_at_ms=now_ms,
             plan_created_monotonic=plan_created_monotonic,
+            remote_clock_lag_bound_ms=remote_clock_lag_bound_ms,
         ) from None
+    expiry_wait_ms = _plan_expiry_horizon_ms(workload) + max(
+        PLAN_EXPIRY_SKEW_MARGIN_MS, remote_clock_lag_bound_ms + 1_000,
+    )
+    if expiry_wait_ms > PLAN_EXPIRY_WAIT_LIMIT_MS:
+        raise _RemoteCapacityPlanError(
+            lifecycle, "ValueError", expires_at_ms=expires_at_ms,
+            plan_created_at_ms=now_ms,
+            plan_created_monotonic=plan_created_monotonic,
+            remote_clock_lag_bound_ms=remote_clock_lag_bound_ms,
+        )
+    if prepare_roundtrip_ms > MAX_PLAN_PREPARE_ROUNDTRIP_MS:
+        raise _RemoteCapacityPlanError(
+            lifecycle, "ValueError", expires_at_ms=expires_at_ms,
+            plan_created_at_ms=now_ms,
+            plan_created_monotonic=plan_created_monotonic,
+            remote_clock_lag_bound_ms=remote_clock_lag_bound_ms,
+        )
     plan["release_slug"] = release_slug
     plan["expires_at_ms"] = expires_at_ms
+    plan["remote_clock_lag_bound_ms"] = remote_clock_lag_bound_ms
     return plan, lifecycle
 
 
 def _cleanup_remote_capacity_plan(
     *, host: str, user: str, config: Path, key: Path, run_id: str,
+    workload: str = WORKLOAD,
     lifecycle: dict[str, Any] | None = None,
     client_request_ids: list[str] | None = None,
     client_cohort_counts: Mapping[str, int] | None = None,
@@ -2951,6 +3106,7 @@ def _cleanup_remote_capacity_plan(
     result, _release_slug, summary = cpu_pair._ssh_plan(
         argparse.Namespace(), host, user, config, key, payload, lifecycle,
         allow_noop_cleanup=True,
+        expected_workload=workload,
     )
     return bool(result and isinstance(summary, dict)), summary if isinstance(summary, dict) else None
 
@@ -2982,20 +3138,33 @@ def _prepare_transport_is_closed(lifecycle: Mapping[str, Any]) -> bool:
 def _wait_for_remote_plan_expiry(
     expires_at_ms: int, *, workload: str, plan_created_at_ms: int,
     plan_created_monotonic: float,
+    remote_clock_lag_bound_ms: int = 0,
 ) -> None:
-    """Wait against the plan-creation monotonic clock, with a fixed upper bound."""
+    """Wait past remote expiry against the plan clock, within a hard wait cap."""
 
     expected_horizon_ms = _plan_expiry_horizon_ms(workload)
     if (type(expires_at_ms) is not int or expires_at_ms < 0
             or type(plan_created_at_ms) is not int or plan_created_at_ms < 0
             or type(plan_created_monotonic) not in (int, float)
             or not math.isfinite(plan_created_monotonic)
+            or type(remote_clock_lag_bound_ms) is not int
+            or remote_clock_lag_bound_ms < 0
             or expires_at_ms - plan_created_at_ms != expected_horizon_ms):
         raise ValueError("capacity plan expiry rejected")
-    target_monotonic = plan_created_monotonic + (
-        expected_horizon_ms + PLAN_EXPIRY_SKEW_MARGIN_MS
-    ) / 1000
+    skew_margin_ms = max(
+        PLAN_EXPIRY_SKEW_MARGIN_MS, remote_clock_lag_bound_ms + 1_000,
+    )
+    target_wait_ms = expected_horizon_ms + skew_margin_ms
+    target_monotonic = plan_created_monotonic + target_wait_ms / 1000
+    # The hard cap is measured from plan creation, not from when cleanup
+    # happens to be requested. Otherwise a slow rejected prepare could add its
+    # full RTT to the plan's already-bounded expiry horizon.
     deadline = plan_created_monotonic + PLAN_EXPIRY_WAIT_LIMIT_MS / 1000
+    wait_started = time.monotonic()
+    if target_monotonic > deadline:
+        raise TimeoutError("capacity plan expiry wait exceeded its bound")
+    if target_monotonic <= wait_started:
+        return
     while True:
         remaining = target_monotonic - time.monotonic()
         if remaining <= 0:
@@ -3382,9 +3551,57 @@ def _project_request_correlation(value: Any) -> dict[str, Any] | None:
     return {"status": value["status"], "summary": summary}
 
 
+def _cpu_usage_rows_are_valid(
+    rows: Any, *, workload: str, require_complete: bool,
+) -> bool:
+    """Bind projected usage windows to the report's exact workload."""
+
+    if workload not in ON_WINDOW_MS_BY_WORKLOAD or not isinstance(rows, list) or len(rows) > 4:
+        return False
+    expected = (("api", "off", 2), ("api", "on", 2), ("web", "off", 1), ("web", "on", 1))
+    if require_complete and len(rows) != len(expected):
+        return False
+    by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        if (not isinstance(row, dict) or row.get("service") not in {"api", "web"}
+                or row.get("phase") not in {"off", "on"}):
+            return False
+        key = (row["service"], row["phase"])
+        if key in by_key:
+            return False
+        expected_ms = 20_000 if row["phase"] == "off" else ON_WINDOW_MS_BY_WORKLOAD[workload]
+        lower, upper = expected_ms - 250, expected_ms + 500
+        minimum, maximum = row.get("window_ms_min"), row.get("window_ms_max")
+        if ((minimum is None) != (maximum is None)
+                or (minimum is not None and (
+                    type(minimum) is not int or type(maximum) is not int
+                    or not lower <= minimum <= maximum <= upper
+                ))):
+            return False
+        by_key[key] = row
+    if not require_complete:
+        return True
+    for service, phase, targets in expected:
+        row = by_key.get((service, phase))
+        expected_ms = 20_000 if phase == "off" else ON_WINDOW_MS_BY_WORKLOAD[workload]
+        if (row is None
+                or row.get("expected_targets") != targets
+                or row.get("observed_targets") != targets
+                or row.get("event_count") != targets
+                or type(row.get("cpu_ns")) is not int or row["cpu_ns"] < 0
+                or row.get("timing_complete") is not True
+                or type(row.get("window_ms_min")) is not int
+                or type(row.get("window_ms_max")) is not int
+                or not expected_ms - 250 <= row["window_ms_min"]
+                <= row["window_ms_max"] <= expected_ms + 500):
+            return False
+    return True
+
+
 def _project_server_telemetry(
     summary: Any, *, include_request_correlation: bool = False,
     include_cpu_profile: bool = False,
+    expected_workload: str = WORKLOAD,
 ) -> dict[str, Any]:
     """Keep only closed CPU and Node-memory aggregates from the fixed plan collector."""
 
@@ -3402,6 +3619,16 @@ def _project_server_telemetry(
         "profile_reason": "missing",
         "profile_rows": [],
     }
+    if isinstance(summary, dict):
+        try:
+            from tools import platform_cpu_diagnostic_pair as cpu_pair
+        except ModuleNotFoundError:
+            import platform_cpu_diagnostic_pair as cpu_pair  # type: ignore[no-redef]
+        summary = cpu_pair._validate_usage_summary(
+            summary, expected_workload=expected_workload,
+            allow_projected_memory_rows=True,
+            allow_noop_cleanup=True,
+        )
     if isinstance(summary, dict):
         cpu_status = summary.get("usage_status") if summary.get("usage_status") in {"complete", "incomplete", "unavailable"} else "incomplete"
         cpu_reason = summary.get("usage_reason") if summary.get("usage_reason") in {"none", "incomplete", "unavailable", "missing", "identity_changed", "invalid_event", "invalid_profile", "journal_failed", "other"} else "other"
@@ -3426,15 +3653,13 @@ def _project_server_telemetry(
                 clean["timing_complete"] = row.get("timing_complete") is True
                 cpu_rows.append(clean)
         if include_cpu_profile:
-            try:
-                from tools import platform_cpu_diagnostic_pair as cpu_pair
-            except ModuleNotFoundError:
-                import platform_cpu_diagnostic_pair as cpu_pair  # type: ignore[no-redef]
             # `_ssh_plan` already validated and bound this summary. Its closed
             # projection strips memory-row run IDs, so permit that exact
             # projected shape only at this in-process boundary.
             validated = cpu_pair._validate_usage_summary(
-                summary, allow_projected_memory_rows=True,
+                summary, expected_workload=expected_workload,
+                allow_projected_memory_rows=True,
+                allow_noop_cleanup=True,
             )
             if validated is None:
                 profile_projection = {
@@ -3618,6 +3843,7 @@ def _parent_run_once(
                     workload=args.workload,
                     plan_created_at_ms=exc.plan_created_at_ms,
                     plan_created_monotonic=exc.plan_created_monotonic,
+                    remote_clock_lag_bound_ms=exc.remote_clock_lag_bound_ms,
                 )
             except TimeoutError:
                 cleanup_ok = False
@@ -3634,6 +3860,7 @@ def _parent_run_once(
                     cleanup_ok, _ = _cleanup_remote_capacity_plan(
                         host=args.ssh_host, user=args.ssh_user,
                         config=ssh_config, key=ssh_key, run_id=run_id,
+                        workload=workload,
                         lifecycle=cleanup_lifecycle,
                     )
                 except Exception:
@@ -3671,6 +3898,7 @@ def _parent_run_once(
             workload=workload,
         )
     state["plan_expiry_ms"] = planned["expires_at_ms"]
+    state["remote_clock_lag_bound_ms"] = planned["remote_clock_lag_bound_ms"]
     control_path: Path | None = None
     ssh_contents: dict[str, bytearray] = {}
     ssh_lifecycle: dict[str, int] = {}
@@ -3705,6 +3933,7 @@ def _parent_run_once(
             run_id=run_id, source_sha=args.app_target_sha,
             expected_plan=(planned["off_start_ms"], planned["on_start_ms"], planned["on_end_ms"]),
             workload=workload,
+            remote_clock_lag_bound_ms=planned["remote_clock_lag_bound_ms"],
         )
 
         def hide_material() -> None:
@@ -3759,6 +3988,7 @@ def _parent_run_once(
                         workload=workload,
                         plan_created_at_ms=plan_created_at_ms,
                         plan_created_monotonic=plan_created_monotonic,
+                        remote_clock_lag_bound_ms=planned["remote_clock_lag_bound_ms"],
                     )
                 except TimeoutError:
                     cleanup_ok = False
@@ -3774,6 +4004,7 @@ def _parent_run_once(
                     cleanup_ok, telemetry_summary = _cleanup_remote_capacity_plan(
                         host=args.ssh_host, user=args.ssh_user,
                         config=ssh_config, key=ssh_key, run_id=run_id,
+                        workload=workload,
                         lifecycle=cleanup_lifecycle,
                         client_request_ids=state.pop("transient_ssr_join_ids", None),
                         client_cohort_counts=state.pop("transient_ssr_join_counts", None),
@@ -3799,6 +4030,7 @@ def _parent_run_once(
         server_telemetry = _project_server_telemetry(
             telemetry_summary, include_request_correlation=correlation_required,
             include_cpu_profile=workload == HTML_CPU_PROFILE_20S_WORKLOAD,
+            expected_workload=workload,
         )
         outcome["server_telemetry"] = server_telemetry
         worker_row = outcome.get("worker")
@@ -3867,6 +4099,7 @@ def _parent_run_once(
                     HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD,
                 },
                 include_cpu_profile=workload == HTML_CPU_PROFILE_20S_WORKLOAD,
+                expected_workload=workload,
             ),
             "server_capacity_claim": None,
             "server_capacity_claim_reason": "resource_correlation_not_provided",
@@ -3931,6 +4164,15 @@ def _parent_composite_run(
             ("capacity", HTML_CAPACITY_120S_WORKLOAD),
             ("cpu_profile", HTML_CPU_PROFILE_20S_WORKLOAD),
         ):
+            required_phase_budget = (
+                COMPOSITE_REQUIRED_BEFORE_CAPACITY_SECONDS
+                if phase_name == "capacity"
+                else COMPOSITE_CPU_PROFILE_PHASE_WORST_CASE_SECONDS
+            )
+            if not _composite_wall_budget_sufficient(
+                deadline, time.monotonic(), required_phase_budget,
+            ):
+                break
             if phase_name == "cpu_profile":
                 capacity_phase = phases["capacity"]
                 if (
@@ -3956,9 +4198,8 @@ def _parent_composite_run(
                 ):
                     break
                 state["stage"] = "composite_quiescent_gap"
-                if time.monotonic() + 5 > deadline:
+                if not _composite_wait_for_profile_gap(deadline):
                     break
-                time.sleep(5)
             if time.monotonic() >= deadline:
                 break
             phase_args = argparse.Namespace(**vars(args))
@@ -4008,18 +4249,21 @@ def _parent_composite_run(
             "performance_credit": False,
             "capacity_quantile_member": False,
         }
+    wall_elapsed_seconds = max(0, time.monotonic() - started)
+    wall_budget_exceeded = wall_elapsed_seconds > 600
+    composite_complete = (
+        both_complete and same_fixture and phase_ids_unique and not wall_budget_exceeded
+    )
+    composite_passed = bool(
+        composite_complete and phases["capacity"].get("passed") is True
+    )
     return {
         "schema": SCHEMA,
         "report_complete": True,
         "workload": HTML_COMPOSITE_WORKLOAD,
         "fixture_kind": HTML_COMPOSITE_FIXTURE_KIND,
-        "status": "complete" if both_complete and same_fixture and phase_ids_unique else "incomplete",
-        "passed": bool(
-            both_complete
-            and same_fixture
-            and phase_ids_unique
-            and phases["capacity"].get("passed") is True
-        ),
+        "status": "complete" if composite_complete else "incomplete",
+        "passed": composite_passed,
         "matrix_credit": False,
         "slo_credit": False,
         "diagnostic_credit": False,
@@ -4050,7 +4294,8 @@ def _parent_composite_run(
         "remote_plan_cleanup": "complete" if both_complete else "incomplete",
         "namespace_closed": both_complete,
         "maximum_wall_seconds": 600,
-        "wall_elapsed_seconds": round(min(600, max(0, time.monotonic() - started)), 3),
+        "wall_elapsed_seconds": round(min(600, wall_elapsed_seconds), 3),
+        "wall_budget_exceeded": wall_budget_exceeded,
     }
 
 
@@ -4407,7 +4652,7 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
             import platform_cpu_diagnostic_pair as cpu_pair  # type: ignore[no-redef]
         profile = cpu_pair._validate_profile_projection({
             key: telemetry[key] for key in ("profile_status", "profile_reason", "profile_rows")
-        })
+        }, expected_workload=value["workload"])
         if profile is None or (
             value.get("status") == "complete" and profile["profile_status"] != "complete"
         ):
@@ -4424,6 +4669,11 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
                 or type(row.get("timing_complete")) is not bool
                 or any(item is not None and type(item) is not int for key, item in row.items() if key not in {"service", "phase", "expected_targets", "observed_targets", "event_count", "timing_complete"})):
             return None
+    if not _cpu_usage_rows_are_valid(
+        telemetry["cpu_rows"], workload=value["workload"],
+        require_complete=telemetry["cpu_status"] == "complete",
+    ):
+        return None
     node_integer_fields = {
         "sample_count", "rss_min_bytes", "rss_max_bytes", "rss_mean_bytes",
         "heap_total_min_bytes", "heap_total_max_bytes", "heap_total_mean_bytes",
@@ -4488,7 +4738,7 @@ def _project_composite_capacity_report(value: dict[str, Any]) -> dict[str, Any] 
         "phase_run_ids", "phase_profile_digests", "same_fixture_manifest",
         "capacity_phase", "cpu_profile_phase", "capacity_quantiles_scope",
         "profile_latency_scope", "remote_plan_cleanup", "namespace_closed",
-        "maximum_wall_seconds", "wall_elapsed_seconds",
+        "maximum_wall_seconds", "wall_elapsed_seconds", "wall_budget_exceeded",
     }
     if set(value) != fields:
         return None
@@ -4525,6 +4775,12 @@ def _project_composite_capacity_report(value: dict[str, Any]) -> dict[str, Any] 
         or isinstance(value.get("wall_elapsed_seconds"), bool)
         or not math.isfinite(value["wall_elapsed_seconds"])
         or not 0 <= value["wall_elapsed_seconds"] <= 600
+        or type(value.get("wall_budget_exceeded")) is not bool
+        or (value["wall_budget_exceeded"] is True and (
+            value["status"] != "incomplete"
+            or value["passed"] is not False
+            or value["wall_elapsed_seconds"] != 600
+        ))
         or type(value.get("same_fixture_manifest")) is not bool
     ):
         return None
@@ -4706,24 +4962,11 @@ def evaluate_capacity_report(
         return "INVALID"
     statuses = worker["http_status_counts"]
     events = memory["memory_events_sampled_max_delta"]
-    expected_cpu = (("api", "off", 2), ("api", "on", 2), ("web", "off", 1), ("web", "on", 1))
     cpu_rows = telemetry["cpu_rows"]
-    cpu_by_key = {(row["service"], row["phase"]): row for row in cpu_rows}
     cpu_complete = bool(
         telemetry["cpu_status"] == "complete"
-        and len(cpu_rows) == len(expected_cpu)
-        and len(cpu_by_key) == len(expected_cpu)
-        and all(
-            (row := cpu_by_key.get((service, phase))) is not None
-            and row["expected_targets"] == targets
-            and row["observed_targets"] == targets
-            and row["event_count"] == targets
-            and row["cpu_ns"] is not None and row["cpu_ns"] >= 0
-            and row["timing_complete"] is True
-            and isinstance(row["window_ms_min"], int)
-            and isinstance(row["window_ms_max"], int)
-            and 19_750 <= row["window_ms_min"] <= row["window_ms_max"] <= 20_500
-            for service, phase, targets in expected_cpu
+        and _cpu_usage_rows_are_valid(
+            cpu_rows, workload=workload, require_complete=True,
         )
     )
     memory_rows = telemetry["node_memory_rows"]
@@ -5598,6 +5841,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 cleanup_lifecycle = {}
                 planned_expiry = stage_state.get("plan_expiry_ms")
+                remote_clock_lag_bound_ms = stage_state.get("remote_clock_lag_bound_ms")
                 plan_created_at_ms = stage_state.get("plan_created_at_ms")
                 plan_created_monotonic = stage_state.get("plan_created_monotonic")
                 if (type(planned_expiry) is not int
@@ -5609,11 +5853,15 @@ def main(argv: list[str] | None = None) -> int:
                     workload=str(stage_state.get("workload")),
                     plan_created_at_ms=plan_created_at_ms,
                     plan_created_monotonic=plan_created_monotonic,
+                    remote_clock_lag_bound_ms=remote_clock_lag_bound_ms,
                 )
                 cleanup_ok, _ = _cleanup_remote_capacity_plan(
                     host=args.ssh_host, user=args.ssh_user,
                     config=Path(args.ssh_config), key=Path(args.ssh_key),
-                    run_id=run_id, lifecycle=cleanup_lifecycle,
+                    run_id=run_id, workload=stage_state.get(
+                        "workload", getattr(args, "workload", WORKLOAD),
+                    ),
+                    lifecycle=cleanup_lifecycle,
                 )
             except TimeoutError:
                 cleanup_ok = False

@@ -108,6 +108,25 @@ SSR_HTML_CAPACITY_DIAGNOSTIC_WORKLOAD = "authenticated_html_ssr_capacity_v1"
 SSR_HTML_COMPOSITE_DIAGNOSTIC_WORKLOAD = (
     "authenticated_html_ssr_capacity_120s_plus_cpu_profile_20s_v1"
 )
+SSR_HTML_CAPACITY_120S_WORKLOAD = "authenticated_html_ssr_capacity_120s_v1"
+SSR_HTML_CPU_PROFILE_20S_WORKLOAD = "authenticated_html_ssr_cpu_profile_20s_v1"
+CPU_DIAGNOSTIC_OFF_WINDOW_MS = 20_000
+CPU_DIAGNOSTIC_GAP_WINDOW_MS = 5_000
+CPU_DIAGNOSTIC_ON_WINDOW_MS_BY_WORKLOAD = {
+    CPU_DIAGNOSTIC_WORKLOAD: 20_000,
+    SSR_CAPACITY_DIAGNOSTIC_WORKLOAD: 20_000,
+    SSR_HTML_CAPACITY_DIAGNOSTIC_WORKLOAD: 20_000,
+    SSR_HTML_CAPACITY_120S_WORKLOAD: 120_000,
+    SSR_HTML_CPU_PROFILE_20S_WORKLOAD: 20_000,
+}
+SSR_CAPACITY_MEMORY_WATCH_WORKLOADS = frozenset(
+    {
+        SSR_CAPACITY_DIAGNOSTIC_WORKLOAD,
+        SSR_HTML_CAPACITY_DIAGNOSTIC_WORKLOAD,
+        SSR_HTML_CAPACITY_120S_WORKLOAD,
+        SSR_HTML_CPU_PROFILE_20S_WORKLOAD,
+    }
+)
 HOST_TOOLS_SIGNER_WORKFLOW = (
     "StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml"
 )
@@ -602,12 +621,8 @@ def validate_cpu_diagnostic_payload(payload: Mapping[str, Any]) -> dict[str, Any
         raise _invalid()
     if not isinstance(source_sha, str) or SHA_RE.fullmatch(source_sha) is None:
         raise _invalid()
-    if (not isinstance(payload.get("workload"), str)
-            or payload.get("workload") not in {
-                CPU_DIAGNOSTIC_WORKLOAD,
-                SSR_CAPACITY_DIAGNOSTIC_WORKLOAD,
-                SSR_HTML_CAPACITY_DIAGNOSTIC_WORKLOAD,
-            }):
+    workload = payload.get("workload")
+    if not isinstance(workload, str) or workload not in CPU_DIAGNOSTIC_ON_WINDOW_MS_BY_WORKLOAD:
         raise _invalid()
     times = [payload.get(name) for name in (
         "off_start_ms", "off_end_ms", "on_start_ms", "on_end_ms"
@@ -617,33 +632,40 @@ def validate_cpu_diagnostic_payload(payload: Mapping[str, Any]) -> dict[str, Any
     off_start, off_end, on_start, on_end = times
     if not (
         off_start < off_end <= on_start < on_end
-        and off_end - off_start == 20_000
-        and on_start - off_end == 5_000
-        and on_end - on_start == 20_000
-        and on_end - off_start == 45_000
+        and off_end - off_start == CPU_DIAGNOSTIC_OFF_WINDOW_MS
+        and on_start - off_end == CPU_DIAGNOSTIC_GAP_WINDOW_MS
+        and on_end - on_start == CPU_DIAGNOSTIC_ON_WINDOW_MS_BY_WORKLOAD[workload]
+        and on_end - off_start == (
+            CPU_DIAGNOSTIC_OFF_WINDOW_MS
+            + CPU_DIAGNOSTIC_GAP_WINDOW_MS
+            + CPU_DIAGNOSTIC_ON_WINDOW_MS_BY_WORKLOAD[workload]
+        )
     ):
         raise _invalid()
     return dict(payload)
 
 
 def validate_ssr_capacity_memory_watch_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Validate the one fixed, read-only 45-second web-cgroup observer."""
+    """Validate a fixed, read-only workload-bound web-cgroup observer."""
 
     payload = _require_mapping(payload)
-    _require_exact_keys(payload, {"schema", "operation", "run_id", "source_sha", "workload"})
+    _require_exact_keys(payload, {
+        "schema", "operation", "run_id", "source_sha", "workload",
+        "observer_deadline_ms",
+    })
     if (type(payload.get("schema")) is not int or payload["schema"] != 1
             or payload.get("operation") != "memory-watch"
             or not isinstance(payload.get("workload"), str)
-            or payload.get("workload") not in {
-                SSR_CAPACITY_DIAGNOSTIC_WORKLOAD,
-                SSR_HTML_CAPACITY_DIAGNOSTIC_WORKLOAD,
-            }):
+            or payload.get("workload") not in SSR_CAPACITY_MEMORY_WATCH_WORKLOADS):
         raise _invalid()
     run_id = payload.get("run_id")
     source_sha = payload.get("source_sha")
+    observer_deadline_ms = payload.get("observer_deadline_ms")
     if not isinstance(run_id, str) or CPU_DIAGNOSTIC_RUN_RE.fullmatch(run_id) is None:
         raise _invalid()
     if not isinstance(source_sha, str) or SHA_RE.fullmatch(source_sha) is None:
+        raise _invalid()
+    if type(observer_deadline_ms) is not int or observer_deadline_ms <= 0:
         raise _invalid()
     return dict(payload)
 

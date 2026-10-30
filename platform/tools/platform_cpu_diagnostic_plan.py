@@ -1612,6 +1612,11 @@ def _usage_summary(
 ) -> dict[str, Any]:
     """Validate exact target/phase journal events; expose aggregates only."""
 
+    workload = plans.get("api", {}).get("workload")
+    if (not isinstance(workload, str) or workload not in SUPPORTED_WORKLOADS
+            or plans.get("web", {}).get("workload") != workload):
+        workload = None
+
     def empty_rows() -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for service in ("api", "web"):
@@ -1659,6 +1664,7 @@ def _usage_summary(
 
     def incomplete(reason: str) -> dict[str, Any]:
         return {
+            "workload": workload,
             "usage_status": "incomplete",
             "usage_reason": reason,
             "usage_rows": empty_rows(),
@@ -2116,6 +2122,7 @@ def _usage_summary(
                   "none" if cgroup_memory_complete else "hierarchy_unavailable")
     )
     return {
+        "workload": workload,
         "usage_status": "complete" if all_complete else "incomplete",
         "usage_reason": reason,
         "usage_rows": rows,
@@ -2203,6 +2210,7 @@ def cleanup(args: argparse.Namespace) -> dict[str, object]:
                 # Capture is supplementary. Never leave a live plan behind
                 # because bounded journal summarization failed.
                 usage = {
+                    "workload": plans["api"].get("workload"),
                     "usage_status": "incomplete",
                     "usage_reason": "invalid_event",
                     "usage_rows": [
@@ -2255,6 +2263,9 @@ def cleanup(args: argparse.Namespace) -> dict[str, object]:
                 }
         else:
             usage = {
+                "workload": (
+                    next(iter(plans.values())).get("workload") if plans else None
+                ),
                 "usage_status": "unavailable",
                 "usage_reason": "missing",
                 "usage_rows": [],

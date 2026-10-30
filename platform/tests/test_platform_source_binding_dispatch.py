@@ -175,6 +175,7 @@ class SourceBindingDispatchTests(unittest.TestCase):
             "run_id": html_plan["run_id"],
             "source_sha": APP_SHA,
             "workload": html_plan["workload"],
+            "observer_deadline_ms": html_plan["on_end_ms"] + 25_000,
         }
         self.assertEqual(
             validate_ssr_capacity_memory_watch_payload(html_watch)["workload"],
@@ -195,23 +196,31 @@ class SourceBindingDispatchTests(unittest.TestCase):
             "run_id": "a" * 32,
             "source_sha": APP_SHA,
             "workload": "authenticated_workspace_read_capacity_v1",
+            "observer_deadline_ms": 2_000_000,
         }
-        self.assertEqual(
-            validate_ssr_capacity_memory_watch_payload(payload)["workload"],
+        for workload in (
             "authenticated_workspace_read_capacity_v1",
-        )
-        html = {
-            **payload,
-            "workload": "authenticated_html_ssr_capacity_v1",
-        }
-        self.assertEqual(
-            validate_ssr_capacity_memory_watch_payload(html)["workload"],
             "authenticated_html_ssr_capacity_v1",
-        )
+            "authenticated_html_ssr_capacity_120s_v1",
+            "authenticated_html_ssr_cpu_profile_20s_v1",
+        ):
+            with self.subTest(workload=workload):
+                value = {**payload, "workload": workload}
+                self.assertEqual(
+                    validate_ssr_capacity_memory_watch_payload(value)["workload"], workload,
+                )
+        for invalid in (
+            {**payload, "workload": "authenticated_workspace_read_pair_v1"},
+            {**payload, "observer_deadline_ms": True},
+            {**payload, "observer_deadline_ms": 0},
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(WorkflowInputError):
+                    validate_ssr_capacity_memory_watch_payload(invalid)
         for mutation in (
             {**payload, "workload": "authenticated_workspace_read_pair_v1"},
             {**payload, "workload": []},
-            {**html, "unexpected": True},
+            {**payload, "unexpected": True},
         ):
             with self.subTest(mutation=mutation):
                 with self.assertRaises(WorkflowInputError):
