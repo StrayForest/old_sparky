@@ -6638,3 +6638,420 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             selected, run_id,
         )
         self.assertEqual(ids, [eligible_on_time_id, eligible_drained_id])
+
+    def test_composite_projection_preserves_typed_phase_failure_and_fingerprint(self) -> None:
+        source_sha = "a" * 40
+        app_sha = "b" * 40
+        manifest_sha = "c" * 64
+        manifest_bytes = 4096
+        run_id = "d" * 32
+        phase_workload = capacity_diagnostic.HTML_CAPACITY_120S_WORKLOAD
+        phase_digest = capacity_diagnostic.profile_digest(32, phase_workload)
+        failure = capacity_diagnostic._parent_failure_receipt(
+            error_class="ValueError", stage="remote_plan_prepare",
+            source_sha=source_sha, app_target_sha=app_sha,
+            external_run_id="41018394289", external_run_attempt="1",
+            run_id=run_id, profile_digest_value=phase_digest,
+            manifest_sha256=manifest_sha, manifest_bytes=manifest_bytes,
+            concurrency=32,
+            prepare_lifecycle={
+                "plan_prepare_status": "refused",
+                "plan_prepare_refusal_class": "ValueError",
+                "prepare_transport": {
+                    "stage": "complete", "return_code": 2,
+                    "stdout_shape": "refusal_marker", "child_state": "reaped",
+                },
+            },
+            cleanup_lifecycle={
+                "plan_cleanup_status": "not_attempted",
+                "plan_cleanup_refusal_class": "none",
+                "cleanup_transport": {
+                    "stage": "not_started", "return_code": None,
+                    "stdout_shape": "none", "child_state": "not_started",
+                },
+            },
+            cleanup_ok=False, workload=phase_workload,
+        )
+        composite = {
+            "schema": capacity_diagnostic.SCHEMA,
+            "report_complete": True,
+            "workload": capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+            "fixture_kind": capacity_diagnostic.HTML_COMPOSITE_FIXTURE_KIND,
+            "status": "incomplete", "passed": False,
+            "matrix_credit": False, "slo_credit": False, "diagnostic_credit": False,
+            "source_sha": source_sha, "app_target_sha": app_sha,
+            "external_run_id": "41018394289", "external_run_attempt": "1",
+            "run_id": "e" * 32,
+            "profile_digest": capacity_diagnostic.profile_digest(
+                32, capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+            ),
+            "fixture_manifest_sha256": manifest_sha,
+            "fixture_manifest_bytes": manifest_bytes,
+            "fixture_tournaments": capacity_diagnostic.FIXTURE_TOURNAMENTS,
+            "fixture_users": capacity_diagnostic.FIXTURE_USERS,
+            "actors": capacity_diagnostic.FIXTURE_USERS,
+            "concurrency": 32, "max_inflight": 32,
+            "load_model": "closed_loop_best_effort",
+            "phase_windows_ms": [120_000, 20_000],
+            "phase_workloads": [
+                capacity_diagnostic.HTML_CAPACITY_120S_WORKLOAD,
+                capacity_diagnostic.HTML_CPU_PROFILE_20S_WORKLOAD,
+            ],
+            "phase_gap_ms": 5_000,
+            "phase_run_ids": [run_id],
+            "phase_profile_digests": [phase_digest],
+            "same_fixture_manifest": False,
+            "capacity_phase": failure,
+            "cpu_profile_phase": None,
+            "capacity_quantiles_scope": "capacity_phase_on_window_only",
+            "profile_latency_scope": "excluded",
+            "remote_plan_cleanup": "incomplete",
+            "namespace_closed": False,
+            "maximum_wall_seconds": 600,
+            "wall_elapsed_seconds": 14.0,
+        }
+        projected = capacity_diagnostic._project_capacity_report(composite)
+        self.assertIsNotNone(projected)
+        self.assertEqual(projected["capacity_phase"]["stage"], "remote_plan_prepare")
+        self.assertEqual(projected["capacity_phase"]["plan_prepare_status"], "refused")
+        self.assertEqual(projected["capacity_phase"]["fixture_manifest_sha256"], manifest_sha)
+        self.assertEqual(capacity_diagnostic.evaluate_capacity_report(
+            composite, source_sha=source_sha, app_target_sha=app_sha,
+            run_id="41018394289", attempt="1", manifest_sha256=manifest_sha,
+            workload=capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+        ), "FAIL")
+
+        manifest_raw = b"composite diagnostic manifest fixture\n"
+        actual_manifest_sha = hashlib.sha256(manifest_raw).hexdigest()
+        sanitizer_report = {
+            **composite,
+            "fixture_manifest_sha256": actual_manifest_sha,
+            "capacity_phase": {**failure, "fixture_manifest_sha256": actual_manifest_sha},
+        }
+        manifest = {"runner_sha": source_sha, "app_target_sha": app_sha}
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            input_path, output_path = root / "input.json", root / "output.json"
+            capacity_diagnostic._write_report(input_path, sanitizer_report)
+            with patch.object(
+                capacity_diagnostic, "_read_manifest",
+                return_value=(manifest_raw, manifest, []),
+            ):
+                decision = capacity_diagnostic.sanitize_capacity_report(
+                    input_path=input_path, output_path=output_path,
+                    manifest_path=root / "manifest.json", source_sha=source_sha,
+                    app_target_sha=app_sha, run_id="41018394289", attempt="1",
+                    workload=capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+                )
+            self.assertEqual(decision, "FAIL")
+            sanitized = json.loads(output_path.read_text(encoding="ascii"))
+            self.assertEqual(sanitized["capacity_phase"]["plan_prepare_status"], "refused")
+            self.assertFalse(sanitized["passed"])
+            self.assertFalse(sanitized["matrix_credit"])
+            self.assertFalse(sanitized["slo_credit"])
+            self.assertFalse(sanitized["diagnostic_credit"])
+
+        fingerprint = capacity_diagnostic._parent_failure_fingerprint(
+            composite,
+            args=Namespace(
+                concurrency=32, source_sha=source_sha, app_target_sha=app_sha,
+                external_run_id="41018394289", external_run_attempt="1",
+                workload=capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+            ),
+            stage_state={"parent_phase": "composite_capacity"},
+        )
+        self.assertEqual(fingerprint["event"], "ssr_capacity_composite_parent_fingerprint")
+        self.assertEqual(fingerprint["capacity_phase"]["kind"], "parent_failure_receipt")
+        self.assertEqual(fingerprint["capacity_phase"]["stage"], "remote_plan_prepare")
+        self.assertEqual(fingerprint["capacity_phase"]["plan_prepare_status"], "refused")
+        self.assertEqual(fingerprint["source_sha"], source_sha)
+        self.assertEqual(fingerprint["app_target_sha"], app_sha)
+        self.assertEqual(fingerprint["external_run_id"], "41018394289")
+        self.assertEqual(fingerprint["external_run_attempt"], "1")
+        self.assertEqual(fingerprint["workload"], capacity_diagnostic.HTML_COMPOSITE_WORKLOAD)
+        self.assertEqual(fingerprint["fixture_kind"], capacity_diagnostic.HTML_COMPOSITE_FIXTURE_KIND)
+        self.assertEqual(fingerprint["run_id"], composite["run_id"])
+        self.assertEqual(fingerprint["profile_digest"], composite["profile_digest"])
+        self.assertEqual(fingerprint["fixture_manifest_sha256"], manifest_sha)
+        self.assertEqual(fingerprint["fixture_manifest_bytes"], manifest_bytes)
+        self.assertEqual(fingerprint["concurrency"], 32)
+        self.assertEqual(fingerprint["phase_run_ids"], [run_id])
+        self.assertEqual(fingerprint["phase_profile_digests"], [phase_digest])
+        self.assertEqual(fingerprint["capacity_phase"]["run_id"], run_id)
+        self.assertEqual(fingerprint["capacity_phase"]["profile_digest"], phase_digest)
+        self.assertEqual(fingerprint["capacity_phase"]["fixture_manifest_sha256"], manifest_sha)
+        self.assertEqual(fingerprint["capacity_phase"]["fixture_manifest_bytes"], manifest_bytes)
+        self.assertEqual(fingerprint["capacity_phase"]["concurrency"], 32)
+        self.assertFalse(fingerprint["passed"])
+        self.assertFalse(fingerprint["matrix_credit"])
+        self.assertFalse(fingerprint["slo_credit"])
+        self.assertFalse(fingerprint["diagnostic_credit"])
+        fingerprint_json = json.dumps(fingerprint, sort_keys=True)
+        self.assertNotIn("example.test", fingerprint_json)
+        self.assertNotIn("/tmp/", fingerprint_json)
+        self.assertNotIn("fixture-user", fingerprint_json)
+
+        for bad_fingerprint_outcome in (
+            {**composite, "source_sha": "f" * 40},
+            {**composite, "app_target_sha": "f" * 40},
+            {**composite, "external_run_attempt": "2"},
+            {**composite, "fixture_manifest_bytes": manifest_bytes + 1},
+            {**composite, "concurrency": 16},
+        ):
+            unbound = capacity_diagnostic._parent_failure_fingerprint(
+                bad_fingerprint_outcome,
+                args=Namespace(
+                    concurrency=32, source_sha=source_sha, app_target_sha=app_sha,
+                    external_run_id="41018394289", external_run_attempt="1",
+                    workload=capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+                ),
+                stage_state={},
+            )
+            self.assertFalse(unbound["binding_valid"])
+            self.assertIsNone(unbound["source_sha"])
+            self.assertIsNone(unbound["app_target_sha"])
+            self.assertIsNone(unbound["external_run_id"])
+            self.assertIsNone(unbound["external_run_attempt"])
+            self.assertIsNone(unbound["run_id"])
+            self.assertEqual(unbound["capacity_phase"]["kind"], "missing_or_invalid")
+            self.assertEqual(unbound["cpu_profile_phase"]["kind"], "missing_or_invalid")
+        wrong_invocation = capacity_diagnostic._parent_failure_fingerprint(
+            composite,
+            args=Namespace(
+                concurrency=32, source_sha=source_sha, app_target_sha="f" * 40,
+                external_run_id="41018394289", external_run_attempt="1",
+                workload=capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+            ),
+            stage_state={},
+        )
+        self.assertFalse(wrong_invocation["binding_valid"])
+        self.assertIsNone(wrong_invocation["app_target_sha"])
+        self.assertEqual(wrong_invocation["capacity_phase"]["kind"], "missing_or_invalid")
+
+        for bad_phase in (
+            {**failure, "source_sha": "f" * 40},
+            {**failure, "app_target_sha": "f" * 40},
+            {**failure, "external_run_attempt": "2"},
+            {**failure, "fixture_manifest_sha256": "f" * 64},
+            {**failure, "concurrency": 16},
+            {**failure, "workload": capacity_diagnostic.HTML_CPU_PROFILE_20S_WORKLOAD},
+        ):
+            invalid = {**composite, "capacity_phase": bad_phase}
+            self.assertIsNone(capacity_diagnostic._project_capacity_report(invalid))
+        self.assertIsNone(capacity_diagnostic._project_capacity_report({
+            **composite, "phase_run_ids": ["f" * 32],
+        }))
+        self.assertIsNone(capacity_diagnostic._project_capacity_report({
+            **composite, "same_fixture_manifest": True,
+        }))
+
+        no_manifest_failure = {
+            **failure, "stage": "manifest_read",
+            "fixture_manifest_sha256": None, "fixture_manifest_bytes": None,
+        }
+        no_manifest = {
+            **composite, "capacity_phase": no_manifest_failure,
+            "same_fixture_manifest": False,
+        }
+        self.assertIsNotNone(capacity_diagnostic._project_capacity_report(no_manifest))
+        invalid_missing_manifest = {
+            **no_manifest, "capacity_phase": {**no_manifest_failure, "stage": "binding"},
+        }
+        self.assertIsNone(capacity_diagnostic._project_capacity_report(invalid_missing_manifest))
+
+        outer_failure = capacity_diagnostic._parent_failure_receipt(
+            error_class="ValueError", stage="composite_capacity",
+            source_sha=source_sha, app_target_sha=app_sha,
+            external_run_id="41018394289", external_run_attempt="1",
+            run_id="e" * 32,
+            profile_digest_value=capacity_diagnostic.profile_digest(
+                32, capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+            ),
+            manifest_sha256=manifest_sha, manifest_bytes=manifest_bytes,
+            concurrency=32, prepare_lifecycle={}, cleanup_lifecycle={},
+            cleanup_ok=False, workload=capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+        )
+        self.assertIsNotNone(capacity_diagnostic._project_parent_failure_receipt(outer_failure))
+        self.assertEqual(outer_failure["stage"], "composite_capacity")
+        outer_fingerprint = capacity_diagnostic._parent_failure_fingerprint(
+            outer_failure,
+            args=Namespace(
+                concurrency=32, source_sha=source_sha, app_target_sha=app_sha,
+                external_run_id="41018394289", external_run_attempt="1",
+                workload=capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+            ),
+            stage_state={},
+        )
+        self.assertEqual(outer_fingerprint["parent_phase"], "composite_capacity")
+        self.assertEqual(outer_fingerprint["parent_error_class"], "ValueError")
+        self.assertFalse(outer_fingerprint["diagnostic_credit"])
+
+    def test_composite_projection_accepts_completed_pair_and_profile_failure(self) -> None:
+        source_sha = "a" * 40
+        app_sha = "b" * 40
+        manifest_raw = b"composite diagnostic manifest fixture\n"
+        manifest_sha = hashlib.sha256(manifest_raw).hexdigest()
+        external_run_id = "41018394289"
+        attempt = "1"
+        capacity_run_id, profile_run_id = "1" * 32, "2" * 32
+        capacity_workload = capacity_diagnostic.HTML_CAPACITY_120S_WORKLOAD
+        profile_workload = capacity_diagnostic.HTML_CPU_PROFILE_20S_WORKLOAD
+        capacity_digest = capacity_diagnostic.profile_digest(32, capacity_workload)
+        profile_digest = capacity_diagnostic.profile_digest(32, profile_workload)
+        phase_common = {
+            "source_sha": source_sha, "app_target_sha": app_sha,
+            "external_run_id": external_run_id, "external_run_attempt": attempt,
+            "fixture_manifest_sha256": manifest_sha,
+            "fixture_manifest_bytes": len(manifest_raw), "concurrency": 32,
+            "namespace_closed": True, "remote_plan_cleanup": "complete",
+            "status": "complete", "passed": True,
+        }
+        capacity_phase = {
+            **phase_common, "workload": capacity_workload,
+            "run_id": capacity_run_id, "profile_digest": capacity_digest,
+            "worker": {
+                "request_window_evidence": {
+                    "schema": 1, "window_start_ms": 10,
+                    "window_end_ms": 120_010,
+                    "request_start_basis": "client_actual_started_at_utc",
+                    "submitted_results": 1, "started_in_window_count": 1,
+                    "started_outside_window_count": 0,
+                    "missing_start_timestamp_count": 0,
+                    "missing_finish_timestamp_count": 0,
+                    "completed_by_window_end_count": 1,
+                    "drain_completed_after_window_count": 0,
+                    "cf_ray_present_count": 1, "cf_ray_missing_count": 0,
+                    "ssr_request_id_singleton_count": 1,
+                    "ssr_request_id_missing_count": 0,
+                    "ssr_request_id_duplicate_count": 0,
+                    "ssr_request_id_malformed_count": 0,
+                    "eligible_response_id_count": 1, "retained_sample_count": 1,
+                    "sample_scheme": capacity_diagnostic.SSR_JOIN_SAMPLE_SCHEME,
+                    "sample_cap_truncated": False, "status": "complete",
+                },
+                "on_window_start_ms": 10, "on_window_end_ms": 120_010,
+            },
+        }
+        profile_phase = {
+            **phase_common, "workload": profile_workload,
+            "run_id": profile_run_id, "profile_digest": profile_digest,
+            "server_telemetry": {"profile_status": "complete"},
+        }
+        composite = {
+            "schema": capacity_diagnostic.SCHEMA, "report_complete": True,
+            "workload": capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+            "fixture_kind": capacity_diagnostic.HTML_COMPOSITE_FIXTURE_KIND,
+            "status": "complete", "passed": True,
+            "matrix_credit": False, "slo_credit": False, "diagnostic_credit": False,
+            "source_sha": source_sha, "app_target_sha": app_sha,
+            "external_run_id": external_run_id, "external_run_attempt": attempt,
+            "run_id": "3" * 32,
+            "profile_digest": capacity_diagnostic.profile_digest(
+                32, capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+            ),
+            "fixture_manifest_sha256": manifest_sha,
+            "fixture_manifest_bytes": len(manifest_raw),
+            "fixture_tournaments": capacity_diagnostic.FIXTURE_TOURNAMENTS,
+            "fixture_users": capacity_diagnostic.FIXTURE_USERS,
+            "actors": capacity_diagnostic.FIXTURE_USERS,
+            "concurrency": 32, "max_inflight": 32,
+            "load_model": "closed_loop_best_effort",
+            "phase_windows_ms": [120_000, 20_000],
+            "phase_workloads": [capacity_workload, profile_workload],
+            "phase_gap_ms": 5_000,
+            "phase_run_ids": [capacity_run_id, profile_run_id],
+            "phase_profile_digests": [capacity_digest, profile_digest],
+            "same_fixture_manifest": True,
+            # The nested inputs are placeholders because this test isolates the
+            # parent projection/join; the phase projector below supplies its
+            # independently bound, already-projected phase values.
+            "capacity_phase": {"test_input": "capacity"},
+            "cpu_profile_phase": {"test_input": "profile"},
+            "capacity_quantiles_scope": "capacity_phase_on_window_only",
+            "profile_latency_scope": "excluded",
+            "remote_plan_cleanup": "complete", "namespace_closed": True,
+            "maximum_wall_seconds": 600, "wall_elapsed_seconds": 150.0,
+        }
+
+        def project_phase(_value: Any, *, expected_workload: str) -> dict[str, Any] | None:
+            if expected_workload == capacity_workload:
+                return dict(capacity_phase)
+            if expected_workload == profile_workload:
+                return dict(profile_phase)
+            return None
+
+        with patch.object(capacity_diagnostic, "_project_composite_phase", side_effect=project_phase):
+            projected = capacity_diagnostic._project_capacity_report(composite)
+            self.assertIsNotNone(projected)
+            self.assertEqual(projected["status"], "complete")
+            self.assertTrue(projected["namespace_closed"])
+            self.assertTrue(projected["capacity_phase"]["passed"])
+            self.assertFalse(projected["cpu_profile_phase"]["performance_credit"])
+            self.assertFalse(projected["cpu_profile_phase"]["capacity_quantile_member"])
+            complete_fingerprint = capacity_diagnostic._parent_failure_fingerprint(
+                composite,
+                args=Namespace(
+                    concurrency=32, source_sha=source_sha, app_target_sha=app_sha,
+                    external_run_id=external_run_id, external_run_attempt=attempt,
+                    workload=capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+                ),
+                stage_state={},
+            )
+            self.assertTrue(complete_fingerprint["binding_valid"])
+            self.assertEqual(complete_fingerprint["cpu_profile_phase"]["kind"], "phase_report")
+            self.assertEqual(complete_fingerprint["phase_run_ids"], [capacity_run_id, profile_run_id])
+            with tempfile.TemporaryDirectory() as temporary_dir:
+                root = Path(temporary_dir)
+                input_path, output_path = root / "input.json", root / "output.json"
+                capacity_diagnostic._write_report(input_path, composite)
+                with patch.object(
+                    capacity_diagnostic, "_read_manifest",
+                    return_value=(manifest_raw, {"runner_sha": source_sha, "app_target_sha": app_sha}, []),
+                ):
+                    decision = capacity_diagnostic.sanitize_capacity_report(
+                        input_path=input_path, output_path=output_path,
+                        manifest_path=root / "manifest.json", source_sha=source_sha,
+                        app_target_sha=app_sha, run_id=external_run_id, attempt=attempt,
+                        workload=capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+                    )
+                self.assertEqual(decision, "PASS")
+                sanitized = json.loads(output_path.read_text(encoding="ascii"))
+                self.assertEqual(sanitized["phase_run_ids"], [capacity_run_id, profile_run_id])
+                self.assertFalse(sanitized["matrix_credit"])
+                self.assertFalse(sanitized["slo_credit"])
+                self.assertFalse(sanitized["diagnostic_credit"])
+
+        profile_failure = capacity_diagnostic._parent_failure_receipt(
+            error_class="ValueError", stage="remote_plan_prepare",
+            source_sha=source_sha, app_target_sha=app_sha,
+            external_run_id=external_run_id, external_run_attempt=attempt,
+            run_id=profile_run_id, profile_digest_value=profile_digest,
+            manifest_sha256=manifest_sha, manifest_bytes=len(manifest_raw),
+            concurrency=32, prepare_lifecycle={}, cleanup_lifecycle={},
+            cleanup_ok=False, workload=profile_workload,
+        )
+        profile_failed_composite = {
+            **composite, "status": "incomplete", "passed": False,
+            "remote_plan_cleanup": "incomplete", "namespace_closed": False,
+            "capacity_phase": {"test_input": "capacity"},
+            "cpu_profile_phase": profile_failure,
+        }
+        project_phase = capacity_diagnostic._project_composite_phase
+        with patch.object(capacity_diagnostic, "_project_composite_phase", side_effect=(
+            lambda _value, *, expected_workload: dict(capacity_phase)
+            if expected_workload == capacity_workload
+            else project_phase(
+                profile_failure, expected_workload=expected_workload,
+            )
+        )):
+            projected_failure = capacity_diagnostic._project_capacity_report(profile_failed_composite)
+            self.assertIsNotNone(projected_failure)
+            self.assertEqual(projected_failure["cpu_profile_phase"]["workload"], profile_workload)
+            self.assertEqual(projected_failure["cpu_profile_phase"]["stage"], "remote_plan_prepare")
+            self.assertTrue(projected_failure["capacity_phase"]["namespace_closed"])
+            self.assertFalse(projected_failure["namespace_closed"])
+            self.assertEqual(capacity_diagnostic.evaluate_capacity_report(
+                profile_failed_composite, source_sha=source_sha, app_target_sha=app_sha,
+                run_id=external_run_id, attempt=attempt, manifest_sha256=manifest_sha,
+                workload=capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+            ), "FAIL")

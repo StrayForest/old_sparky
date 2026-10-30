@@ -214,9 +214,8 @@ GitHub-hosted runner outside Cloudflare's origin network. It supports the
 current `ready-vote`, `read-mix` and authenticated `page-load` profiles and collects a
 parallel origin observer report. Temporary session/CSRF credentials are never
 published as an artifact.
-The external-load workflow's complete fail-closed barrier and privacy-bounded
-evidence contract are maintained in the [retained-load and web verification
-reference](retained-load-and-web-verification.md).
+The [retained-load and web verification reference](retained-load-and-web-verification.md) documents the fail-closed barrier. `TARGET_SHA` is hosted-runner source; `APP_TARGET_SHA` is active app source.
+Differing SHAs require a verified no-op receipt; app/runtime changes cannot use it.
 
 ```bash
 gh workflow run platform-production-external-load.yml \
