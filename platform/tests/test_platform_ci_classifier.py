@@ -432,6 +432,25 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertEqual(recovery_only["reason"], RECOVERY_BOOTSTRAP_REASON)
         validate_manifest(recovery_only, expected_target_sha=self.TARGET_SHA)
 
+        retained_abort_paths = [
+            ".github/workflows/platform-production-retained-load-abort.yml",
+            "platform/tools/platform_abort_retained_load.py",
+            "platform/tools/platform_ci_classifier.py",
+            "platform/tests/test_platform_secret_artifact_boundary.py",
+            "platform/tests/test_platform_workflow_provenance.py",
+        ]
+        self.assertTrue(set(retained_abort_paths) <= RECOVERY_BOOTSTRAP_FILES)
+        retained_abort_route = classify(
+            retained_abort_paths,
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(retained_abort_route["class"], "full")
+        self.assertEqual(retained_abort_route["reason"], RECOVERY_BOOTSTRAP_REASON)
+        self.assertFalse(retained_abort_route["deployable"])
+        self.assertFalse(retained_abort_route["fallback"])
+
         mixed = classify(
             [
                 ".github/workflows/platform-host-tools-candidate.yml",
@@ -1790,6 +1809,35 @@ class PlatformCiClassifierTests(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(completed.stdout.strip(), "classifier manifest accepted")
+
+        runtime_manifest = classify(
+            ["platform/apps/platform_api/app/main.py"],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertTrue(runtime_manifest["deployable"])
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime_archive = self._write_production_classifier_archive(
+                Path(temporary), runtime_manifest
+            )
+            runtime_result = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    str(REPO_ROOT / "platform/tools/platform_production_classifier_artifact.py"),
+                    "manifest",
+                    str(runtime_archive),
+                    "--target-sha",
+                    self.TARGET_SHA,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(runtime_result.returncode, 0, runtime_result.stderr)
+        self.assertEqual(runtime_result.stdout.strip(), "classifier manifest accepted")
 
     def test_classifier_artifact_enumeration_covers_large_and_mutating_pages(self) -> None:
         auto = AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8")

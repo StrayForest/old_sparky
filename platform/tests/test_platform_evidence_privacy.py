@@ -38,6 +38,7 @@ from tools.platform_abort_retained_load import (
     export_abort_evidence,
     main as abort_retained_load_main,
 )
+from tools import platform_abort_retained_load as abort_module
 from tools.platform_live_launch_report import sanitize_live_launch_lines
 from tools.platform_production_qa import (
     _safe_qa_scenario_detail,
@@ -155,7 +156,7 @@ class EvidencePrivacyTests(unittest.TestCase):
             mock.patch("tools.platform_abort_retained_load.os.geteuid", return_value=0),
             mock.patch(
                 "tools.platform_abort_retained_load._process_state",
-                return_value=(set(), set(), 0),
+                return_value=(set(), set(), 0, {}),
             ) as process_state,
             mock.patch("sys.argv", ["abort", "--verify-no-active-run", "123456"]),
             mock.patch("sys.stdout", output),
@@ -168,8 +169,8 @@ class EvidencePrivacyTests(unittest.TestCase):
         )
 
         for process_state in (
-            ({123}, {123}, 0),
-            (set(), set(), 1),
+            ({123}, {123}, 0, {123: 1}),
+            (set(), set(), 1, {}),
         ):
             with self.subTest(process_state=process_state):
                 with (
@@ -192,6 +193,212 @@ class EvidencePrivacyTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(SystemExit, "exact retained-load activity check input"):
                 abort_retained_load_main()
+
+    def test_abort_reconciliation_accepts_only_exact_already_absent_state(self) -> None:
+        run_id = "41018394289"
+        attempt = "1"
+        target_sha = "a" * 40
+        binding = {
+            "schema": 1,
+            "fixture_kind": "ssr_html_capacity_composite_diagnostic_v1",
+            "external_run_id": run_id,
+            "external_run_attempt": attempt,
+            "source_sha": target_sha,
+            "app_target_sha": target_sha,
+            "input_handoff_sha256": "b" * 64,
+            "fixture_manifest_sha256": "c" * 64,
+        }
+        release = json.dumps({"source_git_commit": target_sha})
+        original_read_text = Path.read_text
+
+        def read_release(path: Path, *args, **kwargs):
+            if path == Path(abort_module.RELEASE_PATH):
+                return release
+            return original_read_text(path, *args, **kwargs)
+
+        def invoke(
+            *,
+            bound: dict[str, object] | None = binding,
+            states: list[tuple[set[int], set[int], int, dict[int, int]]] | None = None,
+            lock_clear: bool = True,
+        ):
+            state_rows = states or [(set(), set(), 0, {}), (set(), set(), 0, {})]
+            output = StringIO()
+            with (
+                mock.patch("tools.platform_abort_retained_load.os.geteuid", return_value=0),
+                mock.patch("tools.platform_abort_retained_load.Path.read_text", autospec=True, side_effect=read_release),
+                mock.patch("tools.platform_abort_retained_load._process_state", side_effect=state_rows) as scans,
+                mock.patch("tools.platform_abort_retained_load._diagnostic_abort_binding", return_value=bound),
+                mock.patch("tools.platform_abort_retained_load._supervisor_exit_code", return_value=0),
+                mock.patch("tools.platform_abort_retained_load._retained_lock_is_clear", return_value=lock_clear),
+                mock.patch("sys.argv", [
+                    "abort", "ABORT-PRODUCTION-RETAINED-LOAD", target_sha, run_id, attempt,
+                    "--recovery-workflow-sha", "d" * 40,
+                    "--recovery-helper-sha256", "e" * 64,
+                ]),
+                mock.patch("sys.stdout", output),
+            ):
+                result = abort_retained_load_main()
+            return result, output.getvalue(), scans.call_count
+
+        result, output, scan_count = invoke()
+        self.assertEqual(result, 0)
+        self.assertEqual(scan_count, 2)
+        proof_line = next(line for line in output.splitlines() if line.startswith("ABORT_ONLY_JSON="))
+        receipt = json.loads(proof_line.partition("=")[2])
+        self.assertEqual(receipt["fixture_kind"], "ssr_html_capacity_composite_diagnostic_v1")
+        self.assertEqual(receipt["remote_stage"], "supervisor_already_absent")
+        self.assertEqual(receipt["supervisor_roots_before"], 0)
+        self.assertEqual(receipt["supervisor_tree_before"], 0)
+        self.assertFalse(receipt["namespace_closed"])
+        self.assertEqual(receipt["recovery_workflow_sha"], "d" * 40)
+        self.assertEqual(receipt["recovery_helper_sha256"], "e" * 64)
+        self.assertIn("no matching run-owned process remains", output)
+
+        bad_cases = (
+            {"bound": None},
+            {"bound": {**binding, "external_run_attempt": "2"}},
+            {"bound": {**binding, "app_target_sha": "f" * 40}},
+            {"states": [(set(), set(), 1, {}), (set(), set(), 0, {})]},
+            {"states": [(set(), set(), 0, {}), ({123}, {123}, 0, {123: 1})]},
+            {"lock_clear": False},
+        )
+        for options in bad_cases:
+            with self.subTest(options=options):
+                output = StringIO()
+                state_rows = options.get("states") or [(set(), set(), 0, {}), (set(), set(), 0, {})]
+                with (
+                    mock.patch("tools.platform_abort_retained_load.os.geteuid", return_value=0),
+                    mock.patch("tools.platform_abort_retained_load.Path.read_text", autospec=True, side_effect=read_release),
+                    mock.patch("tools.platform_abort_retained_load._process_state", side_effect=state_rows),
+                    mock.patch("tools.platform_abort_retained_load._diagnostic_abort_binding", return_value=options.get("bound", binding)),
+                    mock.patch("tools.platform_abort_retained_load._supervisor_exit_code", return_value=0),
+                    mock.patch("tools.platform_abort_retained_load._retained_lock_is_clear", return_value=options.get("lock_clear", True)),
+                    mock.patch("sys.argv", [
+                        "abort", "ABORT-PRODUCTION-RETAINED-LOAD", target_sha, run_id, attempt,
+                        "--recovery-workflow-sha", "d" * 40,
+                        "--recovery-helper-sha256", "e" * 64,
+                    ]),
+                    mock.patch("sys.stdout", output),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "reconciliation failed closed"):
+                        abort_retained_load_main()
+
+    def test_abort_reconciliation_active_root_keeps_termination_evidence(self) -> None:
+        run_id = "41018394289"
+        attempt = "1"
+        target_sha = "a" * 40
+        binding = {
+            "fixture_kind": "ssr_html_capacity_composite_diagnostic_v1",
+            "external_run_attempt": attempt,
+            "source_sha": target_sha,
+            "app_target_sha": target_sha,
+            "input_handoff_sha256": "b" * 64,
+            "fixture_manifest_sha256": "c" * 64,
+        }
+        release = json.dumps({"source_git_commit": target_sha})
+        original_read_text = Path.read_text
+
+        def read_release(path: Path, *args, **kwargs):
+            if path == Path(abort_module.RELEASE_PATH):
+                return release
+            return original_read_text(path, *args, **kwargs)
+
+        with (
+            mock.patch("tools.platform_abort_retained_load.os.geteuid", return_value=0),
+            mock.patch("tools.platform_abort_retained_load.Path.read_text", autospec=True, side_effect=read_release),
+            mock.patch(
+                "tools.platform_abort_retained_load._process_state",
+                side_effect=[({123}, {123, 124}, 0, {123: 1, 124: 2}), (set(), set(), 0, {})],
+            ),
+            mock.patch("tools.platform_abort_retained_load.process_snapshot", return_value='{"schema":1,"process_count":2,"snapshot_available":true}\n'),
+            mock.patch("tools.platform_abort_retained_load.signal_tree") as signal_tree,
+            mock.patch("tools.platform_abort_retained_load.alive", return_value=set()),
+            mock.patch("tools.platform_abort_retained_load._diagnostic_abort_binding", return_value=binding),
+            mock.patch("tools.platform_abort_retained_load._supervisor_exit_code", return_value=143),
+            mock.patch("tools.platform_abort_retained_load._retained_lock_is_clear", return_value=True),
+            mock.patch("tools.platform_abort_retained_load.export_abort_evidence", return_value=Path("/tmp/abort-export")) as export,
+            mock.patch("sys.argv", [
+                "abort", "ABORT-PRODUCTION-RETAINED-LOAD", target_sha, run_id, attempt,
+                "--recovery-workflow-sha", "d" * 40,
+                "--recovery-helper-sha256", "e" * 64,
+            ]),
+        ):
+            self.assertEqual(abort_retained_load_main(), 0)
+        signal_tree.assert_called_once_with(
+            {123, 124}, {123: 1, 124: 2}, abort_module.signal.SIGTERM
+        )
+        receipt = export.call_args.kwargs["abort_only"]
+        self.assertEqual(receipt["remote_stage"], "supervisor_terminated")
+        self.assertEqual(receipt["supervisor_roots_before"], 1)
+        self.assertEqual(receipt["supervisor_tree_before"], 2)
+        self.assertEqual(receipt["recovery_helper_sha256"], "e" * 64)
+
+    def test_abort_signal_rejects_reused_pid_before_signaling(self) -> None:
+        with (
+            mock.patch(
+                "tools.platform_abort_retained_load._process_start_time",
+                return_value=99,
+            ),
+            mock.patch("tools.platform_abort_retained_load.os.kill") as kill,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "identity changed"):
+                abort_module.signal_tree(
+                    {123}, {123: 98}, abort_module.signal.SIGTERM
+                )
+        kill.assert_not_called()
+
+    def test_abort_process_match_includes_orphan_observer_and_run_root_helpers(self) -> None:
+        run_id = "41018394289"
+        observer = os.fsencode(abort_module.OBSERVER_PATH)
+        run_root = os.fsencode(str(abort_module.RUN_ROOT_BASE / f"gha-{run_id}"))
+        self.assertTrue(
+            abort_module._is_run_owned_process(
+                [observer, b"--external-run-id", run_id.encode()], run_id
+            )
+        )
+        self.assertTrue(
+            abort_module._is_run_owned_process(
+                [b"/usr/bin/python3", run_root + b"/qa-command.log"], run_id
+            )
+        )
+        self.assertFalse(
+            abort_module._is_run_owned_process(
+                [observer, b"--external-run-id", b"41018394290"], run_id
+            )
+        )
+
+    def test_abort_process_state_finds_reparented_run_owned_children(self) -> None:
+        run_id = "41018394289"
+        observer_pid, helper_pid = 81231, 81232
+        observer = os.fsencode(abort_module.OBSERVER_PATH)
+        run_root = os.fsencode(str(abort_module.RUN_ROOT_BASE / f"gha-{run_id}"))
+
+        def proc_stat(pid: int, ppid: int, start_ticks: int) -> bytes:
+            fields = [b"S", str(ppid).encode(), *([b"0"] * 17), str(start_ticks).encode()]
+            return str(pid).encode() + b" (fixture) " + b" ".join(fields) + b"\n"
+
+        arguments = {
+            observer_pid: observer + b"\0--external-run-id\0" + run_id.encode() + b"\0",
+            helper_pid: b"/usr/bin/python3\0" + run_root + b"/qa-command.log\0",
+        }
+
+        def read_proc(path: Path) -> bytes:
+            parts = path.parts
+            pid = int(parts[2])
+            if parts[3] == "cmdline":
+                return arguments[pid]
+            return proc_stat(pid, 1, pid + 100)
+
+        with (
+            mock.patch("tools.platform_abort_retained_load.all_process_ids", return_value=[observer_pid, helper_pid]),
+            mock.patch("tools.platform_abort_retained_load.Path.read_bytes", autospec=True, side_effect=read_proc),
+        ):
+            roots, tree, errors, identities = abort_module._process_state(run_id)
+        self.assertEqual(roots, {observer_pid, helper_pid})
+        self.assertEqual(tree, {observer_pid, helper_pid})
+        self.assertEqual(errors, 0)
+        self.assertEqual(identities, {observer_pid: observer_pid + 100, helper_pid: helper_pid + 100})
 
     def test_capacity_attribution_projection_preserves_closed_claim_and_unknowns(self) -> None:
         eligible = {
@@ -2380,7 +2587,7 @@ class EvidencePrivacyTests(unittest.TestCase):
                     "input_handoff_sha256": "b" * 64,
                     "fixture_manifest_sha256": "c" * 64,
                     "remote_stage": "supervisor_terminated",
-                    "supervisor_selector": "fixed_script_path_and_run_id",
+                    "supervisor_selector": "fixed_script_paths_run_root_and_run_id",
                     "supervisor_roots_before": 1,
                     "supervisor_tree_before": 1,
                     "supervisor_roots_after": 0,
@@ -2512,6 +2719,7 @@ class EvidencePrivacyTests(unittest.TestCase):
                 for fixture_kind in (
                     "ssr_capacity_diagnostic_v1",
                     "ssr_html_capacity_diagnostic_v1",
+                    "ssr_html_capacity_composite_diagnostic_v1",
                 ):
                     typed_binding = {**binding, "fixture_kind": fixture_kind}
                     binding_path.write_bytes(

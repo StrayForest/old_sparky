@@ -2954,6 +2954,26 @@ class WorkflowProvenanceTests(unittest.TestCase):
                     expected_target_sha=self.SHA,
                 )
 
+        for changed_run in (
+            {**run, "run_attempt": attempt + 1},
+            {**run, "head_sha": "b" * 40},
+            {**run, "event": "workflow_dispatch"},
+            {**run, "head_branch": "feature"},
+            {**run, "conclusion": "failure"},
+            {**run, "path": ".github/workflows/other.yml"},
+        ):
+            with self.subTest(run=changed_run), self.assertRaises(ProvenanceError):
+                validate_recovery_source_security_gates(
+                    workflow,
+                    changed_run,
+                    jobs,
+                    statuses,
+                    expected_run_id=run_id,
+                    expected_attempt=attempt,
+                    expected_target_sha=self.SHA,
+                    now=datetime(2026, 10, 5, 12, tzinfo=timezone.utc),
+                )
+
         for changed_jobs, changed_statuses in (
             ([], statuses),
             ([{**jobs[0], "conclusion": "success"}], statuses),

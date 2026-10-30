@@ -530,25 +530,25 @@ preflight/deploy chain; do not edit `.env.platform` by hand or use unlimited
 overflow. The load gate must not start until the active API/worker processes
 report the reviewed pool values.
 
-Canceling GitHub stops the runner-side SSH client, but detached work can run to
-its 180-minute ceiling. The reviewed abort workflow stops only that load's
-supervisor tree and verifies active source and shared lock:
+Canceling GitHub stops the SSH client, but detached work may continue for 180 minutes. The reviewed abort workflow stops only that load's supervisor tree and verifies active source and lock:
 
 ```bash
 gh workflow run platform-production-retained-load-abort.yml \
   --repo StrayForest/old_sparky --ref dev \
   -f confirmation=ABORT-PRODUCTION-RETAINED-LOAD \
-  -f load_run_id=<canceled-load-run-id> -f load_run_attempt=<exact-attempt> -f target_sha=<active-production-source-sha>
+  -f load_run_id=<canceled-load-run-id> -f load_run_attempt=<exact-attempt> \
+  -f target_sha=<active-production-source-sha> \
+  -f security_run_id=<successful-security-run-for-current-dev-sha> -f security_run_attempt=<exact-security-attempt>
 gh run watch <abort-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
-Typed CPU/SSR abort evidence binds run, attempt, source, fixture kind and
-manifest; it proves the exact supervisor stopped and shared lock cleared,
-records `namespace_closed: false`, and grants no performance credit.
+Validation binds the Security run/attempt and exact CI route to current `dev` SHA before helper creation. It accepts only trusted full routes (recovery-bootstrap, storage operations or deployable runtime); `target_sha` separately identifies the active production app source.
+Typed CPU/SSR abort evidence binds run, attempt, source, fixture kind and manifest; it confirms the selected run-owned processes are absent and the shared lock is clear.
+For composite SSR, the reviewed `dev` workflow stages a digest-bound helper in root-owned `/run` while the app stays on target SHA.
+An already-absent receipt requires two clean scans for the exact supervisor, observer and run-root helper processes, exact exit evidence and a clear lock.
+The receipt keeps `namespace_closed: false`, grants no performance credit, and permits cleanup only after the workflow normalizer accepts it.
 
-If no final report exists, cleanup rebuilds from the matching durable
-`PreprodTestRun.report`, validates marker, email, tournament ownership and
-graph boundaries, and never counts recovered work as passed.
+If no final report exists, cleanup rebuilds from the matching durable `PreprodTestRun.report`, validates marker, email, tournament ownership and graph boundaries, and never counts recovered work as passed.
 
 Cleanup recovery rebuilds missing detail from exact `external-vote/external-vote.json` and validates it.
 External-vote is the transport directory; durable rows/manifests use `write-burst`, and rebuilt files keep that path.

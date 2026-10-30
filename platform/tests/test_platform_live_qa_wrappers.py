@@ -4638,7 +4638,15 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("      load_run_attempt:", abort)
         self.assertIn("LOAD_RUN_ATTEMPT: ${{ inputs.load_run_attempt }}", abort)
-        self.assertIn('"$QA_CONFIRMATION" "$TARGET_SHA" "$LOAD_RUN_ID" "$LOAD_RUN_ATTEMPT"', abort)
+        remote_invocation = abort.split("sudo -n -- /usr/bin/bash -s --", 1)[1]
+        remote_invocation = remote_invocation.split("<<'REMOTE'", 1)[0]
+        normalized_invocation = " ".join(remote_invocation.replace("\\\n", " ").split())
+        self.assertIn(
+            '"$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$HELPER_SHA256" '
+            '"$HELPER_SOURCE_SHA" "$TARGET_SHA" "$LOAD_RUN_ID" '
+            '"$LOAD_RUN_ATTEMPT" "$QA_CONFIRMATION"',
+            normalized_invocation,
+        )
         for source, marker, next_step, fields in (
             (
                 external,
@@ -6822,7 +6830,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             "input_handoff_sha256": "b" * 64,
             "fixture_manifest_sha256": "c" * 64,
             "remote_stage": "supervisor_terminated",
-            "supervisor_selector": "fixed_script_path_and_run_id",
+            "supervisor_selector": "fixed_script_paths_run_root_and_run_id",
             "supervisor_roots_before": 1,
             "supervisor_tree_before": 7,
             "supervisor_roots_after": 0,
@@ -6831,6 +6839,8 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             "supervisor_exit_code": 0,
             "shared_lock_clear": True,
             "namespace_closed": False,
+            "recovery_workflow_sha": "d" * 40,
+            "recovery_helper_sha256": "e" * 64,
         }
 
         def execute(
@@ -6841,6 +6851,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             remote_step: str = "success",
             remote_status: str = "0",
             ssh_cleanup: str = "success",
+            stage_cleanup: str = "success",
         ):
             with tempfile.TemporaryDirectory() as directory:
                 canonical_path = Path(directory) / "canonical.log"
@@ -6867,7 +6878,10 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                         **os.environ,
                         "ABORT_REMOTE_STEP": remote_step,
                         "ABORT_REMOTE_STATUS": remote_status,
+                        "ABORT_STAGE_CLEANUP_STEP": stage_cleanup,
                         "ABORT_SSH_CLEANUP_STEP": ssh_cleanup,
+                        "RECOVERY_WORKFLOW_SHA": "d" * 40,
+                        "RECOVERY_HELPER_SHA256": "e" * 64,
                     },
                     check=False,
                     timeout=5,
@@ -6879,6 +6893,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             "cpu_diagnostic_only_v1",
             "ssr_capacity_diagnostic_v1",
             "ssr_html_capacity_diagnostic_v1",
+            "ssr_html_capacity_composite_diagnostic_v1",
         ):
             with self.subTest(fixture_kind=fixture_kind):
                 self.assertEqual(
@@ -6898,6 +6913,26 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertNotEqual(execute(unavailable, proof, selected_attempt="2").returncode, 0)
         self.assertNotEqual(execute(unavailable, proof, remote_status="1").returncode, 0)
         self.assertNotEqual(execute(unavailable, proof, ssh_cleanup="failure").returncode, 0)
+        self.assertNotEqual(execute(unavailable, proof, stage_cleanup="failure").returncode, 0)
+        already_absent = {
+            **proof,
+            "remote_stage": "supervisor_already_absent",
+            "supervisor_roots_before": 0,
+            "supervisor_tree_before": 0,
+        }
+        self.assertEqual(execute(unavailable, already_absent).returncode, 0)
+        self.assertNotEqual(
+            execute(unavailable, {**already_absent, "supervisor_tree_before": 1}).returncode,
+            0,
+        )
+        self.assertNotEqual(
+            execute(unavailable, {**proof, "recovery_workflow_sha": "f" * 40}).returncode,
+            0,
+        )
+        self.assertNotEqual(
+            execute(unavailable, {**proof, "recovery_helper_sha256": "f" * 64}).returncode,
+            0,
+        )
         self.assertNotEqual(
             execute(unavailable, {**proof, "namespace_closed": True}).returncode, 0
         )
