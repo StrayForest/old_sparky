@@ -365,6 +365,9 @@ class SecretArtifactBoundaryTests(unittest.TestCase):
         abort = workflow["jobs"]["abort"]
         prepare_text = json.dumps(prepare, sort_keys=True)
         abort_text = json.dumps(abort, sort_keys=True)
+        self.assertEqual(workflow["permissions"]["actions"], "read")
+        self.assertIn("security_run_id", workflow[True]["workflow_dispatch"]["inputs"])
+        self.assertIn("security_run_attempt", workflow[True]["workflow_dispatch"]["inputs"])
         self.assertNotIn("environment", prepare)
         self.assertIn("actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803", prepare_text)
         self.assertIn("persist-credentials", prepare_text)
@@ -378,6 +381,27 @@ class SecretArtifactBoundaryTests(unittest.TestCase):
         self.assertIn("/usr/bin/python3.12 -I -B", abort_text)
         self.assertIn("cleanup_recovery_helper", abort_text)
         self.assertIn("supervisor_already_absent", abort_text)
+        step_names = [step.get("name") for step in prepare["steps"]]
+        self.assertLess(
+            step_names.index("Validate exact successful Security gates and trusted route"),
+            step_names.index("Pin the exact helper bytes"),
+        )
+        source_gate = next(
+            step for step in prepare["steps"]
+            if step.get("name") == "Validate exact successful Security gates and trusted route"
+        )
+        source_gate_text = json.dumps(source_gate, sort_keys=True)
+        self.assertIn("validate_recovery_source_security_gates", source_gate_text)
+        self.assertIn("latest-run.json", source_gate_text)
+        self.assertIn("platform-ci-route-", source_gate_text)
+        self.assertIn("platform_production_classifier_artifact.py manifest", source_gate_text)
+        self.assertIn('--target-sha "$SOURCE_SHA"', source_gate["run"])
+        self.assertNotIn("--allow-docs-only", source_gate_text)
+        self.assertNotIn("--allow-out-of-scope", source_gate_text)
+        self.assertEqual(source_gate["env"]["SOURCE_SHA"], "${{ github.sha }}")
+        self.assertIn("security_run_id", source_gate_text)
+        self.assertIn("security_run_attempt", source_gate_text)
+        self.assertEqual(abort["env"]["TARGET_SHA"], "${{ inputs.target_sha }}")
 
     def test_draft_release_is_a_digest_bound_data_only_consumer(self) -> None:
         source = (WORKFLOW_ROOT / "platform-draft-cloudflare.yml").read_text(

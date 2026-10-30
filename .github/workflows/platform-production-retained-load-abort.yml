@@ -19,9 +19,18 @@ on:
         description: "Exact source SHA currently deployed on the production VPS"
         required: true
         type: string
+      security_run_id:
+        description: "Exact successful Platform security and build run for this dev source SHA"
+        required: true
+        type: string
+      security_run_attempt:
+        description: "Exact attempt of that successful Security run"
+        required: true
+        type: string
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: platform-production-retained-load-abort
@@ -38,11 +47,16 @@ jobs:
     steps:
       - name: Require the reviewed dev workflow source
         shell: bash
+        env:
+          SECURITY_RUN_ID: ${{ inputs.security_run_id }}
+          SECURITY_RUN_ATTEMPT: ${{ inputs.security_run_attempt }}
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
           test "$GITHUB_REF" = "refs/heads/dev"
           [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SECURITY_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+          [[ "$SECURITY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,5}$ ]]
 
       - name: Checkout the exact workflow source without credentials
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -50,6 +64,133 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
+
+      - name: Validate exact successful Security gates and trusted route
+        id: source-security
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SECURITY_RUN_ID: ${{ inputs.security_run_id }}
+          SECURITY_RUN_ATTEMPT: ${{ inputs.security_run_attempt }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          test "$GITHUB_REF" = "refs/heads/dev"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          [[ "$SECURITY_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+          [[ "$SECURITY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,5}$ ]]
+          metadata="$RUNNER_TEMP/retained-abort-source-security"
+          install -d -m 700 "$metadata"
+          trap 'rm -rf -- "$metadata"' EXIT
+          api="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY"
+          headers=(--header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' --header 'X-GitHub-Api-Version: 2022-11-28')
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+            "${headers[@]}" "$api/actions/workflows/platform-security.yml" --output "$metadata/workflow.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+            "${headers[@]}" "$api/actions/runs/$SECURITY_RUN_ID" --output "$metadata/latest-run.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+            "${headers[@]}" "$api/actions/runs/$SECURITY_RUN_ID/attempts/$SECURITY_RUN_ATTEMPT" --output "$metadata/run.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+            "${headers[@]}" "$api/actions/runs/$SECURITY_RUN_ID/attempts/$SECURITY_RUN_ATTEMPT/jobs?per_page=100&page=1" --output "$metadata/jobs.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+            "${headers[@]}" "$api/commits/$SOURCE_SHA/statuses?per_page=100&page=1" --output "$metadata/statuses.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+            "${headers[@]}" "$api/git/ref/heads/dev" --output "$metadata/dev-ref.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+            "${headers[@]}" "$api/actions/runs/$SECURITY_RUN_ID/artifacts?per_page=100&page=1" --output "$metadata/artifacts.json"
+          env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 -I -B - "$metadata" "$SECURITY_RUN_ID" "$SECURITY_RUN_ATTEMPT" "$SOURCE_SHA" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          root = Path(sys.argv[1])
+          run_id, attempt, source_sha, output_path = sys.argv[2:]
+          if not re.fullmatch(r"[1-9][0-9]{0,19}", run_id) or not re.fullmatch(r"[1-9][0-9]{0,5}", attempt):
+              raise SystemExit("exact Security identity is malformed")
+          workflow = json.loads((root / "workflow.json").read_text(encoding="utf-8"))
+          latest_run = json.loads((root / "latest-run.json").read_text(encoding="utf-8"))
+          run = json.loads((root / "run.json").read_text(encoding="utf-8"))
+          jobs_payload = json.loads((root / "jobs.json").read_text(encoding="utf-8"))
+          statuses_payload = json.loads((root / "statuses.json").read_text(encoding="utf-8"))
+          dev_ref = json.loads((root / "dev-ref.json").read_text(encoding="utf-8"))
+          artifacts_payload = json.loads((root / "artifacts.json").read_text(encoding="utf-8"))
+          jobs = jobs_payload.get("jobs") if isinstance(jobs_payload, dict) else None
+          statuses = statuses_payload.get("statuses") if isinstance(statuses_payload, dict) else statuses_payload
+          artifacts = artifacts_payload.get("artifacts") if isinstance(artifacts_payload, dict) else None
+          if (not isinstance(jobs, list) or type(jobs_payload.get("total_count")) is not int
+              or jobs_payload["total_count"] != len(jobs) or not 0 < len(jobs) <= 100):
+              raise SystemExit("exact Security jobs response is incomplete")
+          if (not isinstance(statuses, list) or len(statuses) >= 100
+              or any(not isinstance(row, dict) for row in statuses)):
+              raise SystemExit("exact Security status response is incomplete")
+          if (not isinstance(artifacts, list) or type(artifacts_payload.get("total_count")) is not int
+              or artifacts_payload["total_count"] != len(artifacts) or len(artifacts) > 100):
+              raise SystemExit("exact Security artifact response is incomplete")
+          if (not isinstance(dev_ref, dict) or dev_ref.get("ref") != "refs/heads/dev"
+              or not isinstance(dev_ref.get("object"), dict)
+              or dev_ref["object"].get("sha") != source_sha):
+              raise SystemExit("dev has moved away from the exact Security source SHA")
+          if (not isinstance(latest_run, dict)
+              or latest_run.get("id") != int(run_id)
+              or latest_run.get("run_attempt") != int(attempt)
+              or latest_run.get("head_sha") != source_sha
+              or latest_run.get("status") != "completed"
+              or latest_run.get("conclusion") != "success"):
+              raise SystemExit("supplied Security attempt is not the current successful attempt")
+          sys.path.insert(0, str(Path.cwd() / "platform"))
+          from tools.platform_workflow_provenance import validate_recovery_source_security_gates
+          validate_recovery_source_security_gates(
+              workflow, run, jobs, statuses,
+              expected_run_id=int(run_id), expected_attempt=int(attempt),
+              expected_target_sha=source_sha,
+          )
+          producer_rows = [row for row in jobs if isinstance(row, dict)
+                           and row.get("name") == "CI route classifier"
+                           and row.get("run_id") == int(run_id)
+                           and row.get("run_attempt") == int(attempt)
+                           and row.get("head_sha") == source_sha
+                           and row.get("status") == "completed"
+                           and row.get("conclusion") == "success"]
+          if len(producer_rows) != 1:
+              raise SystemExit("exact successful CI route job is missing")
+          route_name = f"platform-ci-route-{run_id}-{attempt}"
+          route_rows = [row for row in artifacts if isinstance(row, dict)
+                        and row.get("name") == route_name and row.get("expired") is False]
+          if len(route_rows) != 1:
+              raise SystemExit("exact CI route artifact is missing or ambiguous")
+          route = route_rows[0]
+          workflow_run = route.get("workflow_run")
+          if (type(route.get("id")) is not int or route["id"] <= 0
+              or type(route.get("size_in_bytes")) is not int
+              or not 0 < route["size_in_bytes"] <= 4 * 1024 * 1024
+              or not isinstance(route.get("digest"), str)
+              or re.fullmatch(r"sha256:[0-9a-f]{64}", route["digest"]) is None
+              or not isinstance(workflow_run, dict)
+              or workflow_run.get("id") != int(run_id)
+              or workflow_run.get("head_sha") != source_sha
+              or ("run_attempt" in workflow_run and workflow_run.get("run_attempt") != int(attempt))):
+              raise SystemExit("CI route artifact provenance is not exact")
+          with Path(output_path).open("a", encoding="ascii") as stream:
+              stream.write(f"route_artifact_id={route['id']}\n")
+              stream.write(f"route_artifact_digest={route['digest'][7:]}\n")
+              stream.write(f"route_artifact_size={route['size_in_bytes']}\n")
+          PY
+          route_artifact_id="$(sed -n 's/^route_artifact_id=//p' "$GITHUB_OUTPUT")"
+          route_artifact_digest="$(sed -n 's/^route_artifact_digest=//p' "$GITHUB_OUTPUT")"
+          route_artifact_size="$(sed -n 's/^route_artifact_size=//p' "$GITHUB_OUTPUT")"
+          [[ "$route_artifact_id" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$route_artifact_digest" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$route_artifact_size" =~ ^[1-9][0-9]{0,8}$ ]]
+          route_archive="$metadata/route.zip"
+          curl --fail-with-body --silent --show-error --location --connect-timeout 10 --max-time 30 --max-filesize 4194304 \
+            "${headers[@]}" "$api/actions/artifacts/$route_artifact_id/zip" --output "$route_archive"
+          test "$(sha256sum "$route_archive" | awk '{print $1}')" = "$route_artifact_digest"
+          test "$(stat -c '%s' "$route_archive")" = "$route_artifact_size"
+          env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 -I -B \
+            platform/tools/platform_production_classifier_artifact.py manifest \
+            "$route_archive" --target-sha "$SOURCE_SHA" >/dev/null
 
       - name: Pin the exact helper bytes
         id: helper
@@ -87,6 +228,8 @@ jobs:
       LOAD_RUN_ID: ${{ inputs.load_run_id }}
       LOAD_RUN_ATTEMPT: ${{ inputs.load_run_attempt }}
       TARGET_SHA: ${{ inputs.target_sha }}
+      SECURITY_RUN_ID: ${{ inputs.security_run_id }}
+      SECURITY_RUN_ATTEMPT: ${{ inputs.security_run_attempt }}
 
     steps:
       - name: Validate explicit abort confirmation
@@ -95,6 +238,10 @@ jobs:
           set -euo pipefail
           test "$GITHUB_REF" = "refs/heads/dev" \
             || { echo "Production abort must run from the reviewed dev branch." >&2; exit 1; }
+          [[ "$SECURITY_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]] \
+            || { echo "security_run_id must be a positive decimal identifier." >&2; exit 1; }
+          [[ "$SECURITY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,5}$ ]] \
+            || { echo "security_run_attempt must be a positive decimal attempt." >&2; exit 1; }
           test "$QA_CONFIRMATION" = "ABORT-PRODUCTION-RETAINED-LOAD" \
             || { echo "Refusing abort without exact confirmation." >&2; exit 1; }
           [[ "$LOAD_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]] \
