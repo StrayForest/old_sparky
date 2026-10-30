@@ -648,16 +648,26 @@ def _supervisor_exit_code(run_id: str) -> int | None:
                 or opened.st_nlink != 1
                 or stat.S_IMODE(opened.st_mode) != 0o600
                 or opened.st_size != before.st_size
+                or opened.st_mtime_ns != before.st_mtime_ns
+                or opened.st_ctime_ns != before.st_ctime_ns
             ):
                 return None
             raw = os.read(descriptor, 5)
             after = os.fstat(descriptor)
             named_after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             if (
-                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-                != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
-                or (named_after.st_dev, named_after.st_ino)
-                != (opened.st_dev, opened.st_ino)
+                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+                != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+                or (
+                    named_after.st_dev, named_after.st_ino, named_after.st_size,
+                    named_after.st_mode, named_after.st_uid, named_after.st_gid,
+                    named_after.st_nlink, named_after.st_mtime_ns, named_after.st_ctime_ns,
+                )
+                != (
+                    opened.st_dev, opened.st_ino, opened.st_size, opened.st_mode,
+                    opened.st_uid, opened.st_gid, opened.st_nlink,
+                    opened.st_mtime_ns, opened.st_ctime_ns,
+                )
             ):
                 return None
         finally:
