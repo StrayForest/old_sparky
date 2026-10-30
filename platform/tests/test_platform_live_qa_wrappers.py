@@ -1448,8 +1448,9 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 "end_lag_ms_min": 0, "end_lag_ms_max": 0,
                 "duplicate_count": 0, "timing_complete": True,
             })
-        helper_result = {
+        complete_helper_result = {
             "status": "expired_plans_removed", "service_count": 2,
+            "workload": "authenticated_workspace_read_pair_v1",
             "usage_status": "complete", "usage_reason": "none", "usage_rows": rows,
             "profile_status": "complete", "profile_reason": "none",
             "profile_rows": [
@@ -1478,6 +1479,14 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             "memory_status": "incomplete", "memory_reason": "incomplete",
             "cgroup_memory_status": "unknown",
             "cgroup_memory_reason": "hierarchy_unavailable", "memory_rows": [],
+        }
+        helper_result = {
+            "status": "expired_plans_removed", "service_count": 0, "workload": None,
+            "usage_status": "unavailable", "usage_reason": "missing", "usage_rows": [],
+            "profile_status": "unavailable", "profile_reason": "missing", "profile_rows": [],
+            "memory_status": "unavailable", "memory_reason": "unavailable", "memory_rows": [],
+            "cgroup_memory_status": "unknown",
+            "cgroup_memory_reason": "hierarchy_unavailable",
         }
         real_popen = subprocess.Popen
 
@@ -1513,6 +1522,17 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             return status, stdout.getvalue()
 
         dispatch_status, dispatch_output = invoke_with_helper_result(helper_result)
+        self.assertEqual(dispatch_status, 0)
+        self.assertTrue(dispatch_output.startswith("CPU_DIAGNOSTIC_PLAN "))
+        projected = json.loads(dispatch_output.removeprefix("CPU_DIAGNOSTIC_PLAN "))
+        self.assertEqual(projected["service_count"], 0)
+        self.assertIsNone(projected["workload"])
+        self.assertEqual(projected["usage_status"], "unavailable")
+        self.assertEqual(projected["usage_rows"], [])
+        self.assertEqual(projected["profile_status"], "unavailable")
+        self.assertEqual(projected["profile_rows"], [])
+
+        dispatch_status, dispatch_output = invoke_with_helper_result(complete_helper_result)
         self.assertEqual(dispatch_status, 0)
         self.assertTrue(dispatch_output.startswith("CPU_DIAGNOSTIC_PLAN "))
         projected = json.loads(dispatch_output.removeprefix("CPU_DIAGNOSTIC_PLAN "))
@@ -1592,15 +1612,15 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertEqual(bad_refusal_status, 2)
         self.assertEqual(bad_refusal_output, "")
 
-        duplicate_result = dict(helper_result)
+        duplicate_result = dict(complete_helper_result)
         duplicate_rows = [dict(row) for row in rows]
         duplicate_rows[0]["duplicate_count"] = 1
         duplicate_result["usage_rows"] = duplicate_rows
         bad_status, bad_output = invoke_with_helper_result(duplicate_result)
         self.assertEqual(bad_status, 2)
         assert_cleanup_failure_marker(bad_output, stage="usage_aggregate")
-        private_label = dict(helper_result)
-        private_profiles = [dict(row) for row in helper_result["profile_rows"]]
+        private_label = dict(complete_helper_result)
+        private_profiles = [dict(row) for row in complete_helper_result["profile_rows"]]
         private_profiles[0]["categories"] = [{
             "category": "raw_function_name", "cpu_us": 1, "observations": 1,
         }]
