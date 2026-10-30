@@ -2716,6 +2716,65 @@ class EvidencePrivacyTests(unittest.TestCase):
                 self.assertIsNone(_closed_root_json(marker, maximum=64))
                 self.assertEqual(_diagnostic_abort_binding("456", "2", source_sha), binding)
                 self.assertIsNone(_diagnostic_abort_binding("456", "2", "b" * 40))
+                split_runner_sha = "d" * 40
+                split_app_sha = "e" * 40
+                split_manifest = json.dumps({
+                    "runner_sha": split_runner_sha,
+                    "app_target_sha": split_app_sha,
+                }, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+                manifest_path.write_bytes(split_manifest)
+                split_binding = {
+                    **binding,
+                    "source_sha": split_runner_sha,
+                    "app_target_sha": split_app_sha,
+                    "fixture_manifest_sha256": hashlib.sha256(split_manifest).hexdigest(),
+                }
+                binding_path.write_bytes(
+                    json.dumps(split_binding, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+                )
+                self.assertEqual(
+                    _diagnostic_abort_binding("456", "2", split_app_sha, split_runner_sha),
+                    split_binding,
+                )
+                self.assertIsNone(
+                    _diagnostic_abort_binding("456", "2", split_app_sha, "f" * 40)
+                )
+                self.assertIsNone(
+                    _diagnostic_abort_binding("456", "2", split_app_sha, "")
+                )
+                self.assertIsNone(
+                    _diagnostic_abort_binding("456", "2", "f" * 40, split_runner_sha)
+                )
+                self.assertIsNone(
+                    _diagnostic_abort_binding("456", "1", split_app_sha, split_runner_sha)
+                )
+                self.assertTrue(abort_module._binding_matches_abort(
+                    split_binding,
+                    run_id="456",
+                    run_attempt="2",
+                    target_sha=split_app_sha,
+                    expected_runner_sha=split_runner_sha,
+                ))
+                self.assertFalse(abort_module._binding_matches_abort(
+                    split_binding,
+                    run_id="456",
+                    run_attempt="2",
+                    target_sha=split_app_sha,
+                    expected_runner_sha="f" * 40,
+                ))
+                self.assertFalse(abort_module._binding_matches_abort(
+                    split_binding,
+                    run_id="456",
+                    run_attempt="2",
+                    target_sha=split_app_sha,
+                    expected_runner_sha="",
+                ))
+                # Restore the same-SHA manifest and marker for the existing
+                # fixture-kind and malformed-binding cases below.
+                manifest_path.write_bytes(manifest)
+                binding_path.write_bytes(
+                    json.dumps(binding, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+                )
                 for fixture_kind in (
                     "ssr_capacity_diagnostic_v1",
                     "ssr_html_capacity_diagnostic_v1",

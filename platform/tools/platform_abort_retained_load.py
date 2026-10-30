@@ -73,6 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verify-no-active-run", metavar="LOAD_RUN_ID")
     parser.add_argument("--recovery-workflow-sha")
     parser.add_argument("--recovery-helper-sha256")
+    parser.add_argument("--expected-runner-sha")
     parser.add_argument("confirmation", nargs="?")
     parser.add_argument("target_sha", nargs="?")
     parser.add_argument("load_run_id", nargs="?")
@@ -394,9 +395,14 @@ ABORT_FIXTURE_KINDS = frozenset({
 
 
 def _diagnostic_abort_binding(
-    run_id: str, run_attempt: str, target_sha: str
+    run_id: str,
+    run_attempt: str,
+    target_sha: str,
+    expected_runner_sha: str | None = None,
 ) -> dict[str, object] | None:
-    """Validate a typed diagnostic fixture's private source/run/manifest binding."""
+    """Validate a fixture's run, runner-source and active-app binding."""
+
+    expected_runner_sha = target_sha if expected_runner_sha is None else expected_runner_sha
 
     run_root = RUN_ROOT_BASE / f"gha-{run_id}"
     root_meta = None
@@ -426,7 +432,7 @@ def _diagnostic_abort_binding(
         or marker.get("fixture_kind") not in ABORT_FIXTURE_KINDS
         or marker.get("external_run_id") != run_id
         or marker.get("external_run_attempt") != run_attempt
-        or marker.get("source_sha") != target_sha
+        or marker.get("source_sha") != expected_runner_sha
         or marker.get("app_target_sha") != target_sha
         or not isinstance(marker.get("input_handoff_sha256"), str)
         or re.fullmatch(r"[0-9a-f]{64}", str(marker.get("input_handoff_sha256"))) is None
@@ -473,7 +479,7 @@ def _diagnostic_abort_binding(
     if (
         digest.hexdigest() != marker["fixture_manifest_sha256"]
         or not isinstance(manifest, dict)
-        or manifest.get("runner_sha") != target_sha
+        or manifest.get("runner_sha") != expected_runner_sha
         or manifest.get("app_target_sha") != target_sha
     ):
         return None
@@ -486,12 +492,14 @@ def _binding_matches_abort(
     run_id: str,
     run_attempt: str,
     target_sha: str,
+    expected_runner_sha: str | None = None,
 ) -> bool:
+    expected_runner_sha = target_sha if expected_runner_sha is None else expected_runner_sha
     return bool(
         isinstance(binding, dict)
         and binding.get("external_run_id") == run_id
         and binding.get("external_run_attempt") == run_attempt
-        and binding.get("source_sha") == target_sha
+        and binding.get("source_sha") == expected_runner_sha
         and binding.get("app_target_sha") == target_sha
         and binding.get("fixture_kind") in ABORT_FIXTURE_KINDS
         and isinstance(binding.get("input_handoff_sha256"), str)
@@ -803,6 +811,7 @@ def main() -> int:
             or args.load_run_attempt is not None
             or args.recovery_workflow_sha is not None
             or args.recovery_helper_sha256 is not None
+            or args.expected_runner_sha is not None
             or RUN_ID_RE.fullmatch(args.verify_no_active_run) is None
         ):
             raise SystemExit("exact retained-load activity check input is invalid")
@@ -825,6 +834,13 @@ def main() -> int:
         raise SystemExit("refusing abort without exact confirmation")
     if not re.fullmatch(r"[0-9a-f]{40}", args.target_sha):
         raise SystemExit("target_sha must be a lowercase 40-character commit SHA")
+    expected_runner_sha = (
+        args.target_sha
+        if args.expected_runner_sha is None
+        else args.expected_runner_sha
+    )
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_runner_sha):
+        raise SystemExit("expected runner SHA must be a lowercase 40-character commit SHA")
     if RUN_ID_RE.fullmatch(args.load_run_id) is None:
         raise SystemExit("load_run_id must be numeric")
     if re.fullmatch(r"[1-9][0-9]{0,8}", args.load_run_attempt) is None:
@@ -845,6 +861,8 @@ def main() -> int:
                 raise SystemExit("staged recovery helper digest mismatch")
     elif IS_ROOT_STAGED_HELPER:
         raise SystemExit("staged recovery helper identity is required")
+    if IS_ROOT_STAGED_HELPER and args.expected_runner_sha is None:
+        raise SystemExit("staged recovery helper requires the selected run's runner SHA")
 
     try:
         release_payload = Path(RELEASE_PATH).read_text(encoding="utf-8")
@@ -864,7 +882,7 @@ def main() -> int:
         time.sleep(0.1)
         roots_after, tree_after, scan_errors_after, _identities_after = _process_state(args.load_run_id)
         binding = _diagnostic_abort_binding(
-            args.load_run_id, args.load_run_attempt, args.target_sha
+            args.load_run_id, args.load_run_attempt, args.target_sha, expected_runner_sha
         )
         exit_code = _supervisor_exit_code(args.load_run_id)
         lock_clear = _retained_lock_is_clear()
@@ -874,6 +892,7 @@ def main() -> int:
                 run_id=args.load_run_id,
                 run_attempt=args.load_run_attempt,
                 target_sha=args.target_sha,
+                expected_runner_sha=expected_runner_sha,
             )
             or scan_errors_before != 0
             or scan_errors_after != 0
@@ -941,7 +960,9 @@ def main() -> int:
     roots_after, tree_after, scan_errors_after, _identities_after = _process_state(args.load_run_id)
     if roots_after:
         raise RuntimeError("an exact retained-load supervisor still exists after abort")
-    binding = _diagnostic_abort_binding(args.load_run_id, args.load_run_attempt, args.target_sha)
+    binding = _diagnostic_abort_binding(
+        args.load_run_id, args.load_run_attempt, args.target_sha, expected_runner_sha
+    )
     exit_code = _supervisor_exit_code(args.load_run_id)
     lock_clear = _retained_lock_is_clear()
     abort_only = None

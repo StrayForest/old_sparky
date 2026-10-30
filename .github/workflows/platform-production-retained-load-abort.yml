@@ -44,6 +44,7 @@ jobs:
     outputs:
       helper_sha256: ${{ steps.helper.outputs.sha256 }}
       source_sha: ${{ steps.helper.outputs.source_sha }}
+      load_runner_sha: ${{ steps.selected-load.outputs.runner_sha }}
     steps:
       - name: Require the reviewed dev workflow source
         shell: bash
@@ -192,6 +193,70 @@ jobs:
             platform/tools/platform_production_classifier_artifact.py manifest \
             "$route_archive" --target-sha "$SOURCE_SHA" >/dev/null
 
+      - name: Resolve the selected external-load runner SHA from its exact attempt
+        id: selected-load
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LOAD_RUN_ID: ${{ inputs.load_run_id }}
+          LOAD_RUN_ATTEMPT: ${{ inputs.load_run_attempt }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          [[ "$LOAD_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$LOAD_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,8}$ ]]
+          metadata="$RUNNER_TEMP/retained-abort-selected-load"
+          install -d -m 700 "$metadata"
+          trap 'rm -rf -- "$metadata"' EXIT
+          api="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY"
+          headers=(--header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' --header 'X-GitHub-Api-Version: 2022-11-28')
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+            "${headers[@]}" "$api/actions/workflows/platform-production-external-load.yml" --output "$metadata/workflow.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+            "${headers[@]}" "$api/actions/runs/$LOAD_RUN_ID/attempts/$LOAD_RUN_ATTEMPT" --output "$metadata/attempt.json"
+          env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 -I -B - \
+            "$metadata/workflow.json" "$metadata/attempt.json" \
+            "$LOAD_RUN_ID" "$LOAD_RUN_ATTEMPT" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          workflow_path, attempt_path, run_id, attempt, output_path = sys.argv[1:]
+          expected_path = ".github/workflows/platform-production-external-load.yml"
+          if (re.fullmatch(r"[1-9][0-9]{0,31}", run_id) is None
+              or re.fullmatch(r"[1-9][0-9]{0,8}", attempt) is None):
+              raise SystemExit("selected external-load identity is malformed")
+          workflow = json.loads(Path(workflow_path).read_text(encoding="utf-8"))
+          selected = json.loads(Path(attempt_path).read_text(encoding="utf-8"))
+          repository = selected.get("repository") if isinstance(selected, dict) else None
+          runner_sha = selected.get("head_sha") if isinstance(selected, dict) else None
+          if (
+              not isinstance(workflow, dict)
+              or type(workflow.get("id")) is not int
+              or workflow["id"] <= 0
+              or workflow.get("path") != expected_path
+              or not isinstance(selected, dict)
+              or type(selected.get("id")) is not int
+              or selected["id"] != int(run_id)
+              or type(selected.get("run_attempt")) is not int
+              or selected["run_attempt"] != int(attempt)
+              or selected.get("workflow_id") != workflow["id"]
+              or selected.get("path") != expected_path
+              or selected.get("head_branch") != "dev"
+              or selected.get("event") != "workflow_dispatch"
+              or not isinstance(repository, dict)
+              or repository.get("full_name") != "StrayForest/old_sparky"
+              or not isinstance(runner_sha, str)
+              or re.fullmatch(r"[0-9a-f]{40}", runner_sha) is None
+          ):
+              raise SystemExit("selected external-load attempt is not exact")
+          with Path(output_path).open("a", encoding="ascii") as stream:
+              stream.write(f"runner_sha={runner_sha}\n")
+          PY
+          runner_sha="$(sed -n 's/^runner_sha=//p' "$GITHUB_OUTPUT")"
+          [[ "$runner_sha" =~ ^[0-9a-f]{40}$ ]]
+
       - name: Pin the exact helper bytes
         id: helper
         shell: bash
@@ -228,6 +293,7 @@ jobs:
       LOAD_RUN_ID: ${{ inputs.load_run_id }}
       LOAD_RUN_ATTEMPT: ${{ inputs.load_run_attempt }}
       TARGET_SHA: ${{ inputs.target_sha }}
+      LOAD_RUNNER_SHA: ${{ needs.prepare-abort-helper.outputs.load_runner_sha }}
       SECURITY_RUN_ID: ${{ inputs.security_run_id }}
       SECURITY_RUN_ATTEMPT: ${{ inputs.security_run_attempt }}
 
@@ -250,6 +316,8 @@ jobs:
             || { echo "load_run_attempt must be a positive decimal attempt." >&2; exit 1; }
           [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] \
             || { echo "target_sha must be a lowercase 40-character commit SHA." >&2; exit 1; }
+          [[ "$LOAD_RUNNER_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "selected load runner SHA is unavailable." >&2; exit 1; }
 
       - name: Download and verify the source-bound recovery helper
         id: helper
@@ -430,7 +498,7 @@ jobs:
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
             sudo -n -- /usr/bin/bash -s -- \
               "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$HELPER_SHA256" \
-              "$HELPER_SOURCE_SHA" "$TARGET_SHA" "$LOAD_RUN_ID" \
+              "$HELPER_SOURCE_SHA" "$TARGET_SHA" "$LOAD_RUNNER_SHA" "$LOAD_RUN_ID" \
               "$LOAD_RUN_ATTEMPT" "$QA_CONFIRMATION" > "$ssh_output_file" 2>&1 <<'REMOTE'
           set -Eeuo pipefail
           workflow_run_id="${1:-}"
@@ -438,14 +506,16 @@ jobs:
           helper_sha="${3:-}"
           workflow_sha="${4:-}"
           target_sha="${5:-}"
-          load_run_id="${6:-}"
-          load_run_attempt="${7:-}"
-          confirmation="${8:-}"
+          load_runner_sha="${6:-}"
+          load_run_id="${7:-}"
+          load_run_attempt="${8:-}"
+          confirmation="${9:-}"
           [[ "$workflow_run_id" =~ ^[1-9][0-9]{0,19}$ ]]
           [[ "$workflow_attempt" =~ ^[1-9][0-9]{0,5}$ ]]
           [[ "$helper_sha" =~ ^[0-9a-f]{64}$ ]]
           [[ "$workflow_sha" =~ ^[0-9a-f]{40}$ ]]
           [[ "$target_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$load_runner_sha" =~ ^[0-9a-f]{40}$ ]]
           [[ "$load_run_id" =~ ^[1-9][0-9]{0,31}$ ]]
           [[ "$load_run_attempt" =~ ^[1-9][0-9]{0,8}$ ]]
           test "$confirmation" = ABORT-PRODUCTION-RETAINED-LOAD
@@ -468,6 +538,7 @@ jobs:
           test "$(sha256sum "$helper" | awk '{print $1}')" = "$helper_sha"
           /usr/bin/python3.12 -I -B "$helper" \
             "$confirmation" "$target_sha" "$load_run_id" "$load_run_attempt" \
+            --expected-runner-sha "$load_runner_sha" \
             --recovery-workflow-sha "$workflow_sha" \
             --recovery-helper-sha256 "$helper_sha"
           REMOTE
@@ -805,7 +876,7 @@ jobs:
           test ! -e "$artifact_dir/abort.log"
 
           /usr/bin/python3 - "$artifact_dir/canonical.log" "$artifact_dir/abort-only.json" \
-            "$LOAD_RUN_ID" "$LOAD_RUN_ATTEMPT" "$TARGET_SHA" <<'PY'
+            "$LOAD_RUN_ID" "$LOAD_RUN_ATTEMPT" "$TARGET_SHA" "$LOAD_RUNNER_SHA" <<'PY'
           import json
           import os
           import re
@@ -814,7 +885,7 @@ jobs:
           import sys
 
           canonical_path, abort_path = Path(sys.argv[1]), Path(sys.argv[2])
-          run_id, attempt, target_sha = sys.argv[3:]
+          run_id, attempt, target_sha, runner_sha = sys.argv[3:]
           try:
               payload = json.loads(canonical_path.read_text(encoding="utf-8"))
           except (OSError, UnicodeError, json.JSONDecodeError):
@@ -908,7 +979,7 @@ jobs:
                   }
                   or proof.get("external_run_id") != run_id
                   or proof.get("external_run_attempt") != attempt
-                  or proof.get("source_sha") != target_sha
+                  or proof.get("source_sha") != runner_sha
                   or proof.get("app_target_sha") != target_sha
                   or not isinstance(proof.get("input_handoff_sha256"), str)
                   or re.fullmatch(r"[0-9a-f]{64}", proof["input_handoff_sha256"]) is None

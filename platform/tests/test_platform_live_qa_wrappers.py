@@ -4643,10 +4643,15 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         normalized_invocation = " ".join(remote_invocation.replace("\\\n", " ").split())
         self.assertIn(
             '"$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$HELPER_SHA256" '
-            '"$HELPER_SOURCE_SHA" "$TARGET_SHA" "$LOAD_RUN_ID" '
+            '"$HELPER_SOURCE_SHA" "$TARGET_SHA" "$LOAD_RUNNER_SHA" "$LOAD_RUN_ID" '
             '"$LOAD_RUN_ATTEMPT" "$QA_CONFIRMATION"',
             normalized_invocation,
         )
+        self.assertIn("id: selected-load", abort)
+        self.assertIn('expected_path = ".github/workflows/platform-production-external-load.yml"', abort)
+        self.assertIn('selected.get("event") != "workflow_dispatch"', abort)
+        self.assertIn('selected.get("head_branch") != "dev"', abort)
+        self.assertIn('repository.get("full_name") != "StrayForest/old_sparky"', abort)
         for source, marker, next_step, fields in (
             (
                 external,
@@ -6809,6 +6814,73 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     self.assertIn(b"root", result.stderr.lower())
 
 
+    def test_retained_abort_resolves_runner_sha_from_exact_external_attempt(self) -> None:
+        workflow_text = (
+            REPO_ROOT / ".github/workflows/platform-production-retained-load-abort.yml"
+        ).read_text(encoding="utf-8")
+        step = workflow_text.split(
+            "      - name: Resolve the selected external-load runner SHA from its exact attempt\n",
+            1,
+        )[1].split("      - name: Pin the exact helper bytes\n", 1)[0]
+        run_block = step.split("        run: |\n", 1)[1]
+        script = textwrap.dedent(
+            run_block.split("<<'PY'\n", 1)[1].split("\n          PY\n", 1)[0]
+        )
+        expected_path = ".github/workflows/platform-production-external-load.yml"
+        workflow = {"id": 71, "path": expected_path}
+        selected = {
+            "id": 123456,
+            "run_attempt": 2,
+            "workflow_id": 71,
+            "path": expected_path,
+            "head_branch": "dev",
+            "event": "workflow_dispatch",
+            "head_sha": "a" * 40,
+            "repository": {"full_name": "StrayForest/old_sparky"},
+        }
+
+        def run_case(mutation: dict[str, object] | None = None,
+                     workflow_mutation: dict[str, object] | None = None) -> tuple[subprocess.CompletedProcess[str], str]:
+            with tempfile.TemporaryDirectory(prefix="retained-abort-selected-load-") as temporary:
+                root = Path(temporary)
+                workflow_path = root / "workflow.json"
+                attempt_path = root / "attempt.json"
+                output_path = root / "github-output"
+                workflow_path.write_text(
+                    json.dumps({**workflow, **(workflow_mutation or {})}), encoding="utf-8"
+                )
+                attempt_path.write_text(
+                    json.dumps({**selected, **(mutation or {})}), encoding="utf-8"
+                )
+                output_path.write_text("", encoding="ascii")
+                completed = subprocess.run(
+                    [sys.executable, "-", str(workflow_path), str(attempt_path),
+                     "123456", "2", str(output_path)],
+                    input=script,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=5,
+                )
+                return completed, output_path.read_text(encoding="ascii")
+
+        accepted, output = run_case()
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertEqual(output, f"runner_sha={'a' * 40}\n")
+        for mutation, workflow_mutation in (
+            ({"id": 123457}, None),
+            ({"run_attempt": 1}, None),
+            ({"workflow_id": 72}, None),
+            ({"path": ".github/workflows/other.yml"}, None),
+            ({"head_branch": "main"}, None),
+            ({"event": "push"}, None),
+            ({"repository": {"full_name": "Other/repo"}}, None),
+            ({"head_sha": "A" * 40}, None),
+            (None, {"path": ".github/workflows/other.yml"}),
+        ):
+            with self.subTest(mutation=mutation, workflow_mutation=workflow_mutation):
+                self.assertNotEqual(run_case(mutation, workflow_mutation)[0].returncode, 0)
+
     def test_retained_abort_normalizer_accepts_only_bound_cpu_abort_proof(self) -> None:
         workflow = (
             REPO_ROOT / ".github/workflows/platform-production-retained-load-abort.yml"
@@ -6819,6 +6891,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         end = workflow.index("\n          PY", heredoc)
         script = textwrap.dedent(workflow[heredoc:end])
         run_id, attempt, target_sha = "39178530966", "1", "a" * 40
+        runner_sha = target_sha
         proof = {
             "schema": 1,
             "status": "safe_for_exact_fixture_cleanup",
@@ -6848,6 +6921,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             abort_proof: object | None,
             *,
             selected_attempt: str = attempt,
+            selected_runner_sha: str = runner_sha,
             remote_step: str = "success",
             remote_status: str = "0",
             ssh_cleanup: str = "success",
@@ -6869,7 +6943,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                         )
                 return subprocess.run(
                     [sys.executable, "-", str(canonical_path), str(proof_path), run_id,
-                     selected_attempt, target_sha],
+                     selected_attempt, target_sha, selected_runner_sha],
                     input=script,
                     text=True,
                     stdout=subprocess.PIPE,
@@ -6911,6 +6985,21 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertEqual(execute(passed, {"schema": 1, "status": "not_applicable"}).returncode, 0)
         self.assertNotEqual(execute(unavailable, None).returncode, 0)
         self.assertNotEqual(execute(unavailable, proof, selected_attempt="2").returncode, 0)
+        split_runner_sha = "f" * 40
+        split_proof = {**proof, "source_sha": split_runner_sha}
+        self.assertEqual(
+            execute(unavailable, split_proof, selected_runner_sha=split_runner_sha).returncode,
+            0,
+        )
+        self.assertNotEqual(
+            execute(unavailable, split_proof, selected_runner_sha="e" * 40).returncode,
+            0,
+        )
+        self.assertNotEqual(
+            execute(unavailable, {**split_proof, "app_target_sha": "c" * 40},
+                    selected_runner_sha=split_runner_sha).returncode,
+            0,
+        )
         self.assertNotEqual(execute(unavailable, proof, remote_status="1").returncode, 0)
         self.assertNotEqual(execute(unavailable, proof, ssh_cleanup="failure").returncode, 0)
         self.assertNotEqual(execute(unavailable, proof, stage_cleanup="failure").returncode, 0)
