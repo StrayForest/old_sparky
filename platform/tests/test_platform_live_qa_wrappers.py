@@ -6921,6 +6921,13 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             "supervisor_tree_before": 0,
         }
         self.assertEqual(execute(unavailable, already_absent).returncode, 0)
+        composite_already_absent = {
+            **already_absent,
+            "fixture_kind": "ssr_html_capacity_composite_diagnostic_v1",
+        }
+        self.assertEqual(
+            execute(unavailable, composite_already_absent).returncode, 0
+        )
         self.assertNotEqual(
             execute(unavailable, {**already_absent, "supervisor_tree_before": 1}).returncode,
             0,
