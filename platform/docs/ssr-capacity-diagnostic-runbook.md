@@ -264,6 +264,25 @@ identities, and all of these conditions hold:
   250 ms start and end bounds. The 120-second capacity workload never enables
   API cProfile. Profile data is attribution only; do not merge it into
   capacity-window latency or CPU results.
+- When the API profiler emits more than ten categories, it retains the
+  CPU-ranked top nine non-`other` categories (with a category-name tie-break)
+  and folds omitted CPU and call counts, including any prior `other` entry,
+  into `other`. The server collector sorts the merged category rows by name
+  and preserves exact equality between category CPU totals and
+  `total_self_cpu_us`. Keep the consumer's conservation check strict; do not
+  add a tolerance for category truncation.
+- The profile summary carries a closed `profile_rejections` object with a
+  capture or summary outcome and bounded per-service rejection-occurrence
+  counters.
+  Counters classify rejected records or missing/duplicate expected targets;
+  they are not a raw journal-row total, and separate predicates may count the
+  same failed target. `complete` requires a complete capture and every counter
+  to be zero. For an incomplete profile, preserve `profile_status` and
+  `profile_reason` and inspect only the closed counters to identify the
+  rejecting predicate. The projection contains no journal messages, process
+  identities, or profile category values from rejected records. Keep all
+  capacity, SLO, matrix and profile performance credit false for this
+  diagnostic, including when both phases complete.
 - Both phase records, the top-level completion state and the full source and
   fixture bindings pass their closed validators. The phases fit within the
   600-second outer deadline, and finalization and exact fixture cleanup pass.

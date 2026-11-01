@@ -62,6 +62,16 @@ SUPERVISORS = WRAPPERS[1:]
 BROWSER_WRAPPERS = WRAPPERS[1:3]
 
 
+def _profile_rejections(capture_reason: str = "complete") -> dict[str, object]:
+    return {
+        "capture_reason": capture_reason,
+        "service_counts": {
+            service: {reason: 0 for reason in platform_workflow_remote_dispatch.CPU_PROFILE_REJECTION_CODES}
+            for service in ("api", "web", "unattributed")
+        },
+    }
+
+
 class LiveQaWrapperContractTests(unittest.TestCase):
     def test_public_browser_counts_are_closed_owner_bound_and_partitioned(self) -> None:
         source_sha = "a" * 40
@@ -1453,6 +1463,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             "workload": "authenticated_workspace_read_pair_v1",
             "usage_status": "complete", "usage_reason": "none", "usage_rows": rows,
             "profile_status": "complete", "profile_reason": "none",
+            "profile_rejections": _profile_rejections(),
             "profile_rows": [
                 {
                     "service": "api", "expected_targets": 2, "observed_targets": 2,
@@ -1484,6 +1495,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             "status": "expired_plans_removed", "service_count": 0, "workload": None,
             "usage_status": "unavailable", "usage_reason": "missing", "usage_rows": [],
             "profile_status": "unavailable", "profile_reason": "missing", "profile_rows": [],
+            "profile_rejections": _profile_rejections("not_started"),
             "memory_status": "unavailable", "memory_reason": "unavailable", "memory_rows": [],
             "cgroup_memory_status": "unknown",
             "cgroup_memory_reason": "hierarchy_unavailable",

@@ -4796,6 +4796,13 @@ class ExternalLoadTests(unittest.TestCase):
             "status": "expired_plans_removed", "service_count": 0, "workload": None,
             "usage_status": "unavailable", "usage_reason": "missing", "usage_rows": [],
             "profile_status": "unavailable", "profile_reason": "missing", "profile_rows": [],
+            "profile_rejections": {
+                "capture_reason": "not_started",
+                "service_counts": {
+                    service: {reason: 0 for reason in cpu_plan.PROFILE_REJECTION_CODES}
+                    for service in ("api", "web", "unattributed")
+                },
+            },
             "memory_status": "unavailable", "memory_reason": "unavailable", "memory_rows": [],
             "cgroup_memory_status": "unknown", "cgroup_memory_reason": "hierarchy_unavailable",
         }

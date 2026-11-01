@@ -17,7 +17,7 @@ import stat
 import threading
 import textwrap
 import signal
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from concurrent.futures import Future, ThreadPoolExecutor
 from argparse import Namespace
 from datetime import datetime
@@ -70,6 +70,16 @@ def _diagnostic_payload(*, service: str = "api") -> dict[str, object]:
 
 def _canonical_payload(payload: dict[str, object]) -> bytes:
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+
+
+def _profile_rejections(capture_reason: str = "complete") -> dict[str, object]:
+    return {
+        "capture_reason": capture_reason,
+        "service_counts": {
+            service: {reason: 0 for reason in diagnostic_plan_tool.PROFILE_REJECTION_CODES}
+            for service in ("api", "web", "unattributed")
+        },
+    }
 
 
 class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
@@ -2617,6 +2627,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 "usage_status": "complete", "usage_reason": "none",
                 "usage_rows": raw_usage_rows,
                 "profile_status": "complete", "profile_reason": "none",
+                "profile_rejections": _profile_rejections(),
                 "profile_rows": [
                     {
                         "service": "api", "expected_targets": 2,
@@ -3853,6 +3864,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "usage_rows": rows,
             "profile_status": "complete",
             "profile_reason": "none",
+            "profile_rejections": _profile_rejections(),
             "profile_rows": [
                 {
                     "service": "api", "expected_targets": 2, "observed_targets": 2,
@@ -4535,6 +4547,283 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 _read_request("prepare-stdin", io.BytesIO(malformed))
         with self.assertRaises(PlanError):
             _read_request("cleanup-stdin", io.BytesIO(raw))
+
+    def test_profile_rejection_taxonomy_reports_bounded_predicate_counts(self) -> None:
+        self.assertEqual(
+            set(diagnostic_plan_tool.PROFILE_REJECTION_CODES), cpu_pair.PROFILE_REJECTION_CODES,
+        )
+        self.assertEqual(
+            set(diagnostic_plan_tool.PROFILE_REJECTION_CODES),
+            remote_dispatch.CPU_PROFILE_REJECTION_CODES,
+        )
+        self.assertEqual(
+            set(diagnostic_plan_tool.PROFILE_REJECTION_CODES),
+            capacity_diagnostic.PROFILE_REJECTION_CODES,
+        )
+        self.assertEqual(
+            diagnostic_plan_tool.PROFILE_CAPTURE_REASONS,
+            cpu_pair.PROFILE_CAPTURE_REASONS,
+        )
+        self.assertEqual(
+            diagnostic_plan_tool.PROFILE_CAPTURE_REASONS,
+            remote_dispatch.CPU_PROFILE_CAPTURE_REASONS,
+        )
+        targets = {
+            "api": [
+                {"service": "api", "pid": 101, "start_ticks": 11, "invocation_id": "c" * 32},
+                {"service": "api", "pid": 102, "start_ticks": 12, "invocation_id": "c" * 32},
+            ],
+            "web": [
+                {"service": "web", "pid": 201, "start_ticks": 21, "invocation_id": "d" * 32},
+            ],
+        }
+        plans = {
+            service: {
+                **_diagnostic_payload(service=service),
+                "targets": service_targets,
+            }
+            for service, service_targets in targets.items()
+        }
+        plans["api"].update({"workload": diagnostic_plan_tool.HTML_CPU_PROFILE_20S_WORKLOAD,
+                             "off_start_ms": 1_000, "off_end_ms": 21_000,
+                             "on_start_ms": 26_000, "on_end_ms": 46_000})
+        plans["web"].update({"workload": diagnostic_plan_tool.HTML_CPU_PROFILE_20S_WORKLOAD,
+                             "off_start_ms": 1_000, "off_end_ms": 21_000,
+                             "on_start_ms": 26_000, "on_end_ms": 46_000})
+        base_rows: list[dict[str, str]] = []
+        for service, service_targets in targets.items():
+            for target in service_targets:
+                message = (
+                    "cpu_diagnostic_complete service=api run_id=" + "a" * 32
+                    + " timer=thread_cpu start_lag_ms=0 elapsed_ms=20000 total_self_cpu_us=100 "
+                    + "functions=other:100:1"
+                    if service == "api" else
+                    "cpu_diagnostic_complete service=web run_id=" + "a" * 32
+                    + " timer=v8_cpu start_lag_ms=0 elapsed_ms=20000 sample_interval_us=100000 "
+                    + "sample_count=1 categories=other:100:1"
+                )
+                base_rows.append({
+                    "MESSAGE": message, "_PID": str(target["pid"]),
+                    "_SYSTEMD_UNIT": f"deadlock-{service}.service",
+                    "_SYSTEMD_INVOCATION_ID": str(target["invocation_id"]),
+                    "_SYSTEMD_CGROUP": f"/system.slice/deadlock-{service}.service",
+                    "__REALTIME_TIMESTAMP": "26000000",
+                })
+        service_rows = {service: [dict(item) for item in values]
+                        for service, values in targets.items()}
+        ticks = {101: 11, 102: 12, 201: 21}
+
+        def collect(
+            rows: list[dict[str, str]], *, capture_reason: str = "complete",
+            start_ticks: dict[int, int] | None = None,
+            parser_side_effect: BaseException | None = None,
+            release_side_effect: BaseException | None = None,
+            systemd_side_effect: BaseException | None = None,
+        ) -> dict[str, Any]:
+            def systemd_unit(service: str, *, timeout_seconds: int = 3) -> dict[str, str]:
+                self.assertEqual(timeout_seconds, 3)
+                return {
+                    "ActiveState": "active",
+                    "InvocationID": str(targets[service][0]["invocation_id"]),
+                    "MainPID": "100",
+                    "ControlGroup": f"/system.slice/deadlock-{service}.service",
+                }
+
+            patches = [
+                patch.object(
+                    diagnostic_plan_tool, "_release_identity",
+                    side_effect=release_side_effect,
+                    return_value=("b" * 40, "release-bbbbbbbbbbbb")
+                    if release_side_effect is None else None,
+                ),
+                patch.object(
+                    diagnostic_plan_tool, "_systemd_unit",
+                    side_effect=systemd_side_effect or systemd_unit,
+                ),
+                patch.object(diagnostic_plan_tool, "_service_targets",
+                             side_effect=lambda service, _unit: service_rows[service]),
+                patch.object(diagnostic_plan_tool, "_process_start_ticks",
+                             side_effect=(start_ticks or ticks).get),
+                patch.object(diagnostic_plan_tool, "_journal_rows",
+                             return_value=(capture_reason, rows)),
+            ]
+            if parser_side_effect is not None:
+                patches.append(patch.object(
+                    diagnostic_plan_tool, "_parse_profile_categories_diagnostic",
+                    side_effect=parser_side_effect,
+                ))
+            with ExitStack() as stack:
+                for active_patch in patches:
+                    stack.enter_context(active_patch)
+                return diagnostic_plan_tool._usage_summary(plans)
+
+        def mutate(index: int, old: str, new: str) -> list[dict[str, str]]:
+            rows = json.loads(json.dumps(base_rows))
+            rows[index]["MESSAGE"] = rows[index]["MESSAGE"].replace(old, new)
+            return rows
+
+        cases = (
+            ("malformed", mutate(0, "elapsed_ms=20000", "elapsed_ms=bad"), "api", "malformed_record"),
+            ("pid", [{**row} for row in base_rows], "api", "identity_pid"),
+            ("invocation", [{**row} for row in base_rows], "api", "identity_invocation"),
+            ("unit", [{**row} for row in base_rows], "api", "identity_unit"),
+            ("cgroup", [{**row} for row in base_rows], "api", "identity_cgroup"),
+            ("timestamp", [{**row} for row in base_rows], "api", "journal_timestamp"),
+            ("journal-window", [{**row} for row in base_rows], "api", "journal_window"),
+            ("start", mutate(0, "start_lag_ms=0", "start_lag_ms=251"), "api", "profile_start_lag"),
+            ("elapsed", mutate(0, "elapsed_ms=20000", "elapsed_ms=19000"), "api", "profile_elapsed"),
+            ("end", mutate(0, "start_lag_ms=0 elapsed_ms=20000",
+                           "start_lag_ms=250 elapsed_ms=20500"), "api", "profile_end_lag"),
+            ("numeric", mutate(0, "total_self_cpu_us=100", "total_self_cpu_us=60000001"), "api", "profile_numeric"),
+            ("category", mutate(0, "functions=other:100:1", "functions=raw_name:100:1"), "api", "profile_category"),
+            ("aggregate", mutate(0, "total_self_cpu_us=100", "total_self_cpu_us=101"), "api", "profile_aggregate"),
+        )
+        for label, rows, service, code in cases:
+            if label == "pid":
+                rows[0]["_PID"] = "999"
+            elif label == "invocation":
+                rows[0]["_SYSTEMD_INVOCATION_ID"] = "e" * 32
+            elif label == "unit":
+                rows[0]["_SYSTEMD_UNIT"] = "wrong.service"
+            elif label == "cgroup":
+                rows[0]["_SYSTEMD_CGROUP"] = "/system.slice/wrong.service"
+            elif label == "timestamp":
+                rows[0]["__REALTIME_TIMESTAMP"] = "invalid"
+            elif label == "journal-window":
+                rows[0]["__REALTIME_TIMESTAMP"] = "0"
+            with self.subTest(rejection=label):
+                summary = collect(rows)
+                self.assertEqual(summary["profile_status"], "incomplete")
+                self.assertGreater(
+                    summary["profile_rejections"]["service_counts"][service][code], 0,
+                )
+                self.assertNotIn("MESSAGE", json.dumps(summary))
+                self.assertNotIn("_PID", json.dumps(summary))
+
+        mismatched_ticks = collect(base_rows, start_ticks={101: 999, 102: 12, 201: 21})
+        self.assertEqual(mismatched_ticks["profile_rejections"]["service_counts"]["api"]["identity_start_ticks"], 1)
+        release_failure = collect(base_rows, release_side_effect=PlanError("private release failure"))
+        self.assertEqual(
+            release_failure["profile_rejections"]["service_counts"]["unattributed"]["release_identity"],
+            1,
+        )
+        api_run_id = plans["api"]["run_id"]
+        plans["api"]["run_id"] = "f" * 32
+        try:
+            plan_identity_failure = collect(base_rows)
+        finally:
+            plans["api"]["run_id"] = api_run_id
+        self.assertEqual(
+            plan_identity_failure["profile_rejections"]["service_counts"]["web"]["plan_identity"],
+            1,
+        )
+        api_targets = plans["api"]["targets"]
+        plans["api"]["targets"] = api_targets[:-1]
+        try:
+            plan_targets_failure = collect(base_rows)
+        finally:
+            plans["api"]["targets"] = api_targets
+        self.assertEqual(
+            plan_targets_failure["profile_rejections"]["service_counts"]["api"]["plan_targets"],
+            1,
+        )
+        systemd_failure = collect(base_rows, systemd_side_effect=PlanError("private unit failure"))
+        self.assertEqual(
+            systemd_failure["profile_rejections"]["service_counts"]["api"]["systemd_identity"],
+            1,
+        )
+        parser_failure = collect(base_rows, parser_side_effect=RuntimeError("private parser detail"))
+        self.assertGreater(
+            parser_failure["profile_rejections"]["service_counts"]["api"]["profile_parser"], 0,
+        )
+        self.assertNotIn("private parser detail", json.dumps(parser_failure))
+        missing = collect(base_rows[1:])
+        self.assertEqual(missing["profile_rejections"]["service_counts"]["api"]["missing"], 1)
+        duplicate = collect([*base_rows, base_rows[0]])
+        self.assertEqual(duplicate["profile_rejections"]["service_counts"]["api"]["duplicate"], 1)
+        capture_failed = collect(base_rows, capture_reason="timeout")
+        self.assertEqual(capture_failed["profile_rejections"]["capture_reason"], "timeout")
+        self.assertEqual(
+            capture_failed["profile_rejections"]["service_counts"]["unattributed"]["malformed_record"],
+            0,
+        )
+
+        complete = collect(base_rows)
+        self.assertEqual(complete["profile_status"], "complete")
+        self.assertTrue(all(
+            count == 0
+            for counters in complete["profile_rejections"]["service_counts"].values()
+            for count in counters.values()
+        ))
+        self.assertIsNotNone(cpu_pair._validate_profile_rejections(complete["profile_rejections"]))
+        self.assertTrue(remote_dispatch._valid_cpu_profile_rejections(
+            complete["profile_rejections"], profile_status="complete",
+        ))
+        aggregate_rejection = collect(
+            mutate(0, "total_self_cpu_us=100", "total_self_cpu_us=101"),
+        )
+        aggregate_rejection.update({"status": "expired_plans_removed", "service_count": 2})
+        self.assertEqual(aggregate_rejection["profile_status"], "incomplete")
+        self.assertEqual(aggregate_rejection["profile_reason"], "invalid_profile")
+        validated_summary = cpu_pair._validate_usage_summary(
+            aggregate_rejection,
+            expected_workload=diagnostic_plan_tool.HTML_CPU_PROFILE_20S_WORKLOAD,
+        )
+        self.assertIsNotNone(validated_summary)
+        projected_telemetry = capacity_diagnostic._project_server_telemetry(
+            aggregate_rejection,
+            include_request_correlation=True,
+            include_cpu_profile=True,
+            expected_workload=diagnostic_plan_tool.HTML_CPU_PROFILE_20S_WORKLOAD,
+        )
+        self.assertEqual(
+            projected_telemetry["profile_rejections"]["service_counts"]["api"]["profile_aggregate"],
+            1,
+        )
+        self.assertEqual(projected_telemetry["profile_status"], "incomplete")
+        fallback_telemetry = capacity_diagnostic._project_server_telemetry(
+            {}, include_cpu_profile=True,
+            expected_workload=diagnostic_plan_tool.HTML_CPU_PROFILE_20S_WORKLOAD,
+        )
+        self.assertEqual(
+            fallback_telemetry["profile_rejections"]["capture_reason"], "summary_validation",
+        )
+        self.assertEqual(
+            fallback_telemetry["profile_rejections"]["service_counts"]["unattributed"]
+            ["summary_validation"],
+            1,
+        )
+        rejected_projection = {
+            "profile_status": "incomplete", "profile_reason": "invalid_profile",
+            "profile_rows": complete["profile_rows"],
+            "profile_rejections": json.loads(json.dumps(complete["profile_rejections"])),
+        }
+        rejected_projection["profile_rejections"]["service_counts"]["api"]["profile_aggregate"] = 1
+        self.assertIsNotNone(cpu_pair._validate_profile_projection(
+            rejected_projection, expected_workload=diagnostic_plan_tool.HTML_CPU_PROFILE_20S_WORKLOAD,
+        ))
+        self.assertTrue(remote_dispatch._valid_cpu_profile_rejections(
+            rejected_projection["profile_rejections"], profile_status="incomplete",
+        ))
+        invalid_complete = json.loads(json.dumps(complete["profile_rejections"]))
+        invalid_complete["service_counts"]["api"]["profile_aggregate"] = 1
+        self.assertFalse(remote_dispatch._valid_cpu_profile_rejections(
+            invalid_complete, profile_status="complete",
+        ))
+        self.assertIsNone(cpu_pair._validate_profile_projection({
+            "profile_status": "complete", "profile_reason": "none",
+            "profile_rows": complete["profile_rows"],
+            "profile_rejections": invalid_complete,
+        }, expected_workload=diagnostic_plan_tool.HTML_CPU_PROFILE_20S_WORKLOAD))
+        invalid_bound = json.loads(json.dumps(complete["profile_rejections"]))
+        invalid_bound["service_counts"]["api"]["profile_aggregate"] = 641
+        self.assertIsNone(cpu_pair._validate_profile_rejections(invalid_bound))
+        invalid_type = json.loads(json.dumps(complete["profile_rejections"]))
+        invalid_type["service_counts"]["api"]["profile_aggregate"] = True
+        self.assertIsNone(cpu_pair._validate_profile_rejections(invalid_type))
+        unknown = json.loads(json.dumps(complete["profile_rejections"]))
+        unknown["service_counts"]["api"]["private_reason"] = 1
+        self.assertIsNone(cpu_pair._validate_profile_rejections(unknown))
 
     def test_html_ssr_memory_watch_binding_is_a_separate_closed_workload(self) -> None:
         for workload in (
@@ -7111,6 +7400,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 "usage_status": "complete", "usage_reason": "none",
                 "usage_rows": usage_rows,
                 "profile_status": "complete", "profile_reason": "none",
+                "profile_rejections": _profile_rejections(),
                 "profile_rows": profile_rows,
                 "memory_status": "unavailable", "memory_reason": "unavailable",
                 "cgroup_memory_status": "unknown",
@@ -8280,6 +8570,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             if workload == capacity_diagnostic.HTML_CPU_PROFILE_20S_WORKLOAD:
                 telemetry.update({
                     "profile_status": "complete", "profile_reason": "none",
+                    "profile_rejections": _profile_rejections(),
                     "profile_rows": [
                         {
                             "service": "api", "expected_targets": 2,
@@ -8612,6 +8903,64 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertFalse(sanitized_incomplete["slo_credit"])
             self.assertFalse(sanitized_incomplete["diagnostic_credit"])
 
+            # A bounded rejection counter survives the full composite report,
+            # sanitizer, and failure-fingerprint path without granting credit.
+            rejected_profile = json.loads(json.dumps(profile))
+            rejected_profile["status"] = "incomplete"
+            rejected_profile["passed"] = False
+            telemetry = rejected_profile["server_telemetry"]
+            telemetry["profile_status"] = "incomplete"
+            telemetry["profile_reason"] = "invalid_profile"
+            telemetry["profile_rejections"] = _profile_rejections()
+            telemetry["profile_rejections"]["service_counts"]["api"]["profile_aggregate"] = 1
+            telemetry["profile_rows"][0].update({
+                "observed_targets": 1, "event_count": 1, "total_cpu_us": None,
+                "start_lag_ms_min": None, "start_lag_ms_max": None,
+                "elapsed_ms_min": None, "elapsed_ms_max": None,
+                "end_lag_ms_min": None, "end_lag_ms_max": None,
+                "categories": [],
+            })
+            args.report = str(root / "producer-profile-rejection.json")
+            rejection_state: dict[str, Any] = {}
+            with (
+                patch.object(capacity_diagnostic, "_read_manifest", return_value=(manifest_raw, manifest, actors)),
+                patch.object(capacity_diagnostic, "_parent_run_once", side_effect=[capacity, rejected_profile]),
+                patch.object(capacity_diagnostic, "_composite_wait_for_profile_gap", return_value=True),
+            ):
+                rejection_report = capacity_diagnostic._parent_composite_run(args, rejection_state)
+            self.assertEqual(rejection_report["status"], "incomplete")
+            projected_rejection = capacity_diagnostic._project_composite_capacity_report(rejection_report)
+            self.assertIsNotNone(projected_rejection)
+            capacity_diagnostic._write_report(Path(args.report), rejection_report)
+            rejection_output = root / "sanitized-profile-rejection.json"
+            with patch.object(
+                capacity_diagnostic, "_read_manifest",
+                return_value=(manifest_raw, manifest, actors),
+            ):
+                self.assertEqual(capacity_diagnostic.sanitize_capacity_report(
+                    input_path=Path(args.report), output_path=rejection_output,
+                    manifest_path=root / "manifest.json", source_sha=source_sha,
+                    app_target_sha=app_sha, run_id=external_run_id, attempt=attempt,
+                    workload=capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+                ), "FAIL")
+            sanitized_rejection = json.loads(rejection_output.read_text(encoding="ascii"))
+            self.assertEqual(
+                sanitized_rejection["cpu_profile_phase"]["server_telemetry"]
+                ["profile_rejections"]["service_counts"]["api"]["profile_aggregate"],
+                1,
+            )
+            self.assertFalse(sanitized_rejection["matrix_credit"])
+            self.assertFalse(sanitized_rejection["slo_credit"])
+            self.assertFalse(sanitized_rejection["diagnostic_credit"])
+            rejection_fingerprint = capacity_diagnostic._parent_failure_fingerprint(
+                rejection_report, args=args, stage_state=rejection_state,
+            )
+            self.assertEqual(
+                rejection_fingerprint["cpu_profile_phase"]["profile_rejections"]
+                ["service_counts"]["api"]["profile_aggregate"],
+                1,
+            )
+
     def test_composite_projection_accepts_completed_pair_and_profile_failure(self) -> None:
         source_sha = "a" * 40
         app_sha = "b" * 40
@@ -8661,7 +9010,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         profile_phase = {
             **phase_common, "workload": profile_workload,
             "run_id": profile_run_id, "profile_digest": profile_digest,
-            "server_telemetry": {"profile_status": "complete"},
+            "server_telemetry": {
+                "profile_status": "complete", "profile_reason": "none",
+                "profile_rejections": _profile_rejections(),
+            },
         }
         composite = {
             "schema": capacity_diagnostic.SCHEMA, "report_complete": True,
