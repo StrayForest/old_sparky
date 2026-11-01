@@ -19,10 +19,9 @@ belong in the linked owner documents below.
   and cleanup workflows. The profile phase reported `invalid_profile`; this is
   not a passing measurement or a server-wide capacity result.
 - The integrated source candidate for profile rejection telemetry, API CPU
-  category conservation and encrypted fixture credential transport is PR #347
-  at `b41f56b6684d300add9b37d89a257cf9effc6e99`. It includes host-tools source
-  **C** `5a8d4c69e208d096af418f67dfba1ef1cf630aa0` and pin successor **P**
-  `5c17be7362e19ca786eefb89d3bf38f2482ab048`; this generation is not installed.
+  category conservation and encrypted fixture credential transport is under
+  PR #347. It updates host-tools source **C**
+  `5a8d4c69e208d096af418f67dfba1ef1cf630aa0`; that generation is not installed.
   Transport review passed; final integrated-source review and exact-head CI are
   pending. The encrypted transport uses a fixture-only age identity; do not
   provision its environment secrets until the integrated source review and CI
