@@ -111,6 +111,73 @@ through the same normal source-binding path with runner `R` and app target
 no-op receipt is absent, does not bind those exact attempts, or the active
 tuple has changed. Do not create a substitute receipt or alias a same-SHA run.
 
+Optional manual inspection of the Security route artifact is not an extra
+authorization step; the abort workflow performs the authoritative validation.
+For an independent archive check, run from the repository root of a checkout at
+the exact successful Security source SHA `R`:
+
+```bash
+set -euo pipefail
+security_run_id="<exact-successful-security-run-id>"
+security_run_attempt="<exact-successful-security-run-attempt>"
+security_source_sha="<security-run-source-sha-R>"
+[[ "$security_run_id" =~ ^[1-9][0-9]{0,31}$ ]]
+[[ "$security_run_attempt" =~ ^[1-9][0-9]{0,8}$ ]]
+[[ "$security_source_sha" =~ ^[0-9a-f]{40}$ ]]
+[[ "$(git rev-parse --verify HEAD)" == "$security_source_sha" ]]
+umask 077
+private_dir="$(mktemp -d "${TMPDIR:-/tmp}/retained-abort-route.XXXXXX")"
+trap 'rm -rf -- "$private_dir"' EXIT
+metadata="$private_dir/artifacts.json"
+archive="$private_dir/route.zip"
+gh api --repo StrayForest/old_sparky \
+  "repos/StrayForest/old_sparky/actions/runs/$security_run_id/artifacts?per_page=100&page=1" \
+  > "$metadata"
+artifact_fields="$(/usr/bin/python3 -I -B - "$metadata" "$security_run_id" "$security_run_attempt" "$security_source_sha" <<'PY'
+import json
+from pathlib import Path
+import re
+import sys
+
+metadata_path, run_id, attempt, source_sha = sys.argv[1:]
+payload = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+rows = payload.get("artifacts") if isinstance(payload, dict) else None
+if (not isinstance(rows, list) or type(payload.get("total_count")) is not int
+        or payload["total_count"] != len(rows) or not 0 < len(rows) <= 100):
+    raise SystemExit("Security artifact list is incomplete")
+expected_name = f"platform-ci-route-{run_id}-{attempt}"
+matches = [row for row in rows if isinstance(row, dict) and row.get("name") == expected_name]
+if len(matches) != 1:
+    raise SystemExit("exact Security route artifact is missing or ambiguous")
+artifact = matches[0]
+workflow_run = artifact.get("workflow_run")
+if (type(artifact.get("id")) is not int or artifact["id"] <= 0
+        or type(artifact.get("size_in_bytes")) is not int
+        or not 0 < artifact["size_in_bytes"] <= 4 * 1024 * 1024
+        or artifact.get("expired") is not False
+        or not isinstance(artifact.get("digest"), str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", artifact["digest"]) is None
+        or not isinstance(workflow_run, dict)
+        or type(workflow_run.get("id")) is not int
+        or workflow_run["id"] != int(run_id)
+        or workflow_run.get("head_sha") != source_sha
+        or ("run_attempt" in workflow_run and
+            (type(workflow_run["run_attempt"]) is not int
+             or workflow_run["run_attempt"] != int(attempt)))):
+    raise SystemExit("Security route artifact identity is not exact")
+print(artifact["id"], artifact["size_in_bytes"], artifact["digest"][7:])
+PY
+)"
+read -r artifact_id api_size api_sha256 <<< "$artifact_fields"
+gh api --repo StrayForest/old_sparky \
+  "repos/StrayForest/old_sparky/actions/artifacts/$artifact_id/zip" \
+  > "$archive"
+[[ "$(stat -c '%s' -- "$archive")" == "$api_size" ]]
+[[ "$(sha256sum -- "$archive" | awk '{print $1}')" == "$api_sha256" ]]
+/usr/bin/python3 -I -B platform/tools/platform_production_classifier_artifact.py \
+  manifest "$archive" --target-sha "$security_source_sha" --require-recovery-bootstrap
+```
+
 The retained-cleanup workflow keeps SSH stdout/stderr in runner-private files
 until it records the closed diagnostic status. Missing or invalid remote
 markers remain unverified and fail closed; only allowlisted stderr classes and
