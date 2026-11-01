@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import stat
 import tempfile
 from typing import Any, Sequence
 
@@ -1661,6 +1662,167 @@ def _source_binding_identity() -> tuple[str, dict[str, Any] | None, str | None]:
     except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
         raise LoadProfileError("SOURCE_BINDING_BASE64 failed closed validation") from exc
     return app_target_sha, binding, expected_digest
+
+
+def _read_private_bounded_bytes(path: Path, *, maximum_bytes: int) -> bytes:
+    before = path.lstat()
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or stat.S_ISLNK(before.st_mode)
+        or before.st_uid != os.geteuid()
+        or before.st_nlink != 1
+        or before.st_size <= 0
+        or before.st_size > maximum_bytes
+        or stat.S_IMODE(before.st_mode) & 0o077
+    ):
+        raise ValueError
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(descriptor)
+        identity = (
+            before.st_dev, before.st_ino, before.st_mode, before.st_uid,
+            before.st_nlink, before.st_size, before.st_mtime_ns, before.st_ctime_ns,
+        )
+        opened_identity = (
+            opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid,
+            opened.st_nlink, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns,
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or opened.st_nlink != 1
+            or identity != opened_identity
+        ):
+            raise ValueError
+        raw = bytearray()
+        while len(raw) <= maximum_bytes:
+            block = os.read(descriptor, min(8192, maximum_bytes + 1 - len(raw)))
+            if not block:
+                break
+            raw.extend(block)
+        after = os.fstat(descriptor)
+        current = path.lstat()
+        after_identity = (
+            after.st_dev, after.st_ino, after.st_mode, after.st_uid,
+            after.st_nlink, after.st_size, after.st_mtime_ns, after.st_ctime_ns,
+        )
+        current_identity = (
+            current.st_dev, current.st_ino, current.st_mode, current.st_uid,
+            current.st_nlink, current.st_size, current.st_mtime_ns, current.st_ctime_ns,
+        )
+        if (
+            len(raw) != before.st_size
+            or identity != after_identity
+            or identity != current_identity
+        ):
+            raise ValueError
+        return bytes(raw)
+    finally:
+        os.close(descriptor)
+
+
+def source_binding_environment_from_handoff(
+    handoff_path: Path, manifest_path: Path, *, runner_sha: str, app_target_sha: str,
+) -> dict[str, str]:
+    """Derive the canonical loader environment from the authenticated input.
+
+    The external-load input artifact is produced only after the workflow has
+    resolved its exact runner-to-app receipt. This shared command validates
+    that closed payload again and emits only the two values consumed by the
+    load and diagnostic manifest readers.
+    """
+
+    if (
+        SOURCE_SHA_RE.fullmatch(runner_sha) is None
+        or SOURCE_SHA_RE.fullmatch(app_target_sha) is None
+    ):
+        raise LoadProfileError("source-binding workflow identities are invalid")
+    try:
+        payload = json.loads(
+            _read_private_bounded_bytes(handoff_path, maximum_bytes=64 * 1024).decode("ascii"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
+        try:
+            from tools.platform_workflow_input_guard import validate_external_payload
+        except ModuleNotFoundError:  # Direct execution from platform/tools.
+            from platform_workflow_input_guard import validate_external_payload
+        validated = validate_external_payload(payload)
+        if validated.get("target_sha") != runner_sha:
+            raise ValueError
+        binding = validated.get("source_binding")
+        if binding is None:
+            if app_target_sha != runner_sha:
+                raise ValueError
+            environment = {"SOURCE_BINDING_BASE64": "", "SOURCE_BINDING_SHA256": ""}
+        else:
+            if (
+                not isinstance(binding, Mapping)
+                or binding.get("runner_sha") != runner_sha
+                or binding.get("app_target_sha") != app_target_sha
+                or app_target_sha == runner_sha
+            ):
+                raise ValueError
+            try:
+                try:
+                    from tools.platform_noop_source_binding import validate_active_runtime_tuple
+                except ModuleNotFoundError:  # Direct execution from platform/tools.
+                    from platform_noop_source_binding import validate_active_runtime_tuple
+                validate_active_runtime_tuple(
+                    binding,
+                    binding.get("baseline_identity"),
+                    expected_runner_sha=runner_sha,
+                )
+            except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                raise ValueError from exc
+            canonical = json.dumps(
+                binding, ensure_ascii=True, allow_nan=False, sort_keys=True,
+                separators=(",", ":"),
+            ).encode("ascii")
+            environment = {
+                "SOURCE_BINDING_BASE64": base64.b64encode(canonical).decode("ascii"),
+                "SOURCE_BINDING_SHA256": hashlib.sha256(canonical).hexdigest(),
+            }
+        previous = {
+            key: os.environ.get(key)
+            for key in (
+                "SOURCE_GIT_SHA", "APP_TARGET_SHA", "SOURCE_BINDING_BASE64",
+                "SOURCE_BINDING_SHA256",
+            )
+        }
+        try:
+            os.environ.update({
+                "SOURCE_GIT_SHA": runner_sha,
+                "APP_TARGET_SHA": app_target_sha,
+                **environment,
+            })
+            try:
+                from tools.platform_external_load import load_manifest_bytes
+            except ModuleNotFoundError:  # Direct execution from platform/tools.
+                from platform_external_load import load_manifest_bytes
+            manifest_raw = _read_private_bounded_bytes(
+                manifest_path, maximum_bytes=24 * 1024 * 1024,
+            )
+            manifest, _actors = load_manifest_bytes(manifest_raw)
+            if manifest.get("schema") == 2:
+                if (
+                    manifest.get("runner_sha") != runner_sha
+                    or manifest.get("app_target_sha") != app_target_sha
+                ):
+                    raise ValueError
+            elif manifest.get("schema") != 1 or app_target_sha != runner_sha:
+                raise ValueError
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        return environment
+    except (
+        ImportError, OSError, OverflowError, RecursionError, RuntimeError,
+        TypeError, UnicodeError, ValueError,
+    ) as exc:
+        raise LoadProfileError("source-binding input handoff failed closed validation") from exc
 
 
 def _external_run_id() -> str:
@@ -5023,6 +5185,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     env_parser = subparsers.add_parser("export-env")
     env_parser.add_argument("--profile", dest="profile_id", required=True)
 
+    source_binding_parser = subparsers.add_parser("export-source-binding-env")
+    source_binding_parser.add_argument("--input-handoff", type=Path, required=True)
+    source_binding_parser.add_argument("--manifest", type=Path, required=True)
+    source_binding_parser.add_argument("--runner-sha", required=True)
+    source_binding_parser.add_argument("--app-target-sha", required=True)
+
     run_parser = subparsers.add_parser("run")
     run_parser.add_argument("--profile", dest="profile_id", required=True)
     run_parser.add_argument("--manifest", type=Path, required=True)
@@ -5088,6 +5256,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.dispatchable:
             raise LoadProfileError("--dispatchable requires --profile")
         print("platform load profiles: ok")
+        return 0
+    if args.command == "export-source-binding-env":
+        for key, value in source_binding_environment_from_handoff(
+            args.input_handoff,
+            args.manifest,
+            runner_sha=args.runner_sha,
+            app_target_sha=args.app_target_sha,
+        ).items():
+            print(f"{key}={value}")
         return 0
     profile = get_profile(args.profile_id)
     if args.command == "profile":

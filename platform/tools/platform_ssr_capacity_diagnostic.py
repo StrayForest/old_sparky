@@ -1834,6 +1834,29 @@ def _read_manifest(path: Path) -> tuple[bytes, dict[str, Any], list[external_loa
     return manifest_raw, manifest, actors
 
 
+def _read_worker_manifest(
+    capacity: Mapping[str, Any], binding: Mapping[str, Any],
+) -> tuple[bytes, dict[str, Any], list[external_load.VirtualUser]]:
+    """Read and bind the worker's source-bound fixture before any probes."""
+
+    manifest_raw, manifest, actors = _read_manifest(Path(str(capacity["manifest_path"])))
+    if (
+        hashlib.sha256(manifest_raw).hexdigest() != capacity["manifest_sha256"]
+        or manifest.get("runner_sha") != binding["source_sha"]
+        or manifest.get("app_target_sha") != binding["app_target_sha"]
+    ):
+        raise ValueError("capacity manifest binding rejected")
+    tournaments = manifest.get("tournaments")
+    if (
+        not isinstance(tournaments, list)
+        or len(tournaments) != FIXTURE_TOURNAMENTS
+        or len(actors) != FIXTURE_USERS
+        or any(item.get("user_count") != FIXTURE_USERS for item in tournaments)
+    ):
+        raise ValueError("capacity fixture dimensions rejected")
+    return manifest_raw, manifest, actors
+
+
 def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
     capacity = config.get("capacity_diagnostic")
     expected_fields = {
@@ -1874,17 +1897,8 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
             or ATTEMPT_RE.fullmatch(binding["external_run_attempt"]) is None
             or os.environ.get("SOURCE_GIT_SHA") != binding["source_sha"]):
         raise ValueError("capacity worker binding rejected")
-    manifest_path = Path(str(capacity["manifest_path"]))
-    manifest_raw, manifest, actors = _read_manifest(manifest_path)
-    if (hashlib.sha256(manifest_raw).hexdigest() != capacity["manifest_sha256"]
-            or manifest.get("runner_sha") != binding["source_sha"]
-            or manifest.get("app_target_sha") != binding["app_target_sha"]):
-        raise ValueError("capacity manifest binding rejected")
+    manifest_raw, manifest, actors = _read_worker_manifest(capacity, binding)
     tournaments = manifest.get("tournaments")
-    if (not isinstance(tournaments, list) or len(tournaments) != FIXTURE_TOURNAMENTS
-            or len(actors) != FIXTURE_USERS
-            or any(item.get("user_count") != FIXTURE_USERS for item in tournaments)):
-        raise ValueError("capacity fixture dimensions rejected")
     slug = tournaments[0].get("slug")
     actor_count = _profile_spec(capacity["workload"])[2]
     selected = [actor for actor in actors if actor.tournament_slug == slug][:actor_count]
@@ -2539,7 +2553,10 @@ def run_isolated_capacity_worker(
             "capacity_diagnostic": dict(capacity_config),
         },
         clear_worker_environment=True,
-        env={"SOURCE_GIT_SHA": source_sha},
+        env=_worker_source_binding_environment(
+            source_sha=source_sha,
+            app_target_sha=args.app_target_sha,
+        ),
         on_namespace_init=on_namespace_init,
         on_namespace_exit=on_namespace_exit,
     )
@@ -4176,6 +4193,33 @@ def _parent_run_once(
     return outcome
 
 
+def _worker_source_binding_environment(
+    *, source_sha: str, app_target_sha: str,
+) -> dict[str, str]:
+    """Forward only the validated source identity to the isolated worker."""
+
+    if (
+        SHA_RE.fullmatch(source_sha) is None
+        or SHA_RE.fullmatch(app_target_sha) is None
+        or os.environ.get("SOURCE_GIT_SHA") != source_sha
+        or os.environ.get("APP_TARGET_SHA") != app_target_sha
+    ):
+        raise ValueError("capacity worker source identity rejected")
+    encoded = os.environ.get("SOURCE_BINDING_BASE64", "")
+    digest = os.environ.get("SOURCE_BINDING_SHA256", "")
+    if app_target_sha == source_sha:
+        if encoded or digest:
+            raise ValueError("same-source worker binding rejected")
+    elif not encoded or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ValueError("verified-noop worker binding is missing")
+    return {
+        "SOURCE_GIT_SHA": source_sha,
+        "APP_TARGET_SHA": app_target_sha,
+        "SOURCE_BINDING_BASE64": encoded,
+        "SOURCE_BINDING_SHA256": digest,
+    }
+
+
 def _parent_composite_run(
     args: argparse.Namespace, stage_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -4197,18 +4241,14 @@ def _parent_composite_run(
     })
     state["composite_run_id"] = state["run_id"]
     state["composite_profile_digest"] = state["profile_digest"]
-    manifest_raw, manifest, actors = _read_manifest(Path(args.manifest))
+    manifest_raw, manifest, actors = _read_composite_parent_manifest(
+        Path(args.manifest),
+        source_sha=args.source_sha,
+        app_target_sha=args.app_target_sha,
+        concurrency=args.concurrency,
+    )
     manifest_sha = hashlib.sha256(manifest_raw).hexdigest()
     state.update({"manifest_sha256": manifest_sha, "manifest_bytes": len(manifest_raw)})
-    if (
-        manifest.get("runner_sha") != args.source_sha
-        or manifest.get("app_target_sha") != args.app_target_sha
-        or len(manifest.get("tournaments", [])) != FIXTURE_TOURNAMENTS
-        or len(actors) != FIXTURE_USERS
-        or any(item.get("user_count") != FIXTURE_USERS for item in manifest["tournaments"])
-        or args.concurrency != 32
-    ):
-        raise ValueError("composite fixture or concurrency binding rejected")
     phases: dict[str, dict[str, Any] | None] = {
         "capacity": None,
         "cpu_profile": None,
@@ -4365,6 +4405,24 @@ def _parent_composite_run(
         "wall_elapsed_seconds": round(min(600, wall_elapsed_seconds), 3),
         "wall_budget_exceeded": wall_budget_exceeded,
     }
+
+
+def _read_composite_parent_manifest(
+    path: Path, *, source_sha: str, app_target_sha: str, concurrency: int,
+) -> tuple[bytes, dict[str, Any], list[external_load.VirtualUser]]:
+    """Perform the composite parent's real source/fixture preflight."""
+
+    manifest_raw, manifest, actors = _read_manifest(path)
+    if (
+        manifest.get("runner_sha") != source_sha
+        or manifest.get("app_target_sha") != app_target_sha
+        or len(manifest.get("tournaments", [])) != FIXTURE_TOURNAMENTS
+        or len(actors) != FIXTURE_USERS
+        or any(item.get("user_count") != FIXTURE_USERS for item in manifest["tournaments"])
+        or concurrency != 32
+    ):
+        raise ValueError("composite fixture or concurrency binding rejected")
+    return manifest_raw, manifest, actors
 
 
 def _parent_run(

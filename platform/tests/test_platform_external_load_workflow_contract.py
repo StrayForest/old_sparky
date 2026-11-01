@@ -14,11 +14,13 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
+from unittest.mock import patch
 import zipfile
 
 import yaml
@@ -3565,6 +3567,429 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                         result.stdout.strip(), f"{cleanup_status} {expected_class}"
                     )
                     self.assertEqual(marker_path.exists(), marker_type == "directory")
+
+    def test_pair_job_source_binding_reaches_parent_worker_and_sanitizer(self) -> None:
+        """Run the workflow's env exporter through actual source-bound readers."""
+
+        from tools import (
+            platform_load,
+            platform_ssr_capacity_diagnostic as capacity_diagnostic,
+            platform_workflow_input_guard,
+        )
+        from tests.test_platform_external_load import manifest_payload
+        from tests.test_platform_noop_source_binding import (
+            APP_SHA,
+            RUNNER_SHA,
+            _validated_source_binding_handoff,
+        )
+
+        pair_job = self.jobs["cpu-diagnostic-pair"]
+        source_step = pair_job.split(
+            "- name: Derive source-binding environment for the diagnostic runner", 1
+        )[1].split("- name: Configure pinned production SSH", 1)[0]
+        self.assertIn("platform/tools/platform_load.py export-source-binding-env", source_step)
+        self.assertIn('--manifest "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json"', source_step)
+        self.assertIn('>> "$GITHUB_ENV"', source_step)
+        self.assertLess(
+            pair_job.index("Derive source-binding environment for the diagnostic runner"),
+            pair_job.index("Run only the guarded SSR capacity diagnostic"),
+        )
+        pair_steps = yaml.safe_load(self.source)["jobs"]["cpu-diagnostic-pair"]["steps"]
+        source_step_definition = next(
+            step for step in pair_steps
+            if step.get("name") == "Derive source-binding environment for the diagnostic runner"
+        )
+        load_steps = yaml.safe_load(self.source)["jobs"]["load-client"]["steps"]
+        load_step_definition = next(
+            step for step in load_steps
+            if step.get("name") == "Run checked-out external HTTP load client"
+        )
+        load_source = load_step_definition["run"]
+        self.assertIn("platform/tools/platform_load.py export-source-binding-env", load_source)
+        self.assertNotIn('>> "$GITHUB_ENV"', load_source)
+        load_handoff_prefix = load_source[:load_source.index("\nload_status=1")]
+        source = Path(capacity_diagnostic.__file__).read_text(encoding="utf-8")
+        self.assertIn("env=_worker_source_binding_environment(", source)
+        for key in (
+            '"SOURCE_GIT_SHA": source_sha',
+            '"APP_TARGET_SHA": app_target_sha',
+            '"SOURCE_BINDING_BASE64": encoded',
+            '"SOURCE_BINDING_SHA256": digest',
+        ):
+            self.assertIn(key, source)
+
+        source_binding = _validated_source_binding_handoff()
+        canonical_binding = json.dumps(
+            source_binding, ensure_ascii=True, allow_nan=False, sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        source_bound_manifest = manifest_payload()
+        source_bound_manifest.update({
+            "schema": 2,
+            "created_at": "2026-11-01T00:00:00Z",
+            "runner_sha": RUNNER_SHA,
+            "app_target_sha": APP_SHA,
+            "source_binding": source_binding,
+            "source_binding_sha256": hashlib.sha256(canonical_binding).hexdigest(),
+        })
+        same_source_manifest = manifest_payload()
+        same_source_manifest.update({
+            "schema": 2,
+            "created_at": "2026-11-01T00:00:00Z",
+            "runner_sha": RUNNER_SHA,
+            "app_target_sha": RUNNER_SHA,
+            "source_binding": None,
+            "source_binding_sha256": None,
+        })
+        for payload in (source_bound_manifest, same_source_manifest):
+            payload["tournaments"][0]["user_count"] = 14
+            payload["users"] = [
+                {
+                    "user_id": f"user-{index:08d}",
+                    "tournament_slug": "qa-tournament",
+                    "session_token": chr(ord("a") + index) * 64,
+                    "csrf_token": chr(ord("A") + index) * 64,
+                }
+                for index in range(14)
+            ]
+
+        input_payload = {
+            "schema": 2,
+            "confirmation": platform_workflow_input_guard.SSR_CAPACITY_CONFIRMATION,
+            "target_sha": RUNNER_SHA,
+            "control_email": "diagnostic@example.invalid",
+            "setup_concurrency": "1",
+            "run_id": "123456",
+            "profile": "external-vote",
+            "tournament_count": "1",
+            "users_per_tournament": "14",
+            "timeout_diagnostics": "false",
+            "fixture_kind": "ssr_html_capacity_composite_diagnostic_v1",
+            "ssr_capacity_concurrency": "32",
+            "ssr_capacity_workload": capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+            "source_binding": source_binding,
+        }
+        validated_input = platform_workflow_input_guard.validate_external_payload(input_payload)
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            input_dir = root / "cpu-diagnostic-input"
+            manifest_dir = root / "cpu-diagnostic-manifest"
+            input_dir.mkdir(mode=0o700)
+            manifest_dir.mkdir(mode=0o700)
+            input_path = input_dir / "platform-production-external-load-input.json"
+            manifest_path = manifest_dir / "manifest.json"
+            input_path.write_text(json.dumps(validated_input), encoding="ascii")
+            manifest_raw = json.dumps(source_bound_manifest).encode("ascii")
+            manifest_path.write_bytes(manifest_raw)
+            input_path.chmod(0o600)
+            manifest_path.chmod(0o600)
+            github_env_path = root / "github-env"
+            github_env_path.write_text("", encoding="ascii")
+            github_env_path.chmod(0o600)
+            env = {
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "HOME": "/tmp",
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                "RUNNER_TEMP": str(root),
+                "GITHUB_ENV": str(github_env_path),
+                "SOURCE_GIT_SHA": RUNNER_SHA,
+                "APP_TARGET_SHA": APP_SHA,
+            }
+            workflow_step = subprocess.run(
+                ["/bin/bash", "-euo", "pipefail", "-c", source_step_definition["run"]],
+                cwd=REPO_ROOT,
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(workflow_step.returncode, 0, workflow_step.stderr)
+            exported = dict(
+                line.split("=", 1) for line in github_env_path.read_text(encoding="ascii").splitlines()
+            )
+            self.assertEqual(
+                set(exported), {"SOURCE_BINDING_BASE64", "SOURCE_BINDING_SHA256"}
+            )
+            self.assertEqual(
+                exported["SOURCE_BINDING_SHA256"],
+                hashlib.sha256(canonical_binding).hexdigest(),
+            )
+
+            load_temp = root / "load-runner-temp"
+            load_input_dir = load_temp / "external-input"
+            load_manifest_dir = load_temp / "external-manifest"
+            load_input_dir.mkdir(parents=True, mode=0o700)
+            load_manifest_dir.mkdir(mode=0o700)
+            load_input_path = load_input_dir / "platform-production-external-load-input.json"
+            load_manifest_path = load_manifest_dir / "manifest.json"
+            load_input_path.write_bytes(input_path.read_bytes())
+            load_manifest_path.write_bytes(manifest_path.read_bytes())
+            load_input_path.chmod(0o600)
+            load_manifest_path.chmod(0o600)
+            load_client_script = (
+                load_handoff_prefix
+                + "\nrun_checked_out_client /usr/bin/python3 -c "
+                + shlex.quote(
+                    "import json, os; print(json.dumps({key: os.environ[key] for key in "
+                    "('SOURCE_GIT_SHA', 'APP_TARGET_SHA', 'SOURCE_BINDING_BASE64', "
+                    "'SOURCE_BINDING_SHA256')}))"
+                )
+            )
+            load_client_env = {
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "HOME": "/tmp",
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                "RUNNER_TEMP": str(load_temp),
+                "SOURCE_GIT_SHA": RUNNER_SHA,
+                "APP_TARGET_SHA": APP_SHA,
+                "PROFILE_ID": "external-vote",
+                "GITHUB_RUN_ID": "123456",
+                "PLATFORM_RUNNER_ENVIRONMENT": "github-hosted",
+            }
+            load_client_step = subprocess.run(
+                ["/bin/bash", "-euo", "pipefail", "-c", load_client_script],
+                cwd=REPO_ROOT,
+                env=load_client_env,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(load_client_step.returncode, 0, load_client_step.stderr)
+            load_exported = json.loads(load_client_step.stdout)
+            self.assertEqual(load_exported["SOURCE_GIT_SHA"], RUNNER_SHA)
+            self.assertEqual(load_exported["APP_TARGET_SHA"], APP_SHA)
+            self.assertEqual(load_exported["SOURCE_BINDING_BASE64"], exported["SOURCE_BINDING_BASE64"])
+            self.assertEqual(load_exported["SOURCE_BINDING_SHA256"], exported["SOURCE_BINDING_SHA256"])
+
+            parent_environment = {
+                "SOURCE_GIT_SHA": RUNNER_SHA,
+                "APP_TARGET_SHA": APP_SHA,
+                **exported,
+            }
+            with patch.dict(os.environ, parent_environment, clear=True):
+                loaded_raw, loaded_manifest, actors = capacity_diagnostic._read_composite_parent_manifest(
+                    manifest_path,
+                    source_sha=RUNNER_SHA,
+                    app_target_sha=APP_SHA,
+                    concurrency=32,
+                )
+                self.assertEqual(len(actors), 14)
+                self.assertEqual(loaded_manifest["runner_sha"], RUNNER_SHA)
+                self.assertEqual(loaded_manifest["app_target_sha"], APP_SHA)
+                worker_environment = capacity_diagnostic._worker_source_binding_environment(
+                    source_sha=RUNNER_SHA,
+                    app_target_sha=APP_SHA,
+                )
+
+            worker_capacity = {
+                "manifest_path": str(manifest_path),
+                "manifest_sha256": hashlib.sha256(loaded_raw).hexdigest(),
+            }
+            worker_binding = {"source_sha": RUNNER_SHA, "app_target_sha": APP_SHA}
+            with patch.dict(os.environ, worker_environment, clear=True):
+                worker_raw, worker_manifest, worker_actors = capacity_diagnostic._read_worker_manifest(
+                    worker_capacity, worker_binding,
+                )
+            self.assertEqual(worker_raw, loaded_raw)
+            self.assertEqual(len(worker_actors), 14)
+            self.assertEqual(worker_manifest["app_target_sha"], APP_SHA)
+
+            with patch.dict(os.environ, parent_environment, clear=True):
+                with self.assertRaises(capacity_diagnostic._CapacitySanitizationError) as sanitizer_error:
+                    capacity_diagnostic.sanitize_capacity_report(
+                        input_path=root / "missing-report.json",
+                        output_path=root / "sanitized.json",
+                        manifest_path=manifest_path,
+                        source_sha=RUNNER_SHA,
+                        app_target_sha=APP_SHA,
+                        run_id="123456",
+                        attempt="1",
+                        workload=capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+                    )
+            self.assertEqual(sanitizer_error.exception.payload["stage"], "report_read")
+
+            mismatched_manifest = dict(source_bound_manifest)
+            mismatched_manifest["source_binding_sha256"] = "0" * 64
+            mismatched_manifest_path = root / "mismatched-manifest-binding.json"
+            mismatched_manifest_path.write_text(
+                json.dumps(mismatched_manifest), encoding="ascii",
+            )
+            mismatched_manifest_path.chmod(0o600)
+            failed_manifest_helper = subprocess.run(
+                [
+                    sys.executable, str(Path(platform_load.__file__)),
+                    "export-source-binding-env",
+                    "--input-handoff", str(input_path),
+                    "--manifest", str(mismatched_manifest_path),
+                    "--runner-sha", RUNNER_SHA,
+                    "--app-target-sha", APP_SHA,
+                ],
+                cwd=REPO_ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertNotEqual(failed_manifest_helper.returncode, 0)
+            self.assertEqual(failed_manifest_helper.stdout, "")
+            with patch.dict(os.environ, parent_environment, clear=True):
+                with self.assertRaises(capacity_diagnostic.external_load.ExternalLoadError):
+                    capacity_diagnostic._read_composite_parent_manifest(
+                        mismatched_manifest_path,
+                        source_sha=RUNNER_SHA,
+                        app_target_sha=APP_SHA,
+                        concurrency=32,
+                    )
+            with patch.dict(os.environ, parent_environment, clear=True):
+                with self.assertRaises(capacity_diagnostic._CapacitySanitizationError) as mismatch_error:
+                    capacity_diagnostic.sanitize_capacity_report(
+                        input_path=root / "missing-report.json",
+                        output_path=root / "mismatch-sanitized.json",
+                        manifest_path=mismatched_manifest_path,
+                        source_sha=RUNNER_SHA,
+                        app_target_sha=APP_SHA,
+                        run_id="123456",
+                        attempt="1",
+                        workload=capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+                    )
+            self.assertEqual(mismatch_error.exception.payload["stage"], "manifest_read")
+
+            for missing_or_mismatched in (
+                {"SOURCE_GIT_SHA": RUNNER_SHA, "APP_TARGET_SHA": APP_SHA},
+                {**parent_environment, "SOURCE_BINDING_SHA256": "0" * 64},
+            ):
+                with patch.dict(os.environ, missing_or_mismatched, clear=True):
+                    with self.assertRaises(capacity_diagnostic.external_load.ExternalLoadError):
+                        capacity_diagnostic._read_composite_parent_manifest(
+                            manifest_path,
+                            source_sha=RUNNER_SHA,
+                            app_target_sha=APP_SHA,
+                            concurrency=32,
+                        )
+
+            with patch.dict(
+                os.environ,
+                {"SOURCE_GIT_SHA": RUNNER_SHA, "APP_TARGET_SHA": APP_SHA},
+                clear=True,
+            ):
+                with self.assertRaises(ValueError):
+                    capacity_diagnostic._worker_source_binding_environment(
+                        source_sha=RUNNER_SHA,
+                        app_target_sha=APP_SHA,
+                    )
+
+            missing_binding_input = dict(validated_input)
+            missing_binding_input["schema"] = 1
+            missing_binding_input.pop("source_binding")
+            missing_input_path = root / "missing-binding-input.json"
+            missing_input_path.write_text(json.dumps(missing_binding_input), encoding="ascii")
+            missing_input_path.chmod(0o600)
+            failed_helper = subprocess.run(
+                [
+                    sys.executable, str(Path(platform_load.__file__)),
+                    "export-source-binding-env",
+                    "--input-handoff", str(missing_input_path),
+                    "--manifest", str(manifest_path),
+                    "--runner-sha", RUNNER_SHA,
+                    "--app-target-sha", APP_SHA,
+                ],
+                cwd=REPO_ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertNotEqual(failed_helper.returncode, 0)
+            self.assertEqual(failed_helper.stdout, "")
+
+            failed_helper = subprocess.run(
+                [
+                    sys.executable, str(Path(platform_load.__file__)),
+                    "export-source-binding-env",
+                    "--input-handoff", str(input_path),
+                    "--manifest", str(manifest_path),
+                    "--runner-sha", RUNNER_SHA,
+                    "--app-target-sha", "c" * 40,
+                ],
+                cwd=REPO_ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertNotEqual(failed_helper.returncode, 0)
+            self.assertEqual(failed_helper.stdout, "")
+
+            same_source_input = dict(validated_input)
+            same_source_input["schema"] = 1
+            same_source_input["target_sha"] = RUNNER_SHA
+            same_source_input.pop("source_binding")
+            same_input_path = root / "same-source-input.json"
+            same_input_path.write_text(json.dumps(same_source_input), encoding="ascii")
+            same_input_path.chmod(0o600)
+            same_manifest_path = root / "same-source-manifest.json"
+            same_manifest_path.write_text(json.dumps(same_source_manifest), encoding="ascii")
+            same_manifest_path.chmod(0o600)
+            same_helper = subprocess.run(
+                [
+                    sys.executable, str(Path(platform_load.__file__)),
+                    "export-source-binding-env",
+                    "--input-handoff", str(same_input_path),
+                    "--manifest", str(same_manifest_path),
+                    "--runner-sha", RUNNER_SHA,
+                    "--app-target-sha", RUNNER_SHA,
+                ],
+                cwd=REPO_ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(same_helper.returncode, 0, same_helper.stderr)
+            same_exported = dict(line.split("=", 1) for line in same_helper.stdout.splitlines())
+            self.assertEqual(same_exported, {
+                "SOURCE_BINDING_BASE64": "",
+                "SOURCE_BINDING_SHA256": "",
+            })
+            with patch.dict(
+                os.environ,
+                {
+                    "SOURCE_GIT_SHA": RUNNER_SHA,
+                    "APP_TARGET_SHA": RUNNER_SHA,
+                    **same_exported,
+                },
+                clear=True,
+            ):
+                same_raw, _same_manifest, same_actors = capacity_diagnostic._read_composite_parent_manifest(
+                    same_manifest_path,
+                    source_sha=RUNNER_SHA,
+                    app_target_sha=RUNNER_SHA,
+                    concurrency=32,
+                )
+                same_worker_environment = capacity_diagnostic._worker_source_binding_environment(
+                    source_sha=RUNNER_SHA,
+                    app_target_sha=RUNNER_SHA,
+                )
+            same_worker_capacity = {
+                "manifest_path": str(same_manifest_path),
+                "manifest_sha256": hashlib.sha256(same_raw).hexdigest(),
+            }
+            with patch.dict(os.environ, same_worker_environment, clear=True):
+                same_worker_raw, _same_worker_manifest, same_worker_actors = (
+                    capacity_diagnostic._read_worker_manifest(
+                        same_worker_capacity,
+                        {"source_sha": RUNNER_SHA, "app_target_sha": RUNNER_SHA},
+                    )
+                )
+            self.assertEqual(len(same_actors), 14)
+            self.assertEqual(len(same_worker_actors), 14)
+            self.assertEqual(same_worker_raw, same_raw)
+            self.assertTrue(same_raw)
 
 
 if __name__ == "__main__":

@@ -217,6 +217,18 @@ and SSH removal use `always()`, but any failed row below keeps the run failed:
 | handoffs/artifacts/SSH | exact SHA/run/attempt/digest; cleanup statuses `0` |
 | evaluation/projection | observer-bound accepted result, structurally complete profile-budget miss, or closed known-status failure; `sanitizer_status=0` |
 
+Load and CPU/SSR diagnostic jobs derive `SOURCE_BINDING_BASE64` and
+`SOURCE_BINDING_SHA256` from the exact downloaded external-load input by running
+`platform/tools/platform_load.py export-source-binding-env` with that input,
+the matching fixture manifest, `SOURCE_GIT_SHA` and `APP_TARGET_SHA`. The helper
+revalidates the closed handoff and verifies the manifest with the ordinary
+external-load parser before emitting the two values to `$GITHUB_ENV`. The
+diagnostic parent, isolated worker and sanitizer inherit these values; the
+worker receives them only through its explicit environment allowlist. Do not
+set or copy source-binding values manually. A missing or mismatched runner/app
+binding stops before measurement or report acceptance; an empty binding is
+valid only when runner and app SHAs are identical.
+
 CPU-only and SSR-capacity fixture confirmations are accepted by the trusted
 origin supervisor only for the fixed one-tournament, fourteen-user fixture
 with timeout diagnostics disabled. The confirmation check runs after the

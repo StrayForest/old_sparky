@@ -1260,6 +1260,9 @@ jobs:
           set -euo pipefail
           test -f "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" && test ! -L "$RUNNER_TEMP/external-input/platform-production-external-load-input.json"
           test -f "$RUNNER_TEMP/external-manifest/manifest.json" && test ! -L "$RUNNER_TEMP/external-manifest/manifest.json"
+          chmod 600 -- \
+            "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" \
+            "$RUNNER_TEMP/external-manifest/manifest.json"
           /usr/bin/python3 - "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" "$RUNNER_TEMP/external-manifest/manifest.json" "$TARGET_SHA" "$GITHUB_RUN_ID" "$APP_TARGET_SHA" <<'PY'
           import hashlib
           import json
@@ -1313,36 +1316,26 @@ jobs:
           PLATFORM_RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: |
           set -u
+          umask 077
           artifact_dir="$RUNNER_TEMP/external-client"
           mkdir -p "$artifact_dir"; chmod 700 "$artifact_dir"
           profile_env="$artifact_dir/profile.env"
-          IFS=$'\t' read -r SOURCE_BINDING_BASE64 SOURCE_BINDING_SHA256 < <(
-            /usr/bin/python3 - "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" "$APP_TARGET_SHA" <<'PY'
-          import base64
-          import hashlib
-          import json
-          import os
-          from pathlib import Path
-          import sys
-
-          payload_path, expected_app_sha = sys.argv[1:]
-          payload = json.loads(Path(payload_path).read_text(encoding="ascii"))
-          if not isinstance(payload, dict) or payload.get("target_sha") != os.environ.get("TARGET_SHA"):
-              raise SystemExit("external source handoff runner SHA is invalid")
-          binding = payload.get("source_binding")
-          if binding is None:
-              if expected_app_sha != payload["target_sha"]:
-                  raise SystemExit("mismatched app source lacks a verified binding")
-              print("-\t-")
-          else:
-              if not isinstance(binding, dict) or binding.get("runner_sha") != payload["target_sha"] or binding.get("app_target_sha") != expected_app_sha:
-                  raise SystemExit("external source handoff binding is inconsistent")
-              raw = json.dumps(binding, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("ascii")
-              print(base64.b64encode(raw).decode("ascii") + "\t" + hashlib.sha256(raw).hexdigest())
-          PY
-          )
-          [[ "$SOURCE_BINDING_BASE64" == "-" ]] && SOURCE_BINDING_BASE64=""
-          [[ "$SOURCE_BINDING_SHA256" == "-" ]] && SOURCE_BINDING_SHA256=""
+          source_binding_env="$artifact_dir/source-binding.env"
+          if ! /usr/bin/python3 platform/tools/platform_load.py export-source-binding-env \
+            --input-handoff "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" \
+            --manifest "$RUNNER_TEMP/external-manifest/manifest.json" \
+            --runner-sha "$SOURCE_GIT_SHA" --app-target-sha "$APP_TARGET_SHA" \
+            > "$source_binding_env"; then
+            echo "external source-binding handoff validation failed" >&2
+            exit 1
+          fi
+          mapfile -t source_binding_lines < "$source_binding_env"
+          rm -f -- "$source_binding_env"
+          [[ "${#source_binding_lines[@]}" == 2 ]] || { echo "external source-binding environment is incomplete" >&2; exit 1; }
+          [[ "${source_binding_lines[0]}" == SOURCE_BINDING_BASE64=* ]] || { echo "external source-binding environment is invalid" >&2; exit 1; }
+          [[ "${source_binding_lines[1]}" == SOURCE_BINDING_SHA256=* ]] || { echo "external source-binding environment is invalid" >&2; exit 1; }
+          SOURCE_BINDING_BASE64="${source_binding_lines[0]#*=}"
+          SOURCE_BINDING_SHA256="${source_binding_lines[1]#*=}"
           run_checked_out_client() {
             env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8 PLATFORM_RUNNER_ENVIRONMENT="$PLATFORM_RUNNER_ENVIRONMENT" SOURCE_GIT_SHA="$SOURCE_GIT_SHA" APP_TARGET_SHA="$APP_TARGET_SHA" SOURCE_BINDING_BASE64="$SOURCE_BINDING_BASE64" SOURCE_BINDING_SHA256="$SOURCE_BINDING_SHA256" GITHUB_RUN_ID="$GITHUB_RUN_ID" "$@"
           }
@@ -1791,6 +1784,17 @@ jobs:
           chmod 600 \
             "$RUNNER_TEMP/cpu-diagnostic-input/platform-production-external-load-input.json" \
             "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json"
+
+      - name: Derive source-binding environment for the diagnostic runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          /usr/bin/python3 platform/tools/platform_load.py export-source-binding-env \
+            --input-handoff "$RUNNER_TEMP/cpu-diagnostic-input/platform-production-external-load-input.json" \
+            --manifest "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json" \
+            --runner-sha "$SOURCE_GIT_SHA" \
+            --app-target-sha "$APP_TARGET_SHA" >> "$GITHUB_ENV"
 
       - name: Configure pinned production SSH for the trusted parent
         shell: bash
