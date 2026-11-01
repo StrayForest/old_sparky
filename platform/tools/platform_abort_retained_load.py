@@ -60,6 +60,7 @@ SCRIPT_PATHS = {
 }
 OBSERVER_PATH = "/opt/oldsparky/platform/current/tools/platform_external_load_observer.py"
 LOCK_PATH = "/run/lock/oldsparky-retained-load-matrix.lock"
+RELEASE_LOCK_PATH = "/run/lock/oldsparky-platform-release.lock"
 CONFIRMATION = "ABORT-PRODUCTION-RETAINED-LOAD"
 RELEASE_PATH = "/opt/oldsparky/platform/current/RELEASE.json"
 RUN_ROOT_BASE = Path("/opt/oldsparky/platform/shared/production-retained-matrix")
@@ -74,6 +75,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--recovery-workflow-sha")
     parser.add_argument("--recovery-helper-sha256")
     parser.add_argument("--expected-runner-sha")
+    parser.add_argument("--terminal-run-status")
+    parser.add_argument("--terminal-run-conclusion")
+    parser.add_argument("--terminal-run-workflow-id")
+    parser.add_argument("--terminal-run-head-sha")
+    parser.add_argument("--terminal-run-job-count")
+    parser.add_argument("--terminal-run-failure-job-count")
+    parser.add_argument("--terminal-run-projection-sha256")
     parser.add_argument("confirmation", nargs="?")
     parser.add_argument("target_sha", nargs="?")
     parser.add_argument("load_run_id", nargs="?")
@@ -621,6 +629,224 @@ def _retained_lock_is_clear() -> bool:
         return False
 
 
+def _open_held_canonical_lock(path: str) -> int:
+    """Acquire one existing production lock after validating its fixed inode."""
+
+    lock_path = Path(path)
+    parent = Path("/run/lock")
+    try:
+        parent_meta = parent.lstat()
+        if (
+            parent.is_symlink()
+            or not stat.S_ISDIR(parent_meta.st_mode)
+            or parent_meta.st_uid != 0
+            or parent.resolve(strict=True) != parent
+            or ((stat.S_IMODE(parent_meta.st_mode) & 0o022) and not (stat.S_IMODE(parent_meta.st_mode) & stat.S_ISVTX))
+        ):
+            raise RuntimeError("canonical lock directory is unsafe")
+        before = lock_path.lstat()
+        if (
+            lock_path.parent != parent
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_uid != 0
+            or before.st_gid != 0
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o600
+        ):
+            raise RuntimeError("canonical lock file is unsafe")
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            or opened.st_uid != 0
+            or opened.st_gid != 0
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+        ):
+            raise RuntimeError("canonical lock identity changed")
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        after = lock_path.lstat()
+        if (
+            (after.st_dev, after.st_ino, after.st_mode, after.st_uid, after.st_gid, after.st_nlink)
+            != (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid, opened.st_gid, opened.st_nlink)
+        ):
+            raise RuntimeError("canonical lock identity changed after acquisition")
+        return descriptor
+    except BaseException:
+        if "descriptor" in locals():
+            os.close(descriptor)
+        raise
+
+
+def _acquire_recovery_lock_pair() -> tuple[int, int]:
+    """Hold canonical release then retained-load locks through reconciliation."""
+
+    release_descriptor = _open_held_canonical_lock(RELEASE_LOCK_PATH)
+    try:
+        retained_descriptor = _open_held_canonical_lock(LOCK_PATH)
+    except BaseException:
+        fcntl.flock(release_descriptor, fcntl.LOCK_UN)
+        os.close(release_descriptor)
+        raise
+    return release_descriptor, retained_descriptor
+
+
+def _close_recovery_lock_pair(descriptors: tuple[int, int]) -> None:
+    for descriptor in reversed(descriptors):
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _reconcile_missing_supervisor_exit(
+    *,
+    args: argparse.Namespace,
+    expected_runner_sha: str,
+    binding_before: dict[str, object],
+    roots_before: set[int],
+    tree_before: set[int],
+    scan_errors_before: int,
+    terminal_controller: dict[str, object],
+    termination_signals: list[str],
+) -> dict[str, object]:
+    """Prove exact run closure without inventing a missing supervisor status."""
+
+    descriptors = _acquire_recovery_lock_pair()
+    try:
+        try:
+            release_payload = Path(RELEASE_PATH).read_text(encoding="utf-8")
+            release_sha = str(json.loads(release_payload).get("source_git_commit") or "")
+        except (OSError, UnicodeError, ValueError, TypeError) as exc:
+            raise RuntimeError("active production release metadata is unreadable under recovery locks") from exc
+        if release_sha != args.target_sha:
+            raise RuntimeError("active production release changed before missing-exit reconciliation")
+
+        first_roots, first_tree, first_errors, _first_identities = _process_state(args.load_run_id)
+        separation_started_ns = time.monotonic_ns()
+        time.sleep(0.1)
+        second_scan_started_ns = time.monotonic_ns()
+        post_scan_separation_ms = (second_scan_started_ns - separation_started_ns) // 1_000_000
+        second_roots, second_tree, second_errors, _second_identities = _process_state(args.load_run_id)
+        binding_after = _diagnostic_abort_binding(
+            args.load_run_id, args.load_run_attempt, args.target_sha, expected_runner_sha
+        )
+        if (
+            not _binding_matches_abort(
+                binding_after,
+                run_id=args.load_run_id,
+                run_attempt=args.load_run_attempt,
+                target_sha=args.target_sha,
+                expected_runner_sha=expected_runner_sha,
+            )
+            or binding_after != binding_before
+            or first_errors != 0
+            or second_errors != 0
+            or first_roots
+            or first_tree
+            or second_roots
+            or second_tree
+            or not 100 <= post_scan_separation_ms <= 5000
+            or _supervisor_exit_code(args.load_run_id) is not None
+        ):
+            raise RuntimeError("missing-exit exact load closure failed under recovery locks")
+
+        return {
+            "schema": 2,
+            "status": "safe_for_exact_fixture_cleanup",
+            "fixture_kind": binding_after["fixture_kind"],
+            "external_run_id": args.load_run_id,
+            "external_run_attempt": binding_after["external_run_attempt"],
+            "source_sha": binding_after["source_sha"],
+            "app_target_sha": binding_after["app_target_sha"],
+            "input_handoff_sha256": binding_after["input_handoff_sha256"],
+            "fixture_manifest_sha256": binding_after["fixture_manifest_sha256"],
+            "remote_stage": (
+                "run_owned_process_tree_stopped_without_exit_record"
+                if roots_before
+                else "run_owned_process_tree_already_absent_without_exit_record"
+            ),
+            "run_owned_process_selector": "fixed_script_paths_run_root_and_run_id",
+            "run_owned_roots_before": len(roots_before),
+            "run_owned_processes_before": len(tree_before),
+            "run_owned_roots_after": 0,
+            "run_owned_processes_after": 0,
+            "run_owned_roots_after_scan_1": 0,
+            "run_owned_processes_after_scan_1": 0,
+            "run_owned_roots_after_scan_2": 0,
+            "run_owned_processes_after_scan_2": 0,
+            "post_abort_scan_count": 2,
+            "post_scan_separation_ms": post_scan_separation_ms,
+            "proc_read_errors": scan_errors_before + first_errors + second_errors,
+            "supervisor_exit_record_present": False,
+            "supervisor_exit_code": None,
+            "termination_signals": termination_signals,
+            "release_lock_held": True,
+            "retained_lock_held": True,
+            "recovery_lock_order": ["release", "retained"],
+            "recovery_locks_held_through_scans_and_revalidation": True,
+            "binding_revalidated": True,
+            "active_release_sha": release_sha,
+            "shared_lock_clear": True,
+            "namespace_closed": False,
+            "terminal_controller": terminal_controller,
+            "recovery_workflow_sha": args.recovery_workflow_sha,
+            "recovery_helper_sha256": args.recovery_helper_sha256,
+        }
+    finally:
+        _close_recovery_lock_pair(descriptors)
+
+
+def _terminal_controller(args: argparse.Namespace, expected_runner_sha: str) -> dict[str, object] | None:
+    fields = (
+        args.terminal_run_status,
+        args.terminal_run_conclusion,
+        args.terminal_run_workflow_id,
+        args.terminal_run_head_sha,
+        args.terminal_run_job_count,
+        args.terminal_run_failure_job_count,
+        args.terminal_run_projection_sha256,
+    )
+    if all(value is None for value in fields):
+        return None
+    if any(value is None for value in fields):
+        raise SystemExit("exact terminal load controller evidence is incomplete")
+    workflow_id = args.terminal_run_workflow_id
+    job_count = args.terminal_run_job_count
+    failure_count = args.terminal_run_failure_job_count
+    if (
+        args.terminal_run_status != "completed"
+        or args.terminal_run_conclusion != "failure"
+        or re.fullmatch(r"[1-9][0-9]{0,19}", workflow_id or "") is None
+        or args.terminal_run_head_sha != expected_runner_sha
+        or re.fullmatch(r"[1-9][0-9]{0,2}", job_count or "") is None
+        or re.fullmatch(r"[1-9][0-9]{0,2}", failure_count or "") is None
+        or int(job_count or "0") > 100
+        or int(failure_count or "0") > int(job_count or "0")
+        or re.fullmatch(r"[0-9a-f]{64}", args.terminal_run_projection_sha256 or "") is None
+    ):
+        raise SystemExit("exact terminal load controller evidence is invalid")
+    return {
+        "schema": 1,
+        "repository": "StrayForest/old_sparky",
+        "workflow_path": ".github/workflows/platform-production-external-load.yml",
+        "event": "workflow_dispatch",
+        "head_branch": "dev",
+        "run_id": args.load_run_id,
+        "run_attempt": args.load_run_attempt,
+        "workflow_id": int(workflow_id),
+        "status": args.terminal_run_status,
+        "conclusion": args.terminal_run_conclusion,
+        "head_sha": args.terminal_run_head_sha,
+        "actor_matches_abort_dispatch": True,
+        "jobs_complete": True,
+        "job_count": int(job_count),
+        "failure_job_count": int(failure_count),
+        "projection_sha256": args.terminal_run_projection_sha256,
+    }
+
+
 def _supervisor_exit_code(run_id: str) -> int | None:
     directory = SUPERVISOR_EXPORT_BASE / f"{LOAD_PREFIX}{run_id}"
     name = "supervisor.exit"
@@ -836,6 +1062,13 @@ def main() -> int:
             or args.recovery_workflow_sha is not None
             or args.recovery_helper_sha256 is not None
             or args.expected_runner_sha is not None
+            or args.terminal_run_status is not None
+            or args.terminal_run_conclusion is not None
+            or args.terminal_run_workflow_id is not None
+            or args.terminal_run_head_sha is not None
+            or args.terminal_run_job_count is not None
+            or args.terminal_run_failure_job_count is not None
+            or args.terminal_run_projection_sha256 is not None
             or RUN_ID_RE.fullmatch(args.verify_no_active_run) is None
         ):
             raise SystemExit("exact retained-load activity check input is invalid")
@@ -887,6 +1120,23 @@ def main() -> int:
         raise SystemExit("staged recovery helper identity is required")
     if IS_ROOT_STAGED_HELPER and args.expected_runner_sha is None:
         raise SystemExit("staged recovery helper requires the selected run's runner SHA")
+    terminal_controller = _terminal_controller(args, expected_runner_sha)
+    if terminal_controller is not None:
+        if args.recovery_workflow_sha is None or args.recovery_helper_sha256 is None:
+            raise SystemExit("terminal recovery evidence requires the staged source-bound helper")
+        binding_before = _diagnostic_abort_binding(
+            args.load_run_id, args.load_run_attempt, args.target_sha, expected_runner_sha
+        )
+        if not _binding_matches_abort(
+            binding_before,
+            run_id=args.load_run_id,
+            run_attempt=args.load_run_attempt,
+            target_sha=args.target_sha,
+            expected_runner_sha=expected_runner_sha,
+        ):
+            raise SystemExit("terminal recovery marker is not bound to the exact load attempt")
+    else:
+        binding_before = None
 
     try:
         release_payload = Path(RELEASE_PATH).read_text(encoding="utf-8")
@@ -924,10 +1174,25 @@ def main() -> int:
             or tree
             or roots_after
             or tree_after
-            or exit_code is None
+            or (exit_code is None and terminal_controller is None)
             or not lock_clear
         ):
             raise RuntimeError("exact retained-load abort reconciliation failed closed")
+        if exit_code is None:
+            assert terminal_controller is not None and binding_before is not None
+            receipt = _reconcile_missing_supervisor_exit(
+                args=args,
+                expected_runner_sha=expected_runner_sha,
+                binding_before=binding_before,
+                roots_before=roots,
+                tree_before=tree,
+                scan_errors_before=scan_errors_before,
+                terminal_controller=terminal_controller,
+                termination_signals=[],
+            )
+            print("Exact terminal load attempt reconciled under both canonical locks; no exit status was recorded.")
+            print(f"ABORT_ONLY_JSON={json.dumps(receipt, ensure_ascii=True, sort_keys=True, separators=(',', ':'))}")
+            return 0
         abort_only = {
             "schema": 1,
             "status": "safe_for_exact_fixture_cleanup",
@@ -966,6 +1231,7 @@ def main() -> int:
     snapshot = process_snapshot(tree)
     print("Exact process snapshot:")
     print(snapshot, end="" if snapshot.endswith("\n") else "\n")
+    termination_signals = ["SIGTERM"]
     signal_tree(tree, identities_before, signal.SIGTERM)
     deadline = time.monotonic() + 30.0
     remaining = alive(tree)
@@ -974,6 +1240,7 @@ def main() -> int:
         remaining = alive(tree)
     if remaining:
         print(f"Escalating SIGKILL for exact remaining process(es): {len(remaining)}")
+        termination_signals.append("SIGKILL")
         signal_tree(remaining, identities_before, signal.SIGKILL)
         time.sleep(0.5)
     remaining = alive(tree)
@@ -991,6 +1258,33 @@ def main() -> int:
     lock_clear = _retained_lock_is_clear()
     abort_only = None
     if (
+        exit_code is None
+        and terminal_controller is not None
+        and binding_before is not None
+        and binding is not None
+        and _binding_matches_abort(
+            binding,
+            run_id=args.load_run_id,
+            run_attempt=args.load_run_attempt,
+            target_sha=args.target_sha,
+            expected_runner_sha=expected_runner_sha,
+        )
+        and scan_errors_before == 0
+        and scan_errors_after == 0
+        and not roots_after
+        and not tree_after
+    ):
+        abort_only = _reconcile_missing_supervisor_exit(
+            args=args,
+            expected_runner_sha=expected_runner_sha,
+            binding_before=binding_before,
+            roots_before=roots,
+            tree_before=tree,
+            scan_errors_before=scan_errors_before,
+            terminal_controller=terminal_controller,
+            termination_signals=termination_signals,
+        )
+    elif (
         binding is not None
         and scan_errors_before == 0
         and scan_errors_after == 0
@@ -1025,6 +1319,9 @@ def main() -> int:
             abort_only["recovery_helper_sha256"] = args.recovery_helper_sha256
     export_dir = export_abort_evidence(args.load_run_id, snapshot, abort_only=abort_only)
     print(f"ABORT_EVIDENCE_EXPORT={export_dir}")
+    if abort_only is None:
+        print("RETAINED_LOAD_ABORT status=stopped_without_verified_cleanup_receipt")
+        return 1
     print(f"ABORTED_PRODUCTION_RETAINED_LOAD={args.load_run_id}")
     return 0
 
