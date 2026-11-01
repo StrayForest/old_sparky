@@ -2560,7 +2560,7 @@ jobs:
           source_security_attempt_url = validate_recovery_source_security_gates(
               security_workflow, security_run, security_jobs, security_statuses,
               expected_run_id=int(security_id), expected_attempt=int(security_attempt),
-              expected_target_sha=target,
+              expected_target_sha=target, route_manifest=incremental,
           )
           digest = hashlib.sha256(json.dumps(cumulative["manifest"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
           with Path(output).open("a", encoding="ascii") as stream:
@@ -2915,7 +2915,10 @@ jobs:
           root_python_ldd="$(sudo env -i HOME=/root PATH=/usr/bin:/bin \
             LD_LIBRARY_PATH="$root_python_prefix/lib" /usr/bin/ldd "$root_runtime_python_real")"
           grep -Fq "libpython3.12.so.1.0 => $root_python_prefix/lib/libpython3.12.so.1.0" <<<"$root_python_ldd"
-          ! grep -Fq "not found" <<<"$root_python_ldd"
+          if grep -Fq "not found" <<<"$root_python_ldd"; then
+            echo "Release builder Python runtime has an unresolved shared-library dependency." >&2
+            exit 1
+          fi
           root_python_contract="$(sudo env -i HOME=/root PATH=/usr/bin:/bin \
             LD_LIBRARY_PATH="$root_python_prefix/lib" "$root_runtime_python" -I \
             -c 'import platform,sys; print(f"{sys.version_info[0]}.{sys.version_info[1]} {sys.platform} {platform.machine()}")')"

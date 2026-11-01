@@ -3058,6 +3058,19 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 route_manifest=recovery_route,
             )
 
+        deploy_workflow = (WORKFLOW_DIR / "platform-production-deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertRegex(
+            deploy_workflow,
+            re.compile(
+                r"validate_recovery_source_security_gates\(\s*"
+                r"security_workflow, security_run, security_jobs, security_statuses,\s*"
+                r"expected_run_id=int\(security_id\), expected_attempt=int\(security_attempt\),\s*"
+                r"expected_target_sha=target, route_manifest=incremental,\s*\)"
+            ),
+        )
+
         for changed_run in (
             {**run, "run_attempt": attempt + 1},
             {**run, "head_sha": "b" * 40},
