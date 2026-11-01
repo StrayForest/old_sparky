@@ -18,12 +18,15 @@ belong in the linked owner documents below.
   or matrix credit. Its exact fixture was closed through the canonical abort
   and cleanup workflows. The profile phase reported `invalid_profile`; this is
   not a passing measurement or a server-wide capacity result.
-- A bounded profile-rejection projection and a category-total conservation
-  correction are in source review. Raw fixture-manifest artifacts must use the
-  reviewed encrypted transport because they contain synthetic session
-  credentials. Do not dispatch another load until these changes pass exact-head
-  CI, the source-bound host-tools generation is updated and deployed, and the
-  fresh profile-A readiness checks pass. Use the
+- The reviewed profile-rejection and API category-conservation source candidate
+  is `5a8d4c69e208d096af418f67dfba1ef1cf630aa0`; its pin-only successor is
+  `5c17be7362e19ca786eefb89d3bf38f2482ab048`. Exact-head CI, encrypted
+  credential transport review, source-bound host-tools provisioning and fresh
+  profile-A readiness are still pending. Raw fixture-manifest artifacts must
+  use the reviewed encrypted transport because they contain synthetic session
+  credentials. Do not dispatch another load until the integrated source passes
+  exact-head CI, its host-tools generation is deployed, and fresh profile-A
+  readiness passes. Use the
   [SSR capacity diagnostic runbook](ssr-capacity-diagnostic-runbook.md) for
   dispatch, acceptance, abort and cleanup.
 - Source-bound backup admission requires one successful producer bound to the
