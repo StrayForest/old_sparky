@@ -1,18 +1,14 @@
 from __future__ import annotations
 
 import cProfile
-from pathlib import Path
 import pstats
-import sys
+from pathlib import Path
 import time
 import unittest
 from unittest.mock import patch
 
 
-PLATFORM_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PLATFORM_ROOT / "python_packages"))
-
-from platform_infra import performance_diagnostic as api_diagnostic
+from python_packages.platform_infra import performance_diagnostic as api_diagnostic
 from tools import platform_cpu_diagnostic_pair as cpu_pair
 from tools import platform_cpu_diagnostic_plan as cpu_plan
 from tools import platform_ssr_capacity_diagnostic as ssr_diagnostic
