@@ -32,32 +32,50 @@ fails closed and the canonical manual cleanup route remains available.
 
 ## Provision the fixture-only identity
 
-After reviewing the recipient change, run this from the repository root. It
-creates an ephemeral identity, verifies the public recipient and streams the
-private key directly to the authenticated GitHub CLI. Do not display or copy
-the identity into a command argument, shell history, log or file outside this
-private directory.
+For the current recipient, provision the already-prepared matching identity; do
+not generate a new random key and compare it with the fixed recipient. The
+private identity file must remain outside the repository. The command below
+accepts its path interactively, verifies its owner/mode/link count and derived
+public recipient, and sends only the private key line to GitHub CLI over stdin.
+It never prints the key or copies it to another file.
 
 ```bash
 set -euo pipefail
 umask 077
+read -r -p "Path to the existing private age identity file: " identity_file
+[[ "$identity_file" = /* ]]
+test "$(stat -c '%F:%h:%a:%u' -- "$identity_file")" = "regular file:1:600:$(id -u)"
+test "$(stat -c '%F:%a:%u' -- "$(dirname -- "$identity_file")")" = "directory:700:$(id -u)"
+test "$(stat -c '%s' -- "$identity_file")" -le 4096
 identity_dir="$(mktemp -d)"
 chmod 700 "$identity_dir"
 trap 'rm -rf -- "$identity_dir"' EXIT
 python3 platform/tools/platform_fixture_credential_transport.py install-age --directory "$identity_dir" >/dev/null
-"$identity_dir/age-keygen" -o "$identity_dir/identity.txt" 2>/dev/null
-chmod 600 "$identity_dir/identity.txt"
-test "$("$identity_dir/age-keygen" -y "$identity_dir/identity.txt")" = \
-  "age1egptr8zhhvfe0ggmyu4cr9azhfsjpvvn3p5eyppznnzx8c5yedjsyeaasa"
-gh secret set FIXTURE_MANIFEST_AGE_IDENTITY --env fixture-manifest < "$identity_dir/identity.txt"
-gh secret set FIXTURE_MANIFEST_AGE_IDENTITY --env production < "$identity_dir/identity.txt"
+recipient="$("$identity_dir/age-keygen" -y "$identity_file")"
+test "$recipient" = "age1egptr8zhhvfe0ggmyu4cr9azhfsjpvvn3p5eyppznnzx8c5yedjsyeaasa"
+key_lines="$(awk '/^AGE-SECRET-KEY-1/ && length($0)==74 { n++ } END { print n+0 }' "$identity_file")"
+test "$key_lines" = 1
+gh secret set FIXTURE_MANIFEST_AGE_IDENTITY --env fixture-manifest < <(awk '/^AGE-SECRET-KEY-1/ && length($0)==74 { print }' "$identity_file")
+gh secret set FIXTURE_MANIFEST_AGE_IDENTITY --env production < <(awk '/^AGE-SECRET-KEY-1/ && length($0)==74 { print }' "$identity_file")
 ```
 
-Configure `fixture-manifest` to allow only the `dev` branch. Keep the
-`FIXTURE_MANIFEST_AGE_IDENTITY` secret value in both named environments and
-never add it to repository secrets. Rotation requires a reviewed recipient
-change and updating both environment secrets together. Do not create or change
-environment secrets until the source change is reviewed.
+Restrict the `fixture-manifest` environment to the `dev` branch. Keep
+`FIXTURE_MANIFEST_AGE_IDENTITY` only in that environment and the existing
+`production` environment, never as a repository secret. The same fixture-only
+identity is needed by production fixture setup, the CPU diagnostic and trusted
+finalization; it is separate from SSH and Cloudflare credentials. Do not change
+existing production environment protections as part of this setup.
+
+For first-time bootstrap or rotation, generate a new identity in a private
+mode-`0700` directory and derive its public recipient with the pinned
+`age-keygen -y`. Review and update the checked-in recipient and its tests in a
+source change, pass CI, and deploy that source before provisioning the matching
+private key with the command above. Never compare a newly generated random
+recipient against the current fixed recipient or provision a key that the
+active source cannot decrypt.
+
+Do not create or change environment secrets until the source change is
+reviewed.
 
 ## Failure handling and evidence
 
