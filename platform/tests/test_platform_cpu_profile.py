@@ -5304,7 +5304,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 self.calls.append((delay, callback))
                 return object()
 
-        for scenario in ("late", "stale", "validation_late", "missing"):
+        for scenario in (
+            "late", "stale", "validation_late", "constructor_late",
+            "enable_late", "missing",
+        ):
             with self.subTest(scenario=scenario):
                 payload = _diagnostic_payload()
                 payload.update({
@@ -5367,17 +5370,47 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                         clock["now_ms"] = plan.on_start_ms + 251
                     return current
 
+                profiles = []
+
+                class FakeProfile:
+                    def __init__(self) -> None:
+                        self.disabled = False
+
+                    def enable(self) -> None:
+                        if scenario == "enable_late":
+                            clock["now_ms"] = plan.on_start_ms + 251
+
+                    def disable(self) -> None:
+                        self.disabled = True
+
+                def create_profile(**_kwargs):
+                    profile = FakeProfile()
+                    profiles.append(profile)
+                    if scenario == "constructor_late":
+                        clock["now_ms"] = plan.on_start_ms + 251
+                    return profile
+
                 with (
                     patch.object(
                         diagnostic_module, "_read_process_plan_uncached",
                         side_effect=revalidate_plan,
                     ),
                     patch.object(diagnostic_module.time, "time_ns", side_effect=lambda: clock["now_ms"] * 1_000_000),
+                    patch.object(
+                        diagnostic_module.cProfile, "Profile",
+                        side_effect=create_profile,
+                    ),
                 ):
                     loop.calls[2][1]()
                 self.assertNotIn(plan.run_id, diagnostic_module._profile_windows_scheduled)
                 self.assertIn(plan.run_id, diagnostic_module._consumed_run_ids)
                 self.assertIsNone(diagnostic_module._active_profile)
+                if scenario in {"constructor_late", "enable_late"}:
+                    self.assertEqual(len(profiles), 1)
+                    self.assertEqual(
+                        profiles[0].disabled,
+                        scenario == "enable_late",
+                    )
                 with (
                     patch.object(diagnostic_module, "read_process_plan", return_value=plan),
                     patch.object(diagnostic_module, "_start_cpu_usage_window"),
@@ -5397,7 +5430,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         # prearm contract case in this test (and from later test methods).
         scenario_keys = {
             hashlib.sha256(scenario.encode()).hexdigest()[:32]
-            for scenario in ("late", "stale", "validation_late", "missing")
+            for scenario in (
+                "late", "stale", "validation_late", "constructor_late",
+                "enable_late", "missing",
+            )
         }
         diagnostic_module._profile_windows_scheduled.difference_update(scenario_keys)
         diagnostic_module._consumed_run_ids.difference_update(scenario_keys)

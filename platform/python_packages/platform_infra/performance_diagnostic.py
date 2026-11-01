@@ -849,26 +849,42 @@ class ApiCpuDiagnostic:
         """Start one bounded API profile on the current event-loop thread."""
 
         global _active_profile
-        start_lag_ms = now_ms - plan.on_start_ms
         if (plan.workload not in PROFILE_WORKLOADS
                 or plan.phase_at(now_ms) != "on"
-                or not 0 <= start_lag_ms <= CPU_WINDOW_TOLERANCE_MS
                 or plan.run_id in _consumed_run_ids
                 or _active_profile is not None):
             _consumed_run_ids.add(plan.run_id)
             return False
-        remaining_seconds = (plan.on_end_ms - now_ms) / 1000
-        if remaining_seconds <= 0:
-            _consumed_run_ids.add(plan.run_id)
-            return False
         diagnostic = cls(plan)
         diagnostic.profile = cProfile.Profile(timer=time.thread_time_ns, timeunit=1e-9)
+        # Constructing the profiler can take time. Validate its start boundary
+        # after construction, then conservatively recheck after enable below.
+        prepared_ms = time.time_ns() // 1_000_000
+        prepared_lag_ms = prepared_ms - plan.on_start_ms
+        if (plan.phase_at(prepared_ms) != "on"
+                or not 0 <= prepared_lag_ms <= CPU_WINDOW_TOLERANCE_MS):
+            _consumed_run_ids.add(plan.run_id)
+            return False
         diagnostic.loop = loop
         diagnostic.started_monotonic = time.monotonic()
-        diagnostic.start_lag_ms = start_lag_ms
+        diagnostic.start_lag_ms = prepared_lag_ms
         _consumed_run_ids.add(plan.run_id)
         _active_profile = diagnostic
         diagnostic.profile.enable()
+        # Record a conservative timestamp after enable: scheduler delays and
+        # profiler activation time count against the fixed 250 ms allowance.
+        enabled_ms = time.time_ns() // 1_000_000
+        enabled_lag_ms = enabled_ms - plan.on_start_ms
+        remaining_seconds = (plan.on_end_ms - enabled_ms) / 1000
+        if (plan.phase_at(enabled_ms) != "on"
+                or not 0 <= enabled_lag_ms <= CPU_WINDOW_TOLERANCE_MS
+                or remaining_seconds <= 0):
+            diagnostic.profile.disable()
+            diagnostic.stopped = True
+            if _active_profile is diagnostic:
+                _active_profile = None
+            return False
+        diagnostic.start_lag_ms = enabled_lag_ms
         diagnostic.stop_handle = loop.call_later(remaining_seconds, diagnostic.stop)
         logger.info("cpu_diagnostic_started service=api run_id=%s", plan.run_id)
         return True
