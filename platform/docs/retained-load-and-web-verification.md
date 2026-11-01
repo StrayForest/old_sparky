@@ -217,17 +217,200 @@ and SSH removal use `always()`, but any failed row below keeps the run failed:
 | handoffs/artifacts/SSH | exact SHA/run/attempt/digest; cleanup statuses `0` |
 | evaluation/projection | observer-bound accepted result, structurally complete profile-budget miss, or closed known-status failure; `sanitizer_status=0` |
 
-Load and CPU/SSR diagnostic jobs derive `SOURCE_BINDING_BASE64` and
-`SOURCE_BINDING_SHA256` from the exact downloaded external-load input by running
-`platform/tools/platform_load.py export-source-binding-env` with that input,
-the matching fixture manifest, `SOURCE_GIT_SHA` and `APP_TARGET_SHA`. The helper
-revalidates the closed handoff and verifies the manifest with the ordinary
-external-load parser before emitting the two values to `$GITHUB_ENV`. The
-diagnostic parent, isolated worker and sanitizer inherit these values; the
-worker receives them only through its explicit environment allowlist. Do not
-set or copy source-binding values manually. A missing or mismatched runner/app
-binding stops before measurement or report acceptance; an empty binding is
-valid only when runner and app SHAs are identical.
+Load-client and CPU/SSR diagnostic jobs run `platform/tools/platform_load.py
+export-source-binding-env` against the exact downloaded input and matching
+manifest, bound to `SOURCE_GIT_SHA` and `APP_TARGET_SHA`. It validates the
+closed handoff and ordinary manifest parser before emitting two values.
+Load-client captures them in a private temporary file and passes them via its
+same-step `env -i` call; `$GITHUB_ENV` affects later steps only. Diagnostic-pair
+appends them before parent and sanitizer steps. The worker gets them through
+its explicit allowlist; never set them manually. Missing or mismatched binding
+stops measurement or acceptance; empty binding is valid only when runner and
+app SHAs are identical.
+
+### Retrieve a bounded SSR failure artifact
+
+Fingerprint and sanitizer artifacts expire after one day. Use the authenticated GitHub API procedure below to verify the exact attempt and ZIP before reading the sole bounded member; repeat if both exist.
+
+~~~bash
+set -euo pipefail
+umask 077
+load_run_id="<exact-load-run-id>"
+load_run_attempt="<exact-load-attempt>"
+load_source_sha="<exact-load-runner-source-sha>"
+artifact_kind="fingerprint" # or sanitizer
+[[ "$load_run_id" =~ ^[1-9][0-9]{0,31}$ ]]
+[[ "$load_run_attempt" =~ ^[1-9][0-9]{0,31}$ ]]
+[[ "$load_source_sha" =~ ^[0-9a-f]{40}$ ]]
+case "$artifact_kind" in
+  fingerprint)
+    artifact_prefix="platform-production-ssr-capacity-fingerprint"
+    member_name="failure-fingerprint.json"; member_limit=16384 ;;
+  sanitizer)
+    artifact_prefix="platform-production-ssr-sanitizer-rejection"
+    member_name="sanitizer-failure.json"; member_limit=262144 ;;
+  *) echo "unknown artifact kind" >&2; exit 2 ;;
+esac
+artifact_name="$artifact_prefix-$load_run_id-$load_run_attempt"
+private_dir="$(mktemp -d /tmp/ssr-failure-artifact.XXXXXX)"
+chmod 700 "$private_dir"
+run_file="$private_dir/run.json"
+list_file="$private_dir/artifacts.json"
+detail_file="$private_dir/artifact.json"
+archive="$private_dir/artifact.zip"
+member_file="$private_dir/$member_name"
+gh api --repo StrayForest/old_sparky \
+  "repos/StrayForest/old_sparky/actions/runs/$load_run_id/attempts/$load_run_attempt" > "$run_file"
+gh api --repo StrayForest/old_sparky \
+  "repos/StrayForest/old_sparky/actions/runs/$load_run_id/artifacts?per_page=100&page=1" > "$list_file"
+fields="$(/usr/bin/python3 -I -B - "$run_file" "$list_file" "$load_run_id" \
+  "$load_run_attempt" "$load_source_sha" "$artifact_name" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+run_path, list_path, run_id, attempt, source, name = sys.argv[1:]
+run = json.loads(Path(run_path).read_text())
+listing = json.loads(Path(list_path).read_text())
+if (not isinstance(run, dict) or type(run.get("id")) is not int
+        or type(run.get("run_attempt")) is not int or run.get("id") != int(run_id)
+        or run.get("run_attempt") != int(attempt)
+        or run.get("head_sha") != source or run.get("head_branch") != "dev"
+        or run.get("path") != ".github/workflows/platform-production-external-load.yml"
+        or run.get("event") != "workflow_dispatch" or run.get("status") != "completed"
+        or run.get("conclusion") != "failure"):
+    raise SystemExit("exact failed load attempt does not match")
+rows = listing.get("artifacts") if isinstance(listing, dict) else None
+if (not isinstance(rows, list) or type(listing.get("total_count")) is not int
+        or listing["total_count"] != len(rows) or not 0 < len(rows) <= 100):
+    raise SystemExit("artifact listing is incomplete or exceeds the page bound")
+matches = [row for row in rows if isinstance(row, dict) and row.get("name") == name]
+if len(matches) != 1:
+    raise SystemExit("exact failure artifact is missing or ambiguous")
+a = matches[0]
+w = a.get("workflow_run")
+if (type(a.get("id")) is not int or a["id"] <= 0
+        or type(a.get("size_in_bytes")) is not int or not 0 < a["size_in_bytes"] <= 4*1024*1024
+        or a.get("expired") is not False or not isinstance(a.get("digest"), str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", a["digest"]) is None
+        or not isinstance(w, dict) or type(w.get("id")) is not int
+        or w.get("id") != int(run_id) or w.get("head_sha") != source
+        or ("run_attempt" in w and (type(w["run_attempt"]) is not int
+                                      or w["run_attempt"] != int(attempt)))):
+    raise SystemExit("artifact metadata is not bound to the exact attempt")
+print(a["id"], a["size_in_bytes"], a["digest"][7:])
+PY
+)"
+read -r artifact_id api_size api_sha <<< "$fields"
+gh api --repo StrayForest/old_sparky \
+  "repos/StrayForest/old_sparky/actions/artifacts/$artifact_id" > "$detail_file"
+gh api --repo StrayForest/old_sparky \
+  "repos/StrayForest/old_sparky/actions/artifacts/$artifact_id/zip" > "$archive"
+/usr/bin/python3 -I -B - "$detail_file" "$archive" "$member_file" \
+  "$artifact_id" "$artifact_name" "$load_run_id" "$load_run_attempt" \
+  "$load_source_sha" "$api_size" "$api_sha" "$member_name" "$member_limit" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import zipfile
+detail_path, archive_path, member_path, artifact_id, name, run_id, attempt, source, size, digest, member, limit = sys.argv[1:]
+a = json.loads(Path(detail_path).read_text())
+w = a.get("workflow_run")
+if (type(a.get("id")) is not int or a.get("id") != int(artifact_id)
+        or a.get("name") != name
+        or a.get("size_in_bytes") != int(size) or a.get("digest") != "sha256:" + digest
+        or a.get("expired") is not False or not isinstance(w, dict)
+        or type(w.get("id")) is not int or w.get("id") != int(run_id)
+        or w.get("head_sha") != source
+        or ("run_attempt" in w and (type(w["run_attempt"]) is not int
+                                      or w["run_attempt"] != int(attempt)))):
+    raise SystemExit("artifact detail does not match exact API listing/run")
+raw = Path(archive_path).read_bytes()
+if (len(raw) != int(size) or len(raw) > 4*1024*1024
+        or hashlib.sha256(raw).hexdigest() != digest):
+    raise SystemExit("outer ZIP size or digest mismatch")
+with zipfile.ZipFile(archive_path) as z:
+    rows = z.infolist()
+    if len(rows) != 1 or rows[0].filename != member:
+        raise SystemExit("ZIP member set is not exact")
+    info = rows[0]
+    if (info.is_dir() or stat.S_IFMT(info.external_attr >> 16) not in (0, stat.S_IFREG)
+            or info.file_size <= 0 or info.file_size > int(limit)):
+        raise SystemExit("ZIP member type or size is invalid")
+    with z.open(info) as source_file:
+        data = source_file.read(int(limit) + 1)
+        if len(data) > int(limit) or source_file.read(1):
+            raise SystemExit("ZIP member exceeds its bound")
+if len(data) != info.file_size:
+    raise SystemExit("ZIP member length is inconsistent")
+fd = os.open(member_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+try:
+    with os.fdopen(fd, "wb", closefd=False) as output:
+        output.write(data); output.flush(); os.fsync(output.fileno())
+finally:
+    os.close(fd)
+print(f"verified {name}; extracted only {member} ({len(data)} bytes)")
+PY
+python3 - "$artifact_kind" "$member_file" "$load_run_id" "$load_run_attempt" "$load_source_sha" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+kind, path, run_id, attempt, source = sys.argv[1:]
+p = json.loads(Path(path).read_text(encoding="ascii"))
+if kind == "fingerprint":
+    if (not isinstance(p, dict) or p.get("event") != "ssr_capacity_composite_parent_fingerprint"
+            or p.get("workload") != "authenticated_html_ssr_capacity_120s_plus_cpu_profile_20s_v1"
+            or p.get("external_run_id") != run_id or p.get("external_run_attempt") != attempt
+            or p.get("source_sha") != source
+            or re.fullmatch(r"[0-9a-f]{40}", str(p.get("app_target_sha", ""))) is None
+            or p.get("diagnostic_only") is not True
+            or any(p.get(k) is not False for k in ("matrix_credit", "slo_credit", "diagnostic_credit"))):
+        raise SystemExit("fingerprint identity or credit flags are invalid")
+    result = {}
+    phase = p.get("capacity_phase")
+    if isinstance(phase, dict):
+        result["capacity_phase"] = {
+            k: phase[k] for k in ("resource_abort_reason", "control_failure_reason") if k in phase
+        }
+    observer = p.get("memory_observer_failure")
+    if isinstance(observer, dict):
+        result["memory_observer_failure"] = {
+            k: observer.get(k) for k in ("stage", "error_class", "remote_stage", "remote_reason")
+        }
+    print(json.dumps(result, sort_keys=True))
+else:
+    required = {
+        "schema", "event", "workload", "source_sha", "app_target_sha",
+        "external_run_id", "external_run_attempt", "status", "stage", "reason",
+        "section", "field", "present", "value_type", "binding_status",
+        "matrix_credit", "slo_credit", "diagnostic_credit",
+    }
+    optional = {"projection_reason", "missing_known_field_count", "unexpected_field_count"}
+    if not isinstance(p, dict) or not required <= set(p) <= required | optional:
+        raise SystemExit("sanitizer artifact has an unexpected schema")
+    if (type(p.get("schema")) is not int or p["schema"] != 1
+            or p["event"] != "ssr_capacity_sanitizer_rejection"
+            or p["workload"] != "authenticated_html_ssr_capacity_120s_plus_cpu_profile_20s_v1"
+            or p["source_sha"] != source
+            or re.fullmatch(r"[0-9a-f]{40}", str(p["app_target_sha"])) is None
+            or p["external_run_id"] != run_id or p["external_run_attempt"] != attempt
+            or p["status"] != "invalid"
+            or any(p[k] is not False for k in ("matrix_credit", "slo_credit", "diagnostic_credit"))):
+        raise SystemExit("sanitizer rejection identity or credit flags are invalid")
+    if p.get("projection_reason") == "field_set_mismatch" and (
+            type(p.get("missing_known_field_count")) is not int
+            or type(p.get("unexpected_field_count")) is not int):
+        raise SystemExit("sanitizer projection counts are invalid")
+    print("closed sanitizer rejection; all credit flags are false")
+PY
+~~~
+
+Keep this private evidence with the exact run; do not paste JSON into a ticket or job log.
 
 CPU-only and SSR-capacity fixture confirmations are accepted by the trusted
 origin supervisor only for the fixed one-tournament, fourteen-user fixture
