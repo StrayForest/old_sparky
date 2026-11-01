@@ -5304,7 +5304,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 self.calls.append((delay, callback))
                 return object()
 
-        for scenario in ("late", "stale", "missing"):
+        for scenario in ("late", "stale", "validation_late", "missing"):
             with self.subTest(scenario=scenario):
                 payload = _diagnostic_payload()
                 payload.update({
@@ -5361,8 +5361,17 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     self.assertEqual(ApiCpuDiagnostic.activate_for_scope(scope), (None, None))
                 clock["now_ms"] = plan.on_start_ms + (251 if scenario == "late" else 0)
                 current = replacement if replacement is not None else plan
+
+                def revalidate_plan(*_args, **_kwargs):
+                    if scenario == "validation_late":
+                        clock["now_ms"] = plan.on_start_ms + 251
+                    return current
+
                 with (
-                    patch.object(diagnostic_module, "_read_process_plan_uncached", return_value=current),
+                    patch.object(
+                        diagnostic_module, "_read_process_plan_uncached",
+                        side_effect=revalidate_plan,
+                    ),
                     patch.object(diagnostic_module.time, "time_ns", side_effect=lambda: clock["now_ms"] * 1_000_000),
                 ):
                     loop.calls[2][1]()
@@ -5388,7 +5397,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         # prearm contract case in this test (and from later test methods).
         scenario_keys = {
             hashlib.sha256(scenario.encode()).hexdigest()[:32]
-            for scenario in ("late", "stale", "missing")
+            for scenario in ("late", "stale", "validation_late", "missing")
         }
         diagnostic_module._profile_windows_scheduled.difference_update(scenario_keys)
         diagnostic_module._consumed_run_ids.difference_update(scenario_keys)

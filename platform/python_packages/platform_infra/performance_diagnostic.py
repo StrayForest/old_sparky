@@ -1004,6 +1004,9 @@ def _schedule_cpu_profile_window(
         if fresh_plan != plan:
             _consumed_run_ids.add(plan.run_id)
             return
-        ApiCpuDiagnostic._start_for_plan(plan, loop, now_ms=actual_ms)
+        # Identity/release checks can block. Measure the start lag after those
+        # checks so the 250 ms bound reflects when cProfile actually begins.
+        start_ms_now = time.time_ns() // 1_000_000
+        ApiCpuDiagnostic._start_for_plan(plan, loop, now_ms=start_ms_now)
 
     loop.call_later(max(0.0, (start_ms - current_ms) / 1000), start_at_edge)
