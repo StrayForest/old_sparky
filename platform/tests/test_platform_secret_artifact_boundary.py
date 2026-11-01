@@ -396,6 +396,13 @@ class SecretArtifactBoundaryTests(unittest.TestCase):
         self.assertIn("platform-ci-route-", source_gate_text)
         self.assertIn("platform_production_classifier_artifact.py manifest", source_gate_text)
         self.assertIn('--target-sha "$SOURCE_SHA"', source_gate["run"])
+        self.assertIn("--emit-manifest-base64", source_gate["run"])
+        self.assertIn("base64.b64decode", source_gate["run"])
+        self.assertIn("route_manifest=route_manifest", source_gate["run"])
+        self.assertLess(
+            source_gate["run"].index("--emit-manifest-base64"),
+            source_gate["run"].index("validate_recovery_source_security_gates("),
+        )
         self.assertNotIn("--allow-docs-only", source_gate_text)
         self.assertNotIn("--allow-out-of-scope", source_gate_text)
         self.assertEqual(source_gate["env"]["SOURCE_SHA"], "${{ github.sha }}")

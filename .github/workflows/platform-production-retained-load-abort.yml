@@ -148,13 +148,6 @@ jobs:
               or latest_run.get("status") != "completed"
               or latest_run.get("conclusion") != "success"):
               raise SystemExit("supplied Security attempt is not the current successful attempt")
-          sys.path.insert(0, str(Path.cwd() / "platform"))
-          from tools.platform_workflow_provenance import validate_recovery_source_security_gates
-          validate_recovery_source_security_gates(
-              workflow, run, jobs, statuses,
-              expected_run_id=int(run_id), expected_attempt=int(attempt),
-              expected_target_sha=source_sha,
-          )
           producer_rows = [row for row in jobs if isinstance(row, dict)
                            and row.get("name") == "CI route classifier"
                            and row.get("run_id") == int(run_id)
@@ -199,7 +192,44 @@ jobs:
           test "$(stat -c '%s' "$route_archive")" = "$route_artifact_size"
           env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 -I -B \
             platform/tools/platform_production_classifier_artifact.py manifest \
-            "$route_archive" --target-sha "$SOURCE_SHA" >/dev/null
+            "$route_archive" --target-sha "$SOURCE_SHA" --emit-manifest-base64 \
+            > "$metadata/route-manifest.b64"
+          env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 -I -B - \
+            "$metadata" "$SECURITY_RUN_ID" "$SECURITY_RUN_ATTEMPT" "$SOURCE_SHA" <<'PY'
+          import base64
+          import json
+          from pathlib import Path
+          import sys
+
+          metadata = Path(sys.argv[1])
+          run_id, attempt, source_sha = sys.argv[2:]
+          route_manifest = json.loads(
+              base64.b64decode(
+                  (metadata / "route-manifest.b64").read_bytes(),
+                  validate=True,
+              )
+          )
+          workflow = json.loads((metadata / "workflow.json").read_text(encoding="utf-8"))
+          run = json.loads((metadata / "run.json").read_text(encoding="utf-8"))
+          jobs_payload = json.loads((metadata / "jobs.json").read_text(encoding="utf-8"))
+          statuses_payload = json.loads((metadata / "statuses.json").read_text(encoding="utf-8"))
+          jobs = jobs_payload.get("jobs")
+          statuses = statuses_payload.get("statuses") if isinstance(statuses_payload, dict) else statuses_payload
+          if not isinstance(jobs, list) or not isinstance(statuses, list):
+              raise SystemExit("exact Security gate snapshots are malformed")
+          sys.path.insert(0, str(Path.cwd() / "platform"))
+          from tools.platform_workflow_provenance import validate_recovery_source_security_gates
+          validate_recovery_source_security_gates(
+              workflow,
+              run,
+              jobs,
+              statuses,
+              expected_run_id=int(run_id),
+              expected_attempt=int(attempt),
+              expected_target_sha=source_sha,
+              route_manifest=route_manifest,
+          )
+          PY
 
       - name: Resolve the selected external-load runner SHA from its exact attempt
         id: selected-load

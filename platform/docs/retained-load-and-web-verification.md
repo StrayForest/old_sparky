@@ -47,7 +47,13 @@ the unchanged active-release tuple at `S5` (`runtime_required=false`). This
 receipt authorizes the runner-to-app source binding only; it does not deploy
 the app. Then use the abort command in the SSR runbook with `target_sha=S5`,
 the exact failed load run and attempt, and the successful Security run and
-attempt for `R`. After the canonical abort receipt passes, dispatch exact
+attempt for `R`. The abort workflow validates the complete Security job page
+against the exact CI route artifact. Every required gate must pass; only the
+`Conditional release runtime fixture` and `Trusted dev immutable release
+runtime` jobs may be skipped when that validated manifest is the full,
+non-deployable recovery-bootstrap route with `runtime_sensitive=false`.
+Deployable routes require both runtime jobs to pass, and no other skipped gate
+is accepted. After the canonical abort receipt passes, dispatch exact
 cleanup through the same normal source-binding path with runner `R` and app
 target `S5`; the cleanup helper rechecks the active tuple. Stop if the no-op
 receipt is absent, does not bind those exact attempts, or the active tuple has
