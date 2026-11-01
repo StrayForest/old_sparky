@@ -5,42 +5,28 @@
 
 ## CPU and memory diagnostic interpretation
 
-The opt-in paired CPU diagnostic uses an eight-actor authenticated read cohort
-and reports at most five bounded Node/V8 samples per phase. Standard 20-second
-plans sample at a nominal four-second interval. The typed
-`authenticated_html_ssr_capacity_120s_v1` plan spaces five samples across its
-bound phase window (about 30 seconds between samples); its ON sample window may
-span at most 120 seconds, while OFF remains at most 20 seconds. The final
-sample endpoint may fall up to 500 ms after its phase boundary, matching the
-existing diagnostic timer tolerance; `sampled_window_duration_ms` itself must
-remain within the planned phase duration. The parser and runner use the wider
-duration bound only when the workload and phase duration match the exact plan;
-other workloads remain capped at 20 seconds. A delayed/incomplete window may
-contain fewer samples; only exactly five accepted samples are complete, and
-missing samples are never filled or promoted to PASS. RSS, V8 heap, external
-memory and array buffers are byte gauges; Node reports `arrayBuffers` as a
-component of `external`, so do not add
-them together. GC entries belong to a phase by their monotonic start time, and
-a collection extending past the phase end contributes only its in-phase
-duration. `sampled_window_duration_ms` is the interval between the first and
-last accepted samples (normally 16 seconds on standard plans), not the full
-20-second request phase. `memory_events_*_sampled_delta` cover only that
-sampled interval.
+The opt-in paired diagnostic uses eight authenticated actors and at most five
+Node/V8 samples per phase. Standard 20-second phases sample nominally every
+four seconds; the typed `authenticated_html_ssr_capacity_120s_v1` plan spreads
+five samples across its longer phase (about 30 seconds). Its ON sample duration
+may reach 120 seconds, while OFF remains at 20 seconds. The endpoint may lag
+the phase boundary by 500 ms, but `sampled_window_duration_ms` must fit the
+planned duration. Only the exact workload/phase gets the wider parser bound;
+all other windows stay capped at 20 seconds. Fewer than five accepted samples
+remain incomplete. `sampled_window_duration_ms` spans the first-to-last sample
+(normally 16 seconds on standard plans), not the full request phase; sampled
+memory-event deltas cover only that interval. RSS, heap, external memory and
+array buffers are bytes; Node `arrayBuffers` is part of `external`. GC entries
+are assigned by monotonic start time and clipped to the phase end.
 
-SSR request correlation reads the API and web journal sources separately,
-with a 24 MiB response cap per service, 64 KiB per-line cap, 50,000-row cap
-and 12-second query deadline. Unit, cgroup and invocation selectors are
-combined as exact journal filters, and each returned row is checked against
-those same identities before use. After plan expiry, the collector waits
-through a one-second marker grace and runs `journalctl --sync` before querying
-the web source; this does not extend either CPU window. The summary records a
-closed `source_collection_reason` for API and web. Both must be
-`complete`, and the stream capture marker must be complete, before source
-coverage can be treated as complete. Any cap, malformed row, identity
-mismatch, journal error, or failed sync remains incomplete with its reason.
-The first observed failure is retained: a failed sync precedes and takes
-priority over any later web-query failure. If sync succeeds, the query reports
-its first detected failure.
+SSR correlation queries API and web journals separately under exact unit,
+cgroup and invocation filters, with 24 MiB/service, 64 KiB/line, 50,000-row
+and 12-second limits. After plan expiry it waits one second for the marker,
+runs `journalctl --sync`, then queries web; this does not extend CPU windows.
+The summary reports a closed `source_collection_reason` for each service.
+Both reasons and the stream marker must be complete. Any cap, malformed row,
+identity mismatch, journal or sync error remains incomplete; the first observed
+failure is preserved, with sync taking precedence over a later query failure.
 
 `memory.peak` is the cgroup lifetime high-water mark, while
 `current_sampled_max` is the greatest sampled `memory.current` value; neither
