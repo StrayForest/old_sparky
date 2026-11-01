@@ -2321,9 +2321,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             parent_cli_report = root / "parent-cli-report.json"
             parent_cli_stdout = io.StringIO()
             with (
+                patch.dict(os.environ, worker_source_binding_env),
                 patch.object(
                     capacity_diagnostic, "_read_manifest",
-                    return_value=(manifest_raw, manifest, actors),
+                    return_value=(manifest_raw, composite_manifest, actors),
                 ),
                 patch.object(capacity_diagnostic, "_prepare_remote_capacity_plan", side_effect=fake_prepare_plan),
                 patch.object(
