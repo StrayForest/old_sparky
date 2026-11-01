@@ -934,13 +934,22 @@ def _bounded_capacity_journal_rows(
     deadline = time.monotonic() + CAPACITY_JOURNAL_TIMEOUT_SECONDS
     reason = "complete"
     eof = False
+
+    def record_failure(candidate: str) -> None:
+        nonlocal reason
+        # Preserve the first observed failure. A later row, byte or process
+        # failure must not hide the malformed/identity event that occurred
+        # earlier in this same bounded response.
+        if reason == "complete":
+            reason = candidate
+
     try:
         os.set_blocking(fd, False)
         selector.register(fd, selectors.EVENT_READ)
         while process.poll() is None or not eof:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                reason = "timeout"
+                record_failure("timeout")
                 break
             for event, _mask in selector.select(min(remaining, 0.1)):
                 try:
@@ -953,17 +962,17 @@ def _bounded_capacity_journal_rows(
                     break
                 bytes_read += len(chunk)
                 if bytes_read > CAPACITY_JOURNAL_BYTES:
-                    reason = "byte_cap"
+                    record_failure("byte_cap")
                     break
                 pending.extend(chunk)
                 while True:
                     newline = pending.find(b"\n")
                     if newline < 0:
                         if len(pending) > CAPACITY_JOURNAL_LINE_BYTES:
-                            reason = "line_cap"
+                            record_failure("line_cap")
                         break
                     if newline > CAPACITY_JOURNAL_LINE_BYTES:
-                        reason = "line_cap"
+                        record_failure("line_cap")
                         del pending[: newline + 1]
                         break
                     line = bytes(pending[:newline])
@@ -971,23 +980,23 @@ def _bounded_capacity_journal_rows(
                     try:
                         row = json.loads(line.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
                     except (UnicodeError, json.JSONDecodeError, PlanError):
-                        reason = "invalid_event"
+                        record_failure("invalid_event")
                         continue
                     if not isinstance(row, dict):
-                        reason = "invalid_event"
+                        record_failure("invalid_event")
                         continue
                     if (row.get("_SYSTEMD_UNIT") != unit
                             or row.get("_SYSTEMD_CGROUP") != cgroup
                             or row.get("_SYSTEMD_INVOCATION_ID") != invocation.lower()):
-                        reason = "invalid_identity"
+                        record_failure("invalid_identity")
                         break
                     source_rows += 1
                     if source_rows > CAPACITY_JOURNAL_ROWS:
-                        reason = "row_cap"
+                        record_failure("row_cap")
                         break
                     message = _message_text(row)
                     if message is None:
-                        reason = "invalid_event"
+                        record_failure("invalid_event")
                         break
                     if _capacity_journal_row_selected(
                             service, message, run_id=run_id, request_ids=request_ids):
@@ -1444,6 +1453,8 @@ def _capacity_request_telemetry(
         run_id=run_id, request_ids=selected_set,
     )
     if not marker_sync_ok and web_collection_reason == "complete":
+        # A source-query error takes precedence; record sync failure only when
+        # the otherwise-complete query cannot guarantee marker visibility.
         web_collection_reason = "journal_sync_failed"
     nginx_raw, nginx_truncated = _bounded_nginx_rows(
         selected_set, since_ms=max(0, start_ms - 1_000), until_ms=capture_end_ms,

@@ -1460,6 +1460,9 @@ def _validate_usage_summary(
                     or (collection_reason["web"] != "complete"
                         and not (truncated["ssr"] and truncated["stream"]))):
                 return None
+            if (any(value != "complete" for value in collection_reason.values())
+                    and (coverage["complete"] or coverage["full_cohort"])):
+                return None
             for rejection_map in rejections.values():
                 if (not isinstance(rejection_map, dict)
                         or any(not isinstance(key, str) or len(key) > 64 or type(item) is not int

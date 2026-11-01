@@ -6838,7 +6838,9 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     patch.object(remote_dispatch, "SUDO", str(fake_sudo)),
                     redirect_stdout(output),
                 ):
-                    self.assertEqual(remote_dispatch._run_cpu_diagnostic_plan(payload), 0)
+                    dispatch_status = remote_dispatch._run_cpu_diagnostic_plan(payload)
+                if dispatch_status != 0:
+                    return None
                 projected = json.loads(
                     output.getvalue().strip().removeprefix("CPU_DIAGNOSTIC_PLAN ")
                 )
@@ -6881,6 +6883,22 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     del missing_scope["request_telemetry"]["summary"]["coverage"]["scope"]
                     self.assertIsNone(dispatch_and_validate(
                         workload, missing_scope, selected_ids, counts,
+                    ))
+                    contradictory_collection = json.loads(json.dumps(
+                        cleanup_summary(workload, produced),
+                    ))
+                    contradictory_coverage = contradictory_collection[
+                        "request_telemetry"
+                    ]["summary"]["coverage"]
+                    contradictory_coverage["source_collection_reason"]["api"] = "byte_cap"
+                    contradictory_coverage["source_rows_truncated"]["api"] = True
+                    contradictory_coverage["complete"] = True
+                    contradictory_coverage["full_cohort"] = True
+                    self.assertIsNone(cpu_pair._validate_usage_summary(
+                        contradictory_collection, expected_workload=workload,
+                    ))
+                    self.assertIsNone(dispatch_and_validate(
+                        workload, contradictory_collection, selected_ids, counts,
                     ))
 
         selected_rank_ids: list[str] = []

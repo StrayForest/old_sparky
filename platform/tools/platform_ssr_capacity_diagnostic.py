@@ -3516,6 +3516,9 @@ def _project_request_correlation(value: Any) -> dict[str, Any] | None:
                 and not (coverage["source_rows_truncated"]["ssr"]
                          and coverage["source_rows_truncated"]["stream"]))):
         return None
+    if (any(value != "complete" for value in collection_reason.values())
+            and (coverage["complete"] or coverage["full_cohort"])):
+        return None
     for rejection_counts in coverage["source_rejections"].values():
         if (not isinstance(rejection_counts, dict)
                 or any(key not in {

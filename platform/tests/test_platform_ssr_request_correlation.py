@@ -243,6 +243,18 @@ class SsrRequestCorrelationTests(unittest.TestCase):
             self.assertEqual(rows, [])
             self.assertEqual(reason, "invalid_identity")
 
+            with fixture.open("wb") as handle:
+                handle.write(b"not-json\n")
+                handle.write(bad_identity)
+            with patch.object(diagnostic_plan_tool.subprocess, "Popen", side_effect=fixture_popen):
+                rows, reason = diagnostic_plan_tool._bounded_capacity_journal_rows(
+                    "web", plan, since_ms=1_793_380_799_000,
+                    until_ms=1_793_380_801_000, markers=("ssr_perf",),
+                    run_id=run_id, request_ids=request_ids,
+                )
+            self.assertEqual(rows, [])
+            self.assertEqual(reason, "invalid_event")
+
     def test_pinned_plan_correlation_runs_from_isolated_single_file_copy(self) -> None:
         plan_source = (
             Path(__file__).resolve().parents[1]
@@ -307,15 +319,18 @@ def records(messages):
 
 query_order = []
 marker_ready = False
+collector_state = {"sync_ok": True, "web_reason": "complete"}
 def wait_and_sync(expires_at_ms):
     global marker_ready
     query_order.append(("sync", expires_at_ms))
     marker_ready = True
-    return True
+    return collector_state["sync_ok"]
 def bounded_rows(service, *args, **kwargs):
     query_order.append(("query", service))
     if service == "web":
         assert marker_ready
+        if collector_state["web_reason"] != "complete":
+            return [], collector_state["web_reason"]
         return records(web_messages + [late_marker]), "complete"
     return records(api_messages), "complete"
 module._wait_and_sync_capacity_capture_marker = wait_and_sync
@@ -349,6 +364,36 @@ assert correlated["timing_ms"]["ssr_stream_milestone_elapsed_ms"]["request_start
 assert correlated["ssr_stream_coverage"]["capture_status"] == "complete"
 assert query_order == [("query", "api"), ("sync", plan["expires_at_ms"]), ("query", "web")]
 assert correlated["coverage"]["source_collection_reason"] == {"api": "complete", "web": "complete"}
+collector_state.update(sync_ok=False, web_reason="byte_cap")
+failed_query = module._capacity_request_telemetry(
+    {"api": dict(plan), "web": dict(plan)},
+    selected_request_ids=[request_id],
+    cohort_counts={
+        "submitted_html_count": 1, "valid_response_id_count": 1,
+        "missing_response_id_count": 0, "duplicate_response_id_count": 0,
+        "malformed_response_id_count": 0, "eligible_response_id_count": 1,
+        "retained_sample_count": 1,
+        "sample_scheme": "sha256-runid-requestid-1of8-v1",
+        "sample_cap_truncated": False,
+    },
+)
+assert failed_query["coverage"]["source_collection_reason"]["web"] == "byte_cap"
+assert failed_query["coverage"]["source_rows_truncated"]["ssr"]
+assert failed_query["coverage"]["source_rows_truncated"]["stream"]
+collector_state.update(sync_ok=False, web_reason="complete")
+failed_sync = module._capacity_request_telemetry(
+    {"api": dict(plan), "web": dict(plan)},
+    selected_request_ids=[request_id],
+    cohort_counts={
+        "submitted_html_count": 1, "valid_response_id_count": 1,
+        "missing_response_id_count": 0, "duplicate_response_id_count": 0,
+        "malformed_response_id_count": 0, "eligible_response_id_count": 1,
+        "retained_sample_count": 1,
+        "sample_scheme": "sha256-runid-requestid-1of8-v1",
+        "sample_cap_truncated": False,
+    },
+)
+assert failed_sync["coverage"]["source_collection_reason"]["web"] == "journal_sync_failed"
 print("ok")
 """
             completed = subprocess.run(
@@ -626,6 +671,12 @@ print("ok")
         }))
         malformed["summary"]["coverage"]["source_collection_reason"]["api"] = "free text"
         self.assertIsNone(capacity_diagnostic._project_request_correlation(malformed))
+        contradictory = json.loads(json.dumps({
+            "status": "incomplete", "summary": incomplete,
+        }))
+        contradictory["summary"]["coverage"]["complete"] = True
+        contradictory["summary"]["coverage"]["full_cohort"] = True
+        self.assertIsNone(capacity_diagnostic._project_request_correlation(contradictory))
 
     def test_malformed_ids_do_not_join_or_escape_report(self) -> None:
         secret = "request-secret-with-sensitive-value"

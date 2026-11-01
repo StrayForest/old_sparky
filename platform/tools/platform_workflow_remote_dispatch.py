@@ -1144,6 +1144,14 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                     collection_reason["web"] == "complete"
                     or (source_truncated["ssr"] and source_truncated["stream"])
                 )
+                and (
+                    all(reason == "complete" for reason in collection_reason.values())
+                    or (
+                        isinstance(telemetry_coverage, dict)
+                        and telemetry_coverage.get("complete") is False
+                        and telemetry_coverage.get("full_cohort") is False
+                    )
+                )
             )
             request_telemetry_valid = (
                 not has_request_telemetry
