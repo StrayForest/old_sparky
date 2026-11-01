@@ -3040,6 +3040,56 @@ class WorkflowProvenanceTests(unittest.TestCase):
                     expected_target_sha=self.SHA,
                     route_manifest=bad_route,
                 )
+        conditional_names = (
+            "Conditional release runtime fixture",
+            "Trusted dev immutable release runtime",
+        )
+        for conditional_name in conditional_names:
+            for bad_conclusion in ("failure", "cancelled"):
+                bad_jobs = [
+                    {
+                        **job,
+                        "status": "completed",
+                        "conclusion": bad_conclusion,
+                    }
+                    if job["name"] == conditional_name
+                    else job
+                    for job in recovery_jobs
+                ]
+                with self.subTest(job=conditional_name, conclusion=bad_conclusion):
+                    with self.assertRaises(ProvenanceError):
+                        validate_recovery_source_security_gates(
+                            workflow,
+                            run,
+                            bad_jobs,
+                            statuses,
+                            expected_run_id=run_id,
+                            expected_attempt=attempt,
+                            expected_target_sha=self.SHA,
+                            route_manifest=recovery_route,
+                        )
+            for bad_identity in (
+                {"run_attempt": attempt + 1},
+                {"head_sha": "b" * 40},
+            ):
+                bad_jobs = [
+                    {**job, **bad_identity}
+                    if job["name"] == conditional_name
+                    else job
+                    for job in recovery_jobs
+                ]
+                with self.subTest(job=conditional_name, identity=bad_identity):
+                    with self.assertRaises(ProvenanceError):
+                        validate_recovery_source_security_gates(
+                            workflow,
+                            run,
+                            bad_jobs,
+                            statuses,
+                            expected_run_id=run_id,
+                            expected_attempt=attempt,
+                            expected_target_sha=self.SHA,
+                            route_manifest=recovery_route,
+                        )
         rejected_core_skip = [
             {**job, "status": "completed", "conclusion": "skipped"}
             if job["name"] == "Security gates"
