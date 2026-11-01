@@ -2720,6 +2720,30 @@ class EvidencePrivacyTests(unittest.TestCase):
                 # marker remains the durable source/run/manifest commitment.
                 manifest_path.unlink()
                 self.assertEqual(_diagnostic_abort_binding("456", "2", source_sha), binding)
+                self.assertIsNone(_diagnostic_abort_binding("456", "1", source_sha))
+                for invalid_binding in (
+                    {**binding, "schema": 2},
+                    {key: value for key, value in binding.items() if key != "fixture_manifest_sha256"},
+                    {**binding, "unexpected": True},
+                    {**binding, "external_run_id": "457"},
+                ):
+                    binding_path.write_bytes(
+                        json.dumps(
+                            invalid_binding, sort_keys=True, separators=(",", ":")
+                        ).encode("ascii") + b"\n"
+                    )
+                    os.chmod(binding_path, 0o600)
+                    self.assertIsNone(_diagnostic_abort_binding("456", "2", source_sha))
+                duplicate_key_binding = json.dumps(
+                    binding, sort_keys=True, separators=(",", ":")
+                ).replace('"schema":1', '"schema":1,"schema":1', 1)
+                binding_path.write_bytes(duplicate_key_binding.encode("ascii") + b"\n")
+                os.chmod(binding_path, 0o600)
+                self.assertIsNone(_diagnostic_abort_binding("456", "2", source_sha))
+                binding_path.write_bytes(
+                    json.dumps(binding, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+                )
+                os.chmod(binding_path, 0o600)
                 manifest_path.write_bytes(manifest)
                 os.chmod(manifest_path, 0o600)
                 self.assertIsNone(_diagnostic_abort_binding("456", "2", "b" * 40))
