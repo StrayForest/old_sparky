@@ -286,7 +286,7 @@ names; do not reuse a static tournament name between runs.
 
 ```bash
 set -euo pipefail
-python3 - <<'PY' | gh api --repo StrayForest/old_sparky --method POST \
+python3 - <<'PY' | gh api --method POST \
   repos/StrayForest/old_sparky/actions/workflows/platform-production-external-load.yml/dispatches \
   --input -
 import getpass
