@@ -1283,7 +1283,7 @@ def _validate_usage_summary(
                 return None
             coverage_fields = {
                 "complete", "scope", "selection_rank_proof", "full_cohort",
-                "source_rows_truncated", "source_input_rows", "source_rejections",
+                "source_collection_reason", "source_rows_truncated", "source_input_rows", "source_rejections",
                 "cf_ray_fallback_enabled",
             }
             coverage = raw_summary.get("coverage")
@@ -1437,6 +1437,17 @@ def _validate_usage_summary(
 
             sources = {"nginx", "ssr", "stream", "api"}
             truncated = coverage.get("source_rows_truncated")
+            collection_reason = coverage.get("source_collection_reason")
+            collection_reasons = {
+                "complete", "invalid_request", "spawn_failed", "timeout", "byte_cap",
+                "line_cap", "row_cap", "invalid_event", "invalid_identity",
+                "journal_failed", "trailing_partial_line", "journal_sync_failed",
+            }
+            if (not isinstance(collection_reason, dict)
+                    or set(collection_reason) != {"api", "web"}
+                    or any(not isinstance(item, str) or item not in collection_reasons
+                           for item in collection_reason.values())):
+                return None
             row_counts = coverage.get("source_input_rows")
             rejections = coverage.get("source_rejections")
             if (not isinstance(truncated, dict) or set(truncated) != sources
@@ -1444,6 +1455,10 @@ def _validate_usage_summary(
                     or not isinstance(row_counts, dict) or set(row_counts) != sources
                     or any(type(item) is not int or not 0 <= item <= 200_001 for item in row_counts.values())
                     or not isinstance(rejections, dict) or set(rejections) != sources):
+                return None
+            if ((collection_reason["api"] != "complete" and not truncated["api"])
+                    or (collection_reason["web"] != "complete"
+                        and not (truncated["ssr"] and truncated["stream"]))):
                 return None
             for rejection_map in rejections.values():
                 if (not isinstance(rejection_map, dict)

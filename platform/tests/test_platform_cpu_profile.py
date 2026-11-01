@@ -6708,7 +6708,11 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             with (
                 patch.object(
                     diagnostic_plan_tool, "_bounded_capacity_journal_rows",
-                    return_value=([], False),
+                    return_value=([], "complete"),
+                ),
+                patch.object(
+                    diagnostic_plan_tool, "_wait_and_sync_capacity_capture_marker",
+                    return_value=True,
                 ),
                 patch.object(
                     diagnostic_plan_tool, "_bounded_nginx_rows",

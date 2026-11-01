@@ -26,6 +26,19 @@ duration. `sampled_window_duration_ms` is the interval between the first and
 last accepted samples (normally 16 seconds on standard plans), not the full
 20-second request phase. `memory_events_*_sampled_delta` cover only that
 sampled interval.
+
+SSR request correlation reads the API and web journal sources separately,
+with a 24 MiB response cap per service, 64 KiB per-line cap, 50,000-row cap
+and 12-second query deadline. Unit, cgroup and invocation selectors are
+combined as exact journal filters, and each returned row is checked against
+those same identities before use. After plan expiry, the collector waits
+through a one-second marker grace and runs `journalctl --sync` before querying
+the web source; this does not extend either CPU window. The summary records a
+closed `source_collection_reason` for API and web. Both must be
+`complete`, and the stream capture marker must be complete, before source
+coverage can be treated as complete. Any cap, malformed row, identity
+mismatch, journal error, or failed sync remains incomplete with its reason.
+
 `memory.peak` is the cgroup lifetime high-water mark, while
 `current_sampled_max` is the greatest sampled `memory.current` value; neither
 is a continuous phase maximum. Missing cgroup support is UNKNOWN; malformed

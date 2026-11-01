@@ -7,6 +7,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+
+from tools import platform_cpu_diagnostic_plan as diagnostic_plan_tool
+from tools import platform_ssr_capacity_diagnostic as capacity_diagnostic
 
 from tools.platform_cpu_diagnostic_plan import (
     is_ssr_response_id_eligible as is_eligible_response_id,
@@ -102,6 +106,143 @@ def summarize(**overrides: object) -> dict[str, object]:
 
 
 class SsrRequestCorrelationTests(unittest.TestCase):
+    def test_capacity_capture_waits_to_grace_edge_then_syncs_journal(self) -> None:
+        calls: list[object] = []
+
+        def run(command, **kwargs):
+            calls.append((command, kwargs))
+            return type("Result", (), {"returncode": 0})()
+
+        with (
+            patch.object(diagnostic_plan_tool.time, "time_ns", return_value=10_000_000_000),
+            patch.object(diagnostic_plan_tool.time, "sleep", side_effect=calls.append),
+            patch.object(diagnostic_plan_tool.subprocess, "run", side_effect=run),
+        ):
+            self.assertTrue(diagnostic_plan_tool._wait_and_sync_capacity_capture_marker(10_000))
+        self.assertEqual(calls[0], 1.0)
+        self.assertEqual(calls[1][0], ["/usr/bin/journalctl", "--sync"])  # type: ignore[index]
+
+        calls.clear()
+        with (
+            patch.object(diagnostic_plan_tool.time, "time_ns", return_value=8_000_000_000),
+            patch.object(diagnostic_plan_tool.subprocess, "run", side_effect=AssertionError("early sync")),
+        ):
+            self.assertFalse(diagnostic_plan_tool._wait_and_sync_capacity_capture_marker(10_000))
+
+    def test_capacity_journal_collection_is_bounded_exact_and_selected(self) -> None:
+        plan = {
+            "targets": [{
+                "service": "web", "pid": 123, "start_ticks": 456,
+                "invocation_id": "a" * 32,
+            }],
+        }
+        request_ids = {f"{value:032x}" for value in range(1_000)}
+        unit = "deadlock-web.service"
+        cgroup = f"/system.slice/{unit}"
+        run_id = "b" * 32
+        marker = (
+            "ssr_stream_capture_coverage scheme=sha256-runid-requestid-1of8-v1 "
+            f"run_id={run_id} eligible=1000 retained=1000 lost=0 rows=25000 "
+            "lost_rows=0 status=complete"
+        )
+        messages = []
+        padding = "x" * 430
+        for request_id in sorted(request_ids):
+            for _ in range(20):
+                messages.append(
+                    "ssr_perf diagnostic_run_id=" + run_id + " request_id=" + request_id
+                    + " stage=page_component duration_ms=1 padding=" + padding
+                )
+            for _ in range(5):
+                messages.append(
+                    "ssr_stream request_id=" + request_id
+                    + " stage=request_start elapsed_ms=1 padding=" + padding
+                )
+        messages.append(marker)
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory) / "journal.jsonl"
+            with fixture.open("wb") as handle:
+                for message in messages:
+                    handle.write(json.dumps({
+                        "MESSAGE": message,
+                        "_SYSTEMD_UNIT": unit,
+                        "_SYSTEMD_CGROUP": cgroup,
+                        "_SYSTEMD_INVOCATION_ID": "a" * 32,
+                        "__REALTIME_TIMESTAMP": "1793380800000000",
+                    }, separators=(",", ":")).encode() + b"\n")
+            self.assertLess(fixture.stat().st_size, diagnostic_plan_tool.CAPACITY_JOURNAL_BYTES)
+
+            real_popen = subprocess.Popen
+            commands: list[list[str]] = []
+
+            def fixture_popen(command, **kwargs):
+                commands.append(command)
+                return real_popen(
+                    [sys.executable, "-c",
+                     "import pathlib,sys;sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes())",
+                     str(fixture)],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True,
+                )
+
+            with patch.object(diagnostic_plan_tool.subprocess, "Popen", side_effect=fixture_popen):
+                rows, reason = diagnostic_plan_tool._bounded_capacity_journal_rows(
+                    "web", plan, since_ms=1_793_380_799_000,
+                    until_ms=1_793_380_801_000,
+                    markers=("ssr_perf", "ssr_stream", "ssr_stream_capture_coverage"),
+                    run_id=run_id, request_ids=request_ids,
+                )
+            self.assertEqual(reason, "complete")
+            self.assertEqual(len(rows), 25_001)
+            self.assertIn("_SYSTEMD_UNIT=deadlock-web.service", commands[0])
+            self.assertIn("_SYSTEMD_CGROUP=/system.slice/deadlock-web.service", commands[0])
+            self.assertIn("_SYSTEMD_INVOCATION_ID=" + "a" * 32, commands[0])
+            self.assertFalse(any(arg == "+" or arg.startswith("+_SYSTEMD_") for arg in commands[0]))
+            self.assertNotIn("_PID", next(
+                arg for arg in commands[0] if arg.startswith("--output-fields=")
+            ))
+
+            with fixture.open("wb") as handle:
+                oversized = json.dumps({
+                    "MESSAGE": "ssr_perf " + padding * 2,
+                    "_SYSTEMD_UNIT": unit,
+                    "_SYSTEMD_CGROUP": cgroup,
+                    "_SYSTEMD_INVOCATION_ID": "a" * 32,
+                    "__REALTIME_TIMESTAMP": "1793380800000000",
+                }, separators=(",", ":")).encode() + b"\n"
+                for _ in range(60_000):
+                    handle.write(oversized)
+            self.assertGreater(fixture.stat().st_size, diagnostic_plan_tool.CAPACITY_JOURNAL_BYTES)
+            with patch.object(diagnostic_plan_tool.subprocess, "Popen", side_effect=fixture_popen):
+                rows, reason = diagnostic_plan_tool._bounded_capacity_journal_rows(
+                    "web", plan, since_ms=1_793_380_799_000,
+                    until_ms=1_793_380_801_000, markers=("ssr_perf",),
+                    run_id=run_id, request_ids=request_ids,
+                )
+            self.assertEqual(rows, [])
+            self.assertEqual(reason, "byte_cap")
+
+            with fixture.open("wb") as handle:
+                bad_identity = json.dumps({
+                    "MESSAGE": "ssr_perf diagnostic_run_id=" + run_id
+                    + " request_id=" + sorted(request_ids)[0]
+                    + " stage=page_component duration_ms=1",
+                    "_SYSTEMD_UNIT": unit,
+                    "_SYSTEMD_CGROUP": cgroup,
+                    "_SYSTEMD_INVOCATION_ID": "c" * 32,
+                    "__REALTIME_TIMESTAMP": "1793380800000000",
+                }, separators=(",", ":")).encode() + b"\n"
+                handle.write(bad_identity)
+            with patch.object(diagnostic_plan_tool.subprocess, "Popen", side_effect=fixture_popen):
+                rows, reason = diagnostic_plan_tool._bounded_capacity_journal_rows(
+                    "web", plan, since_ms=1_793_380_799_000,
+                    until_ms=1_793_380_801_000, markers=("ssr_perf",),
+                    run_id=run_id, request_ids=request_ids,
+                )
+            self.assertEqual(rows, [])
+            self.assertEqual(reason, "invalid_identity")
+
     def test_pinned_plan_correlation_runs_from_isolated_single_file_copy(self) -> None:
         plan_source = (
             Path(__file__).resolve().parents[1]
@@ -160,12 +301,25 @@ web_messages.append(
     "ssr_stream_capture_coverage scheme=sha256-runid-requestid-1of8-v1 "
     "run_id=" + run_id + " eligible=1 retained=1 lost=0 rows=6 lost_rows=0 status=complete"
 )
+late_marker = web_messages.pop()
 def records(messages):
     return [{"MESSAGE": message, "__REALTIME_TIMESTAMP": event_us} for message in messages]
 
-module._bounded_capacity_journal_rows = lambda service, *args, **kwargs: (
-    records(api_messages if service == "api" else web_messages), False
-)
+query_order = []
+marker_ready = False
+def wait_and_sync(expires_at_ms):
+    global marker_ready
+    query_order.append(("sync", expires_at_ms))
+    marker_ready = True
+    return True
+def bounded_rows(service, *args, **kwargs):
+    query_order.append(("query", service))
+    if service == "web":
+        assert marker_ready
+        return records(web_messages + [late_marker]), "complete"
+    return records(api_messages), "complete"
+module._wait_and_sync_capacity_capture_marker = wait_and_sync
+module._bounded_capacity_journal_rows = bounded_rows
 module._bounded_nginx_rows = lambda *args, **kwargs: ([{
     "request_id": request_id, "time": event_time, "request_time": "0.09",
     "cf_ray": "safe-ray",
@@ -193,6 +347,8 @@ assert correlated["timing_ms"]["api_request_by_route"]["tournament_workspace"]["
 assert correlated["timing_ms"]["ssr_stage"]["page_component"]["count"] == 1
 assert correlated["timing_ms"]["ssr_stream_milestone_elapsed_ms"]["request_start"]["count"] == 1
 assert correlated["ssr_stream_coverage"]["capture_status"] == "complete"
+assert query_order == [("query", "api"), ("sync", plan["expires_at_ms"]), ("query", "web")]
+assert correlated["coverage"]["source_collection_reason"] == {"api": "complete", "web": "complete"}
 print("ok")
 """
             completed = subprocess.run(
@@ -434,6 +590,42 @@ print("ok")
         self.assertTrue(
             bounded["coverage"]["source_rows_truncated"]["nginx"]  # type: ignore[index]
         )
+
+    def test_source_collection_reason_is_closed_and_consistent_with_truncation(self) -> None:
+        with self.assertRaises(ValueError):
+            summarize(source_collection_reason={"api": "byte_cap", "web": "complete"})
+        with self.assertRaises(ValueError):
+            summarize(source_collection_reason={"api": "private detail", "web": "complete"})
+        with self.assertRaises(ValueError):
+            summarize(source_collection_reason={"api": [], "web": "complete"})
+
+        incomplete = summarize(
+            rows_truncated={"api": True},
+            source_collection_reason={"api": "byte_cap", "web": "complete"},
+        )
+        incomplete["ssr_stream_coverage"] = {
+            "records": 0, "selector_overflow": 0,
+            "selector_overflow_unattributed": 0, "row_cap_records": 0,
+            "row_cap_rows": 0, "truncated_records": 0, "malformed_records": 0,
+            "capture_marker_records": 1, "capture_eligible_requests": 1,
+            "capture_retained_requests": 1, "capture_lost_requests": 0,
+            "capture_rows": 1, "capture_lost_rows": 0,
+            "capture_truncated_records": 0, "capture_malformed_records": 0,
+            "capture_status": "complete", "status": "none",
+        }
+        projected = capacity_diagnostic._project_request_correlation({
+            "status": "incomplete", "summary": incomplete,
+        })
+        self.assertIsNotNone(projected)
+        self.assertEqual(
+            projected["summary"]["coverage"]["source_collection_reason"]["api"],
+            "byte_cap",
+        )
+        malformed = json.loads(json.dumps({
+            "status": "incomplete", "summary": incomplete,
+        }))
+        malformed["summary"]["coverage"]["source_collection_reason"]["api"] = "free text"
+        self.assertIsNone(capacity_diagnostic._project_request_correlation(malformed))
 
     def test_malformed_ids_do_not_join_or_escape_report(self) -> None:
         secret = "request-secret-with-sensitive-value"
