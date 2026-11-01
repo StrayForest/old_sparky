@@ -55,8 +55,8 @@ recipient="$("$identity_dir/age-keygen" -y "$identity_file")"
 test "$recipient" = "age1egptr8zhhvfe0ggmyu4cr9azhfsjpvvn3p5eyppznnzx8c5yedjsyeaasa"
 key_lines="$(awk '/^AGE-SECRET-KEY-1/ && length($0)==74 { n++ } END { print n+0 }' "$identity_file")"
 test "$key_lines" = 1
-gh secret set FIXTURE_MANIFEST_AGE_IDENTITY --env fixture-manifest < <(awk '/^AGE-SECRET-KEY-1/ && length($0)==74 { print }' "$identity_file")
-gh secret set FIXTURE_MANIFEST_AGE_IDENTITY --env production < <(awk '/^AGE-SECRET-KEY-1/ && length($0)==74 { print }' "$identity_file")
+gh secret set FIXTURE_MANIFEST_AGE_IDENTITY --env fixture-manifest < <(awk '/^AGE-SECRET-KEY-1/ && length($0)==74 { printf "%s", $0 }' "$identity_file")
+gh secret set FIXTURE_MANIFEST_AGE_IDENTITY --env production < <(awk '/^AGE-SECRET-KEY-1/ && length($0)==74 { printf "%s", $0 }' "$identity_file")
 ```
 
 Restrict the `fixture-manifest` environment to the `dev` branch. Keep
