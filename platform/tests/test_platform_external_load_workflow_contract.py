@@ -240,6 +240,56 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                     )
                     self.assertNotEqual(group_check.returncode, 0)
 
+        # The production timeout owns the ordinary TERM-ignoring observer
+        # fallback (`--kill-after=30s`). Exercise the shutdown helper's own
+        # fallback separately: a real session leader exits while a descendant
+        # stays in its process group and ignores TERM.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            event_path = Path(temp_dir) / "events"
+            ready_path = Path(temp_dir) / "descendant-ready"
+            script = textwrap.dedent(
+                r"""
+                set -euo pipefail
+                source "$OBSERVER_SHUTDOWN_HELPER"
+                setsid bash -c '
+                  bash -c '\''trap "" TERM; : > "$READY_PATH"; while :; do sleep 0.05; done'\'' &
+                  while [[ ! -e "$READY_PATH" ]]; do sleep 0.01; done
+                  exit 0
+                ' &
+                observer_pid="$!"
+                for _ in {1..100}; do
+                  [[ -e "$READY_PATH" ]] && break
+                  sleep 0.01
+                done
+                [[ -e "$READY_PATH" ]]
+                kill -0 -- "-$observer_pid"
+                printf 'group_live_before\n' >> "$EVENT_PATH"
+                if platform_external_fixture_stop_observer_group "$observer_pid" 1 1; then
+                  printf 'terminal\n' >> "$EVENT_PATH"
+                else
+                  printf 'not_quiesced\n' >> "$EVENT_PATH"
+                fi
+                """
+            )
+            completed = subprocess.run(
+                ["/bin/bash", "-c", script],
+                env={
+                    **os.environ,
+                    "OBSERVER_SHUTDOWN_HELPER": helper,
+                    "EVENT_PATH": str(event_path),
+                    "READY_PATH": str(ready_path),
+                },
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(
+                event_path.read_text(encoding="ascii").splitlines(),
+                ["group_live_before", "terminal"],
+            )
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.source = WORKFLOW.read_text(encoding="utf-8")
