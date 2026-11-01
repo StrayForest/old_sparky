@@ -2,7 +2,7 @@
 
 - Status: Active operator procedure
 - Owner: Production operator
-- Last reviewed: 2026-10-30
+- Last reviewed: 2026-11-01
 
 Use this runbook for the zero-credit authenticated SSR composite diagnostic.
 It runs one unprofiled 120-second capacity window, then a separate profiled
@@ -161,7 +161,7 @@ is read by a hidden prompt and sent only in the JSON request body on stdin:
 
 ```bash
 set -euo pipefail
-python3 - <<'PY' | gh api --repo StrayForest/old_sparky --method POST \
+python3 - <<'PY' | gh api --method POST \
   repos/StrayForest/old_sparky/actions/workflows/platform-production-external-load.yml/dispatches \
   --input -
 import getpass
@@ -193,7 +193,7 @@ event, branch and exact `head_sha`; record its run ID and attempt before
 watching it:
 
 ```bash
-gh api --repo StrayForest/old_sparky \
+gh api \
   'repos/StrayForest/old_sparky/actions/workflows/platform-production-external-load.yml/runs?event=workflow_dispatch&branch=dev&per_page=10' \
   --jq '.workflow_runs[] | [.id, .run_attempt, .head_sha, .status, (.conclusion // "")] | @tsv'
 gh run watch <exact-load-run-id> --repo StrayForest/old_sparky --exit-status
@@ -213,7 +213,17 @@ identities, and all of these conditions hold:
 - The unprofiled capacity phase completes its full 120-second ON window with
   every submitted request accounted for, successful HTTP status and HTML
   validation, complete required SSR request identity/timing and origin CPU
-  evidence, no abort, and successful plan cleanup. Require exactly one raw
+  evidence, no abort, and successful plan cleanup. In
+  `transient_ssr_join_counts`, require `submitted_html_count` to equal the
+  started-in-window HTML request count, `valid_response_id_count` to equal
+  `submitted_html_count`, and `missing_response_id_count`,
+  `duplicate_response_id_count` and `malformed_response_id_count` all to be
+  zero. `eligible_response_id_count` is the deterministic one-in-eight join
+  sample; `retained_sample_count` may also be limited by its fixed cap. The
+  HTTP/1.1 load client's closed response-header projection must retain
+  `x-platform-ssr-request-id`; the end-to-end transport contract is covered by
+  `test_ssr_response_id_survives_http11_page_capture_and_keeps_closed_validation`.
+  Require exactly one raw
   `ssr_stream_capture_coverage` record for the phase run with `status=complete`.
   In the normalized `ssr_stream_coverage` summary require
   `capture_marker_records=1`, `capture_status=complete`, and
@@ -231,6 +241,17 @@ identities, and all of these conditions hold:
   cd platform/apps/platform_web
   npm run test:ssr-stream-diagnostics
   ```
+- The `authenticated_html_ssr_capacity_120s_v1` plan binds the Node memory
+  event window to its exact phase duration: OFF remains capped at 20 seconds,
+  while ON may span 120 seconds. The final sample endpoint may extend up to
+  500 ms beyond the phase boundary under the existing timer tolerance, while
+  the sampled interval duration itself remains capped at the planned phase
+  length. Legacy and 20-second plan events remain capped at 20 seconds. Require
+  the expected five Node samples, valid endpoints within those bounds, and
+  complete cgroup evidence where the hierarchy is available. A sample outside
+  its exact phase plan, malformed telemetry, or changed service identity makes
+  memory attribution incomplete;
+  it cannot be accepted by widening the generic parser limit.
 - The separate profile phase completes its 20-second ON window against the
   same fixture manifest after the planned gap. Its profile data is attribution
   only; do not merge it into capacity-window latency or CPU results.
@@ -257,12 +278,12 @@ selected load run. Supply the successful Security run and attempt for the
 current `dev` source. The request contains no control-account value:
 
 ```bash
-gh api --repo StrayForest/old_sparky --method POST \
+gh api --method POST \
   repos/StrayForest/old_sparky/actions/workflows/platform-production-retained-load-abort.yml/dispatches \
   --input - <<'JSON'
 {"ref":"dev","inputs":{"confirmation":"ABORT-PRODUCTION-RETAINED-LOAD","load_run_id":"<exact-load-run-id>","load_run_attempt":"<exact-load-attempt>","target_sha":"<active-app-sha-A>","security_run_id":"<successful-security-run-id>","security_run_attempt":"<successful-security-attempt>"}}
 JSON
-gh api --repo StrayForest/old_sparky \
+gh api \
   'repos/StrayForest/old_sparky/actions/runs?event=workflow_dispatch&branch=dev&per_page=10' \
   --jq '.workflow_runs[] | select(.path == ".github/workflows/platform-production-retained-load-abort.yml") | [.id, .run_attempt, .head_sha, .status, (.conclusion // "")] | @tsv'
 gh run watch <exact-abort-run-id> --repo StrayForest/old_sparky --exit-status
@@ -272,15 +293,24 @@ Reconcile and review the exact abort receipt. It must bind the load run and
 attempt, runner source, active app source, fixture manifest and Security
 identity; require the selected process tree absent and shared lock clear. An
 abort receipt with `namespace_closed: false` does not prove namespace closure
-and grants no measurement credit. Proceed to cleanup only when the canonical
-abort normalizer permits exact-fixture cleanup.
+and grants no measurement credit. The origin supervisor removes both copies of
+the session-credential manifest after observer capture. Its root-owned
+`diagnostic-abort-binding.json` is written only after validating and hashing
+that exact manifest and remains the durable source/run/fixture binding for a
+later abort. The abort helper accepts the exact run-bound marker when the
+credential-bearing manifest has already been retired; if the marker, its
+root-owned fixture directory, supervisor exit record, or run/source binding is
+missing or invalid, it fails closed. Do not restore or download the private
+manifest to bypass this check. Proceed to cleanup only when the canonical abort
+normalizer produces `status=safe_for_exact_fixture_cleanup` for the selected
+run and attempt.
 
 Then dispatch exact cleanup. Enter the same control account at the hidden
 prompt; the email travels only in the JSON request body on stdin:
 
 ```bash
 set -euo pipefail
-python3 - <<'PY' | gh api --repo StrayForest/old_sparky --method POST \
+python3 - <<'PY' | gh api --method POST \
   repos/StrayForest/old_sparky/actions/workflows/platform-production-retained-load-cleanup.yml/dispatches \
   --input -
 import getpass
@@ -298,7 +328,7 @@ payload = {
 json.dump(payload, sys.stdout, separators=(",", ":"))
 sys.stdout.write("\n")
 PY
-gh api --repo StrayForest/old_sparky \
+gh api \
   'repos/StrayForest/old_sparky/actions/runs?event=workflow_dispatch&branch=dev&per_page=10' \
   --jq '.workflow_runs[] | select(.path == ".github/workflows/platform-production-retained-load-cleanup.yml") | [.id, .run_attempt, .head_sha, .status, (.conclusion // "")] | @tsv'
 gh run watch <exact-cleanup-run-id> --repo StrayForest/old_sparky --exit-status

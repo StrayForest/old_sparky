@@ -286,7 +286,7 @@ names; do not reuse a static tournament name between runs.
 
 ```bash
 set -euo pipefail
-python3 - <<'PY' | gh api --repo StrayForest/old_sparky --method POST \
+python3 - <<'PY' | gh api --method POST \
   repos/StrayForest/old_sparky/actions/workflows/platform-production-external-load.yml/dispatches \
   --input -
 import getpass
@@ -538,8 +538,8 @@ Canceling a workflow does not prove the remote process tree stopped. Use the
 exact abort and cleanup request bodies, source identities and receipt gates.
 
 Validation binds the Security run/attempt and exact CI route to current `dev` SHA before helper creation. It accepts only trusted full routes (recovery-bootstrap, storage operations or deployable runtime); `target_sha` separately identifies the active production app source.
-The workflow resolves the runner SHA from the selected load run and attempt through the GitHub API, requiring the exact repository, external-load workflow, `workflow_dispatch` event and `dev` branch; operators do not supply a runner SHA. The helper binds that runner SHA and the separately checked active app SHA to the same root-owned marker and fixture manifest.
-Typed CPU/SSR abort evidence binds run, attempt, runner source, app target, fixture kind and manifest; it confirms the selected run-owned processes are absent and the shared lock is clear.
+The workflow resolves the runner SHA from the selected load run and attempt through the GitHub API, requiring the exact repository, external-load workflow, `workflow_dispatch` event and `dev` branch; operators do not supply a runner SHA. The helper binds that runner SHA and the separately checked active app SHA to the same root-owned marker and fixture-manifest digest; it verifies the credential-bearing manifest itself when that file is still present.
+Typed CPU/SSR abort evidence binds run, attempt, runner source, app target, fixture kind and fixture-manifest digest; the root-owned binding marker remains authoritative after the credential-bearing manifest is retired. It confirms the selected run-owned processes are absent and the shared lock is clear.
 For composite SSR, the reviewed `dev` workflow stages a digest-bound helper in root-owned `/run` while the app stays on target SHA.
 An already-absent receipt requires two clean scans for the exact supervisor, observer and run-root helper processes, exact exit evidence and a clear lock.
 The receipt keeps `namespace_closed: false`, grants no performance credit, and permits cleanup only after the workflow normalizer accepts it.

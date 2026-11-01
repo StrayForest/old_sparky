@@ -3476,11 +3476,17 @@ def _project_request_correlation(value: Any) -> dict[str, Any] | None:
 
     coverage_fields = {
         "complete", "scope", "selection_rank_proof", "full_cohort",
-        "source_rows_truncated", "source_input_rows", "source_rejections",
+        "source_collection_reason", "source_rows_truncated", "source_input_rows", "source_rejections",
         "cf_ray_fallback_enabled",
     }
     coverage = summary.get("coverage")
     sources = {"nginx", "ssr", "stream", "api"}
+    collection_reason = coverage.get("source_collection_reason") if isinstance(coverage, dict) else None
+    collection_reasons = {
+        "complete", "invalid_request", "spawn_failed", "timeout", "byte_cap",
+        "line_cap", "row_cap", "invalid_event", "invalid_identity",
+        "journal_failed", "trailing_partial_line", "journal_sync_failed",
+    }
     if (not isinstance(coverage, dict) or set(coverage) != coverage_fields
             or type(coverage.get("complete")) is not bool
             or coverage.get("scope") != "selected_sample_only"
@@ -3490,6 +3496,10 @@ def _project_request_correlation(value: Any) -> dict[str, Any] | None:
             )
             or type(coverage.get("full_cohort")) is not bool
             or coverage.get("cf_ray_fallback_enabled") is not False
+            or not isinstance(collection_reason, dict)
+            or set(collection_reason) != {"api", "web"}
+            or any(not isinstance(item, str) or item not in collection_reasons
+                   for item in collection_reason.values())
             or not isinstance(coverage.get("source_rows_truncated"), dict)
             or set(coverage["source_rows_truncated"]) != sources
             or any(type(item) is not bool for item in coverage["source_rows_truncated"].values())
@@ -3499,6 +3509,15 @@ def _project_request_correlation(value: Any) -> dict[str, Any] | None:
                    for item in coverage["source_input_rows"].values())
             or not isinstance(coverage.get("source_rejections"), dict)
             or set(coverage["source_rejections"]) != sources):
+        return None
+    if ((collection_reason["api"] != "complete"
+         and not coverage["source_rows_truncated"]["api"])
+            or (collection_reason["web"] != "complete"
+                and not (coverage["source_rows_truncated"]["ssr"]
+                         and coverage["source_rows_truncated"]["stream"]))):
+        return None
+    if (any(value != "complete" for value in collection_reason.values())
+            and (coverage["complete"] or coverage["full_cohort"])):
         return None
     for rejection_counts in coverage["source_rejections"].values():
         if (not isinstance(rejection_counts, dict)

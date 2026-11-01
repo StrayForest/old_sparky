@@ -26,6 +26,9 @@ SAFE_RESPONSE_HEADERS = frozenset(
         "connection",
         "etag",
         "retry-after",
+        # The SSR capacity workload needs this server-issued ID to join the
+        # measured HTTP response with bounded web-side stream diagnostics.
+        "x-platform-ssr-request-id",
     }
 )
 PHASE_TIMING_KEYS = (

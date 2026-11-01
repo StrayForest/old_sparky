@@ -1106,6 +1106,53 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                 and has_request_telemetry == ("client_request_ids" in payload)
             )
             request_telemetry = result.get("request_telemetry") if isinstance(result, dict) else None
+            telemetry_summary = (
+                request_telemetry.get("summary")
+                if isinstance(request_telemetry, dict) else None
+            )
+            telemetry_coverage = (
+                telemetry_summary.get("coverage")
+                if isinstance(telemetry_summary, dict) else None
+            )
+            collection_reason = (
+                telemetry_coverage.get("source_collection_reason")
+                if isinstance(telemetry_coverage, dict) else None
+            )
+            source_truncated = (
+                telemetry_coverage.get("source_rows_truncated")
+                if isinstance(telemetry_coverage, dict) else None
+            )
+            valid_collection_reasons = {
+                "complete", "invalid_request", "spawn_failed", "timeout",
+                "byte_cap", "line_cap", "row_cap", "invalid_event",
+                "invalid_identity", "journal_failed", "trailing_partial_line",
+                "journal_sync_failed",
+            }
+            source_collection_reason_valid = (
+                isinstance(collection_reason, dict)
+                and set(collection_reason) == {"api", "web"}
+                and all(isinstance(reason, str) and reason in valid_collection_reasons
+                        for reason in collection_reason.values())
+                and isinstance(source_truncated, dict)
+                and set(source_truncated) == {"api", "ssr", "stream", "nginx"}
+                and all(type(item) is bool for item in source_truncated.values())
+                and (
+                    collection_reason["api"] == "complete"
+                    or source_truncated["api"]
+                )
+                and (
+                    collection_reason["web"] == "complete"
+                    or (source_truncated["ssr"] and source_truncated["stream"])
+                )
+                and (
+                    all(reason == "complete" for reason in collection_reason.values())
+                    or (
+                        isinstance(telemetry_coverage, dict)
+                        and telemetry_coverage.get("complete") is False
+                        and telemetry_coverage.get("full_cohort") is False
+                    )
+                )
+            )
             request_telemetry_valid = (
                 not has_request_telemetry
                 or (
@@ -1122,6 +1169,7 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                                 "timing_ms", "coverage", "ssr_stream_coverage",
                             }
                             and isinstance(request_telemetry["summary"].get("coverage"), dict)
+                            and source_collection_reason_valid
                             and isinstance(request_telemetry["summary"].get("ssr_stream_coverage"), dict)
                             and (
                                 request_telemetry.get("status") == "incomplete"

@@ -3420,6 +3420,47 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         assert parsed is not None
         self.assertIsNone(parsed["cgroup_memory_peak_end_bytes"])
         self.assertEqual(parsed["rss_max_bytes"], 100)
+        self.assertIsNone(diagnostic_plan_tool._parse_node_memory_event(
+            message.replace("sampled_window_end_elapsed_ms=16000", "sampled_window_end_elapsed_ms=20001")
+            .replace("sampled_window_duration_ms=16000", "sampled_window_duration_ms=20001")
+        ))
+        typed_120s_message = (
+            message.replace("sampled_window_start_elapsed_ms=0", "sampled_window_start_elapsed_ms=97")
+            .replace("sampled_window_end_elapsed_ms=16000", "sampled_window_end_elapsed_ms=120022")
+            .replace("sampled_window_duration_ms=16000", "sampled_window_duration_ms=119925")
+        )
+        self.assertIsNone(diagnostic_plan_tool._parse_node_memory_event(typed_120s_message))
+        typed_120s = diagnostic_plan_tool._parse_node_memory_event(
+            typed_120s_message,
+            max_sampled_window_ms=120_000,
+            max_sampled_window_end_ms=120_500,
+        )
+        self.assertIsNotNone(typed_120s)
+        assert typed_120s is not None
+        self.assertEqual(typed_120s["sampled_window_duration_ms"], 119_925)
+        self.assertIsNone(diagnostic_plan_tool._parse_node_memory_event(
+            typed_120s_message.replace(
+                "sampled_window_end_elapsed_ms=120022", "sampled_window_end_elapsed_ms=120501",
+            ).replace(
+                "sampled_window_duration_ms=119925", "sampled_window_duration_ms=120404",
+            ),
+            max_sampled_window_ms=120_000,
+            max_sampled_window_end_ms=120_500,
+        ))
+        self.assertIsNone(diagnostic_plan_tool._parse_node_memory_event(
+            typed_120s_message.replace(
+                "sampled_window_start_elapsed_ms=97", "sampled_window_start_elapsed_ms=0",
+            ).replace(
+                "sampled_window_end_elapsed_ms=120022", "sampled_window_end_elapsed_ms=120001",
+            ).replace(
+                "sampled_window_duration_ms=119925", "sampled_window_duration_ms=120001",
+            ),
+            max_sampled_window_ms=120_000,
+            max_sampled_window_end_ms=120_500,
+        ))
+        self.assertIsNone(diagnostic_plan_tool._parse_node_memory_event(
+            message, max_sampled_window_ms=diagnostic_plan_tool.MAX_TOTAL_WINDOW_MS + 1,
+        ))
         self.assertIsNone(diagnostic_plan_tool._parse_node_memory_event(f"{message} token=private"))
         self.assertIsNone(diagnostic_plan_tool._parse_node_memory_event(message.replace("run_id=" + "a" * 32, "run_id=bad")))
 
@@ -4717,6 +4758,110 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertEqual(
                 profiled_capacity_telemetry["profile_rows"][0]["observed_targets"], 2,
             )
+
+            # Exercise the real plan parser/cleanup summary, remote dispatcher
+            # projection and capacity runner validator for the typed 120s HTML
+            # workload. Legacy 20s memory events use the parser's default cap.
+            typed_workload = diagnostic_plan_tool.HTML_CAPACITY_120S_WORKLOAD
+            typed_plans = json.loads(json.dumps(plans))
+            for service in typed_plans:
+                typed_plans[service].update({
+                    "workload": typed_workload,
+                    "on_end_ms": 146_000,
+                    "expires_at_ms": 161_000,
+                })
+            typed_journal_rows = json.loads(json.dumps(journal_rows))
+            for record in typed_journal_rows:
+                raw_message = record["MESSAGE"]
+                wrapped = None
+                if raw_message.startswith("{"):
+                    wrapped = json.loads(raw_message)
+                    raw_message = wrapped["message"]
+                if raw_message.startswith("cpu_diagnostic_usage ") and "phase=on " in raw_message:
+                    raw_message = raw_message.replace("window_ms=20000", "window_ms=120000")
+                elif raw_message.startswith("cpu_diagnostic_complete "):
+                    record["MESSAGE"] = ""
+                    continue
+                elif raw_message.startswith("cpu_diagnostic_memory ") and "phase=on " in raw_message:
+                    raw_message = raw_message.replace(
+                        "sampled_window_start_elapsed_ms=0",
+                        "sampled_window_start_elapsed_ms=97",
+                    ).replace(
+                        "sampled_window_end_elapsed_ms=16000",
+                        "sampled_window_end_elapsed_ms=120022",
+                    ).replace(
+                        "sampled_window_duration_ms=16000",
+                        "sampled_window_duration_ms=119925",
+                    )
+                record["MESSAGE"] = (
+                    json.dumps({**wrapped, "message": raw_message}, separators=(",", ":"))
+                    if wrapped is not None else raw_message
+                )
+            with (
+                patch.object(diagnostic_plan_tool, "_release_identity", return_value=("b" * 40, "release-bbbbbbbbbbbb")),
+                patch.object(diagnostic_plan_tool, "_systemd_unit", side_effect=systemd_unit),
+                patch.object(diagnostic_plan_tool, "_service_targets", side_effect=lambda service, _unit: service_rows[service]),
+                patch.object(diagnostic_plan_tool, "_process_start_ticks", side_effect={101: 11, 102: 12, 201: 21}.get),
+                patch.object(diagnostic_plan_tool, "_journal_rows", return_value=("complete", typed_journal_rows)),
+            ):
+                typed_summary = diagnostic_plan_tool._usage_summary(typed_plans)
+            self.assertEqual(typed_summary["memory_status"], "complete", typed_summary)
+            self.assertEqual(typed_summary["memory_rows"][1]["sampled_window_duration_ms"], 119_925)
+
+            summary_path.write_text(json.dumps({
+                "status": "expired_plans_removed", "service_count": 2, **typed_summary,
+            }, sort_keys=True), encoding="ascii")
+            typed_stdout = io.StringIO()
+            with (
+                patch.object(remote_dispatch, "_trusted_python_helper", return_value=True),
+                patch.object(remote_dispatch, "SUDO", str(fake_sudo)),
+                redirect_stdout(typed_stdout),
+            ):
+                self.assertEqual(remote_dispatch._run_cpu_diagnostic_plan({
+                    "operation": "cleanup", "schema": 1, "run_id": "a" * 32,
+                }), 0)
+            typed_dispatched = json.loads(
+                typed_stdout.getvalue().strip().removeprefix("CPU_DIAGNOSTIC_PLAN ")
+            )
+            typed_validated = cpu_pair._validate_usage_summary(
+                typed_dispatched, expected_workload=typed_workload,
+            )
+            self.assertIsNotNone(typed_validated)
+            assert typed_validated is not None
+            oversized_typed_summary = json.loads(json.dumps(typed_dispatched))
+            oversized_typed_summary["memory_rows"][1]["sampled_window_end_elapsed_ms"] = 120_501
+            oversized_typed_summary["memory_rows"][1]["sampled_window_duration_ms"] = 120_404
+            self.assertIsNone(cpu_pair._validate_usage_summary(
+                oversized_typed_summary, expected_workload=typed_workload,
+            ))
+            over_duration_summary = json.loads(json.dumps(typed_dispatched))
+            over_duration_summary["memory_rows"][1]["sampled_window_start_elapsed_ms"] = 0
+            over_duration_summary["memory_rows"][1]["sampled_window_end_elapsed_ms"] = 120_001
+            over_duration_summary["memory_rows"][1]["sampled_window_duration_ms"] = 120_001
+            self.assertIsNone(cpu_pair._validate_usage_summary(
+                over_duration_summary, expected_workload=typed_workload,
+            ))
+            typed_telemetry = capacity_diagnostic._project_server_telemetry(
+                typed_validated, expected_workload=typed_workload,
+            )
+            self.assertEqual(typed_telemetry["node_memory_status"], "complete")
+            self.assertEqual(
+                typed_telemetry["node_memory_rows"][1]["sampled_window_duration_ms"], 119_925,
+            )
+
+            mismatched_typed_plans = json.loads(json.dumps(typed_plans))
+            mismatched_typed_plans["web"]["on_end_ms"] += 1
+            with (
+                patch.object(diagnostic_plan_tool, "_release_identity", return_value=("b" * 40, "release-bbbbbbbbbbbb")),
+                patch.object(diagnostic_plan_tool, "_systemd_unit", side_effect=systemd_unit),
+                patch.object(diagnostic_plan_tool, "_service_targets", side_effect=lambda service, _unit: service_rows[service]),
+                patch.object(diagnostic_plan_tool, "_process_start_ticks", side_effect={101: 11, 102: 12, 201: 21}.get),
+                patch.object(diagnostic_plan_tool, "_journal_rows", return_value=("complete", typed_journal_rows)),
+            ):
+                mismatched_summary = diagnostic_plan_tool._usage_summary(mismatched_typed_plans)
+            self.assertEqual(mismatched_summary["usage_reason"], "identity_changed")
+            self.assertEqual(mismatched_summary["memory_status"], "incomplete")
+
             invalid_profile_summary = json.loads(json.dumps(validated_cleanup))
             invalid_profile_summary["profile_rows"][0]["categories"][0]["category"] = "raw.function.name"
             invalid_profile_telemetry = capacity_diagnostic._project_server_telemetry(
@@ -6569,7 +6714,11 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             with (
                 patch.object(
                     diagnostic_plan_tool, "_bounded_capacity_journal_rows",
-                    return_value=([], False),
+                    return_value=([], "complete"),
+                ),
+                patch.object(
+                    diagnostic_plan_tool, "_wait_and_sync_capacity_capture_marker",
+                    return_value=True,
                 ),
                 patch.object(
                     diagnostic_plan_tool, "_bounded_nginx_rows",
@@ -6695,7 +6844,9 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     patch.object(remote_dispatch, "SUDO", str(fake_sudo)),
                     redirect_stdout(output),
                 ):
-                    self.assertEqual(remote_dispatch._run_cpu_diagnostic_plan(payload), 0)
+                    dispatch_status = remote_dispatch._run_cpu_diagnostic_plan(payload)
+                if dispatch_status != 0:
+                    return None
                 projected = json.loads(
                     output.getvalue().strip().removeprefix("CPU_DIAGNOSTIC_PLAN ")
                 )
@@ -6738,6 +6889,22 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     del missing_scope["request_telemetry"]["summary"]["coverage"]["scope"]
                     self.assertIsNone(dispatch_and_validate(
                         workload, missing_scope, selected_ids, counts,
+                    ))
+                    contradictory_collection = json.loads(json.dumps(
+                        cleanup_summary(workload, produced),
+                    ))
+                    contradictory_coverage = contradictory_collection[
+                        "request_telemetry"
+                    ]["summary"]["coverage"]
+                    contradictory_coverage["source_collection_reason"]["api"] = "byte_cap"
+                    contradictory_coverage["source_rows_truncated"]["api"] = True
+                    contradictory_coverage["complete"] = True
+                    contradictory_coverage["full_cohort"] = True
+                    self.assertIsNone(cpu_pair._validate_usage_summary(
+                        contradictory_collection, expected_workload=workload,
+                    ))
+                    self.assertIsNone(dispatch_and_validate(
+                        workload, contradictory_collection, selected_ids, counts,
                     ))
 
         selected_rank_ids: list[str] = []

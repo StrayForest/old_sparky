@@ -29,6 +29,7 @@ import tools.platform_workflow_remote_dispatch as remote_dispatch
 import tools.platform_workflow_input_guard as workflow_input_guard
 from tools import platform_cpu_diagnostic_plan as cpu_plan
 from tools.platform_evidence_sanitizer import project_public_artifact
+from tools.platform_http_transport import HTTP11KeepAliveClient
 from tools.platform_external_load import (
     ExternalLoadError,
     LogicalRequestResult,
@@ -1321,6 +1322,76 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertEqual(delayed_result.error_kind, "TimeoutError")
         self.assertIsNone(delayed_result.html_marker_flags)
         self.assertIsNone(delayed_result.html_content_encoding)
+
+    def test_ssr_response_id_survives_http11_page_capture_and_keeps_closed_validation(self) -> None:
+        body = b"".join((
+            lifecycle_marker(True),
+            b'<span class="header-profile-avatar"></span>',
+            b'<section class="hero-wrap">' + raw_heading("Fixture title") + b"</section>",
+            b'<section class="route-loading-shell"></section>',
+        ))
+        valid_id = "0123456789abcdef0123456789abcdef"
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("X-Private-Unapproved", "must-not-leak")
+                if self.path.endswith("fixture-valid"):
+                    self.send_header("X-Platform-SSR-Request-Id", valid_id)
+                elif self.path.endswith("fixture-malformed"):
+                    self.send_header("X-Platform-SSR-Request-Id", "not-an-id")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        origin = f"http://127.0.0.1:{server.server_port}"
+        local_transport = threading.local()
+        try:
+            with patch.object(external_load, "_page_transport_local", local_transport):
+                results = {
+                    name: external_load._page_request_http11_keepalive(
+                        origin,
+                        VirtualUser("actor", f"fixture-{name}", "s" * 32, "c" * 32),
+                        "html-capacity",
+                        5.0,
+                        session_cookie_name="session",
+                        csrf_cookie_name="csrf",
+                        capture_timestamps=True,
+                        diagnostic_trace_run_id="a" * 32,
+                        require_authenticated_html=True,
+                    )
+                    for name in ("valid", "missing", "malformed")
+                }
+                client = getattr(local_transport, "client", None)
+                self.assertIsInstance(client, HTTP11KeepAliveClient)
+                filtered = client.get(
+                    "/untrusted-header-check", headers={"Accept": "text/plain"},
+                )
+        finally:
+            client = getattr(local_transport, "client", None)
+            if isinstance(client, HTTP11KeepAliveClient):
+                client.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertTrue(all(result.ok for result in results.values()))
+        self.assertEqual(results["valid"].ssr_request_id, valid_id)
+        self.assertFalse(results["valid"].ssr_request_id_malformed)
+        self.assertIsNone(results["missing"].ssr_request_id)
+        self.assertFalse(results["missing"].ssr_request_id_malformed)
+        self.assertIsNone(results["malformed"].ssr_request_id)
+        self.assertTrue(results["malformed"].ssr_request_id_malformed)
+        self.assertNotIn("x-private-unapproved", filtered.headers)
 
     def test_html_capacity_response_failure_stops_refill_and_keeps_partial_counts(self) -> None:
         actors = [VirtualUser(f"actor-{index}", "fixture", "s" * 32, "c" * 32) for index in range(14)]

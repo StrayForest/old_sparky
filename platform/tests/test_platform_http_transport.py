@@ -34,6 +34,8 @@ class _KeepAliveHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "keep-alive")
         self.send_header("ETag", '"transport-test"')
+        self.send_header("X-Platform-SSR-Request-Id", "0123456789abcdef0123456789abcdef")
+        self.send_header("X-Private-Unapproved", "must-not-leak")
         self.end_headers()
         self.wfile.write(body)
 
@@ -101,6 +103,11 @@ class PlatformHttpTransportTests(unittest.TestCase):
         self.assertEqual(first.status, 200)
         self.assertEqual(first.body, b"transport-test")
         self.assertEqual(first.headers["etag"], '"transport-test"')
+        self.assertEqual(
+            first.headers["x-platform-ssr-request-id"],
+            "0123456789abcdef0123456789abcdef",
+        )
+        self.assertNotIn("x-private-unapproved", first.headers)
         self.assertEqual(first.http_version, "1.1")
         self.assertFalse(first.connection_reused)
         self.assertTrue(second.connection_reused)

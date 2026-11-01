@@ -46,7 +46,8 @@ MAX_JOURNAL_LINE_BYTES = 16_384
 MAX_JOURNAL_ROWS = 640
 JOURNAL_TIMEOUT_SECONDS = 3
 CAPACITY_JOURNAL_TIMEOUT_SECONDS = 12
-CAPACITY_JOURNAL_BYTES = 8 * 1024 * 1024
+CAPACITY_JOURNAL_SYNC_TIMEOUT_SECONDS = 3
+CAPACITY_JOURNAL_BYTES = 24 * 1024 * 1024
 CAPACITY_JOURNAL_LINE_BYTES = 64 * 1024
 CAPACITY_JOURNAL_ROWS = 50_000
 CAPACITY_NGINX_BYTES = 32 * 1024 * 1024
@@ -54,6 +55,12 @@ CAPACITY_NGINX_ROWS = 50_000
 CAPACITY_NGINX_FILES = 8
 CAPACITY_REQUEST_SAMPLE_LIMIT = 1_000
 CAPACITY_CAPTURE_DRAIN_MS = 15_000
+CAPACITY_CAPTURE_MARKER_GRACE_MS = 1_000
+CAPACITY_JOURNAL_COLLECTION_REASONS = frozenset({
+    "complete", "invalid_request", "spawn_failed", "timeout", "byte_cap",
+    "line_cap", "row_cap", "invalid_event", "invalid_identity",
+    "journal_failed", "trailing_partial_line", "journal_sync_failed",
+})
 NGINX_ACCESS_LOG = Path("/var/log/nginx/platform-access.log")
 MAX_SAMPLES_PROFILE = 1200
 MEMORY_SAMPLE_COUNT = 5
@@ -878,25 +885,36 @@ def _bounded_capacity_journal_rows(
     since_ms: int,
     until_ms: int,
     markers: tuple[str, ...],
-) -> tuple[list[dict[str, Any]], bool]:
+    run_id: str,
+    request_ids: set[str],
+) -> tuple[list[dict[str, Any]], str]:
     """Read a bounded exact-invocation journal slice for SSR/API joins."""
 
     targets = plan.get("targets")
     invocation = targets[0].get("invocation_id") if isinstance(targets, list) and targets and isinstance(targets[0], dict) else None
     if (service not in PLAN_NAMES or not isinstance(invocation, str)
             or INVOCATION_RE.fullmatch(invocation) is None
+            or RUN_RE.fullmatch(run_id) is None
+            or not isinstance(request_ids, set)
+            or len(request_ids) > CAPACITY_REQUEST_SAMPLE_LIMIT
+            or any(not isinstance(item, str) or _SSR_CORR_REQUEST_ID_RE.fullmatch(item) is None
+                   for item in request_ids)
             or type(since_ms) is not int or type(until_ms) is not int
             or not 0 <= since_ms < until_ms
-            or until_ms - since_ms > MAX_TOTAL_WINDOW_MS + CAPACITY_CAPTURE_DRAIN_MS + 5_000
+            or until_ms - since_ms > MAX_TOTAL_WINDOW_MS + CAPACITY_CAPTURE_DRAIN_MS
+            + CAPACITY_CAPTURE_MARKER_GRACE_MS + 5_000
             or not markers or any(not re.fullmatch(r"[a-z_]+", marker) for marker in markers)):
-        return [], True
+        return [], "invalid_request"
     marker_expression = "|".join(markers)
+    unit = f"deadlock-{service}.service"
+    cgroup = f"/system.slice/{unit}"
     command = [
         "/usr/bin/journalctl", "--no-pager", "--quiet", "--output=json",
-        "--output-fields=MESSAGE,_PID,_SYSTEMD_UNIT,_SYSTEMD_INVOCATION_ID,_SYSTEMD_CGROUP,__REALTIME_TIMESTAMP",
+        "--output-fields=MESSAGE,_SYSTEMD_UNIT,_SYSTEMD_CGROUP,_SYSTEMD_INVOCATION_ID,__REALTIME_TIMESTAMP",
         "--since", _journal_epoch(since_ms), "--until", _journal_epoch(until_ms),
-        f"--unit=deadlock-{service}.service", f"--grep={marker_expression}",
-        "--case-sensitive=yes", f"_SYSTEMD_INVOCATION_ID={invocation.lower()}",
+        f"--grep={marker_expression}", "--case-sensitive=yes",
+        f"_SYSTEMD_UNIT={unit}", f"_SYSTEMD_CGROUP={cgroup}",
+        f"_SYSTEMD_INVOCATION_ID={invocation.lower()}",
     ]
     try:
         process = subprocess.Popen(
@@ -905,23 +923,33 @@ def _bounded_capacity_journal_rows(
             env={"LANG": "C", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "TZ": "UTC"},
         )
     except OSError:
-        return [], True
+        return [], "spawn_failed"
     assert process.stdout is not None
     fd = process.stdout.fileno()
     selector = selectors.DefaultSelector()
     pending = bytearray()
     rows: list[dict[str, Any]] = []
     bytes_read = 0
+    source_rows = 0
     deadline = time.monotonic() + CAPACITY_JOURNAL_TIMEOUT_SECONDS
-    truncated = False
+    reason = "complete"
     eof = False
+
+    def record_failure(candidate: str) -> None:
+        nonlocal reason
+        # Preserve the first observed failure. A later row, byte or process
+        # failure must not hide the malformed/identity event that occurred
+        # earlier in this same bounded response.
+        if reason == "complete":
+            reason = candidate
+
     try:
         os.set_blocking(fd, False)
         selector.register(fd, selectors.EVENT_READ)
         while process.poll() is None or not eof:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                truncated = True
+                record_failure("timeout")
                 break
             for event, _mask in selector.select(min(remaining, 0.1)):
                 try:
@@ -934,36 +962,48 @@ def _bounded_capacity_journal_rows(
                     break
                 bytes_read += len(chunk)
                 if bytes_read > CAPACITY_JOURNAL_BYTES:
-                    truncated = True
+                    record_failure("byte_cap")
                     break
                 pending.extend(chunk)
                 while True:
                     newline = pending.find(b"\n")
                     if newline < 0:
                         if len(pending) > CAPACITY_JOURNAL_LINE_BYTES:
-                            truncated = True
+                            record_failure("line_cap")
                         break
                     if newline > CAPACITY_JOURNAL_LINE_BYTES:
-                        truncated = True
+                        record_failure("line_cap")
                         del pending[: newline + 1]
-                        continue
+                        break
                     line = bytes(pending[:newline])
                     del pending[: newline + 1]
                     try:
                         row = json.loads(line.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
                     except (UnicodeError, json.JSONDecodeError, PlanError):
-                        truncated = True
+                        record_failure("invalid_event")
                         continue
                     if not isinstance(row, dict):
-                        truncated = True
+                        record_failure("invalid_event")
                         continue
-                    rows.append(row)
-                    if len(rows) > CAPACITY_JOURNAL_ROWS:
-                        truncated = True
+                    if (row.get("_SYSTEMD_UNIT") != unit
+                            or row.get("_SYSTEMD_CGROUP") != cgroup
+                            or row.get("_SYSTEMD_INVOCATION_ID") != invocation.lower()):
+                        record_failure("invalid_identity")
                         break
-                if truncated:
+                    source_rows += 1
+                    if source_rows > CAPACITY_JOURNAL_ROWS:
+                        record_failure("row_cap")
+                        break
+                    message = _message_text(row)
+                    if message is None:
+                        record_failure("invalid_event")
+                        break
+                    if _capacity_journal_row_selected(
+                            service, message, run_id=run_id, request_ids=request_ids):
+                        rows.append(row)
+                if reason != "complete":
                     break
-            if truncated:
+            if reason != "complete":
                 break
         if process.poll() is None:
             _terminate_journal(process)
@@ -972,15 +1012,23 @@ def _bounded_capacity_journal_rows(
         except subprocess.TimeoutExpired:
             _terminate_journal(process)
             child_status = process.poll()
-        if child_status != 0 or pending:
-            truncated = True
+        if reason == "complete" and child_status != 0:
+            reason = "journal_failed"
+        if reason == "complete" and pending:
+            reason = "trailing_partial_line"
     finally:
         selector.close()
         process.stdout.close()
         if process.poll() is None:
             _terminate_journal(process)
         pending[:] = b"\0" * len(pending)
-    return rows[:CAPACITY_JOURNAL_ROWS], truncated
+    if reason != "complete":
+        # A partial query must not be mistaken for usable source rows, and
+        # dropping the parsed dictionaries releases their memory before the
+        # next service query or report projection.
+        rows.clear()
+        return [], reason
+    return rows, reason
 
 
 def _iter_file_lines_reverse(
@@ -1110,6 +1158,62 @@ def _message_text(record: dict[str, Any]) -> str | None:
         if isinstance(wrapped, dict):
             message = wrapped.get("message")
     return message if isinstance(message, str) else None
+
+
+def _capacity_journal_row_selected(
+    service: str,
+    message: str,
+    *,
+    run_id: str,
+    request_ids: set[str],
+) -> bool:
+    """Retain exact selected request rows and phase-wide coverage markers."""
+
+    if service == "api":
+        if message.startswith("ssr_api_request_perf_coverage"):
+            return True
+        parsed = _capacity_correlation_parse_request_perf(message)
+        return isinstance(parsed, dict) and parsed.get("request_id") in request_ids
+    if service == "web":
+        if message.startswith(("ssr_stream_coverage", "ssr_stream_capture_coverage")):
+            return True
+        parsed_ssr = _capacity_correlation_parse_ssr_perf(message)
+        if (isinstance(parsed_ssr, dict)
+                and parsed_ssr.get("diagnostic_run_id") == run_id
+                and parsed_ssr.get("request_id") in request_ids):
+            return True
+        parsed_stream = _capacity_correlation_parse_ssr_stream(message)
+        return isinstance(parsed_stream, dict) and parsed_stream.get("request_id") in request_ids
+    return False
+
+
+def _wait_and_sync_capacity_capture_marker(expires_at_ms: int) -> bool:
+    """Wait through the bounded producer timer grace, then flush journald."""
+
+    if type(expires_at_ms) is not int or expires_at_ms <= 0:
+        return False
+    ready_at_ms = expires_at_ms + CAPACITY_CAPTURE_MARKER_GRACE_MS
+    now_ms = time.time_ns() // 1_000_000
+    remaining_ms = ready_at_ms - now_ms
+    if remaining_ms > CAPACITY_CAPTURE_MARKER_GRACE_MS:
+        return False
+    if remaining_ms > 0:
+        try:
+            time.sleep(remaining_ms / 1_000)
+        except (OSError, InterruptedError):
+            return False
+    try:
+        result = subprocess.run(
+            ["/usr/bin/journalctl", "--sync"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, check=False,
+            timeout=CAPACITY_JOURNAL_SYNC_TIMEOUT_SECONDS,
+            close_fds=True,
+            env={"LANG": "C", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "TZ": "UTC"},
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
 
 
 def _record_ssr_stream_coverage(
@@ -1287,23 +1391,15 @@ def _capacity_request_telemetry(
         web_plan["expires_at_ms"],
         end_ms + CAPACITY_CAPTURE_DRAIN_MS,
     )
+    web_query_until_ms = capture_end_ms + CAPACITY_CAPTURE_MARKER_GRACE_MS
     start_utc = datetime.fromtimestamp(start_ms / 1000, tz=UTC).isoformat()
     end_utc = datetime.fromtimestamp(capture_end_ms / 1000, tz=UTC).isoformat()
     selected_set = set(selected_request_ids)
-    api_raw, api_truncated = _bounded_capacity_journal_rows(
+    api_raw, api_collection_reason = _bounded_capacity_journal_rows(
         "api", api_plan, since_ms=max(0, start_ms - 1_000),
         until_ms=capture_end_ms,
         markers=("request_perf", "ssr_api_request_perf_coverage"),
-    )
-    web_raw, web_truncated = _bounded_capacity_journal_rows(
-        "web", web_plan, since_ms=max(0, start_ms - 1_000),
-        until_ms=capture_end_ms, markers=(
-            "ssr_perf", "ssr_stream", "ssr_stream_coverage",
-            "ssr_stream_capture_coverage",
-        ),
-    )
-    nginx_raw, nginx_truncated = _bounded_nginx_rows(
-        selected_set, since_ms=max(0, start_ms - 1_000), until_ms=capture_end_ms,
+        run_id=run_id, request_ids=selected_set,
     )
     def context(event_at_utc: str, request_id: str) -> dict[str, str]:
         return {
@@ -1343,6 +1439,26 @@ def _capacity_request_telemetry(
             if type(value) in (int, float) and not isinstance(value, bool):
                 row[field] = value
         api_rows.append(row)
+    # Release API journal dictionaries before reading the larger web source;
+    # the per-query byte cap is not a process-memory cap.
+    api_raw.clear()
+
+    marker_sync_ok = _wait_and_sync_capacity_capture_marker(web_plan["expires_at_ms"])
+    web_raw, web_collection_reason = _bounded_capacity_journal_rows(
+        "web", web_plan, since_ms=max(0, start_ms - 1_000),
+        until_ms=web_query_until_ms, markers=(
+            "ssr_perf", "ssr_stream", "ssr_stream_coverage",
+            "ssr_stream_capture_coverage",
+        ),
+        run_id=run_id, request_ids=selected_set,
+    )
+    if not marker_sync_ok:
+        # Sync runs before the query; retain its failure as the first observed
+        # cause even if the following query also encounters a failure.
+        web_collection_reason = "journal_sync_failed"
+    nginx_raw, nginx_truncated = _bounded_nginx_rows(
+        selected_set, since_ms=max(0, start_ms - 1_000), until_ms=capture_end_ms,
+    )
 
     ssr_rows: list[dict[str, Any]] = []
     stream_rows: list[dict[str, Any]] = []
@@ -1406,6 +1522,8 @@ def _capacity_request_telemetry(
             "cf_ray": raw.get("cf_ray"),
         })
 
+    api_truncated = api_collection_reason != "complete"
+    web_truncated = web_collection_reason != "complete"
     rows_truncated = {
         "nginx": nginx_truncated,
         "ssr": web_truncated,
@@ -1426,6 +1544,10 @@ def _capacity_request_telemetry(
         nginx_rows=nginx_rows, ssr_rows=ssr_rows, stream_rows=stream_rows,
         api_rows=api_rows,
         rows_truncated=rows_truncated,
+        source_collection_reason={
+            "api": api_collection_reason,
+            "web": web_collection_reason,
+        },
         max_rows=CAPACITY_JOURNAL_ROWS,
         sample_limit=CAPACITY_REQUEST_SAMPLE_LIMIT,
         cf_ray_fallback_proven=False,
@@ -1545,9 +1667,19 @@ def _parse_profile_categories(
     return parsed
 
 
-def _parse_node_memory_event(message: str) -> dict[str, Any] | None:
+def _parse_node_memory_event(
+    message: str,
+    *,
+    max_sampled_window_ms: int = ON_WINDOW_MS,
+    max_sampled_window_end_ms: int | None = None,
+) -> dict[str, Any] | None:
     """Project one bounded Node/cgroup aggregate from its closed log schema."""
-    if not message.startswith("cpu_diagnostic_memory ") or len(message) > 4096:
+    if (not message.startswith("cpu_diagnostic_memory ") or len(message) > 4096
+            or type(max_sampled_window_ms) is not int
+            or not 0 <= max_sampled_window_ms <= MAX_TOTAL_WINDOW_MS
+            or max_sampled_window_end_ms is not None
+            and (type(max_sampled_window_end_ms) is not int
+                 or not 0 <= max_sampled_window_end_ms <= MAX_TOTAL_WINDOW_MS + 500)):
         return None
     values: dict[str, str] = {}
     for token in message.split()[1:]:
@@ -1582,7 +1714,21 @@ def _parse_node_memory_event(message: str) -> dict[str, Any] | None:
             return None
     if result["sample_count"] > 0 and values["status"] == "complete" and result["sample_count"] != 5:
         return None
-    if result["sampled_window_duration_ms"] is not None and result["sampled_window_duration_ms"] > 20_000:
+    if (result["sampled_window_duration_ms"] is not None
+            and result["sampled_window_duration_ms"] > max_sampled_window_ms):
+        return None
+    sampled_start_ms = result["sampled_window_start_elapsed_ms"]
+    sampled_end_ms = result["sampled_window_end_elapsed_ms"]
+    sampled_duration_ms = result["sampled_window_duration_ms"]
+    if (
+        sampled_end_ms is not None and max_sampled_window_end_ms is not None
+        and sampled_end_ms > max_sampled_window_end_ms
+        or sampled_start_ms is not None and sampled_end_ms is not None
+        and sampled_end_ms < sampled_start_ms
+        or sampled_duration_ms is not None and sampled_start_ms is not None
+        and sampled_end_ms is not None
+        and sampled_duration_ms != sampled_end_ms - sampled_start_ms
+    ):
         return None
     if values["cgroup_memory_status"] == "complete" and values["cgroup_memory_reason"] != "none":
         return None
@@ -1699,7 +1845,17 @@ def _usage_summary(
                     or payload.get("off_start_ms") != plans["api"].get("off_start_ms")
                     or payload.get("off_end_ms") != plans["api"].get("off_end_ms")
                     or payload.get("on_start_ms") != plans["api"].get("on_start_ms")
-                    or payload.get("on_end_ms") != plans["api"].get("on_end_ms")):
+                    or payload.get("on_end_ms") != plans["api"].get("on_end_ms")
+                    or any(type(payload.get(key)) is not int for key in (
+                        "off_start_ms", "off_end_ms", "on_start_ms", "on_end_ms",
+                    ))
+                    or any(payload[key] <= 0 for key in (
+                        "off_start_ms", "off_end_ms", "on_start_ms", "on_end_ms",
+                    ))
+                    or payload["off_end_ms"] - payload["off_start_ms"] != OFF_WINDOW_MS
+                    or payload["on_start_ms"] - payload["off_end_ms"] != IDLE_WINDOW_MS
+                    or payload["on_end_ms"] - payload["on_start_ms"]
+                    != _plan_on_window_ms(workload)):
                 return incomplete("identity_changed")
             targets[service] = {
                 int(item["pid"]): (int(item["start_ticks"]), str(item["invocation_id"]))
@@ -1760,7 +1916,32 @@ def _usage_summary(
         usage_match = USAGE_MESSAGE_RE.fullmatch(message) if is_usage else None
         profile_api_match = PROFILE_API_MESSAGE_RE.fullmatch(message) if is_profile else None
         profile_web_match = PROFILE_WEB_MESSAGE_RE.fullmatch(message) if is_profile else None
-        memory_match = _parse_node_memory_event(message) if is_memory else None
+        memory_match = (
+            _parse_node_memory_event(
+                message,
+                max_sampled_window_ms=(
+                    ON_WINDOW_MS_BY_WORKLOAD[workload]
+                    if workload in ON_WINDOW_MS_BY_WORKLOAD else ON_WINDOW_MS
+                ),
+                max_sampled_window_end_ms=(
+                    (ON_WINDOW_MS_BY_WORKLOAD[workload]
+                     if workload in ON_WINDOW_MS_BY_WORKLOAD else ON_WINDOW_MS) + 500
+                ),
+            ) if is_memory else None
+        )
+        if memory_match is not None:
+            expected_memory_window_ms = (
+                OFF_WINDOW_MS if memory_match["phase"] == "off"
+                else ON_WINDOW_MS_BY_WORKLOAD.get(workload, ON_WINDOW_MS)
+            )
+            sampled_window_ms = memory_match["sampled_window_duration_ms"]
+            sampled_window_end_ms = memory_match["sampled_window_end_elapsed_ms"]
+            if (
+                sampled_window_ms is not None and sampled_window_ms > expected_memory_window_ms
+                or sampled_window_end_ms is not None
+                and sampled_window_end_ms > expected_memory_window_ms + 500
+            ):
+                memory_match = None
         if memory_match is not None and memory_match["run_id"] != run_id:
             continue
         if is_usage and usage_match is None:
@@ -2874,6 +3055,7 @@ def summarize_ssr_request_correlation(
     stream_rows: Iterable[Mapping[str, Any]],
     api_rows: Iterable[Mapping[str, Any]],
     rows_truncated: bool | Mapping[str, bool] = False,
+    source_collection_reason: Mapping[str, str] | None = None,
     max_rows: int = _SSR_CORR_DEFAULT_MAX_ROWS,
     sample_limit: int = _SSR_CORR_DEFAULT_SAMPLE_LIMIT,
     cf_ray_fallback_proven: bool = False,
@@ -2910,6 +3092,16 @@ def summarize_ssr_request_correlation(
         raise ValueError("max_rows must be positive")
     if not isinstance(sample_limit, int) or isinstance(sample_limit, bool) or sample_limit < 1:
         raise ValueError("sample_limit must be positive")
+    collection_reason = (
+        {"api": "complete", "web": "complete"}
+        if source_collection_reason is None
+        else dict(source_collection_reason)
+    )
+    if (set(collection_reason) != {"api", "web"}
+            or any(not isinstance(value, str)
+                   or value not in CAPACITY_JOURNAL_COLLECTION_REASONS
+                   for value in collection_reason.values())):
+        raise ValueError("source_collection_reason is invalid")
     submitted = _ssr_corr_safe_count(submitted_html_count)
     valid_ids = _ssr_corr_safe_count(valid_response_id_count)
     eligible_ids = _ssr_corr_safe_count(eligible_response_id_count)
@@ -2986,6 +3178,10 @@ def summarize_ssr_request_correlation(
         )
         source_truncated[name] = local_truncated or declared
         source_rejections[name] = Counter()
+    if ((collection_reason["api"] != "complete" and not source_truncated["api"])
+            or (collection_reason["web"] != "complete"
+                and (not source_truncated["ssr"] or not source_truncated["stream"]))):
+        raise ValueError("source collection reason disagrees with truncation state")
 
     valid_rows: dict[str, list[Mapping[str, Any]]] = {name: [] for name in sources}
     for name, rows in bounded.items():
@@ -3231,6 +3427,7 @@ def summarize_ssr_request_correlation(
                 and len(selected_ids) == submitted
                 and valid_ids == submitted
             ),
+            "source_collection_reason": collection_reason,
             "source_rows_truncated": source_truncated,
             "source_input_rows": source_input_rows,
             "source_rejections": {

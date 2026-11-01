@@ -2715,7 +2715,42 @@ class EvidencePrivacyTests(unittest.TestCase):
             ):
                 self.assertIsNone(_closed_root_json(marker, maximum=64))
                 self.assertEqual(_diagnostic_abort_binding("456", "2", source_sha), binding)
+                # The exact fixture supervisor retires the credential-bearing
+                # manifest after observer capture. Its root-owned binding
+                # marker remains the durable source/run/manifest commitment.
+                manifest_path.unlink()
+                self.assertEqual(_diagnostic_abort_binding("456", "2", source_sha), binding)
+                self.assertIsNone(_diagnostic_abort_binding("456", "1", source_sha))
+                for invalid_binding in (
+                    {**binding, "schema": 2},
+                    {key: value for key, value in binding.items() if key != "fixture_manifest_sha256"},
+                    {**binding, "unexpected": True},
+                    {**binding, "external_run_id": "457"},
+                ):
+                    binding_path.write_bytes(
+                        json.dumps(
+                            invalid_binding, sort_keys=True, separators=(",", ":")
+                        ).encode("ascii") + b"\n"
+                    )
+                    os.chmod(binding_path, 0o600)
+                    self.assertIsNone(_diagnostic_abort_binding("456", "2", source_sha))
+                duplicate_key_binding = json.dumps(
+                    binding, sort_keys=True, separators=(",", ":")
+                ).replace('"schema":1', '"schema":1,"schema":1', 1)
+                binding_path.write_bytes(duplicate_key_binding.encode("ascii") + b"\n")
+                os.chmod(binding_path, 0o600)
+                self.assertIsNone(_diagnostic_abort_binding("456", "2", source_sha))
+                binding_path.write_bytes(
+                    json.dumps(binding, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+                )
+                os.chmod(binding_path, 0o600)
+                manifest_path.write_bytes(manifest)
+                os.chmod(manifest_path, 0o600)
                 self.assertIsNone(_diagnostic_abort_binding("456", "2", "b" * 40))
+                manifest_path.write_bytes(b'{"tampered":true}\n')
+                self.assertIsNone(_diagnostic_abort_binding("456", "2", source_sha))
+                manifest_path.write_bytes(manifest)
+                os.chmod(manifest_path, 0o600)
                 split_runner_sha = "d" * 40
                 split_app_sha = "e" * 40
                 split_manifest = json.dumps({
@@ -2806,6 +2841,32 @@ class EvidencePrivacyTests(unittest.TestCase):
                 )
                 self.assertIsNone(_diagnostic_abort_binding("456", "1", source_sha))
                 binding_path.write_bytes(b"7\n")
+                self.assertIsNone(_diagnostic_abort_binding("456", "2", source_sha))
+
+            binding_path.write_bytes(
+                json.dumps(binding, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+            )
+            binding_path.unlink()
+            with mock.patch.object(abort_module, "RUN_ROOT_BASE", root / "runs"), \
+                mock.patch.object(Path, "lstat", lstat_with_root_identity):
+                self.assertIsNone(_diagnostic_abort_binding("456", "2", source_sha))
+
+            def lstat_with_unsafe_binding_owner(path: Path):
+                record = original_lstat(path)
+                if path in {cpu_root, external_vote}:
+                    return root_owned(record)
+                if path == binding_path:
+                    values = list(record)
+                    values[4] = 1001
+                    values[5] = 1001
+                    return os.stat_result(values)
+                return record
+
+            binding_path.write_bytes(
+                json.dumps(binding, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+            )
+            with mock.patch.object(abort_module, "RUN_ROOT_BASE", root / "runs"), \
+                mock.patch.object(Path, "lstat", lstat_with_unsafe_binding_owner):
                 self.assertIsNone(_diagnostic_abort_binding("456", "2", source_sha))
 
 
