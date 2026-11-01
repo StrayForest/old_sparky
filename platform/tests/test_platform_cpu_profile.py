@@ -5273,7 +5273,16 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 expected_workload=cpu_pair.WORKLOAD,
             )
             self.assertEqual(invalid_profile_telemetry["profile_status"], "incomplete")
-            self.assertEqual(invalid_profile_telemetry["profile_reason"], "missing")
+            self.assertEqual(invalid_profile_telemetry["profile_reason"], "invalid_profile")
+            self.assertEqual(
+                invalid_profile_telemetry["profile_rejections"]["capture_reason"],
+                "summary_validation",
+            )
+            self.assertEqual(
+                invalid_profile_telemetry["profile_rejections"]["service_counts"]
+                ["unattributed"]["summary_validation"],
+                1,
+            )
 
             # No parsed Web memory samples must still produce the closed,
             # incomplete row shape accepted by the remote cleanup projection.
@@ -6965,6 +6974,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             })
         complete_pair_as_single["profile_status"] = "complete"
         complete_pair_as_single["profile_reason"] = "none"
+        complete_pair_as_single["profile_rejections"] = _profile_rejections("complete")
         for row in complete_pair_as_single["profile_rows"]:
             row.update({
                 "observed_targets": row["expected_targets"],
