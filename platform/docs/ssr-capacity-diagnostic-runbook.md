@@ -282,8 +282,17 @@ Reconcile and review the exact abort receipt. It must bind the load run and
 attempt, runner source, active app source, fixture manifest and Security
 identity; require the selected process tree absent and shared lock clear. An
 abort receipt with `namespace_closed: false` does not prove namespace closure
-and grants no measurement credit. Proceed to cleanup only when the canonical
-abort normalizer permits exact-fixture cleanup.
+and grants no measurement credit. The origin supervisor removes both copies of
+the session-credential manifest after observer capture. Its root-owned
+`diagnostic-abort-binding.json` is written only after validating and hashing
+that exact manifest and remains the durable source/run/fixture binding for a
+later abort. The abort helper accepts the exact run-bound marker when the
+credential-bearing manifest has already been retired; if the marker, its
+root-owned fixture directory, supervisor exit record, or run/source binding is
+missing or invalid, it fails closed. Do not restore or download the private
+manifest to bypass this check. Proceed to cleanup only when the canonical abort
+normalizer produces `status=safe_for_exact_fixture_cleanup` for the selected
+run and attempt.
 
 Then dispatch exact cleanup. Enter the same control account at the hidden
 prompt; the email travels only in the JSON request body on stdin:
