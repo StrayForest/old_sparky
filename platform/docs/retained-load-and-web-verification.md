@@ -39,7 +39,7 @@ attempt; if a check fails, stop and follow the operator escalation path. Never
 create the missing exit record or hand-write the receipt.
 
 If the reviewed abort helper is on a recovery-only runner SHA `R` while the
-active app remains at `S5`, use this order:
+active app remains at its freshly verified SHA `A`, use this order:
 
 1. Start `Platform security and build` for the merged recovery-only source SHA
    `R` on `dev`.
@@ -56,11 +56,11 @@ active app remains at `S5`, use this order:
    then let the automatic baseline-reconcile chain finish. Verify its
    authenticated `platform-production-noop-source-receipt` binds the exact
    Security, auto-deploy and deploy run attempts, the cumulative no-op route,
-   and the unchanged active-release tuple at `S5` (`runtime_required=false`).
+   and the unchanged active-release tuple at `A` (`runtime_required=false`).
 
 This receipt authorizes the runner-to-app source binding only; it does not
 deploy the app. Then use the abort command in the SSR runbook with
-`target_sha=S5`, the exact failed load run and attempt, and the successful
+`target_sha=A`, the exact failed load run and attempt, and the successful
 Security run and attempt for `R`. The abort workflow validates the complete
 Security job page against the exact CI route artifact. Every required gate must
 pass; only the `Conditional release runtime fixture` and `Trusted dev immutable
@@ -69,7 +69,7 @@ non-deployable recovery-bootstrap route with `runtime_sensitive=false`.
 Deployable routes require both runtime jobs to pass, and no other skipped gate
 is accepted. After the canonical abort receipt passes, dispatch exact cleanup
 through the same normal source-binding path with runner `R` and app target
-`S5`; the cleanup helper rechecks the active tuple. Stop if the backup proof or
+`A`; the cleanup helper rechecks the active tuple. Stop if the backup proof or
 no-op receipt is absent, does not bind those exact attempts, or the active
 tuple has changed. Do not create a substitute receipt or alias a same-SHA run.
 
