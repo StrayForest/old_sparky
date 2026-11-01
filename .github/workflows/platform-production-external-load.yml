@@ -77,11 +77,177 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Candidate validation and profile code run without the production
-  # environment.  The only value crossing to an approved job is the closed
-  # mode-600 JSON handoff; the approved job validates it again inline.
+  resolve-load-source-and-profile:
+    name: Resolve source binding and load profile without private credentials
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      app_target_sha: ${{ steps.resolve-source-binding.outputs.app_target_sha }}
+      source_binding_base64: ${{ steps.export-binding.outputs.source_binding_base64 }}
+      source_binding_sha256: ${{ steps.export-binding.outputs.source_binding_sha256 }}
+      setup_concurrency: ${{ steps.validate-profile.outputs.setup_concurrency }}
+      tournament_count: ${{ steps.validate-profile.outputs.tournament_count }}
+      users_per_tournament: ${{ steps.validate-profile.outputs.users_per_tournament }}
+    env:
+      PROFILE_ID: ${{ inputs.profile_id }}
+      TIMEOUT_DIAGNOSTICS: ${{ inputs.timeout_diagnostics }}
+      CPU_DIAGNOSTIC_ONLY: ${{ inputs.cpu_diagnostic_only }}
+      SSR_CAPACITY_DIAGNOSTIC_ONLY: ${{ inputs.ssr_capacity_diagnostic_only }}
+      SSR_CAPACITY_CONCURRENCY: ${{ inputs.ssr_capacity_concurrency }}
+      SSR_CAPACITY_WORKLOAD: ${{ inputs.ssr_capacity_workload }}
+      TARGET_SHA: ${{ github.sha }}
+    steps:
+      - name: Mask and remove control identity before candidate checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 - <<'PY'
+          import json,os,stat,sys
+          from pathlib import Path
+          path=Path(os.environ["GITHUB_EVENT_PATH"]);fd=os.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
+          try:
+              st=os.fstat(fd)
+              if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.geteuid() or st.st_nlink!=1 or st.st_size>65536 or stat.S_IMODE(st.st_mode)&0o022: raise ValueError
+              raw=os.read(fd,65537)
+              if len(raw)!=st.st_size: raise ValueError
+          finally: os.close(fd)
+          def pairs(items):
+              out={}
+              for k,v in items:
+                  if k in out: raise ValueError
+                  out[k]=v
+              return out
+          try:
+              event=json.loads(raw.decode("utf-8"),object_pairs_hook=pairs);inputs=event["inputs"]
+              if not isinstance(inputs,dict) or not isinstance(inputs.get("control_email"),str): raise ValueError
+              email=inputs.pop("control_email")
+              for value in dict.fromkeys((email,email.lower())): sys.stdout.write("::add-mask::"+value.replace("%","%25").replace("\r","%0D").replace("\n","%0A")+"\n")
+              sys.stdout.flush()
+              safe=(json.dumps(event,ensure_ascii=True,separators=(",",":"))+"\n").encode();tmp=path.with_name(".sanitized-event-"+str(os.getpid()));out=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC|os.O_NOFOLLOW,0o600)
+              try: os.write(out,safe);os.fsync(out)
+              finally: os.close(out)
+              os.replace(tmp,path)
+              if b"control_email" in path.read_bytes(): raise ValueError
+          except (KeyError,TypeError,UnicodeError,ValueError,json.JSONDecodeError): raise SystemExit("workflow event sanitization failed closed")
+          PY
+      - name: Require exact workflow dispatch inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = refs/heads/dev
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          case "$TIMEOUT_DIAGNOSTICS:$PROFILE_ID:$CPU_DIAGNOSTIC_ONLY:$SSR_CAPACITY_DIAGNOSTIC_ONLY" in
+            false:authenticated-page-load-v1:true:false|false:authenticated-page-load-v1:false:true|true:*:false:false|false:*:false:false) ;;
+            *) exit 1 ;;
+          esac
+      - name: Checkout exact profile source after event scrub
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Probe mandatory load PID-namespace containment
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd platform
+          # Probe the exact sudo/setpriv/unshare chain: --pdeathsig SIGKILL,
+          # --no-new-privs, --inh-caps=-all, --ambient-caps=-all,
+          # --bounding-set=-all, --pid, --mount-proc and --kill-child=SIGKILL.
+          env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+            /usr/bin/python3 - <<'PY'
+          from tools.platform_load_runtime import probe_pid_namespace_capability
+          result = probe_pid_namespace_capability(timeout_seconds=5)
+          if result.get("available") is not True:
+              raise SystemExit("mandatory load containment probe failed")
+          if (result.get("sudo") != "/usr/bin/sudo" or result.get("setpriv") != "/usr/bin/setpriv" or result.get("unshare") != "/usr/bin/unshare" or result.get("protocol") != "stdio" or not isinstance(result.get("runner_uid"), int) or result.get("runner_uid") == 0 or not isinstance(result.get("runner_gid"), int) or result.get("runner_gid") == 0):
+              raise SystemExit("mandatory load containment chain was not proven")
+          PY
+      - name: Require exact checkout and resolve source binding
+        id: resolve-source-binding
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          cd platform
+          binding_dir="$RUNNER_TEMP/platform-production-source-binding"
+          /usr/bin/python3 tools/platform_noop_source_binding.py resolve-workflow-source-binding \
+            "$TARGET_SHA" "$GITHUB_REPOSITORY" "$GITHUB_API_URL" "$binding_dir" "$GITHUB_OUTPUT"
+          test "$(stat -c '%F:%a:%u' "$binding_dir")" = "directory:700:$(id -u)"
+          test "$(stat -c '%F:%h:%a:%u' "$binding_dir/source-binding.json")" = "regular file:1:600:$(id -u)"
+      - name: Validate and export the exact load profile
+        id: validate-profile
+        shell: bash
+        env:
+          APP_TARGET_SHA: ${{ steps.resolve-source-binding.outputs.app_target_sha }}
+        run: |
+          set -euo pipefail
+          profile_env="$RUNNER_TEMP/profile.env"
+          env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+            SOURCE_GIT_SHA="$TARGET_SHA" APP_TARGET_SHA="$APP_TARGET_SHA" GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+            SSR_CAPACITY_CONCURRENCY="$SSR_CAPACITY_CONCURRENCY" SSR_CAPACITY_WORKLOAD="$SSR_CAPACITY_WORKLOAD" \
+            /usr/bin/python3 platform/tools/platform_load.py validate --profile "$PROFILE_ID" --dispatchable
+          env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+            SOURCE_GIT_SHA="$TARGET_SHA" APP_TARGET_SHA="$APP_TARGET_SHA" GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+            SSR_CAPACITY_CONCURRENCY="$SSR_CAPACITY_CONCURRENCY" SSR_CAPACITY_WORKLOAD="$SSR_CAPACITY_WORKLOAD" \
+            /usr/bin/python3 platform/tools/platform_load.py export-env --profile "$PROFILE_ID" > "$profile_env"
+          /usr/bin/python3 - "$profile_env" "$GITHUB_OUTPUT" <<'PY'
+          import os,re,sys
+          from pathlib import Path
+          lines=Path(sys.argv[1]).read_text(encoding="utf-8").splitlines(); values={}
+          for line in lines:
+              if re.fullmatch(r"[A-Z0-9_]{1,80}=[A-Za-z0-9._:/+-]{1,160}",line) is None: raise SystemExit("profile export is not closed")
+              key,value=line.split("=",1)
+              if key in values: raise SystemExit("profile export contains duplicate keys")
+              values[key]=value
+          required={"SETUP_CONCURRENCY","TOURNAMENT_COUNT","USERS_PER_TOURNAMENT"}
+          if not required<=set(values) or any(re.fullmatch(r"[1-9][0-9]{0,8}",values[k]) is None for k in required): raise SystemExit("profile export dimensions are invalid")
+          fd=os.open(sys.argv[2],os.O_WRONLY|os.O_APPEND|os.O_CLOEXEC|os.O_NOFOLLOW)
+          try:
+              for source,target in (("SETUP_CONCURRENCY","setup_concurrency"),("TOURNAMENT_COUNT","tournament_count"),("USERS_PER_TOURNAMENT","users_per_tournament")):
+                  os.write(fd,f"{target}={values[source]}\n".encode("ascii"))
+              os.fsync(fd)
+          finally: os.close(fd)
+          PY
+      - name: Export the validated source binding
+        id: export-binding
+        shell: bash
+        env:
+          APP_TARGET_SHA: ${{ steps.resolve-source-binding.outputs.app_target_sha }}
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 - "$RUNNER_TEMP/platform-production-source-binding/source-binding.json" "$TARGET_SHA" "$APP_TARGET_SHA" "$GITHUB_OUTPUT" <<'PY'
+          import base64,hashlib,json,os,stat,sys
+          from pathlib import Path
+          path,runner,app,output=sys.argv[1:];st=os.lstat(path)
+          if not stat.S_ISREG(st.st_mode) or st.st_nlink!=1 or stat.S_IMODE(st.st_mode)!=0o600 or st.st_size>20*1024: raise SystemExit("source binding handoff is unsafe")
+          raw=Path(path).read_bytes();value=json.loads(raw.decode("ascii"))
+          if set(value)!={"schema","runner_sha","app_target_sha","source_binding"} or value.get("schema")!=1 or value.get("runner_sha")!=runner or value.get("app_target_sha")!=app: raise SystemExit("source binding handoff identity is invalid")
+          binding=value.get("source_binding")
+          if binding is None:
+              if runner!=app: raise SystemExit("same-source binding is invalid")
+              canonical=b""
+          else:
+              if runner==app or not isinstance(binding,dict) or binding.get("runner_sha")!=runner or binding.get("app_target_sha")!=app: raise SystemExit("verified-noop binding is invalid")
+              canonical=json.dumps(binding,ensure_ascii=True,allow_nan=False,sort_keys=True,separators=(",",":")).encode("ascii")
+          fields=f"source_binding_base64={base64.b64encode(canonical).decode('ascii') if canonical else ''}\nsource_binding_sha256={hashlib.sha256(canonical).hexdigest() if canonical else ''}\n".encode("ascii")
+          fd=os.open(output,os.O_WRONLY|os.O_APPEND|os.O_CLOEXEC|os.O_NOFOLLOW)
+          try: os.write(fd,fields);os.fsync(fd)
+          finally: os.close(fd)
+          PY
+
+  # This job only scrubs the event and serializes the private input. Candidate
+  # source/profile code ran on a separate runner with no control email.
   validate-external-inputs:
     name: Validate external-load dispatch
+    needs: resolve-load-source-and-profile
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -90,7 +256,7 @@ jobs:
       contents: read
     outputs:
       input_artifact_id: ${{ steps.publish-input.outputs.artifact-id }}
-      app_target_sha: ${{ steps.resolve-source-binding.outputs.app_target_sha }}
+      app_target_sha: ${{ needs.resolve-load-source-and-profile.outputs.app_target_sha }}
     env:
       QA_CONFIRMATION: ${{ inputs.confirmation }}
       PROFILE_ID: ${{ inputs.profile_id }}
@@ -100,8 +266,14 @@ jobs:
       SSR_CAPACITY_CONCURRENCY: ${{ inputs.ssr_capacity_concurrency }}
       SSR_CAPACITY_WORKLOAD: ${{ inputs.ssr_capacity_workload }}
       TARGET_SHA: ${{ github.sha }}
+      APP_TARGET_SHA: ${{ needs.resolve-load-source-and-profile.outputs.app_target_sha }}
+      PROFILE_SETUP_CONCURRENCY: ${{ needs.resolve-load-source-and-profile.outputs.setup_concurrency }}
+      PROFILE_TOURNAMENT_COUNT: ${{ needs.resolve-load-source-and-profile.outputs.tournament_count }}
+      PROFILE_USERS_PER_TOURNAMENT: ${{ needs.resolve-load-source-and-profile.outputs.users_per_tournament }}
+      SOURCE_BINDING_BASE64: ${{ needs.resolve-load-source-and-profile.outputs.source_binding_base64 }}
+      SOURCE_BINDING_SHA256: ${{ needs.resolve-load-source-and-profile.outputs.source_binding_sha256 }}
     steps:
-      - name: Mask and stage the control identity from the event file
+      - name: Mask and remove control identity from the event file
         shell: bash
         run: |
           set -euo pipefail
@@ -174,36 +346,30 @@ jobs:
               escaped = value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
               sys.stdout.write(f"::add-mask::{escaped}\n")
           sys.stdout.flush()
-
-          destination = Path(os.environ["RUNNER_TEMP"]) / "platform-production-control-email"
-          flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+          email_path = Path(os.environ["RUNNER_TEMP"]) / "platform-production-control-email"
+          email_fd = os.open(email_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
           try:
-              descriptor = os.open(destination, flags, 0o600)
-              try:
-                  metadata = os.fstat(descriptor)
-                  if (
-                      not stat.S_ISREG(metadata.st_mode)
-                      or metadata.st_uid != os.geteuid()
-                      or metadata.st_nlink != 1
-                      or stat.S_IMODE(metadata.st_mode) != 0o600
-                  ):
-                      raise OSError
-                  with os.fdopen(descriptor, "w", encoding="ascii", closefd=False) as handle:
-                      handle.write(canonical_email + "\n")
-                      handle.flush()
-                      os.fsync(handle.fileno())
-                  metadata = os.fstat(descriptor)
-                  if (
-                      not stat.S_ISREG(metadata.st_mode)
-                      or metadata.st_uid != os.geteuid()
-                      or metadata.st_nlink != 1
-                      or stat.S_IMODE(metadata.st_mode) != 0o600
-                  ):
-                      raise OSError
-              finally:
-                  os.close(descriptor)
-          except OSError:
-              raise SystemExit("control identity handoff could not be created safely")
+              value = (canonical_email + "\n").encode("ascii")
+              if os.write(email_fd, value) != len(value):
+                  raise SystemExit("workflow control identity staging failed")
+              os.fsync(email_fd)
+          finally:
+              os.close(email_fd)
+
+          # Candidate code runs only after this event view has been scrubbed.
+          del inputs["control_email"]
+          safe_event = (json.dumps(event, ensure_ascii=True, allow_nan=False, separators=(",", ":")) + "\n").encode("utf-8")
+          event_path = Path(os.environ["GITHUB_EVENT_PATH"])
+          temporary_event = event_path.with_name(".sanitized-event-" + str(os.getpid()))
+          event_fd = os.open(temporary_event, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+          try:
+              os.write(event_fd, safe_event)
+              os.fsync(event_fd)
+          finally:
+              os.close(event_fd)
+          os.replace(temporary_event, event_path)
+          if b"control_email" in event_path.read_bytes():
+              raise SystemExit("workflow event sanitization failed closed")
           PY
 
       - name: Reject invalid external-load dispatch before checkout
@@ -236,185 +402,151 @@ jobs:
             *) echo "External load confirmation/profile combination is invalid." >&2; exit 1 ;;
           esac
 
-      - name: Checkout reviewed load client
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          ref: ${{ github.sha }}
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: Probe mandatory load PID-namespace containment before fixture setup
+      - name: Serialize the private external-load input
         shell: bash
-        run: |
-          set -euo pipefail
-          cd platform
-          # The runtime probe enforces the exact absolute chain:
-          # /usr/bin/sudo -n /usr/bin/setpriv --pdeathsig SIGKILL --
-          # /usr/bin/unshare --pid --fork --mount-proc --kill-child=SIGKILL,
-          # followed by inner setpriv --no-new-privs --inh-caps=-all
-          # --ambient-caps=-all --bounding-set=-all.
-          env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8 \
-            /usr/bin/python3 - <<'PY'
-          from tools.platform_load_runtime import probe_pid_namespace_capability
-
-          result = probe_pid_namespace_capability(timeout_seconds=5)
-          if result.get("available") is not True:
-              raise SystemExit(f"mandatory load containment probe failed: {result.get('reason', 'unknown')}")
-          if (
-              result.get("sudo") != "/usr/bin/sudo"
-              or result.get("setpriv") != "/usr/bin/setpriv"
-              or result.get("unshare") != "/usr/bin/unshare"
-              or result.get("protocol") != "stdio"
-              or not isinstance(result.get("runner_uid"), int)
-              or result.get("runner_uid") == 0
-              or not isinstance(result.get("runner_gid"), int)
-              or result.get("runner_gid") == 0
-          ):
-              raise SystemExit("mandatory load containment probe did not prove the exact non-root system chain")
-          print("mandatory load PID namespace containment: available")
-          PY
-
-      - name: Resolve exact no-op receipt or same-source binding
-        id: resolve-source-binding
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           umask 077
-          cd "$GITHUB_WORKSPACE/platform"
-          binding_dir="$RUNNER_TEMP/platform-production-source-binding"
-          /usr/bin/python3 tools/platform_noop_source_binding.py \
-            resolve-workflow-source-binding \
-            "$TARGET_SHA" "$GITHUB_REPOSITORY" "$GITHUB_API_URL" \
-            "$binding_dir" "$GITHUB_OUTPUT"
-          test "$(stat -c '%F:%a:%u' -- "$binding_dir")" = "directory:700:$(id -u)"
-          test "$(stat -c '%F:%h:%a:%u' -- "$binding_dir/source-binding.json")" = "regular file:1:600:$(id -u)"
-
-      - name: Validate explicit external production load
-        shell: bash
-        env:
-          APP_TARGET_SHA: ${{ steps.resolve-source-binding.outputs.app_target_sha }}
-        run: |
-          set -euo pipefail
-          profile_env="$RUNNER_TEMP/profile.env"
-          run_checked_out_client() {
-            env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8 RUNNER_TEMP="$RUNNER_TEMP" SOURCE_GIT_SHA="$TARGET_SHA" APP_TARGET_SHA="$APP_TARGET_SHA" GITHUB_RUN_ID="$GITHUB_RUN_ID" SSR_CAPACITY_CONCURRENCY="$SSR_CAPACITY_CONCURRENCY" SSR_CAPACITY_WORKLOAD="$SSR_CAPACITY_WORKLOAD" "$@"
-          }
-          run_checked_out_client /usr/bin/python3 platform/tools/platform_load.py validate --profile "$PROFILE_ID" --dispatchable
-          run_checked_out_client /usr/bin/python3 platform/tools/platform_load.py export-env --profile "$PROFILE_ID" > "$profile_env"
-          /usr/bin/python3 - "$profile_env" <<'PY'
-          from pathlib import Path
-          import re
-          import sys
-
-          lines = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
-          required = {"SETUP_CONCURRENCY", "TOURNAMENT_COUNT", "USERS_PER_TOURNAMENT"}
-          seen = set()
-          for line in lines:
-              if not re.fullmatch(r"[A-Z0-9_]{1,80}=[A-Za-z0-9._:/+-]{1,160}", line):
-                  raise SystemExit("profile export is not a closed environment schema")
-              key, value = line.split("=", 1)
-              seen.add(key)
-              if key in required and not re.fullmatch(r"[1-9][0-9]{0,8}", value):
-                  raise SystemExit("profile export numeric value is malformed")
-          if not required <= seen:
-              raise SystemExit("profile export is missing fixture controls")
-          PY
-          while IFS='=' read -r key value; do
-            case "$key" in
-              SETUP_CONCURRENCY|TOURNAMENT_COUNT|USERS_PER_TOURNAMENT) export "$key=$value" ;;
-            esac
-          done < "$profile_env"
-          run_checked_out_client /usr/bin/python3 - \
+          /usr/bin/python3 - \
             "$RUNNER_TEMP/platform-production-external-load-input.json" \
-            "$RUNNER_TEMP/platform-production-source-binding/source-binding.json" \
-            "$QA_CONFIRMATION" "$TARGET_SHA" "$APP_TARGET_SHA" "$SETUP_CONCURRENCY" \
-            "$GITHUB_RUN_ID" "$TOURNAMENT_COUNT" "$USERS_PER_TOURNAMENT" \
-            "$TIMEOUT_DIAGNOSTICS" "$CPU_DIAGNOSTIC_ONLY" "$SSR_CAPACITY_DIAGNOSTIC_ONLY" <<'PY'
-          import os
+            "$RUNNER_TEMP/platform-production-control-email" "$QA_CONFIRMATION" "$TARGET_SHA" "$APP_TARGET_SHA" \
+            "$PROFILE_SETUP_CONCURRENCY" "$GITHUB_RUN_ID" \
+            "$PROFILE_TOURNAMENT_COUNT" "$PROFILE_USERS_PER_TOURNAMENT" \
+            "$TIMEOUT_DIAGNOSTICS" "$CPU_DIAGNOSTIC_ONLY" "$SSR_CAPACITY_DIAGNOSTIC_ONLY" \
+            "$SSR_CAPACITY_CONCURRENCY" "$SSR_CAPACITY_WORKLOAD" \
+            "$SOURCE_BINDING_BASE64" "$SOURCE_BINDING_SHA256" <<'PY'
+          import base64
+          import hashlib
           import json
-          from pathlib import Path
+          import os
           import re
           import stat
           import sys
-          sys.path.insert(0, str(Path("platform").resolve()))
-          from tools.platform_workflow_input_guard import (
-              _write_private_json,
-              validate_external_payload,
-          )
 
-          output_path, binding_path_value, confirmation, target_sha, app_target_sha, setup_concurrency, run_id, tournaments, users, timeout_diagnostics, cpu_diagnostic_only, ssr_capacity_diagnostic_only = sys.argv[1:]
-          diagnostic_only = cpu_diagnostic_only == "true" or ssr_capacity_diagnostic_only == "true"
-          if cpu_diagnostic_only == "true" and ssr_capacity_diagnostic_only == "true":
-              raise SystemExit("diagnostic modes are mutually exclusive")
-          binding_path = Path(binding_path_value)
-          control_email_path = Path(os.environ["RUNNER_TEMP"]) / "platform-production-control-email"
-          metadata = control_email_path.lstat()
-          if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or metadata.st_mode & 0o077:
-              raise SystemExit("control identity handoff permissions are unsafe")
-          control_email = control_email_path.read_text(encoding="ascii")
-          if not control_email.endswith("\n") or control_email.count("\n") != 1:
-              raise SystemExit("control identity handoff is malformed")
-          binding_metadata = binding_path.lstat()
-          if not stat.S_ISREG(binding_metadata.st_mode) or stat.S_ISLNK(binding_metadata.st_mode) or binding_metadata.st_nlink != 1 or stat.S_IMODE(binding_metadata.st_mode) != 0o600:
-              raise SystemExit("source-binding handoff permissions are unsafe")
-          handoff = json.loads(binding_path.read_text(encoding="ascii"))
-          if (
-              not isinstance(handoff, dict)
-              or set(handoff) != {"schema", "runner_sha", "app_target_sha", "source_binding"}
-              or type(handoff.get("schema")) is not int
-              or handoff.get("schema") != 1
-              or handoff.get("runner_sha") != target_sha
-              or handoff.get("app_target_sha") != app_target_sha
-              or re.fullmatch(r"[0-9a-f]{40}", app_target_sha) is None
-          ):
-              raise SystemExit("source-binding handoff is malformed")
-          binding = handoff.get("source_binding")
-          if binding is None:
-              if app_target_sha != target_sha:
-                  raise SystemExit("same-source handoff identities differ")
-          elif (
-              not isinstance(binding, dict)
-              or binding.get("runner_sha") != target_sha
-              or binding.get("app_target_sha") != app_target_sha
-              or app_target_sha == target_sha
-          ):
-              raise SystemExit("verified-noop source binding is malformed")
+          output_path, email_path, confirmation, target, app, concurrency, run_id, tournaments, users, timeout, cpu_only, ssr_only, ssr_concurrency, ssr_workload, encoded_binding, binding_sha = sys.argv[1:]
+          def fail():
+              raise SystemExit("external-load handoff validation failed closed")
+          try:
+              metadata = os.lstat(email_path)
+              if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_size > 256:
+                  fail()
+              raw_email = open(email_path, "rb").read(257)
+              if len(raw_email) != metadata.st_size or not raw_email.endswith(b"\n") or raw_email.count(b"\n") != 1:
+                  fail()
+              email = raw_email[:-1].decode("ascii")
+          except (OSError, UnicodeError):
+              fail()
+          email_re = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._%+\-]{0,62}[A-Za-z0-9])?@[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?)+$")
+          if not email.isascii() or email != email.strip() or email_re.fullmatch(email) is None or len(email) > 254:
+              fail()
+          if re.fullmatch(r"[0-9a-f]{40}", target) is None or re.fullmatch(r"[0-9a-f]{40}", app) is None:
+              fail()
+          if re.fullmatch(r"[1-9][0-9]{0,31}", run_id) is None or re.fullmatch(r"[1-9][0-9]{0,2}", concurrency) is None:
+              fail()
+          if cpu_only == "true" and ssr_only == "true":
+              fail()
+          if timeout not in {"true", "false"} or cpu_only not in {"true", "false"} or ssr_only not in {"true", "false"}:
+              fail()
+          if encoded_binding:
+              try:
+                  binding_raw = base64.b64decode(encoded_binding, validate=True)
+              except Exception:
+                  fail()
+              if hashlib.sha256(binding_raw).hexdigest() != binding_sha:
+                  fail()
+              try:
+                  binding = json.loads(binding_raw.decode("ascii"))
+              except (UnicodeError, json.JSONDecodeError):
+                  fail()
+              if not isinstance(binding, dict) or set(binding) != {
+                  "schema", "binding_mode", "runner_sha", "app_target_sha", "baseline_identity",
+                  "receipt_document_sha256", "receipt_artifact_id", "receipt_artifact_name",
+                  "receipt_artifact_digest", "receipt_archive_sha256", "cumulative_manifest_sha256",
+                  "source_security_run_id", "source_security_run_attempt", "autodeploy_run_id",
+                  "autodeploy_run_attempt", "production_deploy_run_id", "production_deploy_run_attempt",
+              } or binding.get("schema") != 1 or binding.get("binding_mode") != "verified-noop" or binding.get("runner_sha") != target or binding.get("app_target_sha") != app or app == target:
+                  fail()
+          else:
+              binding = None
+              if binding_sha or app != target:
+                  fail()
+          diagnostic = cpu_only == "true" or ssr_only == "true"
+          if diagnostic and (timeout != "false" or tournaments != "1" or users != "14"):
+              fail()
+          fixture_kind = (
+              "cpu_diagnostic_only_v1" if cpu_only == "true" else
+              "ssr_html_capacity_composite_diagnostic_v1" if ssr_only == "true" and ssr_workload == "authenticated_html_ssr_capacity_120s_plus_cpu_profile_20s_v1" else
+              "ssr_html_capacity_diagnostic_v1" if ssr_only == "true" and ssr_workload == "authenticated_html_ssr_capacity_v1" else
+              "ssr_capacity_diagnostic_v1" if ssr_only == "true" else "external_load"
+          )
+          if not diagnostic and (re.fullmatch(r"[1-9][0-9]{0,2}", tournaments) is None or re.fullmatch(r"[1-9][0-9]{0,3}", users) is None):
+              fail()
+          expected_confirmation = (
+              "RUN-PRODUCTION-CPU-DIAGNOSTIC" if cpu_only == "true" else
+              "RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC" if ssr_only == "true" else
+              "RUN-PRODUCTION-TIMEOUT-DIAGNOSTICS" if timeout == "true" else
+              "RUN-PRODUCTION-EXTERNAL-LOAD"
+          )
+          if confirmation != expected_confirmation:
+              fail()
           payload = {
-              "schema": 2 if binding is not None else 1,
-              "confirmation": confirmation,
-              "target_sha": target_sha,
-              "control_email": control_email[:-1],
-              "setup_concurrency": setup_concurrency,
-              "run_id": run_id,
-              "profile": "external-vote",
-              "tournament_count": "1" if diagnostic_only else tournaments,
-              "users_per_tournament": "14" if diagnostic_only else users,
-              "fixture_kind": ("cpu_diagnostic_only_v1" if cpu_diagnostic_only == "true" else
-                               "ssr_html_capacity_composite_diagnostic_v1" if ssr_capacity_diagnostic_only == "true" and os.environ["SSR_CAPACITY_WORKLOAD"] == "authenticated_html_ssr_capacity_120s_plus_cpu_profile_20s_v1" else
-                               "ssr_html_capacity_diagnostic_v1" if ssr_capacity_diagnostic_only == "true" and os.environ["SSR_CAPACITY_WORKLOAD"] == "authenticated_html_ssr_capacity_v1" else
-                               "ssr_capacity_diagnostic_v1" if ssr_capacity_diagnostic_only == "true" else
-                               "external_load"),
-              "timeout_diagnostics": timeout_diagnostics,
+              "schema": "2" if binding is not None else "1", "confirmation": confirmation, "target_sha": target,
+              "control_email": email.lower(), "setup_concurrency": concurrency, "run_id": run_id,
+              "profile": "external-vote", "tournament_count": tournaments,
+              "users_per_tournament": users, "timeout_diagnostics": timeout,
+              "fixture_kind": fixture_kind,
           }
-          if ssr_capacity_diagnostic_only == "true":
-              payload["ssr_capacity_concurrency"] = os.environ["SSR_CAPACITY_CONCURRENCY"]
-              if os.environ["SSR_CAPACITY_WORKLOAD"] in {"authenticated_html_ssr_capacity_v1", "authenticated_html_ssr_capacity_120s_plus_cpu_profile_20s_v1"}:
-                  payload["ssr_capacity_workload"] = os.environ["SSR_CAPACITY_WORKLOAD"]
+          if ssr_only == "true":
+              if ssr_concurrency not in ({"32"} if fixture_kind == "ssr_html_capacity_composite_diagnostic_v1" else {"8", "16"} if fixture_kind == "ssr_capacity_diagnostic_v1" else {"8", "16", "32", "64"}):
+                  fail()
+              payload["ssr_capacity_concurrency"] = ssr_concurrency
+              if fixture_kind in {"ssr_html_capacity_diagnostic_v1", "ssr_html_capacity_composite_diagnostic_v1"}:
+                  payload["ssr_capacity_workload"] = ssr_workload
           if binding is not None:
               payload["source_binding"] = binding
-          _write_private_json(Path(output_path), validate_external_payload(payload))
+          encoded = (json.dumps(payload, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+          fd = os.open(output_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+          try:
+              view = memoryview(encoded)
+              while view:
+                  written = os.write(fd, view)
+                  if written <= 0: fail()
+                  view = view[written:]
+              os.fsync(fd)
+          finally:
+              os.close(fd)
+              try:
+                  os.unlink(email_path)
+              except FileNotFoundError:
+                  pass
           PY
-          test "$(stat -c '%a' "$RUNNER_TEMP/platform-production-external-load-input.json")" = 600
 
-      - name: Publish closed external-load handoff
+      - name: Encrypt the private external-load handoff
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          age_dir="$RUNNER_TEMP/fixture-age-tools"
+          archive="$RUNNER_TEMP/age-v1.3.2.tar.gz"
+          mkdir -m 700 "$age_dir"
+          curl --fail --location --silent --show-error https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-linux-amd64.tar.gz --output "$archive"
+          printf '%s  %s\n' cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10 "$archive" | sha256sum --check --status
+          tar --extract --gzip --file "$archive" --directory "$age_dir" age/age
+          test "$("$age_dir/age" --version)" = v1.3.2
+          install -d -m 700 "$RUNNER_TEMP/fixture-private-transport"
+          "$age_dir/age" --encrypt --recipient age1egptr8zhhvfe0ggmyu4cr9azhfsjpvvn3p5eyppznnzx8c5yedjsyeaasa \
+            --output "$RUNNER_TEMP/fixture-private-transport/private-input.json.age" \
+            "$RUNNER_TEMP/platform-production-external-load-input.json"
+          chmod 600 "$RUNNER_TEMP/fixture-private-transport/private-input.json.age"
+          rm -f -- "$archive"
+
+      - name: Publish encrypted private external-load handoff
         id: publish-input
         if: ${{ success() }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: platform-production-external-load-input-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/platform-production-external-load-input.json
+          name: platform-production-external-load-private-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fixture-private-transport/private-input.json.age
           if-no-files-found: error
           retention-days: 1
 
@@ -424,9 +556,11 @@ jobs:
         run: |
           rm -f -- \
             "$RUNNER_TEMP/platform-production-external-load-input.json" \
+            "$RUNNER_TEMP/fixture-private-transport/private-input.json.age" \
             "$RUNNER_TEMP/profile.env" \
             "$RUNNER_TEMP/platform-production-control-email"
-          rm -rf -- "$RUNNER_TEMP/platform-production-source-binding"
+          rm -rf -- "$RUNNER_TEMP/platform-production-source-binding" \
+            "$RUNNER_TEMP/fixture-private-transport" "$RUNNER_TEMP/fixture-age-tools"
           test ! -e "$RUNNER_TEMP/platform-production-control-email" && test ! -L "$RUNNER_TEMP/platform-production-control-email"
 
   resolve-host-tools-pin:
@@ -442,6 +576,39 @@ jobs:
     env:
       TARGET_SHA: ${{ github.sha }}
     steps:
+      - name: Mask and remove control identity before host-tools resolution
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 - <<'PY'
+          import json,os,stat,sys
+          from pathlib import Path
+          path=Path(os.environ["GITHUB_EVENT_PATH"]);fd=os.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
+          try:
+              st=os.fstat(fd)
+              if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.geteuid() or st.st_nlink!=1 or st.st_size>65536 or stat.S_IMODE(st.st_mode)&0o022: raise ValueError
+              raw=os.read(fd,65537)
+              if len(raw)!=st.st_size: raise ValueError
+          finally: os.close(fd)
+          def pairs(items):
+              out={}
+              for k,v in items:
+                  if k in out: raise ValueError
+                  out[k]=v
+              return out
+          try:
+              event=json.loads(raw.decode("utf-8"),object_pairs_hook=pairs);inputs=event["inputs"]
+              if not isinstance(inputs,dict) or not isinstance(inputs.get("control_email"),str): raise ValueError
+              email=inputs.pop("control_email")
+              for value in dict.fromkeys((email,email.lower())): sys.stdout.write("::add-mask::"+value.replace("%","%25").replace("\r","%0D").replace("\n","%0A")+"\n")
+              sys.stdout.flush()
+              safe=(json.dumps(event,ensure_ascii=True,separators=(",",":"))+"\n").encode();tmp=path.with_name(".sanitized-event-"+str(os.getpid()));out=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC|os.O_NOFOLLOW,0o600)
+              try: os.write(out,safe);os.fsync(out)
+              finally: os.close(out)
+              os.replace(tmp,path)
+              if b"control_email" in path.read_bytes(): raise ValueError
+          except (KeyError,TypeError,UnicodeError,ValueError,json.JSONDecodeError): raise SystemExit("workflow event sanitization failed closed")
+          PY
       - name: Checkout exact target as untrusted source data
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -491,6 +658,7 @@ jobs:
       supervisor_exit_status: ${{ steps.fixture-setup.outputs.supervisor_exit_status }}
       pre_candidate_cleanup_allowed: ${{ steps.fixture-setup.outputs.pre_candidate_cleanup_allowed }}
       manifest_artifact_id: ${{ steps.publish-manifest.outputs.artifact-id }}
+      descriptor_artifact_id: ${{ steps.publish-fixture-descriptor.outputs.artifact-id }}
       ssh_cleanup_status: ${{ steps.cleanup-setup-ssh.outputs.ssh_cleanup_status }}
     env:
       TARGET_SHA: ${{ github.sha }}
@@ -498,81 +666,44 @@ jobs:
       RUN_ID: ${{ github.run_id }}
       INPUT_ARTIFACT_ID: ${{ needs.validate-external-inputs.outputs.input_artifact_id }}
     steps:
-      - name: Mask the control identity before reading the handoff
+      - name: Mask and remove control identity before setup
         shell: bash
         run: |
           set -euo pipefail
           /usr/bin/python3 - <<'PY'
-          import json
-          import os
+          import json,os,stat,sys
           from pathlib import Path
-          import re
-          import stat
-          import sys
-
+          path=Path(os.environ["GITHUB_EVENT_PATH"]);fd=os.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
           try:
-              descriptor = os.open(
-                  os.environ["GITHUB_EVENT_PATH"], os.O_RDONLY | os.O_NOFOLLOW
-              )
-              try:
-                  metadata = os.fstat(descriptor)
-                  if (
-                      not stat.S_ISREG(metadata.st_mode)
-                      or metadata.st_uid != os.geteuid()
-                      or metadata.st_nlink != 1
-                      or metadata.st_size > 65536
-                      or stat.S_IMODE(metadata.st_mode) & 0o022
-                  ):
-                      raise ValueError
-                  raw_event = os.read(descriptor, 65537)
-              finally:
-                  os.close(descriptor)
-              if len(raw_event) > 65536:
-                  raise ValueError
-
-              def reject_duplicate_keys(pairs):
-                  values = {}
-                  for key, value in pairs:
-                      if key in values:
-                          raise ValueError
-                      values[key] = value
-                  return values
-
-              event = json.loads(
-                  raw_event.decode("utf-8"), object_pairs_hook=reject_duplicate_keys
-              )
-              if not isinstance(event, dict):
-                  raise ValueError
-              inputs = event.get("inputs")
-              if not isinstance(inputs, dict) or set(inputs) != {
-                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair", "cpu_diagnostic_only", "ssr_capacity_diagnostic_only", "ssr_capacity_concurrency", "ssr_capacity_workload"
-              }:
-                  raise ValueError
-              email = inputs.get("control_email") if isinstance(inputs, dict) else None
-              if not isinstance(email, str) or not email.isascii() or not 3 <= len(email) <= 254 or email != email.strip() or email.count("@") != 1:
-                  raise ValueError
-              local, domain = email.split("@", 1)
-              local_pattern = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._%+\-]{0,62}[A-Za-z0-9])?$")
-              label_pattern = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?$")
-              labels = domain.split(".")
-              if not 1 <= len(local) <= 64 or not 1 <= len(domain) <= 253 or "." not in domain or local_pattern.fullmatch(local) is None or any(label_pattern.fullmatch(label) is None for label in labels):
-                  raise ValueError
-              if any(ord(character) < 0x21 or ord(character) == 0x7F for character in email):
-                  raise ValueError
-              canonical_email = email.lower()
-          except (OSError, ValueError, TypeError, UnicodeError, json.JSONDecodeError):
-              raise SystemExit("control identity input is invalid")
-          for value in dict.fromkeys((email, canonical_email)):
-              escaped = value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-              sys.stdout.write(f"::add-mask::{escaped}\n")
-          sys.stdout.flush()
+              st=os.fstat(fd)
+              if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.geteuid() or st.st_nlink!=1 or st.st_size>65536 or stat.S_IMODE(st.st_mode)&0o022: raise ValueError
+              raw=os.read(fd,65537)
+              if len(raw)!=st.st_size: raise ValueError
+          finally: os.close(fd)
+          def pairs(items):
+              out={}
+              for k,v in items:
+                  if k in out: raise ValueError
+                  out[k]=v
+              return out
+          try:
+              event=json.loads(raw.decode("utf-8"),object_pairs_hook=pairs);inputs=event["inputs"]
+              if not isinstance(inputs,dict) or not isinstance(inputs.get("control_email"),str): raise ValueError
+              email=inputs.pop("control_email")
+              for value in dict.fromkeys((email,email.lower())): sys.stdout.write("::add-mask::"+value.replace("%","%25").replace("\r","%0D").replace("\n","%0A")+"\n")
+              sys.stdout.flush()
+              safe=(json.dumps(event,ensure_ascii=True,separators=(",",":"))+"\n").encode();tmp=path.with_name(".sanitized-event-"+str(os.getpid()));out=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC|os.O_NOFOLLOW,0o600)
+              try: os.write(out,safe);os.fsync(out)
+              finally: os.close(out)
+              os.replace(tmp,path)
+              if b"control_email" in path.read_bytes(): raise ValueError
+          except (KeyError,TypeError,UnicodeError,ValueError,json.JSONDecodeError): raise SystemExit("workflow event sanitization failed closed")
           PY
-
       - name: Download closed external-load handoff
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
-          name: platform-production-external-load-input-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/external-input
+          name: platform-production-external-load-private-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/external-input-ciphertext
 
       - name: Verify exact external-load handoff artifact
         shell: bash
@@ -596,7 +727,7 @@ jobs:
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$INPUT_ARTIFACT_ID/zip" \
             --output "$archive"
-          /usr/bin/python3 - "$metadata" "$archive" "$INPUT_ARTIFACT_ID" "platform-production-external-load-input-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" "$GITHUB_RUN_ID" "$TARGET_SHA" <<'PY'
+          /usr/bin/python3 - "$metadata" "$archive" "$INPUT_ARTIFACT_ID" "platform-production-external-load-private-input-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" "$GITHUB_RUN_ID" "$TARGET_SHA" <<'PY'
           import hashlib
           import json
           import os
@@ -633,6 +764,55 @@ jobs:
           if actual_digest != expected_digest.removeprefix("sha256:"):
               raise SystemExit("external-load handoff archive digest does not match metadata")
           PY
+
+      - name: Stage the fixture-only decrypt identity
+        id: stage-fixture-setup-identity
+        shell: bash
+        env:
+          FIXTURE_MANIFEST_AGE_IDENTITY: ${{ secrets.FIXTURE_MANIFEST_AGE_IDENTITY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          install -d -m 700 "$RUNNER_TEMP/fixture-private-identity"
+          /usr/bin/python3 - "$RUNNER_TEMP/fixture-private-identity/identity.txt" <<'PY'
+          import os, sys
+          path = sys.argv[1]
+          value = os.environ.get("FIXTURE_MANIFEST_AGE_IDENTITY", "")
+          if len(value) != 74 or not value.startswith("AGE-SECRET-KEY-1") or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-" for c in value):
+              raise SystemExit("fixture decrypt identity is invalid")
+          fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+          try:
+              data = (value + "\n").encode("ascii")
+              if os.write(fd, data) != len(data): raise SystemExit("fixture decrypt identity write failed")
+              os.fsync(fd)
+          finally:
+              os.close(fd)
+          PY
+
+      - name: Decrypt the verified private input handoff
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          age_dir="$RUNNER_TEMP/fixture-age-tools"; archive="$RUNNER_TEMP/age-v1.3.2.tar.gz"
+          age_identity="$RUNNER_TEMP/fixture-private-identity/identity.txt"
+          mkdir -m 700 "$age_dir"
+          trap 'rm -f -- "$age_identity" "$archive" "$RUNNER_TEMP/external-input/platform-production-external-load-input.json.tmp"' EXIT
+          curl --fail --location --silent --show-error https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-linux-amd64.tar.gz --output "$archive"
+          printf '%s  %s\n' cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10 "$archive" | sha256sum --check --status
+          tar --extract --gzip --file "$archive" --directory "$age_dir" age/age
+          test "$("$age_dir/age" --version)" = v1.3.2
+          mkdir -m 700 "$RUNNER_TEMP/external-input"
+          ciphertext="$RUNNER_TEMP/external-input-ciphertext/private-input.json.age"
+          plaintext="$RUNNER_TEMP/external-input/platform-production-external-load-input.json"
+          temporary="$plaintext.tmp"
+          test -f "$ciphertext" && test ! -L "$ciphertext" && test ! -e "$plaintext" && test ! -L "$plaintext"
+          chmod 600 "$ciphertext"
+          "$age_dir/age" --decrypt --identity "$age_identity" --output "$temporary" "$ciphertext"
+          chmod 600 "$temporary"
+          mv -n -- "$temporary" "$plaintext"
+          test "$(stat -c '%u:%g:%a' "$plaintext")" = "$(id -u):$(id -g):600"
+          rm -f -- "$age_identity"; test ! -e "$age_identity" && test ! -L "$age_identity"
 
       - name: Revalidate external handoff and exact target SHA
         shell: bash
@@ -995,13 +1175,90 @@ jobs:
                       raise SystemExit("fixture user field is unsafe")
           PY
 
-      - name: Publish closed fixture manifest
+      - name: Encrypt fixture manifest and write its nonsecret descriptor
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          age_dir="$RUNNER_TEMP/fixture-age-tools"
+          age_archive="$RUNNER_TEMP/age-v1.3.2.tar.gz"
+          install -d -m 700 "$age_dir"
+          curl --fail --location --silent --show-error \
+            https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-linux-amd64.tar.gz \
+            --output "$age_archive"
+          printf '%s  %s\n' cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10 "$age_archive" | sha256sum --check --status
+          tar --extract --gzip --file "$age_archive" --directory "$age_dir" age/age
+          test "$("$age_dir/age" --version)" = v1.3.2
+          "$age_dir/age" --encrypt --recipient age1egptr8zhhvfe0ggmyu4cr9azhfsjpvvn3p5eyppznnzx8c5yedjsyeaasa \
+            --output "$RUNNER_TEMP/external-fixture/manifest.json.age" \
+            "$RUNNER_TEMP/external-fixture/manifest.json"
+          chmod 600 "$RUNNER_TEMP/external-fixture/manifest.json.age"
+          /usr/bin/python3 - "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" "$RUNNER_TEMP/external-fixture/manifest.json" "$RUNNER_TEMP/external-fixture/fixture-descriptor.json" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$TARGET_SHA" "$APP_TARGET_SHA" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+          input_path, manifest_path, output_path, run_id, attempt, runner_sha, app_sha = sys.argv[1:]
+          raw_input = Path(input_path).read_bytes()
+          raw_manifest = Path(manifest_path).read_bytes()
+          private_input = json.loads(raw_input.decode("ascii"))
+          manifest = json.loads(raw_manifest.decode("utf-8"))
+          public_keys = {"schema", "target_sha", "setup_concurrency", "run_id", "profile", "tournament_count", "users_per_tournament", "timeout_diagnostics", "fixture_kind", "source_binding", "ssr_capacity_concurrency", "ssr_capacity_workload"}
+          descriptor = {
+              "schema": 1,
+              "run_id": run_id,
+              "run_attempt": attempt,
+              "runner_sha": runner_sha,
+              "app_target_sha": app_sha,
+              "input": {key: value for key, value in private_input.items() if key in public_keys},
+              "manifest": {
+                  "sha256": hashlib.sha256(raw_manifest).hexdigest(),
+                  "size_bytes": len(raw_manifest),
+                  "schema": manifest["schema"],
+                  "purpose": manifest["purpose"],
+                  "origin": manifest["origin"],
+                  "runner_sha": manifest["runner_sha"],
+                  "app_target_sha": manifest["app_target_sha"],
+                  "source_binding": manifest["source_binding"],
+                  "source_binding_sha256": manifest["source_binding_sha256"],
+                  "tournament_count": len(manifest["tournaments"]),
+                  "user_count": len(manifest["users"]),
+                  "users_per_tournament": sorted(row["user_count"] for row in manifest["tournaments"]),
+              },
+          }
+          if (private_input.get("run_id") != run_id or private_input.get("target_sha") != runner_sha
+                  or manifest.get("runner_sha") != runner_sha or manifest.get("app_target_sha") != app_sha
+                  or manifest.get("source_binding") != private_input.get("source_binding")):
+              raise SystemExit("fixture descriptor source binding is invalid")
+          encoded = (json.dumps(descriptor, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+          fd = os.open(output_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+          try:
+              os.write(fd, encoded)
+              os.fsync(fd)
+          finally:
+              os.close(fd)
+          PY
+          rm -f -- "$age_archive"
+
+      - name: Publish encrypted fixture manifest
         id: publish-manifest
         if: ${{ success() && steps.fixture-setup.outputs.setup_status == '0' && steps.fixture-setup.outputs.manifest_ready == '1' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: platform-production-external-load-manifest-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/external-fixture/manifest.json
+          name: platform-production-external-load-encrypted-manifest-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/external-fixture/manifest.json.age
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Publish closed fixture descriptor
+        id: publish-fixture-descriptor
+        if: ${{ success() && steps.fixture-setup.outputs.setup_status == '0' && steps.fixture-setup.outputs.manifest_ready == '1' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-production-external-load-fixture-descriptor-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/external-fixture/fixture-descriptor.json
           if-no-files-found: error
           retention-days: 1
 
@@ -1013,6 +1270,8 @@ jobs:
           set -Eeuo pipefail
           ssh_dir="$RUNNER_TEMP/production-external-load-ssh-setup"
           handoff="$RUNNER_TEMP/external-input/platform-production-external-load-input.json"
+          identity_dir="$RUNNER_TEMP/fixture-private-identity"
+          age_identity="$identity_dir/identity.txt"
 
           if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
             test -d "$ssh_dir" && test ! -L "$ssh_dir"
@@ -1030,15 +1289,24 @@ jobs:
             rmdir -- "$ssh_dir"
           fi
           test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
-          rm -f -- "$handoff"
+          rm -f -- "$handoff" "$age_identity" \
+            "$RUNNER_TEMP/external-fixture/manifest.json" "$RUNNER_TEMP/age-v1.3.2.tar.gz"
+          rm -rf -- "$RUNNER_TEMP/fixture-age-tools" "$RUNNER_TEMP/external-input-ciphertext"
+          if [[ -e "$identity_dir" || -L "$identity_dir" ]]; then
+            test -d "$identity_dir" && test ! -L "$identity_dir"
+            rmdir -- "$identity_dir"
+          fi
           test ! -e "$handoff" && test ! -L "$handoff"
+          test ! -e "$age_identity" && test ! -L "$age_identity"
+          test ! -e "$identity_dir" && test ! -L "$identity_dir"
           printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"
           unset SSH_DIR
           test -z "${SSH_DIR:-}"
           printf '%s\n' 'ssh_cleanup_status=0' >> "$GITHUB_OUTPUT"
 
-  # The measurement runner may execute the candidate load client, but it is a
-  # fresh runner with no production SSH environment or key material.
+  # The measurement runner may execute the candidate load client. It gets only
+  # the fixture-only age identity, never production SSH secrets or the private
+  # control-email handoff.
   load-client:
     name: Run checked-out external HTTP load client
     needs:
@@ -1056,6 +1324,7 @@ jobs:
     # runner margin for the mandatory namespace probe, teardown/reap and
     # atomic report publication before Actions enforces its outer deadline.
     timeout-minutes: 270
+    environment: fixture-manifest
     permissions:
       actions: read
       contents: read
@@ -1070,10 +1339,10 @@ jobs:
       PROFILE_ID: ${{ inputs.profile_id }}
       TIMEOUT_DIAGNOSTICS: ${{ inputs.timeout_diagnostics }}
       SOURCE_GIT_SHA: ${{ github.sha }}
-      INPUT_ARTIFACT_ID: ${{ needs.validate-external-inputs.outputs.input_artifact_id }}
+      DESCRIPTOR_ARTIFACT_ID: ${{ needs.fixture-setup.outputs.descriptor_artifact_id }}
       MANIFEST_ARTIFACT_ID: ${{ needs.fixture-setup.outputs.manifest_artifact_id }}
     steps:
-      - name: Mask the control identity before reading the handoff
+      - name: Mask and remove control identity from the runner event file
         shell: bash
         run: |
           set -euo pipefail
@@ -1084,75 +1353,71 @@ jobs:
           import re
           import stat
           import sys
-
+          event_path = Path(os.environ["GITHUB_EVENT_PATH"])
+          fd = os.open(event_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
           try:
-              descriptor = os.open(
-                  os.environ["GITHUB_EVENT_PATH"], os.O_RDONLY | os.O_NOFOLLOW
-              )
-              try:
-                  metadata = os.fstat(descriptor)
-                  if (
-                      not stat.S_ISREG(metadata.st_mode)
-                      or metadata.st_uid != os.geteuid()
-                      or metadata.st_nlink != 1
-                      or metadata.st_size > 65536
-                      or stat.S_IMODE(metadata.st_mode) & 0o022
-                  ):
+              before = os.fstat(fd)
+              if not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid() or before.st_nlink != 1 or before.st_size > 65536 or stat.S_IMODE(before.st_mode) & 0o077:
+                  raise ValueError
+              raw = os.read(fd, 65537)
+              after = os.fstat(fd)
+              if len(raw) != before.st_size or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+                  raise ValueError
+          finally:
+              os.close(fd)
+          def reject_duplicate_keys(pairs):
+              values = {}
+              for key, value in pairs:
+                  if key in values:
                       raise ValueError
-                  raw_event = os.read(descriptor, 65537)
-              finally:
-                  os.close(descriptor)
-              if len(raw_event) > 65536:
+                  values[key] = value
+              return values
+          try:
+              event = json.loads(raw.decode("utf-8"), object_pairs_hook=reject_duplicate_keys)
+              inputs = event.get("inputs") if isinstance(event, dict) else None
+              required = {"confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair", "cpu_diagnostic_only", "ssr_capacity_diagnostic_only", "ssr_capacity_concurrency", "ssr_capacity_workload"}
+              if not isinstance(inputs, dict) or set(inputs) != required:
                   raise ValueError
-
-              def reject_duplicate_keys(pairs):
-                  values = {}
-                  for key, value in pairs:
-                      if key in values:
-                          raise ValueError
-                      values[key] = value
-                  return values
-
-              event = json.loads(
-                  raw_event.decode("utf-8"), object_pairs_hook=reject_duplicate_keys
-              )
-              if not isinstance(event, dict):
-                  raise ValueError
-              inputs = event.get("inputs")
-              if not isinstance(inputs, dict) or set(inputs) != {
-                  "confirmation", "control_email", "profile_id", "timeout_diagnostics", "cpu_diagnostic_pair", "cpu_diagnostic_only", "ssr_capacity_diagnostic_only", "ssr_capacity_concurrency", "ssr_capacity_workload"
-              }:
-                  raise ValueError
-              email = inputs.get("control_email") if isinstance(inputs, dict) else None
+              email = inputs.get("control_email")
               if not isinstance(email, str) or not email.isascii() or not 3 <= len(email) <= 254 or email != email.strip() or email.count("@") != 1:
                   raise ValueError
               local, domain = email.split("@", 1)
-              local_pattern = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._%+\-]{0,62}[A-Za-z0-9])?$")
-              label_pattern = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?$")
-              labels = domain.split(".")
-              if not 1 <= len(local) <= 64 or not 1 <= len(domain) <= 253 or "." not in domain or local_pattern.fullmatch(local) is None or any(label_pattern.fullmatch(label) is None for label in labels):
+              if re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._%+\-]{0,62}[A-Za-z0-9])?", local) is None or "." not in domain or any(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?", label) is None for label in domain.split(".")):
                   raise ValueError
-              if any(ord(character) < 0x21 or ord(character) == 0x7F for character in email):
+              if any(ord(ch) < 0x21 or ord(ch) == 0x7f for ch in email):
                   raise ValueError
-              canonical_email = email.lower()
-          except (OSError, ValueError, TypeError, UnicodeError, json.JSONDecodeError):
-              raise SystemExit("control identity input is invalid")
-          for value in dict.fromkeys((email, canonical_email)):
-              escaped = value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-              sys.stdout.write(f"::add-mask::{escaped}\n")
-          sys.stdout.flush()
+              for value in dict.fromkeys((email, email.lower())):
+                  sys.stdout.write("::add-mask::" + value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A") + "\n")
+              sys.stdout.flush()
+              del inputs["control_email"]
+              sanitized = (json.dumps(event, ensure_ascii=True, allow_nan=False, separators=(",", ":")) + "\n").encode("utf-8")
+              if len(sanitized) > 65536:
+                  raise ValueError
+          except (UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+              raise SystemExit("workflow event sanitization failed closed")
+          temporary = event_path.with_name(".sanitized-event-" + str(os.getpid()))
+          out = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+          try:
+              os.write(out, sanitized)
+              os.fsync(out)
+          finally:
+              os.close(out)
+          os.replace(temporary, event_path)
+          checked = event_path.lstat()
+          if not stat.S_ISREG(checked.st_mode) or checked.st_nlink != 1 or stat.S_IMODE(checked.st_mode) != 0o600 or b"control_email" in event_path.read_bytes():
+              raise SystemExit("workflow event sanitization failed closed")
           PY
 
-      - name: Download external-load handoffs
+      - name: Download exact public fixture descriptor
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
-          name: platform-production-external-load-input-${{ github.run_id }}-${{ github.run_attempt }}
+          name: platform-production-external-load-fixture-descriptor-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/external-input
       - name: Download closed fixture manifest
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
-          name: platform-production-external-load-manifest-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/external-manifest
+          name: platform-production-external-load-encrypted-manifest-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/external-manifest-ciphertext
 
       - name: Verify exact load handoff artifacts
         shell: bash
@@ -1214,8 +1479,59 @@ jobs:
               raise SystemExit("load handoff archive digest does not match metadata")
           PY
           }
-          verify_artifact "$INPUT_ARTIFACT_ID" "platform-production-external-load-input-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" external-input
-          verify_artifact "$MANIFEST_ARTIFACT_ID" "platform-production-external-load-manifest-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" external-manifest
+          verify_artifact "$DESCRIPTOR_ARTIFACT_ID" "platform-production-external-load-fixture-descriptor-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" external-descriptor
+          verify_artifact "$MANIFEST_ARTIFACT_ID" "platform-production-external-load-encrypted-manifest-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" external-manifest
+      - name: Stage the fixture-only decrypt identity
+        id: stage-load-client-identity
+        shell: bash
+        env:
+          FIXTURE_MANIFEST_AGE_IDENTITY: ${{ secrets.FIXTURE_MANIFEST_AGE_IDENTITY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          install -d -m 700 "$RUNNER_TEMP/fixture-private-identity"
+          /usr/bin/python3 - "$RUNNER_TEMP/fixture-private-identity/identity.txt" <<'PY'
+          import os, sys
+          path = sys.argv[1]
+          value = os.environ.get("FIXTURE_MANIFEST_AGE_IDENTITY", "")
+          if len(value) != 74 or not value.startswith("AGE-SECRET-KEY-1") or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-" for c in value):
+              raise SystemExit("fixture decrypt identity is invalid")
+          fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+          try:
+              data = (value + "\n").encode("ascii")
+              if os.write(fd, data) != len(data): raise SystemExit("fixture decrypt identity write failed")
+              os.fsync(fd)
+          finally:
+              os.close(fd)
+          PY
+
+      - name: Decrypt fixture manifest for the trusted load client
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          age_dir="$RUNNER_TEMP/fixture-age-tools"
+          age_archive="$RUNNER_TEMP/age-v1.3.2.tar.gz"
+          age_identity="$RUNNER_TEMP/fixture-private-identity/identity.txt"
+          mkdir -m 700 "$age_dir"
+          trap 'rm -f -- "$age_identity" "$age_archive" "$RUNNER_TEMP/external-manifest/manifest.json.tmp"' EXIT
+          curl --fail --location --silent --show-error https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-linux-amd64.tar.gz --output "$age_archive"
+          printf '%s  %s\n' cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10 "$age_archive" | sha256sum --check --status
+          tar --extract --gzip --file "$age_archive" --directory "$age_dir" age/age
+          test "$("$age_dir/age" --version)" = v1.3.2
+          ciphertext="$RUNNER_TEMP/external-manifest-ciphertext/manifest.json.age"
+          plaintext="$RUNNER_TEMP/external-manifest/manifest.json"
+          install -d -m 700 "$RUNNER_TEMP/external-manifest"
+          test -f "$ciphertext" && test ! -L "$ciphertext" && test ! -e "$plaintext"
+          temporary="$plaintext.tmp"
+          test ! -e "$temporary" && test ! -L "$temporary"
+          "$age_dir/age" --decrypt --identity "$age_identity" --output "$temporary" "$ciphertext"
+          chmod 600 "$temporary"
+          mv -n -- "$temporary" "$plaintext"
+          test "$(stat -c '%u:%g:%a' "$plaintext")" = "$(id -u):$(id -g):600"
+          rm -f -- "$age_identity" "$age_archive"
+          test ! -e "$age_identity" && test ! -L "$age_identity"
+
       - name: Checkout reviewed load client
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -1254,61 +1570,22 @@ jobs:
               raise SystemExit("mandatory load containment probe did not prove the exact non-root system chain")
           print("mandatory load PID namespace containment: available")
           PY
-      - name: Validate load manifest before candidate execution
+      - name: Validate exact fixture descriptor and decrypted manifest
         shell: bash
         run: |
           set -euo pipefail
-          test -f "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" && test ! -L "$RUNNER_TEMP/external-input/platform-production-external-load-input.json"
-          test -f "$RUNNER_TEMP/external-manifest/manifest.json" && test ! -L "$RUNNER_TEMP/external-manifest/manifest.json"
-          chmod 600 -- \
-            "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" \
-            "$RUNNER_TEMP/external-manifest/manifest.json"
-          /usr/bin/python3 - "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" "$RUNNER_TEMP/external-manifest/manifest.json" "$TARGET_SHA" "$GITHUB_RUN_ID" "$APP_TARGET_SHA" <<'PY'
-          import hashlib
-          import json
-          from pathlib import Path
-          import re
-          import sys
+          descriptor="$RUNNER_TEMP/external-input/fixture-descriptor.json"
+          manifest="$RUNNER_TEMP/external-manifest/manifest.json"
+          test -f "$descriptor" && test ! -L "$descriptor"
+          test -f "$manifest" && test ! -L "$manifest"
+          chmod 600 "$descriptor" "$manifest"
+          /usr/bin/python3 platform/tools/platform_fixture_credential_transport.py validate-descriptor \
+            --descriptor "$descriptor" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --runner-sha "$TARGET_SHA" --app-sha "$APP_TARGET_SHA"
+          /usr/bin/python3 platform/tools/platform_load.py export-source-binding-env \
+            --input-handoff "$descriptor" --manifest "$manifest" \
+            --runner-sha "$TARGET_SHA" --app-target-sha "$APP_TARGET_SHA" >/dev/null
 
-          sys.path.insert(0, str(Path("platform").resolve()))
-          from tools.platform_workflow_input_guard import validate_external_payload
-
-          input_path, manifest_path, target_sha, run_id, app_target_sha = sys.argv[1:]
-          payload = json.loads(Path(input_path).read_text(encoding="utf-8"))
-          base_input_keys = {
-              "schema", "confirmation", "target_sha", "control_email", "setup_concurrency",
-              "run_id", "profile", "tournament_count", "users_per_tournament",
-              "timeout_diagnostics", "fixture_kind",
-          }
-          schema = payload.get("schema")
-          source_binding = payload.get("source_binding")
-          expected_input_keys = base_input_keys | ({"source_binding"} if schema in (2, "2") else set())
-          if set(payload) != expected_input_keys or schema not in (1, "1", 2, "2") or payload.get("target_sha") != target_sha or payload.get("run_id") != run_id:
-              raise SystemExit("external handoff schema or exact target SHA mismatch")
-          try:
-              if "fixture_kind" not in payload or validate_external_payload(payload) != payload:
-                  raise ValueError
-          except (TypeError, ValueError):
-              raise SystemExit("external handoff fixture schema or mode is invalid")
-          manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-          keys = {"schema", "purpose", "origin", "session_cookie_name", "csrf_cookie_name", "marker", "created_at", "tournaments", "users", "runner_sha", "app_target_sha", "source_binding", "source_binding_sha256"}
-          if set(manifest) != keys or type(manifest.get("schema")) is not int or manifest.get("schema") != 2 or manifest.get("origin") != "https://old-sparky.com" or re.fullmatch(r"preprod[0-9]{12}[0-9a-f]{4}", str(manifest.get("marker"))) is None:
-              raise SystemExit("fixture manifest is not a closed schema")
-          if manifest.get("runner_sha") != target_sha or manifest.get("app_target_sha") != app_target_sha or manifest.get("source_binding") != source_binding:
-              raise SystemExit("fixture source binding differs from the exact workflow handoff")
-          if source_binding is None:
-              if schema not in (1, "1") or app_target_sha != target_sha or manifest.get("source_binding_sha256") is not None:
-                  raise SystemExit("same-source fixture source binding is invalid")
-          else:
-              if schema not in (2, "2") or not isinstance(source_binding, dict) or source_binding.get("runner_sha") != target_sha or source_binding.get("app_target_sha") != app_target_sha:
-                  raise SystemExit("verified no-op source binding is invalid")
-              canonical = json.dumps(source_binding, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("ascii")
-              if manifest.get("source_binding_sha256") != hashlib.sha256(canonical).hexdigest():
-                  raise SystemExit("fixture source-binding digest does not match")
-          if not isinstance(manifest.get("users"), list) or not manifest["users"]:
-              raise SystemExit("fixture manifest has no users")
-          print("closed external handoff accepted for exact target SHA")
-          PY
       - name: Run checked-out external HTTP load client
         id: external-evaluate
         shell: bash
@@ -1322,7 +1599,7 @@ jobs:
           profile_env="$artifact_dir/profile.env"
           source_binding_env="$artifact_dir/source-binding.env"
           if ! /usr/bin/python3 platform/tools/platform_load.py export-source-binding-env \
-            --input-handoff "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" \
+            --input-handoff "$RUNNER_TEMP/external-input/fixture-descriptor.json" \
             --manifest "$RUNNER_TEMP/external-manifest/manifest.json" \
             --runner-sha "$SOURCE_GIT_SHA" --app-target-sha "$APP_TARGET_SHA" \
             > "$source_binding_env"; then
@@ -1474,7 +1751,7 @@ jobs:
           else
             printf '%s\n' "{\"schema\":1,\"target_sha\":\"$TARGET_SHA\",\"run_id\":\"$GITHUB_RUN_ID\",\"ids\":[]}" > "$artifact_dir/timeout-diagnostic-ids.json"
           fi
-          /usr/bin/python3 - "$artifact_dir/load-status.json" "$load_status" "$client_exit_status" "$candidate_state" "$report_ready" "$TARGET_SHA" "$APP_TARGET_SHA" "$SOURCE_BINDING_SHA256" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$PROFILE_ID" "$load_report" "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" <<'PY'
+          /usr/bin/python3 - "$artifact_dir/load-status.json" "$load_status" "$client_exit_status" "$candidate_state" "$report_ready" "$TARGET_SHA" "$APP_TARGET_SHA" "$SOURCE_BINDING_SHA256" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$PROFILE_ID" "$load_report" "$RUNNER_TEMP/external-input/fixture-descriptor.json" <<'PY'
           import json
           import hashlib
           from pathlib import Path
@@ -1539,6 +1816,17 @@ jobs:
   # Finalization and cleanup use a new approved runner.  They consume only the
   # exact input and a bounded diagnostic-id list; no candidate script runs in
   # this secret-bearing job.
+      - name: Remove decrypted fixture material
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f -- "$RUNNER_TEMP/external-manifest/manifest.json" "$RUNNER_TEMP/fixture-private-identity/identity.txt" "$RUNNER_TEMP/age-v1.3.2.tar.gz"
+          rm -rf -- "$RUNNER_TEMP/fixture-age-tools" "$RUNNER_TEMP/external-manifest-ciphertext"
+          rmdir -- "$RUNNER_TEMP/fixture-private-identity" 2>/dev/null || true
+          test ! -e "$RUNNER_TEMP/external-manifest/manifest.json" && test ! -L "$RUNNER_TEMP/external-manifest/manifest.json"
+          test ! -e "$RUNNER_TEMP/fixture-private-identity" && test ! -L "$RUNNER_TEMP/fixture-private-identity"
+
   namespace-containment-barrier:
     name: Verify closed external-load namespace boundary
     needs:
@@ -1685,7 +1973,7 @@ jobs:
           exit 1
 
   derive-diagnostic-source-binding:
-    name: Derive diagnostic source binding without production secrets
+    name: Derive diagnostic source binding from the safe descriptor
     needs:
       - validate-external-inputs
       - fixture-setup
@@ -1707,133 +1995,97 @@ jobs:
     env:
       SOURCE_GIT_SHA: ${{ github.sha }}
       APP_TARGET_SHA: ${{ needs.validate-external-inputs.outputs.app_target_sha }}
+      DESCRIPTOR_ARTIFACT_ID: ${{ needs.fixture-setup.outputs.descriptor_artifact_id }}
     steps:
+      - name: Remove control identity from the runner event file
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 - <<'PY'
+          import json, os, stat, sys
+          from pathlib import Path
+          path=Path(os.environ["GITHUB_EVENT_PATH"]); fd=os.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
+          try:
+              st=os.fstat(fd)
+              if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.geteuid() or st.st_nlink!=1 or st.st_size>65536 or stat.S_IMODE(st.st_mode)&0o077: raise ValueError
+              raw=os.read(fd,65537)
+              if len(raw)!=st.st_size: raise ValueError
+          finally: os.close(fd)
+          def pairs(items):
+              out={}
+              for k,v in items:
+                  if k in out: raise ValueError
+                  out[k]=v
+              return out
+          try:
+              event=json.loads(raw.decode("utf-8"),object_pairs_hook=pairs); inputs=event["inputs"]
+              if not isinstance(inputs,dict) or not isinstance(inputs.get("control_email"),str): raise ValueError
+              email=inputs.pop("control_email")
+              for value in dict.fromkeys((email,email.lower())): sys.stdout.write("::add-mask::"+value.replace("%","%25").replace("\r","%0D").replace("\n","%0A")+"\n")
+              sys.stdout.flush(); safe=(json.dumps(event,ensure_ascii=True,separators=(",",":"))+"\n").encode()
+              tmp=path.with_name(".sanitized-event-"+str(os.getpid())); out=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC|os.O_NOFOLLOW,0o600)
+              try: os.write(out,safe); os.fsync(out)
+              finally: os.close(out)
+              os.replace(tmp,path)
+              if b"control_email" in path.read_bytes(): raise ValueError
+          except (KeyError,TypeError,UnicodeError,ValueError,json.JSONDecodeError): raise SystemExit("workflow event sanitization failed closed")
+          PY
       - name: Checkout exact diagnostic source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ env.SOURCE_GIT_SHA }}
           fetch-depth: 1
           persist-credentials: false
-      - name: Download exact same-run external-load input
+      - name: Download exact same-run fixture descriptor
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
-          name: platform-production-external-load-input-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/diagnostic-binding-input
-      - name: Download exact same-run fixture manifest
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
-        with:
-          name: platform-production-external-load-manifest-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/diagnostic-binding-manifest
-      - name: Validate input and derive bounded source-binding outputs
+          name: platform-production-external-load-fixture-descriptor-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/diagnostic-descriptor
+      - name: Verify exact descriptor artifact API identity and digest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$DESCRIPTOR_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          metadata="$RUNNER_TEMP/descriptor-metadata.json"; archive="$RUNNER_TEMP/descriptor.zip"
+          curl --fail-with-body --silent --show-error -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$DESCRIPTOR_ARTIFACT_ID" --output "$metadata"
+          curl --fail-with-body --silent --show-error --location -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$DESCRIPTOR_ARTIFACT_ID/zip" --output "$archive"
+          /usr/bin/python3 - "$metadata" "$archive" "$DESCRIPTOR_ARTIFACT_ID" "$GITHUB_RUN_ID" "$GITHUB_SHA" <<'PY'
+          import hashlib,json,re,sys
+          from pathlib import Path
+          metadata=Path(sys.argv[1]).read_bytes(); archive=Path(sys.argv[2]).read_bytes(); artifact=json.loads(metadata)
+          name=f"platform-production-external-load-fixture-descriptor-{sys.argv[4]}-{__import__('os').environ['GITHUB_RUN_ATTEMPT']}"
+          run=artifact.get("workflow_run") if isinstance(artifact,dict) else None
+          if (type(artifact.get("id")) is not int or artifact["id"]!=int(sys.argv[3]) or artifact.get("name")!=name or artifact.get("expired") is not False or not isinstance(run,dict) or run.get("id")!=int(sys.argv[4]) or run.get("head_sha")!=sys.argv[5] or artifact.get("digest")!="sha256:"+hashlib.sha256(archive).hexdigest()): raise SystemExit("fixture descriptor artifact identity is invalid")
+          PY
+      - name: Validate descriptor and derive safe binding outputs
         id: derive
         shell: bash
         run: |
           set -euo pipefail
-          umask 077
-          input_path="$RUNNER_TEMP/diagnostic-binding-input/platform-production-external-load-input.json"
-          manifest_path="$RUNNER_TEMP/diagnostic-binding-manifest/manifest.json"
-          test -f "$input_path" && test ! -L "$input_path"
-          test -f "$manifest_path" && test ! -L "$manifest_path"
-          chmod 600 "$input_path" "$manifest_path"
-          binding_env="$RUNNER_TEMP/diagnostic-source-binding.env"
-          trap 'rm -f -- "$binding_env"' EXIT
-          /usr/bin/python3 platform/tools/platform_load.py export-source-binding-env \
-            --input-handoff "$input_path" --manifest "$manifest_path" \
-            --runner-sha "$SOURCE_GIT_SHA" --app-target-sha "$APP_TARGET_SHA" \
-            > "$binding_env"
-          /usr/bin/python3 - "$binding_env" "$input_path" "$SOURCE_GIT_SHA" "$APP_TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_OUTPUT" <<'PY'
-          import base64
-          import hashlib
-          import json
-          import os
+          descriptor="$RUNNER_TEMP/diagnostic-descriptor/fixture-descriptor.json"
+          test -f "$descriptor" && test ! -L "$descriptor"; chmod 600 "$descriptor"
+          /usr/bin/python3 platform/tools/platform_fixture_credential_transport.py validate-descriptor --descriptor "$descriptor" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --runner-sha "$SOURCE_GIT_SHA" --app-sha "$APP_TARGET_SHA"
+          /usr/bin/python3 - "$descriptor" "$SOURCE_GIT_SHA" "$APP_TARGET_SHA" "$GITHUB_OUTPUT" <<'PY'
+          import base64,hashlib,json,os,stat,sys
           from pathlib import Path
-          import re
-          import stat
-          import sys
-
-          env_path, input_path, runner_sha, app_sha, run_id, output_path = sys.argv[1:]
-
-          def read_private(path: str, cap: int) -> bytes:
-              before = os.lstat(path)
-              if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
-                      or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) != 0o600
-                      or before.st_size <= 0 or before.st_size > cap):
-                  raise ValueError
-              fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
-              try:
-                  opened = os.fstat(fd)
-                  if ((opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
-                          != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)):
-                      raise ValueError
-                  chunks = bytearray()
-                  while len(chunks) <= cap:
-                      block = os.read(fd, min(8192, cap + 1 - len(chunks)))
-                      if not block:
-                          break
-                      chunks.extend(block)
-                  if len(chunks) != before.st_size:
-                      raise ValueError
-                  return bytes(chunks)
-              finally:
-                  os.close(fd)
-
+          path,runner,app,output=sys.argv[1:]
+          st=os.lstat(path)
+          if not stat.S_ISREG(st.st_mode) or st.st_nlink!=1 or stat.S_IMODE(st.st_mode)!=0o600: raise SystemExit("fixture descriptor permissions are invalid")
+          value=json.loads(Path(path).read_text(encoding="ascii")); binding=value["manifest"]["source_binding"]
+          if runner==app:
+              encoded=digest=""
+              if binding is not None: raise SystemExit("same-source descriptor contains a binding")
+          else:
+              if not isinstance(binding,dict) or binding.get("runner_sha")!=runner or binding.get("app_target_sha")!=app: raise SystemExit("descriptor source binding is invalid")
+              raw=json.dumps(binding,ensure_ascii=True,allow_nan=False,sort_keys=True,separators=(",",":")).encode("ascii"); encoded=base64.b64encode(raw).decode("ascii"); digest=hashlib.sha256(raw).hexdigest()
+          fd=os.open(output,os.O_WRONLY|os.O_APPEND|os.O_CLOEXEC|os.O_NOFOLLOW)
           try:
-              payload = json.loads(read_private(input_path, 64 * 1024).decode("ascii"))
-              if (not isinstance(payload, dict) or payload.get("target_sha") != runner_sha
-                      or payload.get("run_id") != run_id):
-                  raise ValueError
-              raw = read_private(env_path, 32 * 1024).decode("ascii")
-              lines = raw.splitlines()
-              if (len(lines) != 2 or not lines[0].startswith("SOURCE_BINDING_BASE64=")
-                      or not lines[1].startswith("SOURCE_BINDING_SHA256=")):
-                  raise ValueError
-              encoded, digest = lines[0].partition("=")[2], lines[1].partition("=")[2]
-              if len(encoded) > 21848:
-                  raise ValueError
-              if digest and re.fullmatch(r"[0-9a-f]{64}", digest) is None:
-                  raise ValueError
-              if runner_sha == app_sha:
-                  if encoded or digest:
-                      raise ValueError
-              elif not encoded or not digest:
-                  raise ValueError
-              if encoded:
-                  decoded = base64.b64decode(encoded, validate=True)
-                  if (base64.b64encode(decoded).decode("ascii") != encoded
-                          or len(decoded) > 16 * 1024
-                          or hashlib.sha256(decoded).hexdigest() != digest):
-                      raise ValueError
-                  binding = json.loads(decoded.decode("ascii"))
-                  if (not isinstance(binding, dict) or binding.get("runner_sha") != runner_sha
-                          or binding.get("app_target_sha") != app_sha):
-                      raise ValueError
-              output_stat = os.lstat(output_path)
-              if (not stat.S_ISREG(output_stat.st_mode) or output_stat.st_uid != os.geteuid()
-                      or output_stat.st_nlink != 1 or stat.S_IMODE(output_stat.st_mode) & 0o022
-                      or output_stat.st_size > 1024 * 1024):
-                  raise ValueError
-              fd = os.open(output_path, os.O_WRONLY | os.O_APPEND | os.O_CLOEXEC | os.O_NOFOLLOW)
-              try:
-                  output_stat = os.fstat(fd)
-                  output_path_stat = os.lstat(output_path)
-                  if ((output_stat.st_dev, output_stat.st_ino)
-                          != (output_path_stat.st_dev, output_path_stat.st_ino)
-                          or not stat.S_ISREG(output_stat.st_mode) or output_stat.st_uid != os.geteuid()
-                          or output_stat.st_nlink != 1 or output_stat.st_size > 1024 * 1024):
-                      raise ValueError
-                  output = (f"source_binding_base64={encoded}\n"
-                            f"source_binding_sha256={digest}\n").encode("ascii")
-                  remaining = memoryview(output)
-                  while remaining:
-                      written = os.write(fd, remaining)
-                      if written <= 0:
-                          raise OSError("workflow output write was incomplete")
-                      remaining = remaining[written:]
-                  os.fsync(fd)
-              finally:
-                  os.close(fd)
-          except (OSError, ValueError, TypeError, UnicodeError, json.JSONDecodeError):
-              raise SystemExit("diagnostic source-binding outputs failed closed validation")
+              st=os.fstat(fd)
+              if not stat.S_ISREG(st.st_mode) or st.st_nlink!=1 or st.st_size>1024*1024: raise SystemExit("workflow output is unsafe")
+              os.write(fd,f"source_binding_base64={encoded}\nsource_binding_sha256={digest}\n".encode("ascii")); os.fsync(fd)
+          finally: os.close(fd)
           PY
 
   cpu-diagnostic-pair:
@@ -1870,26 +2122,78 @@ jobs:
       TARGET_SHA: ${{ github.sha }}
       SOURCE_GIT_SHA: ${{ github.sha }}
       APP_TARGET_SHA: ${{ needs.validate-external-inputs.outputs.app_target_sha }}
-      INPUT_ARTIFACT_ID: ${{ needs.validate-external-inputs.outputs.input_artifact_id }}
+      DESCRIPTOR_ARTIFACT_ID: ${{ needs.fixture-setup.outputs.descriptor_artifact_id }}
       MANIFEST_ARTIFACT_ID: ${{ needs.fixture-setup.outputs.manifest_artifact_id }}
     steps:
-      - name: Checkout exact diagnostic runner source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          ref: ${{ env.TARGET_SHA }}
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Download the exact same-run input and fixture manifest
+      - name: Remove control identity from the runner event file
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 - <<'PY'
+          import json,os,stat,sys
+          from pathlib import Path
+          path=Path(os.environ["GITHUB_EVENT_PATH"]);fd=os.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
+          try:
+              st=os.fstat(fd)
+              if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.geteuid() or st.st_nlink!=1 or st.st_size>65536 or stat.S_IMODE(st.st_mode)&0o077: raise ValueError
+              raw=os.read(fd,65537)
+              if len(raw)!=st.st_size: raise ValueError
+          finally: os.close(fd)
+          def pairs(items):
+              out={}
+              for k,v in items:
+                  if k in out: raise ValueError
+                  out[k]=v
+              return out
+          try:
+              event=json.loads(raw.decode("utf-8"),object_pairs_hook=pairs); inputs=event["inputs"]
+              if not isinstance(inputs,dict) or not isinstance(inputs.get("control_email"),str): raise ValueError
+              email=inputs.pop("control_email")
+              for value in dict.fromkeys((email,email.lower())): sys.stdout.write("::add-mask::"+value.replace("%","%25").replace("\r","%0D").replace("\n","%0A")+"\n")
+              sys.stdout.flush()
+              safe=(json.dumps(event,ensure_ascii=True,separators=(",",":"))+"\n").encode();tmp=path.with_name(".sanitized-event-"+str(os.getpid()));out=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC|os.O_NOFOLLOW,0o600)
+              try: os.write(out,safe);os.fsync(out)
+              finally: os.close(out)
+              os.replace(tmp,path)
+              if b"control_email" in path.read_bytes(): raise ValueError
+          except (KeyError,TypeError,UnicodeError,ValueError,json.JSONDecodeError): raise SystemExit("workflow event sanitization failed closed")
+          PY
+      - name: Download the exact same-run public fixture descriptor
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
-          name: platform-production-external-load-input-${{ github.run_id }}-${{ github.run_attempt }}
+          name: platform-production-external-load-fixture-descriptor-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/cpu-diagnostic-input
       - name: Download the exact same-run fixture manifest
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
-          name: platform-production-external-load-manifest-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/cpu-diagnostic-manifest
+          name: platform-production-external-load-encrypted-manifest-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cpu-diagnostic-manifest-ciphertext
+
+      - name: Verify exact diagnostic transport artifact identities
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          verify_artifact() {
+            local artifact_id="$1" expected_name="$2" prefix="$3"
+            [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]]
+            local metadata="$RUNNER_TEMP/$prefix-metadata.json" archive="$RUNNER_TEMP/$prefix.zip"
+            curl --fail-with-body --silent --show-error -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" --output "$metadata"
+            curl --fail-with-body --silent --show-error --location -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip" --output "$archive"
+            /usr/bin/python3 - "$metadata" "$archive" "$artifact_id" "$expected_name" "$GITHUB_RUN_ID" "$GITHUB_SHA" <<'PY'
+          import hashlib,json,sys
+          from pathlib import Path
+          metadata_path,archive_path,artifact_id,name,run_id,sha=sys.argv[1:]
+          value=json.loads(Path(metadata_path).read_text(encoding="utf-8")); run=value.get("workflow_run") if isinstance(value,dict) else None
+          if (type(value.get("id")) is not int or value["id"]!=int(artifact_id) or value.get("name")!=name or value.get("expired") is not False
+              or not isinstance(run,dict) or type(run.get("id")) is not int or run["id"]!=int(run_id) or run.get("head_sha")!=sha
+              or value.get("digest")!="sha256:"+hashlib.sha256(Path(archive_path).read_bytes()).hexdigest()):
+              raise SystemExit("fixture transport artifact identity is invalid")
+          PY
+          }
+          verify_artifact "$DESCRIPTOR_ARTIFACT_ID" "platform-production-external-load-fixture-descriptor-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" diagnostic-descriptor
+          verify_artifact "$MANIFEST_ARTIFACT_ID" "platform-production-external-load-encrypted-manifest-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" diagnostic-manifest
 
       - name: Download matrix report before its optional CPU pair
         if: ${{ inputs.cpu_diagnostic_only != true && inputs.ssr_capacity_diagnostic_only != true }}
@@ -1926,18 +2230,65 @@ jobs:
               raise SystemExit("matrix client run binding does not match")
           PY
 
-      - name: Check out the bounded handoff files
+      - name: Stage the fixture-only decrypt identity
+        id: stage-cpu-diagnostic-identity
+        shell: bash
+        env:
+          FIXTURE_MANIFEST_AGE_IDENTITY: ${{ secrets.FIXTURE_MANIFEST_AGE_IDENTITY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          install -d -m 700 "$RUNNER_TEMP/fixture-private-identity"
+          /usr/bin/python3 - "$RUNNER_TEMP/fixture-private-identity/identity.txt" <<'PY'
+          import os, sys
+          path = sys.argv[1]
+          value = os.environ.get("FIXTURE_MANIFEST_AGE_IDENTITY", "")
+          if len(value) != 74 or not value.startswith("AGE-SECRET-KEY-1") or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-" for c in value):
+              raise SystemExit("fixture decrypt identity is invalid")
+          fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+          try:
+              data = (value + "\n").encode("ascii")
+              if os.write(fd, data) != len(data): raise SystemExit("fixture decrypt identity write failed")
+              os.fsync(fd)
+          finally:
+              os.close(fd)
+          PY
+
+      - name: Decrypt fixture manifest for the trusted diagnostic parent
         shell: bash
         run: |
           set -euo pipefail
+          umask 077
+          age_dir="$RUNNER_TEMP/fixture-age-tools"; archive="$RUNNER_TEMP/age-v1.3.2.tar.gz"; identity="$RUNNER_TEMP/fixture-private-identity/identity.txt"
+          mkdir -m 700 "$age_dir"
+          trap 'rm -f -- "$identity" "$archive" "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json.tmp"' EXIT
+          curl --fail --location --silent --show-error https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-linux-amd64.tar.gz --output "$archive"
+          printf '%s  %s\n' cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10 "$archive" | sha256sum --check --status
+          tar --extract --gzip --file "$archive" --directory "$age_dir" age/age
+          test "$("$age_dir/age" --version)" = v1.3.2
+          cipher="$RUNNER_TEMP/cpu-diagnostic-manifest-ciphertext/manifest.json.age"; plain="$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json"
+          install -d -m 700 "$RUNNER_TEMP/cpu-diagnostic-manifest"; test -f "$cipher" && test ! -L "$cipher" && test ! -e "$plain"
+          temporary="$plain.tmp"; test ! -e "$temporary" && test ! -L "$temporary"
+          "$age_dir/age" --decrypt --identity "$identity" --output "$temporary" "$cipher"; chmod 600 "$temporary"; mv -n -- "$temporary" "$plain"
+          rm -f -- "$identity" "$archive"; test ! -e "$identity" && test ! -L "$identity"
+      - name: Checkout exact diagnostic runner source after private key removal
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate exact fixture descriptor and manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          descriptor="$RUNNER_TEMP/cpu-diagnostic-input/fixture-descriptor.json"
           test "$(git rev-parse HEAD)" = "$TARGET_SHA"
-          test -f "$RUNNER_TEMP/cpu-diagnostic-input/platform-production-external-load-input.json"
-          test ! -L "$RUNNER_TEMP/cpu-diagnostic-input/platform-production-external-load-input.json"
-          test -f "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json"
-          test ! -L "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json"
-          chmod 600 \
-            "$RUNNER_TEMP/cpu-diagnostic-input/platform-production-external-load-input.json" \
-            "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json"
+          test -f "$descriptor" && test ! -L "$descriptor"
+          test -f "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json" && test ! -L "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json"
+          chmod 600 "$descriptor" "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json"
+          /usr/bin/python3 platform/tools/platform_fixture_credential_transport.py validate-descriptor --descriptor "$descriptor" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --runner-sha "$SOURCE_GIT_SHA" --app-sha "$APP_TARGET_SHA"
+          /usr/bin/python3 platform/tools/platform_load.py export-source-binding-env --input-handoff "$descriptor" --manifest "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json" --runner-sha "$SOURCE_GIT_SHA" --app-target-sha "$APP_TARGET_SHA" >/dev/null
 
       - name: Configure pinned production SSH for the trusted parent
         shell: bash
@@ -2058,7 +2409,7 @@ jobs:
           set +e
           /usr/bin/python3 platform/tools/platform_cpu_diagnostic_pair.py parent \
             --manifest "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json" \
-            --input-handoff "$RUNNER_TEMP/cpu-diagnostic-input/platform-production-external-load-input.json" \
+            --input-handoff "$RUNNER_TEMP/cpu-diagnostic-input/fixture-descriptor.json" \
             --report "$report_path" \
             --source-sha "$TARGET_SHA" \
             --app-target-sha "$APP_TARGET_SHA" \
@@ -2444,6 +2795,17 @@ jobs:
           if-no-files-found: ignore
           retention-days: 1
 
+      - name: Remove decrypted diagnostic fixture material
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f -- "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json" "$RUNNER_TEMP/fixture-private-identity/identity.txt" "$RUNNER_TEMP/age-v1.3.2.tar.gz"
+          rm -rf -- "$RUNNER_TEMP/fixture-age-tools" "$RUNNER_TEMP/cpu-diagnostic-manifest-ciphertext"
+          rmdir -- "$RUNNER_TEMP/fixture-private-identity" 2>/dev/null || true
+          test ! -e "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json" && test ! -L "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json"
+          test ! -e "$RUNNER_TEMP/fixture-private-identity" && test ! -L "$RUNNER_TEMP/fixture-private-identity"
+
   fixture-finalize:
     name: Signal fixture completion and collect origin evidence
     needs:
@@ -2601,8 +2963,8 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
-          name: platform-production-external-load-input-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/external-input
+          name: platform-production-external-load-private-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/external-input-ciphertext
       - name: Download candidate load data
         if: ${{ inputs.cpu_diagnostic_only != true && inputs.ssr_capacity_diagnostic_only != true }}
         continue-on-error: true
@@ -2624,6 +2986,54 @@ jobs:
         with:
           name: platform-production-ssr-capacity-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/external-client
+      - name: Stage the fixture-only finalizer identity
+        id: stage-fixture-finalizer-identity
+        if: >-
+          always() && (
+            (needs.namespace-containment-barrier.outputs.namespace_closed_status == '0' && needs.namespace-containment-manual-barrier.outputs.manual_required == '0') ||
+            ((inputs.cpu_diagnostic_only == true || inputs.ssr_capacity_diagnostic_only == true) && needs.fixture-setup.outputs.pre_candidate_cleanup_allowed == '1')
+          )
+        shell: bash
+        env:
+          FIXTURE_MANIFEST_AGE_IDENTITY: ${{ secrets.FIXTURE_MANIFEST_AGE_IDENTITY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          install -d -m 700 "$RUNNER_TEMP/fixture-private-identity"
+          /usr/bin/python3 - "$RUNNER_TEMP/fixture-private-identity/identity.txt" <<'PY'
+          import os, sys
+          path = sys.argv[1]
+          value = os.environ.get("FIXTURE_MANIFEST_AGE_IDENTITY", "")
+          if len(value) != 74 or not value.startswith("AGE-SECRET-KEY-1") or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-" for c in value):
+              raise SystemExit("fixture decrypt identity is invalid")
+          fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+          try:
+              data = (value + "\n").encode("ascii")
+              if os.write(fd, data) != len(data): raise SystemExit("fixture decrypt identity write failed")
+              os.fsync(fd)
+          finally:
+              os.close(fd)
+          PY
+
+      - name: Decrypt exact private input for cleanup
+        if: ${{ always() && steps.stage-fixture-finalizer-identity.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          age_dir="$RUNNER_TEMP/fixture-age-tools"; archive="$RUNNER_TEMP/age-v1.3.2.tar.gz"; identity="$RUNNER_TEMP/fixture-private-identity/identity.txt"
+          mkdir -m 700 "$age_dir"
+          trap 'rm -f -- "$identity" "$archive" "$RUNNER_TEMP/external-input/platform-production-external-load-input.json.tmp"' EXIT
+          curl --fail --location --silent --show-error https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-linux-amd64.tar.gz --output "$archive"
+          printf '%s  %s\n' cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10 "$archive" | sha256sum --check --status
+          tar --extract --gzip --file "$archive" --directory "$age_dir" age/age
+          test "$("$age_dir/age" --version)" = v1.3.2
+          cipher="$RUNNER_TEMP/external-input-ciphertext/private-input.json.age"; plain="$RUNNER_TEMP/external-input/platform-production-external-load-input.json"
+          install -d -m 700 "$RUNNER_TEMP/external-input"; test -f "$cipher" && test ! -L "$cipher" && test ! -e "$plain"
+          temporary="$plain.tmp"; test ! -e "$temporary" && test ! -L "$temporary"
+          "$age_dir/age" --decrypt --identity "$identity" --output "$temporary" "$cipher"; chmod 600 "$temporary"; mv -n -- "$temporary" "$plain"
+          rm -f -- "$identity" "$archive"; test ! -e "$identity" && test ! -L "$identity"
+
       - name: Revalidate finalizer handoffs
         id: revalidate-finalizer
         if: >-
@@ -2820,7 +3230,7 @@ jobs:
           }
           if [[ ! -s "$input_path" || -L "$input_path" ]]; then
             handoff_status=1
-          elif ! verify_artifact "$INPUT_ARTIFACT_ID" "platform-production-external-load-input-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" external-finalizer-input; then
+          elif ! verify_artifact "$INPUT_ARTIFACT_ID" "platform-production-external-load-private-input-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" external-finalizer-input; then
             handoff_status=1
           fi
           install -d -m 700 "$candidate_dir"
@@ -3688,6 +4098,17 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      - name: Remove decrypted finalizer fixture material
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f -- "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" "$RUNNER_TEMP/fixture-private-identity/identity.txt" "$RUNNER_TEMP/age-v1.3.2.tar.gz"
+          rm -rf -- "$RUNNER_TEMP/fixture-age-tools" "$RUNNER_TEMP/external-input-ciphertext"
+          rmdir -- "$RUNNER_TEMP/fixture-private-identity" 2>/dev/null || true
+          test ! -e "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" && test ! -L "$RUNNER_TEMP/external-input/platform-production-external-load-input.json"
+          test ! -e "$RUNNER_TEMP/fixture-private-identity" && test ! -L "$RUNNER_TEMP/fixture-private-identity"
+
   # Evaluation/sanitization happens on another secret-free checkout runner.
   evaluate-load:
     name: Evaluate checked-out load report
@@ -3710,13 +4131,46 @@ jobs:
       TIMEOUT_DIAGNOSTICS: ${{ inputs.timeout_diagnostics }}
       SOURCE_GIT_SHA: ${{ github.sha }}
       APP_TARGET_SHA: ${{ needs.validate-external-inputs.outputs.app_target_sha }}
-      INPUT_ARTIFACT_ID: ${{ needs.validate-external-inputs.outputs.input_artifact_id }}
+      DESCRIPTOR_ARTIFACT_ID: ${{ needs.fixture-setup.outputs.descriptor_artifact_id }}
       MANIFEST_ARTIFACT_ID: ${{ needs.fixture-setup.outputs.manifest_artifact_id }}
       CPU_DIAGNOSTIC_ONLY: ${{ inputs.cpu_diagnostic_only }}
       SSR_CAPACITY_DIAGNOSTIC_ONLY: ${{ inputs.ssr_capacity_diagnostic_only }}
       CANDIDATE_ARTIFACT_ID: ${{ (inputs.cpu_diagnostic_only || inputs.ssr_capacity_diagnostic_only) && needs['cpu-diagnostic-pair'].outputs.candidate_artifact_id || needs.load-client.outputs.candidate_artifact_id }}
       ORIGIN_ARTIFACT_ID: ${{ needs.fixture-finalize.outputs.origin_artifact_id }}
     steps:
+      - name: Remove control identity from the runner event file
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 - <<'PY'
+          import json,os,stat,sys
+          from pathlib import Path
+          path=Path(os.environ["GITHUB_EVENT_PATH"]);fd=os.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
+          try:
+              st=os.fstat(fd)
+              if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.geteuid() or st.st_nlink!=1 or st.st_size>65536 or stat.S_IMODE(st.st_mode)&0o077: raise ValueError
+              raw=os.read(fd,65537)
+              if len(raw)!=st.st_size: raise ValueError
+          finally: os.close(fd)
+          def pairs(items):
+              out={}
+              for k,v in items:
+                  if k in out: raise ValueError
+                  out[k]=v
+              return out
+          try:
+              event=json.loads(raw.decode("utf-8"),object_pairs_hook=pairs);inputs=event["inputs"]
+              if not isinstance(inputs,dict) or not isinstance(inputs.get("control_email"),str): raise ValueError
+              email=inputs.pop("control_email")
+              for value in dict.fromkeys((email,email.lower())): sys.stdout.write("::add-mask::"+value.replace("%","%25").replace("\r","%0D").replace("\n","%0A")+"\n")
+              sys.stdout.flush()
+              safe=(json.dumps(event,ensure_ascii=True,separators=(",",":"))+"\n").encode();tmp=path.with_name(".sanitized-event-"+str(os.getpid()));out=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC|os.O_NOFOLLOW,0o600)
+              try: os.write(out,safe);os.fsync(out)
+              finally: os.close(out)
+              os.replace(tmp,path)
+              if b"control_email" in path.read_bytes(): raise ValueError
+          except (KeyError,TypeError,UnicodeError,ValueError,json.JSONDecodeError): raise SystemExit("workflow event sanitization failed closed")
+          PY
       - name: Checkout reviewed load evaluator
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -3749,11 +4203,11 @@ jobs:
         with:
           name: platform-production-ssr-capacity-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/external-client
-      - name: Download exact source-binding handoff
+      - name: Download exact public fixture descriptor
         continue-on-error: true
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
-          name: platform-production-external-load-input-${{ github.run_id }}-${{ github.run_attempt }}
+          name: platform-production-external-load-fixture-descriptor-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/external-input
       - name: Download fixed origin evidence
         continue-on-error: true
@@ -3766,8 +4220,8 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
-          name: platform-production-external-load-manifest-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/external-manifest
+          name: platform-production-external-load-encrypted-manifest-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/external-manifest-ciphertext
       - name: Verify evaluator artifact identity and digest
         id: verify-evaluator-artifacts
         if: ${{ always() }}
@@ -3834,11 +4288,11 @@ jobs:
           origin_status=0
           input_status=0
           manifest_status=0
-          verify_artifact "$INPUT_ARTIFACT_ID" "platform-production-external-load-input-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" evaluator-input || input_status=1
+          verify_artifact "$DESCRIPTOR_ARTIFACT_ID" "platform-production-external-load-fixture-descriptor-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" evaluator-descriptor || input_status=1
           if [[ "$CPU_DIAGNOSTIC_ONLY" == true ]]; then
-            verify_artifact "$MANIFEST_ARTIFACT_ID" "platform-production-external-load-manifest-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" evaluator-manifest || manifest_status=1
+            verify_artifact "$MANIFEST_ARTIFACT_ID" "platform-production-external-load-encrypted-manifest-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" evaluator-manifest || manifest_status=1
           elif [[ "$SSR_CAPACITY_DIAGNOSTIC_ONLY" == true ]]; then
-            verify_artifact "$MANIFEST_ARTIFACT_ID" "platform-production-external-load-manifest-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" evaluator-manifest || manifest_status=1
+            verify_artifact "$MANIFEST_ARTIFACT_ID" "platform-production-external-load-encrypted-manifest-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" evaluator-manifest || manifest_status=1
           fi
           candidate_artifact_name="platform-production-external-load-client-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           if [[ "$CPU_DIAGNOSTIC_ONLY" == true ]]; then
@@ -3850,7 +4304,7 @@ jobs:
           verify_artifact "$ORIGIN_ARTIFACT_ID" "platform-production-external-load-origin-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" evaluator-origin || origin_status=1
           echo "candidate_artifact_status=$candidate_status" >> "$GITHUB_OUTPUT"
           echo "origin_artifact_status=$origin_status" >> "$GITHUB_OUTPUT"
-          echo "input_artifact_status=$input_status" >> "$GITHUB_OUTPUT"
+          echo "descriptor_artifact_status=$input_status" >> "$GITHUB_OUTPUT"
           echo "manifest_artifact_status=$manifest_status" >> "$GITHUB_OUTPUT"
           exit 0
       - name: Evaluate typed CPU-only diagnostic without matrix credit
@@ -3862,67 +4316,37 @@ jobs:
           outcome=INVALID
           report="$RUNNER_TEMP/external-client/cpu-diagnostic.json"
           cleanup="$RUNNER_TEMP/external-evidence/cleanup-summary.json"
-          manifest="$RUNNER_TEMP/external-manifest/manifest.json"
-          handoff="$RUNNER_TEMP/external-input/platform-production-external-load-input.json"
+          descriptor="$RUNNER_TEMP/external-input/fixture-descriptor.json"
+          chmod 600 "$descriptor" 2>/dev/null || true
           if [[ "${{ steps.verify-evaluator-artifacts.outputs.candidate_artifact_status }}" == 0 \
             && "${{ steps.verify-evaluator-artifacts.outputs.origin_artifact_status }}" == 0 \
-            && "${{ steps.verify-evaluator-artifacts.outputs.input_artifact_status }}" == 0 \
+            && "${{ steps.verify-evaluator-artifacts.outputs.descriptor_artifact_status }}" == 0 \
             && "${{ steps.verify-evaluator-artifacts.outputs.manifest_artifact_status }}" == 0 \
-            && -s "$report" && ! -L "$report" && -s "$cleanup" && ! -L "$cleanup" && -s "$manifest" && ! -L "$manifest" && -s "$handoff" && ! -L "$handoff" ]]; then
-            outcome="$(/usr/bin/python3 - "$report" "$cleanup" "$manifest" "$handoff" "$SOURCE_GIT_SHA" "$APP_TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" <<'PY'
-          import hashlib
-          import json
+            && -s "$report" && ! -L "$report" && -s "$cleanup" && ! -L "$cleanup" && -s "$descriptor" && ! -L "$descriptor" ]]; then
+            outcome="$(/usr/bin/python3 - "$report" "$cleanup" "$descriptor" "$SOURCE_GIT_SHA" "$APP_TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" <<'PY'
+          import hashlib,json,sys
           from pathlib import Path
-          import sys
-
-          report_path, cleanup_path, manifest_path, handoff_path, source_sha, app_sha, run_id, attempt = sys.argv[1:]
+          report_path,cleanup_path,descriptor_path,source_sha,app_sha,run_id,attempt=sys.argv[1:]
           try:
-              report = json.loads(Path(report_path).read_text(encoding="ascii"))
-              cleanup = json.loads(Path(cleanup_path).read_text(encoding="ascii"))
-              manifest_raw = Path(manifest_path).read_bytes()
-              manifest = json.loads(manifest_raw.decode("ascii"))
-              handoff_raw = Path(handoff_path).read_bytes()
-              handoff = json.loads(handoff_raw.decode("ascii"))
-              binding = handoff.get("source_binding")
-              binding_raw = json.dumps(binding, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("ascii") if binding is not None else b""
-              binding_sha = hashlib.sha256(binding_raw).hexdigest() if binding is not None else None
-              if (
-                  not isinstance(cleanup, dict)
-                  or cleanup.get("ok") is not True
-                  or cleanup.get("control_account_preserved") is not True
-                  or cleanup.get("users_deleted") != 14
-                  or cleanup.get("tournaments_deleted") != 1
-                  or not isinstance(manifest, dict)
-                  or len(manifest.get("tournaments", [])) != 1
-                  or len(manifest.get("users", [])) != 14
-                  or handoff.get("target_sha") != source_sha
-                  or handoff.get("run_id") != run_id
-                  or handoff.get("fixture_kind") != "cpu_diagnostic_only_v1"
-                  or handoff.get("tournament_count") != "1"
-                  or handoff.get("users_per_tournament") != "14"
-                  or manifest.get("runner_sha") != source_sha
-                  or manifest.get("app_target_sha") != app_sha
-                  or manifest.get("source_binding_sha256") != binding_sha
-                  or (binding is not None and (binding.get("runner_sha") != source_sha or binding.get("app_target_sha") != app_sha))
-                  or report.get("input_handoff_sha256") != hashlib.sha256(handoff_raw).hexdigest()
-                  or report.get("source_binding_sha256") != binding_sha
-              ):
-                  raise ValueError
-              sys.path.insert(0, str(Path.cwd() / "platform"))
+              sys.path.insert(0,str(Path.cwd()/"platform"))
+              from tools.platform_fixture_credential_transport import validate_descriptor
+              descriptor=validate_descriptor(Path(descriptor_path),run_id,attempt,source_sha,app_sha)
+              report=json.loads(Path(report_path).read_text(encoding="ascii"));cleanup=json.loads(Path(cleanup_path).read_text(encoding="ascii"))
+              descriptor_raw=Path(descriptor_path).read_bytes();public_input=descriptor["input"];manifest=descriptor["manifest"];binding=manifest["source_binding"]
+              if (not isinstance(cleanup,dict) or cleanup.get("ok") is not True or cleanup.get("control_account_preserved") is not True
+                  or cleanup.get("users_deleted")!=manifest["user_count"] or cleanup.get("tournaments_deleted")!=manifest["tournament_count"]
+                  or public_input.get("fixture_kind")!="cpu_diagnostic_only_v1" or public_input.get("tournament_count")!="1" or public_input.get("users_per_tournament")!="14"
+                  or report.get("input_handoff_sha256")!=hashlib.sha256(descriptor_raw).hexdigest()
+                  or report.get("source_binding_sha256")!=manifest.get("source_binding_sha256") or report.get("source_binding")!=binding): raise ValueError
+              sys.path.insert(0,str(Path.cwd()/"platform"))
               from tools.platform_cpu_diagnostic_pair import evaluate_cpu_only_report
-              print(evaluate_cpu_only_report(
-                  report, source_sha=source_sha, app_target_sha=app_sha,
-                  run_id=run_id, attempt=attempt,
-                  manifest_sha256=hashlib.sha256(manifest_raw).hexdigest(),
-              ))
-          except Exception:
-              print("INVALID")
+              print(evaluate_cpu_only_report(report,source_sha=source_sha,app_target_sha=app_sha,run_id=run_id,attempt=attempt,manifest_sha256=manifest["sha256"]))
+          except Exception: print("INVALID")
           PY
           )"
           fi
           case "$outcome" in PASS|FAIL|INVALID) ;; *) outcome=INVALID ;; esac
-          status=0
-          [[ "$outcome" == INVALID ]] && status=1
+          status=0; [[ "$outcome" == INVALID ]] && status=1
           acceptance="diagnostic_$(printf '%s' "$outcome" | tr '[:upper:]' '[:lower:]')"
           echo "evaluation_status=$status" >> "$GITHUB_OUTPUT"
           echo "acceptance_status=$acceptance" >> "$GITHUB_OUTPUT"
@@ -3936,64 +4360,40 @@ jobs:
           outcome=INVALID
           report="$RUNNER_TEMP/external-client/ssr-capacity.json"
           cleanup="$RUNNER_TEMP/external-evidence/cleanup-summary.json"
-          manifest="$RUNNER_TEMP/external-manifest/manifest.json"
-          handoff="$RUNNER_TEMP/external-input/platform-production-external-load-input.json"
+          descriptor="$RUNNER_TEMP/external-input/fixture-descriptor.json"
+          chmod 600 "$descriptor" 2>/dev/null || true
           if [[ "${{ steps.verify-evaluator-artifacts.outputs.candidate_artifact_status }}" == 0 \
             && "${{ steps.verify-evaluator-artifacts.outputs.origin_artifact_status }}" == 0 \
-            && "${{ steps.verify-evaluator-artifacts.outputs.input_artifact_status }}" == 0 \
+            && "${{ steps.verify-evaluator-artifacts.outputs.descriptor_artifact_status }}" == 0 \
             && "${{ steps.verify-evaluator-artifacts.outputs.manifest_artifact_status }}" == 0 \
             && "${{ needs.fixture-finalize.outputs.cleanup_status }}" == 0 \
             && "${{ needs.fixture-finalize.outputs.ssh_cleanup_status }}" == 0 \
-            && -s "$report" && ! -L "$report" && -s "$cleanup" && ! -L "$cleanup" \
-            && -s "$manifest" && ! -L "$manifest" && -s "$handoff" && ! -L "$handoff" ]]; then
-            outcome="$(/usr/bin/python3 - "$report" "$cleanup" "$manifest" "$handoff" "$SOURCE_GIT_SHA" "$APP_TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" <<'PY'
-          import hashlib
-          import json
+            && -s "$report" && ! -L "$report" && -s "$cleanup" && ! -L "$cleanup" && -s "$descriptor" && ! -L "$descriptor" ]]; then
+            outcome="$(/usr/bin/python3 - "$report" "$cleanup" "$descriptor" "$SOURCE_GIT_SHA" "$APP_TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" <<'PY'
+          import json,sys
           from pathlib import Path
-          import sys
-
-          report_path, cleanup_path, manifest_path, handoff_path, source_sha, app_sha, run_id, attempt = sys.argv[1:]
+          report_path,cleanup_path,descriptor_path,source_sha,app_sha,run_id,attempt=sys.argv[1:]
           try:
-              report = json.loads(Path(report_path).read_text(encoding="ascii"))
-              cleanup = json.loads(Path(cleanup_path).read_text(encoding="ascii"))
-              manifest_raw = Path(manifest_path).read_bytes()
-              manifest = json.loads(manifest_raw.decode("ascii"))
-              handoff = json.loads(Path(handoff_path).read_text(encoding="ascii"))
-              if (
-                  not isinstance(cleanup, dict)
-                  or cleanup.get("ok") is not True
-                  or cleanup.get("control_account_preserved") is not True
-                  or cleanup.get("users_deleted") != 14
-                  or cleanup.get("tournaments_deleted") != 1
-                  or not isinstance(manifest, dict)
-                  or len(manifest.get("tournaments", [])) != 1
-                  or len(manifest.get("users", [])) != 14
-                  or handoff.get("target_sha") != source_sha
-                  or handoff.get("run_id") != run_id
-                  or handoff.get("fixture_kind") not in {"ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1", "ssr_html_capacity_composite_diagnostic_v1"}
-                  or handoff.get("tournament_count") != "1"
-                  or handoff.get("users_per_tournament") != "14"
-                  or manifest.get("runner_sha") != source_sha
-                  or manifest.get("app_target_sha") != app_sha
-                  or report.get("fixture_manifest_sha256") != hashlib.sha256(manifest_raw).hexdigest()
-              ):
+              sys.path.insert(0,str(Path.cwd()/"platform"))
+              from tools.platform_fixture_credential_transport import validate_descriptor
+              descriptor=validate_descriptor(Path(descriptor_path),run_id,attempt,source_sha,app_sha)
+              report=json.loads(Path(report_path).read_text(encoding="ascii"));cleanup=json.loads(Path(cleanup_path).read_text(encoding="ascii"))
+              public_input=descriptor["input"];manifest=descriptor["manifest"]
+              if (not isinstance(cleanup,dict) or cleanup.get("ok") is not True or cleanup.get("control_account_preserved") is not True
+                  or cleanup.get("users_deleted")!=manifest["user_count"] or cleanup.get("tournaments_deleted")!=manifest["tournament_count"]
+                  or public_input.get("fixture_kind") not in {"ssr_capacity_diagnostic_v1","ssr_html_capacity_diagnostic_v1","ssr_html_capacity_composite_diagnostic_v1"}
+                  or public_input.get("tournament_count")!="1" or public_input.get("users_per_tournament")!="14"
+                  or report.get("fixture_manifest_sha256")!=manifest.get("sha256")):
                   raise ValueError
-              sys.path.insert(0, str(Path.cwd() / "platform"))
+              sys.path.insert(0,str(Path.cwd()/"platform"))
               from tools.platform_ssr_capacity_diagnostic import evaluate_capacity_report
-              print(evaluate_capacity_report(
-                  report, source_sha=source_sha, app_target_sha=app_sha,
-                  run_id=run_id, attempt=attempt,
-                  manifest_sha256=hashlib.sha256(manifest_raw).hexdigest(),
-                  workload=handoff.get("ssr_capacity_workload", "authenticated_workspace_read_capacity_v1"),
-              ))
-          except Exception:
-              print("INVALID")
+              print(evaluate_capacity_report(report,source_sha=source_sha,app_target_sha=app_sha,run_id=run_id,attempt=attempt,manifest_sha256=manifest["sha256"],workload=public_input.get("ssr_capacity_workload","authenticated_workspace_read_capacity_v1")))
+          except Exception: print("INVALID")
           PY
           )"
           fi
           case "$outcome" in PASS|FAIL|INVALID) ;; *) outcome=INVALID ;; esac
-          status=0
-          [[ "$outcome" == INVALID ]] && status=1
+          status=0; [[ "$outcome" == INVALID ]] && status=1
           acceptance="capacity_$(printf '%s' "$outcome" | tr '[:upper:]' '[:lower:]')"
           echo "evaluation_status=$status" >> "$GITHUB_OUTPUT"
           echo "acceptance_status=$acceptance" >> "$GITHUB_OUTPUT"
@@ -4007,20 +4407,22 @@ jobs:
           report="$RUNNER_TEMP/external-client/external-load.json"
           load_status_file="$RUNNER_TEMP/external-client/load-status.json"
           observer="$RUNNER_TEMP/external-evidence/server-observability.json"
-          source_input="$RUNNER_TEMP/external-input/platform-production-external-load-input.json"
+          source_input="$RUNNER_TEMP/external-input/fixture-descriptor.json"
+          chmod 600 "$source_input" 2>/dev/null || true
           if [[ -s "$source_input" && ! -L "$source_input" ]]; then
             IFS=$'\t' read -r SOURCE_BINDING_BASE64 SOURCE_BINDING_SHA256 < <(
               /usr/bin/python3 - "$source_input" "$SOURCE_GIT_SHA" "$APP_TARGET_SHA" <<'PY'
           import base64
           import hashlib
           import json
+          import os
           from pathlib import Path
           import sys
           path, runner_sha, app_sha = sys.argv[1:]
-          payload = json.loads(Path(path).read_text(encoding="ascii"))
-          if not isinstance(payload, dict) or payload.get("target_sha") != runner_sha:
-              raise SystemExit("evaluator source handoff runner SHA is invalid")
-          binding = payload.get("source_binding")
+          sys.path.insert(0, str(Path.cwd() / "platform"))
+          from tools.platform_fixture_credential_transport import validate_descriptor
+          payload = validate_descriptor(Path(path), os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"], runner_sha, app_sha)
+          binding = payload.get("manifest", {}).get("source_binding")
           if binding is None:
               if app_sha != runner_sha:
                   raise SystemExit("evaluator source handoff is missing a no-op binding")
@@ -4069,9 +4471,9 @@ jobs:
             && "${{ needs.fixture-finalize.outputs.cleanup_identity_status }}" == 0 \
             && "${{ steps.verify-evaluator-artifacts.outputs.candidate_artifact_status }}" == 0 \
             && "${{ steps.verify-evaluator-artifacts.outputs.origin_artifact_status }}" == 0 \
-            && "${{ steps.verify-evaluator-artifacts.outputs.input_artifact_status }}" == 0 \
+            && "${{ steps.verify-evaluator-artifacts.outputs.descriptor_artifact_status }}" == 0 \
             && -s "$report" && -s "$load_status_file" && -s "$observer" ]]; then
-          validation_kind="$(/usr/bin/python3 - "$load_status_file" "$report" "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" "$SOURCE_GIT_SHA" "$APP_TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$PROFILE_ID" "$TIMEOUT_DIAGNOSTICS" <<'PY'
+          validation_kind="$(/usr/bin/python3 - "$load_status_file" "$report" "$RUNNER_TEMP/external-input/fixture-descriptor.json" "$SOURCE_GIT_SHA" "$APP_TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$PROFILE_ID" "$TIMEOUT_DIAGNOSTICS" <<'PY'
           import hashlib
           import json
           import os
@@ -4099,8 +4501,10 @@ jobs:
           if receipt_stat.st_nlink != 1 or report_stat.st_nlink != 1:
               raise SystemExit("candidate receipt or report link count is invalid")
           payload = json.loads(receipt_path.read_text(encoding="utf-8"), object_pairs_hook=closed_object)
-          input_payload = json.loads(Path(input_path).read_text(encoding="ascii"), object_pairs_hook=closed_object)
-          binding = input_payload.get("source_binding")
+          sys.path.insert(0, str(Path.cwd() / "platform"))
+          from tools.platform_fixture_credential_transport import validate_descriptor
+          input_payload = validate_descriptor(Path(input_path), run_id, attempt, target_sha, app_target_sha)
+          binding = input_payload["manifest"].get("source_binding")
           binding_digest = None
           if binding is not None:
               canonical_binding = json.dumps(binding, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("ascii")
@@ -4118,7 +4522,7 @@ jobs:
               or payload.get("app_target_sha") != app_target_sha
               or payload.get("source_binding") != binding
               or payload.get("source_binding_sha256") != binding_digest
-              or input_payload.get("target_sha") != target_sha
+              or input_payload.get("runner_sha") != target_sha
               or payload.get("run_id") != run_id
               or payload.get("run_attempt") != attempt
               or payload.get("profile_id") != profile_id
@@ -4473,7 +4877,7 @@ jobs:
           test "${{ needs.fixture-finalize.outputs.candidate_artifact_status }}" = 0 || { echo "Candidate load artifact identity/digest failed." >&2; exit 1; }
           test "${{ steps.verify-evaluator-artifacts.outputs.candidate_artifact_status }}" = 0 || { echo "Evaluator candidate artifact identity/digest failed." >&2; exit 1; }
           test "${{ steps.verify-evaluator-artifacts.outputs.origin_artifact_status }}" = 0 || { echo "Evaluator origin artifact identity/digest failed." >&2; exit 1; }
-          test "${{ steps.verify-evaluator-artifacts.outputs.input_artifact_status }}" = 0 || { echo "Evaluator source-binding handoff identity/digest failed." >&2; exit 1; }
+          test "${{ steps.verify-evaluator-artifacts.outputs.descriptor_artifact_status }}" = 0 || { echo "Evaluator source-binding handoff identity/digest failed." >&2; exit 1; }
           test "${{ steps.evaluate-load.outputs.evaluation_status }}" = 0 || { echo "External load acceptance failed." >&2; exit 1; }
           test "${{ steps.sanitize.outputs.sanitizer_status }}" = 0 || { echo "External evidence projection/sanitizer failed." >&2; exit 1; }
           acceptance_status="${{ steps.evaluate-load.outputs.acceptance_status }}"
@@ -4507,7 +4911,7 @@ jobs:
           test "${{ needs.fixture-finalize.outputs.cleanup_identity_status }}" = 0
           test "${{ steps.verify-evaluator-artifacts.outputs.candidate_artifact_status }}" = 0
           test "${{ steps.verify-evaluator-artifacts.outputs.origin_artifact_status }}" = 0
-          test "${{ steps.verify-evaluator-artifacts.outputs.input_artifact_status }}" = 0
+          test "${{ steps.verify-evaluator-artifacts.outputs.descriptor_artifact_status }}" = 0
           test "${{ steps.verify-evaluator-artifacts.outputs.manifest_artifact_status }}" = 0
           test "${{ steps.evaluate-cpu-diagnostic.outputs.evaluation_status }}" = 0
           test "${{ steps.evaluate-cpu-diagnostic.outputs.acceptance_status }}" = diagnostic_pass || { echo "CPU diagnostic did not meet its bounded overhead contract." >&2; exit 1; }
@@ -4545,7 +4949,7 @@ jobs:
           test "${{ needs.fixture-finalize.outputs.candidate_artifact_status }}" = 0
           test "${{ steps.verify-evaluator-artifacts.outputs.candidate_artifact_status }}" = 0
           test "${{ steps.verify-evaluator-artifacts.outputs.origin_artifact_status }}" = 0
-          test "${{ steps.verify-evaluator-artifacts.outputs.input_artifact_status }}" = 0
+          test "${{ steps.verify-evaluator-artifacts.outputs.descriptor_artifact_status }}" = 0
           test "${{ steps.verify-evaluator-artifacts.outputs.manifest_artifact_status }}" = 0
           test "${{ steps.evaluate-ssr-capacity.outputs.evaluation_status }}" = 0
           test "${{ steps.evaluate-ssr-capacity.outputs.acceptance_status }}" = capacity_pass || { echo "SSR capacity diagnostic did not produce complete bounded evidence." >&2; exit 1; }

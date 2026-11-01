@@ -454,16 +454,9 @@ under-load measurement; it does not establish a production performance gain.
 The change remains a measured optimization hypothesis until the R load matrix
 provides comparable observer evidence.
 
-Artifact handoffs carry the exact artifact ID across jobs. Each consumer then
-reads the authenticated Actions artifact metadata and requires the expected
-run-derived name (including the run attempt), artifact ID, unexpired state,
-workflow run ID and source SHA. The metadata's `sha256:` digest must be exactly
-64 lowercase hexadecimal characters and must match the downloaded ZIP bytes;
-missing metadata or any mismatch fails closed. Consumers do not depend on
-cross-job digest outputs, which Actions may suppress when a value is treated as
-secret-like. Every verifier receives its SHA from that job's declared source
-identity; the evaluator uses `SOURCE_GIT_SHA` for both artifact metadata and
-the candidate receipt binding.
+Artifact handoffs carry the exact artifact ID across jobs. Each consumer reads authenticated Actions metadata and requires the expected run-derived name (including attempt), artifact ID, unexpired state, workflow run ID and source SHA. Its `sha256:` digest must be 64 lowercase hexadecimal characters and match downloaded ZIP bytes; missing metadata or any mismatch fails closed. Consumers do not depend on cross-job digest outputs, which Actions may suppress when secret-like. Every verifier receives its SHA from that job's declared source identity; the evaluator uses `SOURCE_GIT_SHA` for artifact metadata and the candidate receipt binding.
+
+Fixture input and manifest artifacts are credential-bearing ciphertext; see the [fixture credential transport procedure](fixture-credential-transport.md). Inspect only the closed descriptor and separately sanitized report, fingerprint and cleanup evidence.
 
 The candidate receipt is not an acceptance result. The independent evaluator
 validates its exact schema and report digest, then binds the origin observer and

@@ -66,3 +66,13 @@ exact artifact API identity, size and digest before opening it. Do not attach
 manual `Authorization` headers, follow storage redirects yourself, or use
 `gh run download` when the outer ZIP digest must be verified; it extracts the
 artifact contents.
+
+External-load fixture inputs and manifests contain live fixture credentials.
+Only age-encrypted bytes may cross Actions artifacts; the public descriptor
+must remain closed and credential-free. Decryption identities are fixture-only
+environment secrets, never SSH/Cloudflare credentials. Do not upload, log, or
+manually download/decrypt the raw input or manifest; inspect sanitized reports
+and fingerprints only. Mask and remove `control_email` from each runner event before candidate
+checkout or cleanup processing. Serialize and encrypt it on a separate runner
+before any candidate code executes; mode-0600 files do not isolate same-user
+processes.

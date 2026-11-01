@@ -38,6 +38,56 @@ jobs:
     env:
       TARGET_SHA: ${{ github.sha }}
     steps:
+      - name: Mask and remove control identity before candidate checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 - <<'PY'
+          import json, os, stat, sys
+          from pathlib import Path
+          path = Path(os.environ["GITHUB_EVENT_PATH"])
+          fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+          try:
+              st = os.fstat(fd)
+              if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_nlink != 1 or st.st_size > 65536 or stat.S_IMODE(st.st_mode) & 0o022:
+                  raise ValueError
+              raw = os.read(fd, 65537)
+              if len(raw) != st.st_size:
+                  raise ValueError
+          finally:
+              os.close(fd)
+          def pairs(items):
+              result = {}
+              for key, value in items:
+                  if key in result:
+                      raise ValueError
+                  result[key] = value
+              return result
+          try:
+              event = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs)
+              inputs = event["inputs"]
+              if not isinstance(inputs, dict) or set(inputs) != {"confirmation", "load_run_id", "control_email"} or not isinstance(inputs["control_email"], str):
+                  raise ValueError
+              email = inputs.pop("control_email")
+              if not email or not email.isascii():
+                  raise ValueError
+              for value in dict.fromkeys((email, email.lower())):
+                  sys.stdout.write("::add-mask::" + value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A") + "\n")
+              sys.stdout.flush()
+              safe = (json.dumps(event, ensure_ascii=True, separators=(",", ":")) + "\n").encode()
+              temporary = path.with_name(".sanitized-event-" + str(os.getpid()))
+              out = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+              try:
+                  os.write(out, safe)
+                  os.fsync(out)
+              finally:
+                  os.close(out)
+              os.replace(temporary, path)
+              if b"control_email" in path.read_bytes():
+                  raise ValueError
+          except (KeyError, TypeError, UnicodeError, ValueError, json.JSONDecodeError):
+              raise SystemExit("workflow event sanitization failed closed")
+          PY
       - name: Checkout exact target as untrusted source data
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -189,6 +239,65 @@ jobs:
       SOURCE_BINDING_ARTIFACT_ID: ${{ needs.resolve-host-tools-pin.outputs.source_binding_artifact_id }}
 
     steps:
+      - name: Mask and remove control identity before cleanup processing
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 - <<'PY'
+          import json, os, stat, sys
+          from pathlib import Path
+          path = Path(os.environ["GITHUB_EVENT_PATH"])
+          fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+          try:
+              st = os.fstat(fd)
+              if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_nlink != 1 or st.st_size > 65536 or stat.S_IMODE(st.st_mode) & 0o022:
+                  raise ValueError
+              raw = os.read(fd, 65537)
+              if len(raw) != st.st_size:
+                  raise ValueError
+          finally:
+              os.close(fd)
+          def pairs(items):
+              result = {}
+              for key, value in items:
+                  if key in result:
+                      raise ValueError
+                  result[key] = value
+              return result
+          try:
+              event = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs)
+              inputs = event["inputs"]
+              if not isinstance(inputs, dict) or set(inputs) != {"confirmation", "load_run_id", "control_email"} or not isinstance(inputs["control_email"], str):
+                  raise ValueError
+              email = inputs.pop("control_email")
+              if not email or not email.isascii():
+                  raise ValueError
+              for value in dict.fromkeys((email, email.lower())):
+                  sys.stdout.write("::add-mask::" + value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A") + "\n")
+              sys.stdout.flush()
+              email_path = Path(os.environ["RUNNER_TEMP"]) / "retained-cleanup-control-email"
+              email_fd = os.open(email_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+              try:
+                  data = (email.lower() + "\n").encode("ascii")
+                  if os.write(email_fd, data) != len(data):
+                      raise ValueError
+                  os.fsync(email_fd)
+              finally:
+                  os.close(email_fd)
+              safe = (json.dumps(event, ensure_ascii=True, separators=(",", ":")) + "\n").encode()
+              temporary = path.with_name(".sanitized-event-" + str(os.getpid()))
+              out = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+              try:
+                  os.write(out, safe)
+                  os.fsync(out)
+              finally:
+                  os.close(out)
+              os.replace(temporary, path)
+              if b"control_email" in path.read_bytes():
+                  raise ValueError
+          except (KeyError, TypeError, UnicodeError, ValueError, json.JSONDecodeError):
+              raise SystemExit("workflow event sanitization failed closed")
+          PY
       - name: Download exact source-binding handoff
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
@@ -432,10 +541,17 @@ jobs:
               )
               inputs = event.get("inputs") if isinstance(event, dict) else None
               if not isinstance(inputs, dict) or set(inputs) != {
-                  "confirmation", "control_email", "load_run_id"
-              }:
+                  "confirmation", "load_run_id"
+              } or b"control_email" in raw_event:
                   raise ValueError
-              email = inputs.get("control_email") if isinstance(inputs, dict) else None
+              email_path = Path(os.environ["RUNNER_TEMP"]) / "retained-cleanup-control-email"
+              email_metadata = email_path.lstat()
+              if not stat.S_ISREG(email_metadata.st_mode) or stat.S_ISLNK(email_metadata.st_mode) or email_metadata.st_nlink != 1 or stat.S_IMODE(email_metadata.st_mode) != 0o600 or email_metadata.st_size > 256:
+                  raise ValueError
+              email_raw = email_path.read_bytes()
+              if not email_raw.endswith(b"\n") or email_raw.count(b"\n") != 1:
+                  raise ValueError
+              email = email_raw[:-1].decode("ascii")
               binding_path = Path(binding_path_value)
               binding_meta = binding_path.lstat()
               if (
@@ -753,6 +869,22 @@ jobs:
               output_file.write(f"never_started_source_sha={never_started_source_sha}\n")
           PY
           test "$(stat -c '%F:%h:%a:%u' -- "$RUNNER_TEMP/platform-retained-cleanup-input.json")" = "regular file:1:600:$(id -u)"
+
+      - name: Remove staged cleanup control identity
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f -- "$RUNNER_TEMP/retained-cleanup-control-email"
+          test ! -e "$RUNNER_TEMP/retained-cleanup-control-email" && test ! -L "$RUNNER_TEMP/retained-cleanup-control-email"
+
+      - name: Remove staged cleanup control identity
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f -- "$RUNNER_TEMP/retained-cleanup-control-email"
+          test ! -e "$RUNNER_TEMP/retained-cleanup-control-email" && test ! -L "$RUNNER_TEMP/retained-cleanup-control-email"
 
       - name: Configure production SSH
         shell: bash

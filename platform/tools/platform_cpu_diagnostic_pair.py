@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from concurrent.futures import ALL_COMPLETED, FIRST_COMPLETED, ThreadPoolExecutor, wait
+from collections.abc import Mapping
 import hashlib
 import json
 import os
@@ -2106,7 +2107,7 @@ def _parent(args: argparse.Namespace) -> int:
     # The manifest and SSH identity are only opened by this trusted parent.
     manifest_path = Path(args.manifest)
     handoff_path = Path(args.input_handoff)
-    handoff_raw = _read_private_file(handoff_path, cap=16 * 1024)
+    handoff_raw = _read_private_file(handoff_path, cap=64 * 1024)
     try:
         handoff = json.loads(
             handoff_raw.decode("ascii"), object_pairs_hook=_pairs
@@ -2115,8 +2116,24 @@ def _parent(args: argparse.Namespace) -> int:
         raise PairError("external input handoff rejected") from exc
     if not isinstance(handoff, dict):
         raise PairError("external input handoff shape rejected")
+    fixture_descriptor: Mapping[str, Any] | None = None
+    if set(handoff) == {
+        "schema", "run_id", "run_attempt", "runner_sha", "app_target_sha", "input", "manifest",
+    }:
+        try:
+            from tools.platform_fixture_credential_transport import validate_descriptor
+        except ModuleNotFoundError:  # Direct execution from platform/tools.
+            from platform_fixture_credential_transport import validate_descriptor
+        try:
+            fixture_descriptor = validate_descriptor(
+                handoff_path, args.external_run_id, args.external_run_attempt,
+                args.source_sha, args.app_target_sha,
+            )
+        except SystemExit as exc:
+            raise PairError("fixture descriptor binding rejected") from exc
+        handoff = fixture_descriptor["input"]
     base_handoff_keys = {
-        "schema", "confirmation", "target_sha", "control_email", "setup_concurrency",
+        "schema", "confirmation", "control_email", "target_sha", "setup_concurrency",
         "run_id", "profile", "tournament_count", "users_per_tournament", "timeout_diagnostics",
     }
     fixture_kind = handoff.get("fixture_kind", "external_load")
@@ -2131,7 +2148,8 @@ def _parent(args: argparse.Namespace) -> int:
     ) | ({"source_binding"} if schema in (2, "2") else set())
     source_binding_handoff = handoff.get("source_binding")
     if (
-        set(handoff) != expected_handoff_keys
+        (fixture_descriptor is None and set(handoff) != expected_handoff_keys)
+        or (fixture_descriptor is not None and "control_email" in handoff)
         or schema not in (1, "1", 2, "2")
         or handoff.get("target_sha") != args.source_sha
         or handoff.get("run_id") != args.external_run_id
@@ -2143,6 +2161,8 @@ def _parent(args: argparse.Namespace) -> int:
             CPU_ONLY_USERS_PER_TOURNAMENT if fixture_kind == "cpu_diagnostic_only_v1" else USERS_PER_TOURNAMENT
         )
         or (
+            fixture_descriptor is None
+            and
             fixture_kind == "cpu_diagnostic_only_v1"
             and (
                 handoff.get("confirmation") != "RUN-PRODUCTION-CPU-DIAGNOSTIC"
@@ -2177,6 +2197,12 @@ def _parent(args: argparse.Namespace) -> int:
             or manifest_metadata.st_size > 24 * 1024 * 1024
         ):
             raise PairError("fixture manifest metadata rejected")
+        if fixture_descriptor is not None and (
+            hashlib.sha256(os.read(manifest_fd, manifest_metadata.st_size)).hexdigest()
+            != fixture_descriptor["manifest"].get("sha256")
+        ):
+            raise PairError("fixture manifest descriptor digest rejected")
+        os.lseek(manifest_fd, 0, os.SEEK_SET)
         manifest_buffer = bytearray()
         while len(manifest_buffer) <= 24 * 1024 * 1024:
             block = os.read(manifest_fd, min(65_536, 24 * 1024 * 1024 + 1 - len(manifest_buffer)))
