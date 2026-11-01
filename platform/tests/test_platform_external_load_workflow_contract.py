@@ -8,6 +8,7 @@ instead of relying on GitHub's implicit job conclusion propagation.
 
 from __future__ import annotations
 
+import ast
 import base64
 import copy
 import hashlib
@@ -157,7 +158,7 @@ def _step_script(job: str, name: str) -> str:
 
 
 class ExternalLoadWorkflowContractTests(unittest.TestCase):
-    def test_isolated_capacity_worker_passes_app_sha_to_environment_builder(self) -> None:
+    def test_isolated_capacity_worker_callers_bind_explicit_app_sha(self) -> None:
         from tools import platform_ssr_capacity_diagnostic as capacity_diagnostic
         from tests.test_platform_noop_source_binding import (
             APP_SHA,
@@ -167,6 +168,23 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
 
         source_sha = RUNNER_SHA
         app_target_sha = APP_SHA
+        canary_source = Path(capacity_diagnostic.__file__).with_name(
+            "platform_ssr_capacity_worker_canary.py",
+        ).read_text(encoding="utf-8")
+        canary_tree = ast.parse(canary_source)
+        canary_calls = [
+            node for node in ast.walk(canary_tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "run_isolated_capacity_worker"
+        ]
+        self.assertEqual(len(canary_calls), 1)
+        app_sha_arguments = [
+            keyword.value for keyword in canary_calls[0].keywords
+            if keyword.arg == "app_target_sha"
+        ]
+        self.assertEqual(len(app_sha_arguments), 1)
+        self.assertEqual(ast.unparse(app_sha_arguments[0]), "source_sha")
         canonical_binding = json.dumps(
             _validated_source_binding_handoff(),
             ensure_ascii=True,

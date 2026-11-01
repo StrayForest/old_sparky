@@ -149,6 +149,7 @@ def main() -> int:
             worker_report_path=worker_report_path,
             supervisor_report_path=report_path,
             source_sha=source_sha,
+            app_target_sha=source_sha,
             watcher=_SyntheticWatcher(),
             hide_ssh_material=lambda: None,
             restore_ssh_material=lambda: None,
