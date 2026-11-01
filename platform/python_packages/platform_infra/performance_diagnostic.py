@@ -49,6 +49,7 @@ PROFILE_WORKLOADS = frozenset({WORKLOAD, WORKLOAD_HTML_SSR_CPU_PROFILE_20S})
 CPU_USAGE_PREARM_WORKLOADS = frozenset({
     WORKLOAD_HTML_SSR_CAPACITY,
     WORKLOAD_HTML_SSR_CAPACITY_120S,
+    WORKLOAD_HTML_SSR_CPU_PROFILE_20S,
 })
 HTML_REQUEST_PERF_WORKLOADS = frozenset({
     WORKLOAD_HTML_SSR_CAPACITY_120S,
@@ -763,6 +764,7 @@ def _prearm_cpu_usage_windows(plan: DiagnosticPlan, loop: Any, *, now_ms: int | 
 
 _active_profile: "ApiCpuDiagnostic | None" = None
 _consumed_run_ids: set[str] = set()
+_profile_windows_scheduled: set[str] = set()
 _usage_windows_started: set[tuple[str, str]] = set()
 _usage_windows_scheduled: set[tuple[str, str]] = set()
 
@@ -843,6 +845,35 @@ class ApiCpuDiagnostic:
         self.stopped = False
 
     @classmethod
+    def _start_for_plan(cls, plan: DiagnosticPlan, loop: Any, *, now_ms: int) -> bool:
+        """Start one bounded API profile on the current event-loop thread."""
+
+        global _active_profile
+        start_lag_ms = now_ms - plan.on_start_ms
+        if (plan.workload not in PROFILE_WORKLOADS
+                or plan.phase_at(now_ms) != "on"
+                or not 0 <= start_lag_ms <= CPU_WINDOW_TOLERANCE_MS
+                or plan.run_id in _consumed_run_ids
+                or _active_profile is not None):
+            _consumed_run_ids.add(plan.run_id)
+            return False
+        remaining_seconds = (plan.on_end_ms - now_ms) / 1000
+        if remaining_seconds <= 0:
+            _consumed_run_ids.add(plan.run_id)
+            return False
+        diagnostic = cls(plan)
+        diagnostic.profile = cProfile.Profile(timer=time.thread_time_ns, timeunit=1e-9)
+        diagnostic.loop = loop
+        diagnostic.started_monotonic = time.monotonic()
+        diagnostic.start_lag_ms = start_lag_ms
+        _consumed_run_ids.add(plan.run_id)
+        _active_profile = diagnostic
+        diagnostic.profile.enable()
+        diagnostic.stop_handle = loop.call_later(remaining_seconds, diagnostic.stop)
+        logger.info("cpu_diagnostic_started service=api run_id=%s", plan.run_id)
+        return True
+
+    @classmethod
     def activate_for_scope(
         cls,
         scope: dict[str, Any],
@@ -871,8 +902,11 @@ class ApiCpuDiagnostic:
             except RuntimeError:
                 return None, None
             _prearm_cpu_usage_windows(prearm_plan, loop)
-            # Prearming records no request phase or profiler context; only
-            # callbacks at the immutable plan edges emit usage samples.
+            if prearm_plan.workload == WORKLOAD_HTML_SSR_CPU_PROFILE_20S:
+                _schedule_cpu_profile_window(prearm_plan, loop)
+            # Prearming records no request phase or profiler context. Bound
+            # callbacks start usage windows and, for the dedicated profile
+            # workload only, cProfile at the immutable ON edge.
             return None, None
         if trace_run_id != plan.run_id:
             return None, None
@@ -888,6 +922,8 @@ class ApiCpuDiagnostic:
             return plan, phase
         if phase == "off" and plan.workload in CPU_USAGE_PREARM_WORKLOADS:
             _schedule_cpu_usage_window(plan, "on", loop, now_ms=now_ms)
+            if plan.workload == WORKLOAD_HTML_SSR_CPU_PROFILE_20S:
+                _schedule_cpu_profile_window(plan, loop, now_ms=now_ms)
         _start_cpu_usage_window(plan, phase, loop)
         # HTML capacity diagnostics need the same run/phase correlation and
         # low-cost CPU usage window, but never enable the expensive cProfile
@@ -896,19 +932,15 @@ class ApiCpuDiagnostic:
             return plan, phase
         if phase == "off" or plan.run_id in _consumed_run_ids or _active_profile is not None:
             return plan, phase
-        remaining_seconds = max(0.0, (plan.on_end_ms - now_ms) / 1000)
-        if remaining_seconds <= 0:
+        if plan.run_id in _profile_windows_scheduled:
             return plan, phase
-        diagnostic = cls(plan)
-        diagnostic.profile = cProfile.Profile(timer=time.thread_time_ns, timeunit=1e-9)
-        diagnostic.loop = loop
-        diagnostic.started_monotonic = time.monotonic()
-        diagnostic.start_lag_ms = max(0, now_ms - plan.on_start_ms)
-        _consumed_run_ids.add(plan.run_id)
-        _active_profile = diagnostic
-        diagnostic.profile.enable()
-        diagnostic.stop_handle = loop.call_later(remaining_seconds, diagnostic.stop)
-        logger.info("cpu_diagnostic_started service=api run_id=%s", plan.run_id)
+        if plan.workload == WORKLOAD_HTML_SSR_CPU_PROFILE_20S:
+            # This workload's profile must be armed by a bound prearm or OFF
+            # request and start on the event-loop ON edge. An ON request may
+            # not shift the capture start or rescue a missing edge callback.
+            _consumed_run_ids.add(plan.run_id)
+            return plan, phase
+        cls._start_for_plan(plan, loop, now_ms=now_ms)
         return plan, phase
 
     def stop(self) -> None:
@@ -937,3 +969,41 @@ class ApiCpuDiagnostic:
                 categories[:6000],
             )
         )
+
+
+def _schedule_cpu_profile_window(
+    plan: DiagnosticPlan, loop: Any, *, now_ms: int | None = None,
+) -> None:
+    """Prearm the dedicated API profile on its exact ON edge."""
+
+    if (plan.workload != WORKLOAD_HTML_SSR_CPU_PROFILE_20S
+            or plan.run_id in _consumed_run_ids
+            or plan.run_id in _profile_windows_scheduled):
+        return
+    start_ms = plan.on_start_ms
+    current_ms = int(time.time_ns() // 1_000_000) if now_ms is None else now_ms
+    if current_ms >= plan.on_end_ms:
+        _consumed_run_ids.add(plan.run_id)
+        return
+    _profile_windows_scheduled.add(plan.run_id)
+
+    def start_at_edge() -> None:
+        actual_ms = time.time_ns() // 1_000_000
+        if actual_ms < start_ms:
+            loop.call_later((start_ms - actual_ms) / 1000, start_at_edge)
+            return
+        _profile_windows_scheduled.discard(plan.run_id)
+        try:
+            fresh_plan = _read_process_plan_uncached(
+                "api", now_ms=actual_ms, pid=None, start_ticks=None,
+                invocation_id=None, release_identity=None,
+                phase_at_ms=plan.on_start_ms,
+            )
+        except (OSError, ValueError, PlanError):
+            fresh_plan = None
+        if fresh_plan != plan:
+            _consumed_run_ids.add(plan.run_id)
+            return
+        ApiCpuDiagnostic._start_for_plan(plan, loop, now_ms=actual_ms)
+
+    loop.call_later(max(0.0, (start_ms - current_ms) / 1000), start_at_edge)

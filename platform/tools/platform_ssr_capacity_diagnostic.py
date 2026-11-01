@@ -1503,7 +1503,7 @@ def _worker_counts_are_closed(payload: Mapping[str, Any]) -> bool:
 
 
 def _warmup_diagnostic_trace_run_id(workload: str, run_id: str) -> str | None:
-    """Only HTML capacity warmups may carry the root-bound API prearm marker."""
+    """Only fixed HTML SSR diagnostic warmups may carry the root-bound prearm marker."""
 
     return run_id if _is_html_workload(workload) else None
 

@@ -416,7 +416,10 @@ async function main() {
   const authorizedRunId = prearmModule.authorizedWorkspaceDiagnosticPrearmRunId(
     prearmPlan, { ...prearmPlan }, 48_000,
   );
-  for (const workload of ["authenticated_html_ssr_capacity_120s_v1"]) {
+  for (const workload of [
+    "authenticated_html_ssr_capacity_120s_v1",
+    "authenticated_html_ssr_cpu_profile_20s_v1",
+  ]) {
     const typedPlan = { ...prearmPlan, workload };
     if (prearmModule.authorizedWorkspaceDiagnosticPrearmRunId(
       typedPlan, { ...typedPlan }, 48_000,

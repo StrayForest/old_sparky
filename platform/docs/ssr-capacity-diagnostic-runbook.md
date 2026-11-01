@@ -253,8 +253,14 @@ identities, and all of these conditions hold:
   memory attribution incomplete;
   it cannot be accepted by widening the generic parser limit.
 - The separate profile phase completes its 20-second ON window against the
-  same fixture manifest after the planned gap. Its profile data is attribution
-  only; do not merge it into capacity-window latency or CPU results.
+  same fixture manifest after the planned gap. Its trace-marked HTML warmups
+  prearm API and web OFF/ON usage windows; API also arms a thread-CPU cProfile
+  callback on each worker event loop. The callback rechecks the exact plan and
+  starts at the planned ON edge. A missing, late, or stale callback remains
+  incomplete; the first ON request cannot start or shift this profile. Keep the
+  250 ms start-lag bound. The 120-second capacity workload never enables API
+  cProfile. Profile data is attribution only; do not merge it into
+  capacity-window latency or CPU results.
 - Both phase records, the top-level completion state and the full source and
   fixture bindings pass their closed validators. The phases fit within the
   600-second outer deadline, and finalization and exact fixture cleanup pass.
@@ -265,9 +271,12 @@ The capacity phase is descriptive and has no latency or throughput threshold.
 Any missing phase, request identity, required metric, cleanup proof, binding,
 or deadline condition makes the composite incomplete; retain the partial
 observations as partial and assign no capacity, SLO, or matrix credit. The
-profiled phase is never capacity evidence. Do not report function-level
-attribution from aggregate-only summaries; the V8 sampling interval is
-100 milliseconds and API thread CPU excludes other threads.
+profiled phase is never capacity evidence. API function self-time is measured
+on the event-loop thread and excludes other threads. Web V8 category values
+sum sampled `timeDeltas` at a 100-millisecond interval; they are not process
+CPU time or exact function self-time, and `other` can combine many unclassified
+frames. Do not report function-level attribution from these aggregate-only
+summaries.
 
 If the report sanitizer emits `report_projection_rejected`, preserve its
 closed `composite_report` field path and `projection_reason` for diagnosis.
