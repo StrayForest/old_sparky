@@ -2755,6 +2755,14 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             capacity_sanitize["run"],
         )
         self.assertIn("always()", capacity_sanitizer_rejection_upload["if"])
+        self.assertIn(
+            "steps.remove-diagnostic-ssh-material.outcome == 'success'",
+            capacity_sanitizer_rejection_upload["if"],
+        )
+        self.assertIn(
+            "steps.remove-ssr-capacity-ssh.outcome == 'success'",
+            capacity_sanitizer_rejection_upload["if"],
+        )
         self.assertIn("steps.sanitize-ssr-capacity.outcome == 'failure'", capacity_sanitizer_rejection_upload["if"])
         self.assertEqual(
             capacity_sanitizer_rejection_upload["with"]["path"],

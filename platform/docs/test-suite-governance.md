@@ -568,10 +568,9 @@ workflows that materialize credentials use a literal, per-workflow `$RUNNER_TEMP
 directory symlink. An `always()` cleanup removes only the named key, `known_hosts`, config and control-socket paths, verifies each
 path and the directory are absent, clears `SSH_DIR` through `GITHUB_ENV`, and gates any later artifact action on cleanup success.
 Cleanup is never `continue-on-error`, so a cleanup failure keeps the job failed without replacing the primary operation result.
-Their host-key setup uses two fresh mode-600 scans, each bounded by `timeout --foreground 4s ssh-keyscan -T 3`, with a
-0.5-second backoff. It ignores blank/comment lines but requires exactly one exact-host Ed25519 record matching the pinned
-fingerprint; SSH host checking stays strict. Failure diagnostics expose only status, counts and validation booleans. Dynamic
-contract tests cover all workflow sites, OpenSSH banners, retries, malformed/multiple/mismatched keys and cleanup.
+Their host-key setup uses two fresh mode-600 scans, each bounded by `timeout --foreground 4s ssh-keyscan -T 3`, with a 0.5-second backoff; it ignores blank/comment lines and requires exactly one exact-host Ed25519 record.
+The record must match the pinned fingerprint; SSH checking stays strict and failure diagnostics expose only status, counts and validation booleans. Dynamic contract tests cover all workflow sites, OpenSSH banners, retries, malformed/multiple/mismatched keys and cleanup.
+Before workflow edits, run from `platform/`: `python3 -m unittest tests.test_platform_release_audit_hardening.ReleaseHardeningContractTests.test_all_workflow_ssh_secrets_are_scoped_to_trusted_run_steps`; this source-only check covers all workflow secret scope, cleanup gates and bounded artifacts, while hosted `backend-privileged` CI retains the full module.
 
 Every retained result identifies its source SHA, profile ID/version/digest,
 runner, fixture shape, offered logical actions, HTTP attempts and acceptance

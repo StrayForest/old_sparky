@@ -2279,7 +2279,7 @@ jobs:
 
       - name: Publish bounded SSR sanitizer rejection details
         id: publish-ssr-sanitizer-rejection
-        if: ${{ always() && inputs.ssr_capacity_diagnostic_only == true && steps.sanitize-ssr-capacity.outcome == 'failure' }}
+        if: ${{ always() && inputs.ssr_capacity_diagnostic_only == true && steps.remove-diagnostic-ssh-material.outcome == 'success' && steps.remove-ssr-capacity-ssh.outcome == 'success' && steps.sanitize-ssr-capacity.outcome == 'failure' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: platform-production-ssr-sanitizer-rejection-${{ github.run_id }}-${{ github.run_attempt }}
