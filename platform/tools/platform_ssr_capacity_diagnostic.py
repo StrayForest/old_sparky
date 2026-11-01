@@ -2026,6 +2026,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
                 capacity, binding, initial, submitted=0, completed=0,
                 observed_duration_ms=0,
                 manifest_sha256=capacity["manifest_sha256"],
+                control_failure_reason=control_failure_reason,
             )
         now_ms = time.time_ns() // 1_000_000
         if now_ms >= capacity["off_start_ms"]:
@@ -2115,6 +2116,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
                 off_probe_submitted=probe_count, off_probe_completed=probe_count,
                 off_probe_status=200,
                 manifest_sha256=capacity["manifest_sha256"],
+                control_failure_reason=control_failure_reason,
             )
         time.sleep(min(0.025, on_start_monotonic - time.monotonic()))
 
@@ -4265,6 +4267,16 @@ def _parent_composite_run(
             phase_state: dict[str, Any] = {}
             state["stage"] = f"composite_{phase_name}"
             phase_report = _parent_run_once(phase_args, phase_state)
+            observer_failure = phase_state.get("memory_observer_failure")
+            if isinstance(observer_failure, Mapping):
+                # Keep only the four closed observer classifications in the
+                # outer composite state; raw observer output is never retained.
+                state["memory_observer_failure"] = {
+                    key: observer_failure.get(key) for key in (
+                        "failure_stage", "error_class", "remote_failure_stage",
+                        "remote_failure_reason",
+                    )
+                }
             if (
                 phase_report.get("fixture_manifest_sha256") != manifest_sha
                 or phase_report.get("fixture_manifest_bytes") != len(manifest_raw)
@@ -5599,23 +5611,9 @@ def _parent_failure_fingerprint(
     parent_error_class = outcome.get("error_class")
     if not isinstance(parent_error_class, str) or parent_error_class not in PARENT_ERROR_CLASSES:
         parent_error_class = None
-    observer = stage_state.get("memory_observer_failure")
-    if not isinstance(observer, Mapping):
-        observer = {}
-    observer_failure = {
-        "stage": observer.get("failure_stage")
-        if isinstance(observer.get("failure_stage"), str)
-        and observer.get("failure_stage") in MEMORY_OBSERVER_FAILURE_STAGES else "unknown",
-        "error_class": observer.get("error_class")
-        if isinstance(observer.get("error_class"), str)
-        and observer.get("error_class") in MEMORY_OBSERVER_ERROR_CLASSES else "unknown",
-        "remote_stage": observer.get("remote_failure_stage")
-        if isinstance(observer.get("remote_failure_stage"), str)
-        and observer.get("remote_failure_stage") in REMOTE_WATCH_FAILURE_STAGES else "unknown",
-        "remote_reason": observer.get("remote_failure_reason")
-        if isinstance(observer.get("remote_failure_reason"), str)
-        and observer.get("remote_failure_reason") in REMOTE_WATCH_FAILURE_REASONS else "unknown",
-    }
+    observer_failure = _project_memory_observer_failure(
+        stage_state.get("memory_observer_failure"),
+    )
     payload = {
         "schema": 1,
         "event": "ssr_capacity_parent_fingerprint",
@@ -5676,6 +5674,26 @@ def _parent_failure_fingerprint(
     if cleanup_failure_detail is not None:
         payload["cleanup"]["failure_detail"] = cleanup_failure_detail
     return payload
+
+
+def _project_memory_observer_failure(value: Any) -> dict[str, str]:
+    """Return only closed observer classifications for failure fingerprints."""
+
+    observer = value if isinstance(value, Mapping) else {}
+    return {
+        "stage": observer.get("failure_stage")
+        if isinstance(observer.get("failure_stage"), str)
+        and observer.get("failure_stage") in MEMORY_OBSERVER_FAILURE_STAGES else "unknown",
+        "error_class": observer.get("error_class")
+        if isinstance(observer.get("error_class"), str)
+        and observer.get("error_class") in MEMORY_OBSERVER_ERROR_CLASSES else "unknown",
+        "remote_stage": observer.get("remote_failure_stage")
+        if isinstance(observer.get("remote_failure_stage"), str)
+        and observer.get("remote_failure_stage") in REMOTE_WATCH_FAILURE_STAGES else "unknown",
+        "remote_reason": observer.get("remote_failure_reason")
+        if isinstance(observer.get("remote_failure_reason"), str)
+        and observer.get("remote_failure_reason") in REMOTE_WATCH_FAILURE_REASONS else "unknown",
+    }
 
 
 def _composite_parent_failure_fingerprint(
@@ -5775,6 +5793,19 @@ def _composite_parent_failure_fingerprint(
                 "fixture_manifest_bytes": report["fixture_manifest_bytes"],
                 "concurrency": report["concurrency"],
                 "worker_status": worker_status,
+                "resource_abort_reason": (
+                    worker.get("resource_abort_reason")
+                    if isinstance(worker, Mapping)
+                    and isinstance(worker.get("resource_abort_reason"), str)
+                    and worker.get("resource_abort_reason") in CAPACITY_ABORT_REASONS
+                    else "other"
+                ),
+                **({"control_failure_reason": worker["control_failure_reason"]}
+                   if isinstance(worker, Mapping)
+                   and worker.get("resource_abort_reason") == "control_file_invalid"
+                   and isinstance(worker.get("control_failure_reason"), str)
+                   and worker.get("control_failure_reason") in CONTROL_FAILURE_REASONS
+                   else {}),
                 "remote_plan_cleanup": report["remote_plan_cleanup"],
                 "namespace_closed": report["namespace_closed"],
             }
@@ -5848,6 +5879,9 @@ def _composite_parent_failure_fingerprint(
         "slo_credit": False,
         "diagnostic_credit": False,
         "namespace_closed": namespace_closed,
+        "memory_observer_failure": _project_memory_observer_failure(
+            stage_state.get("memory_observer_failure"),
+        ),
         "remote_plan_cleanup": cleanup,
         "same_fixture_manifest": (
             projected_report.get("same_fixture_manifest") is True

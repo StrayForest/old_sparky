@@ -7791,6 +7791,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "tournaments": [{"user_count": capacity_diagnostic.FIXTURE_USERS}],
         }
         actors = [None] * capacity_diagnostic.FIXTURE_USERS
+        composite_state: dict[str, Any] = {}
         phase_report = capacity_diagnostic._parent_failure_receipt(
             error_class="ValueError", stage="remote_plan_prepare",
             source_sha=source_sha, app_target_sha=app_sha,
@@ -7813,15 +7814,45 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)
             args.report = str(root / "producer-report.json")
+            def phase_with_observer(phase_args: Any, phase_state: dict[str, Any]) -> dict[str, Any]:
+                phase_state["memory_observer_failure"] = {
+                    "failure_stage": "first_row_read",
+                    "error_class": "TimeoutError",
+                    "remote_failure_stage": "helper_read",
+                    "remote_failure_reason": "read_error",
+                    "raw_output": "do-not-retain-private observer data",
+                }
+                return phase_report
+
             with (
                 patch.object(capacity_diagnostic, "_read_manifest", return_value=(manifest_raw, manifest, actors)),
-                patch.object(capacity_diagnostic, "_parent_run_once", return_value=phase_report),
+                patch.object(capacity_diagnostic, "_parent_run_once", side_effect=phase_with_observer),
             ):
-                produced = capacity_diagnostic._parent_composite_run(args, {})
+                produced = capacity_diagnostic._parent_composite_run(args, composite_state)
             self.assertEqual(produced["status"], "incomplete")
             self.assertFalse(produced["passed"])
             self.assertFalse(produced["namespace_closed"])
             self.assertFalse(produced["diagnostic_credit"])
+            fingerprint = capacity_diagnostic._parent_failure_fingerprint(
+                produced, args=args, stage_state=composite_state,
+            )
+            self.assertEqual(fingerprint["memory_observer_failure"], {
+                "stage": "first_row_read", "error_class": "TimeoutError",
+                "remote_stage": "helper_read", "remote_reason": "read_error",
+            })
+            self.assertNotIn("raw_output", json.dumps(fingerprint))
+            self.assertNotIn("private observer data", json.dumps(fingerprint))
+            fingerprint_path = root / "failure-fingerprint.json"
+            capacity_diagnostic._write_parent_failure_fingerprint(
+                fingerprint_path, fingerprint,
+            )
+            fingerprint_artifact = json.loads(
+                fingerprint_path.read_text(encoding="ascii"),
+            )
+            self.assertEqual(
+                fingerprint_artifact["memory_observer_failure"],
+                fingerprint["memory_observer_failure"],
+            )
             capacity_diagnostic._write_report(Path(args.report), produced)
             with patch.object(
                 capacity_diagnostic, "_read_manifest",
@@ -7951,6 +7982,98 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertNotIn("private-unexpected-field-value", json.dumps(unknown_payload))
             self.assertNotIn("private-unexpected-field-name", unknown_stdout.getvalue())
             self.assertFalse((unknown_root / "rejected.json").exists())
+
+    def test_composite_fingerprint_projects_only_closed_worker_failure_reasons(self) -> None:
+        source_sha, app_sha = "a" * 40, "b" * 40
+        workload = capacity_diagnostic.HTML_CAPACITY_120S_WORKLOAD
+        binding = {
+            "run_id": "c" * 32, "source_sha": source_sha,
+            "app_target_sha": app_sha,
+            "profile_digest": capacity_diagnostic.profile_digest(32, workload),
+            "external_run_id": "41018394289", "external_run_attempt": "1",
+        }
+        manifest_raw = b"worker control-projection fixture\n"
+        manifest = {
+            "runner_sha": source_sha, "app_target_sha": app_sha,
+            "tournaments": [{"slug": "test-slug", "user_count": 14}],
+            "origin": "https://example.test", "session_cookie_name": "session",
+            "csrf_cookie_name": "csrf",
+        }
+        actors = [SimpleNamespace(tournament_slug="test-slug") for _ in range(14)]
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            control_path = root / capacity_diagnostic.CONTROL_BASENAME
+            manifest_sha = hashlib.sha256(manifest_raw).hexdigest()
+            off_start = time.time_ns() // 1_000_000 + 30_000
+            capacity_config = {
+                "schema": 1, "workload": workload,
+                "fixture_kind": capacity_diagnostic.HTML_FIXTURE_KIND,
+                "manifest_path": str(root / "manifest.json"),
+                "manifest_sha256": manifest_sha, "manifest_bytes": len(manifest_raw),
+                "control_path": str(control_path), "binding": binding,
+                "concurrency": 32, "off_start_ms": off_start,
+                "off_end_ms": off_start + 20_000,
+                "on_start_ms": off_start + 25_000,
+                "on_end_ms": off_start + 145_000,
+            }
+            control_now = time.monotonic_ns()
+            control_payload = {
+                "schema": 1, **binding, "decision": "continue", "reason": "none",
+                "sequence": 0, "updated_monotonic_ns": control_now,
+            }
+            capacity_control.write_control(
+                control_path, control_payload, expected=binding,
+                now_monotonic_ns=control_now,
+            )
+            wrote_stale = {"done": False}
+            stale_write_lock = threading.Lock()
+
+            def warmup_result(*_args: Any, **_kwargs: Any) -> Any:
+                with stale_write_lock:
+                    if not wrote_stale["done"]:
+                        stale_now = time.monotonic_ns() - 2_000_000_000
+                        capacity_control.write_control(
+                            control_path,
+                            {**control_payload, "updated_monotonic_ns": stale_now},
+                            expected=binding, now_monotonic_ns=stale_now,
+                        )
+                        wrote_stale["done"] = True
+                return external_load.RequestResult(
+                    "warmup", "GET", "/fixture", 200, 1.0, True, 1,
+                    html_content_type_ok=True, html_page_marker_ok=True,
+                    html_content_encoding="identity",
+                    html_marker_flags={
+                        key: True for key in capacity_diagnostic.WARMUP_MARKER_FIELDS
+                    },
+                )
+
+            config = {
+                "capacity_diagnostic": capacity_config,
+                "worker_report_path": str(root / "worker-report.json"),
+            }
+            config_path = root / "worker-config.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            with (
+                patch.dict(os.environ, {"SOURCE_GIT_SHA": source_sha}),
+                patch.object(capacity_diagnostic, "_read_manifest", return_value=(manifest_raw, manifest, actors)),
+                patch.object(external_load, "_page_request", side_effect=warmup_result),
+                patch.object(capacity_diagnostic.load_runtime, "_set_parent_death_signal"),
+            ):
+                return_code = capacity_diagnostic.load_runtime.worker_entry(
+                    lambda worker_config: capacity_diagnostic._worker_callback(worker_config),
+                    config_path=config_path,
+                )
+            self.assertEqual(return_code, 1)
+            worker_payload = json.loads(
+                (root / "worker-report.json").read_text(encoding="utf-8"),
+            )
+            self.assertEqual(worker_payload["resource_abort_reason"], "control_file_invalid")
+            self.assertEqual(worker_payload["control_failure_reason"], "stale")
+            self.assertEqual(worker_payload["submitted"], 0)
+            self.assertEqual(worker_payload["off_probe"]["submitted"], 0)
+            self.assertTrue(capacity_diagnostic._worker_report_matches(
+                worker_payload, capacity_config,
+            ))
 
     def test_composite_parent_producer_round_trips_complete_pair(self) -> None:
         source_sha, app_sha = "a" * 40, "b" * 40
@@ -8204,6 +8327,88 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             external_run_attempt=attempt, concurrency=32,
             workload=capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
         )
+        control_capacity = json.loads(json.dumps(capacity))
+        control_capacity["status"] = "incomplete"
+        control_capacity["passed"] = False
+        control_capacity["worker"]["status"] = "incomplete"
+        control_capacity["worker"]["resource_abort_reason"] = "control_file_invalid"
+        control_capacity["worker"]["control_failure_reason"] = "snapshot_replaced"
+        self.assertIsNotNone(capacity_diagnostic._project_capacity_report(control_capacity))
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            control_root = Path(temporary_dir)
+            args.report = str(control_root / "control-producer-report.json")
+            control_state: dict[str, Any] = {}
+            with (
+                patch.object(capacity_diagnostic, "_read_manifest", return_value=(manifest_raw, manifest, actors)),
+                patch.object(capacity_diagnostic, "_parent_run_once", return_value=control_capacity),
+            ):
+                control_produced = capacity_diagnostic._parent_composite_run(args, control_state)
+            self.assertEqual(control_produced["status"], "incomplete")
+            self.assertIsNotNone(
+                capacity_diagnostic._project_composite_capacity_report(control_produced),
+            )
+            capacity_diagnostic._write_report(Path(args.report), control_produced)
+            with patch.object(
+                capacity_diagnostic, "_read_manifest",
+                return_value=(manifest_raw, manifest, actors),
+            ):
+                self.assertEqual(capacity_diagnostic.sanitize_capacity_report(
+                    input_path=Path(args.report), output_path=control_root / "control-sanitized.json",
+                    manifest_path=control_root / "manifest.json", source_sha=source_sha,
+                    app_target_sha=app_sha, run_id=external_run_id, attempt=attempt,
+                    workload=capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+                ), "FAIL")
+            control_sanitized = json.loads(
+                (control_root / "control-sanitized.json").read_text(encoding="ascii"),
+            )
+            self.assertEqual(
+                control_sanitized["capacity_phase"]["worker"]["control_failure_reason"],
+                "snapshot_replaced",
+            )
+            control_fingerprint = capacity_diagnostic._parent_failure_fingerprint(
+                control_produced, args=args, stage_state=control_state,
+            )
+            self.assertEqual(
+                control_fingerprint["capacity_phase"]["control_failure_reason"],
+                "snapshot_replaced",
+            )
+            fingerprint_path = control_root / "failure-fingerprint.json"
+            capacity_diagnostic._write_parent_failure_fingerprint(
+                fingerprint_path, control_fingerprint,
+            )
+            self.assertEqual(
+                json.loads(fingerprint_path.read_text(encoding="ascii"))
+                ["capacity_phase"]["control_failure_reason"],
+                "snapshot_replaced",
+            )
+            malformed_control = json.loads(json.dumps(control_produced))
+            malformed_control["capacity_phase"]["worker"]["control_failure_reason"] = (
+                "secret-control-reason-value"
+            )
+            self.assertIsNone(
+                capacity_diagnostic._project_composite_capacity_report(malformed_control),
+            )
+            malformed_path = control_root / "malformed-control-report.json"
+            capacity_diagnostic._write_report(malformed_path, malformed_control)
+            with patch.object(
+                capacity_diagnostic, "_read_manifest",
+                return_value=(manifest_raw, manifest, actors),
+            ):
+                with self.assertRaises(
+                    capacity_diagnostic._CapacitySanitizationError,
+                ) as caught:
+                    capacity_diagnostic.sanitize_capacity_report(
+                        input_path=malformed_path,
+                        output_path=control_root / "malformed-sanitized.json",
+                        manifest_path=control_root / "manifest.json",
+                        source_sha=source_sha, app_target_sha=app_sha,
+                        run_id=external_run_id, attempt=attempt,
+                        workload=capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+                    )
+            self.assertNotIn(
+                "secret-control-reason-value",
+                json.dumps(caught.exception.payload, sort_keys=True),
+            )
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)
             args.report = str(root / "producer-report.json")

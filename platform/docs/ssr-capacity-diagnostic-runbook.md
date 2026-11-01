@@ -281,6 +281,52 @@ CPU time or exact function self-time, and `other` can combine many unclassified
 frames. Do not report function-level attribution from these aggregate-only
 summaries.
 
+For an incomplete diagnostic, use the one-day failure-fingerprint artifact to
+read only the bounded failure classifications. `capacity_phase.resource_abort_reason`
+identifies the worker abort class; when it is `control_file_invalid`, use
+`capacity_phase.control_failure_reason` only if present. The
+`memory_observer_failure` fields classify observer handling and remote-watch
+failures. A missing or `unknown` value leaves the cause unresolved. These
+classifications do not establish why an underlying file or process failed.
+Do not inspect or export raw control files, worker/supervisor reports, or
+observer stderr. Any incomplete result remains zero-credit and follows the
+exact-run abort and cleanup procedure below.
+
+When the fingerprint artifact is listed for the exact run, download it to a
+private directory and print only its closed classifications:
+
+```bash
+set -euo pipefail
+umask 077
+private_dir="$(mktemp -d /tmp/ssr-failure-fingerprint.XXXXXX)"
+chmod 700 "$private_dir"
+gh run download <exact-load-run-id> --repo StrayForest/old_sparky \
+  --name "platform-production-ssr-capacity-fingerprint-<exact-load-run-id>-<exact-load-attempt>" \
+  --dir "$private_dir"
+python3 - "$private_dir/failure-fingerprint.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
+summary = {}
+capacity = payload.get("capacity_phase")
+if isinstance(capacity, dict):
+    summary["capacity_phase"] = {
+        key: capacity[key]
+        for key in ("resource_abort_reason", "control_failure_reason")
+        if key in capacity
+    }
+observer = payload.get("memory_observer_failure")
+if isinstance(observer, dict):
+    summary["memory_observer_failure"] = {
+        key: observer.get(key)
+        for key in ("stage", "error_class", "remote_stage", "remote_reason")
+    }
+print(json.dumps(summary, sort_keys=True))
+PY
+```
+
 If the report sanitizer emits `report_projection_rejected`, preserve its
 closed `composite_report` field path and `projection_reason` for diagnosis.
 These are static schema labels and structural types/counts only; they do not
