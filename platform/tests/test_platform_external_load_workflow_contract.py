@@ -2718,6 +2718,11 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             for step in cpu_steps
             if step.get("name") == "Project the SSR capacity report through its closed schema"
         )
+        capacity_sanitizer_rejection_upload = next(
+            step
+            for step in cpu_steps
+            if step.get("name") == "Publish bounded SSR sanitizer rejection details"
+        )
         self.assertLess(
             cpu_step_indexes["Run the fixed authenticated workspace CPU pair"],
             cpu_step_indexes["Remove diagnostic SSH material"],
@@ -2745,6 +2750,20 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "steps.remove-ssr-capacity-ssh.outcome == 'success'",
             capacity_sanitize["if"],
         )
+        self.assertIn(
+            '--diagnostic-output "$RUNNER_TEMP/ssr-capacity-report/sanitizer-failure.json"',
+            capacity_sanitize["run"],
+        )
+        self.assertIn("always()", capacity_sanitizer_rejection_upload["if"])
+        self.assertIn("steps.sanitize-ssr-capacity.outcome == 'failure'", capacity_sanitizer_rejection_upload["if"])
+        self.assertEqual(
+            capacity_sanitizer_rejection_upload["with"]["path"],
+            "${{ runner.temp }}/ssr-capacity-report/sanitizer-failure.json",
+        )
+        self.assertEqual(capacity_sanitizer_rejection_upload["with"]["if-no-files-found"], "ignore")
+        self.assertEqual(capacity_sanitizer_rejection_upload["with"]["retention-days"], 1)
+        self.assertNotIn("report.json", capacity_sanitizer_rejection_upload["with"]["path"])
+        self.assertNotIn("failure-fingerprint.json", capacity_sanitizer_rejection_upload["with"]["path"])
         self.assertIn("always()", capacity_fingerprint_upload["if"])
         self.assertIn(
             "inputs.ssr_capacity_diagnostic_only == true",

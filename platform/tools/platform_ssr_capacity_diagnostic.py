@@ -4940,6 +4940,34 @@ def _project_composite_phase(
 ) -> dict[str, Any] | None:
     """Project one composite phase as either a full report or a typed failure receipt."""
 
+    annotation_fields = {
+        "attribution_only", "performance_credit", "capacity_quantile_member",
+    }
+    if isinstance(value, dict):
+        has_annotations = bool(annotation_fields & set(value))
+        if expected_workload != HTML_CPU_PROFILE_20S_WORKLOAD and has_annotations:
+            return None
+        failure_receipt = _project_parent_failure_receipt(value)
+        if expected_workload == HTML_CPU_PROFILE_20S_WORKLOAD:
+            # Completed profile reports emitted by the composite producer
+            # always carry this exact attribution-only envelope. Typed
+            # failure receipts may omit it because they never receive credit.
+            if (failure_receipt is None and not annotation_fields <= set(value)):
+                return None
+            if has_annotations and (
+                not annotation_fields <= set(value)
+                or value.get("attribution_only") is not True
+                or value.get("performance_credit") is not False
+                or value.get("capacity_quantile_member") is not False
+            ):
+                return None
+        elif has_annotations:
+            return None
+        if has_annotations:
+            # Keep the child projector's closed schemas strict by validating
+            # then removing only these three known envelope fields.
+            value = {key: item for key, item in value.items() if key not in annotation_fields}
+
     failure = _project_parent_failure_receipt(value)
     if failure is not None:
         try:
@@ -5149,6 +5177,172 @@ def _projection_rejection_reason(value: Any) -> str:
                     or any(type(item) is not bool for item in identity.values())):
                 return "runner_identity_shape"
     return "report_projection_rejected"
+
+
+def _composite_projection_failure_detail(value: Any) -> dict[str, Any]:
+    """Return a closed, value-free first-failure hint for composite reports.
+
+    This intentionally mirrors the composite projector's validation order. It
+    is diagnostic only: the strict projector remains the authority and this
+    helper never makes a rejected report acceptable.
+    """
+
+    fields = {
+        "schema", "report_complete", "workload", "fixture_kind", "status", "passed",
+        "matrix_credit", "slo_credit", "diagnostic_credit", "source_sha",
+        "app_target_sha", "external_run_id", "external_run_attempt", "run_id",
+        "profile_digest", "fixture_manifest_sha256", "fixture_manifest_bytes",
+        "fixture_tournaments", "fixture_users", "actors", "concurrency", "max_inflight",
+        "load_model", "phase_windows_ms", "phase_workloads", "phase_gap_ms",
+        "phase_run_ids", "phase_profile_digests", "same_fixture_manifest",
+        "capacity_phase", "cpu_profile_phase", "capacity_quantiles_scope",
+        "profile_latency_scope", "remote_plan_cleanup", "namespace_closed",
+        "maximum_wall_seconds", "wall_elapsed_seconds", "wall_budget_exceeded",
+    }
+
+    def failure(field: str, reason: str, observed: Any = None, *, present: bool = True) -> dict[str, Any]:
+        return {
+            "section": "composite_report",
+            "field": field,
+            "projection_reason": reason,
+            "present": present,
+            "value_type": _safe_json_type(observed),
+        }
+
+    actual_fields = set(value) if isinstance(value, dict) else set()
+    if actual_fields != fields:
+        return {
+            **failure("field_set", "field_set_mismatch", value),
+            "missing_known_field_count": len(fields - actual_fields),
+            "unexpected_field_count": len(actual_fields - fields),
+        }
+
+    scalar_checks: tuple[tuple[str, bool], ...] = (
+        ("schema", type(value.get("schema")) is int and value["schema"] == SCHEMA),
+        ("report_complete", value.get("report_complete") is True),
+        ("workload", value.get("workload") == HTML_COMPOSITE_WORKLOAD),
+        ("fixture_kind", value.get("fixture_kind") == HTML_COMPOSITE_FIXTURE_KIND),
+        ("status", value.get("status") in {"complete", "incomplete"}),
+        ("passed", type(value.get("passed")) is bool),
+        ("matrix_credit", value.get("matrix_credit") is False),
+        ("slo_credit", value.get("slo_credit") is False),
+        ("diagnostic_credit", value.get("diagnostic_credit") is False),
+        ("source_sha", isinstance(value.get("source_sha"), str) and SHA_RE.fullmatch(value["source_sha"]) is not None),
+        ("app_target_sha", isinstance(value.get("app_target_sha"), str) and SHA_RE.fullmatch(value["app_target_sha"]) is not None),
+        ("external_run_id", isinstance(value.get("external_run_id"), str) and value["external_run_id"].isdecimal()),
+        ("external_run_attempt", isinstance(value.get("external_run_attempt"), str) and ATTEMPT_RE.fullmatch(value["external_run_attempt"]) is not None),
+        ("run_id", isinstance(value.get("run_id"), str) and RUN_RE.fullmatch(value["run_id"]) is not None),
+        ("profile_digest", isinstance(value.get("profile_digest"), str) and re.fullmatch(r"[0-9a-f]{64}", value["profile_digest"]) is not None),
+        ("fixture_manifest_sha256", isinstance(value.get("fixture_manifest_sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", value["fixture_manifest_sha256"]) is not None),
+        ("fixture_manifest_bytes", type(value.get("fixture_manifest_bytes")) is int and 0 < value["fixture_manifest_bytes"] <= 256 * 1024),
+        ("fixture_tournaments", value.get("fixture_tournaments") == FIXTURE_TOURNAMENTS),
+        ("fixture_users", value.get("fixture_users") == FIXTURE_USERS),
+        ("actors", value.get("actors") == FIXTURE_USERS),
+        ("concurrency", value.get("concurrency") == 32),
+        ("max_inflight", value.get("max_inflight") == 32),
+        ("load_model", value.get("load_model") == "closed_loop_best_effort"),
+        ("phase_windows_ms", value.get("phase_windows_ms") == [120_000, 20_000]),
+        ("phase_workloads", value.get("phase_workloads") == [HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD]),
+        ("phase_gap_ms", value.get("phase_gap_ms") == 5_000),
+        ("capacity_quantiles_scope", value.get("capacity_quantiles_scope") == "capacity_phase_on_window_only"),
+        ("profile_latency_scope", value.get("profile_latency_scope") == "excluded"),
+        ("remote_plan_cleanup", value.get("remote_plan_cleanup") in {"complete", "incomplete"}),
+        ("namespace_closed", type(value.get("namespace_closed")) is bool),
+        ("maximum_wall_seconds", value.get("maximum_wall_seconds") == 600),
+    )
+    for field, valid in scalar_checks:
+        if not valid:
+            return failure(field, "invalid_value", value.get(field), present=field in value)
+    elapsed = value.get("wall_elapsed_seconds")
+    if (type(elapsed) not in (int, float) or isinstance(elapsed, bool)
+            or not math.isfinite(elapsed) or not 0 <= elapsed <= 600):
+        return failure("wall_elapsed_seconds", "invalid_value", elapsed)
+    exceeded = value.get("wall_budget_exceeded")
+    if (type(exceeded) is not bool or (exceeded is True and (
+        value["status"] != "incomplete" or value["passed"] is not False or elapsed != 600
+    ))):
+        return failure("wall_budget_exceeded", "invalid_value", exceeded)
+    same_fixture = value.get("same_fixture_manifest")
+    if type(same_fixture) is not bool:
+        return failure("same_fixture_manifest", "invalid_value", same_fixture)
+
+    run_ids, digests = value.get("phase_run_ids"), value.get("phase_profile_digests")
+    if (not isinstance(run_ids, list) or len(run_ids) > 2
+            or any(not isinstance(item, str) or RUN_RE.fullmatch(item) is None for item in run_ids)
+            or len(set(run_ids)) != len(run_ids)):
+        return failure("phase_run_ids", "invalid_identity_list", run_ids)
+    if (not isinstance(digests, list) or len(digests) > 2
+            or any(not isinstance(item, str) or re.fullmatch(r"[0-9a-f]{64}", item) is None for item in digests)
+            or len(run_ids) != len(digests)):
+        return failure("phase_profile_digests", "invalid_identity_list", digests)
+
+    capacity_raw, profile_raw = value.get("capacity_phase"), value.get("cpu_profile_phase")
+    capacity = _project_composite_phase(
+        capacity_raw, expected_workload=HTML_CAPACITY_120S_WORKLOAD,
+    ) if capacity_raw is not None else None
+    profile = _project_composite_phase(
+        profile_raw, expected_workload=HTML_CPU_PROFILE_20S_WORKLOAD,
+    ) if profile_raw is not None else None
+    if capacity_raw is not None and capacity is None:
+        return failure("capacity_phase", "phase_projection_rejected", capacity_raw)
+    if profile_raw is not None and profile is None:
+        annotation_fields = {
+            "attribution_only", "performance_credit", "capacity_quantile_member",
+        }
+        if isinstance(profile_raw, dict) and any(key in profile_raw for key in annotation_fields):
+            if (not annotation_fields <= set(profile_raw)
+                    or profile_raw.get("attribution_only") is not True
+                    or profile_raw.get("performance_credit") is not False
+                    or profile_raw.get("capacity_quantile_member") is not False):
+                return failure("cpu_profile_phase", "profile_annotation_mismatch", profile_raw)
+        return failure("cpu_profile_phase", "phase_projection_rejected", profile_raw)
+    if profile is not None and (capacity is None or capacity.get("status") != "complete"
+            or capacity.get("namespace_closed") is not True
+            or capacity.get("remote_plan_cleanup") != "complete"):
+        return failure("cpu_profile_phase", "capacity_prerequisite_incomplete", profile_raw)
+    for name, phase in (("capacity_phase", capacity), ("cpu_profile_phase", profile)):
+        if phase is not None and any((
+            phase.get("source_sha") != value["source_sha"],
+            phase.get("app_target_sha") != value["app_target_sha"],
+            phase.get("external_run_id") != value["external_run_id"],
+            phase.get("external_run_attempt") != value["external_run_attempt"],
+            phase.get("concurrency") != 32,
+        )):
+            return failure(name, "phase_binding_mismatch", phase)
+        if phase is not None:
+            if phase.get("fixture_manifest_sha256") is None:
+                if (phase.get("failure_only") is not True
+                        or phase.get("stage") not in {"identity", "manifest_read"}
+                        or phase.get("fixture_manifest_bytes") is not None):
+                    return failure(name, "phase_manifest_incomplete", phase)
+            elif (phase.get("fixture_manifest_sha256") != value["fixture_manifest_sha256"]
+                    or phase.get("fixture_manifest_bytes") != value["fixture_manifest_bytes"]):
+                return failure(name, "phase_manifest_mismatch", phase)
+    expected_same_fixture = all(phase is not None and
+        phase.get("fixture_manifest_sha256") == value["fixture_manifest_sha256"] and
+        phase.get("fixture_manifest_bytes") == value["fixture_manifest_bytes"]
+        for phase in (capacity, profile))
+    if same_fixture is not expected_same_fixture:
+        return failure("same_fixture_manifest", "phase_manifest_summary_mismatch", same_fixture)
+    expected_ids = [phase["run_id"] for phase in (capacity, profile) if phase is not None]
+    expected_digests = [phase["profile_digest"] for phase in (capacity, profile) if phase is not None]
+    if run_ids != expected_ids:
+        return failure("phase_run_ids", "phase_identity_summary_mismatch", run_ids)
+    if digests != expected_digests:
+        return failure("phase_profile_digests", "phase_identity_summary_mismatch", digests)
+    phase_pair_closed = bool(capacity is not None and profile is not None
+        and capacity.get("status") == "complete" and profile.get("status") == "complete"
+        and capacity.get("remote_plan_cleanup") == "complete"
+        and profile.get("remote_plan_cleanup") == "complete"
+        and capacity.get("namespace_closed") is True and profile.get("namespace_closed") is True)
+    complete = bool(phase_pair_closed and same_fixture is True and len(run_ids) == 2
+        and len(set(run_ids)) == 2 and exceeded is False)
+    if ((value["status"] == "complete") != complete
+            or value["namespace_closed"] != phase_pair_closed):
+        return failure("phase_completion", "composite_completion_mismatch", value.get("status"))
+    if value["passed"] != bool(complete and capacity and capacity.get("passed") is True):
+        return failure("passed", "composite_passed_mismatch", value.get("passed"))
+    return failure("composite_projection", "unclassified_rejection", value)
 
 
 def _project_supervisor_evidence(value: Any) -> dict[str, Any]:
@@ -5781,7 +5975,10 @@ def sanitize_capacity_report(
             or manifest.get("app_target_sha") != app_target_sha):
         if projected is None:
             reason = _projection_rejection_reason(value)
-            raise _sanitization_failure("report_projection", reason, value=value)
+            failure = _sanitization_failure("report_projection", reason, value=value)
+            if isinstance(value, dict) and value.get("workload") == HTML_COMPOSITE_WORKLOAD:
+                failure.payload.update(_composite_projection_failure_detail(value))
+            raise failure
         failure = _sanitization_failure("report_binding", "report_binding_rejected")
         failure.payload["binding_status"] = "rejected"
         raise failure
@@ -5805,6 +6002,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--failure-report")
     parser.add_argument("--input")
     parser.add_argument("--output")
+    parser.add_argument("--diagnostic-output")
     parser.add_argument("--source-sha")
     parser.add_argument("--app-target-sha")
     parser.add_argument("--external-run-id")
@@ -5839,6 +6037,29 @@ def main(argv: list[str] | None = None) -> int:
                 diagnostic = _sanitization_failure(
                     "report_read", "unexpected",
                 ).payload
+            if args.diagnostic_output:
+                diagnostic_path = Path(args.diagnostic_output)
+                input_path = Path(args.input)
+                if (diagnostic_path.name != "sanitizer-failure.json"
+                        or diagnostic_path.parent != input_path.parent):
+                    raise SystemExit("sanitizer diagnostic path is invalid")
+                payload = {
+                    "schema": 1,
+                    "event": "ssr_capacity_sanitizer_rejection",
+                    "workload": args.workload,
+                    "source_sha": args.source_sha,
+                    "app_target_sha": args.app_target_sha,
+                    "external_run_id": args.external_run_id,
+                    "external_run_attempt": args.external_run_attempt,
+                    **diagnostic,
+                    "matrix_credit": False,
+                    "slo_credit": False,
+                    "diagnostic_credit": False,
+                }
+                try:
+                    _write_report(diagnostic_path, payload)
+                except Exception:
+                    raise SystemExit("sanitizer diagnostic write failed") from None
             print(json.dumps(diagnostic, sort_keys=True, separators=(",", ":")))
             return 2
         print(decision)
