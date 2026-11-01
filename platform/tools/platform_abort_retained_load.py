@@ -440,9 +440,33 @@ def _diagnostic_abort_binding(
         or re.fullmatch(r"[0-9a-f]{64}", str(marker.get("fixture_manifest_sha256"))) is None
     ):
         return None
-    manifest_path = run_root / "external-vote" / "manifest.json"
+    external_vote_root = run_root / "external-vote"
+    try:
+        vote_root_meta = external_vote_root.lstat()
+        if (
+            not stat.S_ISDIR(vote_root_meta.st_mode)
+            or vote_root_meta.st_uid != 0
+            or vote_root_meta.st_gid != 0
+            or vote_root_meta.st_nlink < 2
+            or stat.S_IMODE(vote_root_meta.st_mode) != 0o700
+        ):
+            return None
+    except OSError:
+        return None
+
+    manifest_path = external_vote_root / "manifest.json"
     try:
         manifest_meta = manifest_path.lstat()
+    except FileNotFoundError:
+        # The fixture supervisor writes this root-owned marker only after it
+        # has validated and hashed the exact credential-bearing manifest. It
+        # then deliberately removes that manifest after observer capture.
+        # The persisted marker is the durable abort binding; the raw session
+        # credential is not required to stop the exact run-owned process tree.
+        return marker
+    except OSError:
+        return None
+    try:
         if (
             not stat.S_ISREG(manifest_meta.st_mode)
             or manifest_meta.st_uid != 0
