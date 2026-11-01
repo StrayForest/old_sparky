@@ -130,7 +130,7 @@ private_dir="$(mktemp -d "${TMPDIR:-/tmp}/retained-abort-route.XXXXXX")"
 trap 'rm -rf -- "$private_dir"' EXIT
 metadata="$private_dir/artifacts.json"
 archive="$private_dir/route.zip"
-gh api --repo StrayForest/old_sparky \
+gh api \
   "repos/StrayForest/old_sparky/actions/runs/$security_run_id/artifacts?per_page=100&page=1" \
   > "$metadata"
 artifact_fields="$(/usr/bin/python3 -I -B - "$metadata" "$security_run_id" "$security_run_attempt" "$security_source_sha" <<'PY'
@@ -169,7 +169,7 @@ print(artifact["id"], artifact["size_in_bytes"], artifact["digest"][7:])
 PY
 )"
 read -r artifact_id api_size api_sha256 <<< "$artifact_fields"
-gh api --repo StrayForest/old_sparky \
+gh api \
   "repos/StrayForest/old_sparky/actions/artifacts/$artifact_id/zip" \
   > "$archive"
 [[ "$(stat -c '%s' -- "$archive")" == "$api_size" ]]
@@ -259,9 +259,9 @@ list_file="$private_dir/artifacts.json"
 detail_file="$private_dir/artifact.json"
 archive="$private_dir/artifact.zip"
 member_file="$private_dir/$member_name"
-gh api --repo StrayForest/old_sparky \
+gh api \
   "repos/StrayForest/old_sparky/actions/runs/$load_run_id/attempts/$load_run_attempt" > "$run_file"
-gh api --repo StrayForest/old_sparky \
+gh api \
   "repos/StrayForest/old_sparky/actions/runs/$load_run_id/artifacts?per_page=100&page=1" > "$list_file"
 fields="$(/usr/bin/python3 -I -B - "$run_file" "$list_file" "$load_run_id" \
   "$load_run_attempt" "$load_source_sha" "$artifact_name" <<'PY'
@@ -303,9 +303,9 @@ print(a["id"], a["size_in_bytes"], a["digest"][7:])
 PY
 )"
 read -r artifact_id api_size api_sha <<< "$fields"
-gh api --repo StrayForest/old_sparky \
+gh api \
   "repos/StrayForest/old_sparky/actions/artifacts/$artifact_id" > "$detail_file"
-gh api --repo StrayForest/old_sparky \
+gh api \
   "repos/StrayForest/old_sparky/actions/artifacts/$artifact_id/zip" > "$archive"
 /usr/bin/python3 -I -B - "$detail_file" "$archive" "$member_file" \
   "$artifact_id" "$artifact_name" "$load_run_id" "$load_run_attempt" \
