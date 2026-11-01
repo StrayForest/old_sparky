@@ -305,6 +305,14 @@ manifest to bypass this check. Proceed to cleanup only when the canonical abort
 normalizer produces `status=safe_for_exact_fixture_cleanup` for the selected
 run and attempt.
 
+The origin supervisor keeps the observer timeout tree in its own process
+session. On `SIGINT` or `SIGTERM`, it stops and reaps that session before it
+writes terminal observer progress or `supervisor.exit`. If the exact-run export
+lacks a valid supervisor exit record, its process group remains, or observer
+progress reports a phase regression, treat the fixture as open: run the
+canonical abort for that exact run and attempt, then exact cleanup after the
+abort normalizer permits it. Do not create or repair terminal receipts by hand.
+
 Then dispatch exact cleanup. Enter the same control account at the hidden
 prompt; the email travels only in the JSON request body on stdin:
 
