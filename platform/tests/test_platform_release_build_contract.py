@@ -3607,6 +3607,15 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             'PLATFORM_RELEASE_PYTHON="$root_runtime_python"',
         ):
             self.assertIn(runtime_contract, build_step)
+        self.assertIn(
+            'if grep -Fq "not found" <<<"$root_python_ldd"; then',
+            build_step,
+        )
+        self.assertIn(
+            "Release builder Python runtime has an unresolved shared-library dependency.",
+            build_step,
+        )
+        self.assertNotIn('! grep -Fq "not found"', build_step)
         builder_start = build_step.index('"$ci_build_root/platform/tools/platform_build_release.sh"')
         builder_env_start = build_step.rfind("sudo env -i", 0, builder_start)
         self.assertGreaterEqual(builder_env_start, 0)

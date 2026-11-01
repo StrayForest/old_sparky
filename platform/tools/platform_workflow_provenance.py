@@ -984,9 +984,10 @@ def validate_recovery_source_security_gates(
     expected_run_id: int,
     expected_attempt: int,
     expected_target_sha: str,
+    route_manifest: Mapping[str, Any] | None = None,
     now: datetime | None = None,
 ) -> str:
-    """Require exact successful full CI and both real runtime jobs for T."""
+    """Require exact Security gates, including route-conditional runtime jobs."""
 
     attempt_url = validate_security_marker(
         workflow,
@@ -999,12 +1000,20 @@ def validate_recovery_source_security_gates(
         now=now,
     )
     _validate_job_rows(jobs)
+    recovery_bootstrap_route = _is_verified_nondeployable_recovery_route(
+        route_manifest,
+        expected_target_sha=expected_target_sha,
+    )
+    conditional_runtime_jobs = {
+        "Conditional release runtime fixture",
+        "Trusted dev immutable release runtime",
+    }
     for name in RECOVERY_REQUIRED_SECURITY_JOBS:
         matching = [job for job in jobs if job.get("name") == name]
         if len(matching) != 1:
             raise _fail("recovery source security gate is missing or ambiguous")
         job = matching[0]
-        if (
+        job_contract_failed = (
             job.get("status") != "completed"
             or job.get("conclusion") != "success"
             or job.get("run_id") != expected_run_id
@@ -1013,9 +1022,94 @@ def validate_recovery_source_security_gates(
                 or job.get("run_attempt") != expected_attempt
             ))
             or job.get("head_sha") != expected_target_sha
-        ):
+        )
+        allowed_conditional_skip = (
+            recovery_bootstrap_route
+            and name in conditional_runtime_jobs
+            and job.get("status") == "completed"
+            and job.get("conclusion") == "skipped"
+            and job.get("run_id") == expected_run_id
+            and ("run_attempt" not in job or (
+                type(job.get("run_attempt")) is int
+                and job.get("run_attempt") == expected_attempt
+            ))
+            and job.get("head_sha") == expected_target_sha
+        )
+        if job_contract_failed and not allowed_conditional_skip:
             raise _fail("recovery source security gate did not pass for the exact attempt")
     return attempt_url
+
+
+def _is_verified_nondeployable_recovery_route(
+    route_manifest: Mapping[str, Any] | None,
+    *,
+    expected_target_sha: str,
+) -> bool:
+    """Recognize only a digest-valid closed recovery-bootstrap CI manifest."""
+
+    if not isinstance(route_manifest, Mapping):
+        return False
+    fields = {
+        "schema",
+        "version",
+        "target_sha",
+        "event",
+        "class",
+        "expected_gates",
+        "runtime_sensitive",
+        "deployable",
+        "fallback",
+        "reason",
+        "files",
+        "digest",
+    }
+    if set(route_manifest) != fields:
+        return False
+    if (
+        type(route_manifest.get("schema")) is not int
+        or route_manifest.get("schema") != 1
+        or type(route_manifest.get("version")) is not int
+        or route_manifest.get("version") != 1
+        or route_manifest.get("target_sha") != expected_target_sha
+        or route_manifest.get("event") != "push"
+        or route_manifest.get("class") != "full"
+        or route_manifest.get("runtime_sensitive") is not False
+        or route_manifest.get("deployable") is not False
+        or route_manifest.get("fallback") is not False
+    ):
+        return False
+    try:
+        if __package__:
+            from . import platform_ci_classifier as classifier
+        else:
+            import platform_ci_classifier as classifier
+    except ImportError:
+        return False
+    if (
+        route_manifest.get("reason") != classifier.RECOVERY_BOOTSTRAP_REASON
+        or route_manifest.get("expected_gates") != list(classifier.FULL_GATE_IDS)
+    ):
+        return False
+    files = route_manifest.get("files")
+    if (
+        not isinstance(files, list)
+        or not files
+        or any(not isinstance(path, str) for path in files)
+    ):
+        return False
+    normalized_files, file_error = classifier._normalise_files(files)
+    if (
+        file_error is not None
+        or normalized_files != files
+        or not classifier._is_recovery_bootstrap_only(normalized_files)
+    ):
+        return False
+    digest = route_manifest.get("digest")
+    return (
+        isinstance(digest, str)
+        and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
+        and digest == classifier.manifest_digest(route_manifest)
+    )
 
 
 def validate_deployment_event(

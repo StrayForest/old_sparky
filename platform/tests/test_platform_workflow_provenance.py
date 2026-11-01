@@ -2954,6 +2954,173 @@ class WorkflowProvenanceTests(unittest.TestCase):
                     expected_target_sha=self.SHA,
                 )
 
+        recovery_route = {
+            "schema": 1,
+            "version": 1,
+            "target_sha": self.SHA,
+            "event": "push",
+            "class": "full",
+            "expected_gates": [
+                "backend",
+                "python-quality",
+                "security",
+                "migration",
+                "docs",
+                "web-quality",
+                "web-hermetic",
+                "verification-contract",
+            ],
+            "runtime_sensitive": False,
+            "deployable": False,
+            "fallback": False,
+            "reason": RECOVERY_BOOTSTRAP_REASON,
+            "files": sorted(
+                {
+                    ".github/workflows/platform-production-retained-load-abort.yml",
+                    "platform/tools/platform_abort_retained_load.py",
+                }
+            ),
+            "digest": "",
+        }
+        recovery_route["digest"] = manifest_digest(recovery_route)
+        recovery_jobs = [
+            {
+                **job,
+                "status": "completed",
+                "conclusion": (
+                    "skipped"
+                    if job["name"] in {
+                        "Conditional release runtime fixture",
+                        "Trusted dev immutable release runtime",
+                    }
+                    else "success"
+                ),
+            }
+            for job in jobs
+        ]
+        self.assertEqual(
+            validate_recovery_source_security_gates(
+                workflow,
+                run,
+                recovery_jobs,
+                statuses,
+                expected_run_id=run_id,
+                expected_attempt=attempt,
+                expected_target_sha=self.SHA,
+                route_manifest=recovery_route,
+                now=datetime(2026, 10, 5, 12, tzinfo=timezone.utc),
+            ),
+            f"{base}/attempts/{attempt}",
+        )
+        bad_routes = []
+        for changes in (
+            {"deployable": True},
+            {"runtime_sensitive": True},
+            {"reason": "ordinary deployable source"},
+            {"target_sha": "b" * 40},
+            {
+                "files": sorted(
+                    [*recovery_route["files"], "platform/unauthorized.py"]
+                ),
+            },
+        ):
+            bad_route = {**recovery_route, **changes}
+            bad_route["digest"] = manifest_digest(bad_route)
+            bad_routes.append(bad_route)
+        bad_routes.append({**recovery_route, "digest": "0" * 64})
+        for bad_route in bad_routes:
+            with self.subTest(route=bad_route), self.assertRaises(ProvenanceError):
+                validate_recovery_source_security_gates(
+                    workflow,
+                    run,
+                    recovery_jobs,
+                    statuses,
+                    expected_run_id=run_id,
+                    expected_attempt=attempt,
+                    expected_target_sha=self.SHA,
+                    route_manifest=bad_route,
+                )
+        conditional_names = (
+            "Conditional release runtime fixture",
+            "Trusted dev immutable release runtime",
+        )
+        for conditional_name in conditional_names:
+            for bad_conclusion in ("failure", "cancelled"):
+                bad_jobs = [
+                    {
+                        **job,
+                        "status": "completed",
+                        "conclusion": bad_conclusion,
+                    }
+                    if job["name"] == conditional_name
+                    else job
+                    for job in recovery_jobs
+                ]
+                with self.subTest(job=conditional_name, conclusion=bad_conclusion):
+                    with self.assertRaises(ProvenanceError):
+                        validate_recovery_source_security_gates(
+                            workflow,
+                            run,
+                            bad_jobs,
+                            statuses,
+                            expected_run_id=run_id,
+                            expected_attempt=attempt,
+                            expected_target_sha=self.SHA,
+                            route_manifest=recovery_route,
+                        )
+            for bad_identity in (
+                {"run_attempt": attempt + 1},
+                {"head_sha": "b" * 40},
+            ):
+                bad_jobs = [
+                    {**job, **bad_identity}
+                    if job["name"] == conditional_name
+                    else job
+                    for job in recovery_jobs
+                ]
+                with self.subTest(job=conditional_name, identity=bad_identity):
+                    with self.assertRaises(ProvenanceError):
+                        validate_recovery_source_security_gates(
+                            workflow,
+                            run,
+                            bad_jobs,
+                            statuses,
+                            expected_run_id=run_id,
+                            expected_attempt=attempt,
+                            expected_target_sha=self.SHA,
+                            route_manifest=recovery_route,
+                        )
+        rejected_core_skip = [
+            {**job, "status": "completed", "conclusion": "skipped"}
+            if job["name"] == "Security gates"
+            else job
+            for job in recovery_jobs
+        ]
+        with self.assertRaises(ProvenanceError):
+            validate_recovery_source_security_gates(
+                workflow,
+                run,
+                rejected_core_skip,
+                statuses,
+                expected_run_id=run_id,
+                expected_attempt=attempt,
+                expected_target_sha=self.SHA,
+                route_manifest=recovery_route,
+            )
+
+        deploy_workflow = (WORKFLOW_DIR / "platform-production-deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertRegex(
+            deploy_workflow,
+            re.compile(
+                r"validate_recovery_source_security_gates\(\s*"
+                r"security_workflow, security_run, security_jobs, security_statuses,\s*"
+                r"expected_run_id=int\(security_id\), expected_attempt=int\(security_attempt\),\s*"
+                r"expected_target_sha=target, route_manifest=incremental,\s*\)"
+            ),
+        )
+
         for changed_run in (
             {**run, "run_attempt": attempt + 1},
             {**run, "head_sha": "b" * 40},
