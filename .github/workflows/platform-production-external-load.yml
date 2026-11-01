@@ -1260,6 +1260,9 @@ jobs:
           set -euo pipefail
           test -f "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" && test ! -L "$RUNNER_TEMP/external-input/platform-production-external-load-input.json"
           test -f "$RUNNER_TEMP/external-manifest/manifest.json" && test ! -L "$RUNNER_TEMP/external-manifest/manifest.json"
+          chmod 600 -- \
+            "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" \
+            "$RUNNER_TEMP/external-manifest/manifest.json"
           /usr/bin/python3 - "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" "$RUNNER_TEMP/external-manifest/manifest.json" "$TARGET_SHA" "$GITHUB_RUN_ID" "$APP_TARGET_SHA" <<'PY'
           import hashlib
           import json
@@ -1313,36 +1316,26 @@ jobs:
           PLATFORM_RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: |
           set -u
+          umask 077
           artifact_dir="$RUNNER_TEMP/external-client"
           mkdir -p "$artifact_dir"; chmod 700 "$artifact_dir"
           profile_env="$artifact_dir/profile.env"
-          IFS=$'\t' read -r SOURCE_BINDING_BASE64 SOURCE_BINDING_SHA256 < <(
-            /usr/bin/python3 - "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" "$APP_TARGET_SHA" <<'PY'
-          import base64
-          import hashlib
-          import json
-          import os
-          from pathlib import Path
-          import sys
-
-          payload_path, expected_app_sha = sys.argv[1:]
-          payload = json.loads(Path(payload_path).read_text(encoding="ascii"))
-          if not isinstance(payload, dict) or payload.get("target_sha") != os.environ.get("TARGET_SHA"):
-              raise SystemExit("external source handoff runner SHA is invalid")
-          binding = payload.get("source_binding")
-          if binding is None:
-              if expected_app_sha != payload["target_sha"]:
-                  raise SystemExit("mismatched app source lacks a verified binding")
-              print("-\t-")
-          else:
-              if not isinstance(binding, dict) or binding.get("runner_sha") != payload["target_sha"] or binding.get("app_target_sha") != expected_app_sha:
-                  raise SystemExit("external source handoff binding is inconsistent")
-              raw = json.dumps(binding, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("ascii")
-              print(base64.b64encode(raw).decode("ascii") + "\t" + hashlib.sha256(raw).hexdigest())
-          PY
-          )
-          [[ "$SOURCE_BINDING_BASE64" == "-" ]] && SOURCE_BINDING_BASE64=""
-          [[ "$SOURCE_BINDING_SHA256" == "-" ]] && SOURCE_BINDING_SHA256=""
+          source_binding_env="$artifact_dir/source-binding.env"
+          if ! /usr/bin/python3 platform/tools/platform_load.py export-source-binding-env \
+            --input-handoff "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" \
+            --manifest "$RUNNER_TEMP/external-manifest/manifest.json" \
+            --runner-sha "$SOURCE_GIT_SHA" --app-target-sha "$APP_TARGET_SHA" \
+            > "$source_binding_env"; then
+            echo "external source-binding handoff validation failed" >&2
+            exit 1
+          fi
+          mapfile -t source_binding_lines < "$source_binding_env"
+          rm -f -- "$source_binding_env"
+          [[ "${#source_binding_lines[@]}" == 2 ]] || { echo "external source-binding environment is incomplete" >&2; exit 1; }
+          [[ "${source_binding_lines[0]}" == SOURCE_BINDING_BASE64=* ]] || { echo "external source-binding environment is invalid" >&2; exit 1; }
+          [[ "${source_binding_lines[1]}" == SOURCE_BINDING_SHA256=* ]] || { echo "external source-binding environment is invalid" >&2; exit 1; }
+          SOURCE_BINDING_BASE64="${source_binding_lines[0]#*=}"
+          SOURCE_BINDING_SHA256="${source_binding_lines[1]#*=}"
           run_checked_out_client() {
             env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8 PLATFORM_RUNNER_ENVIRONMENT="$PLATFORM_RUNNER_ENVIRONMENT" SOURCE_GIT_SHA="$SOURCE_GIT_SHA" APP_TARGET_SHA="$APP_TARGET_SHA" SOURCE_BINDING_BASE64="$SOURCE_BINDING_BASE64" SOURCE_BINDING_SHA256="$SOURCE_BINDING_SHA256" GITHUB_RUN_ID="$GITHUB_RUN_ID" "$@"
           }
@@ -1691,6 +1684,158 @@ jobs:
           echo 'BLOCKED: namespace_closed is missing/false; do not begin or assume fixture cleanup. Follow the emergency/manual retained-fixture abort runbook.' >&2
           exit 1
 
+  derive-diagnostic-source-binding:
+    name: Derive diagnostic source binding without production secrets
+    needs:
+      - validate-external-inputs
+      - fixture-setup
+    if: >-
+      always() &&
+      (inputs.cpu_diagnostic_pair == true || inputs.cpu_diagnostic_only == true || inputs.ssr_capacity_diagnostic_only == true) &&
+      needs.validate-external-inputs.result == 'success' &&
+      needs.fixture-setup.result == 'success' &&
+      needs.fixture-setup.outputs.setup_status == '0' &&
+      needs.fixture-setup.outputs.manifest_ready == '1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      source_binding_base64: ${{ steps.derive.outputs.source_binding_base64 }}
+      source_binding_sha256: ${{ steps.derive.outputs.source_binding_sha256 }}
+    env:
+      SOURCE_GIT_SHA: ${{ github.sha }}
+      APP_TARGET_SHA: ${{ needs.validate-external-inputs.outputs.app_target_sha }}
+    steps:
+      - name: Checkout exact diagnostic source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ env.SOURCE_GIT_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Download exact same-run external-load input
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-production-external-load-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/diagnostic-binding-input
+      - name: Download exact same-run fixture manifest
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-production-external-load-manifest-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/diagnostic-binding-manifest
+      - name: Validate input and derive bounded source-binding outputs
+        id: derive
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          input_path="$RUNNER_TEMP/diagnostic-binding-input/platform-production-external-load-input.json"
+          manifest_path="$RUNNER_TEMP/diagnostic-binding-manifest/manifest.json"
+          test -f "$input_path" && test ! -L "$input_path"
+          test -f "$manifest_path" && test ! -L "$manifest_path"
+          chmod 600 "$input_path" "$manifest_path"
+          binding_env="$RUNNER_TEMP/diagnostic-source-binding.env"
+          trap 'rm -f -- "$binding_env"' EXIT
+          /usr/bin/python3 platform/tools/platform_load.py export-source-binding-env \
+            --input-handoff "$input_path" --manifest "$manifest_path" \
+            --runner-sha "$SOURCE_GIT_SHA" --app-target-sha "$APP_TARGET_SHA" \
+            > "$binding_env"
+          /usr/bin/python3 - "$binding_env" "$input_path" "$SOURCE_GIT_SHA" "$APP_TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_OUTPUT" <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import stat
+          import sys
+
+          env_path, input_path, runner_sha, app_sha, run_id, output_path = sys.argv[1:]
+
+          def read_private(path: str, cap: int) -> bytes:
+              before = os.lstat(path)
+              if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
+                      or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) != 0o600
+                      or before.st_size <= 0 or before.st_size > cap):
+                  raise ValueError
+              fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+              try:
+                  opened = os.fstat(fd)
+                  if ((opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+                          != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)):
+                      raise ValueError
+                  chunks = bytearray()
+                  while len(chunks) <= cap:
+                      block = os.read(fd, min(8192, cap + 1 - len(chunks)))
+                      if not block:
+                          break
+                      chunks.extend(block)
+                  if len(chunks) != before.st_size:
+                      raise ValueError
+                  return bytes(chunks)
+              finally:
+                  os.close(fd)
+
+          try:
+              payload = json.loads(read_private(input_path, 64 * 1024).decode("ascii"))
+              if (not isinstance(payload, dict) or payload.get("target_sha") != runner_sha
+                      or payload.get("run_id") != run_id):
+                  raise ValueError
+              raw = read_private(env_path, 32 * 1024).decode("ascii")
+              lines = raw.splitlines()
+              if (len(lines) != 2 or not lines[0].startswith("SOURCE_BINDING_BASE64=")
+                      or not lines[1].startswith("SOURCE_BINDING_SHA256=")):
+                  raise ValueError
+              encoded, digest = lines[0].partition("=")[2], lines[1].partition("=")[2]
+              if len(encoded) > 21848:
+                  raise ValueError
+              if digest and re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                  raise ValueError
+              if runner_sha == app_sha:
+                  if encoded or digest:
+                      raise ValueError
+              elif not encoded or not digest:
+                  raise ValueError
+              if encoded:
+                  decoded = base64.b64decode(encoded, validate=True)
+                  if (base64.b64encode(decoded).decode("ascii") != encoded
+                          or len(decoded) > 16 * 1024
+                          or hashlib.sha256(decoded).hexdigest() != digest):
+                      raise ValueError
+                  binding = json.loads(decoded.decode("ascii"))
+                  if (not isinstance(binding, dict) or binding.get("runner_sha") != runner_sha
+                          or binding.get("app_target_sha") != app_sha):
+                      raise ValueError
+              output_stat = os.lstat(output_path)
+              if (not stat.S_ISREG(output_stat.st_mode) or output_stat.st_uid != os.geteuid()
+                      or output_stat.st_nlink != 1 or stat.S_IMODE(output_stat.st_mode) & 0o022
+                      or output_stat.st_size > 1024 * 1024):
+                  raise ValueError
+              fd = os.open(output_path, os.O_WRONLY | os.O_APPEND | os.O_CLOEXEC | os.O_NOFOLLOW)
+              try:
+                  output_stat = os.fstat(fd)
+                  output_path_stat = os.lstat(output_path)
+                  if ((output_stat.st_dev, output_stat.st_ino)
+                          != (output_path_stat.st_dev, output_path_stat.st_ino)
+                          or not stat.S_ISREG(output_stat.st_mode) or output_stat.st_uid != os.geteuid()
+                          or output_stat.st_nlink != 1 or output_stat.st_size > 1024 * 1024):
+                      raise ValueError
+                  output = (f"source_binding_base64={encoded}\n"
+                            f"source_binding_sha256={digest}\n").encode("ascii")
+                  remaining = memoryview(output)
+                  while remaining:
+                      written = os.write(fd, remaining)
+                      if written <= 0:
+                          raise OSError("workflow output write was incomplete")
+                      remaining = remaining[written:]
+                  os.fsync(fd)
+              finally:
+                  os.close(fd)
+          except (OSError, ValueError, TypeError, UnicodeError, json.JSONDecodeError):
+              raise SystemExit("diagnostic source-binding outputs failed closed validation")
+          PY
+
   cpu-diagnostic-pair:
     name: Run isolated zero-credit authenticated SSR CPU pair
     needs:
@@ -1698,6 +1843,7 @@ jobs:
       - resolve-host-tools-pin
       - fixture-setup
       - load-client
+      - derive-diagnostic-source-binding
     if: >-
       always() &&
       (inputs.cpu_diagnostic_pair == true || inputs.cpu_diagnostic_only == true || inputs.ssr_capacity_diagnostic_only == true) &&
@@ -1706,6 +1852,7 @@ jobs:
       needs.fixture-setup.result == 'success' &&
       needs.fixture-setup.outputs.setup_status == '0' &&
       needs.fixture-setup.outputs.manifest_ready == '1' &&
+      needs.derive-diagnostic-source-binding.result == 'success' &&
       (
         ((inputs.cpu_diagnostic_only == true || inputs.ssr_capacity_diagnostic_only == true) && needs.load-client.result == 'skipped') ||
         (inputs.cpu_diagnostic_only != true && inputs.ssr_capacity_diagnostic_only != true && (needs.load-client.result == 'success' || needs.load-client.result == 'failure'))
@@ -1902,6 +2049,8 @@ jobs:
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          SOURCE_BINDING_BASE64: ${{ needs.derive-diagnostic-source-binding.outputs.source_binding_base64 }}
+          SOURCE_BINDING_SHA256: ${{ needs.derive-diagnostic-source-binding.outputs.source_binding_sha256 }}
         run: |
           set -euo pipefail
           report_dir="$RUNNER_TEMP/cpu-diagnostic-report"
@@ -1931,6 +2080,8 @@ jobs:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
           PLATFORM_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          SOURCE_BINDING_BASE64: ${{ needs.derive-diagnostic-source-binding.outputs.source_binding_base64 }}
+          SOURCE_BINDING_SHA256: ${{ needs.derive-diagnostic-source-binding.outputs.source_binding_sha256 }}
         run: |
           set +e
           /usr/bin/python3 platform/tools/platform_ssr_capacity_diagnostic.py parent \
@@ -2219,6 +2370,9 @@ jobs:
         id: sanitize-cpu-report
         if: ${{ always() && inputs.ssr_capacity_diagnostic_only != true && steps.cpu-pair.outputs.pair_status != '' && steps.remove-diagnostic-ssh-material.outcome != '' }}
         shell: bash
+        env:
+          SOURCE_BINDING_BASE64: ${{ needs.derive-diagnostic-source-binding.outputs.source_binding_base64 }}
+          SOURCE_BINDING_SHA256: ${{ needs.derive-diagnostic-source-binding.outputs.source_binding_sha256 }}
         run: |
           set -euo pipefail
           kind='${{ inputs.cpu_diagnostic_only == true && 'cpu_diagnostic_only_v1' || 'external_load' }}'
@@ -2246,6 +2400,9 @@ jobs:
         id: sanitize-ssr-capacity
         if: ${{ always() && inputs.ssr_capacity_diagnostic_only == true && steps.ssr-capacity.outputs.capacity_status != '' && steps.remove-ssr-capacity-ssh.outcome == 'success' }}
         shell: bash
+        env:
+          SOURCE_BINDING_BASE64: ${{ needs.derive-diagnostic-source-binding.outputs.source_binding_base64 }}
+          SOURCE_BINDING_SHA256: ${{ needs.derive-diagnostic-source-binding.outputs.source_binding_sha256 }}
         run: |
           set -euo pipefail
           /usr/bin/python3 platform/tools/platform_ssr_capacity_diagnostic.py sanitize-report \

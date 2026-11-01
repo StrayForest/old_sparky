@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import gzip
 import os
 import json
@@ -2115,8 +2116,83 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
 
             producer_report = root / "namespace-open-parent-report.json"
             sanitized_report = root / "namespace-open-sanitized.json"
+            worker_source_binding = {
+                "schema": 1,
+                "binding_mode": "verified-noop",
+                "runner_sha": "a" * 40,
+                "app_target_sha": "b" * 40,
+                "baseline_identity": {
+                    "schema": 1,
+                    "source_sha": "b" * 40,
+                    "release_slug": "gha-123456-2-bbbbbbbbbbbb",
+                    "release_json_sha256": "c" * 64,
+                    "current_link_dev": 1,
+                    "current_link_ino": 2,
+                    "release_dev": 1,
+                    "release_ino": 3,
+                    "pending_operation": False,
+                },
+                "receipt_document_sha256": "d" * 64,
+                "receipt_artifact_id": "456789",
+                "receipt_artifact_name": "platform-production-noop-source-receipt-123456-2",
+                "receipt_artifact_digest": "sha256:" + "e" * 64,
+                "receipt_archive_sha256": "e" * 64,
+                "cumulative_manifest_sha256": "f" * 64,
+                "source_security_run_id": "234567",
+                "source_security_run_attempt": "1",
+                "autodeploy_run_id": "345678",
+                "autodeploy_run_attempt": "3",
+                "production_deploy_run_id": "123456",
+                "production_deploy_run_attempt": "2",
+            }
+            from tools.platform_noop_source_binding import validate_source_binding_handoff
+
+            worker_source_binding = validate_source_binding_handoff(
+                worker_source_binding,
+                expected_runner_sha="a" * 40,
+                expected_app_target_sha="b" * 40,
+                expected_security_run_id="234567",
+                expected_security_attempt="1",
+                expected_autodeploy_run_id="345678",
+                expected_autodeploy_attempt="3",
+                expected_deploy_run_id="123456",
+                expected_deploy_attempt="2",
+                expected_artifact_id="456789",
+                expected_artifact_name=(
+                    "platform-production-noop-source-receipt-123456-2"
+                ),
+                expected_artifact_digest="sha256:" + "e" * 64,
+            )
+            worker_source_binding_raw = json.dumps(
+                worker_source_binding,
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("ascii")
+            worker_source_binding_env = {
+                "SOURCE_GIT_SHA": "a" * 40,
+                "APP_TARGET_SHA": "b" * 40,
+                "SOURCE_BINDING_BASE64": base64.b64encode(
+                    worker_source_binding_raw,
+                ).decode("ascii"),
+                "SOURCE_BINDING_SHA256": hashlib.sha256(
+                    worker_source_binding_raw,
+                ).hexdigest(),
+            }
+            composite_manifest = {
+                **manifest,
+                "source_binding": worker_source_binding,
+                "source_binding_sha256": worker_source_binding_env[
+                    "SOURCE_BINDING_SHA256"
+                ],
+            }
             with (
-                patch.object(capacity_diagnostic, "_read_manifest", return_value=(manifest_raw, manifest, actors)),
+                patch.dict(os.environ, worker_source_binding_env),
+                patch.object(
+                    capacity_diagnostic, "_read_manifest",
+                    return_value=(manifest_raw, composite_manifest, actors),
+                ),
                 patch.object(capacity_diagnostic, "_prepare_remote_capacity_plan", side_effect=fake_prepare_plan),
                 patch.object(
                     capacity_diagnostic.load_runtime, "run_supervised",
@@ -2245,9 +2321,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             parent_cli_report = root / "parent-cli-report.json"
             parent_cli_stdout = io.StringIO()
             with (
+                patch.dict(os.environ, worker_source_binding_env),
                 patch.object(
                     capacity_diagnostic, "_read_manifest",
-                    return_value=(manifest_raw, manifest, actors),
+                    return_value=(manifest_raw, composite_manifest, actors),
                 ),
                 patch.object(capacity_diagnostic, "_prepare_remote_capacity_plan", side_effect=fake_prepare_plan),
                 patch.object(

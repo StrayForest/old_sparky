@@ -292,98 +292,20 @@ Do not inspect or export raw control files, worker/supervisor reports, or
 observer stderr. Any incomplete result remains zero-credit and follows the
 exact-run abort and cleanup procedure below.
 
-When the fingerprint artifact is listed for the exact run, download it to a
-private directory and print only its closed classifications:
-
-```bash
-set -euo pipefail
-umask 077
-private_dir="$(mktemp -d /tmp/ssr-failure-fingerprint.XXXXXX)"
-chmod 700 "$private_dir"
-gh run download <exact-load-run-id> --repo StrayForest/old_sparky \
-  --name "platform-production-ssr-capacity-fingerprint-<exact-load-run-id>-<exact-load-attempt>" \
-  --dir "$private_dir"
-python3 - "$private_dir/failure-fingerprint.json" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-payload = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
-summary = {}
-capacity = payload.get("capacity_phase")
-if isinstance(capacity, dict):
-    summary["capacity_phase"] = {
-        key: capacity[key]
-        for key in ("resource_abort_reason", "control_failure_reason")
-        if key in capacity
-    }
-observer = payload.get("memory_observer_failure")
-if isinstance(observer, dict):
-    summary["memory_observer_failure"] = {
-        key: observer.get(key)
-        for key in ("stage", "error_class", "remote_stage", "remote_reason")
-    }
-print(json.dumps(summary, sort_keys=True))
-PY
-```
-
 If the report sanitizer emits `report_projection_rejected`, preserve its
 closed `composite_report` field path and `projection_reason` for diagnosis.
 These are static schema labels and structural types/counts only; they do not
 contain report values or unexpected key names. A rejected report grants no
 credit. Do not infer whether either phase ran from missing projected phase IDs;
-the workflow publishes the bounded rejection object as a separate one-day
-sanitizer diagnostic artifact. Use independently bound phase evidence and the
-exact run window when determining whether phase work ran.
+use independently bound phase evidence and the exact run window.
 
-Download and freeze that artifact promptly if sanitization failed; its
-retention is one day. Validate it without printing its values:
-
-```bash
-set -euo pipefail
-umask 077
-private_dir="$(mktemp -d /tmp/ssr-sanitizer-diagnostic.XXXXXX)"
-chmod 700 "$private_dir"
-gh run download <exact-load-run-id> --repo StrayForest/old_sparky \
-  --name "platform-production-ssr-sanitizer-rejection-<exact-load-run-id>-<exact-load-attempt>" \
-  --dir "$private_dir"
-python3 - "$private_dir/sanitizer-failure.json" <<'PY'
-import json
-import re
-import sys
-from pathlib import Path
-
-payload = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
-required = {
-    "schema", "event", "workload", "source_sha", "app_target_sha",
-    "external_run_id", "external_run_attempt", "status", "stage", "reason",
-    "section", "field", "present", "value_type", "binding_status",
-    "matrix_credit", "slo_credit", "diagnostic_credit",
-}
-optional = {
-    "projection_reason", "missing_known_field_count", "unexpected_field_count",
-}
-assert required <= set(payload) <= required | optional
-assert payload["schema"] == 1
-assert payload["event"] == "ssr_capacity_sanitizer_rejection"
-assert re.fullmatch(r"[0-9a-f]{40}", payload["source_sha"])
-assert re.fullmatch(r"[0-9a-f]{40}", payload["app_target_sha"])
-assert payload["external_run_id"].isdecimal()
-assert re.fullmatch(r"[1-9][0-9]{0,8}", payload["external_run_attempt"])
-assert payload["status"] == "invalid"
-assert payload["matrix_credit"] is False
-assert payload["slo_credit"] is False
-assert payload["diagnostic_credit"] is False
-if payload.get("projection_reason") == "field_set_mismatch":
-    assert type(payload.get("missing_known_field_count")) is int
-    assert type(payload.get("unexpected_field_count")) is int
-print("closed SSR sanitizer rejection artifact; all credit flags are false")
-PY
-```
-
-Keep the private directory and its artifact with the exact run's evidence; do
-not paste the JSON into a ticket or job log.
-
+When a one-day fingerprint or sanitizer-rejection artifact is available, use
+the [bounded SSR failure-artifact procedure](retained-load-and-web-verification.md#retrieve-a-bounded-ssr-failure-artifact)
+with the exact load run ID, attempt and runner source SHA. It verifies the
+authoritative attempt and outer artifact digest before reading the one expected
+member, then prints only closed failure classifications. Keep the private
+artifact with the exact run evidence; do not paste its JSON into a ticket or
+job log.
 ## Abort and close the exact fixture
 
 If the selected run has an active or uncertain remote process tree, use the
