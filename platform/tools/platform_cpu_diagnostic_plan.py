@@ -1669,6 +1669,7 @@ PROFILE_REJECTION_CODES = (
     "summary_validation",
     "missing",
     "duplicate",
+    "unexpected",
 )
 PROFILE_CAPTURE_REASONS = frozenset({
     "not_started", "complete", "journal_failed", "timeout", "byte_cap", "line_cap", "invalid_event",
@@ -2055,8 +2056,24 @@ def _usage_summary(
             continue
         if is_profile and profile_api_match is None and profile_web_match is None:
             invalid_profile = True
+            record_unit = record.get("_SYSTEMD_UNIT")
+            unit_service = (
+                "api" if record_unit == expected_units["api"]
+                else "web" if record_unit == expected_units["web"]
+                else "unattributed"
+            )
             service_hint = PROFILE_SERVICE_HINT_RE.match(message)
-            reject_profile(service_hint.group(1) if service_hint else "unattributed", "malformed_record")
+            hinted_service = service_hint.group(1) if service_hint else None
+            # A malformed message cannot establish service identity. Use the
+            # trusted journal unit only when it is known and does not conflict
+            # with the message hint; disagreement stays unattributed.
+            rejection_service = (
+                unit_service
+                if unit_service != "unattributed"
+                and (hinted_service is None or hinted_service == unit_service)
+                else "unattributed"
+            )
+            reject_profile(rejection_service, "malformed_record")
             continue
         if is_memory and memory_match is None:
             invalid_memory = True
@@ -2352,6 +2369,10 @@ def _usage_summary(
             reject_profile(service, "missing", expected_profile_count - event_count)
         if duplicate_count:
             reject_profile(service, "duplicate", duplicate_count)
+        if expected_profile_count == 0 and event_count > 0:
+            if profile_reason == "none":
+                profile_reason = "invalid_profile"
+            reject_profile(service, "unexpected", event_count)
         if not row_complete:
             profile_complete = False
         category_totals: dict[str, list[int]] = {}

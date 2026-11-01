@@ -216,7 +216,7 @@ CPU_PROFILE_REJECTION_CODES = frozenset({
     "journal_timestamp", "journal_window", "profile_start_lag", "profile_elapsed",
     "profile_end_lag", "profile_numeric", "profile_category",
     "profile_aggregate", "profile_parser", "summary_exception", "summary_validation",
-    "missing", "duplicate",
+    "missing", "duplicate", "unexpected",
 })
 CPU_PROFILE_CAPTURE_REASONS = frozenset({
     "not_started", "complete", "journal_failed", "timeout", "byte_cap",

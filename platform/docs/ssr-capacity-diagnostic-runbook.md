@@ -274,7 +274,8 @@ identities, and all of these conditions hold:
 - The profile summary carries a closed `profile_rejections` object with a
   capture or summary outcome and bounded per-service rejection-occurrence
   counters.
-  Counters classify rejected records or missing/duplicate expected targets;
+  Counters classify rejected records, missing/duplicate expected targets, or
+  unexpected profile events when the workload does not request profiling;
   they are not a raw journal-row total, and separate predicates may count the
   same failed target. `complete` requires a complete capture and every counter
   to be zero. For an incomplete profile, preserve `profile_status` and

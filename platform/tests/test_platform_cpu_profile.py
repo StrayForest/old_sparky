@@ -4700,6 +4700,44 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 self.assertNotIn("MESSAGE", json.dumps(summary))
                 self.assertNotIn("_PID", json.dumps(summary))
 
+        conflicting_malformed = json.loads(json.dumps(base_rows))
+        conflicting_malformed[0]["MESSAGE"] = conflicting_malformed[0]["MESSAGE"].replace(
+            "elapsed_ms=20000", "elapsed_ms=bad",
+        )
+        conflicting_malformed[0]["_SYSTEMD_UNIT"] = "deadlock-web.service"
+        conflicting_malformed_summary = collect(conflicting_malformed)
+        self.assertEqual(
+            conflicting_malformed_summary["profile_rejections"]["service_counts"]["unattributed"]["malformed_record"],
+            1,
+        )
+        self.assertEqual(
+            conflicting_malformed_summary["profile_rejections"]["service_counts"]["api"]["malformed_record"],
+            0,
+        )
+
+        old_workloads = {service: plan["workload"] for service, plan in plans.items()}
+        try:
+            for plan in plans.values():
+                plan["workload"] = diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD
+            unexpected_profiles = collect(base_rows)
+        finally:
+            for service, old_workload in old_workloads.items():
+                plans[service]["workload"] = old_workload
+        self.assertEqual(unexpected_profiles["profile_status"], "incomplete")
+        self.assertEqual(unexpected_profiles["profile_reason"], "invalid_profile")
+        self.assertEqual(
+            unexpected_profiles["profile_rejections"]["service_counts"]["api"]["unexpected"], 2,
+        )
+        self.assertEqual(
+            unexpected_profiles["profile_rejections"]["service_counts"]["web"]["unexpected"], 1,
+        )
+        self.assertIsNotNone(
+            cpu_pair._validate_profile_rejections(unexpected_profiles["profile_rejections"]),
+        )
+        self.assertTrue(remote_dispatch._valid_cpu_profile_rejections(
+            unexpected_profiles["profile_rejections"], profile_status="incomplete",
+        ))
+
         mismatched_ticks = collect(base_rows, start_ticks={101: 999, 102: 12, 201: 21})
         self.assertEqual(mismatched_ticks["profile_rejections"]["service_counts"]["api"]["identity_start_ticks"], 1)
         release_failure = collect(base_rows, release_side_effect=PlanError("private release failure"))
