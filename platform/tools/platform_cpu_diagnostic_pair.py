@@ -1727,6 +1727,33 @@ def _validate_usage_summary(
             raw = clean[field]
             if raw is not None and (type(raw) is not int or not 0 <= raw <= 10**16):
                 return None
+        expected_memory_window_ms = (
+            120_000
+            if phase == "on" and summary_workload == "authenticated_html_ssr_capacity_120s_v1"
+            else 20_000
+        )
+        sampled_start_ms = clean["sampled_window_start_elapsed_ms"]
+        sampled_end_ms = clean["sampled_window_end_elapsed_ms"]
+        sampled_duration_ms = clean["sampled_window_duration_ms"]
+        if row.get("status") == "complete" and any(type(value) is not int for value in (
+            sampled_start_ms, sampled_end_ms, sampled_duration_ms,
+        )):
+            return None
+        if any(value is not None for value in (
+            sampled_start_ms, sampled_end_ms, sampled_duration_ms,
+        )) and (
+            any(type(value) is not int for value in (
+                sampled_start_ms, sampled_end_ms, sampled_duration_ms,
+            ))
+            or not 0 <= sampled_start_ms <= 1_000
+            or sampled_end_ms < sampled_start_ms
+            or sampled_end_ms > expected_memory_window_ms
+            or sampled_duration_ms != sampled_end_ms - sampled_start_ms
+            or sampled_duration_ms > expected_memory_window_ms
+            or row.get("status") == "complete"
+            and sampled_duration_ms < expected_memory_window_ms - 5_000
+        ):
+            return None
         duration = clean["gc_duration_ms"]
         if duration is not None and (
             type(duration) not in {int, float} or isinstance(duration, bool)

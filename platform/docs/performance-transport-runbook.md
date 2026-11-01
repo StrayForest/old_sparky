@@ -6,16 +6,23 @@
 ## CPU and memory diagnostic interpretation
 
 The opt-in paired CPU diagnostic uses an eight-actor authenticated read cohort
-and reports one bounded Node/V8 sample at a nominal four-second interval,
-capped at five per phase. A delayed/incomplete window may contain fewer
-samples; only exactly five accepted samples are complete, and missing samples
-are never filled or promoted to PASS. RSS, V8 heap, external memory and array buffers are byte gauges; Node
-reports `arrayBuffers` as a component of `external`, so do not add them
-together. GC entries belong to a phase by their monotonic start time, and a
-collection extending past the phase end contributes only its in-phase
+and reports at most five bounded Node/V8 samples per phase. Standard 20-second
+plans sample at a nominal four-second interval. The typed
+`authenticated_html_ssr_capacity_120s_v1` plan spaces five samples across its
+bound phase window (about 30 seconds between samples); its ON sample window may
+span at most the exact planned 120 seconds, while OFF remains at most 20
+seconds. The parser and runner use that wider bound only when the workload and
+phase duration match the exact plan; other workloads remain capped at 20
+seconds. A delayed/incomplete window may contain fewer samples; only exactly
+five accepted samples are complete, and missing samples are never filled or
+promoted to PASS. RSS, V8 heap, external memory and array buffers are byte
+gauges; Node reports `arrayBuffers` as a component of `external`, so do not add
+them together. GC entries belong to a phase by their monotonic start time, and
+a collection extending past the phase end contributes only its in-phase
 duration. `sampled_window_duration_ms` is the interval between the first and
-last accepted samples (normally 16 seconds), not the full 20-second request
-phase. `memory_events_*_sampled_delta` cover only that sampled interval.
+last accepted samples (normally 16 seconds on standard plans), not the full
+20-second request phase. `memory_events_*_sampled_delta` cover only that
+sampled interval.
 `memory.peak` is the cgroup lifetime high-water mark, while
 `current_sampled_max` is the greatest sampled `memory.current` value; neither
 is a continuous phase maximum. Missing cgroup support is UNKNOWN; malformed

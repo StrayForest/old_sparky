@@ -1545,9 +1545,15 @@ def _parse_profile_categories(
     return parsed
 
 
-def _parse_node_memory_event(message: str) -> dict[str, Any] | None:
+def _parse_node_memory_event(
+    message: str,
+    *,
+    max_sampled_window_ms: int = ON_WINDOW_MS,
+) -> dict[str, Any] | None:
     """Project one bounded Node/cgroup aggregate from its closed log schema."""
-    if not message.startswith("cpu_diagnostic_memory ") or len(message) > 4096:
+    if (not message.startswith("cpu_diagnostic_memory ") or len(message) > 4096
+            or type(max_sampled_window_ms) is not int
+            or not 0 <= max_sampled_window_ms <= MAX_TOTAL_WINDOW_MS):
         return None
     values: dict[str, str] = {}
     for token in message.split()[1:]:
@@ -1582,7 +1588,21 @@ def _parse_node_memory_event(message: str) -> dict[str, Any] | None:
             return None
     if result["sample_count"] > 0 and values["status"] == "complete" and result["sample_count"] != 5:
         return None
-    if result["sampled_window_duration_ms"] is not None and result["sampled_window_duration_ms"] > 20_000:
+    if (result["sampled_window_duration_ms"] is not None
+            and result["sampled_window_duration_ms"] > max_sampled_window_ms):
+        return None
+    sampled_start_ms = result["sampled_window_start_elapsed_ms"]
+    sampled_end_ms = result["sampled_window_end_elapsed_ms"]
+    sampled_duration_ms = result["sampled_window_duration_ms"]
+    if (
+        sampled_start_ms is not None and sampled_start_ms > 1_000
+        or sampled_end_ms is not None and sampled_end_ms > max_sampled_window_ms
+        or sampled_start_ms is not None and sampled_end_ms is not None
+        and sampled_end_ms < sampled_start_ms
+        or sampled_duration_ms is not None and sampled_start_ms is not None
+        and sampled_end_ms is not None
+        and sampled_duration_ms != sampled_end_ms - sampled_start_ms
+    ):
         return None
     if values["cgroup_memory_status"] == "complete" and values["cgroup_memory_reason"] != "none":
         return None
@@ -1699,7 +1719,17 @@ def _usage_summary(
                     or payload.get("off_start_ms") != plans["api"].get("off_start_ms")
                     or payload.get("off_end_ms") != plans["api"].get("off_end_ms")
                     or payload.get("on_start_ms") != plans["api"].get("on_start_ms")
-                    or payload.get("on_end_ms") != plans["api"].get("on_end_ms")):
+                    or payload.get("on_end_ms") != plans["api"].get("on_end_ms")
+                    or any(type(payload.get(key)) is not int for key in (
+                        "off_start_ms", "off_end_ms", "on_start_ms", "on_end_ms",
+                    ))
+                    or any(payload[key] <= 0 for key in (
+                        "off_start_ms", "off_end_ms", "on_start_ms", "on_end_ms",
+                    ))
+                    or payload["off_end_ms"] - payload["off_start_ms"] != OFF_WINDOW_MS
+                    or payload["on_start_ms"] - payload["off_end_ms"] != IDLE_WINDOW_MS
+                    or payload["on_end_ms"] - payload["on_start_ms"]
+                    != _plan_on_window_ms(workload)):
                 return incomplete("identity_changed")
             targets[service] = {
                 int(item["pid"]): (int(item["start_ticks"]), str(item["invocation_id"]))
@@ -1760,7 +1790,28 @@ def _usage_summary(
         usage_match = USAGE_MESSAGE_RE.fullmatch(message) if is_usage else None
         profile_api_match = PROFILE_API_MESSAGE_RE.fullmatch(message) if is_profile else None
         profile_web_match = PROFILE_WEB_MESSAGE_RE.fullmatch(message) if is_profile else None
-        memory_match = _parse_node_memory_event(message) if is_memory else None
+        memory_match = (
+            _parse_node_memory_event(
+                message,
+                max_sampled_window_ms=(
+                    ON_WINDOW_MS_BY_WORKLOAD[workload]
+                    if workload in ON_WINDOW_MS_BY_WORKLOAD else ON_WINDOW_MS
+                ),
+            ) if is_memory else None
+        )
+        if memory_match is not None:
+            expected_memory_window_ms = (
+                OFF_WINDOW_MS if memory_match["phase"] == "off"
+                else ON_WINDOW_MS_BY_WORKLOAD.get(workload, ON_WINDOW_MS)
+            )
+            sampled_window_ms = memory_match["sampled_window_duration_ms"]
+            sampled_window_end_ms = memory_match["sampled_window_end_elapsed_ms"]
+            if (
+                sampled_window_ms is not None and sampled_window_ms > expected_memory_window_ms
+                or sampled_window_end_ms is not None
+                and sampled_window_end_ms > expected_memory_window_ms
+            ):
+                memory_match = None
         if memory_match is not None and memory_match["run_id"] != run_id:
             continue
         if is_usage and usage_match is None:
