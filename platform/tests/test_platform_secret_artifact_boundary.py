@@ -397,7 +397,8 @@ class SecretArtifactBoundaryTests(unittest.TestCase):
         self.assertIn("platform_production_classifier_artifact.py manifest", source_gate_text)
         self.assertIn('--target-sha "$SOURCE_SHA"', source_gate["run"])
         self.assertIn("--emit-manifest-base64", source_gate["run"])
-        self.assertIn("base64.b64decode", source_gate["run"])
+        self.assertIn("decode_classifier_manifest_base64_output", source_gate["run"])
+        self.assertIn('(metadata / "route-manifest.b64").read_bytes()', source_gate["run"])
         self.assertIn("route_manifest=route_manifest", source_gate["run"])
         self.assertLess(
             source_gate["run"].index("--emit-manifest-base64"),

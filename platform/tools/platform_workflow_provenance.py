@@ -16,6 +16,8 @@ attempt URL.  A status row cannot promote a preflight or another repository.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -175,6 +177,28 @@ def collect_github_api_pages(
 
 def _fail(message: str) -> ProvenanceError:
     return ProvenanceError(message)
+
+
+def decode_classifier_manifest_base64_output(raw: bytes) -> bytes:
+    """Decode the classifier CLI's single canonical base64 output line.
+
+    The CLI uses ``print`` and therefore emits one trailing LF; command
+    substitution can remove it. Accept either form, then keep base64
+    validation strict so other whitespace cannot be mistaken for the manifest.
+    """
+
+    if type(raw) is not bytes:
+        raise _fail("classifier manifest base64 output framing is invalid")
+    encoded = raw[:-1] if raw.endswith(b"\n") else raw
+    if not encoded or b"\n" in encoded or b"\r" in encoded:
+        raise _fail("classifier manifest base64 output framing is invalid")
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise _fail("classifier manifest base64 output is invalid") from exc
+    if base64.b64encode(decoded) != encoded:
+        raise _fail("classifier manifest base64 output is not canonical")
+    return decoded
 
 
 def _positive_int(value: object, field: str) -> int:
