@@ -3675,21 +3675,56 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         )
 
         pair_job = self.jobs["cpu-diagnostic-pair"]
-        source_step = pair_job.split(
-            "- name: Derive source-binding environment for the diagnostic runner", 1
-        )[1].split("- name: Configure pinned production SSH", 1)[0]
-        self.assertIn("platform/tools/platform_load.py export-source-binding-env", source_step)
-        self.assertIn('--manifest "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json"', source_step)
-        self.assertIn('>> "$GITHUB_ENV"', source_step)
-        self.assertLess(
-            pair_job.index("Derive source-binding environment for the diagnostic runner"),
-            pair_job.index("Run only the guarded SSR capacity diagnostic"),
-        )
-        pair_steps = yaml.safe_load(self.source)["jobs"]["cpu-diagnostic-pair"]["steps"]
+        binding_job = self.jobs["derive-diagnostic-source-binding"]
+        binding_steps = yaml.safe_load(self.source)["jobs"]["derive-diagnostic-source-binding"]["steps"]
         source_step_definition = next(
-            step for step in pair_steps
-            if step.get("name") == "Derive source-binding environment for the diagnostic runner"
+            step for step in binding_steps
+            if step.get("name") == "Validate input and derive bounded source-binding outputs"
         )
+        source_step = source_step_definition["run"]
+        self.assertIn("platform/tools/platform_load.py export-source-binding-env", source_step)
+        self.assertIn('--manifest "$manifest_path"', source_step)
+        self.assertIn('"$GITHUB_OUTPUT"', source_step)
+        self.assertIn('payload.get("run_id") != run_id', source_step)
+        self.assertIn("      - validate-external-inputs\n", binding_job)
+        self.assertIn("      - fixture-setup\n", binding_job)
+        self.assertNotIn("load-client", binding_job)
+        self.assertIn(
+            "inputs.cpu_diagnostic_pair == true || inputs.cpu_diagnostic_only == true || inputs.ssr_capacity_diagnostic_only == true",
+            binding_job,
+        )
+        self.assertNotIn("environment: production", binding_job)
+        self.assertNotIn("secrets.", binding_job)
+        self.assertNotIn("platform_load.py", pair_job)
+        self.assertIn("needs.derive-diagnostic-source-binding.result == 'success'", pair_job)
+        self.assertIn("needs.load-client.result == 'skipped'", pair_job)
+        self.assertIn("needs.load-client.result == 'success' || needs.load-client.result == 'failure'", pair_job)
+        self.assertIn("inputs.cpu_diagnostic_pair == true", pair_job)
+        self.assertIn("inputs.cpu_diagnostic_only == true", pair_job)
+        self.assertIn("inputs.ssr_capacity_diagnostic_only == true", pair_job)
+        pair_steps = yaml.safe_load(self.source)["jobs"]["cpu-diagnostic-pair"]["steps"]
+        expected_binding_env = {
+            "SOURCE_BINDING_BASE64": (
+                "${{ needs.derive-diagnostic-source-binding.outputs.source_binding_base64 }}"
+            ),
+            "SOURCE_BINDING_SHA256": (
+                "${{ needs.derive-diagnostic-source-binding.outputs.source_binding_sha256 }}"
+            ),
+        }
+        for step_name in (
+            "Run the fixed authenticated workspace CPU pair",
+            "Run only the guarded SSR capacity diagnostic",
+            "Project the CPU diagnostic report through its closed schema",
+            "Project the SSR capacity report through its closed schema",
+        ):
+            step = next(item for item in pair_steps if item.get("name") == step_name)
+            self.assertEqual(
+                {key: step["env"].get(key) for key in expected_binding_env},
+                expected_binding_env,
+            )
+        for step in pair_steps:
+            if step.get("name", "").startswith(("Configure", "Remove")):
+                self.assertFalse(set(step.get("env", {})) & set(expected_binding_env))
         load_steps = yaml.safe_load(self.source)["jobs"]["load-client"]["steps"]
         load_step_definition = next(
             step for step in load_steps
@@ -3764,8 +3799,8 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)
-            input_dir = root / "cpu-diagnostic-input"
-            manifest_dir = root / "cpu-diagnostic-manifest"
+            input_dir = root / "diagnostic-binding-input"
+            manifest_dir = root / "diagnostic-binding-manifest"
             input_dir.mkdir(mode=0o700)
             manifest_dir.mkdir(mode=0o700)
             input_path = input_dir / "platform-production-external-load-input.json"
@@ -3775,16 +3810,17 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             manifest_path.write_bytes(manifest_raw)
             input_path.chmod(0o600)
             manifest_path.chmod(0o600)
-            github_env_path = root / "github-env"
-            github_env_path.write_text("", encoding="ascii")
-            github_env_path.chmod(0o600)
+            github_output_path = root / "github-output"
+            github_output_path.write_text("", encoding="ascii")
+            github_output_path.chmod(0o600)
             env = {
                 "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                 "HOME": "/tmp",
                 "LANG": "C.UTF-8",
                 "LC_ALL": "C.UTF-8",
                 "RUNNER_TEMP": str(root),
-                "GITHUB_ENV": str(github_env_path),
+                "GITHUB_OUTPUT": str(github_output_path),
+                "GITHUB_RUN_ID": "123456",
                 "SOURCE_GIT_SHA": RUNNER_SHA,
                 "APP_TARGET_SHA": APP_SHA,
             }
@@ -3798,16 +3834,40 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 timeout=15,
             )
             self.assertEqual(workflow_step.returncode, 0, workflow_step.stderr)
-            exported = dict(
-                line.split("=", 1) for line in github_env_path.read_text(encoding="ascii").splitlines()
+            binding_outputs = dict(
+                line.split("=", 1)
+                for line in github_output_path.read_text(encoding="ascii").splitlines()
             )
             self.assertEqual(
-                set(exported), {"SOURCE_BINDING_BASE64", "SOURCE_BINDING_SHA256"}
+                set(binding_outputs), {"source_binding_base64", "source_binding_sha256"}
             )
+            exported = {
+                "SOURCE_BINDING_BASE64": binding_outputs["source_binding_base64"],
+                "SOURCE_BINDING_SHA256": binding_outputs["source_binding_sha256"],
+            }
             self.assertEqual(
                 exported["SOURCE_BINDING_SHA256"],
                 hashlib.sha256(canonical_binding).hexdigest(),
             )
+
+            wrong_run_payload = {**validated_input, "run_id": "654321"}
+            input_path.write_text(json.dumps(wrong_run_payload), encoding="ascii")
+            wrong_run_output = root / "wrong-run-github-output"
+            wrong_run_output.write_text("", encoding="ascii")
+            wrong_run_output.chmod(0o600)
+            wrong_run_env = {**env, "GITHUB_OUTPUT": str(wrong_run_output)}
+            wrong_run_step = subprocess.run(
+                ["/bin/bash", "-euo", "pipefail", "-c", source_step_definition["run"]],
+                cwd=REPO_ROOT,
+                env=wrong_run_env,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertNotEqual(wrong_run_step.returncode, 0)
+            self.assertEqual(wrong_run_output.read_text(encoding="ascii"), "")
+            input_path.write_text(json.dumps(validated_input), encoding="ascii")
 
             load_temp = root / "load-runner-temp"
             load_input_dir = load_temp / "external-input"
@@ -4046,6 +4106,35 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             self.assertEqual(same_exported, {
                 "SOURCE_BINDING_BASE64": "",
                 "SOURCE_BINDING_SHA256": "",
+            })
+            input_path.write_text(json.dumps(same_source_input), encoding="ascii")
+            manifest_path.write_text(json.dumps(same_source_manifest), encoding="ascii")
+            input_path.chmod(0o600)
+            manifest_path.chmod(0o600)
+            same_output_path = root / "same-source-github-output"
+            same_output_path.write_text("", encoding="ascii")
+            same_output_path.chmod(0o600)
+            same_step = subprocess.run(
+                ["/bin/bash", "-euo", "pipefail", "-c", source_step_definition["run"]],
+                cwd=REPO_ROOT,
+                env={
+                    **env,
+                    "APP_TARGET_SHA": RUNNER_SHA,
+                    "GITHUB_OUTPUT": str(same_output_path),
+                },
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(same_step.returncode, 0, same_step.stderr)
+            same_outputs = dict(
+                line.split("=", 1)
+                for line in same_output_path.read_text(encoding="ascii").splitlines()
+            )
+            self.assertEqual(same_outputs, {
+                "source_binding_base64": "",
+                "source_binding_sha256": "",
             })
             with patch.dict(
                 os.environ,

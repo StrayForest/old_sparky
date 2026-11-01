@@ -217,16 +217,16 @@ and SSH removal use `always()`, but any failed row below keeps the run failed:
 | handoffs/artifacts/SSH | exact SHA/run/attempt/digest; cleanup statuses `0` |
 | evaluation/projection | observer-bound accepted result, structurally complete profile-budget miss, or closed known-status failure; `sanitizer_status=0` |
 
-Load-client and CPU/SSR diagnostic jobs run `platform/tools/platform_load.py
-export-source-binding-env` against the exact downloaded input and matching
-manifest, bound to `SOURCE_GIT_SHA` and `APP_TARGET_SHA`. It validates the
-closed handoff and ordinary manifest parser before emitting two values.
-Load-client captures them in a private temporary file and passes them via its
-same-step `env -i` call; `$GITHUB_ENV` affects later steps only. Diagnostic-pair
-appends them before parent and sanitizer steps. The worker gets them through
-its explicit allowlist; never set them manually. Missing or mismatched binding
-stops measurement or acceptance; empty binding is valid only when runner and
-app SHAs are identical.
+`load-client` runs `platform/tools/platform_load.py export-source-binding-env` against the exact input and manifest, keeping validated values in a private
+file for its same-step `env -i` call. `$GITHUB_ENV` affects later steps only.
+Diagnostic mode uses the no-secret `derive-diagnostic-source-binding` job after
+the exact same-run/attempt input and manifest are ready. It validates input
+run/runner identity and manifest, then exposes only the bounded binding and
+digest as outputs. Parent and sanitizer steps receive step-scoped env; SSH
+setup/cleanup do not. The worker uses its explicit allowlist. Never set values
+manually. Missing or mismatched binding stops acceptance; empty binding is valid
+only when runner and app SHAs match. See the [source-binding test contract](test-suite-governance.md#production-and-performance-boundaries)
+for required full-module verification and coverage.
 
 ### Retrieve a bounded SSR failure artifact
 

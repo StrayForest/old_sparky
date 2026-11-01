@@ -65,6 +65,22 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
         self.assertIn("needs: validate-external-inputs", jobs["fixture-setup"])
         self.assertIn("environment: production", jobs["fixture-setup"])
         self.assertIn("manifest_ready:", jobs["fixture-setup"])
+        derive = jobs["derive-diagnostic-source-binding"]
+        self.assertIn("needs.validate-external-inputs.result == 'success'", derive)
+        self.assertIn("needs.fixture-setup.outputs.manifest_ready == '1'", derive)
+        self.assertNotIn("load-client", derive)
+        self.assertNotIn("environment: production", derive)
+        self.assertNotRegex(derive, r"secrets\.PROD_SSH_")
+        self.assertIn("actions: read", derive)
+        self.assertIn("contents: read", derive)
+        self.assertIn("ref: ${{ env.SOURCE_GIT_SHA }}", derive)
+        self.assertIn("persist-credentials: false", derive)
+        self.assertIn("      - derive-diagnostic-source-binding\n", jobs["cpu-diagnostic-pair"])
+        self.assertIn(
+            "needs.derive-diagnostic-source-binding.result == 'success'",
+            jobs["cpu-diagnostic-pair"],
+        )
+        self.assertNotIn("platform_load.py", jobs["cpu-diagnostic-pair"])
         self.assertIn("needs:\n      - validate-external-inputs\n      - fixture-setup", jobs["load-client"])
         self.assertIn("actions/checkout@", jobs["load-client"])
         self.assertNotRegex(jobs["load-client"], r"secrets\.PROD_SSH_")
