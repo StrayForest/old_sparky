@@ -18,15 +18,18 @@ belong in the linked owner documents below.
   or matrix credit. Its exact fixture was closed through the canonical abort
   and cleanup workflows. The profile phase reported `invalid_profile`; this is
   not a passing measurement or a server-wide capacity result.
-- The reviewed profile-rejection and API category-conservation source candidate
-  is `5a8d4c69e208d096af418f67dfba1ef1cf630aa0`; its pin-only successor is
-  `5c17be7362e19ca786eefb89d3bf38f2482ab048`. Exact-head CI, encrypted
-  credential transport review, source-bound host-tools provisioning and fresh
-  profile-A readiness are still pending. Raw fixture-manifest artifacts must
-  use the reviewed encrypted transport because they contain synthetic session
-  credentials. Do not dispatch another load until the integrated source passes
-  exact-head CI, its host-tools generation is deployed, and fresh profile-A
-  readiness passes. Use the
+- The integrated source candidate for profile rejection telemetry, API CPU
+  category conservation and encrypted fixture credential transport is PR #347
+  at `b41f56b6684d300add9b37d89a257cf9effc6e99`. It includes host-tools source
+  **C** `5a8d4c69e208d096af418f67dfba1ef1cf630aa0` and pin successor **P**
+  `5c17be7362e19ca786eefb89d3bf38f2482ab048`; this generation is not installed.
+  Transport review passed; final integrated-source review and exact-head CI are
+  pending. The encrypted transport uses a fixture-only age identity; do not
+  provision its environment secrets until the integrated source review and CI
+  pass. Raw fixture-manifest artifacts contain synthetic session credentials
+  and must remain encrypted. Do not dispatch another load until the integrated
+  source passes exact-head CI, its host-tools generation is deployed, and fresh
+  profile-A readiness passes. Use the
   [SSR capacity diagnostic runbook](ssr-capacity-diagnostic-runbook.md) for
   dispatch, acceptance, abort and cleanup.
 - Source-bound backup admission requires one successful producer bound to the
