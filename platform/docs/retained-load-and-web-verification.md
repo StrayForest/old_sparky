@@ -41,6 +41,36 @@ create the missing exit record or hand-write the receipt.
 If the reviewed abort helper is on a recovery-only runner SHA `R` while the
 active app remains at its freshly verified SHA `A`, use this order:
 
+Before starting Security or reserving its backup, inventory task-owned
+temporary paths, sizes and open users. Remove only exact task artifacts whose
+owner and lack of process references are verified; follow the [test-suite
+storage guidance](test-suite-governance.md) and coordinate exact-path cleanup
+with the release lead. Do not remove installed releases, shared runtimes,
+current/previous releases, backup pairs or other protected paths. Then collect
+fresh read-only host capacity evidence for active app `A`:
+
+```bash
+gh workflow run platform-production-storage-diagnostics.yml \
+  --repo StrayForest/old_sparky --ref dev \
+  -f expected_sha=A
+gh run watch <storage-diagnostics-run-id> \
+  --repo StrayForest/old_sparky --exit-status
+```
+
+Before reserving either backup, require the reported free-space budget to cover
+the storage policy floor and backup lead, both preserved new backup archives
+(recovery source `R` and the later app source), and the candidate release's
+measured transfer/staging allocation. Use the newest verified archive and a
+comparable release artifact for conservative size inputs; include any
+temporary allocation that coexists with their final files. If an input is
+unknown, the report is incomplete, or the budget is insufficient, stop before
+starting Security and arrange reviewed exact-path cleanup or a later window.
+The diagnostic is a snapshot, not a reservation; the backup and deployment
+guards still decide admission at execution time. Do not use the diagnostics'
+generic release-candidate list for deletion. For any maintenance review, use
+the [pin-bearing no-apply retention preview](operations-runbook.md#retention-and-disk-safety),
+which validates the installed unit and includes its protected pins.
+
 1. Start `Platform security and build` for the merged recovery-only source SHA
    `R` on `dev`.
 2. While that exact Security run is active and the shared production backup
