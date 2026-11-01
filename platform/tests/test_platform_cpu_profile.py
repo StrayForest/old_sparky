@@ -5173,10 +5173,18 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         for workload in (
             capacity_diagnostic.WORKLOAD,
             capacity_diagnostic.HTML_WORKLOAD,
+            capacity_diagnostic.HTML_CAPACITY_120S_WORKLOAD,
         ):
             with self.subTest(workload=workload):
                 payload = _diagnostic_payload()
                 payload["workload"] = workload
+                if workload == capacity_diagnostic.HTML_CAPACITY_120S_WORKLOAD:
+                    payload.update({
+                        "on_end_ms": 146_000,
+                        "expires_at_ms": diagnostic_plan_tool._plan_expiry_ms(
+                            146_000, workload,
+                        ),
+                    })
                 plan = parse_plan_payload(_canonical_payload(payload), expected_service="api")
                 self.assertEqual(plan.workload, workload)
                 with (
@@ -5192,6 +5200,248 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 usage_window.assert_called_once()
                 self.assertEqual(usage_window.call_args.args[:2], (plan, "on"))
                 self.assertIsNone(diagnostic_module._active_profile)
+
+    def test_html_cpu_profile_prearms_edge_callbacks_per_api_worker(self) -> None:
+        import importlib.util
+
+        class FakeLoop:
+            def __init__(self) -> None:
+                self.calls: list[tuple[float, object]] = []
+
+            def call_later(self, delay: float, callback):
+                self.calls.append((delay, callback))
+                return object()
+
+        worker_path = Path(__file__).resolve().parents[1] / "python_packages/platform_infra/performance_diagnostic.py"
+        payload = _diagnostic_payload()
+        payload.update({
+            "run_id": "e" * 32,
+            "workload": diagnostic_plan_tool.HTML_CPU_PROFILE_20S_WORKLOAD,
+            "off_start_ms": 100_000,
+            "off_end_ms": 120_000,
+            "on_start_ms": 125_000,
+            "on_end_ms": 145_000,
+            "expires_at_ms": 160_000,
+        })
+        plan = parse_plan_payload(_canonical_payload(payload), expected_service="api")
+        scope = {
+            "type": "http", "method": "GET",
+            "path": "/api/v1/tournaments/safe-slug/workspace",
+            "headers": [(b"x-platform-ssr-trace", plan.run_id.encode("ascii"))],
+        }
+        worker_modules = []
+        for index in range(2):
+            module_name = f"performance_diagnostic_api_worker_{index}"
+            module_spec = importlib.util.spec_from_file_location(module_name, worker_path)
+            self.assertIsNotNone(module_spec)
+            self.assertIsNotNone(module_spec.loader)
+            module = importlib.util.module_from_spec(module_spec)
+            sys.modules[module_name] = module
+            module_spec.loader.exec_module(module)
+            worker_modules.append((module_name, module))
+
+        try:
+            for worker_index, (_module_name, worker) in enumerate(worker_modules):
+                with self.subTest(worker=worker_index):
+                    loop = FakeLoop()
+                    clock = {"now_ms": 48_000, "monotonic": 100.0}
+                    with (
+                        patch.object(worker, "read_process_plan", return_value=None),
+                        patch.object(worker, "_read_process_plan_for_cpu_prearm", return_value=plan),
+                        patch.object(
+                            worker.time, "time_ns",
+                            side_effect=lambda: clock["now_ms"] * 1_000_000,
+                        ),
+                        patch("asyncio.get_running_loop", return_value=loop),
+                    ):
+                        self.assertEqual(worker.ApiCpuDiagnostic.activate_for_scope(scope), (None, None))
+                    self.assertEqual([delay for delay, _callback in loop.calls], [52.0, 77.0, 77.0])
+                    self.assertEqual(worker._profile_windows_scheduled, {plan.run_id})
+                    self.assertIn((plan.run_id, "off"), worker._usage_windows_scheduled)
+                    self.assertIn((plan.run_id, "on"), worker._usage_windows_scheduled)
+                    self.assertIsNone(worker._active_profile)
+
+                    # The prearmed profile callback revalidates the exact plan
+                    # and starts cProfile on this worker's own event-loop thread.
+                    clock["now_ms"] = plan.on_start_ms
+                    with (
+                        patch.object(worker, "_read_process_plan_uncached", return_value=plan),
+                        patch.object(
+                            worker.time, "time_ns",
+                            side_effect=lambda: clock["now_ms"] * 1_000_000,
+                        ),
+                        patch.object(worker.time, "monotonic", side_effect=lambda: clock["monotonic"]),
+                        patch.object(worker, "_emit_cpu_diagnostic_message") as emit,
+                    ):
+                        loop.calls[2][1]()
+                        self.assertEqual(worker._active_profile.start_lag_ms, 0)
+                        self.assertIsNotNone(worker._active_profile.profile)
+                        self.assertEqual(len(loop.calls), 4)
+                        self.assertEqual(loop.calls[3][0], 20.0)
+
+                        # The sole stop timer ends the profile at ON's planned
+                        # end, and no later request can extend this capture.
+                        clock["now_ms"] = plan.on_end_ms
+                        clock["monotonic"] = 120.0
+                        loop.calls[3][1]()
+                        emit.assert_called_once()
+                        self.assertIn("start_lag_ms=0", emit.call_args.args[0])
+                        self.assertIn("elapsed_ms=20000", emit.call_args.args[0])
+                        self.assertIsNone(worker._active_profile)
+                    self.assertIn(plan.run_id, worker._consumed_run_ids)
+        finally:
+            for module_name, _worker in worker_modules:
+                sys.modules.pop(module_name, None)
+
+    def test_html_cpu_profile_rejects_late_stale_or_missing_edge_prearm(self) -> None:
+        import python_packages.platform_infra.performance_diagnostic as diagnostic_module
+
+        class FakeLoop:
+            def __init__(self) -> None:
+                self.calls: list[tuple[float, object]] = []
+
+            def call_later(self, delay: float, callback):
+                self.calls.append((delay, callback))
+                return object()
+
+        for scenario in (
+            "late", "stale", "validation_late", "constructor_late",
+            "enable_late", "missing",
+        ):
+            with self.subTest(scenario=scenario):
+                payload = _diagnostic_payload()
+                payload.update({
+                    "run_id": hashlib.sha256(scenario.encode()).hexdigest()[:32],
+                    "workload": diagnostic_plan_tool.HTML_CPU_PROFILE_20S_WORKLOAD,
+                    "off_start_ms": 100_000,
+                    "off_end_ms": 120_000,
+                    "on_start_ms": 125_000,
+                    "on_end_ms": 145_000,
+                    "expires_at_ms": 160_000,
+                })
+                plan = parse_plan_payload(_canonical_payload(payload), expected_service="api")
+                scope = {
+                    "type": "http", "method": "GET",
+                    "path": "/api/v1/tournaments/safe-slug/workspace",
+                    "headers": [(b"x-platform-ssr-trace", plan.run_id.encode("ascii"))],
+                }
+                loop = FakeLoop()
+                clock = {"now_ms": 48_000}
+                if scenario == "missing":
+                    clock["now_ms"] = plan.on_start_ms + 251
+                    with (
+                        patch.object(diagnostic_module, "read_process_plan", return_value=plan),
+                        patch.object(diagnostic_module, "_start_cpu_usage_window") as usage_start,
+                        patch.object(diagnostic_module.time, "time_ns", side_effect=lambda: clock["now_ms"] * 1_000_000),
+                        patch("asyncio.get_running_loop", return_value=loop),
+                    ):
+                        ApiCpuDiagnostic.activate_for_scope(scope)
+                    usage_start.assert_called_once()
+                    self.assertFalse(loop.calls)
+                    self.assertIn(plan.run_id, diagnostic_module._consumed_run_ids)
+                    self.assertIsNone(diagnostic_module._active_profile)
+                    diagnostic_module._profile_windows_scheduled.discard(plan.run_id)
+                    diagnostic_module._consumed_run_ids.discard(plan.run_id)
+                    for phase in ("off", "on"):
+                        key = (plan.run_id, phase)
+                        diagnostic_module._usage_windows_scheduled.discard(key)
+                        diagnostic_module._usage_windows_started.discard(key)
+                    continue
+
+                prearm_plan = plan
+                replacement = None
+                if scenario == "stale":
+                    replacement_payload = {**payload, "source_sha": "f" * 40}
+                    replacement = parse_plan_payload(
+                        _canonical_payload(replacement_payload), expected_service="api",
+                    )
+                with (
+                    patch.object(diagnostic_module, "read_process_plan", return_value=None),
+                    patch.object(diagnostic_module, "_read_process_plan_for_cpu_prearm", return_value=prearm_plan),
+                    patch.object(diagnostic_module.time, "time_ns", side_effect=lambda: clock["now_ms"] * 1_000_000),
+                    patch("asyncio.get_running_loop", return_value=loop),
+                ):
+                    self.assertEqual(ApiCpuDiagnostic.activate_for_scope(scope), (None, None))
+                clock["now_ms"] = plan.on_start_ms + (251 if scenario == "late" else 0)
+                current = replacement if replacement is not None else plan
+
+                def revalidate_plan(*_args, **_kwargs):
+                    if scenario == "validation_late":
+                        clock["now_ms"] = plan.on_start_ms + 251
+                    return current
+
+                profiles = []
+
+                class FakeProfile:
+                    def __init__(self) -> None:
+                        self.disabled = False
+
+                    def enable(self) -> None:
+                        if scenario == "enable_late":
+                            clock["now_ms"] = plan.on_start_ms + 251
+
+                    def disable(self) -> None:
+                        self.disabled = True
+
+                def create_profile(**_kwargs):
+                    profile = FakeProfile()
+                    profiles.append(profile)
+                    if scenario == "constructor_late":
+                        clock["now_ms"] = plan.on_start_ms + 251
+                    return profile
+
+                with (
+                    patch.object(
+                        diagnostic_module, "_read_process_plan_uncached",
+                        side_effect=revalidate_plan,
+                    ),
+                    patch.object(diagnostic_module.time, "time_ns", side_effect=lambda: clock["now_ms"] * 1_000_000),
+                    patch.object(
+                        diagnostic_module.cProfile, "Profile",
+                        side_effect=create_profile,
+                    ),
+                ):
+                    loop.calls[2][1]()
+                self.assertNotIn(plan.run_id, diagnostic_module._profile_windows_scheduled)
+                self.assertIn(plan.run_id, diagnostic_module._consumed_run_ids)
+                self.assertIsNone(diagnostic_module._active_profile)
+                if scenario in {"constructor_late", "enable_late"}:
+                    self.assertEqual(len(profiles), 1)
+                    self.assertEqual(
+                        profiles[0].disabled,
+                        scenario == "enable_late",
+                    )
+                with (
+                    patch.object(diagnostic_module, "read_process_plan", return_value=plan),
+                    patch.object(diagnostic_module, "_start_cpu_usage_window"),
+                    patch.object(diagnostic_module.time, "time_ns", side_effect=lambda: clock["now_ms"] * 1_000_000),
+                    patch("asyncio.get_running_loop", return_value=loop),
+                ):
+                    ApiCpuDiagnostic.activate_for_scope(scope)
+                self.assertIsNone(diagnostic_module._active_profile)
+                diagnostic_module._profile_windows_scheduled.discard(plan.run_id)
+                diagnostic_module._consumed_run_ids.discard(plan.run_id)
+                for phase in ("off", "on"):
+                    key = (plan.run_id, phase)
+                    diagnostic_module._usage_windows_scheduled.discard(key)
+                    diagnostic_module._usage_windows_started.discard(key)
+
+        # Keep the module-level idempotence sets isolated from the following
+        # prearm contract case in this test (and from later test methods).
+        scenario_keys = {
+            hashlib.sha256(scenario.encode()).hexdigest()[:32]
+            for scenario in (
+                "late", "stale", "validation_late", "constructor_late",
+                "enable_late", "missing",
+            )
+        }
+        diagnostic_module._profile_windows_scheduled.difference_update(scenario_keys)
+        diagnostic_module._consumed_run_ids.difference_update(scenario_keys)
+        for run_id in scenario_keys:
+            for phase in ("off", "on"):
+                key = (run_id, phase)
+                diagnostic_module._usage_windows_scheduled.discard(key)
+                diagnostic_module._usage_windows_started.discard(key)
 
         class FakeLoop:
             def __init__(self) -> None:
@@ -7069,15 +7319,18 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "path": "/api/v1/tournaments/safe-slug/workspace",
             "headers": [(b"x-platform-ssr-trace", b"d" * 32)],
         }
+        clock = {"now_ms": plan.on_start_ms}
         with patch(
             "python_packages.platform_infra.performance_diagnostic.read_process_plan",
             return_value=plan,
         ), patch(
             "python_packages.platform_infra.performance_diagnostic.time.time_ns",
-            return_value=30_000_000_000,
+            side_effect=lambda: clock["now_ms"] * 1_000_000,
         ), patch.object(
             diagnostic_module, "_emit_cpu_diagnostic_message",
-        ) as emit_event:
+        ) as emit_event, patch.object(
+            diagnostic_module, "_read_process_plan_uncached", return_value=plan,
+        ) as revalidate:
             bound_plan, phase = ApiCpuDiagnostic.activate_for_scope(scope)
             self.assertIs(bound_plan, plan)
             self.assertEqual(phase, "on")
@@ -7090,11 +7343,82 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertIs(second_plan, plan)
             self.assertEqual(second_phase, "on")
             self.assertIs(diagnostic_module._active_profile, active)
+            clock["now_ms"] = plan.on_end_ms
             active.stop()
             self.assertTrue(active.stopped)
             self.assertIsNone(diagnostic_module._active_profile)
         self.assertEqual(emit_event.call_count, 1)
         self.assertTrue(emit_event.call_args.args[0].startswith("cpu_diagnostic_complete service=api "))
+        self.assertEqual(revalidate.call_args.kwargs["phase_at_ms"], plan.on_end_ms - 1)
+
+    def test_api_cpu_profile_completion_requires_live_plan_and_on_time_stop(self) -> None:
+        import python_packages.platform_infra.performance_diagnostic as diagnostic_module
+
+        payload = _diagnostic_payload()
+        plan = parse_plan_payload(_canonical_payload(payload), expected_service="api")
+        replacement = parse_plan_payload(
+            _canonical_payload({**payload, "source_sha": "f" * 40}),
+            expected_service="api",
+        )
+        old_active = diagnostic_module._active_profile
+        try:
+            for scenario in (
+                "valid", "replaced", "expired", "unreadable", "late",
+                "slow_replacement",
+            ):
+                with self.subTest(scenario=scenario):
+                    diagnostic = ApiCpuDiagnostic(plan)
+                    diagnostic.profile = SimpleNamespace(disable=lambda: None)
+                    diagnostic.started_monotonic = 1.0
+                    diagnostic_module._active_profile = diagnostic
+                    clock = {
+                        "now_ms": plan.on_end_ms + (251 if scenario == "late" else 0),
+                        "monotonic": 21.0,
+                    }
+                    current_plan = {
+                        "valid": plan,
+                        "replaced": replacement,
+                        "expired": None,
+                        "unreadable": None,
+                        "late": plan,
+                        "slow_replacement": replacement,
+                    }[scenario]
+
+                    def read_current_plan(*_args, **_kwargs):
+                        if scenario == "slow_replacement":
+                            clock["now_ms"] += 500
+                        if scenario == "unreadable":
+                            raise OSError("unavailable")
+                        return current_plan
+
+                    with (
+                        patch.object(
+                            diagnostic_module.time, "time_ns",
+                            side_effect=lambda: clock["now_ms"] * 1_000_000,
+                        ),
+                        patch.object(
+                            diagnostic_module.time, "monotonic",
+                            side_effect=lambda: clock["monotonic"],
+                        ),
+                        patch.object(
+                            diagnostic_module, "_read_process_plan_uncached",
+                            side_effect=read_current_plan,
+                        ) as read_plan,
+                        patch.object(diagnostic_module, "_profile_summary", return_value=([], 0)),
+                        patch.object(diagnostic_module, "_emit_cpu_diagnostic_message") as emit,
+                    ):
+                        diagnostic.stop()
+
+                    self.assertTrue(diagnostic.stopped)
+                    self.assertIsNone(diagnostic_module._active_profile)
+                    self.assertEqual(emit.call_count, int(scenario == "valid"))
+                    self.assertEqual(read_plan.call_count, int(scenario != "late"))
+                    if scenario == "slow_replacement":
+                        self.assertEqual(
+                            read_plan.call_args.kwargs["now_ms"], plan.on_end_ms,
+                        )
+        finally:
+            diagnostic_module._active_profile = old_active
 
     async def test_profiler_is_disabled_without_explicit_output_directory(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
@@ -7455,6 +7779,556 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(outer_fingerprint["parent_phase"], "composite_capacity")
         self.assertEqual(outer_fingerprint["parent_error_class"], "ValueError")
         self.assertFalse(outer_fingerprint["diagnostic_credit"])
+
+    def test_composite_parent_producer_round_trips_failure_and_reports_closed_rejection_path(self) -> None:
+        source_sha, app_sha = "a" * 40, "b" * 40
+        external_run_id, attempt = "41018394289", "1"
+        manifest_raw = b"producer-to-sanitizer composite fixture\n"
+        manifest_sha = hashlib.sha256(manifest_raw).hexdigest()
+        manifest = {
+            "runner_sha": source_sha,
+            "app_target_sha": app_sha,
+            "tournaments": [{"user_count": capacity_diagnostic.FIXTURE_USERS}],
+        }
+        actors = [None] * capacity_diagnostic.FIXTURE_USERS
+        phase_report = capacity_diagnostic._parent_failure_receipt(
+            error_class="ValueError", stage="remote_plan_prepare",
+            source_sha=source_sha, app_target_sha=app_sha,
+            external_run_id=external_run_id, external_run_attempt=attempt,
+            run_id="d" * 32,
+            profile_digest_value=capacity_diagnostic.profile_digest(
+                32, capacity_diagnostic.HTML_CAPACITY_120S_WORKLOAD,
+            ),
+            manifest_sha256=manifest_sha, manifest_bytes=len(manifest_raw),
+            concurrency=32, prepare_lifecycle={}, cleanup_lifecycle={},
+            cleanup_ok=False,
+            workload=capacity_diagnostic.HTML_CAPACITY_120S_WORKLOAD,
+        )
+        args = Namespace(
+            manifest="manifest.json", report="report.json", source_sha=source_sha,
+            app_target_sha=app_sha, external_run_id=external_run_id,
+            external_run_attempt=attempt, concurrency=32,
+            workload=capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+        )
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            args.report = str(root / "producer-report.json")
+            with (
+                patch.object(capacity_diagnostic, "_read_manifest", return_value=(manifest_raw, manifest, actors)),
+                patch.object(capacity_diagnostic, "_parent_run_once", return_value=phase_report),
+            ):
+                produced = capacity_diagnostic._parent_composite_run(args, {})
+            self.assertEqual(produced["status"], "incomplete")
+            self.assertFalse(produced["passed"])
+            self.assertFalse(produced["namespace_closed"])
+            self.assertFalse(produced["diagnostic_credit"])
+            capacity_diagnostic._write_report(Path(args.report), produced)
+            with patch.object(
+                capacity_diagnostic, "_read_manifest",
+                return_value=(manifest_raw, manifest, actors),
+            ):
+                decision = capacity_diagnostic.sanitize_capacity_report(
+                    input_path=Path(args.report), output_path=root / "sanitized.json",
+                    manifest_path=root / "manifest.json", source_sha=source_sha,
+                    app_target_sha=app_sha, run_id=external_run_id, attempt=attempt,
+                    workload=capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+                )
+            self.assertEqual(decision, "FAIL")
+            sanitized = json.loads((root / "sanitized.json").read_text(encoding="ascii"))
+            self.assertEqual(sanitized["capacity_phase"]["stage"], "remote_plan_prepare")
+            self.assertFalse(sanitized["matrix_credit"])
+            self.assertFalse(sanitized["slo_credit"])
+            self.assertFalse(sanitized["diagnostic_credit"])
+
+            malformed = {**produced, "remote_plan_cleanup": "private-detail-not-allowed"}
+            malformed_path = root / "malformed-report.json"
+            capacity_diagnostic._write_report(malformed_path, malformed)
+            with patch.object(
+                capacity_diagnostic, "_read_manifest",
+                return_value=(manifest_raw, manifest, actors),
+            ):
+                with self.assertRaises(capacity_diagnostic._CapacitySanitizationError) as caught:
+                    capacity_diagnostic.sanitize_capacity_report(
+                        input_path=malformed_path, output_path=root / "rejected.json",
+                        manifest_path=root / "manifest.json", source_sha=source_sha,
+                        app_target_sha=app_sha, run_id=external_run_id, attempt=attempt,
+                        workload=capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+                    )
+            payload = caught.exception.payload
+            self.assertEqual(payload["section"], "composite_report")
+            self.assertEqual(payload["field"], "remote_plan_cleanup")
+            self.assertEqual(payload["reason"], "report_projection_rejected")
+            self.assertEqual(payload["projection_reason"], "invalid_value")
+            self.assertEqual(payload["value_type"], "string")
+            self.assertFalse(payload["diagnostic_credit"])
+            serialized = json.dumps(payload, sort_keys=True)
+            self.assertNotIn("private-detail-not-allowed", serialized)
+            self.assertNotIn(source_sha, serialized)
+            self.assertNotIn(app_sha, serialized)
+
+            cli_stdout = io.StringIO()
+            published_path = root / "sanitizer-failure.json"
+            with (
+                patch.object(
+                    capacity_diagnostic, "_read_manifest",
+                    return_value=(manifest_raw, manifest, actors),
+                ),
+                redirect_stdout(cli_stdout),
+            ):
+                self.assertEqual(capacity_diagnostic.main([
+                    "sanitize-report", "--input", str(malformed_path),
+                    "--output", str(root / "cli-rejected.json"),
+                    "--manifest", str(root / "manifest.json"),
+                    "--source-sha", source_sha, "--app-target-sha", app_sha,
+                    "--external-run-id", external_run_id,
+                    "--external-run-attempt", attempt,
+                    "--workload", capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+                    "--diagnostic-output", str(published_path),
+                ]), 2)
+            published = json.loads(published_path.read_text(encoding="ascii"))
+            self.assertEqual(set(published), {
+                "schema", "event", "workload", "source_sha", "app_target_sha",
+                "external_run_id", "external_run_attempt", "status", "stage",
+                "reason", "section", "field", "present", "value_type",
+                "binding_status", "matrix_credit", "slo_credit", "diagnostic_credit",
+                "projection_reason",
+            })
+            self.assertEqual(published["event"], "ssr_capacity_sanitizer_rejection")
+            self.assertEqual(published["workload"], capacity_diagnostic.HTML_COMPOSITE_WORKLOAD)
+            self.assertEqual(published["source_sha"], source_sha)
+            self.assertEqual(published["app_target_sha"], app_sha)
+            self.assertEqual(published["external_run_id"], external_run_id)
+            self.assertEqual(published["external_run_attempt"], attempt)
+            self.assertEqual(published["section"], "composite_report")
+            self.assertEqual(published["field"], "remote_plan_cleanup")
+            self.assertEqual(published["projection_reason"], "invalid_value")
+            self.assertFalse(published["matrix_credit"])
+            self.assertFalse(published["slo_credit"])
+            self.assertFalse(published["diagnostic_credit"])
+            self.assertEqual(stat.S_IMODE(published_path.stat().st_mode), 0o600)
+            self.assertNotIn("private-detail-not-allowed", json.dumps(published))
+            self.assertNotIn("private-detail-not-allowed", cli_stdout.getvalue())
+            for private_identity in (
+                produced["run_id"], produced["profile_digest"],
+                phase_report["run_id"], phase_report["profile_digest"],
+            ):
+                self.assertNotIn(private_identity, json.dumps(published))
+                self.assertNotIn(private_identity, cli_stdout.getvalue())
+
+            unknown_root = root / "unknown-field-case"
+            unknown_root.mkdir(mode=0o700)
+            unexpected = {
+                **produced,
+                "private-unexpected-field-name": "private-unexpected-field-value",
+            }
+            unexpected_path = unknown_root / "producer-report.json"
+            capacity_diagnostic._write_report(unexpected_path, unexpected)
+            unknown_diagnostic = unknown_root / "sanitizer-failure.json"
+            unknown_stdout = io.StringIO()
+            with (
+                patch.object(
+                    capacity_diagnostic, "_read_manifest",
+                    return_value=(manifest_raw, manifest, actors),
+                ),
+                redirect_stdout(unknown_stdout),
+            ):
+                self.assertEqual(capacity_diagnostic.main([
+                    "sanitize-report", "--input", str(unexpected_path),
+                    "--output", str(unknown_root / "rejected.json"),
+                    "--manifest", str(unknown_root / "manifest.json"),
+                    "--source-sha", source_sha, "--app-target-sha", app_sha,
+                    "--external-run-id", external_run_id,
+                    "--external-run-attempt", attempt,
+                    "--workload", capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+                    "--diagnostic-output", str(unknown_diagnostic),
+                ]), 2)
+            unknown_payload = json.loads(unknown_diagnostic.read_text(encoding="ascii"))
+            self.assertEqual(unknown_payload["field"], "field_set")
+            self.assertEqual(unknown_payload["projection_reason"], "field_set_mismatch")
+            self.assertEqual(unknown_payload["missing_known_field_count"], 0)
+            self.assertEqual(unknown_payload["unexpected_field_count"], 1)
+            self.assertNotIn("private-unexpected-field-name", json.dumps(unknown_payload))
+            self.assertNotIn("private-unexpected-field-value", json.dumps(unknown_payload))
+            self.assertNotIn("private-unexpected-field-name", unknown_stdout.getvalue())
+            self.assertFalse((unknown_root / "rejected.json").exists())
+
+    def test_composite_parent_producer_round_trips_complete_pair(self) -> None:
+        source_sha, app_sha = "a" * 40, "b" * 40
+        external_run_id, attempt = "41018394289", "1"
+        manifest_raw = b"complete producer-to-sanitizer fixture\n"
+        manifest_sha = hashlib.sha256(manifest_raw).hexdigest()
+        manifest = {
+            "runner_sha": source_sha, "app_target_sha": app_sha,
+            "tournaments": [{"user_count": capacity_diagnostic.FIXTURE_USERS}],
+        }
+        actors = [None] * capacity_diagnostic.FIXTURE_USERS
+
+        def phase_report(workload: str, run_id: str) -> dict[str, Any]:
+            window_ms = capacity_diagnostic.ON_WINDOW_MS_BY_WORKLOAD[workload]
+            profile_digest = capacity_diagnostic.profile_digest(32, workload)
+            window_start, window_end = 100_000, 100_000 + window_ms
+            request_id = next(
+                f"{index:032x}"
+                for index in range(1, 10_000)
+                if diagnostic_plan_tool.is_ssr_response_id_eligible(
+                    run_id, f"{index:032x}",
+                )
+            )
+            event_at = "2026-10-29T12:00:01+00:00"
+            window_start_utc = "2026-10-29T12:00:00+00:00"
+            window_end_utc = "2026-10-29T12:00:15+00:00"
+            correlation_summary = diagnostic_plan_tool.summarize_ssr_request_correlation(
+                selected_request_ids=[request_id],
+                submitted_html_count=1, valid_response_id_count=1,
+                eligible_response_id_count=1,
+                selection_scheme="sha256-runid-requestid-1of8-v1",
+                missing_response_id_count=0, duplicate_response_id_count=0,
+                malformed_response_id_count=0, run_id=run_id, phase="on",
+                window_start_utc=window_start_utc, window_end_utc=window_end_utc,
+                nginx_rows=[{
+                    "run_id": run_id, "phase": "on", "window_start_utc": window_start_utc,
+                    "window_end_utc": window_end_utc, "event_at_utc": event_at,
+                    "request_id": request_id, "request_time_ms": 50.0, "cf_ray": None,
+                }],
+                ssr_rows=[{
+                    "run_id": run_id, "phase": "on", "window_start_utc": window_start_utc,
+                    "window_end_utc": window_end_utc, "event_at_utc": event_at,
+                    "request_id": request_id, "stage": "page_component", "duration_ms": 40.0,
+                }],
+                stream_rows=[{
+                    "run_id": run_id, "phase": "on", "window_start_utc": window_start_utc,
+                    "window_end_utc": window_end_utc, "event_at_utc": event_at,
+                    "request_id": request_id, "stage": "request_start", "elapsed_ms": 0.5,
+                }],
+                api_rows=[{
+                    "run_id": run_id, "phase": "on", "window_start_utc": window_start_utc,
+                    "window_end_utc": window_end_utc, "event_at_utc": event_at,
+                    "request_id": request_id, "route_class": "tournament_workspace",
+                    "total_ms": 20.0, "sql_ms": 4.0, "max_sql_ms": 2.0,
+                    "pool_checkout_wait_ms": 1.0, "pool_connection_hold_ms": 3.0,
+                    "compute_ms": 8.0, "sql_count": 2,
+                }],
+            )
+            correlation_summary["ssr_stream_coverage"] = {
+                "records": 0, "selector_overflow": 0,
+                "selector_overflow_unattributed": 0, "row_cap_records": 0,
+                "row_cap_rows": 0, "truncated_records": 0,
+                "malformed_records": 0, "capture_marker_records": 1,
+                "capture_eligible_requests": 1, "capture_retained_requests": 1,
+                "capture_lost_requests": 0, "capture_rows": 1,
+                "capture_lost_rows": 0, "capture_truncated_records": 0,
+                "capture_malformed_records": 0, "capture_status": "complete",
+                "status": "none",
+            }
+            cpu_rows = []
+            for service, phase, targets in (
+                ("api", "off", 2), ("api", "on", 2),
+                ("web", "off", 1), ("web", "on", 1),
+            ):
+                row_window = 20_000 if phase == "off" else window_ms
+                cpu_rows.append({
+                    "service": service, "phase": phase,
+                    "expected_targets": targets, "observed_targets": targets,
+                    "event_count": targets, "cpu_ns": targets * row_window * 1_000,
+                    "window_ms_min": row_window, "window_ms_max": row_window,
+                    "start_lag_ms_min": 0, "start_lag_ms_max": 0,
+                    "end_lag_ms_min": 0, "end_lag_ms_max": 0,
+                    "timing_complete": True,
+                })
+            node_integer_fields = {
+                "sample_count", "rss_min_bytes", "rss_max_bytes", "rss_mean_bytes",
+                "heap_total_min_bytes", "heap_total_max_bytes", "heap_total_mean_bytes",
+                "heap_used_min_bytes", "heap_used_max_bytes", "heap_used_mean_bytes",
+                "heap_limit_min_bytes", "heap_limit_max_bytes", "heap_limit_mean_bytes",
+                "external_min_bytes", "external_max_bytes", "external_mean_bytes",
+                "array_buffers_min_bytes", "array_buffers_max_bytes", "array_buffers_mean_bytes",
+                "sampled_window_start_elapsed_ms", "sampled_window_end_elapsed_ms",
+                "sampled_window_duration_ms", "cgroup_sample_count",
+                "cgroup_memory_current_start_bytes", "cgroup_memory_current_end_bytes",
+                "cgroup_memory_current_sampled_max_bytes", "cgroup_memory_peak_start_bytes",
+                "cgroup_memory_peak_end_bytes", "cgroup_memory_peak_sampled_max_bytes",
+                "memory_events_low_sampled_delta", "memory_events_high_sampled_delta",
+                "memory_events_max_sampled_delta", "memory_events_oom_sampled_delta",
+                "memory_events_oom_kill_sampled_delta", "memory_events_oom_group_kill_sampled_delta",
+                "gc_count", "gc_major_count", "gc_minor_count", "gc_incremental_count",
+                "gc_weakcb_count", "gc_other_count",
+            }
+            node_rows = []
+            for phase in ("off", "on"):
+                row = {field: 1 for field in node_integer_fields}
+                row.update({
+                    "service": "web", "phase": phase, "status": "complete",
+                    "gc_duration_ms": 0, "gc_status": "complete",
+                    "cgroup_memory_status": "complete", "cgroup_memory_reason": "none",
+                    "gc_overflow": False,
+                })
+                row.update({
+                    "sample_count": 5, "sampled_window_start_elapsed_ms": 0,
+                    "sampled_window_end_elapsed_ms": 20_000 if phase == "off" else window_ms,
+                    "sampled_window_duration_ms": 20_000 if phase == "off" else window_ms,
+                    "cgroup_sample_count": 5,
+                })
+                node_rows.append(row)
+            telemetry = {
+                "schema": 1, "cpu_status": "complete", "cpu_reason": "none",
+                "cpu_rows": cpu_rows,
+                "node_memory_status": "complete", "node_memory_reason": "none",
+                "cgroup_memory_status": "complete", "cgroup_memory_reason": "none",
+                "node_memory_rows": node_rows,
+                "request_correlation": {"status": "complete", "summary": correlation_summary},
+            }
+            if workload == capacity_diagnostic.HTML_CPU_PROFILE_20S_WORKLOAD:
+                telemetry.update({
+                    "profile_status": "complete", "profile_reason": "none",
+                    "profile_rows": [
+                        {
+                            "service": "api", "expected_targets": 2,
+                            "observed_targets": 2, "event_count": 2,
+                            "timer": "thread_cpu", "observation_unit": "calls",
+                            "total_cpu_us": 2_000_000, "sample_count": None,
+                            "start_lag_ms_min": 0, "start_lag_ms_max": 0,
+                            "elapsed_ms_min": 20_000, "elapsed_ms_max": 20_000,
+                            "end_lag_ms_min": 0, "end_lag_ms_max": 0,
+                            "categories": [{
+                                "category": "repo.get_current_user", "cpu_us": 50_000,
+                                "observations": 100,
+                            }],
+                        },
+                        {
+                            "service": "web", "expected_targets": 1,
+                            "observed_targets": 1, "event_count": 1,
+                            "timer": "v8_cpu", "observation_unit": "samples",
+                            "total_cpu_us": 1_000_000, "sample_count": 100,
+                            "start_lag_ms_min": 0, "start_lag_ms_max": 0,
+                            "elapsed_ms_min": 20_000, "elapsed_ms_max": 20_000,
+                            "end_lag_ms_min": 0, "end_lag_ms_max": 0,
+                            "categories": [{
+                                "category": "other", "cpu_us": 1_000_000,
+                                "observations": 100,
+                            }],
+                        },
+                    ],
+                })
+            failure_evidence = {
+                "failure_count": 0,
+                "by_phase": {
+                    phase: {"failure_count": 0, "error_class_counts": {}, "observed_status_counts": {}}
+                    for phase in ("off_probe", "on_worker")
+                },
+                "records": [], "records_truncated": False,
+            }
+            phase_request_evidence = {
+                "schema": 1, "window_start_ms": window_start, "window_end_ms": window_end,
+                "request_start_basis": "client_actual_started_at_utc",
+                "submitted_results": 1, "started_in_window_count": 1,
+                "started_outside_window_count": 0, "missing_start_timestamp_count": 0,
+                "missing_finish_timestamp_count": 0, "completed_by_window_end_count": 1,
+                "drain_completed_after_window_count": 0, "cf_ray_present_count": 1,
+                "cf_ray_missing_count": 0, "ssr_request_id_singleton_count": 1,
+                "ssr_request_id_missing_count": 0, "ssr_request_id_duplicate_count": 0,
+                "ssr_request_id_malformed_count": 0, "eligible_response_id_count": 1,
+                "retained_sample_count": 1,
+                "sample_scheme": capacity_diagnostic.SSR_JOIN_SAMPLE_SCHEME,
+                "sample_cap_truncated": False, "status": "complete",
+            }
+            worker = {
+                "status": "complete", "submitted": 1, "completed": 1,
+                "http_status_counts": {"200": 1}, "error_counts": {},
+                "failure_evidence": failure_evidence,
+                "actual_on_request_started_at_utc": None,
+                "actual_on_request_finished_at_utc": None,
+                "failure_evidence_status": "available",
+                "latency_ms": {"sample_count": 1, "p50": 1.0, "p95": 1.0, "p99": 1.0, "max": 1.0},
+                "request_window_evidence": phase_request_evidence,
+                "resource_abort_reason": None,
+                "on_window_start_ms": window_start, "on_window_end_ms": window_end,
+                "observed_duration_ms": window_ms,
+                "off_probe": {"submitted": 32, "completed": 32, "http_status": 200},
+                "max_inflight": 32, "fixture_manifest_bytes": len(manifest_raw),
+                "response_bytes_total": 100,
+                "process_cpu_windows": [
+                    {"window": name, "status": "complete",
+                     "cpu_ns": expected * 100_000,
+                     "elapsed_ns": expected * 1_000_000,
+                     "cores": 0.1}
+                    for name, expected in (("off", 20_000), ("on", window_ms))
+                ],
+            }
+            return {
+                **capacity_diagnostic.profile_payload(32, workload),
+                "report_complete": True, "status": "complete", "passed": True,
+                "matrix_credit": False, "slo_credit": False, "diagnostic_credit": False,
+                "source_sha": source_sha, "app_target_sha": app_sha,
+                "external_run_id": external_run_id, "external_run_attempt": attempt,
+                "run_id": run_id, "profile_digest": profile_digest,
+                "fixture_manifest_sha256": manifest_sha,
+                "fixture_manifest_bytes": len(manifest_raw),
+                "namespace_closed": True, "worker": worker,
+                "memory_guard": {
+                    "status": "complete", "samples": 5,
+                    "current_min_bytes": 100, "current_max_bytes": 200,
+                    "memory_peak_lifetime_max_bytes": 300,
+                    "memory_events_sampled_max_delta": {
+                        key: 0 for key in ("low", "high", "max", "oom", "oom_kill", "oom_group_kill")
+                    },
+                    "target_identity_status": "complete", "terminal_decision": "complete",
+                    "terminal_reason": "none", "ssh_material_restored": True,
+                },
+                "runner_headroom": {
+                    "schema": 1, "status": "complete", "reason": "none",
+                    "runner_environment": "github-hosted",
+                    "identity": {
+                        key: True for key in (
+                            "outer_pid_namespace_matches_pid1", "outer_mount_namespace_matches_pid1",
+                            "outer_cgroup_namespace_matches_pid1", "target_cgroup_namespace_matches_outer",
+                            "target_mount_namespace_is_isolated", "target_pid_namespace_is_isolated",
+                            "global_cgroup2_mount", "workload_membership_matches_outer",
+                        )
+                    },
+                    "sample_count": 3, "window_seconds": window_ms / 1000,
+                    "effective_cpu_capacity_cores": 4.0, "max_cgroup_cpu_usage_cores": 1.0,
+                    "max_visible_throttled_periods_delta": 0, "window_scope": "on_window",
+                    "window_start_offset_ms": 0, "window_end_offset_ms": window_ms,
+                },
+                "server_telemetry": telemetry,
+                "server_capacity_claim": None,
+                "server_capacity_claim_reason": "resource_correlation_not_provided",
+                "generator_cpu_evidence": "measured", "remote_plan_cleanup": "complete",
+            }
+
+        capacity = phase_report(capacity_diagnostic.HTML_CAPACITY_120S_WORKLOAD, "1" * 32)
+        profile = phase_report(capacity_diagnostic.HTML_CPU_PROFILE_20S_WORKLOAD, "2" * 32)
+        args = Namespace(
+            manifest="manifest.json", report="unused.json", source_sha=source_sha,
+            app_target_sha=app_sha, external_run_id=external_run_id,
+            external_run_attempt=attempt, concurrency=32,
+            workload=capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+        )
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            args.report = str(root / "producer-report.json")
+            with (
+                patch.object(capacity_diagnostic, "_read_manifest", return_value=(manifest_raw, manifest, actors)),
+                patch.object(capacity_diagnostic, "_parent_run_once", side_effect=[capacity, profile]),
+                patch.object(capacity_diagnostic, "_composite_wait_for_profile_gap", return_value=True),
+            ):
+                produced = capacity_diagnostic._parent_composite_run(args, {})
+            self.assertEqual(produced["status"], "complete")
+            self.assertTrue(produced["passed"])
+            capacity_diagnostic._write_report(Path(args.report), produced)
+            with patch.object(
+                capacity_diagnostic, "_read_manifest",
+                return_value=(manifest_raw, manifest, actors),
+            ):
+                decision = capacity_diagnostic.sanitize_capacity_report(
+                    input_path=Path(args.report), output_path=root / "sanitized.json",
+                    manifest_path=root / "manifest.json", source_sha=source_sha,
+                    app_target_sha=app_sha, run_id=external_run_id, attempt=attempt,
+                    workload=capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+                )
+            self.assertEqual(decision, "PASS")
+            sanitized = json.loads((root / "sanitized.json").read_text(encoding="ascii"))
+            self.assertEqual(sanitized["phase_run_ids"], ["1" * 32, "2" * 32])
+            self.assertTrue(sanitized["namespace_closed"])
+            self.assertTrue(sanitized["capacity_phase"]["passed"])
+            self.assertTrue(sanitized["cpu_profile_phase"]["attribution_only"])
+            self.assertFalse(sanitized["cpu_profile_phase"]["performance_credit"])
+            self.assertFalse(sanitized["matrix_credit"])
+            self.assertFalse(sanitized["slo_credit"])
+            self.assertFalse(sanitized["diagnostic_credit"])
+            complete_cli_output = root / "sanitized-by-cli.json"
+            complete_diagnostic = root / "should-not-exist.json"
+            complete_stdout = io.StringIO()
+            with (
+                patch.object(
+                    capacity_diagnostic, "_read_manifest",
+                    return_value=(manifest_raw, manifest, actors),
+                ),
+                redirect_stdout(complete_stdout),
+            ):
+                self.assertEqual(capacity_diagnostic.main([
+                    "sanitize-report", "--input", args.report,
+                    "--output", str(complete_cli_output),
+                    "--manifest", str(root / "manifest.json"),
+                    "--source-sha", source_sha, "--app-target-sha", app_sha,
+                    "--external-run-id", external_run_id,
+                    "--external-run-attempt", attempt,
+                    "--workload", capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+                    "--diagnostic-output", str(complete_diagnostic),
+                ]), 0)
+            self.assertEqual(complete_stdout.getvalue(), "PASS\n")
+            self.assertTrue(complete_cli_output.is_file())
+            self.assertFalse(complete_diagnostic.exists())
+
+            for annotation_index, invalid_annotation in enumerate((
+                {**profile, "attribution_only": 1},
+                {**profile, "performance_credit": True},
+                {**profile, "capacity_quantile_member": 0},
+                {**profile, "private-unexpected-field-name": "private-value"},
+                {key: value for key, value in profile.items()
+                 if key != "performance_credit"},
+                {key: value for key, value in profile.items()
+                 if key not in {"attribution_only", "performance_credit", "capacity_quantile_member"}},
+            )):
+                with self.subTest(annotation_index=annotation_index):
+                    self.assertIsNone(capacity_diagnostic._project_composite_phase(
+                        invalid_annotation,
+                        expected_workload=capacity_diagnostic.HTML_CPU_PROFILE_20S_WORKLOAD,
+                    ))
+            annotation_detail = capacity_diagnostic._composite_projection_failure_detail({
+                **produced, "cpu_profile_phase": {**profile, "performance_credit": True},
+            })
+            self.assertEqual(annotation_detail["field"], "cpu_profile_phase")
+            self.assertEqual(annotation_detail["projection_reason"], "profile_annotation_mismatch")
+            self.assertIsNone(capacity_diagnostic._project_composite_phase(
+                {**capacity, "attribution_only": True,
+                 "performance_credit": False, "capacity_quantile_member": False},
+                expected_workload=capacity_diagnostic.HTML_CAPACITY_120S_WORKLOAD,
+            ))
+
+            profile_failure = capacity_diagnostic._parent_failure_receipt(
+                error_class="ValueError", stage="remote_plan_prepare",
+                source_sha=source_sha, app_target_sha=app_sha,
+                external_run_id=external_run_id, external_run_attempt=attempt,
+                run_id="3" * 32,
+                profile_digest_value=capacity_diagnostic.profile_digest(
+                    32, capacity_diagnostic.HTML_CPU_PROFILE_20S_WORKLOAD,
+                ),
+                manifest_sha256=manifest_sha, manifest_bytes=len(manifest_raw),
+                concurrency=32, prepare_lifecycle={}, cleanup_lifecycle={},
+                cleanup_ok=False,
+                workload=capacity_diagnostic.HTML_CPU_PROFILE_20S_WORKLOAD,
+            )
+            args.report = str(root / "producer-incomplete-profile.json")
+            with (
+                patch.object(capacity_diagnostic, "_read_manifest", return_value=(manifest_raw, manifest, actors)),
+                patch.object(capacity_diagnostic, "_parent_run_once", side_effect=[capacity, profile_failure]),
+                patch.object(capacity_diagnostic, "_composite_wait_for_profile_gap", return_value=True),
+            ):
+                produced_incomplete = capacity_diagnostic._parent_composite_run(args, {})
+            self.assertEqual(produced_incomplete["status"], "incomplete")
+            self.assertIs(produced_incomplete["cpu_profile_phase"]["attribution_only"], True)
+            capacity_diagnostic._write_report(Path(args.report), produced_incomplete)
+            with patch.object(
+                capacity_diagnostic, "_read_manifest",
+                return_value=(manifest_raw, manifest, actors),
+            ):
+                incomplete_decision = capacity_diagnostic.sanitize_capacity_report(
+                    input_path=Path(args.report), output_path=root / "sanitized-incomplete.json",
+                    manifest_path=root / "manifest.json", source_sha=source_sha,
+                    app_target_sha=app_sha, run_id=external_run_id, attempt=attempt,
+                    workload=capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+                )
+            self.assertEqual(incomplete_decision, "FAIL")
+            sanitized_incomplete = json.loads(
+                (root / "sanitized-incomplete.json").read_text(encoding="ascii"),
+            )
+            self.assertEqual(sanitized_incomplete["status"], "incomplete")
+            self.assertEqual(sanitized_incomplete["cpu_profile_phase"]["stage"], "remote_plan_prepare")
+            self.assertNotIn("attribution_only", sanitized_incomplete["cpu_profile_phase"])
+            self.assertFalse(sanitized_incomplete["matrix_credit"])
+            self.assertFalse(sanitized_incomplete["slo_credit"])
+            self.assertFalse(sanitized_incomplete["diagnostic_credit"])
 
     def test_composite_projection_accepts_completed_pair_and_profile_failure(self) -> None:
         source_sha = "a" * 40

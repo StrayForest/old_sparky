@@ -1980,6 +1980,11 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                                 or "name: Publish only the bounded SSR capacity summary" in step
                             )
                         )
+                        bounded_ssr_rejection = (
+                            path.name == "platform-production-external-load.yml"
+                            and job_name == "cpu-diagnostic-pair"
+                            and "name: Publish bounded SSR sanitizer rejection details" in step
+                        )
                         if bounded_cpu_summary:
                             sanitizer_step_id = (
                                 "sanitize-cpu-report"
@@ -2009,6 +2014,44 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                             self.assertNotRegex(
                                 step,
                                 r"(?:PROD_SSH_(?:HOST|USER|KEY)|SSH_DIR|id_ed25519|known_hosts|old_sparky_prod|report\.json|ssh-lifecycle)",
+                                f"{location} must not publish raw diagnostics or SSH material",
+                            )
+                        elif bounded_ssr_rejection:
+                            condition = re.search(
+                                r"(?m)^\s+if:\s*(.+)$", step
+                            )
+                            self.assertIsNotNone(condition, location)
+                            self.assertEqual(
+                                condition.group(1).strip(),
+                                "${{ always() && inputs.ssr_capacity_diagnostic_only == true "
+                                "&& steps.remove-diagnostic-ssh-material.outcome == 'success' "
+                                "&& steps.remove-ssr-capacity-ssh.outcome == 'success' "
+                                "&& steps.sanitize-ssr-capacity.outcome == 'failure' }}",
+                                f"{location} must upload only the bounded rejection after both SSH cleanups",
+                            )
+                            self.assertRegex(
+                                step,
+                                r"(?m)^\s+id:\s*publish-ssr-sanitizer-rejection\s*$",
+                                location,
+                            )
+                            self.assertIn(
+                                "${{ runner.temp }}/ssr-capacity-report/sanitizer-failure.json",
+                                step,
+                                location,
+                            )
+                            self.assertRegex(
+                                step,
+                                r"(?m)^\s+if-no-files-found:\s*ignore\s*$",
+                                location,
+                            )
+                            self.assertRegex(
+                                step,
+                                r"(?m)^\s+retention-days:\s*1\s*$",
+                                location,
+                            )
+                            self.assertNotRegex(
+                                step,
+                                r"(?:PROD_SSH_(?:HOST|USER|KEY)|SSH_DIR|id_ed25519|known_hosts|old_sparky_prod|report\.json|failure-fingerprint\.json)",
                                 f"{location} must not publish raw diagnostics or SSH material",
                             )
                         else:

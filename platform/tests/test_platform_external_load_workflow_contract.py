@@ -28,6 +28,9 @@ from tools.platform_workflow_input_guard import validate_external_payload
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = REPO_ROOT / ".github/workflows/platform-production-external-load.yml"
 CANARY_WORKFLOW = REPO_ROOT / ".github/workflows/platform-load-containment-canary.yml"
+OBSERVER_SHUTDOWN_HELPER = (
+    REPO_ROOT / "platform/tools/platform_external_fixture_observer_shutdown.sh"
+)
 
 
 def _jobs(source: str) -> dict[str, str]:
@@ -149,6 +152,144 @@ def _step_script(job: str, name: str) -> str:
 
 
 class ExternalLoadWorkflowContractTests(unittest.TestCase):
+    def test_supervisor_stops_observer_session_before_terminal_exit_receipt(self) -> None:
+        supervisor_source = (
+            REPO_ROOT / "platform/tools/platform_production_external_fixture_qa.sh"
+        ).read_text(encoding="utf-8")
+        exit_trap = supervisor_source.split("write_supervisor_exit() {", 1)[1].split(
+            "trap write_supervisor_exit EXIT", 1
+        )[0]
+        self.assertLess(
+            exit_trap.index("platform_external_fixture_stop_observer_group"),
+            exit_trap.index('record_progress "supervisor_exit"'),
+        )
+        self.assertIn('trap \'handle_supervisor_signal 143\' TERM', supervisor_source)
+        self.assertIn('trap \'handle_supervisor_signal 130\' INT', supervisor_source)
+        self.assertIn('"$SETSID" timeout --signal=TERM --kill-after=30s', supervisor_source)
+        self.assertIn('observer_launch_in_progress=1', supervisor_source)
+        self.assertIn('pending_supervisor_exit_status="$requested_status"', supervisor_source)
+        self.assertIn('"$observer_stopped" == "1"', exit_trap)
+
+        helper = str(OBSERVER_SHUTDOWN_HELPER)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script = textwrap.dedent(
+                r"""
+                set -euo pipefail
+                source "$OBSERVER_SHUTDOWN_HELPER"
+                event_path="$EVENT_PATH"
+                observer_pid=""
+                on_exit() {
+                  trap '' INT TERM
+                  if platform_external_fixture_stop_observer_group "$observer_pid" 1 1; then
+                    observer_pid=""
+                    printf 'terminal\n' >> "$event_path"
+                  else
+                    printf 'not_quiesced\n' >> "$event_path"
+                  fi
+                }
+                trap on_exit EXIT
+                trap 'exit 143' TERM
+                setsid timeout --signal=TERM --kill-after=1s 60s bash -c '
+                  event_path="$EVENT_PATH"
+                  if [[ "$IGNORE_TERM" == "1" ]]; then
+                    trap "" TERM
+                  else
+                    trap "printf \"observer_stopped\\n\" >> \"\$event_path\"; exit 0" TERM
+                  fi
+                  while :; do sleep 0.05; done
+                ' &
+                observer_pid="$!"
+                printf '%s\n' "$observer_pid" > "$PID_PATH"
+                sleep 0.1
+                kill -TERM "$$"
+                """
+            )
+            for ignore_term in ("0", "1"):
+                with self.subTest(observer_ignores_term=ignore_term == "1"):
+                    case = Path(temp_dir) / ignore_term
+                    case.mkdir()
+                    event_path = case / "events"
+                    pid_path = case / "observer-pid"
+                    completed = subprocess.run(
+                        ["/bin/bash", "-c", script],
+                        env={
+                            **os.environ,
+                            "OBSERVER_SHUTDOWN_HELPER": helper,
+                            "EVENT_PATH": str(event_path),
+                            "PID_PATH": str(pid_path),
+                            "IGNORE_TERM": ignore_term,
+                        },
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    self.assertEqual(completed.returncode, 143, completed.stderr)
+                    events = event_path.read_text(encoding="ascii").splitlines()
+                    if ignore_term == "0":
+                        self.assertEqual(events, ["observer_stopped", "terminal"])
+                    else:
+                        self.assertEqual(events, ["terminal"])
+                    observer_pid = pid_path.read_text(encoding="ascii").strip()
+                    group_check = subprocess.run(
+                        ["/bin/kill", "-0", "--", f"-{observer_pid}"],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=2,
+                    )
+                    self.assertNotEqual(group_check.returncode, 0)
+
+        # The production timeout owns the ordinary TERM-ignoring observer
+        # fallback (`--kill-after=30s`). Exercise the shutdown helper's own
+        # fallback separately: a real session leader exits while a descendant
+        # stays in its process group and ignores TERM.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            event_path = Path(temp_dir) / "events"
+            ready_path = Path(temp_dir) / "descendant-ready"
+            script = textwrap.dedent(
+                r"""
+                set -euo pipefail
+                source "$OBSERVER_SHUTDOWN_HELPER"
+                setsid bash -c '
+                  bash -c '\''trap "" TERM; : > "$READY_PATH"; while :; do sleep 0.05; done'\'' &
+                  while [[ ! -e "$READY_PATH" ]]; do sleep 0.01; done
+                  exit 0
+                ' &
+                observer_pid="$!"
+                for _ in {1..100}; do
+                  [[ -e "$READY_PATH" ]] && break
+                  sleep 0.01
+                done
+                [[ -e "$READY_PATH" ]]
+                kill -0 -- "-$observer_pid"
+                printf 'group_live_before\n' >> "$EVENT_PATH"
+                if platform_external_fixture_stop_observer_group "$observer_pid" 1 1; then
+                  printf 'terminal\n' >> "$EVENT_PATH"
+                else
+                  printf 'not_quiesced\n' >> "$EVENT_PATH"
+                fi
+                """
+            )
+            completed = subprocess.run(
+                ["/bin/bash", "-c", script],
+                env={
+                    **os.environ,
+                    "OBSERVER_SHUTDOWN_HELPER": helper,
+                    "EVENT_PATH": str(event_path),
+                    "READY_PATH": str(ready_path),
+                },
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(
+                event_path.read_text(encoding="ascii").splitlines(),
+                ["group_live_before", "terminal"],
+            )
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.source = WORKFLOW.read_text(encoding="utf-8")
@@ -2577,6 +2718,11 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             for step in cpu_steps
             if step.get("name") == "Project the SSR capacity report through its closed schema"
         )
+        capacity_sanitizer_rejection_upload = next(
+            step
+            for step in cpu_steps
+            if step.get("name") == "Publish bounded SSR sanitizer rejection details"
+        )
         self.assertLess(
             cpu_step_indexes["Run the fixed authenticated workspace CPU pair"],
             cpu_step_indexes["Remove diagnostic SSH material"],
@@ -2604,6 +2750,28 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "steps.remove-ssr-capacity-ssh.outcome == 'success'",
             capacity_sanitize["if"],
         )
+        self.assertIn(
+            '--diagnostic-output "$RUNNER_TEMP/ssr-capacity-report/sanitizer-failure.json"',
+            capacity_sanitize["run"],
+        )
+        self.assertIn("always()", capacity_sanitizer_rejection_upload["if"])
+        self.assertIn(
+            "steps.remove-diagnostic-ssh-material.outcome == 'success'",
+            capacity_sanitizer_rejection_upload["if"],
+        )
+        self.assertIn(
+            "steps.remove-ssr-capacity-ssh.outcome == 'success'",
+            capacity_sanitizer_rejection_upload["if"],
+        )
+        self.assertIn("steps.sanitize-ssr-capacity.outcome == 'failure'", capacity_sanitizer_rejection_upload["if"])
+        self.assertEqual(
+            capacity_sanitizer_rejection_upload["with"]["path"],
+            "${{ runner.temp }}/ssr-capacity-report/sanitizer-failure.json",
+        )
+        self.assertEqual(capacity_sanitizer_rejection_upload["with"]["if-no-files-found"], "ignore")
+        self.assertEqual(capacity_sanitizer_rejection_upload["with"]["retention-days"], 1)
+        self.assertNotIn("report.json", capacity_sanitizer_rejection_upload["with"]["path"])
+        self.assertNotIn("failure-fingerprint.json", capacity_sanitizer_rejection_upload["with"]["path"])
         self.assertIn("always()", capacity_fingerprint_upload["if"])
         self.assertIn(
             "inputs.ssr_capacity_diagnostic_only == true",

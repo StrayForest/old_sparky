@@ -59,3 +59,10 @@
 - API/domain: `backend`; migration: `migration`; docs/skills: `docs`;
   web: `web-quality` and, when applicable, `web-hermetic`.
 - Release: follow `docs/deployment-runbook.md` and the current CSP mode documented in `docs/CURRENT.md`.
+
+For raw GitHub Actions artifact ZIPs, use the authenticated `gh api` command
+with stdout redirected to a private file created under `umask 077`. Verify the
+exact artifact API identity, size and digest before opening it. Do not attach
+manual `Authorization` headers, follow storage redirects yourself, or use
+`gh run download` when the outer ZIP digest must be verified; it extracts the
+artifact contents.

@@ -3,6 +3,7 @@ const RUN_ID_RE = /^[0-9a-f]{32}$/u;
 const HTML_WORKLOADS = new Set([
   "authenticated_html_ssr_capacity_v1",
   "authenticated_html_ssr_capacity_120s_v1",
+  "authenticated_html_ssr_cpu_profile_20s_v1",
 ]);
 
 export function authorizedWorkspaceDiagnosticPrearmRunId(contextPlan, currentPlan, nowMs) {

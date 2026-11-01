@@ -39,25 +39,144 @@ attempt; if a check fails, stop and follow the operator escalation path. Never
 create the missing exit record or hand-write the receipt.
 
 If the reviewed abort helper is on a recovery-only runner SHA `R` while the
-active app remains at `S5`, first complete the normal `dev` Security and
-automatic baseline-reconcile chain for `R`. Wait for its authenticated
-`platform-production-noop-source-receipt` and verify it binds the exact
-Security, auto-deploy and deploy run attempts, the cumulative no-op route, and
-the unchanged active-release tuple at `S5` (`runtime_required=false`). This
-receipt authorizes the runner-to-app source binding only; it does not deploy
-the app. Then use the abort command in the SSR runbook with `target_sha=S5`,
-the exact failed load run and attempt, and the successful Security run and
-attempt for `R`. The abort workflow validates the complete Security job page
-against the exact CI route artifact. Every required gate must pass; only the
-`Conditional release runtime fixture` and `Trusted dev immutable release
-runtime` jobs may be skipped when that validated manifest is the full,
+active app remains at its freshly verified SHA `A`, use this order:
+
+Before starting Security or reserving its backup, inventory task-owned
+temporary paths, sizes and open users. Remove only exact task artifacts whose
+owner and lack of process references are verified; follow the [test-suite
+storage guidance](test-suite-governance.md) and coordinate exact-path cleanup
+with the release lead. Do not remove installed releases, shared runtimes,
+current/previous releases, backup pairs or other protected paths. Then collect
+fresh read-only host capacity evidence for active app `A`:
+
+Use the exact active app SHA from the current successful, source-bound deployment
+receipt. Assign that 40-character public SHA to `active_app_sha`; the workflow
+checks it against the fresh active-release identity on the host. The placeholder
+below is an input to replace, not a valid SHA value:
+
+```bash
+set -euo pipefail
+active_app_sha="<active-app-sha-from-current-deployment-receipt>"
+[[ "$active_app_sha" =~ ^[0-9a-f]{40}$ ]]
+gh workflow run platform-production-storage-diagnostics.yml \
+  --repo StrayForest/old_sparky --ref dev \
+  -f expected_sha="$active_app_sha"
+gh run watch <storage-diagnostics-run-id> \
+  --repo StrayForest/old_sparky --exit-status
+```
+
+Before reserving either backup, require the reported free-space budget to cover
+the storage policy floor and backup lead, both preserved new backup archives
+(recovery source `R` and the later app source), and the candidate release's
+measured transfer/staging allocation. Use the newest verified archive and a
+comparable release artifact for conservative size inputs; include any
+temporary allocation that coexists with their final files. If an input is
+unknown, the report is incomplete, or the budget is insufficient, stop before
+starting Security and arrange reviewed exact-path cleanup or a later window.
+The diagnostic is a snapshot, not a reservation; the backup and deployment
+guards still decide admission at execution time. Do not use the diagnostics'
+generic release-candidate list for deletion. For any maintenance review, use
+the [pin-bearing no-apply retention preview](operations-runbook.md#retention-and-disk-safety),
+which validates the installed unit and includes its protected pins.
+
+1. Start `Platform security and build` for the merged recovery-only source SHA
+   `R` on `dev`.
+2. While that exact Security run is active and the shared production backup
+   slot is unowned, dispatch exactly one source-bound `operation=create`
+   backup for the same Security run/attempt and `R`, using the existing
+   [backup command and timing requirements](backup-restore-runbook.md#local-verified-backup).
+   Confirm both the backup workflow and its production job start before the
+   latest required Security job completes. Reserve and start it before waiting
+   for Security success or an AUTO receipt; AUTO only verifies the backup and
+   does not dispatch it. Use the default `tmpfs_v1` backend for this `dev`
+   source attempt.
+3. Wait for exact Security success and the restore-verified backup receipt,
+   then let the automatic baseline-reconcile chain finish. Verify its
+   authenticated `platform-production-noop-source-receipt` binds the exact
+   Security, auto-deploy and deploy run attempts, the cumulative no-op route,
+   and the unchanged active-release tuple at `A` (`runtime_required=false`).
+
+This receipt authorizes the runner-to-app source binding only; it does not
+deploy the app. Then use the abort command in the SSR runbook with
+`target_sha=A`, the exact failed load run and attempt, and the successful
+Security run and attempt for `R`. The abort workflow validates the complete
+Security job page against the exact CI route artifact. Every required gate must
+pass; only the `Conditional release runtime fixture` and `Trusted dev immutable
+release runtime` jobs may be skipped when that validated manifest is the full,
 non-deployable recovery-bootstrap route with `runtime_sensitive=false`.
 Deployable routes require both runtime jobs to pass, and no other skipped gate
-is accepted. After the canonical abort receipt passes, dispatch exact
-cleanup through the same normal source-binding path with runner `R` and app
-target `S5`; the cleanup helper rechecks the active tuple. Stop if the no-op
-receipt is absent, does not bind those exact attempts, or the active tuple has
-changed. Do not create a substitute receipt or alias a same-SHA run.
+is accepted. After the canonical abort receipt passes, dispatch exact cleanup
+through the same normal source-binding path with runner `R` and app target
+`A`; the cleanup helper rechecks the active tuple. Stop if the backup proof or
+no-op receipt is absent, does not bind those exact attempts, or the active
+tuple has changed. Do not create a substitute receipt or alias a same-SHA run.
+
+Optional manual inspection of the Security route artifact is not an extra
+authorization step; the abort workflow performs the authoritative validation.
+For an independent archive check, run from the repository root of a checkout at
+the exact successful Security source SHA `R`:
+
+```bash
+set -euo pipefail
+security_run_id="<exact-successful-security-run-id>"
+security_run_attempt="<exact-successful-security-run-attempt>"
+security_source_sha="<security-run-source-sha-R>"
+[[ "$security_run_id" =~ ^[1-9][0-9]{0,31}$ ]]
+[[ "$security_run_attempt" =~ ^[1-9][0-9]{0,8}$ ]]
+[[ "$security_source_sha" =~ ^[0-9a-f]{40}$ ]]
+[[ "$(git rev-parse --verify HEAD)" == "$security_source_sha" ]]
+umask 077
+private_dir="$(mktemp -d "${TMPDIR:-/tmp}/retained-abort-route.XXXXXX")"
+trap 'rm -rf -- "$private_dir"' EXIT
+metadata="$private_dir/artifacts.json"
+archive="$private_dir/route.zip"
+gh api --repo StrayForest/old_sparky \
+  "repos/StrayForest/old_sparky/actions/runs/$security_run_id/artifacts?per_page=100&page=1" \
+  > "$metadata"
+artifact_fields="$(/usr/bin/python3 -I -B - "$metadata" "$security_run_id" "$security_run_attempt" "$security_source_sha" <<'PY'
+import json
+from pathlib import Path
+import re
+import sys
+
+metadata_path, run_id, attempt, source_sha = sys.argv[1:]
+payload = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+rows = payload.get("artifacts") if isinstance(payload, dict) else None
+if (not isinstance(rows, list) or type(payload.get("total_count")) is not int
+        or payload["total_count"] != len(rows) or not 0 < len(rows) <= 100):
+    raise SystemExit("Security artifact list is incomplete")
+expected_name = f"platform-ci-route-{run_id}-{attempt}"
+matches = [row for row in rows if isinstance(row, dict) and row.get("name") == expected_name]
+if len(matches) != 1:
+    raise SystemExit("exact Security route artifact is missing or ambiguous")
+artifact = matches[0]
+workflow_run = artifact.get("workflow_run")
+if (type(artifact.get("id")) is not int or artifact["id"] <= 0
+        or type(artifact.get("size_in_bytes")) is not int
+        or not 0 < artifact["size_in_bytes"] <= 4 * 1024 * 1024
+        or artifact.get("expired") is not False
+        or not isinstance(artifact.get("digest"), str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", artifact["digest"]) is None
+        or not isinstance(workflow_run, dict)
+        or type(workflow_run.get("id")) is not int
+        or workflow_run["id"] != int(run_id)
+        or workflow_run.get("head_sha") != source_sha
+        or ("run_attempt" in workflow_run and
+            (type(workflow_run["run_attempt"]) is not int
+             or workflow_run["run_attempt"] != int(attempt)))):
+    raise SystemExit("Security route artifact identity is not exact")
+print(artifact["id"], artifact["size_in_bytes"], artifact["digest"][7:])
+PY
+)"
+read -r artifact_id api_size api_sha256 <<< "$artifact_fields"
+gh api --repo StrayForest/old_sparky \
+  "repos/StrayForest/old_sparky/actions/artifacts/$artifact_id/zip" \
+  > "$archive"
+[[ "$(stat -c '%s' -- "$archive")" == "$api_size" ]]
+[[ "$(sha256sum -- "$archive" | awk '{print $1}')" == "$api_sha256" ]]
+/usr/bin/python3 -I -B platform/tools/platform_production_classifier_artifact.py \
+  manifest "$archive" --target-sha "$security_source_sha" --require-recovery-bootstrap
+```
 
 The retained-cleanup workflow keeps SSH stdout/stderr in runner-private files
 until it records the closed diagnostic status. Missing or invalid remote

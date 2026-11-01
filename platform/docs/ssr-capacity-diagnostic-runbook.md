@@ -253,8 +253,17 @@ identities, and all of these conditions hold:
   memory attribution incomplete;
   it cannot be accepted by widening the generic parser limit.
 - The separate profile phase completes its 20-second ON window against the
-  same fixture manifest after the planned gap. Its profile data is attribution
-  only; do not merge it into capacity-window latency or CPU results.
+  same fixture manifest after the planned gap. Its trace-marked HTML warmups
+  prearm API and web OFF/ON usage windows; API also arms a thread-CPU cProfile
+  callback on each worker event loop. The callback rechecks the exact plan and
+  starts at the planned ON edge; the API rechecks actual start time around
+  profiler construction and activation. At stop, it disables first, then
+  rechecks the exact process-bound plan and end time before emitting a complete
+  profile record. A missing, late, replaced, or unreadable plan remains
+  incomplete; the first ON request cannot start or shift this profile. Keep the
+  250 ms start and end bounds. The 120-second capacity workload never enables
+  API cProfile. Profile data is attribution only; do not merge it into
+  capacity-window latency or CPU results.
 - Both phase records, the top-level completion state and the full source and
   fixture bindings pass their closed validators. The phases fit within the
   600-second outer deadline, and finalization and exact fixture cleanup pass.
@@ -265,9 +274,69 @@ The capacity phase is descriptive and has no latency or throughput threshold.
 Any missing phase, request identity, required metric, cleanup proof, binding,
 or deadline condition makes the composite incomplete; retain the partial
 observations as partial and assign no capacity, SLO, or matrix credit. The
-profiled phase is never capacity evidence. Do not report function-level
-attribution from aggregate-only summaries; the V8 sampling interval is
-100 milliseconds and API thread CPU excludes other threads.
+profiled phase is never capacity evidence. API function self-time is measured
+on the event-loop thread and excludes other threads. Web V8 category values
+sum sampled `timeDeltas` at a 100-millisecond interval; they are not process
+CPU time or exact function self-time, and `other` can combine many unclassified
+frames. Do not report function-level attribution from these aggregate-only
+summaries.
+
+If the report sanitizer emits `report_projection_rejected`, preserve its
+closed `composite_report` field path and `projection_reason` for diagnosis.
+These are static schema labels and structural types/counts only; they do not
+contain report values or unexpected key names. A rejected report grants no
+credit. Do not infer whether either phase ran from missing projected phase IDs;
+the workflow publishes the bounded rejection object as a separate one-day
+sanitizer diagnostic artifact. Use independently bound phase evidence and the
+exact run window when determining whether phase work ran.
+
+Download and freeze that artifact promptly if sanitization failed; its
+retention is one day. Validate it without printing its values:
+
+```bash
+set -euo pipefail
+umask 077
+private_dir="$(mktemp -d /tmp/ssr-sanitizer-diagnostic.XXXXXX)"
+chmod 700 "$private_dir"
+gh run download <exact-load-run-id> --repo StrayForest/old_sparky \
+  --name "platform-production-ssr-sanitizer-rejection-<exact-load-run-id>-<exact-load-attempt>" \
+  --dir "$private_dir"
+python3 - "$private_dir/sanitizer-failure.json" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
+required = {
+    "schema", "event", "workload", "source_sha", "app_target_sha",
+    "external_run_id", "external_run_attempt", "status", "stage", "reason",
+    "section", "field", "present", "value_type", "binding_status",
+    "matrix_credit", "slo_credit", "diagnostic_credit",
+}
+optional = {
+    "projection_reason", "missing_known_field_count", "unexpected_field_count",
+}
+assert required <= set(payload) <= required | optional
+assert payload["schema"] == 1
+assert payload["event"] == "ssr_capacity_sanitizer_rejection"
+assert re.fullmatch(r"[0-9a-f]{40}", payload["source_sha"])
+assert re.fullmatch(r"[0-9a-f]{40}", payload["app_target_sha"])
+assert payload["external_run_id"].isdecimal()
+assert re.fullmatch(r"[1-9][0-9]{0,8}", payload["external_run_attempt"])
+assert payload["status"] == "invalid"
+assert payload["matrix_credit"] is False
+assert payload["slo_credit"] is False
+assert payload["diagnostic_credit"] is False
+if payload.get("projection_reason") == "field_set_mismatch":
+    assert type(payload.get("missing_known_field_count")) is int
+    assert type(payload.get("unexpected_field_count")) is int
+print("closed SSR sanitizer rejection artifact; all credit flags are false")
+PY
+```
+
+Keep the private directory and its artifact with the exact run's evidence; do
+not paste the JSON into a ticket or job log.
 
 ## Abort and close the exact fixture
 
@@ -304,6 +373,14 @@ missing or invalid, it fails closed. Do not restore or download the private
 manifest to bypass this check. Proceed to cleanup only when the canonical abort
 normalizer produces `status=safe_for_exact_fixture_cleanup` for the selected
 run and attempt.
+
+The origin supervisor keeps the observer timeout tree in its own process
+session. On `SIGINT` or `SIGTERM`, it stops and reaps that session before it
+writes terminal observer progress or `supervisor.exit`. If the exact-run export
+lacks a valid supervisor exit record, its process group remains, or observer
+progress reports a phase regression, treat the fixture as open: run the
+canonical abort for that exact run and attempt, then exact cleanup after the
+abort normalizer permits it. Do not create or repair terminal receipts by hand.
 
 Then dispatch exact cleanup. Enter the same control account at the hidden
 prompt; the email travels only in the JSON request body on stdin:

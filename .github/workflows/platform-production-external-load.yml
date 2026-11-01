@@ -2254,6 +2254,7 @@ jobs:
             --manifest "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json" \
             --source-sha "$TARGET_SHA" --app-target-sha "$APP_TARGET_SHA" \
             --external-run-id "$GITHUB_RUN_ID" --external-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --diagnostic-output "$RUNNER_TEMP/ssr-capacity-report/sanitizer-failure.json" \
             --workload '${{ inputs.ssr_capacity_workload }}'
 
       - name: Publish only the bounded SSR capacity summary
@@ -2273,6 +2274,16 @@ jobs:
         with:
           name: platform-production-ssr-capacity-fingerprint-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/ssr-capacity-report/failure-fingerprint.json
+          if-no-files-found: ignore
+          retention-days: 1
+
+      - name: Publish bounded SSR sanitizer rejection details
+        id: publish-ssr-sanitizer-rejection
+        if: ${{ always() && inputs.ssr_capacity_diagnostic_only == true && steps.remove-diagnostic-ssh-material.outcome == 'success' && steps.remove-ssr-capacity-ssh.outcome == 'success' && steps.sanitize-ssr-capacity.outcome == 'failure' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-production-ssr-sanitizer-rejection-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ssr-capacity-report/sanitizer-failure.json
           if-no-files-found: ignore
           retention-days: 1
 

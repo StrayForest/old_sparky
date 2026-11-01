@@ -9,6 +9,8 @@ set -euo pipefail
 RUNTIME_ROOT="/opt/oldsparky/platform"
 PLATFORM_ROOT="$RUNTIME_ROOT/current"
 TOOLS_DIR="$PLATFORM_ROOT/tools"
+OBSERVER_SHUTDOWN_HELPER="$TOOLS_DIR/platform_external_fixture_observer_shutdown.sh"
+SETSID="/usr/bin/setsid"
 SCRIPT_PATH="$(readlink -f -- "$TOOLS_DIR/platform_production_external_fixture_qa.sh")"
 QA_PYTHON="$RUNTIME_ROOT/shared/venv/bin/python"
 OUTPUT_ROOT_BASE="$RUNTIME_ROOT/shared/production-retained-matrix"
@@ -37,10 +39,17 @@ if [[ ! -f "$LOCK_HELPER" || -L "$LOCK_HELPER" || ! -x "$LOCK_HELPER" ]]; then
   echo "Canonical retained-load lock helper is missing or unsafe." >&2
   exit 1
 fi
+if [[ ! -f "$OBSERVER_SHUTDOWN_HELPER" || -L "$OBSERVER_SHUTDOWN_HELPER" \
+  || ! -r "$OBSERVER_SHUTDOWN_HELPER" || ! -x "$SETSID" ]]; then
+  echo "Canonical observer shutdown support is missing or unsafe." >&2
+  exit 1
+fi
 # The helper is selected only after the active immutable release path has been
 # validated above; ShellCheck cannot resolve that runtime-derived source path.
 # shellcheck source=/dev/null
 source "$LOCK_HELPER"
+# shellcheck source=/dev/null
+source "$OBSERVER_SHUTDOWN_HELPER"
 ORIGINAL_ARGS=("$@")
 platform_retained_load_lock_supervise "${ORIGINAL_ARGS[@]}" || {
   echo "Another retained load or cleanup operation is already running on this host." >&2
@@ -231,18 +240,34 @@ export_dir="/tmp/old-sparky-production-retained-load-$run_id"
 supervisor_exit_path="$export_dir/supervisor.exit"
 export_created=0
 export_dir_identity=""
+observer_pid=""
+observer_launch_in_progress=0
+pending_supervisor_exit_status=""
 # ShellCheck cannot infer functions invoked through a dynamically registered
 # EXIT trap; this callback is reachable only when that trap fires.
 # shellcheck disable=SC2317
 write_supervisor_exit() {
   local supervisor_status=$?
-  if [[ "${progress_enabled:-0}" == "1" ]]; then
+  local observer_stopped=1
+  # Ignore a second termination signal while the observer session is being
+  # stopped. The terminal receipt must not race with a live progress writer.
+  trap '' INT TERM
+  if [[ -n "${observer_pid:-}" ]]; then
+    if platform_external_fixture_stop_observer_group "$observer_pid"; then
+      observer_pid=""
+    else
+      observer_stopped=0
+      supervisor_status=1
+      echo "Observer process group did not stop; withholding terminal fixture receipts." >&2
+    fi
+  fi
+  if [[ "${progress_enabled:-0}" == "1" && "$observer_stopped" == "1" ]]; then
     record_progress "supervisor_exit" "${progress_stop_marker_seen:-false}" || true
     if [[ "${progress_write_failed:-0}" == "1" && "$supervisor_status" == "0" ]]; then
       supervisor_status=1
     fi
   fi
-  if [[ "$export_created" == "1" && -n "$export_dir_identity" \
+  if [[ "$observer_stopped" == "1" && "$export_created" == "1" && -n "$export_dir_identity" \
     && -d "$export_dir" && ! -L "$export_dir" \
     && "$(/usr/bin/stat -c '%d:%i:%u:%g:%a:%h' -- "$export_dir" 2>/dev/null || true)" == "$export_dir_identity" ]]; then
     if [[ ! -e "$supervisor_exit_path" && ! -L "$supervisor_exit_path" ]] \
@@ -271,6 +296,17 @@ write_supervisor_exit() {
   exit "$supervisor_status"
 }
 trap write_supervisor_exit EXIT
+# shellcheck disable=SC2317
+handle_supervisor_signal() {
+  local requested_status="$1"
+  if [[ "${observer_launch_in_progress:-0}" == "1" ]]; then
+    pending_supervisor_exit_status="$requested_status"
+    return 0
+  fi
+  exit "$requested_status"
+}
+trap 'handle_supervisor_signal 130' INT
+trap 'handle_supervisor_signal 143' TERM
 validate_fixture_confirmation() {
   case "$confirmation:$fixture_kind" in
     "$EXTERNAL_CONFIRMATION:external_load"|"$TIMEOUT_DIAGNOSTICS_CONFIRMATION:external_load"|\
@@ -633,11 +669,16 @@ PY
   if [[ "$timeout_diagnostics" == "true" ]]; then
     observer_args+=(--diagnostic-id-file "$timeout_diagnostic_ids_path")
   fi
-  timeout --signal=TERM --kill-after=30s "$MAX_RUNTIME" \
+  observer_launch_in_progress=1
+  "$SETSID" timeout --signal=TERM --kill-after=30s "$MAX_RUNTIME" \
     env PLATFORM_RUNTIME_SERVICE=observer \
     "$QA_PYTHON" -B "${observer_args[@]}" \
       > "$external_vote_observer_log" 2>&1 &
   observer_pid="$!"
+  observer_launch_in_progress=0
+  if [[ -n "$pending_supervisor_exit_status" ]]; then
+    exit "$pending_supervisor_exit_status"
+  fi
   set -e
   sleep 1
   kill -0 "$observer_pid" 2>/dev/null || {
@@ -652,13 +693,11 @@ PY
   printf 'PRODUCTION_EXTERNAL_LOAD_READY=%s\n' "$export_dir/manifest.json"
   observer_deadline=$(( $(date +%s) + 10800 ))
   observer_waited_early=0
-  observer_exited_before_complete=0
   observer_early_status=0
   while [[ ! -e "$external_vote_complete" ]]; do
     if ! kill -0 "$observer_pid" 2>/dev/null; then
       wait "$observer_pid" 2>/dev/null || observer_early_status="$?"
       observer_waited_early=1
-      observer_exited_before_complete=1
       echo "External-load observer exited before the load completed." >&2
       qa_status=1
       break
@@ -685,9 +724,11 @@ PY
   fi
   if [[ "$observer_waited_early" == "1" ]]; then
     observer_status="$observer_early_status"
+    observer_pid=""
   else
     observer_status=0
     wait "$observer_pid" 2>/dev/null || observer_status="$?"
+    observer_pid=""
   fi
   if [[ "$progress_enabled" == "1" ]]; then
     record_progress "observer_reaped" "$progress_stop_marker_seen" "$observer_status" || true
