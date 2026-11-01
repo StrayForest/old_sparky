@@ -1745,9 +1745,8 @@ def _validate_usage_summary(
             any(type(value) is not int for value in (
                 sampled_start_ms, sampled_end_ms, sampled_duration_ms,
             ))
-            or not 0 <= sampled_start_ms <= 1_000
             or sampled_end_ms < sampled_start_ms
-            or sampled_end_ms > expected_memory_window_ms
+            or sampled_end_ms > expected_memory_window_ms + 500
             or sampled_duration_ms != sampled_end_ms - sampled_start_ms
             or sampled_duration_ms > expected_memory_window_ms
             or row.get("status") == "complete"

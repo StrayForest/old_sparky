@@ -10,13 +10,16 @@ and reports at most five bounded Node/V8 samples per phase. Standard 20-second
 plans sample at a nominal four-second interval. The typed
 `authenticated_html_ssr_capacity_120s_v1` plan spaces five samples across its
 bound phase window (about 30 seconds between samples); its ON sample window may
-span at most the exact planned 120 seconds, while OFF remains at most 20
-seconds. The parser and runner use that wider bound only when the workload and
-phase duration match the exact plan; other workloads remain capped at 20
-seconds. A delayed/incomplete window may contain fewer samples; only exactly
-five accepted samples are complete, and missing samples are never filled or
-promoted to PASS. RSS, V8 heap, external memory and array buffers are byte
-gauges; Node reports `arrayBuffers` as a component of `external`, so do not add
+span at most 120 seconds, while OFF remains at most 20 seconds. The final
+sample endpoint may fall up to 500 ms after its phase boundary, matching the
+existing diagnostic timer tolerance; `sampled_window_duration_ms` itself must
+remain within the planned phase duration. The parser and runner use the wider
+duration bound only when the workload and phase duration match the exact plan;
+other workloads remain capped at 20 seconds. A delayed/incomplete window may
+contain fewer samples; only exactly five accepted samples are complete, and
+missing samples are never filled or promoted to PASS. RSS, V8 heap, external
+memory and array buffers are byte gauges; Node reports `arrayBuffers` as a
+component of `external`, so do not add
 them together. GC entries belong to a phase by their monotonic start time, and
 a collection extending past the phase end contributes only its in-phase
 duration. `sampled_window_duration_ms` is the interval between the first and

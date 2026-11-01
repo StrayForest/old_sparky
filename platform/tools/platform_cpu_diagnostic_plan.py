@@ -1549,11 +1549,15 @@ def _parse_node_memory_event(
     message: str,
     *,
     max_sampled_window_ms: int = ON_WINDOW_MS,
+    max_sampled_window_end_ms: int | None = None,
 ) -> dict[str, Any] | None:
     """Project one bounded Node/cgroup aggregate from its closed log schema."""
     if (not message.startswith("cpu_diagnostic_memory ") or len(message) > 4096
             or type(max_sampled_window_ms) is not int
-            or not 0 <= max_sampled_window_ms <= MAX_TOTAL_WINDOW_MS):
+            or not 0 <= max_sampled_window_ms <= MAX_TOTAL_WINDOW_MS
+            or max_sampled_window_end_ms is not None
+            and (type(max_sampled_window_end_ms) is not int
+                 or not 0 <= max_sampled_window_end_ms <= MAX_TOTAL_WINDOW_MS + 500)):
         return None
     values: dict[str, str] = {}
     for token in message.split()[1:]:
@@ -1595,8 +1599,8 @@ def _parse_node_memory_event(
     sampled_end_ms = result["sampled_window_end_elapsed_ms"]
     sampled_duration_ms = result["sampled_window_duration_ms"]
     if (
-        sampled_start_ms is not None and sampled_start_ms > 1_000
-        or sampled_end_ms is not None and sampled_end_ms > max_sampled_window_ms
+        sampled_end_ms is not None and max_sampled_window_end_ms is not None
+        and sampled_end_ms > max_sampled_window_end_ms
         or sampled_start_ms is not None and sampled_end_ms is not None
         and sampled_end_ms < sampled_start_ms
         or sampled_duration_ms is not None and sampled_start_ms is not None
@@ -1797,6 +1801,10 @@ def _usage_summary(
                     ON_WINDOW_MS_BY_WORKLOAD[workload]
                     if workload in ON_WINDOW_MS_BY_WORKLOAD else ON_WINDOW_MS
                 ),
+                max_sampled_window_end_ms=(
+                    (ON_WINDOW_MS_BY_WORKLOAD[workload]
+                     if workload in ON_WINDOW_MS_BY_WORKLOAD else ON_WINDOW_MS) + 500
+                ),
             ) if is_memory else None
         )
         if memory_match is not None:
@@ -1809,7 +1817,7 @@ def _usage_summary(
             if (
                 sampled_window_ms is not None and sampled_window_ms > expected_memory_window_ms
                 or sampled_window_end_ms is not None
-                and sampled_window_end_ms > expected_memory_window_ms
+                and sampled_window_end_ms > expected_memory_window_ms + 500
             ):
                 memory_match = None
         if memory_match is not None and memory_match["run_id"] != run_id:

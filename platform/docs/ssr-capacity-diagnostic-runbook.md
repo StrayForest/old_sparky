@@ -243,11 +243,14 @@ identities, and all of these conditions hold:
   ```
 - The `authenticated_html_ssr_capacity_120s_v1` plan binds the Node memory
   event window to its exact phase duration: OFF remains capped at 20 seconds,
-  while ON may span the full planned 120 seconds. Legacy and 20-second plan
-  events remain capped at 20 seconds. Require the expected five Node samples,
-  valid window endpoints within that bound, and complete cgroup evidence where
-  the hierarchy is available. A sample outside its exact phase plan, malformed
-  telemetry, or changed service identity makes memory attribution incomplete;
+  while ON may span 120 seconds. The final sample endpoint may extend up to
+  500 ms beyond the phase boundary under the existing timer tolerance, while
+  the sampled interval duration itself remains capped at the planned phase
+  length. Legacy and 20-second plan events remain capped at 20 seconds. Require
+  the expected five Node samples, valid endpoints within those bounds, and
+  complete cgroup evidence where the hierarchy is available. A sample outside
+  its exact phase plan, malformed telemetry, or changed service identity makes
+  memory attribution incomplete;
   it cannot be accepted by widening the generic parser limit.
 - The separate profile phase completes its 20-second ON window against the
   same fixture manifest after the planned gap. Its profile data is attribution

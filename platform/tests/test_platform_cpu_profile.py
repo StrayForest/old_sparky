@@ -3425,23 +3425,38 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             .replace("sampled_window_duration_ms=16000", "sampled_window_duration_ms=20001")
         ))
         typed_120s_message = (
-            message.replace("sampled_window_end_elapsed_ms=16000", "sampled_window_end_elapsed_ms=120000")
-            .replace("sampled_window_duration_ms=16000", "sampled_window_duration_ms=120000")
+            message.replace("sampled_window_start_elapsed_ms=0", "sampled_window_start_elapsed_ms=97")
+            .replace("sampled_window_end_elapsed_ms=16000", "sampled_window_end_elapsed_ms=120022")
+            .replace("sampled_window_duration_ms=16000", "sampled_window_duration_ms=119925")
         )
         self.assertIsNone(diagnostic_plan_tool._parse_node_memory_event(typed_120s_message))
         typed_120s = diagnostic_plan_tool._parse_node_memory_event(
-            typed_120s_message, max_sampled_window_ms=120_000,
+            typed_120s_message,
+            max_sampled_window_ms=120_000,
+            max_sampled_window_end_ms=120_500,
         )
         self.assertIsNotNone(typed_120s)
         assert typed_120s is not None
-        self.assertEqual(typed_120s["sampled_window_duration_ms"], 120_000)
+        self.assertEqual(typed_120s["sampled_window_duration_ms"], 119_925)
         self.assertIsNone(diagnostic_plan_tool._parse_node_memory_event(
             typed_120s_message.replace(
-                "sampled_window_end_elapsed_ms=120000", "sampled_window_end_elapsed_ms=120001",
+                "sampled_window_end_elapsed_ms=120022", "sampled_window_end_elapsed_ms=120501",
             ).replace(
-                "sampled_window_duration_ms=120000", "sampled_window_duration_ms=120001",
+                "sampled_window_duration_ms=119925", "sampled_window_duration_ms=120404",
             ),
             max_sampled_window_ms=120_000,
+            max_sampled_window_end_ms=120_500,
+        ))
+        self.assertIsNone(diagnostic_plan_tool._parse_node_memory_event(
+            typed_120s_message.replace(
+                "sampled_window_start_elapsed_ms=97", "sampled_window_start_elapsed_ms=0",
+            ).replace(
+                "sampled_window_end_elapsed_ms=120022", "sampled_window_end_elapsed_ms=120001",
+            ).replace(
+                "sampled_window_duration_ms=119925", "sampled_window_duration_ms=120001",
+            ),
+            max_sampled_window_ms=120_000,
+            max_sampled_window_end_ms=120_500,
         ))
         self.assertIsNone(diagnostic_plan_tool._parse_node_memory_event(
             message, max_sampled_window_ms=diagnostic_plan_tool.MAX_TOTAL_WINDOW_MS + 1,
@@ -4769,11 +4784,14 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     continue
                 elif raw_message.startswith("cpu_diagnostic_memory ") and "phase=on " in raw_message:
                     raw_message = raw_message.replace(
+                        "sampled_window_start_elapsed_ms=0",
+                        "sampled_window_start_elapsed_ms=97",
+                    ).replace(
                         "sampled_window_end_elapsed_ms=16000",
-                        "sampled_window_end_elapsed_ms=120000",
+                        "sampled_window_end_elapsed_ms=120022",
                     ).replace(
                         "sampled_window_duration_ms=16000",
-                        "sampled_window_duration_ms=120000",
+                        "sampled_window_duration_ms=119925",
                     )
                 record["MESSAGE"] = (
                     json.dumps({**wrapped, "message": raw_message}, separators=(",", ":"))
@@ -4788,7 +4806,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             ):
                 typed_summary = diagnostic_plan_tool._usage_summary(typed_plans)
             self.assertEqual(typed_summary["memory_status"], "complete", typed_summary)
-            self.assertEqual(typed_summary["memory_rows"][1]["sampled_window_duration_ms"], 120_000)
+            self.assertEqual(typed_summary["memory_rows"][1]["sampled_window_duration_ms"], 119_925)
 
             summary_path.write_text(json.dumps({
                 "status": "expired_plans_removed", "service_count": 2, **typed_summary,
@@ -4809,15 +4827,20 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertIsNotNone(typed_validated)
             assert typed_validated is not None
             oversized_typed_summary = json.loads(json.dumps(typed_dispatched))
-            oversized_typed_summary["memory_rows"][1]["sampled_window_end_elapsed_ms"] = 120_001
-            oversized_typed_summary["memory_rows"][1]["sampled_window_duration_ms"] = 120_001
+            oversized_typed_summary["memory_rows"][1]["sampled_window_end_elapsed_ms"] = 120_501
+            oversized_typed_summary["memory_rows"][1]["sampled_window_duration_ms"] = 120_404
             self.assertIsNone(cpu_pair._validate_usage_summary(oversized_typed_summary))
+            over_duration_summary = json.loads(json.dumps(typed_dispatched))
+            over_duration_summary["memory_rows"][1]["sampled_window_start_elapsed_ms"] = 0
+            over_duration_summary["memory_rows"][1]["sampled_window_end_elapsed_ms"] = 120_001
+            over_duration_summary["memory_rows"][1]["sampled_window_duration_ms"] = 120_001
+            self.assertIsNone(cpu_pair._validate_usage_summary(over_duration_summary))
             typed_telemetry = capacity_diagnostic._project_server_telemetry(
                 typed_validated, expected_workload=typed_workload,
             )
             self.assertEqual(typed_telemetry["node_memory_status"], "complete")
             self.assertEqual(
-                typed_telemetry["node_memory_rows"][1]["sampled_window_duration_ms"], 120_000,
+                typed_telemetry["node_memory_rows"][1]["sampled_window_duration_ms"], 119_925,
             )
 
             mismatched_typed_plans = json.loads(json.dumps(typed_plans))
