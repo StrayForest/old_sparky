@@ -4823,18 +4823,24 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             typed_dispatched = json.loads(
                 typed_stdout.getvalue().strip().removeprefix("CPU_DIAGNOSTIC_PLAN ")
             )
-            typed_validated = cpu_pair._validate_usage_summary(typed_dispatched)
+            typed_validated = cpu_pair._validate_usage_summary(
+                typed_dispatched, expected_workload=typed_workload,
+            )
             self.assertIsNotNone(typed_validated)
             assert typed_validated is not None
             oversized_typed_summary = json.loads(json.dumps(typed_dispatched))
             oversized_typed_summary["memory_rows"][1]["sampled_window_end_elapsed_ms"] = 120_501
             oversized_typed_summary["memory_rows"][1]["sampled_window_duration_ms"] = 120_404
-            self.assertIsNone(cpu_pair._validate_usage_summary(oversized_typed_summary))
+            self.assertIsNone(cpu_pair._validate_usage_summary(
+                oversized_typed_summary, expected_workload=typed_workload,
+            ))
             over_duration_summary = json.loads(json.dumps(typed_dispatched))
             over_duration_summary["memory_rows"][1]["sampled_window_start_elapsed_ms"] = 0
             over_duration_summary["memory_rows"][1]["sampled_window_end_elapsed_ms"] = 120_001
             over_duration_summary["memory_rows"][1]["sampled_window_duration_ms"] = 120_001
-            self.assertIsNone(cpu_pair._validate_usage_summary(over_duration_summary))
+            self.assertIsNone(cpu_pair._validate_usage_summary(
+                over_duration_summary, expected_workload=typed_workload,
+            ))
             typed_telemetry = capacity_diagnostic._project_server_telemetry(
                 typed_validated, expected_workload=typed_workload,
             )
