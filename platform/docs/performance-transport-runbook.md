@@ -38,9 +38,9 @@ closed `source_collection_reason` for API and web. Both must be
 `complete`, and the stream capture marker must be complete, before source
 coverage can be treated as complete. Any cap, malformed row, identity
 mismatch, journal error, or failed sync remains incomplete with its reason.
-Within one query, the first detected collection failure is retained. If both
-the web query and its preceding sync fail, the query reason takes precedence;
-`journal_sync_failed` is used when the query itself completes.
+The first observed failure is retained: a failed sync precedes and takes
+priority over any later web-query failure. If sync succeeds, the query reports
+its first detected failure.
 
 `memory.peak` is the cgroup lifetime high-water mark, while
 `current_sampled_max` is the greatest sampled `memory.current` value; neither

@@ -1452,9 +1452,9 @@ def _capacity_request_telemetry(
         ),
         run_id=run_id, request_ids=selected_set,
     )
-    if not marker_sync_ok and web_collection_reason == "complete":
-        # A source-query error takes precedence; record sync failure only when
-        # the otherwise-complete query cannot guarantee marker visibility.
+    if not marker_sync_ok:
+        # Sync runs before the query; retain its failure as the first observed
+        # cause even if the following query also encounters a failure.
         web_collection_reason = "journal_sync_failed"
     nginx_raw, nginx_truncated = _bounded_nginx_rows(
         selected_set, since_ms=max(0, start_ms - 1_000), until_ms=capture_end_ms,

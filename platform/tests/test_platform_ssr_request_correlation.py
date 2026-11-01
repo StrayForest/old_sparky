@@ -364,7 +364,7 @@ assert correlated["timing_ms"]["ssr_stream_milestone_elapsed_ms"]["request_start
 assert correlated["ssr_stream_coverage"]["capture_status"] == "complete"
 assert query_order == [("query", "api"), ("sync", plan["expires_at_ms"]), ("query", "web")]
 assert correlated["coverage"]["source_collection_reason"] == {"api": "complete", "web": "complete"}
-collector_state.update(sync_ok=False, web_reason="byte_cap")
+collector_state.update(sync_ok=True, web_reason="byte_cap")
 failed_query = module._capacity_request_telemetry(
     {"api": dict(plan), "web": dict(plan)},
     selected_request_ids=[request_id],
@@ -380,6 +380,20 @@ failed_query = module._capacity_request_telemetry(
 assert failed_query["coverage"]["source_collection_reason"]["web"] == "byte_cap"
 assert failed_query["coverage"]["source_rows_truncated"]["ssr"]
 assert failed_query["coverage"]["source_rows_truncated"]["stream"]
+collector_state.update(sync_ok=False, web_reason="byte_cap")
+sync_and_query_failure = module._capacity_request_telemetry(
+    {"api": dict(plan), "web": dict(plan)},
+    selected_request_ids=[request_id],
+    cohort_counts={
+        "submitted_html_count": 1, "valid_response_id_count": 1,
+        "missing_response_id_count": 0, "duplicate_response_id_count": 0,
+        "malformed_response_id_count": 0, "eligible_response_id_count": 1,
+        "retained_sample_count": 1,
+        "sample_scheme": "sha256-runid-requestid-1of8-v1",
+        "sample_cap_truncated": False,
+    },
+)
+assert sync_and_query_failure["coverage"]["source_collection_reason"]["web"] == "journal_sync_failed"
 collector_state.update(sync_ok=False, web_reason="complete")
 failed_sync = module._capacity_request_telemetry(
     {"api": dict(plan), "web": dict(plan)},
