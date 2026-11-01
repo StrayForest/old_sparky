@@ -8,6 +8,7 @@ instead of relying on GitHub's implicit job conclusion propagation.
 
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 import json
@@ -19,6 +20,8 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -154,6 +157,76 @@ def _step_script(job: str, name: str) -> str:
 
 
 class ExternalLoadWorkflowContractTests(unittest.TestCase):
+    def test_isolated_capacity_worker_passes_app_sha_to_environment_builder(self) -> None:
+        from tools import platform_ssr_capacity_diagnostic as capacity_diagnostic
+        from tests.test_platform_noop_source_binding import (
+            APP_SHA,
+            RUNNER_SHA,
+            _validated_source_binding_handoff,
+        )
+
+        source_sha = RUNNER_SHA
+        app_target_sha = APP_SHA
+        canonical_binding = json.dumps(
+            _validated_source_binding_handoff(),
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        binding_base64 = base64.b64encode(canonical_binding).decode("ascii")
+        binding_sha256 = hashlib.sha256(canonical_binding).hexdigest()
+        captured: dict[str, object] = {}
+
+        class StopBeforeNamespace(Exception):
+            pass
+
+        def capture_supervisor(**kwargs: object) -> None:
+            captured.update(kwargs)
+            raise StopBeforeNamespace
+
+        now_ms = time.time_ns() // 1_000_000
+        with (
+            patch.dict(os.environ, {
+                "SOURCE_GIT_SHA": source_sha,
+                "APP_TARGET_SHA": app_target_sha,
+                "SOURCE_BINDING_BASE64": binding_base64,
+                "SOURCE_BINDING_SHA256": binding_sha256,
+            }, clear=True),
+            patch.object(capacity_diagnostic.external_load, "RunnerCgroupSampler"),
+            patch.object(
+                capacity_diagnostic.load_runtime,
+                "run_supervised",
+                side_effect=capture_supervisor,
+            ),
+            self.assertRaises(StopBeforeNamespace),
+        ):
+            capacity_diagnostic.run_isolated_capacity_worker(
+                stage_state={},
+                capacity_config={"workload": capacity_diagnostic.HTML_CAPACITY_120S_WORKLOAD},
+                worker_binding={},
+                worker_report_path=Path("worker-report.json"),
+                supervisor_report_path=Path("supervisor-report.json"),
+                source_sha=source_sha,
+                app_target_sha=app_target_sha,
+                watcher=SimpleNamespace(worker_deadline_unix_ms=None),
+                hide_ssh_material=lambda: None,
+                restore_ssh_material=lambda: None,
+                maximum_runtime_seconds=capacity_diagnostic.WORKER_RUNTIME_SECONDS_BY_WORKLOAD[
+                    capacity_diagnostic.HTML_CAPACITY_120S_WORKLOAD
+                ],
+                on_start_ms=now_ms + 1_000,
+                on_end_ms=now_ms + 121_000,
+            )
+
+        self.assertTrue(captured["clear_worker_environment"])
+        self.assertEqual(captured["env"], {
+            "SOURCE_GIT_SHA": source_sha,
+            "APP_TARGET_SHA": app_target_sha,
+            "SOURCE_BINDING_BASE64": binding_base64,
+            "SOURCE_BINDING_SHA256": binding_sha256,
+        })
+
     def test_supervisor_stops_observer_session_before_terminal_exit_receipt(self) -> None:
         supervisor_source = (
             REPO_ROOT / "platform/tools/platform_production_external_fixture_qa.sh"
