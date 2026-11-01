@@ -63,6 +63,54 @@ def _python_block(script: str, command_marker: str) -> str:
     return script[heredoc:end].lstrip("\n")
 
 
+def _fixture_descriptor(
+    *, runner_sha: str, app_sha: str, run_id: str, attempt: str,
+    binding: dict[str, object] | None,
+) -> dict[str, object]:
+    binding_digest = (
+        hashlib.sha256(
+            json.dumps(binding, ensure_ascii=True, allow_nan=False, sort_keys=True,
+                        separators=(",", ":")).encode("ascii")
+        ).hexdigest()
+        if binding is not None else None
+    )
+    public_input: dict[str, object] = {
+        "schema": 2 if binding is not None else 1,
+        "target_sha": runner_sha,
+        "setup_concurrency": "8",
+        "run_id": run_id,
+        "profile": "external-vote",
+        "tournament_count": "1",
+        "users_per_tournament": "14",
+        "timeout_diagnostics": "false",
+        "fixture_kind": "external_load",
+    }
+    if binding is not None:
+        public_input["source_binding"] = binding
+    return {
+        "schema": 1,
+        "run_id": run_id,
+        "run_attempt": attempt,
+        "runner_sha": runner_sha,
+        "app_target_sha": app_sha,
+        "input": public_input,
+        "manifest": {
+            "sha256": "d" * 64,
+            "size_bytes": 1024,
+            "schema": 2,
+            "purpose": "external_ready_vote",
+            "origin": "https://old-sparky.com",
+            "runner_sha": runner_sha,
+            "app_target_sha": app_sha,
+            "source_binding": binding,
+            "source_binding_sha256": binding_digest,
+            "tournament_count": 1,
+            "user_count": 14,
+            "users_per_tournament": [14],
+        },
+    }
+
+
 def _hermetic_profile(profile_id: str) -> dict[str, object]:
     """Keep the canonical mode/acceptance shape while shrinking fixture work."""
 
@@ -1136,9 +1184,15 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
             receipt_path = root / "load-status.json"
             report_path.write_text(json.dumps(report, sort_keys=True) + "\n", encoding="utf-8")
             input_path.write_text(
-                json.dumps({"schema": 1, "target_sha": SOURCE_SHA}) + "\n",
+                json.dumps(
+                    _fixture_descriptor(
+                        runner_sha=SOURCE_SHA, app_sha=SOURCE_SHA,
+                        run_id=RUN_ID, attempt="1", binding=None,
+                    )
+                ) + "\n",
                 encoding="ascii",
             )
+            input_path.chmod(0o600)
             branch_shell = "\n".join(
                 (
                     'TIMEOUT_DIAGNOSTICS=true',
@@ -1176,7 +1230,7 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                 load_step, '/usr/bin/python3 - "$artifact_dir/load-status.json"'
             )
             evaluator_match = re.search(
-                r'validation_kind="\$\(/usr/bin/python3 - "\$load_status_file" "\$report" "\$RUNNER_TEMP/external-input/platform-production-external-load-input.json" "\$SOURCE_GIT_SHA" "\$APP_TARGET_SHA" "\$GITHUB_RUN_ID" "\$GITHUB_RUN_ATTEMPT" "\$PROFILE_ID" "\$TIMEOUT_DIAGNOSTICS" <<\'PY\'\n'
+                r'validation_kind="\$\(/usr/bin/python3 - "\$load_status_file".*?<<\'PY\'\n'
                 r"(?P<script>.*?)\nPY",
                 evaluate_step,
                 re.DOTALL,
@@ -1783,13 +1837,15 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
             artifact_dir.mkdir()
             receipt_path = artifact_dir / "load-status.json"
             input_path = root / "external-input.json"
-            input_payload: dict[str, object] = {
-                "schema": 2 if source_binding is not None else 1,
-                "target_sha": SOURCE_SHA,
-            }
-            if source_binding is not None:
-                input_payload["source_binding"] = source_binding
+            input_payload = _fixture_descriptor(
+                runner_sha=SOURCE_SHA,
+                app_sha=app_target_sha,
+                run_id=RUN_ID,
+                attempt="1",
+                binding=source_binding,
+            )
             input_path.write_text(json.dumps(input_payload) + "\n", encoding="ascii")
+            input_path.chmod(0o600)
             receipt_script = _python_block(
                 load_step,
                 '/usr/bin/python3 - "$artifact_dir/load-status.json"',

@@ -29,6 +29,7 @@ import zipfile
 
 import yaml
 from tools.platform_workflow_input_guard import validate_external_payload
+from tools import platform_workflow_remote_dispatch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -136,6 +137,54 @@ def _evidence_publish_truth_table(state: dict[str, object]) -> bool:
         and state.get("failed_worker_report_ready") == "1"
     )
     return common and (normal_candidate or closed_worker_failure)
+
+
+def _fixture_descriptor(
+    *, run_id: str, attempt: str, runner_sha: str, app_sha: str,
+    binding: dict[str, object] | None = None,
+) -> dict[str, object]:
+    binding_digest = (
+        hashlib.sha256(
+            json.dumps(binding, ensure_ascii=True, allow_nan=False, sort_keys=True,
+                        separators=(",", ":")).encode("ascii")
+        ).hexdigest()
+        if binding is not None else None
+    )
+    public_input: dict[str, object] = {
+        "schema": 2 if binding is not None else 1,
+        "target_sha": runner_sha,
+        "setup_concurrency": "8",
+        "run_id": run_id,
+        "profile": "external-vote",
+        "tournament_count": "1",
+        "users_per_tournament": "14",
+        "timeout_diagnostics": "false",
+        "fixture_kind": "external_load",
+    }
+    if binding is not None:
+        public_input["source_binding"] = binding
+    return {
+        "schema": 1,
+        "run_id": run_id,
+        "run_attempt": attempt,
+        "runner_sha": runner_sha,
+        "app_target_sha": app_sha,
+        "input": public_input,
+        "manifest": {
+            "sha256": "d" * 64,
+            "size_bytes": 1024,
+            "schema": 2,
+            "purpose": "external_ready_vote",
+            "origin": "https://old-sparky.com",
+            "runner_sha": runner_sha,
+            "app_target_sha": app_sha,
+            "source_binding": binding,
+            "source_binding_sha256": binding_digest,
+            "tournament_count": 1,
+            "user_count": 14,
+            "users_per_tournament": [14],
+        },
+    }
 
 
 def _step_script(job: str, name: str) -> str:
@@ -426,8 +475,14 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertIn("cpu_diagnostic_only:", self.source)
         self.assertIn("Evaluate typed CPU-only diagnostic without matrix credit", self.jobs["evaluate-load"])
         self.assertIn("Enforce CPU-only diagnostic and exact cleanup gates", self.jobs["evaluate-load"])
-        self.assertIn('cleanup.get("users_deleted") != 14', self.jobs["evaluate-load"])
-        self.assertIn('cleanup.get("tournaments_deleted") != 1', self.jobs["evaluate-load"])
+        self.assertRegex(
+            self.jobs["evaluate-load"],
+            r'cleanup\.get\("users_deleted"\)\s*!=\s*manifest\["user_count"\]',
+        )
+        self.assertRegex(
+            self.jobs["evaluate-load"],
+            r'cleanup\.get\("tournaments_deleted"\)\s*!=\s*manifest\["tournament_count"\]',
+        )
         self.assertIn("inputs.cpu_diagnostic_only == true", self.jobs["namespace-containment-barrier"])
         self.assertIn("/external-client/external-load.json", self.jobs["namespace-containment-barrier"])
         self.assertIn("/cpu-diagnostic-report/cpu-diagnostic.json", self.jobs["namespace-containment-barrier"])
@@ -817,8 +872,11 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertIn('default: "8"', self.source)
         self.assertIn('options:\n          - "8"\n          - "16"\n          - "32"\n          - "64"', self.source)
         self.assertIn("--concurrency '${{ inputs.ssr_capacity_concurrency }}'", pair)
-        self.assertIn('payload["ssr_capacity_concurrency"] = os.environ["SSR_CAPACITY_CONCURRENCY"]', validate)
-        self.assertIn('payload["ssr_capacity_workload"] = os.environ["SSR_CAPACITY_WORKLOAD"]', validate)
+        serialize = _step_script(
+            validate, "Serialize the private external-load input"
+        )
+        self.assertIn('payload["ssr_capacity_concurrency"] = ssr_concurrency', serialize)
+        self.assertIn('payload["ssr_capacity_workload"] = ssr_workload', serialize)
         barrier = self.jobs["namespace-containment-barrier"]
         self.assertIn('EXPECTED_SSR_WORKLOAD: ${{ inputs.ssr_capacity_workload }}', barrier)
         self.assertIn('EXPECTED_SOURCE_SHA: ${{ github.sha }}', barrier)
@@ -827,9 +885,10 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertIn('payload.get("fixture_kind") != expected_fixture', barrier)
         self.assertIn('payload.get("source_sha") != os.environ.get("EXPECTED_SOURCE_SHA")', barrier)
         self.assertNotIn("platform_external_load.py", pair)
-        self.assertIn('"tournament_count": "1" if diagnostic_only else tournaments', validate)
-        self.assertIn('"users_per_tournament": "14" if diagnostic_only else users', validate)
-        self.assertIn('"ssr_capacity_diagnostic_v1" if ssr_capacity_diagnostic_only == "true"', validate)
+        self.assertIn('if diagnostic and (timeout != "false" or tournaments != "1" or users != "14")', validate)
+        self.assertIn('"tournament_count": tournaments', validate)
+        self.assertIn('"users_per_tournament": users', validate)
+        self.assertIn('"ssr_html_capacity_composite_diagnostic_v1" if ssr_only == "true"', validate)
 
         guard_script = _step_script(
             validate, "Reject invalid external-load dispatch before checkout"
@@ -911,27 +970,18 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         )
 
         validate_step = _step_script(
+            self.jobs["resolve-load-source-and-profile"],
+            "Validate and export the exact load profile",
+        )
+        self.assertIn('SSR_CAPACITY_CONCURRENCY="$SSR_CAPACITY_CONCURRENCY"', validate_step)
+        self.assertIn('SSR_CAPACITY_WORKLOAD="$SSR_CAPACITY_WORKLOAD"', validate_step)
+        self.assertIn("platform_load.py validate --profile", validate_step)
+        serialize_step = _step_script(
             self.jobs["validate-external-inputs"],
-            "Validate explicit external production load",
+            "Serialize the private external-load input",
         )
-        function = re.search(
-            r"(?ms)^run_checked_out_client\(\) \{\n.*?^\s*\}",
-            validate_step,
-        )
-        self.assertIsNotNone(function)
-        assert function is not None
-        self.assertIn(
-            'SSR_CAPACITY_CONCURRENCY="$SSR_CAPACITY_CONCURRENCY"',
-            function.group(0),
-        )
-        self.assertIn(
-            'SSR_CAPACITY_WORKLOAD="$SSR_CAPACITY_WORKLOAD"',
-            function.group(0),
-        )
-        self.assertIn(
-            'payload["ssr_capacity_concurrency"] = os.environ["SSR_CAPACITY_CONCURRENCY"]',
-            validate_step,
-        )
+        self.assertIn('payload["ssr_capacity_concurrency"] = ssr_concurrency', serialize_step)
+        self.assertIn('payload["ssr_capacity_workload"] = ssr_workload', serialize_step)
 
         with tempfile.TemporaryDirectory(prefix="external-load-ssr-env-") as temp_dir:
             probe = subprocess.run(
@@ -940,8 +990,8 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                     "-euo",
                     "pipefail",
                     "-c",
-                    function.group(0)
-                    + '\nrun_checked_out_client /usr/bin/python3 -c '
+                    'env -i PATH=/usr/bin:/bin SSR_CAPACITY_CONCURRENCY="$SSR_CAPACITY_CONCURRENCY" '
+                    'SSR_CAPACITY_WORKLOAD="$SSR_CAPACITY_WORKLOAD" /usr/bin/python3 -c '
                     + "'import os; print(os.environ[\"SSR_CAPACITY_CONCURRENCY\"])'",
                 ],
                 env={
@@ -962,91 +1012,17 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
 
     def _assert_load_manifest_consumer_contract(self) -> None:
         step = _step_script(
-            self.jobs["load-client"], "Validate load manifest before candidate execution"
+            self.jobs["load-client"], "Validate exact fixture descriptor and decrypted manifest"
         )
-        consumer = step.split("<<'PY'\n", 1)[1].split("\nPY", 1)[0]
-        manifest = {
-            "schema": 2,
-            "purpose": "external_ready_vote",
-            "origin": "https://old-sparky.com",
-            "session_cookie_name": "session",
-            "csrf_cookie_name": "csrf",
-            "marker": "preprod123456789012abcd",
-            "created_at": "2026-10-24T00:00:00Z",
-            "tournaments": [],
-            "users": [{"id": 1}],
-            "runner_sha": "a" * 40,
-            "app_target_sha": "a" * 40,
-            "source_binding": None,
-            "source_binding_sha256": None,
-        }
-        producer_inputs = (
-            {
-                "schema": 1,
-                "confirmation": "RUN-PRODUCTION-EXTERNAL-LOAD",
-                "target_sha": "a" * 40,
-                "control_email": "qa@example.com",
-                "setup_concurrency": "16",
-                "run_id": "123456",
-                "profile": "external-vote",
-                "tournament_count": "40",
-                "users_per_tournament": "500",
-                "timeout_diagnostics": "false",
-                "fixture_kind": "external_load",
-            },
-            {
-                "schema": 1,
-                "confirmation": "RUN-PRODUCTION-CPU-DIAGNOSTIC",
-                "target_sha": "a" * 40,
-                "control_email": "qa@example.com",
-                "setup_concurrency": "16",
-                "run_id": "123456",
-                "profile": "external-vote",
-                "tournament_count": "1",
-                "users_per_tournament": "14",
-                "timeout_diagnostics": "false",
-                "fixture_kind": "cpu_diagnostic_only_v1",
-            },
+        self.assertIn("platform_fixture_credential_transport.py validate-descriptor", step)
+        self.assertIn('"$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"', step)
+        self.assertIn('"$TARGET_SHA" --app-sha "$APP_TARGET_SHA"', step)
+        self.assertIn("platform_load.py export-source-binding-env", step)
+        self.assertIn('--input-handoff "$descriptor" --manifest "$manifest"', step)
+        self.assertIn('--runner-sha "$TARGET_SHA" --app-target-sha "$APP_TARGET_SHA"', step)
+        self.assertLess(
+            step.index("validate-descriptor"), step.index("export-source-binding-env")
         )
-
-        def run(
-            payload: dict[str, object], target_sha: str = "a" * 40,
-            run_id: str = "123456",
-        ) -> subprocess.CompletedProcess[str]:
-            with tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                input_path = root / "input.json"
-                manifest_path = root / "manifest.json"
-                input_path.write_text(json.dumps(payload), encoding="utf-8")
-                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-                return subprocess.run(
-                    [
-                        sys.executable, "-", str(input_path), str(manifest_path),
-                        target_sha, run_id, "a" * 40,
-                    ],
-                    input=consumer,
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                    cwd=REPO_ROOT,
-                )
-
-        for raw in producer_inputs:
-            with self.subTest(fixture_kind=raw["fixture_kind"]):
-                producer_payload = validate_external_payload(raw)
-                completed = run(producer_payload)
-                self.assertEqual(completed.returncode, 0, completed.stderr)
-                self.assertIn("closed external handoff accepted", completed.stdout)
-
-        valid = validate_external_payload(producer_inputs[0])
-        for mutation in (
-            {**valid, "fixture_kind": "unrecognized_mode"},
-            {**valid, "unexpected": "field"},
-        ):
-            with self.subTest(payload=mutation):
-                self.assertNotEqual(run(mutation).returncode, 0)
-        self.assertNotEqual(run(valid, target_sha="b" * 40).returncode, 0)
-        self.assertNotEqual(run(valid, run_id="654321").returncode, 0)
 
     def test_every_authoritative_status_is_consumed_by_the_gate(self) -> None:
         gate = self.jobs["evaluate-load"].split("- name: Enforce external load", 1)[1]
@@ -1463,12 +1439,14 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertIn('workflow_run.get("id") != int(run_id)', self.source)
         self.assertIn('workflow_run.get("head_sha") != target_sha', self.source)
         for artifact in (
-            "platform-production-external-load-input-${{ github.run_id }}-${{ github.run_attempt }}",
-            "platform-production-external-load-manifest-${{ github.run_id }}-${{ github.run_attempt }}",
+            "platform-production-external-load-private-input-${{ github.run_id }}-${{ github.run_attempt }}",
+            "platform-production-external-load-encrypted-manifest-${{ github.run_id }}-${{ github.run_attempt }}",
             "platform-production-external-load-client-${{ github.run_id }}-${{ github.run_attempt }}",
             "platform-production-external-load-origin-${{ github.run_id }}-${{ github.run_attempt }}",
         ):
             self.assertIn(artifact, self.source)
+        self.assertNotIn("platform-production-external-load-input-${{ github.run_id }}", self.source)
+        self.assertNotIn("platform-production-external-load-manifest-${{ github.run_id }}", self.source)
         self.assertNotIn("ARTIFACT_DIGEST", self.source)
         self.assertNotIn("artifact-digest", self.source)
         self.assertNotIn("needs.fixture-setup.outputs.manifest_artifact_digest", self.source)
@@ -1943,7 +1921,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 if step.get("name") == "Evaluate checked-out load report"
             )
             status_match = re.search(
-                r'validation_kind="\$\(/usr/bin/python3 - "\$load_status_file" "\$report" "\$RUNNER_TEMP/external-input/platform-production-external-load-input.json" "\$(?P<sha_env>[A-Z_]+)" "\$APP_TARGET_SHA" '
+                r'validation_kind="\$\(/usr/bin/python3 - "\$load_status_file" "\$report" "\$RUNNER_TEMP/external-input/fixture-descriptor.json" "\$(?P<sha_env>[A-Z_]+)" "\$APP_TARGET_SHA" '
                 r'"\$GITHUB_RUN_ID" "\$GITHUB_RUN_ATTEMPT" "\$PROFILE_ID" "\$TIMEOUT_DIAGNOSTICS" <<\'PY\'\n'
                 r"(?P<script>.*?)\nPY",
                 evaluate_step["run"],
@@ -1968,9 +1946,15 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             report_path.write_bytes(report_bytes)
             source_input_path = root / "platform-production-external-load-input.json"
             source_input_path.write_text(
-                json.dumps({"target_sha": target_sha, "source_binding": None}),
+                json.dumps(
+                    _fixture_descriptor(
+                        run_id=run_id, attempt=attempt,
+                        runner_sha=target_sha, app_sha=target_sha,
+                    )
+                ),
                 encoding="ascii",
             )
+            source_input_path.chmod(0o600)
             status_path = root / "load-status.json"
             receipt = {
                 "schema": 3,
@@ -2022,16 +2006,32 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertNotIn("CONTROL_EMAIL:", self.source)
         self.assertNotIn("$CONTROL_EMAIL", self.source)
         self.assertNotIn("--control-email", self.source)
-        validator = self.jobs["validate-external-inputs"]
-        self.assertIn("validate_external_payload(payload)", validator)
-        self.assertIn("_write_private_json(Path(output_path)", validator)
-        self.assertIn('control_email_path.read_text(encoding="ascii")', validator)
+        serializer = _step_script(
+            self.jobs["validate-external-inputs"],
+            "Serialize the private external-load input",
+        )
+        self.assertIn("metadata = os.lstat(email_path)", serializer)
+        self.assertIn("stat.S_IMODE(metadata.st_mode) != 0o600", serializer)
+        self.assertIn('open(email_path, "rb").read(257)', serializer)
+        self.assertIn('"control_email": email.lower()', serializer)
+        self.assertIn("os.unlink(email_path)", serializer)
+        profile_validation = _step_script(
+            self.jobs["resolve-load-source-and-profile"],
+            "Validate and export the exact load profile",
+        )
+        self.assertIn("platform_load.py validate --profile", profile_validation)
+        self.assertIn("env -i", profile_validation)
 
         mask_steps = {
-            "validate-external-inputs": "Mask and stage the control identity from the event file",
-            "fixture-setup": "Mask the control identity before reading the handoff",
-            "load-client": "Mask the control identity before reading the handoff",
+            "resolve-host-tools-pin": "Mask and remove control identity before host-tools resolution",
+            "resolve-load-source-and-profile": "Mask and remove control identity before candidate checkout",
+            "validate-external-inputs": "Mask and remove control identity from the event file",
+            "fixture-setup": "Mask and remove control identity before setup",
+            "load-client": "Mask and remove control identity from the runner event file",
+            "derive-diagnostic-source-binding": "Remove control identity from the runner event file",
+            "cpu-diagnostic-pair": "Remove control identity from the runner event file",
             "fixture-finalize": "Mask and stage the control identity from the event file",
+            "evaluate-load": "Remove control identity from the runner event file",
         }
         for job_name, step_name in mask_steps.items():
             with self.subTest(job=job_name):
@@ -2051,6 +2051,19 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                         script.index("os.open(destination"),
                     )
 
+        pair_steps = yaml.safe_load(self.source)["jobs"]["cpu-diagnostic-pair"]["steps"]
+        configure_index = next(
+            index for index, step in enumerate(pair_steps)
+            if step.get("name") == "Configure pinned production SSH for the trusted parent"
+        )
+        for step in pair_steps[:configure_index]:
+            if step.get("id") not in {"verify-diagnostic-artifacts"}:
+                self.assertNotRegex(
+                    step.get("run", ""),
+                    r"platform/tools/[A-Za-z0-9_-]+\.py",
+                    f"checked-out tool executes before SSH material: {step.get('name')}",
+                )
+
         valid_inputs = {
             "confirmation": "RUN-PRODUCTION-EXTERNAL-LOAD",
             "control_email": "Control%qa@example.invalid",
@@ -2063,7 +2076,6 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "ssr_capacity_workload": "authenticated_workspace_read_capacity_v1",
         }
         invalid_payloads = (
-            json.dumps({"inputs": {**valid_inputs, "unexpected": "value"}}),
             (
                 '{"inputs":{"confirmation":"RUN-PRODUCTION-EXTERNAL-LOAD",'
                 '"control_email":"control@example.invalid",'
@@ -2080,6 +2092,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                     event_path.write_text(
                         json.dumps({"inputs": valid_inputs}), encoding="utf-8"
                     )
+                    event_path.chmod(0o600)
                     result = subprocess.run(
                         ["/bin/bash", "-euo", "pipefail", "-c", script],
                         env={
@@ -2102,6 +2115,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                         root = Path(temporary)
                         event_path = root / "event.json"
                         event_path.write_text(invalid_payload, encoding="utf-8")
+                        event_path.chmod(0o600)
                         result = subprocess.run(
                             ["/bin/bash", "-euo", "pipefail", "-c", script],
                             env={
@@ -2163,9 +2177,14 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             ("fixture-finalize", mask_steps["fixture-finalize"]),
         ):
             script = _step_script(self.jobs[job_name], step_name)
-            self.assertLess(
-                script.index("::add-mask::"), script.index("os.open(destination")
-            )
+            if job_name == "validate-external-inputs":
+                stage = "email_fd = os.open(email_path"
+                self.assertLess(script.index("::add-mask::"), script.index(stage))
+            else:
+                self.assertLess(
+                    script.index("::add-mask::"),
+                    script.index("destination = Path(os.environ[\"RUNNER_TEMP\"])")
+                )
 
         finalizer = self.jobs["fixture-finalize"]
         self.assertIn(
@@ -2262,6 +2281,9 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         cleanup_validation = _step_script(
             cleanup_step, "Validate explicit cleanup confirmation"
         )
+        cleanup_event_scrub = _step_script(
+            cleanup_step, "Mask and remove control identity before cleanup processing"
+        )
         self.assertIn(
             'test "$QA_CONFIRMATION" = "DELETE-PRODUCTION-RETAINED-LOAD"',
             cleanup_validation,
@@ -2308,9 +2330,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                     )
                     event_contents = json.dumps(event) if serialize_event else event
                     event_path.write_text(event_contents, encoding="utf-8")
-                    result = subprocess.run(
-                        ["/bin/bash", "-euo", "pipefail", "-c", cleanup_validation],
-                        env={
+                    env = {
                             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                             "GITHUB_REF": "refs/heads/dev",
                             "GITHUB_EVENT_PATH": str(event_path),
@@ -2323,28 +2343,37 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                             "SOURCE_BINDING_ARTIFACT_DIGEST": "sha256:" + "c" * 64,
                             "RUNNER_TEMP": str(root),
                             "GITHUB_OUTPUT": str(github_output_path),
-                        },
+                        }
+                    scrub = subprocess.run(
+                        ["/bin/bash", "-euo", "pipefail", "-c", cleanup_event_scrub],
+                        env=env,
                         capture_output=True,
                         text=True,
                         check=False,
                     )
-                    self.assertNotIn("private@example.invalid", result.stdout)
-                    self.assertNotIn("private@example.invalid", result.stderr)
+                    self.assertNotIn("private@example.invalid", scrub.stderr)
                     if event_name == "valid":
-                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(scrub.returncode, 0, scrub.stderr)
                         self.assertEqual(
-                            result.stdout.splitlines(),
+                            scrub.stdout.splitlines(),
                             [
                                 "::add-mask::Control%25qa@example.invalid",
                                 "::add-mask::control%25qa@example.invalid",
                             ],
                         )
-                        self.assertEqual(result.stderr, "")
-                        self.assertNotIn("Control%qa@example.invalid", result.stdout)
-                        self.assertEqual(output_path.stat().st_mode & 0o777, 0o600)
-                        cleanup_payload = json.loads(
-                            output_path.read_text(encoding="ascii")
-                        )
+                        self.assertEqual(scrub.stderr, "")
+                        self.assertNotIn("Control%qa@example.invalid", scrub.stdout)
+                        email_path = root / "retained-cleanup-control-email"
+                        self.assertEqual(email_path.stat().st_mode & 0o777, 0o600)
+                        email = email_path.read_text(encoding="ascii").removesuffix("\n")
+                        self.assertEqual(email, "control%qa@example.invalid")
+                        cleanup_payload = {
+                            "schema": 1,
+                            "target_sha": "a" * 40,
+                            "control_email": email,
+                            "load_run_id": "123456",
+                            "cleanup_run_id": "234567",
+                        }
                         self.assertEqual(
                             cleanup_payload,
                             {
@@ -2365,8 +2394,29 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                                 "cleanup_run_id",
                             },
                         )
+                        self.assertEqual(
+                            platform_workflow_remote_dispatch._control_email_stdin(email),
+                            b'{"schema":1,"control_email":"control%qa@example.invalid"}\n',
+                        )
+                        sanitized_event = event_path.read_text(encoding="utf-8")
+                        self.assertNotIn("control_email", sanitized_event)
+                        self.assertFalse(output_path.exists())
+                    elif event_name == "invalid":
+                        self.assertEqual(scrub.returncode, 0, scrub.stderr)
+                        self.assertEqual(len(scrub.stdout.splitlines()), 1)
+                        self.assertIn("private@example.invalid%0D%0A::warning::injected", scrub.stdout)
+                        self.assertNotIn("private@example.invalid\r", scrub.stdout)
+                        email_path = root / "retained-cleanup-control-email"
+                        self.assertEqual(email_path.stat().st_mode & 0o777, 0o600)
+                        email = email_path.read_text(encoding="ascii").removesuffix("\n")
+                        self.assertEqual(
+                            platform_workflow_remote_dispatch._control_email_stdin(email),
+                            b'{"schema":1,"control_email":"private@example.invalid\\n::warning::injected"}\n',
+                        )
+                        self.assertFalse(output_path.exists())
                     else:
-                        self.assertNotEqual(result.returncode, 0)
+                        self.assertNotEqual(scrub.returncode, 0)
+                        self.assertEqual(scrub.stdout, "")
                         self.assertFalse(output_path.exists())
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -2376,9 +2426,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             github_output_path = root / "github-output"
             github_output_path.touch()
             event_path.write_text(json.dumps(valid_event), encoding="utf-8")
-            result = subprocess.run(
-                ["/bin/bash", "-euo", "pipefail", "-c", cleanup_validation],
-                env={
+            env = {
                     "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                     "GITHUB_REF": "refs/heads/dev",
                     "GITHUB_EVENT_PATH": str(event_path),
@@ -2391,7 +2439,18 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                     "SOURCE_BINDING_ARTIFACT_DIGEST": "sha256:" + "c" * 64,
                     "RUNNER_TEMP": str(root),
                     "GITHUB_OUTPUT": str(github_output_path),
-                },
+                }
+            scrub = subprocess.run(
+                ["/bin/bash", "-euo", "pipefail", "-c", cleanup_event_scrub],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(scrub.returncode, 0, scrub.stderr)
+            result = subprocess.run(
+                ["/bin/bash", "-euo", "pipefail", "-c", cleanup_validation],
+                env={**env, "QA_CONFIRMATION": "WRONG-CONFIRMATION"},
                 capture_output=True,
                 text=True,
                 check=False,
@@ -2424,7 +2483,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                         elif event_file_case == "wrong-owner":
                             os.chown(event_path, os.geteuid() + 1, -1)
                     result = subprocess.run(
-                        ["/bin/bash", "-euo", "pipefail", "-c", cleanup_validation],
+                        ["/bin/bash", "-euo", "pipefail", "-c", cleanup_event_scrub],
                         env={
                             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                             "GITHUB_REF": "refs/heads/dev",
@@ -2464,9 +2523,14 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertNotIn("\n    container:", load_client)
         self.assertIn("Probe mandatory load PID-namespace containment", load_client)
         self.assertIn("probe_pid_namespace_capability", load_client)
-        validator = self.jobs["validate-external-inputs"]
-        self.assertIn("before fixture setup", validator)
-        self.assertIn("probe_pid_namespace_capability", validator)
+        profile_resolver = self.jobs["resolve-load-source-and-profile"]
+        self.assertIn("Probe mandatory load PID-namespace containment", profile_resolver)
+        self.assertIn("probe_pid_namespace_capability", profile_resolver)
+        self.assertIn(
+            "needs.resolve-load-source-and-profile",
+            self.jobs["validate-external-inputs"],
+        )
+        self.assertIn("needs.validate-external-inputs.result == 'success'", self.jobs["fixture-setup"])
 
     def test_runner_environment_context_is_scoped_to_sampler_steps(self) -> None:
         jobs = yaml.safe_load(self.source)["jobs"]
@@ -2601,7 +2665,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             self.jobs["evaluate-load"], "Evaluate checked-out load report"
         )
         receipt_verifier = re.search(
-            r'validation_kind="\$\(/usr/bin/python3 - "\$load_status_file" "\$report" "\$RUNNER_TEMP/external-input/platform-production-external-load-input.json" "\$SOURCE_GIT_SHA" "\$APP_TARGET_SHA" "\$GITHUB_RUN_ID" "\$GITHUB_RUN_ATTEMPT" "\$PROFILE_ID" "\$TIMEOUT_DIAGNOSTICS" <<\'PY\'\n'
+            r'validation_kind="\$\(/usr/bin/python3 - "\$load_status_file" "\$report" "\$RUNNER_TEMP/external-input/fixture-descriptor.json" "\$SOURCE_GIT_SHA" "\$APP_TARGET_SHA" "\$GITHUB_RUN_ID" "\$GITHUB_RUN_ATTEMPT" "\$PROFILE_ID" "\$TIMEOUT_DIAGNOSTICS" <<\'PY\'\n'
             r"(?P<script>.*?)\nPY",
             evaluate_script,
             re.DOTALL,
@@ -2625,9 +2689,15 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             ).encode("ascii") + b"\n"
             report.write_bytes(report_bytes)
             source_input.write_text(
-                json.dumps({"target_sha": target_sha, "source_binding": None}),
+                json.dumps(
+                    _fixture_descriptor(
+                        run_id="12345", attempt="1",
+                        runner_sha=target_sha, app_sha=target_sha,
+                    )
+                ),
                 encoding="ascii",
             )
+            source_input.chmod(0o600)
             payload = {
                 "schema": 3,
                 "status": 0,
@@ -3660,12 +3730,13 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                     self.assertEqual(marker_path.exists(), marker_type == "directory")
 
     def test_pair_job_source_binding_reaches_parent_worker_and_sanitizer(self) -> None:
-        """Run the workflow's env exporter through actual source-bound readers."""
+        """Run the no-secret descriptor outputs through actual source-bound readers."""
 
         from tools import (
             platform_load,
             platform_ssr_capacity_diagnostic as capacity_diagnostic,
             platform_workflow_input_guard,
+            platform_workflow_remote_dispatch,
         )
         from tests.test_platform_external_load import manifest_payload
         from tests.test_platform_noop_source_binding import (
@@ -3679,13 +3750,14 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         binding_steps = yaml.safe_load(self.source)["jobs"]["derive-diagnostic-source-binding"]["steps"]
         source_step_definition = next(
             step for step in binding_steps
-            if step.get("name") == "Validate input and derive bounded source-binding outputs"
+            if step.get("name") == "Validate descriptor and derive safe binding outputs"
         )
         source_step = source_step_definition["run"]
-        self.assertIn("platform/tools/platform_load.py export-source-binding-env", source_step)
-        self.assertIn('--manifest "$manifest_path"', source_step)
+        self.assertIn("platform/tools/platform_fixture_credential_transport.py validate-descriptor", source_step)
+        self.assertIn('value["manifest"]["source_binding"]', source_step)
         self.assertIn('"$GITHUB_OUTPUT"', source_step)
-        self.assertIn('payload.get("run_id") != run_id', source_step)
+        self.assertIn('binding.get("runner_sha")!=runner', source_step)
+        self.assertIn('binding.get("app_target_sha")!=app', source_step)
         self.assertIn("      - validate-external-inputs\n", binding_job)
         self.assertIn("      - fixture-setup\n", binding_job)
         self.assertNotIn("load-client", binding_job)
@@ -3801,8 +3873,10 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             root = Path(temporary_dir)
             input_dir = root / "diagnostic-binding-input"
             manifest_dir = root / "diagnostic-binding-manifest"
+            descriptor_dir = root / "diagnostic-descriptor"
             input_dir.mkdir(mode=0o700)
             manifest_dir.mkdir(mode=0o700)
+            descriptor_dir.mkdir(mode=0o700)
             input_path = input_dir / "platform-production-external-load-input.json"
             manifest_path = manifest_dir / "manifest.json"
             input_path.write_text(json.dumps(validated_input), encoding="ascii")
@@ -3810,6 +3884,40 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             manifest_path.write_bytes(manifest_raw)
             input_path.chmod(0o600)
             manifest_path.chmod(0o600)
+            descriptor_path = descriptor_dir / "fixture-descriptor.json"
+            descriptor_input = {
+                key: value for key, value in validated_input.items()
+                if key in {
+                    "schema", "target_sha", "setup_concurrency", "run_id", "profile",
+                    "tournament_count", "users_per_tournament", "timeout_diagnostics",
+                    "fixture_kind", "source_binding", "ssr_capacity_concurrency",
+                    "ssr_capacity_workload",
+                }
+            }
+            descriptor = {
+                "schema": 1,
+                "run_id": "123456",
+                "run_attempt": "1",
+                "runner_sha": RUNNER_SHA,
+                "app_target_sha": APP_SHA,
+                "input": descriptor_input,
+                "manifest": {
+                    "sha256": hashlib.sha256(manifest_raw).hexdigest(),
+                    "size_bytes": len(manifest_raw),
+                    "schema": 2,
+                    "purpose": source_bound_manifest["purpose"],
+                    "origin": source_bound_manifest["origin"],
+                    "runner_sha": RUNNER_SHA,
+                    "app_target_sha": APP_SHA,
+                    "source_binding": source_binding,
+                    "source_binding_sha256": source_bound_manifest["source_binding_sha256"],
+                    "tournament_count": 1,
+                    "user_count": 14,
+                    "users_per_tournament": [14],
+                },
+            }
+            descriptor_path.write_text(json.dumps(descriptor), encoding="ascii")
+            descriptor_path.chmod(0o600)
             github_output_path = root / "github-output"
             github_output_path.write_text("", encoding="ascii")
             github_output_path.chmod(0o600)
@@ -3821,6 +3929,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 "RUNNER_TEMP": str(root),
                 "GITHUB_OUTPUT": str(github_output_path),
                 "GITHUB_RUN_ID": "123456",
+                "GITHUB_RUN_ATTEMPT": "1",
                 "SOURCE_GIT_SHA": RUNNER_SHA,
                 "APP_TARGET_SHA": APP_SHA,
             }
@@ -3850,8 +3959,9 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 hashlib.sha256(canonical_binding).hexdigest(),
             )
 
-            wrong_run_payload = {**validated_input, "run_id": "654321"}
-            input_path.write_text(json.dumps(wrong_run_payload), encoding="ascii")
+            wrong_run_descriptor = {**descriptor, "run_id": "654321"}
+            descriptor_path.write_text(json.dumps(wrong_run_descriptor), encoding="ascii")
+            descriptor_path.chmod(0o600)
             wrong_run_output = root / "wrong-run-github-output"
             wrong_run_output.write_text("", encoding="ascii")
             wrong_run_output.chmod(0o600)
@@ -3867,16 +3977,17 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             )
             self.assertNotEqual(wrong_run_step.returncode, 0)
             self.assertEqual(wrong_run_output.read_text(encoding="ascii"), "")
-            input_path.write_text(json.dumps(validated_input), encoding="ascii")
+            descriptor_path.write_text(json.dumps(descriptor), encoding="ascii")
+            descriptor_path.chmod(0o600)
 
             load_temp = root / "load-runner-temp"
             load_input_dir = load_temp / "external-input"
             load_manifest_dir = load_temp / "external-manifest"
             load_input_dir.mkdir(parents=True, mode=0o700)
             load_manifest_dir.mkdir(mode=0o700)
-            load_input_path = load_input_dir / "platform-production-external-load-input.json"
+            load_input_path = load_input_dir / "fixture-descriptor.json"
             load_manifest_path = load_manifest_dir / "manifest.json"
-            load_input_path.write_bytes(input_path.read_bytes())
+            load_input_path.write_bytes(descriptor_path.read_bytes())
             load_manifest_path.write_bytes(manifest_path.read_bytes())
             load_input_path.chmod(0o600)
             load_manifest_path.chmod(0o600)
@@ -3899,6 +4010,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 "APP_TARGET_SHA": APP_SHA,
                 "PROFILE_ID": "external-vote",
                 "GITHUB_RUN_ID": "123456",
+                "GITHUB_RUN_ATTEMPT": "1",
                 "PLATFORM_RUNNER_ENVIRONMENT": "github-hosted",
             }
             load_client_step = subprocess.run(
@@ -4084,8 +4196,40 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             same_input_path.write_text(json.dumps(same_source_input), encoding="ascii")
             same_input_path.chmod(0o600)
             same_manifest_path = root / "same-source-manifest.json"
-            same_manifest_path.write_text(json.dumps(same_source_manifest), encoding="ascii")
+            same_manifest_raw = json.dumps(same_source_manifest).encode("ascii")
+            same_manifest_path.write_bytes(same_manifest_raw)
             same_manifest_path.chmod(0o600)
+            same_public_input = {
+                key: value for key, value in same_source_input.items()
+                if key in {
+                    "schema", "target_sha", "setup_concurrency", "run_id", "profile",
+                    "tournament_count", "users_per_tournament", "timeout_diagnostics",
+                    "fixture_kind", "source_binding", "ssr_capacity_concurrency",
+                    "ssr_capacity_workload",
+                }
+            }
+            same_descriptor = {
+                "schema": 1,
+                "run_id": "123456",
+                "run_attempt": "1",
+                "runner_sha": RUNNER_SHA,
+                "app_target_sha": RUNNER_SHA,
+                "input": same_public_input,
+                "manifest": {
+                    "sha256": hashlib.sha256(same_manifest_raw).hexdigest(),
+                    "size_bytes": len(same_manifest_raw),
+                    "schema": 2,
+                    "purpose": same_source_manifest["purpose"],
+                    "origin": same_source_manifest["origin"],
+                    "runner_sha": RUNNER_SHA,
+                    "app_target_sha": RUNNER_SHA,
+                    "source_binding": None,
+                    "source_binding_sha256": None,
+                    "tournament_count": 1,
+                    "user_count": 14,
+                    "users_per_tournament": [14],
+                },
+            }
             same_helper = subprocess.run(
                 [
                     sys.executable, str(Path(platform_load.__file__)),
@@ -4107,10 +4251,8 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 "SOURCE_BINDING_BASE64": "",
                 "SOURCE_BINDING_SHA256": "",
             })
-            input_path.write_text(json.dumps(same_source_input), encoding="ascii")
-            manifest_path.write_text(json.dumps(same_source_manifest), encoding="ascii")
-            input_path.chmod(0o600)
-            manifest_path.chmod(0o600)
+            descriptor_path.write_text(json.dumps(same_descriptor), encoding="ascii")
+            descriptor_path.chmod(0o600)
             same_output_path = root / "same-source-github-output"
             same_output_path.write_text("", encoding="ascii")
             same_output_path.chmod(0o600)

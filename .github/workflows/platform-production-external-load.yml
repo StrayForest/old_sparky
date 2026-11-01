@@ -1758,12 +1758,18 @@ jobs:
           import sys
 
           destination, status, client_exit, state, report_ready, target_sha, app_target_sha, binding_sha, run_id, attempt, profile_id, report_path, input_path = sys.argv[1:]
-          handoff = json.loads(Path(input_path).read_text(encoding="ascii"))
-          source_binding = handoff.get("source_binding")
+          sys.path.insert(0, str(Path.cwd() / "platform"))
+          from tools.platform_fixture_credential_transport import validate_descriptor
+          descriptor = validate_descriptor(
+              Path(input_path), run_id, attempt, target_sha, app_target_sha,
+          )
+          public_input = descriptor["input"]
+          manifest_projection = descriptor["manifest"]
+          source_binding = manifest_projection["source_binding"]
           report = Path(report_path)
           report_digest = hashlib.sha256(report.read_bytes()).hexdigest() if report_ready == "1" and report.is_file() and not report.is_symlink() else None
           binding_digest = binding_sha or None
-          if handoff.get("target_sha") != target_sha or handoff.get("source_binding") != source_binding:
+          if public_input.get("target_sha") != target_sha or public_input.get("run_id") != run_id:
               raise SystemExit("load-status source binding differs from the validated input")
           if (source_binding is None and app_target_sha != target_sha) or (source_binding is not None and (source_binding.get("app_target_sha") != app_target_sha or source_binding.get("runner_sha") != target_sha)):
               raise SystemExit("load-status runner/app SHA binding is inconsistent")
@@ -2287,8 +2293,9 @@ jobs:
           test -f "$descriptor" && test ! -L "$descriptor"
           test -f "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json" && test ! -L "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json"
           chmod 600 "$descriptor" "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json"
-          /usr/bin/python3 platform/tools/platform_fixture_credential_transport.py validate-descriptor --descriptor "$descriptor" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --runner-sha "$SOURCE_GIT_SHA" --app-sha "$APP_TARGET_SHA"
-          /usr/bin/python3 platform/tools/platform_load.py export-source-binding-env --input-handoff "$descriptor" --manifest "$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json" --runner-sha "$SOURCE_GIT_SHA" --app-target-sha "$APP_TARGET_SHA" >/dev/null
+          # The no-secret source-binding job validates the public descriptor
+          # and supplies only closed bounded outputs. The parent below performs
+          # the full descriptor-to-manifest check before any remote work.
 
       - name: Configure pinned production SSH for the trusted parent
         shell: bash
