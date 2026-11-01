@@ -334,6 +334,140 @@ class EvidencePrivacyTests(unittest.TestCase):
         self.assertEqual(receipt["supervisor_tree_before"], 2)
         self.assertEqual(receipt["recovery_helper_sha256"], "e" * 64)
 
+    def test_missing_supervisor_exit_requires_terminal_failure_and_locked_rechecks(self) -> None:
+        run_id = "41314916034"
+        attempt = "1"
+        target_sha = "a" * 40
+        runner_sha = "b" * 40
+        binding = {
+            "schema": 1,
+            "fixture_kind": "ssr_html_capacity_composite_diagnostic_v1",
+            "external_run_id": run_id,
+            "external_run_attempt": attempt,
+            "source_sha": runner_sha,
+            "app_target_sha": target_sha,
+            "input_handoff_sha256": "c" * 64,
+            "fixture_manifest_sha256": "d" * 64,
+        }
+        release = json.dumps({"source_git_commit": target_sha})
+        empty_state = (set(), set(), 0, {})
+        original_read_text = Path.read_text
+
+        def read_release(path: Path, *args, **kwargs):
+            if path == Path(abort_module.RELEASE_PATH):
+                return release
+            return original_read_text(path, *args, **kwargs)
+
+        def invoke(
+            *,
+            conclusion: str = "failure",
+            scans: list[tuple[set[int], set[int], int, dict[int, int]]] | None = None,
+            bindings: list[dict[str, object] | None] | None = None,
+            exit_codes: list[int | None] | None = None,
+            lock_error: Exception | None = None,
+            include_terminal: bool = True,
+        ) -> tuple[int, str, mock.Mock, mock.Mock, mock.Mock]:
+            output = StringIO()
+            args = [
+                "abort", "ABORT-PRODUCTION-RETAINED-LOAD", target_sha, run_id, attempt,
+                "--expected-runner-sha", runner_sha,
+                "--recovery-workflow-sha", "e" * 40,
+                "--recovery-helper-sha256", "f" * 64,
+            ]
+            if include_terminal:
+                args.extend([
+                    "--terminal-run-status", "completed",
+                    "--terminal-run-conclusion", conclusion,
+                    "--terminal-run-workflow-id", "777",
+                    "--terminal-run-head-sha", runner_sha,
+                    "--terminal-run-job-count", "4",
+                    "--terminal-run-failure-job-count", "1",
+                    "--terminal-run-projection-sha256", "9" * 64,
+                ])
+            with (
+                mock.patch("tools.platform_abort_retained_load.os.geteuid", return_value=0),
+                mock.patch("tools.platform_abort_retained_load.Path.read_text", autospec=True, side_effect=read_release),
+                mock.patch(
+                    "tools.platform_abort_retained_load._process_state",
+                    side_effect=scans or [empty_state] * 4,
+                ) as process_state,
+                mock.patch("tools.platform_abort_retained_load.process_snapshot", return_value="safe snapshot\n"),
+                mock.patch("tools.platform_abort_retained_load.signal_tree") as signal_tree,
+                mock.patch("tools.platform_abort_retained_load.alive", return_value=set()),
+                mock.patch(
+                    "tools.platform_abort_retained_load._diagnostic_abort_binding",
+                    side_effect=bindings or [binding, binding, binding],
+                ),
+                mock.patch(
+                    "tools.platform_abort_retained_load._supervisor_exit_code",
+                    side_effect=exit_codes or [None, None],
+                ),
+                mock.patch("tools.platform_abort_retained_load._retained_lock_is_clear", return_value=True),
+                mock.patch("tools.platform_abort_retained_load.export_abort_evidence", return_value=Path("/tmp/abort-export")) as export_evidence,
+                mock.patch(
+                    "tools.platform_abort_retained_load._acquire_recovery_lock_pair",
+                    side_effect=lock_error or [(91, 92)],
+                ),
+                mock.patch("tools.platform_abort_retained_load._close_recovery_lock_pair") as close_locks,
+                mock.patch("sys.argv", args),
+                mock.patch("sys.stdout", output),
+            ):
+                result = abort_retained_load_main()
+            self.assertEqual(process_state.call_count, 4 if include_terminal else 2)
+            return result, output.getvalue(), close_locks, signal_tree, export_evidence
+
+        result, output, close_locks, signal_tree, _export_evidence = invoke()
+        self.assertEqual(result, 0)
+        close_locks.assert_called_once_with((91, 92))
+        receipt_line = next(
+            line for line in output.splitlines() if line.startswith("ABORT_ONLY_JSON=")
+        )
+        receipt = json.loads(receipt_line.partition("=")[2])
+        self.assertEqual(receipt["schema"], 2)
+        self.assertEqual(receipt["remote_stage"], "run_owned_process_tree_already_absent_without_exit_record")
+        self.assertEqual(receipt["supervisor_exit_record_present"], False)
+        self.assertIsNone(receipt["supervisor_exit_code"])
+        self.assertEqual(receipt["post_abort_scan_count"], 2)
+        self.assertGreaterEqual(receipt["post_scan_separation_ms"], 100)
+        self.assertLessEqual(receipt["post_scan_separation_ms"], 5000)
+        self.assertEqual(receipt["recovery_lock_order"], ["release", "retained"])
+        self.assertTrue(receipt["recovery_locks_held_through_scans_and_revalidation"])
+        self.assertEqual(receipt["terminal_controller"]["conclusion"], "failure")
+        self.assertFalse(receipt["namespace_closed"])
+
+        with self.assertRaisesRegex(SystemExit, "terminal load controller evidence is invalid"):
+            invoke(conclusion="success")
+        with self.assertRaisesRegex(RuntimeError, "closure failed under recovery locks"):
+            invoke(scans=[empty_state, empty_state, ({123}, {123}, 0, {123: 1}), empty_state])
+        with self.assertRaisesRegex(RuntimeError, "closure failed under recovery locks"):
+            invoke(bindings=[binding, binding, {**binding, "fixture_manifest_sha256": "0" * 64}])
+        with self.assertRaises(BlockingIOError):
+            invoke(lock_error=BlockingIOError("busy"))
+        with self.assertRaisesRegex(RuntimeError, "closure failed under recovery locks"):
+            invoke(exit_codes=[None, 1])
+        with self.assertRaisesRegex(RuntimeError, "reconciliation failed closed"):
+            invoke(include_terminal=False)
+
+        active_state = ({321}, {321, 322}, 0, {321: 11, 322: 12})
+        result, output, close_locks, signal_tree, export_evidence = invoke(
+            scans=[active_state, empty_state, empty_state, empty_state],
+            exit_codes=[None, None],
+        )
+        self.assertEqual(result, 0)
+        signal_tree.assert_called_once_with({321, 322}, {321: 11, 322: 12}, abort_module.signal.SIGTERM)
+        receipt = export_evidence.call_args.kwargs["abort_only"]
+        self.assertEqual(receipt["remote_stage"], "run_owned_process_tree_stopped_without_exit_record")
+        self.assertEqual(receipt["termination_signals"], ["SIGTERM"])
+
+        result, output, _close_locks, _signal_tree, export_evidence = invoke(
+            include_terminal=False,
+            scans=[active_state, empty_state],
+            exit_codes=[None],
+        )
+        self.assertEqual(result, 1)
+        self.assertIn("stopped_without_verified_cleanup_receipt", output)
+        self.assertIsNone(export_evidence.call_args.kwargs["abort_only"])
+
     def test_abort_signal_rejects_reused_pid_before_signaling(self) -> None:
         with (
             mock.patch(

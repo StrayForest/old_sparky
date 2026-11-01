@@ -45,6 +45,14 @@ jobs:
       helper_sha256: ${{ steps.helper.outputs.sha256 }}
       source_sha: ${{ steps.helper.outputs.source_sha }}
       load_runner_sha: ${{ steps.selected-load.outputs.runner_sha }}
+      terminal_recovery_enabled: ${{ steps.selected-load.outputs.terminal_recovery_enabled }}
+      terminal_run_status: ${{ steps.selected-load.outputs.terminal_run_status }}
+      terminal_run_conclusion: ${{ steps.selected-load.outputs.terminal_run_conclusion }}
+      terminal_run_workflow_id: ${{ steps.selected-load.outputs.terminal_run_workflow_id }}
+      terminal_run_head_sha: ${{ steps.selected-load.outputs.terminal_run_head_sha }}
+      terminal_run_job_count: ${{ steps.selected-load.outputs.terminal_run_job_count }}
+      terminal_run_failure_job_count: ${{ steps.selected-load.outputs.terminal_run_failure_job_count }}
+      terminal_run_projection_sha256: ${{ steps.selected-load.outputs.terminal_run_projection_sha256 }}
     steps:
       - name: Require the reviewed dev workflow source
         shell: bash
@@ -200,6 +208,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           LOAD_RUN_ID: ${{ inputs.load_run_id }}
           LOAD_RUN_ATTEMPT: ${{ inputs.load_run_attempt }}
+          DISPATCH_ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
@@ -214,28 +223,38 @@ jobs:
             "${headers[@]}" "$api/actions/workflows/platform-production-external-load.yml" --output "$metadata/workflow.json"
           curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
             "${headers[@]}" "$api/actions/runs/$LOAD_RUN_ID/attempts/$LOAD_RUN_ATTEMPT" --output "$metadata/attempt.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+            "${headers[@]}" "$api/actions/runs/$LOAD_RUN_ID" --output "$metadata/latest-run.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+            "${headers[@]}" "$api/actions/runs/$LOAD_RUN_ID/attempts/$LOAD_RUN_ATTEMPT/jobs?per_page=100&page=1" --output "$metadata/jobs.json"
           env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 -I -B - \
-            "$metadata/workflow.json" "$metadata/attempt.json" \
-            "$LOAD_RUN_ID" "$LOAD_RUN_ATTEMPT" "$GITHUB_OUTPUT" <<'PY'
+            "$metadata/workflow.json" "$metadata/attempt.json" "$metadata/latest-run.json" "$metadata/jobs.json" \
+            "$LOAD_RUN_ID" "$LOAD_RUN_ATTEMPT" "$DISPATCH_ACTOR" "$GITHUB_OUTPUT" <<'PY'
           import json
+          import hashlib
           from pathlib import Path
           import re
           import sys
 
-          workflow_path, attempt_path, run_id, attempt, output_path = sys.argv[1:]
+          workflow_path, attempt_path, latest_run_path, jobs_path, run_id, attempt, dispatch_actor, output_path = sys.argv[1:]
           expected_path = ".github/workflows/platform-production-external-load.yml"
           if (re.fullmatch(r"[1-9][0-9]{0,31}", run_id) is None
-              or re.fullmatch(r"[1-9][0-9]{0,8}", attempt) is None):
+              or re.fullmatch(r"[1-9][0-9]{0,8}", attempt) is None
+              or not dispatch_actor or len(dispatch_actor) > 100):
               raise SystemExit("selected external-load identity is malformed")
           workflow = json.loads(Path(workflow_path).read_text(encoding="utf-8"))
           selected = json.loads(Path(attempt_path).read_text(encoding="utf-8"))
+          latest = json.loads(Path(latest_run_path).read_text(encoding="utf-8"))
+          jobs_payload = json.loads(Path(jobs_path).read_text(encoding="utf-8"))
           repository = selected.get("repository") if isinstance(selected, dict) else None
           runner_sha = selected.get("head_sha") if isinstance(selected, dict) else None
+          actor = selected.get("actor") if isinstance(selected, dict) else None
+          latest_repository = latest.get("repository") if isinstance(latest, dict) else None
+          latest_actor = latest.get("actor") if isinstance(latest, dict) else None
+          if not isinstance(workflow, dict) or type(workflow.get("id")) is not int or workflow["id"] <= 0:
+              raise SystemExit("external-load workflow identity is unavailable")
           if (
-              not isinstance(workflow, dict)
-              or type(workflow.get("id")) is not int
-              or workflow["id"] <= 0
-              or workflow.get("path") != expected_path
+              workflow.get("path") != expected_path
               or not isinstance(selected, dict)
               or type(selected.get("id")) is not int
               or selected["id"] != int(run_id)
@@ -249,13 +268,99 @@ jobs:
               or repository.get("full_name") != "StrayForest/old_sparky"
               or not isinstance(runner_sha, str)
               or re.fullmatch(r"[0-9a-f]{40}", runner_sha) is None
+              or not isinstance(actor, dict)
+              or actor.get("login") != dispatch_actor
+              or not isinstance(latest, dict)
+              or type(latest.get("id")) is not int
+              or latest["id"] != int(run_id)
+              or latest.get("run_attempt") != int(attempt)
+              or latest.get("workflow_id") != workflow["id"]
+              or latest.get("path") != expected_path
+              or latest.get("head_branch") != "dev"
+              or latest.get("event") != "workflow_dispatch"
+              or latest.get("head_sha") != runner_sha
+              or latest.get("status") != selected.get("status")
+              or latest.get("conclusion") != selected.get("conclusion")
+              or not isinstance(latest_repository, dict)
+              or latest_repository.get("full_name") != "StrayForest/old_sparky"
+              or not isinstance(latest_actor, dict)
+              or latest_actor.get("login") != dispatch_actor
+              or latest_actor.get("id") != actor.get("id")
           ):
               raise SystemExit("selected external-load attempt is not exact")
+          recovery_enabled = latest.get("status") == "completed" and latest.get("conclusion") == "failure"
+          controller_projection = None
+          job_count = 0
+          failure_job_count = 0
+          if recovery_enabled:
+              jobs = jobs_payload.get("jobs") if isinstance(jobs_payload, dict) else None
+              if (not isinstance(jobs, list) or type(jobs_payload.get("total_count")) is not int
+                  or jobs_payload["total_count"] != len(jobs) or not 0 < len(jobs) <= 100):
+                  raise SystemExit("terminal external-load jobs response is incomplete")
+              if selected.get("status") != "completed" or selected.get("conclusion") != "failure":
+                  raise SystemExit("selected external-load attempt is not terminal failure")
+              normalized_jobs = []
+              for row in jobs:
+                  if (not isinstance(row, dict) or type(row.get("id")) is not int or row["id"] <= 0
+                      or row.get("run_id") != int(run_id) or row.get("run_attempt") != int(attempt)
+                      or row.get("head_sha") != runner_sha or row.get("status") != "completed"
+                      or row.get("conclusion") not in {"success", "failure", "skipped"}):
+                      raise SystemExit("terminal external-load jobs include a nonterminal or mismatched row")
+                  normalized_jobs.append({
+                      "id": row["id"], "run_id": int(run_id), "run_attempt": int(attempt),
+                      "head_sha": runner_sha, "status": row["status"], "conclusion": row["conclusion"],
+                  })
+              if len({row["id"] for row in normalized_jobs}) != len(normalized_jobs):
+                  raise SystemExit("terminal external-load jobs contain duplicate identities")
+              job_count = len(normalized_jobs)
+              failure_job_count = sum(row["conclusion"] == "failure" for row in normalized_jobs)
+              if failure_job_count < 1:
+                  raise SystemExit("failed external-load run has no failed terminal job")
+              if (actor.get("id") is None or type(actor.get("id")) is not int or actor["id"] <= 0
+                  or latest.get("status") != "completed" or latest.get("conclusion") != "failure"):
+                  raise SystemExit("terminal external-load run or actor identity is invalid")
+              controller_projection = {
+                  "schema": 1, "repository": "StrayForest/old_sparky", "workflow_path": expected_path,
+                  "event": "workflow_dispatch", "head_branch": "dev", "run_id": int(run_id),
+                  "run_attempt": int(attempt), "workflow_id": workflow["id"], "status": "completed",
+                  "conclusion": "failure", "head_sha": runner_sha, "actor_id": actor["id"],
+                  "jobs": sorted(normalized_jobs, key=lambda row: row["id"]),
+              }
           with Path(output_path).open("a", encoding="ascii") as stream:
               stream.write(f"runner_sha={runner_sha}\n")
+              stream.write(f"terminal_recovery_enabled={'true' if recovery_enabled else 'false'}\n")
+              if recovery_enabled:
+                  projection_sha = hashlib.sha256(
+                      json.dumps(controller_projection, ensure_ascii=True, sort_keys=True,
+                                 separators=(",", ":"), allow_nan=False).encode("ascii")
+                  ).hexdigest()
+                  stream.write("terminal_run_status=completed\n")
+                  stream.write("terminal_run_conclusion=failure\n")
+                  stream.write(f"terminal_run_workflow_id={workflow['id']}\n")
+                  stream.write(f"terminal_run_head_sha={runner_sha}\n")
+                  stream.write(f"terminal_run_job_count={job_count}\n")
+                  stream.write(f"terminal_run_failure_job_count={failure_job_count}\n")
+                  stream.write(f"terminal_run_projection_sha256={projection_sha}\n")
           PY
           runner_sha="$(sed -n 's/^runner_sha=//p' "$GITHUB_OUTPUT")"
           [[ "$runner_sha" =~ ^[0-9a-f]{40}$ ]]
+          recovery_enabled="$(sed -n 's/^terminal_recovery_enabled=//p' "$GITHUB_OUTPUT")"
+          [[ "$recovery_enabled" == true || "$recovery_enabled" == false ]]
+          if [[ "$recovery_enabled" == true ]]; then
+            terminal_status="$(sed -n 's/^terminal_run_status=//p' "$GITHUB_OUTPUT")"
+            terminal_conclusion="$(sed -n 's/^terminal_run_conclusion=//p' "$GITHUB_OUTPUT")"
+            terminal_workflow_id="$(sed -n 's/^terminal_run_workflow_id=//p' "$GITHUB_OUTPUT")"
+            terminal_head_sha="$(sed -n 's/^terminal_run_head_sha=//p' "$GITHUB_OUTPUT")"
+            terminal_job_count="$(sed -n 's/^terminal_run_job_count=//p' "$GITHUB_OUTPUT")"
+            terminal_failure_count="$(sed -n 's/^terminal_run_failure_job_count=//p' "$GITHUB_OUTPUT")"
+            terminal_projection_sha="$(sed -n 's/^terminal_run_projection_sha256=//p' "$GITHUB_OUTPUT")"
+            [[ "$terminal_status" == completed && "$terminal_conclusion" == failure ]]
+            [[ "$terminal_workflow_id" =~ ^[1-9][0-9]{0,19}$ ]]
+            [[ "$terminal_head_sha" == "$runner_sha" ]]
+            [[ "$terminal_job_count" =~ ^[1-9][0-9]{0,2}$ && "$terminal_job_count" -le 100 ]]
+            [[ "$terminal_failure_count" =~ ^[1-9][0-9]{0,2}$ && "$terminal_failure_count" -le "$terminal_job_count" ]]
+            [[ "$terminal_projection_sha" =~ ^[0-9a-f]{64}$ ]]
+          fi
 
       - name: Pin the exact helper bytes
         id: helper
@@ -294,6 +399,14 @@ jobs:
       LOAD_RUN_ATTEMPT: ${{ inputs.load_run_attempt }}
       TARGET_SHA: ${{ inputs.target_sha }}
       LOAD_RUNNER_SHA: ${{ needs.prepare-abort-helper.outputs.load_runner_sha }}
+      LOAD_TERMINAL_RECOVERY_ENABLED: ${{ needs.prepare-abort-helper.outputs.terminal_recovery_enabled }}
+      LOAD_TERMINAL_RUN_STATUS: ${{ needs.prepare-abort-helper.outputs.terminal_run_status }}
+      LOAD_TERMINAL_RUN_CONCLUSION: ${{ needs.prepare-abort-helper.outputs.terminal_run_conclusion }}
+      LOAD_TERMINAL_RUN_WORKFLOW_ID: ${{ needs.prepare-abort-helper.outputs.terminal_run_workflow_id }}
+      LOAD_TERMINAL_RUN_HEAD_SHA: ${{ needs.prepare-abort-helper.outputs.terminal_run_head_sha }}
+      LOAD_TERMINAL_RUN_JOB_COUNT: ${{ needs.prepare-abort-helper.outputs.terminal_run_job_count }}
+      LOAD_TERMINAL_RUN_FAILURE_JOB_COUNT: ${{ needs.prepare-abort-helper.outputs.terminal_run_failure_job_count }}
+      LOAD_TERMINAL_RUN_PROJECTION_SHA256: ${{ needs.prepare-abort-helper.outputs.terminal_run_projection_sha256 }}
       SECURITY_RUN_ID: ${{ inputs.security_run_id }}
       SECURITY_RUN_ATTEMPT: ${{ inputs.security_run_attempt }}
 
@@ -318,6 +431,18 @@ jobs:
             || { echo "target_sha must be a lowercase 40-character commit SHA." >&2; exit 1; }
           [[ "$LOAD_RUNNER_SHA" =~ ^[0-9a-f]{40}$ ]] \
             || { echo "selected load runner SHA is unavailable." >&2; exit 1; }
+          [[ "$LOAD_TERMINAL_RECOVERY_ENABLED" == true || "$LOAD_TERMINAL_RECOVERY_ENABLED" == false ]] \
+            || { echo "selected load terminal recovery state is unavailable." >&2; exit 1; }
+          if [[ "$LOAD_TERMINAL_RECOVERY_ENABLED" == true ]]; then
+            [[ "$LOAD_TERMINAL_RUN_STATUS" == completed && "$LOAD_TERMINAL_RUN_CONCLUSION" == failure ]]
+            [[ "$LOAD_TERMINAL_RUN_WORKFLOW_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+            [[ "$LOAD_TERMINAL_RUN_HEAD_SHA" == "$LOAD_RUNNER_SHA" ]]
+            [[ "$LOAD_TERMINAL_RUN_JOB_COUNT" =~ ^[1-9][0-9]{0,2}$ && "$LOAD_TERMINAL_RUN_JOB_COUNT" -le 100 ]]
+            [[ "$LOAD_TERMINAL_RUN_FAILURE_JOB_COUNT" =~ ^[1-9][0-9]{0,2}$ && "$LOAD_TERMINAL_RUN_FAILURE_JOB_COUNT" -le "$LOAD_TERMINAL_RUN_JOB_COUNT" ]]
+            [[ "$LOAD_TERMINAL_RUN_PROJECTION_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          else
+            [[ -z "$LOAD_TERMINAL_RUN_STATUS$LOAD_TERMINAL_RUN_CONCLUSION$LOAD_TERMINAL_RUN_WORKFLOW_ID$LOAD_TERMINAL_RUN_HEAD_SHA$LOAD_TERMINAL_RUN_JOB_COUNT$LOAD_TERMINAL_RUN_FAILURE_JOB_COUNT$LOAD_TERMINAL_RUN_PROJECTION_SHA256" ]]
+          fi
 
       - name: Download and verify the source-bound recovery helper
         id: helper
@@ -443,6 +568,102 @@ jobs:
           chmod 600 "$ssh_dir/config"
           echo "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
 
+      - name: Revalidate exact failed load attempt immediately before SSH
+        id: revalidate_terminal_before_ssh
+        if: ${{ env.LOAD_TERMINAL_RECOVERY_ENABLED == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          [[ "$LOAD_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$LOAD_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,8}$ ]]
+          metadata="$RUNNER_TEMP/retained-abort-terminal-pre-ssh"
+          install -d -m 700 "$metadata"
+          trap 'rm -rf -- "$metadata"' EXIT
+          api="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY"
+          headers=(--header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' --header 'X-GitHub-Api-Version: 2022-11-28')
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+            "${headers[@]}" "$api/actions/runs/$LOAD_RUN_ID" --output "$metadata/latest.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+            "${headers[@]}" "$api/actions/runs/$LOAD_RUN_ID/attempts/$LOAD_RUN_ATTEMPT" --output "$metadata/attempt.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+            "${headers[@]}" "$api/actions/runs/$LOAD_RUN_ID/attempts/$LOAD_RUN_ATTEMPT/jobs?per_page=100&page=1" --output "$metadata/jobs.json"
+          validator="$RUNNER_TEMP/retained-abort-terminal-validator.py"
+          cat > "$validator" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+
+          latest_path, attempt_path, jobs_path, run_id, attempt, head_sha, dispatch_actor, workflow_id, expected_jobs, expected_failures, expected_sha = sys.argv[1:]
+          latest = json.loads(Path(latest_path).read_text(encoding="utf-8"))
+          selected = json.loads(Path(attempt_path).read_text(encoding="utf-8"))
+          jobs_payload = json.loads(Path(jobs_path).read_text(encoding="utf-8"))
+          path = ".github/workflows/platform-production-external-load.yml"
+          repository = latest.get("repository") if isinstance(latest, dict) else None
+          selected_repository = selected.get("repository") if isinstance(selected, dict) else None
+          latest_actor = latest.get("actor") if isinstance(latest, dict) else None
+          actor = selected.get("actor") if isinstance(selected, dict) else None
+          if (not isinstance(latest, dict) or not isinstance(selected, dict)
+              or latest.get("id") != int(run_id) or selected.get("id") != int(run_id)
+              or latest.get("run_attempt") != int(attempt) or selected.get("run_attempt") != int(attempt)
+              or latest.get("status") != "completed" or selected.get("status") != "completed"
+              or latest.get("conclusion") != "failure" or selected.get("conclusion") != "failure"
+              or latest.get("workflow_id") != int(workflow_id) or selected.get("workflow_id") != int(workflow_id)
+              or latest.get("path") != path or selected.get("path") != path
+              or latest.get("head_branch") != "dev" or selected.get("head_branch") != "dev"
+              or latest.get("event") != "workflow_dispatch" or selected.get("event") != "workflow_dispatch"
+              or latest.get("head_sha") != head_sha or selected.get("head_sha") != head_sha
+              or not isinstance(repository, dict) or repository.get("full_name") != "StrayForest/old_sparky"
+              or not isinstance(selected_repository, dict)
+              or selected_repository.get("full_name") != "StrayForest/old_sparky"
+              or not isinstance(latest_actor, dict)
+              or latest_actor.get("login") != dispatch_actor
+              or type(latest_actor.get("id")) is not int or latest_actor["id"] <= 0
+              or not isinstance(actor, dict) or actor.get("login") != dispatch_actor
+              or type(actor.get("id")) is not int or actor["id"] <= 0):
+              raise SystemExit("selected load attempt is no longer the exact failed terminal run")
+          if latest_actor["id"] != actor["id"]:
+              raise SystemExit("selected load attempt actor changed")
+          jobs = jobs_payload.get("jobs") if isinstance(jobs_payload, dict) else None
+          if (not isinstance(jobs, list) or type(jobs_payload.get("total_count")) is not int
+              or jobs_payload["total_count"] != len(jobs) or len(jobs) != int(expected_jobs)
+              or not 0 < len(jobs) <= 100):
+              raise SystemExit("selected load terminal job set is incomplete")
+          normalized = []
+          for row in jobs:
+              if (not isinstance(row, dict) or type(row.get("id")) is not int or row["id"] <= 0
+                  or row.get("run_id") != int(run_id) or row.get("run_attempt") != int(attempt)
+                  or row.get("head_sha") != head_sha or row.get("status") != "completed"
+                  or row.get("conclusion") not in {"success", "failure", "skipped"}):
+                  raise SystemExit("selected load terminal jobs include a pending or mismatched row")
+              normalized.append({"id": row["id"], "run_id": int(run_id), "run_attempt": int(attempt),
+                                "head_sha": head_sha, "status": row["status"], "conclusion": row["conclusion"]})
+          if len({row["id"] for row in normalized}) != len(normalized):
+              raise SystemExit("selected load terminal jobs contain duplicate identities")
+          failures = sum(row["conclusion"] == "failure" for row in normalized)
+          if failures != int(expected_failures) or failures < 1:
+              raise SystemExit("selected load terminal failure set changed")
+          projection = {"schema": 1, "repository": "StrayForest/old_sparky", "workflow_path": path,
+                        "event": "workflow_dispatch", "head_branch": "dev", "run_id": int(run_id),
+                        "run_attempt": int(attempt), "workflow_id": int(workflow_id), "status": "completed",
+                        "conclusion": "failure", "head_sha": head_sha, "actor_id": actor["id"],
+                        "jobs": sorted(normalized, key=lambda row: row["id"])}
+          actual_sha = hashlib.sha256(json.dumps(projection, ensure_ascii=True, sort_keys=True,
+                                                 separators=(",", ":"), allow_nan=False).encode("ascii")).hexdigest()
+          if actual_sha != expected_sha:
+              raise SystemExit("selected load terminal controller projection changed")
+          PY
+          chmod 600 "$validator"
+          env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 -I -B "$validator" \
+            "$metadata/latest.json" "$metadata/attempt.json" "$metadata/jobs.json" \
+            "$LOAD_RUN_ID" "$LOAD_RUN_ATTEMPT" "$LOAD_RUNNER_SHA" "$GITHUB_ACTOR" \
+            "$LOAD_TERMINAL_RUN_WORKFLOW_ID" "$LOAD_TERMINAL_RUN_JOB_COUNT" \
+            "$LOAD_TERMINAL_RUN_FAILURE_JOB_COUNT" "$LOAD_TERMINAL_RUN_PROJECTION_SHA256"
+          printf '%s\n' 'exact failed load attempt revalidated before SSH'
+
       - name: Abort the exact production load process tree
         id: abort_remote
         shell: bash
@@ -451,6 +672,7 @@ jobs:
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
           HELPER_SHA256: ${{ needs.prepare-abort-helper.outputs.helper_sha256 }}
           HELPER_SOURCE_SHA: ${{ needs.prepare-abort-helper.outputs.source_sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           artifact_dir="$RUNNER_TEMP/production-retained-abort-artifacts"
@@ -467,6 +689,27 @@ jobs:
           [[ "$LOAD_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
           [[ "$LOAD_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,8}$ ]]
           [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          terminal_args=()
+          if [[ "$LOAD_TERMINAL_RECOVERY_ENABLED" == true ]]; then
+            [[ "$LOAD_TERMINAL_RUN_STATUS" == completed && "$LOAD_TERMINAL_RUN_CONCLUSION" == failure ]]
+            [[ "$LOAD_TERMINAL_RUN_WORKFLOW_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+            [[ "$LOAD_TERMINAL_RUN_HEAD_SHA" == "$LOAD_RUNNER_SHA" ]]
+            [[ "$LOAD_TERMINAL_RUN_JOB_COUNT" =~ ^[1-9][0-9]{0,2}$ && "$LOAD_TERMINAL_RUN_JOB_COUNT" -le 100 ]]
+            [[ "$LOAD_TERMINAL_RUN_FAILURE_JOB_COUNT" =~ ^[1-9][0-9]{0,2}$ && "$LOAD_TERMINAL_RUN_FAILURE_JOB_COUNT" -le "$LOAD_TERMINAL_RUN_JOB_COUNT" ]]
+            [[ "$LOAD_TERMINAL_RUN_PROJECTION_SHA256" =~ ^[0-9a-f]{64}$ ]]
+            terminal_args=(
+              --terminal-run-status "$LOAD_TERMINAL_RUN_STATUS"
+              --terminal-run-conclusion "$LOAD_TERMINAL_RUN_CONCLUSION"
+              --terminal-run-workflow-id "$LOAD_TERMINAL_RUN_WORKFLOW_ID"
+              --terminal-run-head-sha "$LOAD_TERMINAL_RUN_HEAD_SHA"
+              --terminal-run-job-count "$LOAD_TERMINAL_RUN_JOB_COUNT"
+              --terminal-run-failure-job-count "$LOAD_TERMINAL_RUN_FAILURE_JOB_COUNT"
+              --terminal-run-projection-sha256 "$LOAD_TERMINAL_RUN_PROJECTION_SHA256"
+            )
+          else
+            [[ "$LOAD_TERMINAL_RECOVERY_ENABLED" == false ]]
+            [[ -z "$LOAD_TERMINAL_RUN_STATUS$LOAD_TERMINAL_RUN_CONCLUSION$LOAD_TERMINAL_RUN_WORKFLOW_ID$LOAD_TERMINAL_RUN_HEAD_SHA$LOAD_TERMINAL_RUN_JOB_COUNT$LOAD_TERMINAL_RUN_FAILURE_JOB_COUNT$LOAD_TERMINAL_RUN_PROJECTION_SHA256" ]]
+          fi
           [[ "$HELPER_SOURCE_SHA" = "$GITHUB_SHA" ]]
           [[ "$HELPER_SHA256" =~ ^[0-9a-f]{64}$ ]]
           test "$(sha256sum "$helper_file" | awk '{print $1}')" = "$HELPER_SHA256"
@@ -486,6 +729,29 @@ jobs:
           ssh -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes \
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" "chmod 600 '$incoming'"
+          if [[ "$LOAD_TERMINAL_RECOVERY_ENABLED" == true ]]; then
+            recheck_dir="$RUNNER_TEMP/retained-abort-terminal-immediate-pre-remote"
+            validator="$RUNNER_TEMP/retained-abort-terminal-validator.py"
+            install -d -m 700 "$recheck_dir"
+            trap 'rm -rf -- "$recheck_dir"' EXIT
+            test -f "$validator" && test ! -L "$validator"
+            test "$(stat -c '%F:%a:%h' "$validator")" = "regular file:600:1"
+            api="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY"
+            headers=(--header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' --header 'X-GitHub-Api-Version: 2022-11-28')
+            curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+              "${headers[@]}" "$api/actions/runs/$LOAD_RUN_ID" --output "$recheck_dir/latest.json"
+            curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+              "${headers[@]}" "$api/actions/runs/$LOAD_RUN_ID/attempts/$LOAD_RUN_ATTEMPT" --output "$recheck_dir/attempt.json"
+            curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+              "${headers[@]}" "$api/actions/runs/$LOAD_RUN_ID/attempts/$LOAD_RUN_ATTEMPT/jobs?per_page=100&page=1" --output "$recheck_dir/jobs.json"
+            env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 -I -B "$validator" \
+              "$recheck_dir/latest.json" "$recheck_dir/attempt.json" "$recheck_dir/jobs.json" \
+              "$LOAD_RUN_ID" "$LOAD_RUN_ATTEMPT" "$LOAD_RUNNER_SHA" "$GITHUB_ACTOR" \
+              "$LOAD_TERMINAL_RUN_WORKFLOW_ID" "$LOAD_TERMINAL_RUN_JOB_COUNT" \
+              "$LOAD_TERMINAL_RUN_FAILURE_JOB_COUNT" "$LOAD_TERMINAL_RUN_PROJECTION_SHA256"
+            rm -rf -- "$recheck_dir"
+            trap - EXIT
+          fi
           set +e
           ssh \
             -F "$SSH_DIR/config" \
@@ -499,7 +765,7 @@ jobs:
             sudo -n -- /usr/bin/bash -s -- \
               "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$HELPER_SHA256" \
               "$HELPER_SOURCE_SHA" "$TARGET_SHA" "$LOAD_RUNNER_SHA" "$LOAD_RUN_ID" \
-              "$LOAD_RUN_ATTEMPT" "$QA_CONFIRMATION" > "$ssh_output_file" 2>&1 <<'REMOTE'
+              "$LOAD_RUN_ATTEMPT" "$QA_CONFIRMATION" "${terminal_args[@]}" > "$ssh_output_file" 2>&1 <<'REMOTE'
           set -Eeuo pipefail
           workflow_run_id="${1:-}"
           workflow_attempt="${2:-}"
@@ -510,6 +776,8 @@ jobs:
           load_run_id="${7:-}"
           load_run_attempt="${8:-}"
           confirmation="${9:-}"
+          shift 9
+          terminal_args=("$@")
           [[ "$workflow_run_id" =~ ^[1-9][0-9]{0,19}$ ]]
           [[ "$workflow_attempt" =~ ^[1-9][0-9]{0,5}$ ]]
           [[ "$helper_sha" =~ ^[0-9a-f]{64}$ ]]
@@ -519,6 +787,23 @@ jobs:
           [[ "$load_run_id" =~ ^[1-9][0-9]{0,31}$ ]]
           [[ "$load_run_attempt" =~ ^[1-9][0-9]{0,8}$ ]]
           test "$confirmation" = ABORT-PRODUCTION-RETAINED-LOAD
+          if ((${#terminal_args[@]} != 0)); then
+            ((${#terminal_args[@]} == 14))
+            test "${terminal_args[0]}" = --terminal-run-status
+            test "${terminal_args[1]}" = completed
+            test "${terminal_args[2]}" = --terminal-run-conclusion
+            test "${terminal_args[3]}" = failure
+            test "${terminal_args[4]}" = --terminal-run-workflow-id
+            [[ "${terminal_args[5]}" =~ ^[1-9][0-9]{0,19}$ ]]
+            test "${terminal_args[6]}" = --terminal-run-head-sha
+            test "${terminal_args[7]}" = "$load_runner_sha"
+            test "${terminal_args[8]}" = --terminal-run-job-count
+            [[ "${terminal_args[9]}" =~ ^[1-9][0-9]{0,2}$ && "${terminal_args[9]}" -le 100 ]]
+            test "${terminal_args[10]}" = --terminal-run-failure-job-count
+            [[ "${terminal_args[11]}" =~ ^[1-9][0-9]{0,2}$ && "${terminal_args[11]}" -le "${terminal_args[9]}" ]]
+            test "${terminal_args[12]}" = --terminal-run-projection-sha256
+            [[ "${terminal_args[13]}" =~ ^[0-9a-f]{64}$ ]]
+          fi
           test "$(id -u)" -eq 0
           incoming="/tmp/oldsparky-retained-abort-helper-${workflow_run_id}-${workflow_attempt}.py"
           stage="/run/oldsparky-retained-abort-${workflow_run_id}-${workflow_attempt}"
@@ -540,10 +825,46 @@ jobs:
             "$confirmation" "$target_sha" "$load_run_id" "$load_run_attempt" \
             --expected-runner-sha "$load_runner_sha" \
             --recovery-workflow-sha "$workflow_sha" \
-            --recovery-helper-sha256 "$helper_sha"
+            --recovery-helper-sha256 "$helper_sha" \
+            "${terminal_args[@]}"
           REMOTE
           remote_status=$?
           set -e
+          if [[ "$LOAD_TERMINAL_RECOVERY_ENABLED" == true ]]; then
+            set +e
+            (
+              set -euo pipefail
+              umask 077
+              recheck_dir="$RUNNER_TEMP/retained-abort-terminal-immediate-post-ssh"
+              validator="$RUNNER_TEMP/retained-abort-terminal-validator.py"
+              install -d -m 700 "$recheck_dir"
+              trap 'rm -rf -- "$recheck_dir"' EXIT
+              test -f "$validator" && test ! -L "$validator"
+              test "$(stat -c '%F:%a:%h' "$validator")" = "regular file:600:1"
+              api="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY"
+              headers=(--header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' --header 'X-GitHub-Api-Version: 2022-11-28')
+              curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+                "${headers[@]}" "$api/actions/runs/$LOAD_RUN_ID" --output "$recheck_dir/latest.json"
+              curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+                "${headers[@]}" "$api/actions/runs/$LOAD_RUN_ID/attempts/$LOAD_RUN_ATTEMPT" --output "$recheck_dir/attempt.json"
+              curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+                "${headers[@]}" "$api/actions/runs/$LOAD_RUN_ID/attempts/$LOAD_RUN_ATTEMPT/jobs?per_page=100&page=1" --output "$recheck_dir/jobs.json"
+              env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 -I -B "$validator" \
+                "$recheck_dir/latest.json" "$recheck_dir/attempt.json" "$recheck_dir/jobs.json" \
+                "$LOAD_RUN_ID" "$LOAD_RUN_ATTEMPT" "$LOAD_RUNNER_SHA" "$GITHUB_ACTOR" \
+                "$LOAD_TERMINAL_RUN_WORKFLOW_ID" "$LOAD_TERMINAL_RUN_JOB_COUNT" \
+                "$LOAD_TERMINAL_RUN_FAILURE_JOB_COUNT" "$LOAD_TERMINAL_RUN_PROJECTION_SHA256"
+            )
+            immediate_recheck_status=$?
+            set -e
+            if [[ "$immediate_recheck_status" != 0 ]]; then
+              printf '%s\n' 'Exact terminal load attempt revalidation immediately after remote abort failed.' >&2
+              if [[ "$remote_status" != 0 ]]; then
+                exit "$remote_status"
+              fi
+              exit 1
+            fi
+          fi
           export_dir="$(sed -n 's/^ABORT_EVIDENCE_EXPORT=//p' "$ssh_output_file" | tail -n 1)"
           if [[ -n "$export_dir" ]]; then
             [[ "$export_dir" =~ ^/tmp/old-sparky-production-retained-abort-[0-9]+$ ]] || {
@@ -624,6 +945,38 @@ jobs:
           PY
           echo "remote_status=$remote_status" >> "$GITHUB_OUTPUT"
           exit "$remote_status"
+
+      - name: Revalidate exact failed load attempt immediately after remote abort
+        id: revalidate_terminal_after_remote
+        if: ${{ always() && env.LOAD_TERMINAL_RECOVERY_ENABLED == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          [[ "$LOAD_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$LOAD_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,8}$ ]]
+          metadata="$RUNNER_TEMP/retained-abort-terminal-after-remote"
+          validator="$RUNNER_TEMP/retained-abort-terminal-validator.py"
+          install -d -m 700 "$metadata"
+          trap 'rm -rf -- "$metadata"' EXIT
+          test -f "$validator" && test ! -L "$validator"
+          test "$(stat -c '%F:%a:%h' "$validator")" = "regular file:600:1"
+          api="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY"
+          headers=(--header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' --header 'X-GitHub-Api-Version: 2022-11-28')
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+            "${headers[@]}" "$api/actions/runs/$LOAD_RUN_ID" --output "$metadata/latest.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+            "${headers[@]}" "$api/actions/runs/$LOAD_RUN_ID/attempts/$LOAD_RUN_ATTEMPT" --output "$metadata/attempt.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+            "${headers[@]}" "$api/actions/runs/$LOAD_RUN_ID/attempts/$LOAD_RUN_ATTEMPT/jobs?per_page=100&page=1" --output "$metadata/jobs.json"
+          env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 -I -B "$validator" \
+            "$metadata/latest.json" "$metadata/attempt.json" "$metadata/jobs.json" \
+            "$LOAD_RUN_ID" "$LOAD_RUN_ATTEMPT" "$LOAD_RUNNER_SHA" "$GITHUB_ACTOR" \
+            "$LOAD_TERMINAL_RUN_WORKFLOW_ID" "$LOAD_TERMINAL_RUN_JOB_COUNT" \
+            "$LOAD_TERMINAL_RUN_FAILURE_JOB_COUNT" "$LOAD_TERMINAL_RUN_PROJECTION_SHA256"
+          printf '%s\n' 'exact failed load attempt revalidated immediately after remote abort'
 
       - name: Remove the exact temporary recovery helper stage
         id: cleanup_recovery_helper
@@ -892,7 +1245,9 @@ jobs:
               raise SystemExit("required abort log evidence is not valid JSON")
           if not isinstance(payload, dict) or payload.get("truncated") is not False:
               raise SystemExit("required abort log evidence is incomplete")
-          if payload.get("status") == "unavailable":
+          if payload.get("status") not in {"unavailable", "passed", "failed", "unknown"}:
+              raise SystemExit("required abort log evidence is incomplete")
+          if payload.get("status") in {"unavailable", "passed", "failed", "unknown"}:
               proof_raw = b""
               descriptor = -1
               try:
@@ -956,7 +1311,7 @@ jobs:
                   raise SystemExit("typed diagnostic abort proof is invalid")
               if canonical_proof != proof_raw:
                   raise SystemExit("typed diagnostic abort proof is not canonical")
-              expected = {
+              expected_v1 = {
                   "schema", "status", "fixture_kind", "external_run_id",
                   "external_run_attempt", "source_sha", "app_target_sha",
                   "input_handoff_sha256", "fixture_manifest_sha256", "remote_stage",
@@ -965,67 +1320,216 @@ jobs:
                   "supervisor_exit_code", "shared_lock_clear", "namespace_closed",
                   "recovery_workflow_sha", "recovery_helper_sha256",
               }
-              if (
-                  not isinstance(proof, dict)
-                  or set(proof) != expected
-                  or type(proof.get("schema")) is not int or proof["schema"] != 1
-                  or proof.get("status") != "safe_for_exact_fixture_cleanup"
-                  or not isinstance(proof.get("fixture_kind"), str)
-                  or proof.get("fixture_kind") not in {
+              expected_v2 = {
+                  "schema", "status", "fixture_kind", "external_run_id",
+                  "external_run_attempt", "source_sha", "app_target_sha",
+                  "input_handoff_sha256", "fixture_manifest_sha256", "remote_stage",
+                  "run_owned_process_selector", "run_owned_roots_before", "run_owned_processes_before",
+                  "run_owned_roots_after", "run_owned_processes_after",
+                  "run_owned_roots_after_scan_1", "run_owned_processes_after_scan_1",
+                  "run_owned_roots_after_scan_2", "run_owned_processes_after_scan_2",
+                  "post_abort_scan_count", "post_scan_separation_ms", "proc_read_errors",
+                  "supervisor_exit_record_present", "supervisor_exit_code", "shared_lock_clear",
+                  "namespace_closed", "recovery_workflow_sha", "recovery_helper_sha256",
+                  "termination_signals", "release_lock_held", "retained_lock_held",
+                  "recovery_lock_order", "recovery_locks_held_through_scans_and_revalidation",
+                  "binding_revalidated", "active_release_sha", "terminal_controller",
+              }
+              expected_controller = {
+                  "schema", "repository", "workflow_path", "event", "head_branch",
+                  "run_id", "run_attempt", "workflow_id", "status", "conclusion",
+                  "head_sha", "actor_matches_abort_dispatch", "jobs_complete",
+                  "job_count", "failure_job_count", "projection_sha256",
+              }
+              controller = proof.get("terminal_controller") if isinstance(proof, dict) else None
+              allowed_fixture_kinds = {
                       "cpu_diagnostic_only_v1",
                       "ssr_capacity_diagnostic_v1",
                       "ssr_html_capacity_diagnostic_v1",
                       "ssr_html_capacity_composite_diagnostic_v1",
-                  }
-                  or proof.get("external_run_id") != run_id
-                  or proof.get("external_run_attempt") != attempt
-                  or proof.get("source_sha") != runner_sha
-                  or proof.get("app_target_sha") != target_sha
-                  or not isinstance(proof.get("input_handoff_sha256"), str)
-                  or re.fullmatch(r"[0-9a-f]{64}", proof["input_handoff_sha256"]) is None
-                  or not isinstance(proof.get("fixture_manifest_sha256"), str)
-                  or re.fullmatch(r"[0-9a-f]{64}", proof["fixture_manifest_sha256"]) is None
-                  or proof.get("remote_stage") not in {
+              }
+              common_ok = (
+                  isinstance(proof, dict)
+                  and proof.get("status") == "safe_for_exact_fixture_cleanup"
+                  and isinstance(proof.get("fixture_kind"), str)
+                  and proof.get("fixture_kind") in allowed_fixture_kinds
+                  and proof.get("external_run_id") == run_id
+                  and proof.get("external_run_attempt") == attempt
+                  and proof.get("source_sha") == runner_sha
+                  and proof.get("app_target_sha") == target_sha
+                  and isinstance(proof.get("input_handoff_sha256"), str)
+                  and re.fullmatch(r"[0-9a-f]{64}", proof["input_handoff_sha256"]) is not None
+                  and isinstance(proof.get("fixture_manifest_sha256"), str)
+                  and re.fullmatch(r"[0-9a-f]{64}", proof["fixture_manifest_sha256"]) is not None
+                  and type(proof.get("proc_read_errors")) is int
+                  and proof.get("proc_read_errors") == 0
+                  and proof.get("shared_lock_clear") is True
+                  and proof.get("namespace_closed") is False
+                  and proof.get("recovery_workflow_sha") == os.environ.get("RECOVERY_WORKFLOW_SHA")
+                  and re.fullmatch(
+                      r"[0-9a-f]{64}", str(proof.get("recovery_helper_sha256", ""))
+                  ) is not None
+                  and proof.get("recovery_helper_sha256") == os.environ.get("RECOVERY_HELPER_SHA256")
+                  and os.environ.get("ABORT_REMOTE_STEP") == "success"
+                  and os.environ.get("ABORT_REMOTE_STATUS") == "0"
+                  and os.environ.get("ABORT_STAGE_CLEANUP_STEP") == "success"
+                  and os.environ.get("ABORT_SSH_CLEANUP_STEP") == "success"
+              )
+              legacy_ok = (
+                  common_ok
+                  and set(proof) == expected_v1
+                  and type(proof.get("schema")) is int
+                  and proof.get("schema") == 1
+                  and proof.get("supervisor_selector") == "fixed_script_paths_run_root_and_run_id"
+                  and proof.get("remote_stage") in {
                       "supervisor_terminated", "supervisor_already_absent"
                   }
-                  or proof.get("supervisor_selector") != "fixed_script_paths_run_root_and_run_id"
-                  or type(proof.get("supervisor_roots_before")) is not int
-                  or type(proof.get("supervisor_tree_before")) is not int
-                  or (
-                      proof.get("remote_stage") == "supervisor_terminated"
-                      and (
-                          proof["supervisor_roots_before"] < 1
-                          or proof["supervisor_tree_before"] < 1
+                  and type(proof.get("supervisor_roots_before")) is int
+                  and type(proof.get("supervisor_tree_before")) is int
+                  and (
+                      (proof["remote_stage"] == "supervisor_terminated"
+                       and proof["supervisor_roots_before"] > 0
+                       and proof["supervisor_tree_before"] > 0)
+                      or (proof["remote_stage"] == "supervisor_already_absent"
+                          and proof["supervisor_roots_before"] == 0
+                          and proof["supervisor_tree_before"] == 0)
+                  )
+                  and type(proof.get("supervisor_roots_after")) is int
+                  and proof.get("supervisor_roots_after") == 0
+                  and type(proof.get("supervisor_descendants_after")) is int
+                  and proof.get("supervisor_descendants_after") == 0
+                  and type(proof.get("supervisor_exit_code")) is int
+                  and 0 <= proof["supervisor_exit_code"] <= 255
+              )
+              recovery_controller_ok = False
+              if os.environ.get("LOAD_TERMINAL_RECOVERY_ENABLED") == "true" and isinstance(controller, dict):
+                  recovery_controller_ok = (
+                  isinstance(controller, dict)
+                  and set(controller) == expected_controller
+                  and type(controller.get("schema")) is int
+                  and controller.get("schema") == 1
+                  and controller.get("repository") == "StrayForest/old_sparky"
+                  and controller.get("workflow_path") == ".github/workflows/platform-production-external-load.yml"
+                  and controller.get("event") == "workflow_dispatch"
+                  and controller.get("head_branch") == "dev"
+                  and controller.get("run_id") == run_id
+                  and controller.get("run_attempt") == attempt
+                  and type(controller.get("workflow_id")) is int
+                  and controller.get("workflow_id") == int(os.environ.get("LOAD_TERMINAL_RUN_WORKFLOW_ID", "0"))
+                  and controller.get("status") == "completed"
+                  and controller.get("conclusion") == "failure"
+                  and controller.get("head_sha") == runner_sha
+                  and controller.get("actor_matches_abort_dispatch") is True
+                  and controller.get("jobs_complete") is True
+                  and type(controller.get("job_count")) is int
+                  and 1 <= controller["job_count"] <= 100
+                  and controller.get("job_count") == int(os.environ.get("LOAD_TERMINAL_RUN_JOB_COUNT", "0"))
+                  and type(controller.get("failure_job_count")) is int
+                  and 1 <= controller["failure_job_count"] <= controller["job_count"]
+                  and controller.get("failure_job_count") == int(
+                      os.environ.get("LOAD_TERMINAL_RUN_FAILURE_JOB_COUNT", "0")
+                  )
+                  and controller.get("projection_sha256")
+                  == os.environ.get("LOAD_TERMINAL_RUN_PROJECTION_SHA256")
+                  )
+              terminal_stage = proof.get("remote_stage") if isinstance(proof, dict) else None
+              terminal_signals = proof.get("termination_signals") if isinstance(proof, dict) else None
+              stage_valid = False
+              if isinstance(proof, dict) and terminal_stage == "run_owned_process_tree_stopped_without_exit_record":
+                  stage_valid = (
+                      type(proof.get("run_owned_roots_before")) is int
+                      and proof["run_owned_roots_before"] > 0
+                      and type(proof.get("run_owned_processes_before")) is int
+                      and proof["run_owned_processes_before"] > 0
+                      and terminal_signals in (["SIGTERM"], ["SIGTERM", "SIGKILL"])
+                  )
+              elif isinstance(proof, dict):
+                  stage_valid = (
+                      terminal_stage == "run_owned_process_tree_already_absent_without_exit_record"
+                      and type(proof.get("run_owned_roots_before")) is int
+                      and proof["run_owned_roots_before"] == 0
+                      and type(proof.get("run_owned_processes_before")) is int
+                      and proof["run_owned_processes_before"] == 0
+                      and terminal_signals == []
+                  )
+              missing_exit_ok = (
+                  common_ok
+                  and os.environ.get("LOAD_TERMINAL_RECOVERY_ENABLED") == "true"
+                  and set(proof) == expected_v2
+                  and type(proof.get("schema")) is int
+                  and proof.get("schema") == 2
+                  and proof.get("run_owned_process_selector") == "fixed_script_paths_run_root_and_run_id"
+                  and stage_valid
+                  and recovery_controller_ok
+                  and proof.get("supervisor_exit_record_present") is False
+                  and proof.get("supervisor_exit_code") is None
+                  and proof.get("post_abort_scan_count") == 2
+                  and type(proof.get("post_abort_scan_count")) is int
+                  and type(proof.get("post_scan_separation_ms")) is int
+                  and 100 <= proof["post_scan_separation_ms"] <= 5000
+                  and all(
+                      type(proof.get(field)) is int and proof[field] == 0
+                      for field in (
+                          "run_owned_roots_after", "run_owned_processes_after",
+                          "run_owned_roots_after_scan_1", "run_owned_processes_after_scan_1",
+                          "run_owned_roots_after_scan_2", "run_owned_processes_after_scan_2",
                       )
                   )
-                  or (
-                      proof.get("remote_stage") == "supervisor_already_absent"
-                      and (
-                          proof["supervisor_roots_before"] != 0
-                          or proof["supervisor_tree_before"] != 0
-                      )
-                  )
-                  or type(proof.get("supervisor_roots_after")) is not int or proof["supervisor_roots_after"] != 0
-                  or type(proof.get("supervisor_descendants_after")) is not int or proof["supervisor_descendants_after"] != 0
-                  or type(proof.get("proc_read_errors")) is not int or proof["proc_read_errors"] != 0
-                  or type(proof.get("supervisor_exit_code")) is not int
-                  or not 0 <= proof["supervisor_exit_code"] <= 255
-                  or proof.get("shared_lock_clear") is not True
-                  or proof.get("namespace_closed") is not False
-                  or proof.get("recovery_workflow_sha") != os.environ.get("RECOVERY_WORKFLOW_SHA")
-                  or re.fullmatch(
-                      r"[0-9a-f]{64}", str(proof.get("recovery_helper_sha256", ""))
-                  ) is None
-                  or proof.get("recovery_helper_sha256") != os.environ.get("RECOVERY_HELPER_SHA256")
-                  or os.environ.get("ABORT_REMOTE_STEP") != "success"
-                  or os.environ.get("ABORT_REMOTE_STATUS") != "0"
-                  or os.environ.get("ABORT_STAGE_CLEANUP_STEP") != "success"
-                  or os.environ.get("ABORT_SSH_CLEANUP_STEP") != "success"
-              ):
+                  and proof.get("release_lock_held") is True
+                  and proof.get("retained_lock_held") is True
+                  and proof.get("recovery_lock_order") == ["release", "retained"]
+                  and proof.get("recovery_locks_held_through_scans_and_revalidation") is True
+                  and proof.get("binding_revalidated") is True
+                  and proof.get("active_release_sha") == target_sha
+              )
+              if not (legacy_ok or missing_exit_ok):
                   raise SystemExit("typed diagnostic abort proof binding or termination checks failed")
-          elif payload.get("status") not in {"passed", "failed", "unknown"}:
-              raise SystemExit("required abort log evidence is incomplete")
           PY
+
+      - name: Revalidate exact failed load attempt after abort normalization
+        id: revalidate_terminal_after_normalization
+        if: ${{ always() && env.LOAD_TERMINAL_RECOVERY_ENABLED == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          [[ "$LOAD_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$LOAD_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,8}$ ]]
+          metadata="$RUNNER_TEMP/retained-abort-terminal-post-normalization"
+          validator="$RUNNER_TEMP/retained-abort-terminal-validator.py"
+          install -d -m 700 "$metadata"
+          trap 'rm -rf -- "$metadata"; rm -f -- "$validator"' EXIT
+          test -f "$validator" && test ! -L "$validator"
+          test "$(stat -c '%F:%a:%h' "$validator")" = "regular file:600:1"
+          api="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY"
+          headers=(--header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' --header 'X-GitHub-Api-Version: 2022-11-28')
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+            "${headers[@]}" "$api/actions/runs/$LOAD_RUN_ID" --output "$metadata/latest.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+            "${headers[@]}" "$api/actions/runs/$LOAD_RUN_ID/attempts/$LOAD_RUN_ATTEMPT" --output "$metadata/attempt.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+            "${headers[@]}" "$api/actions/runs/$LOAD_RUN_ID/attempts/$LOAD_RUN_ATTEMPT/jobs?per_page=100&page=1" --output "$metadata/jobs.json"
+          env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 -I -B "$validator" \
+            "$metadata/latest.json" "$metadata/attempt.json" "$metadata/jobs.json" \
+            "$LOAD_RUN_ID" "$LOAD_RUN_ATTEMPT" "$LOAD_RUNNER_SHA" "$GITHUB_ACTOR" \
+            "$LOAD_TERMINAL_RUN_WORKFLOW_ID" "$LOAD_TERMINAL_RUN_JOB_COUNT" \
+            "$LOAD_TERMINAL_RUN_FAILURE_JOB_COUNT" "$LOAD_TERMINAL_RUN_PROJECTION_SHA256"
+          printf '%s\n' 'exact failed load attempt revalidated after abort normalization'
+
+      - name: Remove terminal attempt revalidation helper
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          validator="$RUNNER_TEMP/retained-abort-terminal-validator.py"
+          if [[ -e "$validator" || -L "$validator" ]]; then
+            test -f "$validator" && test ! -L "$validator"
+            test "$(stat -c '%F:%a:%h' "$validator")" = "regular file:600:1"
+            rm -- "$validator"
+          fi
+          test ! -e "$validator" && test ! -L "$validator"
 
       - name: Diagnose abort evidence normalization
         if: ${{ always() }}
@@ -1097,7 +1601,7 @@ jobs:
           exit 0
 
       - name: Publish abort evidence
-        if: ${{ always() && steps.cleanup_ssh.outcome == 'success' && steps.normalize_abort_evidence.outcome == 'success' }}
+        if: ${{ always() && steps.cleanup_ssh.outcome == 'success' && steps.normalize_abort_evidence.outcome == 'success' && (env.LOAD_TERMINAL_RECOVERY_ENABLED != 'true' || (steps.revalidate_terminal_before_ssh.outcome == 'success' && steps.revalidate_terminal_after_remote.outcome == 'success' && steps.revalidate_terminal_after_normalization.outcome == 'success')) }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: platform-production-retained-abort-${{ github.run_id }}-${{ github.run_attempt }}

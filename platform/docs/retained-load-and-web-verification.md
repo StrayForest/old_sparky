@@ -20,6 +20,39 @@ sessions and audit rows while preserving the control account. The [cleanup
 tool](../tools/platform_cleanup_retained_matrix.py) calls `dispose_engine()` and
 `dispose_redis_clients()`; close warnings are failures, not harmless noise.
 
+Use the [canonical retained-load abort workflow](../../.github/workflows/platform-production-retained-load-abort.yml)
+for the exact load run and attempt; its dispatch command and required Security
+identity are in the [SSR diagnostic runbook](ssr-capacity-diagnostic-runbook.md).
+When the run-bound `supervisor.exit` record is absent, the recovery path is
+limited to the exact latest external-load attempt in completed failure state,
+with the reviewed workflow/source, matching actor, and a complete set of
+terminal jobs that includes a failure. The workflow rechecks that attempt
+immediately before remote abort, immediately after remote abort, and after
+proof normalization. Under the release lock then the retained-load lock, the
+helper revalidates the durable run marker and requires two fresh, error-free
+zero-process scans at least 100 ms apart. The schema-2 receipt explicitly
+records that no supervisor exit record exists, its exit code is null, and
+`namespace_closed` is false. It cannot be substituted for a recorded
+supervisor exit or prove namespace closure. Continue to exact cleanup only
+after the canonical normalizer publishes the receipt for that same run and
+attempt; if a check fails, stop and follow the operator escalation path. Never
+create the missing exit record or hand-write the receipt.
+
+If the reviewed abort helper is on a recovery-only runner SHA `R` while the
+active app remains at `S5`, first complete the normal `dev` Security and
+automatic baseline-reconcile chain for `R`. Wait for its authenticated
+`platform-production-noop-source-receipt` and verify it binds the exact
+Security, auto-deploy and deploy run attempts, the cumulative no-op route, and
+the unchanged active-release tuple at `S5` (`runtime_required=false`). This
+receipt authorizes the runner-to-app source binding only; it does not deploy
+the app. Then use the abort command in the SSR runbook with `target_sha=S5`,
+the exact failed load run and attempt, and the successful Security run and
+attempt for `R`. After the canonical abort receipt passes, dispatch exact
+cleanup through the same normal source-binding path with runner `R` and app
+target `S5`; the cleanup helper rechecks the active tuple. Stop if the no-op
+receipt is absent, does not bind those exact attempts, or the active tuple has
+changed. Do not create a substitute receipt or alias a same-SHA run.
+
 The retained-cleanup workflow keeps SSH stdout/stderr in runner-private files
 until it records the closed diagnostic status. Missing or invalid remote
 markers remain unverified and fail closed; only allowlisted stderr classes and

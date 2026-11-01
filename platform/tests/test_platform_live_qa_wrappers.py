@@ -4731,7 +4731,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 )
 
         self.assertIn(
-            "if: ${{ always() && steps.cleanup_ssh.outcome == 'success' && steps.normalize_abort_evidence.outcome == 'success' }}",
+            "if: ${{ always() && steps.cleanup_ssh.outcome == 'success' && steps.normalize_abort_evidence.outcome == 'success' && (env.LOAD_TERMINAL_RECOVERY_ENABLED != 'true' || (steps.revalidate_terminal_before_ssh.outcome == 'success' && steps.revalidate_terminal_after_remote.outcome == 'success' && steps.revalidate_terminal_after_normalization.outcome == 'success')) }}",
             abort,
         )
         self.assertIn(
@@ -6843,11 +6843,29 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             1,
         )[1].split("      - name: Pin the exact helper bytes\n", 1)[0]
         run_block = step.split("        run: |\n", 1)[1]
+        self.assertIn("id: revalidate_terminal_before_ssh", workflow_text)
+        self.assertIn("id: revalidate_terminal_after_remote", workflow_text)
+        self.assertIn("id: revalidate_terminal_after_normalization", workflow_text)
+        self.assertIn("steps.revalidate_terminal_before_ssh.outcome == 'success'", workflow_text)
+        self.assertIn("steps.revalidate_terminal_after_remote.outcome == 'success'", workflow_text)
+        self.assertIn("steps.revalidate_terminal_after_normalization.outcome == 'success'", workflow_text)
+        remote_step = workflow_text.split(
+            "      - name: Abort the exact production load process tree\n", 1
+        )[1].split("      - name: Revalidate exact failed load attempt immediately after remote abort\n", 1)[0]
+        self.assertLess(
+            remote_step.index("remote_status=$?"),
+            remote_step.index('recheck_dir="$RUNNER_TEMP/retained-abort-terminal-immediate-post-ssh"'),
+        )
+        self.assertLess(
+            remote_step.index('recheck_dir="$RUNNER_TEMP/retained-abort-terminal-immediate-post-ssh"'),
+            remote_step.index("copy_if_present()"),
+        )
         script = textwrap.dedent(
             run_block.split("<<'PY'\n", 1)[1].split("\n          PY\n", 1)[0]
         )
         expected_path = ".github/workflows/platform-production-external-load.yml"
         workflow = {"id": 71, "path": expected_path}
+        actor = {"login": "operator", "id": 19}
         selected = {
             "id": 123456,
             "run_attempt": 2,
@@ -6857,14 +6875,29 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             "event": "workflow_dispatch",
             "head_sha": "a" * 40,
             "repository": {"full_name": "StrayForest/old_sparky"},
+            "actor": actor,
+            "status": "completed",
+            "conclusion": "failure",
         }
+        jobs = [{
+            "id": 991,
+            "run_id": 123456,
+            "run_attempt": 2,
+            "head_sha": "a" * 40,
+            "status": "completed",
+            "conclusion": "failure",
+        }]
 
         def run_case(mutation: dict[str, object] | None = None,
-                     workflow_mutation: dict[str, object] | None = None) -> tuple[subprocess.CompletedProcess[str], str]:
+                     workflow_mutation: dict[str, object] | None = None,
+                     latest_mutation: dict[str, object] | None = None,
+                     jobs_mutation: dict[str, object] | None = None) -> tuple[subprocess.CompletedProcess[str], str]:
             with tempfile.TemporaryDirectory(prefix="retained-abort-selected-load-") as temporary:
                 root = Path(temporary)
                 workflow_path = root / "workflow.json"
                 attempt_path = root / "attempt.json"
+                latest_path = root / "latest.json"
+                jobs_path = root / "jobs.json"
                 output_path = root / "github-output"
                 workflow_path.write_text(
                     json.dumps({**workflow, **(workflow_mutation or {})}), encoding="utf-8"
@@ -6872,10 +6905,17 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 attempt_path.write_text(
                     json.dumps({**selected, **(mutation or {})}), encoding="utf-8"
                 )
+                latest_path.write_text(
+                    json.dumps({**selected, **(latest_mutation or {})}), encoding="utf-8"
+                )
+                jobs_payload = {"total_count": len(jobs), "jobs": jobs}
+                if jobs_mutation:
+                    jobs_payload.update(jobs_mutation)
+                jobs_path.write_text(json.dumps(jobs_payload), encoding="utf-8")
                 output_path.write_text("", encoding="ascii")
                 completed = subprocess.run(
                     [sys.executable, "-", str(workflow_path), str(attempt_path),
-                     "123456", "2", str(output_path)],
+                     str(latest_path), str(jobs_path), "123456", "2", "operator", str(output_path)],
                     input=script,
                     text=True,
                     capture_output=True,
@@ -6886,7 +6926,8 @@ class LiveQaWrapperContractTests(unittest.TestCase):
 
         accepted, output = run_case()
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
-        self.assertEqual(output, f"runner_sha={'a' * 40}\n")
+        self.assertIn(f"runner_sha={'a' * 40}\n", output)
+        self.assertIn("terminal_recovery_enabled=true\n", output)
         for mutation, workflow_mutation in (
             ({"id": 123457}, None),
             ({"run_attempt": 1}, None),
@@ -6900,6 +6941,103 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         ):
             with self.subTest(mutation=mutation, workflow_mutation=workflow_mutation):
                 self.assertNotEqual(run_case(mutation, workflow_mutation)[0].returncode, 0)
+        for latest_mutation, jobs_mutation in (
+            ({"run_attempt": 3}, None),
+            ({"conclusion": "success"}, None),
+            ({"actor": {"login": "other", "id": 19}}, None),
+            (None, {"total_count": 2}),
+            (None, {"jobs": [{**jobs[0], "status": "in_progress"}]}),
+            (None, {"jobs": [{**jobs[0], "run_attempt": 1}]}),
+            (None, {"jobs": [jobs[0], jobs[0]], "total_count": 2}),
+        ):
+            with self.subTest(latest_mutation=latest_mutation, jobs_mutation=jobs_mutation):
+                self.assertNotEqual(
+                    run_case(latest_mutation=latest_mutation, jobs_mutation=jobs_mutation)[0].returncode,
+                    0,
+                )
+        oversized_jobs = [
+            {**jobs[0], "id": jobs[0]["id"] + offset}
+            for offset in range(101)
+        ]
+        self.assertNotEqual(
+            run_case(jobs_mutation={"total_count": 101, "jobs": oversized_jobs})[0].returncode,
+            0,
+        )
+
+        recheck_step = workflow_text.split(
+            "      - name: Revalidate exact failed load attempt immediately before SSH\n",
+            1,
+        )[1].split("      - name: Abort the exact production load process tree\n", 1)[0]
+        recheck_script = textwrap.dedent(
+            recheck_step.split('cat > "$validator" <<\'PY\'\n', 1)[1]
+            .split("\n          PY\n", 1)[0]
+        )
+        normalized_jobs = [{
+            "id": 991,
+            "run_id": 123456,
+            "run_attempt": 2,
+            "head_sha": "a" * 40,
+            "status": "completed",
+            "conclusion": "failure",
+        }]
+        projection = {
+            "schema": 1,
+            "repository": "StrayForest/old_sparky",
+            "workflow_path": expected_path,
+            "event": "workflow_dispatch",
+            "head_branch": "dev",
+            "run_id": 123456,
+            "run_attempt": 2,
+            "workflow_id": 71,
+            "status": "completed",
+            "conclusion": "failure",
+            "head_sha": "a" * 40,
+            "actor_id": actor["id"],
+            "jobs": normalized_jobs,
+        }
+        projection_sha = hashlib.sha256(
+            json.dumps(projection, ensure_ascii=True, sort_keys=True,
+                       separators=(",", ":"), allow_nan=False).encode("ascii")
+        ).hexdigest()
+
+        def run_recheck(latest_row: dict[str, object] | None = None,
+                        attempt_row: dict[str, object] | None = None,
+                        job_rows: list[dict[str, object]] | None = None,
+                        total_count: int = 1) -> subprocess.CompletedProcess[str]:
+            with tempfile.TemporaryDirectory(prefix="retained-abort-recheck-") as temporary:
+                root = Path(temporary)
+                paths = [root / name for name in ("latest.json", "attempt.json", "jobs.json")]
+                documents = [
+                    latest_row or selected,
+                    attempt_row or selected,
+                    {"total_count": total_count, "jobs": normalized_jobs if job_rows is None else job_rows},
+                ]
+                for path, document in zip(paths, documents, strict=True):
+                    path.write_text(json.dumps(document), encoding="utf-8")
+                return subprocess.run(
+                    [sys.executable, "-", *(str(path) for path in paths), "123456", "2",
+                     "a" * 40, "operator", "71", "1", "1", projection_sha],
+                    input=recheck_script,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=5,
+                )
+
+        self.assertEqual(run_recheck().returncode, 0)
+        for latest_row, attempt_row, job_rows, total_count in (
+            ({**selected, "run_attempt": 3}, None, None, 1),
+            ({**selected, "conclusion": "success"}, None, None, 1),
+            (None, {**selected, "repository": {"full_name": "Other/repo"}}, None, 1),
+            ({**selected, "actor": {"login": "other", "id": 19}}, None, None, 1),
+            (None, None, [{**normalized_jobs[0], "status": "in_progress"}], 1),
+            (None, None, None, 2),
+        ):
+            with self.subTest(latest_row=latest_row, attempt_row=attempt_row, total_count=total_count):
+                self.assertNotEqual(
+                    run_recheck(latest_row, attempt_row, job_rows, total_count).returncode,
+                    0,
+                )
 
     def test_retained_abort_normalizer_accepts_only_bound_cpu_abort_proof(self) -> None:
         workflow = (
@@ -6935,6 +7073,24 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             "recovery_workflow_sha": "d" * 40,
             "recovery_helper_sha256": "e" * 64,
         }
+        controller = {
+            "schema": 1,
+            "repository": "StrayForest/old_sparky",
+            "workflow_path": ".github/workflows/platform-production-external-load.yml",
+            "event": "workflow_dispatch",
+            "head_branch": "dev",
+            "run_id": run_id,
+            "run_attempt": attempt,
+            "workflow_id": 71,
+            "status": "completed",
+            "conclusion": "failure",
+            "head_sha": runner_sha,
+            "actor_matches_abort_dispatch": True,
+            "jobs_complete": True,
+            "job_count": 2,
+            "failure_job_count": 1,
+            "projection_sha256": "f" * 64,
+        }
 
         def execute(
             canonical: object,
@@ -6946,6 +7102,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             remote_status: str = "0",
             ssh_cleanup: str = "success",
             stage_cleanup: str = "success",
+            terminal_enabled: bool = False,
         ):
             with tempfile.TemporaryDirectory() as directory:
                 canonical_path = Path(directory) / "canonical.log"
@@ -6976,6 +7133,11 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                         "ABORT_SSH_CLEANUP_STEP": ssh_cleanup,
                         "RECOVERY_WORKFLOW_SHA": "d" * 40,
                         "RECOVERY_HELPER_SHA256": "e" * 64,
+                        "LOAD_TERMINAL_RECOVERY_ENABLED": "true" if terminal_enabled else "false",
+                        "LOAD_TERMINAL_RUN_WORKFLOW_ID": "71",
+                        "LOAD_TERMINAL_RUN_JOB_COUNT": "2",
+                        "LOAD_TERMINAL_RUN_FAILURE_JOB_COUNT": "1",
+                        "LOAD_TERMINAL_RUN_PROJECTION_SHA256": "f" * 64,
                     },
                     check=False,
                     timeout=5,
@@ -7002,8 +7164,18 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             execute(unavailable, {**proof, "fixture_kind": []}).returncode,
             0,
         )
-        self.assertEqual(execute(passed, {"schema": 1, "status": "not_applicable"}).returncode, 0)
+        self.assertNotEqual(execute(passed, {"schema": 1, "status": "not_applicable"}).returncode, 0)
+        self.assertNotEqual(
+            execute({"schema": 1, "status": "failed", "truncated": False},
+                    {"schema": 1, "status": "not_applicable"}).returncode,
+            0,
+        )
         self.assertNotEqual(execute(unavailable, None).returncode, 0)
+        for canonical_status in ("passed", "failed", "unknown"):
+            with self.subTest(canonical_status=canonical_status):
+                canonical = {"schema": 1, "status": canonical_status, "truncated": False}
+                self.assertNotEqual(execute(canonical, None).returncode, 0)
+                self.assertEqual(execute(canonical, proof).returncode, 0)
         self.assertNotEqual(execute(unavailable, proof, selected_attempt="2").returncode, 0)
         split_runner_sha = "f" * 40
         split_proof = {**proof, "source_sha": split_runner_sha}
@@ -7068,6 +7240,83 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertNotEqual(execute(unavailable, duplicate_key_proof).returncode, 0)
         oversized_proof = b" " * 4097
         self.assertNotEqual(execute(unavailable, oversized_proof).returncode, 0)
+
+        missing_exit = {
+            **proof,
+            "schema": 2,
+            "remote_stage": "run_owned_process_tree_already_absent_without_exit_record",
+            "run_owned_process_selector": "fixed_script_paths_run_root_and_run_id",
+            "run_owned_roots_before": 0,
+            "run_owned_processes_before": 0,
+            "run_owned_roots_after": 0,
+            "run_owned_processes_after": 0,
+            "run_owned_roots_after_scan_1": 0,
+            "run_owned_processes_after_scan_1": 0,
+            "run_owned_roots_after_scan_2": 0,
+            "run_owned_processes_after_scan_2": 0,
+            "post_abort_scan_count": 2,
+            "post_scan_separation_ms": 100,
+            "supervisor_exit_record_present": False,
+            "supervisor_exit_code": None,
+            "termination_signals": [],
+            "release_lock_held": True,
+            "retained_lock_held": True,
+            "recovery_lock_order": ["release", "retained"],
+            "recovery_locks_held_through_scans_and_revalidation": True,
+            "binding_revalidated": True,
+            "active_release_sha": target_sha,
+            "terminal_controller": controller,
+        }
+        for legacy_only_field in (
+            "supervisor_selector", "supervisor_roots_before", "supervisor_tree_before",
+            "supervisor_roots_after", "supervisor_descendants_after",
+        ):
+            missing_exit.pop(legacy_only_field)
+        self.assertNotEqual(execute(unavailable, missing_exit).returncode, 0)
+        valid_absent = execute(unavailable, missing_exit, terminal_enabled=True)
+        self.assertEqual(
+            valid_absent.returncode,
+            0,
+            valid_absent.stderr,
+        )
+        stopped_without_exit = {
+            **missing_exit,
+            "remote_stage": "run_owned_process_tree_stopped_without_exit_record",
+            "run_owned_roots_before": 1,
+            "run_owned_processes_before": 7,
+            "termination_signals": ["SIGTERM"],
+        }
+        self.assertEqual(
+            execute(unavailable, stopped_without_exit, terminal_enabled=True).returncode,
+            0,
+        )
+        invalid_controller_proofs = (
+            {**missing_exit, "remote_stage": "supervisor_reaped_without_exit_record"},
+            {**missing_exit, "external_run_attempt": "2"},
+            {**missing_exit, "source_sha": "f" * 40},
+            {**missing_exit, "app_target_sha": "f" * 40},
+            {**missing_exit, "supervisor_exit_record_present": True},
+            {**missing_exit, "supervisor_exit_code": 0},
+            {**missing_exit, "namespace_closed": True},
+            {**missing_exit, "post_abort_scan_count": True},
+            {**missing_exit, "post_scan_separation_ms": 99},
+            {**missing_exit, "post_scan_separation_ms": 5001},
+            {**missing_exit, "run_owned_roots_after_scan_2": 1},
+            {**missing_exit, "release_lock_held": False},
+            {**missing_exit, "recovery_lock_order": ["retained", "release"]},
+            {**missing_exit, "recovery_locks_held_through_scans_and_revalidation": False},
+            {**missing_exit, "terminal_controller": {**controller, "conclusion": "success"}},
+            {**missing_exit, "terminal_controller": {**controller, "actor_matches_abort_dispatch": False}},
+            {**missing_exit, "terminal_controller": {**controller, "jobs_complete": False}},
+            {**missing_exit, "terminal_controller": {**controller, "run_attempt": "2"}},
+            {**missing_exit, "terminal_controller": {**controller, "projection_sha256": "0" * 64}},
+        )
+        for invalid in invalid_controller_proofs:
+            with self.subTest(invalid=invalid):
+                self.assertNotEqual(
+                    execute(unavailable, invalid, terminal_enabled=True).returncode,
+                    0,
+                )
 
 
 if __name__ == "__main__":
