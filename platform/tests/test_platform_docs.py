@@ -77,13 +77,20 @@ def _unsupported_gh_api_options(block: str) -> set[str]:
 class PlatformDocsTests(unittest.TestCase):
     def test_repository_documentation_is_indexed_and_linked(self) -> None:
         self.assertEqual(MODULE.collect_issues(MODULE.DOCS_ROOT), [])
+        sample_markdown = (
+            "Prose mentions gh api --repo, but is not an executable block.\n"
+            "~~~bash\n"
+            "# A comment mentioning gh api --repo is ignored.\n"
+            "gh api --repo StrayForest/old_sparky \\\n  repos/StrayForest/old_sparky/actions/runs/1\n"
+            "gh api \\\n  --output result.zip repos/StrayForest/old_sparky/actions/artifacts/2/zip\n"
+            "gh run watch 3 --repo StrayForest/old_sparky --exit-status\n"
+            "~~~\n"
+        )
+        sample_blocks = _bash_fenced_blocks(sample_markdown)
+        self.assertEqual(len(sample_blocks), 1)
         self.assertEqual(
-            _unsupported_gh_api_options(
-                "# comment mentioning gh api --repo is ignored.\n"
-                "gh api \\\n  repos/example/repo/actions/runs --output result.json\n"
-                "gh api repos/example/repo/runs --jq '.id'\n"
-            ),
-            {"--output"},
+            _unsupported_gh_api_options(sample_blocks[0]),
+            {"--repo", "--output"},
         )
         offenders = []
         for document in sorted(MODULE.DOCS_ROOT.rglob("*.md")):
