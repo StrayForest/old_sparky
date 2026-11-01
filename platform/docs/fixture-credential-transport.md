@@ -70,13 +70,17 @@ identity is needed by production fixture setup, the CPU diagnostic and trusted
 finalization; it is separate from SSH and Cloudflare credentials. Do not change
 existing production environment protections as part of this setup.
 
-For first-time bootstrap or rotation, generate a new identity in a private
+For first-time bootstrap or rotation, first stop new diagnostic dispatches
+and let every run encrypted to the current recipient finish its canonical
+cleanup. Do not replace either environment key while an active run may need to
+decrypt its input or manifest. Generate a new identity in a private
 mode-`0700` directory and derive its public recipient with the pinned
 `age-keygen -y`. Review and update the checked-in recipient and its tests in a
 source change, pass CI, and deploy that source before provisioning the matching
-private key with the command above. Never compare a newly generated random
-recipient against the current fixed recipient or provision a key that the
-active source cannot decrypt.
+private key with the command above. With runs quiesced, update both environment
+secrets to the matching new identity before resuming dispatches. Never compare
+a newly generated random recipient against the current fixed recipient or
+provision a key that the active source cannot decrypt.
 
 Do not create or change environment secrets until the source change is
 reviewed.
