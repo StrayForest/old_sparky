@@ -822,9 +822,9 @@ def _bounded_profile_categories(
         projected = retained + [("other", other_values)]
     else:
         projected = ordered
-    # The closed parent summary schema requires category names in lexical
-    # order. CPU ranking above selects the bounded set, not its wire order.
-    projected.sort(key=lambda item: item[0])
+    # Preserve the existing CPU-ranked wire order; the journal collector
+    # canonicalizes merged category rows before they reach the parent schema.
+    projected.sort(key=lambda item: (-item[1][0], item[0]))
     return [(name, values[0], values[1]) for name, values in projected]
 
 

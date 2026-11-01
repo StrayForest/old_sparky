@@ -134,6 +134,9 @@ class ApiCpuProfileConservationTests(unittest.TestCase):
         ordered = sorted(totals.items(), key=lambda item: (-item[1][0], item[0]))
         return [(name, values[0], values[1]) for name, values in ordered[:10]], total_self_us, len(ordered)
 
+    def _assert_cpu_ranked(self, rows: list[tuple[str, int, int]]) -> None:
+        self.assertEqual(rows, sorted(rows, key=lambda row: (-row[1], row[0])))
+
     def _journal_summary(self, api_messages: list[str]) -> dict[str, object]:
         source_sha = "a" * 40
         release_slug = "gha-profile-conservation-test"
@@ -218,7 +221,7 @@ class ApiCpuProfileConservationTests(unittest.TestCase):
 
         rows, total = api_diagnostic._profile_summary(profile)
         self.assertLessEqual(len(rows), 10)
-        self.assertEqual([row[0] for row in rows], sorted(row[0] for row in rows))
+        self._assert_cpu_ranked(rows)
         self.assertEqual(len({row[0] for row in rows}), len(rows))
         self.assertIn("other", {row[0] for row in rows})
         self.assertEqual(sum(row[1] for row in rows), total)
@@ -228,13 +231,13 @@ class ApiCpuProfileConservationTests(unittest.TestCase):
 
     def test_small_profile_keeps_all_categories_without_fabricating_other(self) -> None:
         profile = self._profile(sorted(api_diagnostic.API_FUNCTION_ALLOWLIST)[:4])
-        _legacy_rows, legacy_total, raw_category_count = self._legacy_top_ten(profile)
+        legacy_rows, legacy_total, raw_category_count = self._legacy_top_ten(profile)
         rows, total = api_diagnostic._profile_summary(profile)
         self.assertGreater(total, 0)
         self.assertLessEqual(len(rows), 10)
         self.assertEqual(len(rows), raw_category_count)
         self.assertEqual(total, legacy_total)
-        self.assertEqual([row[0] for row in rows], sorted(row[0] for row in rows))
+        self.assertEqual(rows, legacy_rows)
         self.assertEqual(sum(row[1] for row in rows), total)
         stats = pstats.Stats(profile).stats
         self.assertEqual(sum(row[2] for row in rows), sum(int(value[1]) for value in stats.values()))
@@ -246,7 +249,7 @@ class ApiCpuProfileConservationTests(unittest.TestCase):
         }
         projected = api_diagnostic._bounded_profile_categories(totals)
         self.assertEqual(len(projected), 10)
-        self.assertEqual([row[0] for row in projected], sorted(row[0] for row in projected))
+        self._assert_cpu_ranked(projected)
         self.assertIn("other", {row[0] for row in projected})
         self.assertEqual(sum(row[1] for row in projected), sum(row[0] for row in totals.values()))
         self.assertEqual(sum(row[2] for row in projected), sum(row[1] for row in totals.values()))
@@ -255,7 +258,7 @@ class ApiCpuProfileConservationTests(unittest.TestCase):
         profile = self._profile(sorted(api_diagnostic.API_FUNCTION_ALLOWLIST)[:12], unclassified=True)
         rows, total = api_diagnostic._profile_summary(profile)
         self.assertLessEqual(len(rows), 10)
-        self.assertEqual([row[0] for row in rows], sorted(row[0] for row in rows))
+        self._assert_cpu_ranked(rows)
         self.assertIn("other", {row[0] for row in rows})
         self.assertEqual(sum(row[1] for row in rows), total)
         stats = pstats.Stats(profile).stats
