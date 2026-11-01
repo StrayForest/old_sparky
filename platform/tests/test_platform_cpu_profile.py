@@ -7319,15 +7319,18 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "path": "/api/v1/tournaments/safe-slug/workspace",
             "headers": [(b"x-platform-ssr-trace", b"d" * 32)],
         }
+        clock = {"now_ms": plan.on_start_ms}
         with patch(
             "python_packages.platform_infra.performance_diagnostic.read_process_plan",
             return_value=plan,
         ), patch(
             "python_packages.platform_infra.performance_diagnostic.time.time_ns",
-            return_value=26_000_000_000,
+            side_effect=lambda: clock["now_ms"] * 1_000_000,
         ), patch.object(
             diagnostic_module, "_emit_cpu_diagnostic_message",
-        ) as emit_event:
+        ) as emit_event, patch.object(
+            diagnostic_module, "_read_process_plan_uncached", return_value=plan,
+        ) as revalidate:
             bound_plan, phase = ApiCpuDiagnostic.activate_for_scope(scope)
             self.assertIs(bound_plan, plan)
             self.assertEqual(phase, "on")
@@ -7340,11 +7343,82 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertIs(second_plan, plan)
             self.assertEqual(second_phase, "on")
             self.assertIs(diagnostic_module._active_profile, active)
+            clock["now_ms"] = plan.on_end_ms
             active.stop()
             self.assertTrue(active.stopped)
             self.assertIsNone(diagnostic_module._active_profile)
         self.assertEqual(emit_event.call_count, 1)
         self.assertTrue(emit_event.call_args.args[0].startswith("cpu_diagnostic_complete service=api "))
+        self.assertEqual(revalidate.call_args.kwargs["phase_at_ms"], plan.on_end_ms - 1)
+
+    def test_api_cpu_profile_completion_requires_live_plan_and_on_time_stop(self) -> None:
+        import python_packages.platform_infra.performance_diagnostic as diagnostic_module
+
+        payload = _diagnostic_payload()
+        plan = parse_plan_payload(_canonical_payload(payload), expected_service="api")
+        replacement = parse_plan_payload(
+            _canonical_payload({**payload, "source_sha": "f" * 40}),
+            expected_service="api",
+        )
+        old_active = diagnostic_module._active_profile
+        try:
+            for scenario in (
+                "valid", "replaced", "expired", "unreadable", "late",
+                "slow_replacement",
+            ):
+                with self.subTest(scenario=scenario):
+                    diagnostic = ApiCpuDiagnostic(plan)
+                    diagnostic.profile = SimpleNamespace(disable=lambda: None)
+                    diagnostic.started_monotonic = 1.0
+                    diagnostic_module._active_profile = diagnostic
+                    clock = {
+                        "now_ms": plan.on_end_ms + (251 if scenario == "late" else 0),
+                        "monotonic": 21.0,
+                    }
+                    current_plan = {
+                        "valid": plan,
+                        "replaced": replacement,
+                        "expired": None,
+                        "unreadable": None,
+                        "late": plan,
+                        "slow_replacement": replacement,
+                    }[scenario]
+
+                    def read_current_plan(*_args, **_kwargs):
+                        if scenario == "slow_replacement":
+                            clock["now_ms"] += 500
+                        if scenario == "unreadable":
+                            raise OSError("unavailable")
+                        return current_plan
+
+                    with (
+                        patch.object(
+                            diagnostic_module.time, "time_ns",
+                            side_effect=lambda: clock["now_ms"] * 1_000_000,
+                        ),
+                        patch.object(
+                            diagnostic_module.time, "monotonic",
+                            side_effect=lambda: clock["monotonic"],
+                        ),
+                        patch.object(
+                            diagnostic_module, "_read_process_plan_uncached",
+                            side_effect=read_current_plan,
+                        ) as read_plan,
+                        patch.object(diagnostic_module, "_profile_summary", return_value=([], 0)),
+                        patch.object(diagnostic_module, "_emit_cpu_diagnostic_message") as emit,
+                    ):
+                        diagnostic.stop()
+
+                    self.assertTrue(diagnostic.stopped)
+                    self.assertIsNone(diagnostic_module._active_profile)
+                    self.assertEqual(emit.call_count, int(scenario == "valid"))
+                    self.assertEqual(read_plan.call_count, int(scenario != "late"))
+                    if scenario == "slow_replacement":
+                        self.assertEqual(
+                            read_plan.call_args.kwargs["now_ms"], plan.on_end_ms,
+                        )
+        finally:
+            diagnostic_module._active_profile = old_active
 
     async def test_profiler_is_disabled_without_explicit_output_directory(self) -> None:
         with patch.dict(os.environ, {}, clear=True):

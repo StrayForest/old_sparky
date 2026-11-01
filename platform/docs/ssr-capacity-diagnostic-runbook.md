@@ -256,10 +256,13 @@ identities, and all of these conditions hold:
   same fixture manifest after the planned gap. Its trace-marked HTML warmups
   prearm API and web OFF/ON usage windows; API also arms a thread-CPU cProfile
   callback on each worker event loop. The callback rechecks the exact plan and
-  starts at the planned ON edge. A missing, late, or stale callback remains
+  starts at the planned ON edge; the API rechecks actual start time around
+  profiler construction and activation. At stop, it disables first, then
+  rechecks the exact process-bound plan and end time before emitting a complete
+  profile record. A missing, late, replaced, or unreadable plan remains
   incomplete; the first ON request cannot start or shift this profile. Keep the
-  250 ms start-lag bound. The 120-second capacity workload never enables API
-  cProfile. Profile data is attribution only; do not merge it into
+  250 ms start and end bounds. The 120-second capacity workload never enables
+  API cProfile. Profile data is attribution only; do not merge it into
   capacity-window latency or CPU results.
 - Both phase records, the top-level completion state and the full source and
   fixture bindings pass their closed validators. The phases fit within the

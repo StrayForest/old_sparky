@@ -970,6 +970,21 @@ class ApiCpuDiagnostic:
             _active_profile = None
         if self.profile is None:
             return
+        ended_ms = time.time_ns() // 1_000_000
+        end_lag_ms = ended_ms - self.plan.on_end_ms
+        if not 0 <= end_lag_ms <= CPU_WINDOW_TOLERANCE_MS:
+            return
+        try:
+            current_plan = _read_process_plan_uncached(
+                "api", now_ms=ended_ms, pid=None, start_ticks=None,
+                invocation_id=None, release_identity=None,
+                phase_at_ms=self.plan.on_end_ms - 1,
+                expiry_tolerance_ms=CPU_WINDOW_TOLERANCE_MS,
+            )
+        except (OSError, ValueError):
+            current_plan = None
+        if current_plan != self.plan:
+            return
         rows, total_self_us = _profile_summary(self.profile)
         elapsed_ms = 0
         if self.started_monotonic is not None:
@@ -1015,7 +1030,7 @@ def _schedule_cpu_profile_window(
                 invocation_id=None, release_identity=None,
                 phase_at_ms=plan.on_start_ms,
             )
-        except (OSError, ValueError, PlanError):
+        except (OSError, ValueError):
             fresh_plan = None
         if fresh_plan != plan:
             _consumed_run_ids.add(plan.run_id)
