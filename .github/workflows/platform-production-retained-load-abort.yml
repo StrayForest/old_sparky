@@ -196,17 +196,20 @@ jobs:
             > "$metadata/route-manifest.b64"
           env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 -I -B - \
             "$metadata" "$SECURITY_RUN_ID" "$SECURITY_RUN_ATTEMPT" "$SOURCE_SHA" <<'PY'
-          import base64
           import json
           from pathlib import Path
           import sys
 
           metadata = Path(sys.argv[1])
           run_id, attempt, source_sha = sys.argv[2:]
+          sys.path.insert(0, str(Path.cwd() / "platform"))
+          from tools.platform_workflow_provenance import (
+              decode_classifier_manifest_base64_output,
+              validate_recovery_source_security_gates,
+          )
           route_manifest = json.loads(
-              base64.b64decode(
+              decode_classifier_manifest_base64_output(
                   (metadata / "route-manifest.b64").read_bytes(),
-                  validate=True,
               )
           )
           workflow = json.loads((metadata / "workflow.json").read_text(encoding="utf-8"))
@@ -217,8 +220,6 @@ jobs:
           statuses = statuses_payload.get("statuses") if isinstance(statuses_payload, dict) else statuses_payload
           if not isinstance(jobs, list) or not isinstance(statuses, list):
               raise SystemExit("exact Security gate snapshots are malformed")
-          sys.path.insert(0, str(Path.cwd() / "platform"))
-          from tools.platform_workflow_provenance import validate_recovery_source_security_gates
           validate_recovery_source_security_gates(
               workflow,
               run,

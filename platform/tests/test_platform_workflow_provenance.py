@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import ast
+import base64
 from datetime import datetime, timezone
 import importlib
 import inspect
@@ -9,12 +10,14 @@ import json
 import os
 import re
 import sys
+import stat
 import subprocess
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+import zipfile
 
 import yaml
 
@@ -37,6 +40,7 @@ from tools.platform_workflow_provenance import (  # noqa: E402
     SECURITY_SUCCESS_DESCRIPTION,
     RECOVERY_REQUIRED_SECURITY_JOBS,
     ProvenanceError,
+    decode_classifier_manifest_base64_output,
     _payload_rows,
     deployment_snapshot_digest,
     latest_context_status,
@@ -2857,6 +2861,24 @@ class WorkflowProvenanceTests(unittest.TestCase):
                     expected_target_sha=self.SHA,
                 )
 
+    def test_classifier_manifest_base64_line_accepts_exact_cli_newline(self) -> None:
+        payload = b'{"schema":1,"target_sha":"' + (b"a" * 40) + b'"}'
+        emitted_by_cli = base64.b64encode(payload) + b"\n"
+        self.assertEqual(
+            decode_classifier_manifest_base64_output(emitted_by_cli), payload
+        )
+        self.assertEqual(decode_classifier_manifest_base64_output(emitted_by_cli[:-1]), payload)
+        for invalid in (
+            emitted_by_cli + b"\n",
+            emitted_by_cli.replace(b"\n", b"\r\n"),
+            b" " + emitted_by_cli,
+            emitted_by_cli[:-1] + b" \n",
+            emitted_by_cli[:-1] + b" !\n",
+            emitted_by_cli[:-1] + b"=\n",
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(ProvenanceError):
+                decode_classifier_manifest_base64_output(invalid)
+
     def test_recovery_security_requires_all_full_gates_and_both_real_runtime_jobs(self) -> None:
         run_id, attempt = 808, 3
         base = f"https://github.com/StrayForest/old_sparky/actions/runs/{run_id}"
@@ -2907,6 +2929,59 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 "creator": {"login": "github-actions[bot]", "type": "Bot", "id": 41898282},
             }
         ]
+        emitted_route = classify(
+            [".github/workflows/platform-production-retained-load-abort.yml"],
+            event="push",
+            target_sha=self.SHA,
+            branch="dev",
+        )
+        temporary = tempfile.TemporaryDirectory(prefix="classifier-route-roundtrip-")
+        self.addCleanup(temporary.cleanup)
+        archive_path = Path(temporary.name) / "classifier-route.zip"
+        emitted_path = archive_path.with_suffix(".b64")
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            member = zipfile.ZipInfo("classifier-manifest.json")
+            member.create_system = 3
+            member.external_attr = (stat.S_IFREG | 0o600) << 16
+            archive.writestr(
+                member,
+                json.dumps(emitted_route, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+            )
+        emitted = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                str(TOOLS / "platform_production_classifier_artifact.py"),
+                "manifest",
+                str(archive_path),
+                "--target-sha",
+                self.SHA,
+                "--require-recovery-bootstrap",
+                "--emit-manifest-base64",
+            ],
+            check=False,
+            capture_output=True,
+        )
+        self.assertEqual(emitted.returncode, 0, emitted.stderr.decode("utf-8", errors="replace"))
+        emitted_path.write_bytes(emitted.stdout)
+        decoded_route = json.loads(
+            decode_classifier_manifest_base64_output(emitted_path.read_bytes())
+        )
+        self.assertEqual(
+            validate_recovery_source_security_gates(
+                workflow,
+                run,
+                jobs,
+                statuses,
+                expected_run_id=run_id,
+                expected_attempt=attempt,
+                expected_target_sha=self.SHA,
+                route_manifest=decoded_route,
+                now=datetime(2026, 10, 5, 12, tzinfo=timezone.utc),
+            ),
+            f"{base}/attempts/{attempt}",
+        )
         self.assertEqual(
             validate_recovery_source_security_gates(
                 workflow,
