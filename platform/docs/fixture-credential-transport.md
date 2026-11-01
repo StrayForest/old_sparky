@@ -44,19 +44,23 @@ set -euo pipefail
 umask 077
 read -r -p "Path to the existing private age identity file: " identity_file
 [[ "$identity_file" = /* ]]
-test "$(stat -c '%F:%h:%a:%u' -- "$identity_file")" = "regular file:1:600:$(id -u)"
-test "$(stat -c '%F:%a:%u' -- "$(dirname -- "$identity_file")")" = "directory:700:$(id -u)"
-test "$(stat -c '%s' -- "$identity_file")" -le 4096
+test ! -L "$identity_file"
+repo_root="$(realpath -e -- "$(git rev-parse --show-toplevel)")"
+identity_real="$(realpath -e -- "$identity_file")"
+case "$identity_real" in "$repo_root"|"$repo_root"/*) exit 1 ;; esac
+test "$(stat -c '%F:%h:%a:%u' -- "$identity_real")" = "regular file:1:600:$(id -u)"
+test "$(stat -c '%F:%a:%u' -- "$(dirname -- "$identity_real")")" = "directory:700:$(id -u)"
+test "$(stat -c '%s' -- "$identity_real")" -le 4096
 identity_dir="$(mktemp -d)"
 chmod 700 "$identity_dir"
 trap 'rm -rf -- "$identity_dir"' EXIT
 python3 platform/tools/platform_fixture_credential_transport.py install-age --directory "$identity_dir" >/dev/null
-recipient="$("$identity_dir/age-keygen" -y "$identity_file")"
+recipient="$("$identity_dir/age-keygen" -y "$identity_real")"
 test "$recipient" = "age1egptr8zhhvfe0ggmyu4cr9azhfsjpvvn3p5eyppznnzx8c5yedjsyeaasa"
-key_lines="$(awk '/^AGE-SECRET-KEY-1/ && length($0)==74 { n++ } END { print n+0 }' "$identity_file")"
+key_lines="$(awk '/^AGE-SECRET-KEY-1/ && length($0)==74 { n++ } END { print n+0 }' "$identity_real")"
 test "$key_lines" = 1
-gh secret set FIXTURE_MANIFEST_AGE_IDENTITY --env fixture-manifest < <(awk '/^AGE-SECRET-KEY-1/ && length($0)==74 { printf "%s", $0 }' "$identity_file")
-gh secret set FIXTURE_MANIFEST_AGE_IDENTITY --env production < <(awk '/^AGE-SECRET-KEY-1/ && length($0)==74 { printf "%s", $0 }' "$identity_file")
+gh secret set FIXTURE_MANIFEST_AGE_IDENTITY --env fixture-manifest < <(awk '/^AGE-SECRET-KEY-1/ && length($0)==74 { printf "%s", $0 }' "$identity_real")
+gh secret set FIXTURE_MANIFEST_AGE_IDENTITY --env production < <(awk '/^AGE-SECRET-KEY-1/ && length($0)==74 { printf "%s", $0 }' "$identity_real")
 ```
 
 Restrict the `fixture-manifest` environment to the `dev` branch. Keep
