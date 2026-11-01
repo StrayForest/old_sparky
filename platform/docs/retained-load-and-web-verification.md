@@ -49,10 +49,18 @@ with the release lead. Do not remove installed releases, shared runtimes,
 current/previous releases, backup pairs or other protected paths. Then collect
 fresh read-only host capacity evidence for active app `A`:
 
+Use the exact active app SHA from the current successful, source-bound deployment
+receipt. Assign that 40-character public SHA to `active_app_sha`; the workflow
+checks it against the fresh active-release identity on the host. The placeholder
+below is an input to replace, not a valid SHA value:
+
 ```bash
+set -euo pipefail
+active_app_sha="<active-app-sha-from-current-deployment-receipt>"
+[[ "$active_app_sha" =~ ^[0-9a-f]{40}$ ]]
 gh workflow run platform-production-storage-diagnostics.yml \
   --repo StrayForest/old_sparky --ref dev \
-  -f expected_sha=A
+  -f expected_sha="$active_app_sha"
 gh run watch <storage-diagnostics-run-id> \
   --repo StrayForest/old_sparky --exit-status
 ```
