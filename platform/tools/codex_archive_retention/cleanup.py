@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
 import fcntl
 import hashlib
 import json
 import os
 import re
+import secrets
 import sqlite3
 import stat
 import subprocess
@@ -24,6 +26,7 @@ STATE_DB_NAME = "state_5.sqlite"
 ARCHIVE_DIR_NAME = "archived_sessions"
 ACTIVE_DIR_NAME = "sessions"
 RETENTION_LOCK_NAME = ".codex-archive-retention.lock"
+RETENTION_CURSOR_NAME = ".codex-archive-retention.cursor"
 LEGACY_QUARANTINE_NAME = ".codex-archive-retention"
 DEFAULT_CLI = Path("/usr/local/libexec/codex-archive-retention/codex")
 DEFAULT_MANIFEST = Path("/usr/local/libexec/codex-archive-retention/codex.manifest.json")
@@ -387,6 +390,90 @@ def ensure_no_legacy_quarantine(home: Path) -> None:
         raise UnsafeState("legacy quarantine has pending entries requiring operator review")
 
 
+def load_cursor(home: Path) -> str | None:
+    path = home / RETENTION_CURSOR_NAME
+    try:
+        path_info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if (
+        not stat.S_ISREG(path_info.st_mode)
+        or stat.S_ISLNK(path_info.st_mode)
+        or stat.S_IMODE(path_info.st_mode) != 0o600
+        or path_info.st_nlink != 1
+        or path_info.st_size > 256
+        or (os.geteuid() == 0 and path_info.st_uid != 0)
+    ):
+        raise UnsafeState("retention cursor has unsafe identity or mode")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (path_info.st_dev, path_info.st_ino):
+            raise UnsafeState("retention cursor identity changed while opening")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            raw = stream.read(257)
+    finally:
+        os.close(descriptor)
+    if len(raw) > 256:
+        raise UnsafeState("retention cursor exceeds its size bound")
+    try:
+        payload = json.loads(raw.decode("ascii"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise UnsafeState("retention cursor is malformed") from error
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"schema_version", "after_thread_id"}
+        or type(payload.get("schema_version")) is not int
+        or payload["schema_version"] != 1
+        or not isinstance(payload.get("after_thread_id"), str)
+        or not THREAD_ID_RE.fullmatch(payload["after_thread_id"])
+    ):
+        raise UnsafeState("retention cursor schema is unsupported")
+    return payload["after_thread_id"]
+
+
+def save_cursor(home: Path, thread_id: str) -> None:
+    path = home / RETENTION_CURSOR_NAME
+    payload = json.dumps(
+        {"schema_version": 1, "after_thread_id": thread_id},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii") + b"\n"
+    temporary = home / f"{RETENTION_CURSOR_NAME}.{secrets.token_hex(8)}.tmp"
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(home, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def next_candidate(
+    candidates: list[str], after_thread_id: str | None, visited: set[str]
+) -> str | None:
+    if not candidates:
+        return None
+    offset = bisect_right(candidates, after_thread_id) if after_thread_id else 0
+    ordered = candidates[offset:] + candidates[:offset]
+    return next((candidate for candidate in ordered if candidate not in visited), None)
+
+
 def run_delete(cli: Path, home: Path, thread_id: str) -> int:
     result = subprocess.run(
         [str(cli), "delete", "--force", "--archived-only", thread_id],
@@ -423,33 +510,47 @@ def run_maintenance(home: Path, cli: Path, manifest: Path, activation: Path) -> 
         except BlockingIOError:
             return 0
 
+        attempts = 0
         deleted = 0
         blocked: set[str] = set()
-        while deleted < MAX_DELETES_PER_RUN:
-            candidate = next(
-                (item for item in archived_candidates(home) if item not in blocked), None
+        native_refusals = 0
+        metadata_races = 0
+        visited: set[str] = set()
+        cursor = load_cursor(home)
+        considered = 0
+        while considered < MAX_DELETES_PER_RUN and attempts < MAX_DELETES_PER_RUN:
+            candidate = next_candidate(
+                archived_candidates(home), cursor, visited
             )
             if candidate is None:
                 break
+            considered += 1
+            visited.add(candidate)
+            cursor = candidate
+            save_cursor(home, cursor)
             before = row_and_files(home, candidate)
             if before[0] is None:
                 blocked.add(candidate)
+                metadata_races += 1
                 continue
+            attempts += 1
             result = run_delete(cli, home, candidate)
             after = row_and_files(home, candidate)
             if result != 0:
                 if after != before:
                     raise UnsafeState("native delete failed after changing archived state")
                 blocked.add(candidate)
+                native_refusals += 1
                 continue
             if after[0] is not None or after[1]:
                 raise UnsafeState("native delete returned success with archived state remaining")
             deleted += 1
-            blocked.clear()
         archived_rows, archived_files = archive_summary(home)
         log(
-            f"deleted {deleted} archived session(s); native guards deferred "
-            f"{len(blocked)} candidate(s); {archived_rows} archived database row(s) "
+            f"native attempts {attempts}/{MAX_DELETES_PER_RUN}; deleted {deleted} "
+            f"archived session(s); deferred {len(blocked)} candidate(s) "
+            f"(native refusals {native_refusals}, metadata races {metadata_races}); "
+            f"{archived_rows} archived database row(s) "
             f"and {archived_files} archived rollout file(s) remain"
         )
         return 0

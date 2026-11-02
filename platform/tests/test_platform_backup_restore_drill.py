@@ -4975,6 +4975,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         keep: int,
         restore_result: int = 12,
         scratch_backend: str = backup_drill.SCRATCH_BACKEND_TMPFS_V1,
+        created_at: dt.datetime | None = None,
     ) -> dict[str, Any]:
         args = argparse.Namespace(
             env_file=output_dir.parent / ".env.platform",
@@ -5014,7 +5015,8 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 mock.patch.object(
                     backup_drill,
                     "utc_now",
-                    return_value=dt.datetime(2026, 10, 6, 12, 0, 0, tzinfo=dt.UTC),
+                    return_value=created_at
+                    or dt.datetime(2026, 10, 6, 12, 0, 0, tzinfo=dt.UTC),
                 ),
             ):
                 result = backup_drill.create_backup(args)
@@ -10981,6 +10983,64 @@ raise SystemExit(status)
                 'backup.get("retention_archive_matches_new") is not True',
             ):
                 self.assertIn(predicate, workflow)
+
+    def test_retired_manifest_names_do_not_block_consecutive_keep_one_creates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = pathlib.Path(temporary_dir)
+            output_dir = root / "backups"
+            output_dir.mkdir()
+            legacy_name = "platformdb-20200101T000000Z.dump"
+            legacy_dump, legacy_sidecar = self._write_backup_pair(
+                output_dir, legacy_name, b"legacy verified archive"
+            )
+            manifest = self._write_protected_backup_manifest(
+                root / "protected.json", [legacy_name]
+            )
+
+            first = self._create_protected_backup(
+                output_dir,
+                manifest,
+                keep=1,
+                created_at=dt.datetime(2026, 10, 6, 12, 0, 0, tzinfo=dt.UTC),
+            )
+            first_proof = first["protected_retention_proof"]
+            self.assertTrue(
+                backup_drill.valid_protected_retention_proof(
+                    first_proof, requested_keep=1, new_dump_file=first["dump_file"]
+                )
+            )
+            self.assertFalse(legacy_dump.exists())
+            self.assertFalse(legacy_sidecar.exists())
+            self.assertEqual(first_proof["protected_pairs"]["after"], [])
+            self.assertEqual(first_proof["verified_selection"]["retained_count"], 1)
+
+            second = self._create_protected_backup(
+                output_dir,
+                manifest,
+                keep=1,
+                created_at=dt.datetime(2026, 10, 7, 12, 0, 0, tzinfo=dt.UTC),
+            )
+            second_proof = second["protected_retention_proof"]
+            self.assertTrue(
+                backup_drill.valid_protected_retention_proof(
+                    second_proof, requested_keep=1, new_dump_file=second["dump_file"]
+                )
+            )
+            self.assertEqual(second_proof["protected_pairs"]["before"], [])
+            self.assertEqual(second_proof["protected_pairs"]["after"], [])
+            self.assertEqual(second_proof["verified_selection"]["retained_count"], 1)
+            self.assertFalse((output_dir / first["dump_file"]).exists())
+            self.assertFalse(
+                (output_dir / first["dump_file"].replace(".dump", ".json")).exists()
+            )
+            self.assertTrue((output_dir / second["dump_file"]).is_file())
+            self.assertEqual(
+                {path.name for path in output_dir.iterdir()},
+                {
+                    second["dump_file"],
+                    second["dump_file"].replace(".dump", ".json"),
+                },
+            )
 
     def test_protected_rotation_emits_ordered_identity_proof_and_rejects_tampering(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:

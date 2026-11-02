@@ -11,6 +11,10 @@ database rows or files directly.
 
 The pinned upstream source and reviewed patch are declared in
 [`../tools/codex_archive_retention/codex-source.lock.json`](../tools/codex_archive_retention/codex-source.lock.json).
+The pinned patch also aligns the 170 local workspace package versions in
+`codex-rs/Cargo.lock` with the exact source manifests (`0.166.0`). It leaves
+third-party package records and dependency lists unchanged; native checks and
+the release build continue to use `--locked`.
 The companion is a private binary; it does not replace the system Codex
 installation. The build workflow runs only for same-repository pull requests
 targeting `dev`, with read-only repository permission. It checks out the exact
@@ -198,11 +202,14 @@ esac
 
 The service runs as root because `/root/.codex` is root-owned. Its systemd
 sandbox makes the filesystem read-only except for that Codex home and gives
-the service no external credentials. The wrapper takes a
-nonblocking root-owned lock, handles at most 16 sessions per invocation, and
+the service no external credentials. The wrapper takes a nonblocking
+root-owned lock, makes at most 16 native delete attempts per invocation, and
 re-enumerates after each deletion so archived child sessions are handled
-before their parents. Native guard refusals are deferred to a later timer
-run; an inconsistent successful deletion or unexpected state stops the run.
+before their parents. A root-owned mode-`0600` cursor in the Codex home rotates
+the starting thread ID between runs, so a refused ID does not consume the whole
+batch or starve later eligible rows. Each ID is attempted at most once per
+invocation; native guard refusals are deferred to a later timer run. An invalid
+cursor, inconsistent successful deletion, or unexpected state stops the run.
 The service sandbox makes installed code read-only while it runs as root; no
 other service identity can write the root-owned companion files.
 
@@ -210,9 +217,11 @@ other service identity can write the root-owned companion files.
 
 After activation, inspect only unit status and bounded wrapper logs; do not
 capture, print, or attach rollout data. A healthy completed run has service
-status `inactive (dead)` and exit status zero. The log reports deleted count,
-deferred count, and remaining archived row and file counts only. Confirm that
-the active-session collection and its state rows remain present using a
+status `inactive (dead)` and exit status zero. The log reports native attempt
+count, deleted count, deferred count, and remaining archived row and file
+counts only. The cursor is metadata-only scheduling state; do not edit or
+remove it while the timer is enabled. Confirm that the active-session
+collection and its state rows remain present using a
 separate metadata-only check before accepting the first run.
 
 If provenance validation, metadata validation, systemd verification, or the

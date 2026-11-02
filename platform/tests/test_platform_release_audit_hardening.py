@@ -3216,8 +3216,8 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                     argv = list(evidence.maintenance_preview_argv())
                     if ("--apply" in argv or "--json" not in argv
                         or "--protected-release" not in argv
-                        or "--protected-backup-manifest" not in argv
-                        or argv[argv.index("--backup-keep") + 1] != "15"):
+                        or "--protected-backup-manifest" in argv
+                        or argv[argv.index("--backup-keep") + 1] != "1"):
                         raise SystemExit(1)
                     argv[0] = sys.executable
                     argv[1] = {str(producer)!r}
@@ -3296,10 +3296,10 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             preview_argv = json.loads((root / "maintenance-argv.json").read_text())
             self.assertIn("--json", preview_argv)
             self.assertNotIn("--apply", preview_argv)
-            self.assertIn("--protected-backup-manifest", preview_argv)
-            self.assertIn("/opt/oldsparky/platform/shared/backup-retention/protected-dump-files.json", preview_argv)
+            self.assertNotIn("--protected-backup-manifest", preview_argv)
+            self.assertNotIn("/opt/oldsparky/platform/shared/backup-retention/protected-dump-files.json", preview_argv)
             self.assertIn("--backup-keep", preview_argv)
-            self.assertEqual(preview_argv[preview_argv.index("--backup-keep") + 1], "15")
+            self.assertEqual(preview_argv[preview_argv.index("--backup-keep") + 1], "1")
             self.assertEqual(
                 [preview_argv[index + 1] for index, value in enumerate(preview_argv[:-1]) if value == "--protected-release"],
                 [

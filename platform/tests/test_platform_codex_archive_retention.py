@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -270,6 +272,79 @@ class CodexArchiveRetentionTests(unittest.TestCase):
         self.assertTrue(rollout.exists())
         with sqlite3.connect(self.database) as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM threads").fetchone()[0], 1)
+
+    def test_native_refusal_is_reported_and_does_not_repeat_after_success(self) -> None:
+        blocked_id = "00000000-0000-4000-8000-000000000001"
+        removable_id = "00000000-0000-4000-8000-000000000002"
+        for thread_id in (blocked_id, removable_id):
+            self.write_rollout(self.insert_thread(thread_id))
+        output = io.StringIO()
+
+        with mock.patch.dict(os.environ, {"CODEX_TEST_FAIL_IDS": blocked_id}):
+            with contextlib.redirect_stderr(output):
+                self.assertEqual(self.run_retention(), 0)
+
+        self.assertEqual(
+            self.call_lines(),
+            [
+                f"delete --force --archived-only {blocked_id}",
+                f"delete --force --archived-only {removable_id}",
+            ],
+        )
+        self.assertIn("native attempts 2/16; deleted 1 archived session(s)", output.getvalue())
+        self.assertIn(
+            "deferred 1 candidate(s) (native refusals 1, metadata races 0)",
+            output.getvalue(),
+        )
+
+    def test_sixteen_attempt_cap_rotates_to_later_ids_on_next_pass(self) -> None:
+        thread_ids = [
+            f"00000000-0000-4000-8000-{number:012x}"
+            for number in range(1, cleanup.MAX_DELETES_PER_RUN + 2)
+        ]
+        for thread_id in thread_ids:
+            self.write_rollout(self.insert_thread(thread_id))
+        failures = ",".join(thread_ids[:-1])
+
+        with mock.patch.dict(os.environ, {"CODEX_TEST_FAIL_IDS": failures}):
+            self.assertEqual(self.run_retention(), 0)
+            first_pass = self.call_lines()
+            self.assertEqual(len(first_pass), cleanup.MAX_DELETES_PER_RUN)
+            self.assertEqual(
+                [line.rsplit(" ", 1)[-1] for line in first_pass], thread_ids[:-1]
+            )
+
+            self.assertEqual(self.run_retention(), 0)
+
+        all_calls = self.call_lines()
+        second_pass = all_calls[len(first_pass):]
+        self.assertEqual(len(second_pass), cleanup.MAX_DELETES_PER_RUN)
+        self.assertEqual(second_pass[0], f"delete --force --archived-only {thread_ids[-1]}")
+        self.assertEqual(
+            json.loads((self.home / cleanup.RETENTION_CURSOR_NAME).read_text()),
+            {
+                "after_thread_id": thread_ids[cleanup.MAX_DELETES_PER_RUN - 2],
+                "schema_version": 1,
+            },
+        )
+        self.assertEqual(
+            stat.S_IMODE((self.home / cleanup.RETENTION_CURSOR_NAME).stat().st_mode),
+            0o600,
+        )
+
+    def test_malformed_cursor_fails_closed_before_native_delete(self) -> None:
+        thread_id = "16161616-1616-4616-8616-161616161616"
+        rollout = self.insert_thread(thread_id)
+        self.write_rollout(rollout)
+        cursor = self.home / cleanup.RETENTION_CURSOR_NAME
+        cursor.write_text("{not-json", encoding="ascii")
+        cursor.chmod(0o600)
+
+        with self.assertRaises(cleanup.UnsafeState):
+            self.run_retention()
+
+        self.assertEqual(self.call_lines(), [])
+        self.assertTrue(rollout.exists())
 
     def test_companion_provenance_mismatch_fails_before_delete(self) -> None:
         thread_id = "13131313-1313-4313-8313-131313131313"

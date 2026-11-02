@@ -7,6 +7,6 @@
   "rust_toolchain": "1.95.0",
   "target": "x86_64-unknown-linux-gnu",
   "patch_file": "patches/codex-0.166.0.patch",
-  "patch_sha256": "56bc45be72c6c647658ed13af3a32c4e076505e35d5f021b663950d6efa828c2",
+  "patch_sha256": "8f4b9eda5226224c2c27247e54a56eb93730228d1fc7e6f8ac4fbda1f6fd1ed2",
   "max_binary_bytes": 262144000
 }
