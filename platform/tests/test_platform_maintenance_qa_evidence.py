@@ -221,10 +221,7 @@ def _loaded_unit_properties(
 
 def _legacy_preserve_maintenance_argv() -> tuple[str, ...]:
     argv = list(evidence.EXPECTED_MAINTENANCE_ARGV)
-    manifest_index = argv.index("--protected-backup-manifest")
-    del argv[manifest_index : manifest_index + 2]
-    argv[argv.index("15", argv.index("--backup-keep"))] = "14"
-    argv.insert(3, "--preserve-existing-backups")
+    argv[argv.index("1", argv.index("--backup-keep"))] = "15"
     return tuple(argv)
 
 
@@ -1070,6 +1067,11 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
             ):
                 evidence._safe_unit_bytes(str(immutable_unit), installed=False)
         preview_argv = evidence.maintenance_preview_argv()
+        self.assertIn("--protected-backup-manifest", evidence.EXPECTED_MAINTENANCE_ARGV)
+        self.assertIn(
+            "/opt/oldsparky/platform/shared/backup-retention/protected-dump-files.json",
+            evidence.EXPECTED_MAINTENANCE_ARGV,
+        )
         self.assertNotIn("--apply", preview_argv)
         self.assertNotIn("--private-backup-diagnostics", preview_argv)
         self.assertEqual(
@@ -1077,10 +1079,13 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
             "disk_ext4_image_v1",
         )
         self.assertIn("--json", preview_argv)
-        self.assertIn("--protected-backup-manifest", preview_argv)
-        self.assertIn("/opt/oldsparky/platform/shared/backup-retention/protected-dump-files.json", preview_argv)
+        self.assertNotIn("--protected-backup-manifest", preview_argv)
+        self.assertNotIn(
+            "/opt/oldsparky/platform/shared/backup-retention/protected-dump-files.json",
+            preview_argv,
+        )
         self.assertIn("--backup-keep", preview_argv)
-        self.assertIn("15", preview_argv)
+        self.assertEqual(preview_argv[preview_argv.index("--backup-keep") + 1], "1")
         for slug in evidence.REQUIRED_PROTECTED_RELEASES:
             self.assertIn(slug, preview_argv)
         properties = _loaded_unit_properties()

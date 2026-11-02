@@ -269,6 +269,7 @@ KNOWN_TEST_MODULES = frozenset(
     test_platform_cleanup_retained_orphan
     test_platform_cloudflare_audit
     test_platform_cloudflare_ips
+    test_platform_codex_archive_retention
     test_platform_configure_shared_env
     test_platform_configure_ufw
     test_platform_api_cpu_plan_permissions
@@ -502,6 +503,7 @@ TOOL_MODULES = frozenset(
         "test_platform_cleanup_retained_orphan",
         "test_platform_cloudflare_audit",
         "test_platform_cloudflare_ips",
+        "test_platform_codex_archive_retention",
         "test_platform_configure_shared_env",
         "test_platform_configure_ufw",
         "test_platform_deploy_smoke",
@@ -656,16 +658,16 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {
 # the sorted current IDs to these digests; a new test therefore needs an
 # explicit catalog update instead of silently inheriting a module default.
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
-    "module_count": 175,
-    "module_digest": "6266f71e1cf1a97db640b276ef65ab4b4bed1224ea20a3811cc32f40fe46e173",
-    "test_count": 2297,
-    "test_id_digest": "a5a60541c1fae67061df0d82b34357695d7bfa11e19dc671ca3ddb4ce9e7b074",
-    "backend_test_count": 2219,
-    "backend_test_id_digest": "c000e9d9f2f51bac8d445b5d7c557ddc0795d856734c5eec16097cad591a7f09",
-    "verification_test_count": 78,
-    "verification_test_id_digest": "3d9621c245877a188d3768cb835b85ddf3055971e4d5ee6b949aadd5d9fd0008",
-    "verification_classifier_test_count": 41,
-    "verification_classifier_test_id_digest": "3e754b6d27fce28cc94285bfd4be6b9cfcae84988b8f9befc892615f8547d32e",
+    "module_count": 176,
+    "module_digest": "5f5168273bae9359473f971b7c853b7c517f39f21ea91cf025a2ff24eca391c4",
+    "test_count": 2334,
+    "test_id_digest": "552da50ddc0ad6f28baf7d6919a567e68174edaf40f4e918c3006785814b7109",
+    "backend_test_count": 2255,
+    "backend_test_id_digest": "9022be67f4798f5562e0f027b2029410ac8079c3dbbd5fcd20cb0bdcf8dd81a9",
+    "verification_test_count": 79,
+    "verification_test_id_digest": "07e248ca2567a38ccbb35532881959dccbf507798e77578ca919422e4daa4b4d",
+    "verification_classifier_test_count": 42,
+    "verification_classifier_test_id_digest": "c339ecd588a32d75fbcc61984b4af954a4da47d7ee882df2ede986707bfe159f",
 }
 # Keep each executable contour's boundary independently snapshotted.  The
 # aggregate snapshot proves total ownership, while these entries make a
@@ -688,10 +690,10 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
         "test_id_digest": "e641b7fb36a11f1918e039e8bf6bf555b451ca54f8800322642ce38310d824a3",
     },
     "backend-tool-contract": {
-        "module_count": 53,
-        "module_digest": "fc8cb918289460364da1e8ce7b099bad4e78478312231b1f18de0ed21da15226",
-        "test_count": 616,
-        "test_id_digest": "79a7cb4c6e1a16465615fc2a38e1809549cfa523e313dc9599922388d4b247fd",
+        "module_count": 54,
+        "module_digest": "636080917fb0aba2e9a3af886ef5063e9f19ea9f73e40d4053e137dc74441bb2",
+        "test_count": 652,
+        "test_id_digest": "b426c7a42b7d99f36973ae81a26ef01fd9320b8594f22b001ea157143c3a45ae",
     },
     "backend-integration": {
         "module_count": 41,
@@ -703,7 +705,7 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
         "module_count": 28,
         "module_digest": "ab96560430aa4c30fb02e1468449f16fd0e6ea4e9a22780303c1b40453c04355",
         "test_count": 715,
-        "test_id_digest": "859d493fea2c4dd333634bd21a38dc7ffa9f039a99073fb00a2e2a01e8acbc2d",
+        "test_id_digest": "ce9f72fb6bfd9f563f94aee8ea916bbdacd783f99ad358299ddf84b332dfab4f",
     },
     "performance-contract": {
         "module_count": 13,
@@ -714,8 +716,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     VERIFICATION_CONTOUR: {
         "module_count": 3,
         "module_digest": "bc3b5eb1bc4e61842407a5e9edd6ab07f4bb21581ac2663b4754f6dcdaf5c02c",
-        "test_count": 78,
-        "test_id_digest": "3d9621c245877a188d3768cb835b85ddf3055971e4d5ee6b949aadd5d9fd0008",
+        "test_count": 79,
+        "test_id_digest": "07e248ca2567a38ccbb35532881959dccbf507798e77578ca919422e4daa4b4d",
     },
 }
 EXPECTED_MODULE_COUNT = int(EXPECTED_SNAPSHOT["module_count"])

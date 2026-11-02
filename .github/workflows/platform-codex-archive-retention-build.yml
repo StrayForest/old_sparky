@@ -1,0 +1,728 @@
+name: Platform Codex archive retention companion build
+
+on:
+  pull_request:
+    branches: [dev]
+    paths:
+      - ".github/workflows/platform-codex-archive-retention-build.yml"
+      - "platform/tools/codex_archive_retention/**"
+      - "platform/tests/test_platform_codex_archive_retention.py"
+      - "platform/tools/platform_ci_classifier.py"
+      - "platform/tests/test_platform_ci_classifier.py"
+      - "platform/tools/platform_test_catalog.py"
+
+# This workflow builds an evidence artifact only. It has no production
+# credentials and never installs the companion or touches a Codex home.
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-archive-retention-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and test pinned Codex companion
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.base.ref == 'dev'
+    permissions:
+      contents: read
+    env:
+      PLATFORM_SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+      PLATFORM_SOURCE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PLATFORM_EVENT: ${{ github.event_name }}
+      PLATFORM_REF: ${{ github.ref }}
+      PLATFORM_BASE_REF: ${{ github.event.pull_request.base.ref }}
+      PLATFORM_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+      PLATFORM_PR_NUMBER: ${{ github.event.pull_request.number }}
+      PLATFORM_TESTED_MERGE_SHA: ${{ github.sha }}
+      CODEX_REPOSITORY: https://github.com/openai/codex.git
+      CODEX_SOURCE_TAG: rust-v0.166.0
+      CODEX_SOURCE_COMMIT: 6ff1e1ca3b30fc8b914720681fcf5fe62e95f856
+      CODEX_RUST_TOOLCHAIN: 1.95.0
+      CODEX_TARGET: x86_64-unknown-linux-gnu
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Checkout exact platform workflow source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+          path: platform-source
+          persist-credentials: false
+
+      - name: Validate same-repository PR source binding
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$PLATFORM_EVENT" = pull_request
+          test "$PLATFORM_BASE_REF" = dev
+          test "$PLATFORM_HEAD_REPOSITORY" = "$GITHUB_REPOSITORY"
+          test "$PLATFORM_SOURCE_SHA" = "$PLATFORM_SOURCE_HEAD_SHA"
+          [[ "$PLATFORM_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PLATFORM_TESTED_MERGE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PLATFORM_PR_NUMBER" =~ ^[1-9][0-9]{0,8}$ ]]
+          test "$PLATFORM_REF" = "refs/pull/$PLATFORM_PR_NUMBER/merge"
+          test "$(git -C platform-source rev-parse --verify HEAD^{commit})" = "$PLATFORM_SOURCE_SHA"
+          test -z "$(git -C platform-source status --porcelain=v1 --untracked-files=all)"
+
+      - name: Validate source lock and patch binding
+        id: lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          lock=platform-source/platform/tools/codex_archive_retention/codex-source.lock.json
+          patch=platform-source/platform/tools/codex_archive_retention/patches/codex-0.166.0.patch
+          /usr/bin/python3 -I -B - "$lock" "$patch" "$GITHUB_OUTPUT" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          lock = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          patch_path = Path(sys.argv[2])
+          expected = {
+              "schema_version": 1,
+              "source_repository": "https://github.com/openai/codex.git",
+              "source_tag": "rust-v0.166.0",
+              "source_commit": "6ff1e1ca3b30fc8b914720681fcf5fe62e95f856",
+              "cli_version": "codex-cli 0.166.0",
+              "rust_toolchain": "1.95.0",
+              "target": "x86_64-unknown-linux-gnu",
+              "patch_file": "patches/codex-0.166.0.patch",
+          }
+          if any(lock.get(key) != value for key, value in expected.items()):
+              raise SystemExit("Codex source lock differs from the reviewed workflow pins")
+          if type(lock.get("max_binary_bytes")) is not int or not 1 <= lock["max_binary_bytes"] <= 262144000:
+              raise SystemExit("Codex binary size limit is invalid")
+          if re.fullmatch(r"[0-9a-f]{64}", lock.get("patch_sha256", "")) is None:
+              raise SystemExit("Codex source patch digest is malformed")
+          if hashlib.sha256(patch_path.read_bytes()).hexdigest() != lock["patch_sha256"]:
+              raise SystemExit("Codex source patch digest differs from the source lock")
+          with Path(sys.argv[3]).open("a", encoding="ascii") as output:
+              output.write(f"patch_sha256={lock['patch_sha256']}\n")
+              output.write(f"max_binary_bytes={lock['max_binary_bytes']}\n")
+          PY
+
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$CODEX_RUST_TOOLCHAIN" --profile minimal
+          rustup target add "$CODEX_TARGET" --toolchain "$CODEX_RUST_TOOLCHAIN"
+
+      - name: Fetch exact upstream source and apply reviewed patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init codex-source
+          git -C codex-source remote add origin "$CODEX_REPOSITORY"
+          git -C codex-source fetch --no-tags --depth=1 origin "refs/tags/$CODEX_SOURCE_TAG:refs/tags/$CODEX_SOURCE_TAG"
+          resolved="$(git -C codex-source rev-parse "$CODEX_SOURCE_TAG^{commit}")"
+          test "$resolved" = "$CODEX_SOURCE_COMMIT"
+          git -C codex-source checkout --detach "$CODEX_SOURCE_COMMIT"
+          patch="$GITHUB_WORKSPACE/platform-source/platform/tools/codex_archive_retention/patches/codex-0.166.0.patch"
+          git -C codex-source apply --unidiff-zero --whitespace=error-all --check "$patch"
+          git -C codex-source apply --unidiff-zero --whitespace=error-all "$patch"
+          git -C codex-source diff --check
+
+      - name: Generate pinned schema fixtures in an isolated copy
+        working-directory: codex-source/codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          schema_source="$PWD/app-server-protocol/schema"
+          schema_copy="$RUNNER_TEMP/codex-app-server-schema"
+          test ! -e "$schema_copy" && test ! -L "$schema_copy"
+          install -d -m 700 "$schema_copy"
+          cp -a "$schema_source/." "$schema_copy/"
+          run_schema_writer() {
+            local mode="$1"
+            local log_path="$RUNNER_TEMP/codex-schema-writer-$mode.log"
+            local command_status=0
+            CODEX_APP_SERVER_SCHEMA_ROOT="$schema_copy" \
+              CODEX_APP_SERVER_SCHEMA_EXPERIMENTAL="$mode" \
+              cargo +"$CODEX_RUST_TOOLCHAIN" test --locked -p codex-app-server-protocol \
+                --lib schema_fixtures_tests::write_schema_fixtures_from_env -- --exact --ignored \
+                2>&1 | tee "$log_path" || command_status=$?
+            local result_status=0
+            /usr/bin/python3 -I -B - "$log_path" <<'PY' || result_status=$?
+          from pathlib import Path
+          import re
+          import sys
+          output = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+          results = re.findall(
+              r"test result: (ok|FAILED)\. ([0-9]+) passed; ([0-9]+) failed;",
+              output,
+          )
+          if not results or not any(int(passed) + int(failed) > 0 for _, passed, failed in results):
+              raise SystemExit("schema writer filter matched no tests")
+          if any(result != "ok" or int(passed) != 1 or int(failed) != 0
+                 for result, passed, failed in results):
+              raise SystemExit("schema writer did not pass exactly one test")
+          PY
+            rm -f -- "$log_path"
+            if (( command_status != 0 || result_status != 0 )); then
+              printf 'Pinned schema writer failed for experimental=%s (command=%s, result=%s)\n' \
+                "$mode" "$command_status" "$result_status" >&2
+              return 1
+            fi
+          }
+          run_schema_writer 0
+          run_schema_writer 1
+
+      - name: Package generated schema fixture diagnostics
+        id: schema
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -I -B - \
+            platform-source/platform/tools/codex_archive_retention/codex-source.lock.json \
+            platform-source/platform/tools/codex_archive_retention/patches/codex-0.166.0.patch \
+            codex-source/codex-rs/app-server-protocol/schema \
+            "$RUNNER_TEMP/codex-app-server-schema" \
+            "$RUNNER_TEMP/codex-schema-fixture-diagnostic" "$GITHUB_OUTPUT" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import stat
+          import sys
+
+          lock_path, patch_path, baseline_root, generated_root, diagnostic_root, output_path = map(Path, sys.argv[1:])
+          lock = json.loads(lock_path.read_text(encoding="utf-8"))
+          allowed = {
+              "typescript/v2/ThreadDeleteParams.ts",
+              "json/ClientRequest.json",
+              "json/v2/ThreadDeleteParams.json",
+              "json/codex_app_server_protocol.schemas.json",
+              "json/codex_app_server_protocol.v2.schemas.json",
+              "precomputed/app-server-exports-stable.json.zst",
+              "precomputed/app-server-exports-experimental.json.zst",
+          }
+          if hashlib.sha256(patch_path.read_bytes()).hexdigest() != lock.get("patch_sha256"):
+              raise SystemExit("schema diagnostic patch does not match the source lock")
+          if (lock.get("source_commit") != os.environ.get("CODEX_SOURCE_COMMIT")
+                  or lock.get("source_tag") != os.environ.get("CODEX_SOURCE_TAG")
+                  or lock.get("rust_toolchain") != os.environ.get("CODEX_RUST_TOOLCHAIN")
+                  or lock.get("target") != os.environ.get("CODEX_TARGET")
+                  or os.environ.get("GITHUB_REPOSITORY") != "StrayForest/old_sparky"
+                  or re.fullmatch(r"[0-9a-f]{40}", os.environ.get("PLATFORM_SOURCE_SHA", "")) is None
+                  or os.environ.get("PLATFORM_SOURCE_SHA") != os.environ.get("PLATFORM_SOURCE_HEAD_SHA")
+                  or re.fullmatch(r"[0-9a-f]{40}", os.environ.get("PLATFORM_TESTED_MERGE_SHA", "")) is None
+                  or re.fullmatch(r"[1-9][0-9]{0,8}", os.environ.get("PLATFORM_PR_NUMBER", "")) is None
+                  or re.fullmatch(r"[1-9][0-9]{0,31}", os.environ.get("GITHUB_RUN_ID", "")) is None
+                  or re.fullmatch(r"[1-9][0-9]{0,31}", os.environ.get("GITHUB_RUN_ATTEMPT", "")) is None):
+              raise SystemExit("schema diagnostic source identity is invalid")
+
+          def inventory(root: Path) -> dict[str, Path]:
+              rows = {}
+              for path in root.rglob("*"):
+                  info = path.lstat()
+                  if stat.S_ISDIR(info.st_mode):
+                      continue
+                  if not stat.S_ISREG(info.st_mode):
+                      raise SystemExit("schema tree contains a non-regular entry")
+                  rows[path.relative_to(root).as_posix()] = path
+              return rows
+
+          before = inventory(baseline_root)
+          after = inventory(generated_root)
+          changed = []
+          for name in sorted(set(before) | set(after)):
+              if name not in before or name not in after:
+                  changed.append(name)
+                  continue
+              if before[name].read_bytes() != after[name].read_bytes():
+                  changed.append(name)
+          unexpected = sorted(set(changed) - allowed)
+          if unexpected:
+              raise SystemExit("schema writer changed a path outside the closed fixture allowlist")
+          if not changed:
+              with output_path.open("a", encoding="ascii") as output:
+                  output.write("schema_changed=false\n")
+              print("Pinned generated schema fixtures match the reviewed source")
+              raise SystemExit(0)
+          if len(changed) > len(allowed):
+              raise SystemExit("schema diagnostic changed-file count exceeds its bound")
+          entries = []
+          total_bytes = 0
+          files = []
+          for name in changed:
+              path = after.get(name)
+              if path is None:
+                  raise SystemExit("schema generator removed an allowed fixture")
+              data = path.read_bytes()
+              total_bytes += len(data)
+              if len(data) > 32 * 1024 * 1024 or total_bytes > 64 * 1024 * 1024:
+                  raise SystemExit("schema diagnostic output exceeds its byte cap")
+              entries.append({"path": name, "size_bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+              files.append((name, data))
+          diagnostic_root.mkdir(mode=0o700)
+          for name, data in files:
+              destination = diagnostic_root / name
+              destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+              descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+              with os.fdopen(descriptor, "wb") as stream:
+                  stream.write(data)
+                  stream.flush()
+                  os.fsync(stream.fileno())
+          manifest = {
+              "schema_version": 1,
+              "platform_repository": os.environ["GITHUB_REPOSITORY"],
+              "platform_pr_number": os.environ["PLATFORM_PR_NUMBER"],
+              "platform_source_sha": os.environ["PLATFORM_SOURCE_SHA"],
+              "platform_tested_merge_sha": os.environ["PLATFORM_TESTED_MERGE_SHA"],
+              "workflow_run_id": os.environ["GITHUB_RUN_ID"],
+              "workflow_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "source_repository": lock["source_repository"],
+              "source_tag": lock["source_tag"],
+              "source_commit": lock["source_commit"],
+              "patch_sha256": lock["patch_sha256"],
+              "rust_toolchain": lock["rust_toolchain"],
+              "target": lock["target"],
+              "changed_files": entries,
+          }
+          manifest_path = diagnostic_root / "schema-fixture-diagnostic.json"
+          manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
+          manifest_path.chmod(0o600)
+          with output_path.open("a", encoding="ascii") as output:
+              output.write("schema_changed=true\n")
+              output.write(f"schema_diagnostic_path={diagnostic_root}\n")
+          print(f"Pinned schema generation changed {len(changed)} allowlisted fixture file(s)")
+          PY
+
+      - name: Upload non-executable schema fixture diagnostic
+        if: steps.schema.outputs.schema_changed == 'true'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: codex-schema-fixture-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.schema.outputs.schema_diagnostic_path }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Fail closed on generated schema fixture drift
+        if: steps.schema.outputs.schema_changed == 'true'
+        shell: bash
+        run: |
+          echo "Generated protocol fixtures differ from the pinned source; review the source-bound diagnostic before native tests or build." >&2
+          exit 1
+
+      - name: Run focused archived-only native lifecycle tests
+        if: steps.schema.outputs.schema_changed == 'false'
+        working-directory: codex-source/codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          failed=0
+          run_focused_test() {
+            local test_name="$1"
+            shift
+            local log_path="$RUNNER_TEMP/codex-native-test-$RANDOM.log"
+            local command_status=0
+            "$@" 2>&1 | tee "$log_path" || command_status=$?
+            local result_status=0
+            /usr/bin/python3 -I -B - "$log_path" <<'PY' || result_status=$?
+          from pathlib import Path
+          import re
+          import sys
+          output = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+          results = re.findall(
+              r"test result: (ok|FAILED)\. ([0-9]+) passed; ([0-9]+) failed;",
+              output,
+          )
+          if not results or not any(int(passed) + int(failed) > 0 for _, passed, failed in results):
+              raise SystemExit("focused native test filter matched no tests")
+          if any(result != "ok" or int(failed) > 0 for result, _, failed in results):
+              raise SystemExit("focused native test output contains failed tests")
+          PY
+            if (( command_status != 0 || result_status != 0 )); then
+              printf 'Focused native test failed: %s (command=%s, results=%s)\n' \
+                "$test_name" "$command_status" "$result_status"
+              failed=1
+            else
+              printf 'Focused native test passed: %s\n' "$test_name"
+            fi
+            rm -f -- "$log_path"
+          }
+          run_focused_test thread-store \
+            cargo +"$CODEX_RUST_TOOLCHAIN" test --locked -p codex-thread-store --lib \
+            local::delete_thread::tests::archived_only
+          run_focused_test app-server \
+            cargo +"$CODEX_RUST_TOOLCHAIN" test --locked -p codex-app-server --test all \
+            thread_delete_archived_only_refuses_active_thread
+          run_focused_test cli \
+            cargo +"$CODEX_RUST_TOOLCHAIN" test --locked -p codex-cli --bin codex \
+            delete_archived_only_requires_force_and_uuid
+          run_focused_test protocol \
+            cargo +"$CODEX_RUST_TOOLCHAIN" test --locked -p codex-app-server-protocol \
+            schema_fixtures
+          if (( failed != 0 )); then
+            printf 'One or more focused native test filters failed.\n' >&2
+            exit 1
+          fi
+
+      - name: Build and bind private companion binary
+        id: artifact
+        shell: bash
+        env:
+          PATCH_SHA256: ${{ steps.lock.outputs.patch_sha256 }}
+          MAX_BINARY_BYTES: ${{ steps.lock.outputs.max_binary_bytes }}
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_BUILD_JOBS: "1"
+        run: |
+          set -euo pipefail
+          umask 077
+          cd codex-source/codex-rs
+          diagnostics_dir="$RUNNER_TEMP/codex-build-diagnostics"
+          install -d -m 700 "$diagnostics_dir"
+          /usr/bin/python3 -I -B -u - "$diagnostics_dir" "$CODEX_RUST_TOOLCHAIN" \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_REPOSITORY" \
+            "$PLATFORM_PR_NUMBER" "$PLATFORM_SOURCE_SHA" "$PLATFORM_TESTED_MERGE_SHA" \
+            600 15 <<'PY' &
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import signal
+          import subprocess
+          import sys
+          import threading
+          import time
+          from datetime import datetime, timezone
+
+          root = Path(sys.argv[1])
+          toolchain = sys.argv[2]
+          run_id, run_attempt, repository, pull_request, head_sha, merge_sha = sys.argv[3:9]
+          sample_limit = int(sys.argv[9])
+          interval_seconds = int(sys.argv[10])
+          stop_requested = threading.Event()
+
+          def stop_sampler(_signum, _frame):
+              stop_requested.set()
+
+          signal.signal(signal.SIGTERM, stop_sampler)
+          signal.signal(signal.SIGINT, stop_sampler)
+
+          def command_text(*args):
+              try:
+                  result = subprocess.run(
+                      list(args), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                      stderr=subprocess.DEVNULL, text=True, timeout=10, check=False,
+                  )
+              except (OSError, subprocess.SubprocessError):
+                  return None
+              return result.stdout.strip() if result.returncode == 0 else None
+
+          def command_integer(*args):
+              value = command_text(*args)
+              return int(value) if value is not None and value.isdecimal() else None
+
+          def memory_info():
+              result = {}
+              try:
+                  for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+                      match = re.fullmatch(r"(MemTotal|MemAvailable):\s+(\d+)\s+kB", line)
+                      if match:
+                          result[match.group(1).lower() + "_bytes"] = int(match.group(2)) * 1024
+              except OSError:
+                  pass
+              return result
+
+          def cgroup_info():
+              result = {"memory_current_bytes": None, "memory_max_bytes": None,
+                        "memory_peak_bytes": None, "oom_events": {}}
+              try:
+                  membership = next(
+                      line[3:] for line in Path("/proc/self/cgroup").read_text(encoding="ascii").splitlines()
+                      if line.startswith("0::")
+                  )
+                  relative = Path(membership.lstrip("/"))
+                  if ".." in relative.parts:
+                      return result
+                  base = (Path("/sys/fs/cgroup") / relative).resolve(strict=True)
+                  if not base.is_relative_to(Path("/sys/fs/cgroup").resolve(strict=True)):
+                      return result
+                  for file_name, key in (("memory.current", "memory_current_bytes"),
+                                         ("memory.max", "memory_max_bytes"),
+                                         ("memory.peak", "memory_peak_bytes")):
+                      try:
+                          value = (base / file_name).read_text(encoding="ascii").strip()
+                          result[key] = int(value) if value.isdigit() else None
+                      except OSError:
+                          pass
+                  try:
+                      for line in (base / "memory.events").read_text(encoding="ascii").splitlines():
+                          parts = line.split()
+                          if len(parts) == 2 and parts[0] in {
+                              "low", "high", "max", "oom", "oom_kill", "oom_group_kill"
+                          } and parts[1].isdigit():
+                              result["oom_events"][parts[0]] = int(parts[1])
+                  except OSError:
+                      pass
+              except (OSError, StopIteration, RuntimeError):
+                  pass
+              return result
+
+          def disk_info():
+              try:
+                  data = os.statvfs(Path.cwd())
+                  total = data.f_blocks * data.f_frsize
+                  available = data.f_bavail * data.f_frsize
+                  return {"filesystem_total_bytes": total,
+                          "filesystem_available_bytes": available,
+                          "filesystem_used_bytes": max(0, total - data.f_bfree * data.f_frsize)}
+              except OSError:
+                  return {"filesystem_total_bytes": None,
+                          "filesystem_available_bytes": None,
+                          "filesystem_used_bytes": None}
+
+          def rustc_memory_info():
+              rss = command_text("ps", "-C", "rustc", "-o", "rss=")
+              if rss is None:
+                  return {"rustc_process_count": None,
+                          "rustc_rss_sum_bytes": None,
+                          "rustc_rss_max_bytes": None}
+              values = []
+              for line in rss.splitlines():
+                  value = line.strip()
+                  if not value.isdecimal():
+                      return {"rustc_process_count": None,
+                              "rustc_rss_sum_bytes": None,
+                              "rustc_rss_max_bytes": None}
+                  values.append(int(value) * 1024)
+              return {
+                  "rustc_process_count": len(values),
+                  "rustc_rss_sum_bytes": sum(values),
+                  "rustc_rss_max_bytes": max(values, default=0),
+              }
+
+          def snapshot(sample_number):
+              return {
+                  "sample": sample_number,
+                  "utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                  "nproc": command_integer("nproc"),
+                  "python_cpu_count": os.cpu_count(),
+                  **memory_info(),
+                  **cgroup_info(),
+                  **disk_info(),
+                  **rustc_memory_info(),
+              }
+
+          def write_private_json(path, payload):
+              flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+              descriptor = os.open(path, flags, 0o600)
+              with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                  json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+                  stream.write("\n")
+                  stream.flush()
+                  os.fsync(stream.fileno())
+
+          release = {}
+          for line in Path("/etc/os-release").read_text(encoding="utf-8").splitlines():
+              key, separator, value = line.partition("=")
+              if separator and key in {"ID", "VERSION_ID"}:
+                  release[key.lower()] = value.strip().strip('"')
+          baseline = {
+              "schema_version": 1,
+              "workflow_run_id": run_id,
+              "workflow_run_attempt": run_attempt,
+              "platform_repository": repository,
+              "pull_request": pull_request,
+              "platform_source_sha": head_sha,
+              "tested_merge_sha": merge_sha,
+              "os_release": release,
+              "rust_toolchain": toolchain,
+              "rustc_version": command_text("rustc", f"+{toolchain}", "--version"),
+              "cargo_version": command_text("cargo", f"+{toolchain}", "--version"),
+              "release_profile": "release",
+              "release_lto": False,
+              "release_codegen_units": 4,
+              "cargo_locked": True,
+              "cargo_timings": True,
+              "sample_interval_seconds": interval_seconds,
+              "sample_limit": sample_limit,
+              "resource_sample_duration_seconds": sample_limit * interval_seconds,
+              **snapshot(0),
+          }
+          write_private_json(root / "resource-baseline.json", baseline)
+          sample_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+          sample_descriptor = os.open(root / "resource-samples.ndjson", sample_flags, 0o600)
+          with os.fdopen(sample_descriptor, "w", encoding="utf-8") as samples:
+              for number in range(1, sample_limit + 1):
+                  row = snapshot(number)
+                  line = json.dumps(row, sort_keys=True, separators=(",", ":"))
+                  samples.write(line + "\n")
+                  samples.flush()
+                  os.fsync(samples.fileno())
+                  print("codex-build-resource " + line, flush=True)
+                  if number == sample_limit or stop_requested.wait(interval_seconds):
+                      break
+          PY
+          sampler_pid=$!
+          stop_sampler() {
+            if [[ -n "${sampler_pid:-}" ]]; then
+              if kill -0 "$sampler_pid" 2>/dev/null; then
+                kill -TERM "$sampler_pid" || return 1
+              fi
+              wait "$sampler_pid" || sampler_status=$?
+              sampler_pid=
+            fi
+          }
+          write_build_summary() {
+            /usr/bin/python3 -I -B - "$diagnostics_dir" "$1" "${sampler_status:-0}" "$2" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          root = Path(sys.argv[1])
+          payload = {
+              "schema_version": 1,
+              "build_exit_status": int(sys.argv[2]),
+              "sampler_exit_status": int(sys.argv[3]),
+              "cargo_timing_report": sys.argv[4],
+          }
+          descriptor = os.open(
+              root / "build-summary.json",
+              os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+              0o600,
+          )
+          with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+              json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+              stream.write("\n")
+              stream.flush()
+              os.fsync(stream.fileno())
+          PY
+          }
+          sampler_status=0
+          timing_status=missing
+          on_term() {
+            trap - TERM
+            build_status=143
+            stop_sampler || sampler_status=1
+            write_build_summary "$build_status" "$timing_status"
+            exit 143
+          }
+          trap on_term TERM
+          on_exit() {
+            original_status=$?
+            trap - EXIT
+            if stop_sampler; then
+              :
+            else
+              sampler_status=$?
+              printf 'build resource sampler exit status: %s\n' "$sampler_status" >&2
+            fi
+            if [[ ! -s "$diagnostics_dir/build-summary.json" ]]; then
+              write_build_summary "$original_status" "$timing_status" || {
+                printf 'failed to persist bounded build summary\n' >&2
+              }
+            fi
+          }
+          trap on_exit EXIT
+          for _ in {1..20}; do
+            [[ -f "$diagnostics_dir/resource-baseline.json" ]] && break
+            sleep 1
+          done
+          test -s "$diagnostics_dir/resource-baseline.json"
+          if /usr/bin/time -v -o "$diagnostics_dir/time-v.txt" \
+            cargo +"$CODEX_RUST_TOOLCHAIN" build --locked --release --timings \
+              -p codex-cli --bin codex; then
+            build_status=0
+          else
+            build_status=$?
+          fi
+          if [[ -f target/cargo-timings/cargo-timing.html ]]; then
+            timing_bytes="$(stat -c '%s' target/cargo-timings/cargo-timing.html)"
+            if (( timing_bytes <= 10485760 )); then
+              install -m 600 target/cargo-timings/cargo-timing.html "$diagnostics_dir/cargo-timing.html"
+              timing_status=copied
+            else
+              timing_status=exceeds_10_mib
+            fi
+          fi
+          stop_sampler || sampler_status=1
+          write_build_summary "$build_status" "$timing_status"
+          if (( build_status != 0 )); then
+            exit "$build_status"
+          fi
+          if (( sampler_status != 0 )); then
+            printf 'build diagnostics sampler failed; refusing binary artifact\n' >&2
+            exit 1
+          fi
+          artifact_dir="$RUNNER_TEMP/codex-archive-retention"
+          install -d -m 700 "$artifact_dir"
+          install -m 700 target/release/codex "$artifact_dir/codex"
+          strip --strip-unneeded "$artifact_dir/codex"
+          binary_bytes="$(stat -c '%s' "$artifact_dir/codex")"
+          test "$binary_bytes" -gt 0
+          test "$binary_bytes" -le "$MAX_BINARY_BYTES"
+          binary_sha256="$(sha256sum "$artifact_dir/codex" | awk '{print $1}')"
+          CODEX_HOME="$RUNNER_TEMP/empty-codex-home" "$artifact_dir/codex" --version > "$artifact_dir/version.txt"
+          test "$(cat "$artifact_dir/version.txt")" = "codex-cli 0.166.0"
+          /usr/bin/python3 -I -B - "$artifact_dir" "$binary_sha256" "$binary_bytes" "$PATCH_SHA256" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          root = Path(sys.argv[1])
+          lock_path = Path(os.environ["GITHUB_WORKSPACE"]) / "platform-source/platform/tools/codex_archive_retention/codex-source.lock.json"
+          lock = json.loads(lock_path.read_text(encoding="utf-8"))
+          manifest = {
+              "schema_version": 1,
+              "platform_repository": os.environ["GITHUB_REPOSITORY"],
+              "platform_event": os.environ["PLATFORM_EVENT"],
+              "platform_ref": os.environ["PLATFORM_REF"],
+              "platform_base_ref": os.environ["PLATFORM_BASE_REF"],
+              "platform_head_repository": os.environ["PLATFORM_HEAD_REPOSITORY"],
+              "platform_pr_number": os.environ["PLATFORM_PR_NUMBER"],
+              "platform_source_sha": os.environ["PLATFORM_SOURCE_SHA"],
+              "platform_source_head_sha": os.environ["PLATFORM_SOURCE_HEAD_SHA"],
+              "platform_tested_merge_sha": os.environ["PLATFORM_TESTED_MERGE_SHA"],
+              "workflow_run_id": os.environ["GITHUB_RUN_ID"],
+              "workflow_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "source_repository": lock["source_repository"],
+              "source_tag": lock["source_tag"],
+              "source_commit": lock["source_commit"],
+              "patch_sha256": sys.argv[4],
+              "rust_toolchain": lock["rust_toolchain"],
+              "target": lock["target"],
+              "cli_version": lock["cli_version"],
+              "release_profile": "release",
+              "release_lto": False,
+              "release_codegen_units": 4,
+              "binary_bytes": int(sys.argv[3]),
+              "binary_sha256": sys.argv[2],
+          }
+          path = root / "codex.manifest.json"
+          path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
+          path.chmod(0o600)
+          PY
+          printf 'artifact_dir=%s\n' "$artifact_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Upload bounded native build diagnostics
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: codex-archive-retention-build-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/codex-build-diagnostics
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload non-deployable companion evidence artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: codex-archive-retention-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.artifact.outputs.artifact_dir }}
+          if-no-files-found: error
+          retention-days: 7

@@ -75,7 +75,7 @@ _RECEIPT_KEYS = frozenset(
         "restore_verified",
         "alembic_revision_verified",
         "restored_table_count",
-        "preexisting_archives_preserved",
+        "retained_pair_count",
         "rotation_mode",
     }
 )
@@ -178,8 +178,8 @@ def _validate_receipt(value: Any, expected: BackupBinding, *, backup_run_id: str
         "created": True,
         "restore_verified": True,
         "alembic_revision_verified": True,
-        "preexisting_archives_preserved": True,
-        "rotation_mode": "preserve-existing",
+        "retained_pair_count": 1,
+        "rotation_mode": "rotate-existing",
     }
     for key, expected_value in fixed.items():
         if type(value.get(key)) is not type(expected_value) or value.get(key) != expected_value:
@@ -208,6 +208,8 @@ def _validate_receipt(value: Any, expected: BackupBinding, *, backup_run_id: str
         or value["archive_size_bytes"] <= 0
         or type(value.get("restored_table_count")) is not int
         or value["restored_table_count"] < 1
+        or type(value.get("retained_pair_count")) is not int
+        or value["retained_pair_count"] != 1
     ):
         raise BackupProofError("backup receipt archive verification is invalid")
     return value

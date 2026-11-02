@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "source_repository": "https://github.com/openai/codex.git",
+  "source_tag": "rust-v0.166.0",
+  "source_commit": "6ff1e1ca3b30fc8b914720681fcf5fe62e95f856",
+  "cli_version": "codex-cli 0.166.0",
+  "rust_toolchain": "1.95.0",
+  "target": "x86_64-unknown-linux-gnu",
+  "patch_file": "patches/codex-0.166.0.patch",
+  "patch_sha256": "a9b5efcf2386d54158ac6611204985604e147ef3257baf053ecd7af74334eb4e",
+  "max_binary_bytes": 262144000
+}

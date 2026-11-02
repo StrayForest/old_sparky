@@ -46,11 +46,18 @@ jobs:
           import json, os, stat, sys
           from pathlib import Path
           path = Path(os.environ["GITHUB_EVENT_PATH"])
-          fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+          try:
+              fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+          except OSError:
+              raise SystemExit("EVENT_SCRUB reason=event_file_open")
           try:
               st = os.fstat(fd)
-              if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_nlink != 1 or st.st_size > 65536 or stat.S_IMODE(st.st_mode) & 0o022:
-                  raise ValueError
+              if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_nlink != 1 or st.st_size > 65536 or stat.S_IMODE(st.st_mode) & 0o7022:
+                  raise SystemExit("EVENT_SCRUB reason=event_file_metadata")
+              os.fchmod(fd, 0o600)
+              st = os.fstat(fd)
+              if stat.S_IMODE(st.st_mode) != 0o600:
+                  raise SystemExit("EVENT_SCRUB reason=event_file_seal")
               raw = os.read(fd, 65537)
               if len(raw) != st.st_size:
                   raise ValueError
@@ -60,17 +67,17 @@ jobs:
               result = {}
               for key, value in items:
                   if key in result:
-                      raise ValueError
+                      raise SystemExit("EVENT_SCRUB reason=duplicate_event_key")
                   result[key] = value
               return result
           try:
               event = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs)
               inputs = event["inputs"]
               if not isinstance(inputs, dict) or set(inputs) != {"confirmation", "load_run_id", "control_email"} or not isinstance(inputs["control_email"], str):
-                  raise ValueError
+                  raise SystemExit("EVENT_SCRUB reason=dispatch_input_shape")
               email = inputs.pop("control_email")
               if not email or not email.isascii():
-                  raise ValueError
+                  raise SystemExit("EVENT_SCRUB reason=control_identity_invalid")
               for value in dict.fromkeys((email, email.lower())):
                   sys.stdout.write("::add-mask::" + value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A") + "\n")
               sys.stdout.flush()
@@ -102,7 +109,7 @@ jobs:
               if not isinstance(checked_inputs, dict) or "control_email" in checked_inputs or any(contains_private_value(checked, secret) for secret in {email, email.lower(), email.casefold()} if secret):
                   raise ValueError
           except (KeyError, TypeError, UnicodeError, ValueError, json.JSONDecodeError):
-              raise SystemExit("workflow event sanitization failed closed")
+              raise SystemExit("EVENT_SCRUB reason=event_payload_invalid")
           PY
       - name: Checkout exact target as untrusted source data
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -263,11 +270,18 @@ jobs:
           import json, os, stat, sys
           from pathlib import Path
           path = Path(os.environ["GITHUB_EVENT_PATH"])
-          fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+          try:
+              fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+          except OSError:
+              raise SystemExit("EVENT_SCRUB reason=event_file_open")
           try:
               st = os.fstat(fd)
-              if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_nlink != 1 or st.st_size > 65536 or stat.S_IMODE(st.st_mode) & 0o022:
-                  raise ValueError
+              if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_nlink != 1 or st.st_size > 65536 or stat.S_IMODE(st.st_mode) & 0o7022:
+                  raise SystemExit("EVENT_SCRUB reason=event_file_metadata")
+              os.fchmod(fd, 0o600)
+              st = os.fstat(fd)
+              if stat.S_IMODE(st.st_mode) != 0o600:
+                  raise SystemExit("EVENT_SCRUB reason=event_file_seal")
               raw = os.read(fd, 65537)
               if len(raw) != st.st_size:
                   raise ValueError
@@ -296,20 +310,33 @@ jobs:
               try:
                   data = (email.lower() + "\n").encode("ascii")
                   if os.write(email_fd, data) != len(data):
-                      raise ValueError
+                      raise SystemExit("EVENT_SCRUB reason=control_identity_write")
                   os.fsync(email_fd)
               finally:
                   os.close(email_fd)
               safe = (json.dumps(event, ensure_ascii=True, separators=(",", ":")) + "\n").encode()
-              temporary = path.with_name(".sanitized-event-" + str(os.getpid()))
-              out = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+              sanitized_path = Path(os.environ["RUNNER_TEMP"]) / "retained-cleanup-sanitized-event.json"
+              out = os.open(sanitized_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
               try:
-                  os.write(out, safe)
+                  if os.write(out, safe) != len(safe):
+                      raise SystemExit("EVENT_SCRUB reason=sanitized_event_write")
                   os.fsync(out)
+                  written = os.fstat(out)
+                  if not stat.S_ISREG(written.st_mode) or written.st_uid != os.geteuid() or written.st_nlink != 1 or stat.S_IMODE(written.st_mode) != 0o600 or written.st_size != len(safe):
+                      raise SystemExit("EVENT_SCRUB reason=sanitized_event_metadata")
               finally:
                   os.close(out)
-              os.replace(temporary, path)
-              checked = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=pairs)
+              check_fd = os.open(sanitized_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+              try:
+                  checked_meta = os.fstat(check_fd)
+                  if not stat.S_ISREG(checked_meta.st_mode) or checked_meta.st_uid != os.geteuid() or checked_meta.st_nlink != 1 or stat.S_IMODE(checked_meta.st_mode) != 0o600 or checked_meta.st_size != len(safe):
+                      raise SystemExit("EVENT_SCRUB reason=sanitized_event_metadata")
+                  checked_raw = os.read(check_fd, len(safe) + 1)
+              finally:
+                  os.close(check_fd)
+              if checked_raw != safe:
+                  raise SystemExit("EVENT_SCRUB reason=sanitized_event_contents")
+              checked = json.loads(checked_raw.decode("utf-8"), object_pairs_hook=pairs)
               checked_inputs = checked.get("inputs") if isinstance(checked, dict) else None
               def contains_private_value(value, secret):
                   pending = [value]
@@ -326,9 +353,9 @@ jobs:
                           pending.extend(current)
                   return False
               if not isinstance(checked_inputs, dict) or "control_email" in checked_inputs or any(contains_private_value(checked, secret) for secret in {email, email.lower(), email.casefold()} if secret):
-                  raise ValueError
+                  raise SystemExit("EVENT_SCRUB reason=control_identity_retained")
           except (KeyError, TypeError, UnicodeError, ValueError, json.JSONDecodeError):
-              raise SystemExit("workflow event sanitization failed closed")
+              raise SystemExit("EVENT_SCRUB reason=event_payload_invalid")
           PY
       - name: Download exact source-binding handoff
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
@@ -519,7 +546,7 @@ jobs:
           # Validate and serialize operator-controlled identity before any
           # SSH key file, keyscan or remote command is reached.  This is a
           # data-only handoff; the secret job never loads repository code.
-          /usr/bin/python3 - "$TARGET_SHA" "$LOAD_RUN_ID" "$GITHUB_RUN_ID" "$GITHUB_EVENT_PATH" \
+          /usr/bin/python3 - "$TARGET_SHA" "$LOAD_RUN_ID" "$GITHUB_RUN_ID" "$RUNNER_TEMP/retained-cleanup-sanitized-event.json" \
             "$RUNNER_TEMP/retained-cleanup-source-binding/source-binding.json" \
             "$APP_TARGET_SHA" <<'PY'
           import json
@@ -532,90 +559,110 @@ jobs:
           import urllib.request
 
           target_sha, load_run_id, cleanup_run_id, event_path, binding_path_value, expected_app_sha = sys.argv[1:]
-          try:
-              flags = os.O_RDONLY | os.O_NOFOLLOW
-              descriptor = os.open(event_path, flags)
-              try:
-                  metadata = os.fstat(descriptor)
-                  if (
-                      not stat.S_ISREG(metadata.st_mode)
-                      or metadata.st_uid != os.geteuid()
-                      or metadata.st_nlink != 1
-                      or metadata.st_size > 65536
-                      or stat.S_IMODE(metadata.st_mode) & 0o022
-                  ):
+
+          def fail(reason):
+              raise SystemExit(f"CLEANUP_PREFLIGHT reason={reason}")
+
+          def reject_duplicate_keys(pairs):
+              values = {}
+              for key, value in pairs:
+                  if key in values:
                       raise ValueError
-                  with os.fdopen(descriptor, "rb", closefd=False) as event_file:
-                      raw_event = event_file.read(65537)
+                  values[key] = value
+              return values
+
+          try:
+              event_fd = os.open(event_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+              try:
+                  event_meta = os.fstat(event_fd)
+                  if (
+                      not stat.S_ISREG(event_meta.st_mode)
+                      or event_meta.st_uid != os.geteuid()
+                      or event_meta.st_nlink != 1
+                      or stat.S_IMODE(event_meta.st_mode) != 0o600
+                      or event_meta.st_size > 65536
+                  ):
+                      fail("sanitized_event_metadata")
+                  raw_event = os.read(event_fd, 65537)
               finally:
-                  os.close(descriptor)
-              if len(raw_event) > 65536:
-                  raise ValueError
-
-              def reject_duplicate_keys(pairs):
-                  values = {}
-                  for key, value in pairs:
-                      if key in values:
-                          raise ValueError
-                      values[key] = value
-                  return values
-
-              def reject_duplicate_binding_keys(pairs):
-                  values = {}
-                  for key, value in pairs:
-                      if key in values:
-                          raise ValueError
-                      values[key] = value
-                  return values
-
-              event = json.loads(
-                  raw_event.decode("utf-8"), object_pairs_hook=reject_duplicate_keys
-              )
-              inputs = event.get("inputs") if isinstance(event, dict) else None
-              if not isinstance(inputs, dict) or set(inputs) != {
-                  "confirmation", "load_run_id"
-              }:
-                  raise ValueError
-              email_path = Path(os.environ["RUNNER_TEMP"]) / "retained-cleanup-control-email"
-              email_metadata = email_path.lstat()
-              if not stat.S_ISREG(email_metadata.st_mode) or stat.S_ISLNK(email_metadata.st_mode) or email_metadata.st_nlink != 1 or stat.S_IMODE(email_metadata.st_mode) != 0o600 or email_metadata.st_size > 256:
-                  raise ValueError
-              email_raw = email_path.read_bytes()
-              if not email_raw.endswith(b"\n") or email_raw.count(b"\n") != 1:
-                  raise ValueError
-              email = email_raw[:-1].decode("ascii")
-              def contains_private_value(value, secret):
-                  pending = [value]
-                  folded = secret.casefold()
-                  while pending:
-                      current = pending.pop()
-                      if isinstance(current, str):
-                          if folded in current.casefold():
-                              return True
-                      elif isinstance(current, dict):
-                          for key, item in current.items():
-                              pending.extend((key, item))
-                      elif isinstance(current, list):
-                          pending.extend(current)
-                  return False
-              if any(contains_private_value(event, secret) for secret in {email, email.lower(), email.casefold()} if secret):
-                  raise ValueError
-              binding_path = Path(binding_path_value)
-              binding_meta = binding_path.lstat()
-              if (
-                  not stat.S_ISREG(binding_meta.st_mode)
-                  or stat.S_ISLNK(binding_meta.st_mode)
-                  or binding_meta.st_nlink != 1
-                  or binding_meta.st_size > 20 * 1024
-              ):
-                  raise ValueError
-              binding_raw = binding_path.read_bytes()
-              source_handoff = json.loads(
-                  binding_raw.decode("ascii"),
-                  object_pairs_hook=reject_duplicate_binding_keys,
-              )
+                  os.close(event_fd)
+              if len(raw_event) != event_meta.st_size or len(raw_event) > 65536:
+                  fail("sanitized_event_size")
+              event = json.loads(raw_event.decode("utf-8"), object_pairs_hook=reject_duplicate_keys)
+          except SystemExit:
+              raise
           except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
-              raise SystemExit("cleanup control identity input is invalid")
+              fail("sanitized_event_invalid")
+          inputs = event.get("inputs") if isinstance(event, dict) else None
+          if not isinstance(inputs, dict) or set(inputs) != {"confirmation", "load_run_id"}:
+              fail("sanitized_input_shape")
+          if inputs.get("confirmation") != os.environ.get("QA_CONFIRMATION") or inputs.get("load_run_id") != load_run_id:
+              fail("dispatch_binding")
+
+          email_path = Path(os.environ["RUNNER_TEMP"]) / "retained-cleanup-control-email"
+          try:
+              email_fd = os.open(email_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+              try:
+                  email_meta = os.fstat(email_fd)
+                  if (
+                      not stat.S_ISREG(email_meta.st_mode)
+                      or email_meta.st_uid != os.geteuid()
+                      or email_meta.st_nlink != 1
+                      or stat.S_IMODE(email_meta.st_mode) != 0o600
+                      or email_meta.st_size > 256
+                  ):
+                      fail("control_identity_metadata")
+                  email_raw = os.read(email_fd, 257)
+              finally:
+                  os.close(email_fd)
+              if len(email_raw) != email_meta.st_size or not email_raw.endswith(b"\n") or email_raw.count(b"\n") != 1:
+                  fail("control_identity_format")
+              email = email_raw[:-1].decode("ascii")
+          except SystemExit:
+              raise
+          except (OSError, UnicodeError, ValueError):
+              fail("control_identity_unavailable")
+
+          def contains_private_value(value, secret):
+              pending = [value]
+              folded = secret.casefold()
+              while pending:
+                  current = pending.pop()
+                  if isinstance(current, str):
+                      if folded in current.casefold():
+                          return True
+                  elif isinstance(current, dict):
+                      for key, item in current.items():
+                          pending.extend((key, item))
+                  elif isinstance(current, list):
+                      pending.extend(current)
+              return False
+          if any(contains_private_value(event, secret) for secret in {email, email.lower(), email.casefold()} if secret):
+              fail("control_identity_retained")
+
+          binding_path = Path(binding_path_value)
+          try:
+              binding_fd = os.open(binding_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+              try:
+                  binding_meta = os.fstat(binding_fd)
+                  if (
+                      not stat.S_ISREG(binding_meta.st_mode)
+                      or binding_meta.st_uid != os.geteuid()
+                      or binding_meta.st_nlink != 1
+                      or stat.S_IMODE(binding_meta.st_mode) != 0o600
+                      or binding_meta.st_size > 20 * 1024
+                  ):
+                      fail("source_binding_metadata")
+                  binding_raw = os.read(binding_fd, 20 * 1024 + 1)
+              finally:
+                  os.close(binding_fd)
+              if len(binding_raw) != binding_meta.st_size or len(binding_raw) > 20 * 1024:
+                  fail("source_binding_size")
+              source_handoff = json.loads(binding_raw.decode("ascii"), object_pairs_hook=reject_duplicate_keys)
+          except SystemExit:
+              raise
+          except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+              fail("source_binding_invalid")
           binding_keys = {
               "schema", "binding_mode", "runner_sha", "app_target_sha", "baseline_identity",
               "receipt_document_sha256", "receipt_artifact_id", "receipt_artifact_name",
@@ -687,6 +734,8 @@ jobs:
                   or source_binding.get("receipt_archive_sha256") != source_binding.get("receipt_artifact_digest", "").removeprefix("sha256:")
               ):
                   raise SystemExit("cleanup verified-noop binding proof is malformed")
+
+          sys.stdout.write("CLEANUP_PREFLIGHT status=validated\n")
 
           def exact_api_json(path):
               request = urllib.request.Request(

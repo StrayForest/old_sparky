@@ -427,6 +427,12 @@ manifest. Cleanup still uses the ordinary run-bound identity and control
 account-preservation checks. A missing, malformed or zero status without a
 manifest remains a manual-barrier failure.
 
+For a CPU-only or SSR-only diagnostic, the finalizer also permits exact cleanup
+after successful setup when both candidate jobs were skipped. Before SSH it
+validates the encrypted input, descriptor/source binding and run identity. If a
+candidate job ran, this route is unavailable; cleanup never proves namespace
+closure or grants phase credit, and the diagnostic remains failed.
+
 A structurally complete budget miss may pass through origin attachment and
 sanitization so its evidence is retained, but final workflow enforcement still
 fails the run. A status `0` or `500` result may use the same reserved candidate

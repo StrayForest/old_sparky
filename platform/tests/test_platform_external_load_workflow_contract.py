@@ -19,6 +19,7 @@ import re
 import shlex
 import subprocess
 import sys
+import stat
 import tempfile
 import textwrap
 import time
@@ -1071,6 +1072,82 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         for status in statuses:
             with self.subTest(status=status):
                 self.assertIn(status, gate)
+
+    def test_fixture_commit_without_any_candidate_job_allows_exact_finalizer_cleanup(self) -> None:
+        workflow = yaml.safe_load(self.source)
+        finalizer = workflow["jobs"]["fixture-finalize"]
+        cleanup_route = (
+            "needs.fixture-setup.outputs.setup_status == '0'",
+            "needs.fixture-setup.outputs.manifest_ready == '1'",
+            "needs.load-client.result == 'skipped'",
+            "needs['cpu-diagnostic-pair'].result == 'skipped'",
+        )
+        for step_name in (
+            "Stage the fixture-only finalizer identity",
+            "Revalidate finalizer handoffs",
+            "Exact cleanup of external fixture",
+        ):
+            step = next(step for step in finalizer["steps"] if step.get("name") == step_name)
+            condition = step.get("if", "")
+            for fragment in cleanup_route:
+                with self.subTest(step=step_name, condition=fragment):
+                    self.assertIn(fragment, condition)
+            self.assertIn("inputs.cpu_diagnostic_only == true", condition)
+            self.assertIn("inputs.ssr_capacity_diagnostic_only == true", condition)
+
+        ssh_step = next(
+            step for step in finalizer["steps"]
+            if step.get("name") == "Configure finalizer SSH"
+        )
+        self.assertIn(
+            "steps.revalidate-finalizer.outputs.cleanup_identity_status == '0'",
+            ssh_step.get("if", ""),
+        )
+
+        def may_cleanup(*, diagnostic, setup, manifest, load, pair, namespace_closed):
+            return namespace_closed or (
+                diagnostic and setup == "0" and manifest == "1"
+                and load == "skipped" and pair == "skipped"
+            )
+
+        self.assertTrue(may_cleanup(
+            diagnostic=True, setup="0", manifest="1", load="skipped",
+            pair="skipped", namespace_closed=False,
+        ))
+        self.assertTrue(may_cleanup(
+            diagnostic=False, setup="0", manifest="1", load="failure",
+            pair="skipped", namespace_closed=True,
+        ))
+        for update in (
+            {"diagnostic": False},
+            {"setup": "1"},
+            {"manifest": "0"},
+            {"load": "success"},
+            {"load": "failure"},
+            {"pair": "success"},
+            {"pair": "failure"},
+        ):
+            state = {
+                "diagnostic": True, "setup": "0", "manifest": "1",
+                "load": "skipped", "pair": "skipped", "namespace_closed": False,
+            }
+            state.update(update)
+            with self.subTest(disallowed=update):
+                self.assertFalse(may_cleanup(**state))
+
+        def may_configure_ssh(*, cleanup_identity_status):
+            return may_cleanup(
+                diagnostic=True,
+                setup="0",
+                manifest="1",
+                load="skipped",
+                pair="skipped",
+                namespace_closed=False,
+            ) and cleanup_identity_status == "0"
+
+        self.assertTrue(may_configure_ssh(cleanup_identity_status="0"))
+        self.assertFalse(may_configure_ssh(cleanup_identity_status="1"))
+        self.assertFalse(may_configure_ssh(cleanup_identity_status=""))
 
     def test_fault_injection_truth_table_rejects_each_phase_failure(self) -> None:
         passing = {
@@ -2185,7 +2262,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                             check=False,
                         )
                         self.assertNotEqual(result.returncode, 0)
-                        self.assertIn("workflow event sanitization failed closed", result.stderr)
+                        self.assertIn("EVENT_SCRUB reason=event_payload_invalid", result.stderr)
                         self.assertNotIn(credential, result.stderr)
                         self.assertNotIn(credential.lower(), result.stderr.lower())
 
@@ -2263,6 +2340,97 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 self.assertIn('"$RUNNER_TEMP/platform-production-control-email"', cleanup)
                 self.assertIn("test ! -e", cleanup)
 
+    def test_event_scrub_steps_seal_owner_readable_event_files_and_reject_unsafe_metadata(self) -> None:
+        mask_steps = {
+            "resolve-host-tools-pin": "Mask and remove control identity before host-tools resolution",
+            "resolve-load-source-and-profile": "Mask and remove control identity before candidate checkout",
+            "validate-external-inputs": "Mask and remove control identity from the event file",
+            "fixture-setup": "Mask and remove control identity before setup",
+            "load-client": "Mask and remove control identity from the runner event file",
+            "derive-diagnostic-source-binding": "Remove control identity from the runner event file",
+            "cpu-diagnostic-pair": "Remove control identity from the runner event file",
+            "fixture-finalize": "Mask and stage the control identity from the event file",
+            "evaluate-load": "Remove control identity from the runner event file",
+        }
+        valid_inputs = {
+            "confirmation": "RUN-PRODUCTION-EXTERNAL-LOAD",
+            "control_email": "Control%qa@example.invalid",
+            "profile_id": "ready-vote-slo-v2",
+            "timeout_diagnostics": False,
+            "cpu_diagnostic_pair": False,
+            "cpu_diagnostic_only": False,
+            "ssr_capacity_diagnostic_only": False,
+            "ssr_capacity_concurrency": "8",
+            "ssr_capacity_workload": "authenticated_workspace_read_capacity_v1",
+        }
+        for job_name, step_name in mask_steps.items():
+            script = _step_script(self.jobs[job_name], step_name)
+            for event_mode in (0o600, 0o644):
+                with self.subTest(job=job_name, event_mode=oct(event_mode)), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    event_path = root / "event.json"
+                    event_path.write_text(
+                        json.dumps({
+                            "inputs": valid_inputs,
+                            "repository": {"description": "metadata mentions control_email"},
+                        }),
+                        encoding="utf-8",
+                    )
+                    event_path.chmod(event_mode)
+                    result = subprocess.run(
+                        ["/bin/bash", "-euo", "pipefail", "-c", script],
+                        env={
+                            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                            "GITHUB_EVENT_PATH": str(event_path),
+                            "RUNNER_TEMP": str(root),
+                        },
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(stat.S_IMODE(event_path.stat().st_mode), 0o600)
+                    self.assertNotIn(valid_inputs["control_email"], result.stdout)
+                    self.assertNotIn(valid_inputs["control_email"], result.stderr)
+                    self.assertIn("::add-mask::", result.stdout)
+
+            for unsafe_case in ("group-other-write", "special-bits", "oversized", "symlink", "wrong-owner"):
+                if unsafe_case == "wrong-owner" and os.geteuid() != 0:
+                    continue
+                with self.subTest(job=job_name, unsafe_case=unsafe_case), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    event_path = root / "event.json"
+                    event_bytes = json.dumps({"inputs": valid_inputs}).encode("utf-8")
+                    if unsafe_case == "symlink":
+                        target_path = root / "target.json"
+                        target_path.write_bytes(event_bytes)
+                        event_path.symlink_to(target_path)
+                    elif unsafe_case == "oversized":
+                        event_path.write_bytes(event_bytes + b" " * 65537)
+                    else:
+                        event_path.write_bytes(event_bytes)
+                        if unsafe_case == "group-other-write":
+                            event_path.chmod(0o666)
+                        elif unsafe_case == "special-bits":
+                            event_path.chmod(0o4600)
+                        else:
+                            os.chown(event_path, os.geteuid() + 1, -1)
+                    result = subprocess.run(
+                        ["/bin/bash", "-euo", "pipefail", "-c", script],
+                        env={
+                            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                            "GITHUB_EVENT_PATH": str(event_path),
+                            "RUNNER_TEMP": str(root),
+                        },
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("EVENT_SCRUB reason=", result.stderr)
+                    self.assertNotIn(valid_inputs["control_email"], result.stdout)
+                    self.assertNotIn(valid_inputs["control_email"], result.stderr)
+
     def test_retained_cleanup_identity_uses_event_file_and_private_stdin_handoff(self) -> None:
         workflow = (
             REPO_ROOT / ".github/workflows/platform-production-retained-load-cleanup.yml"
@@ -2270,9 +2438,10 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertNotIn("CONTROL_EMAIL:", workflow)
         self.assertNotIn("${{ inputs.control_email }}", workflow)
         self.assertNotIn("$CONTROL_EMAIL", workflow)
-        self.assertIn('"$GITHUB_EVENT_PATH"', workflow)
+        self.assertIn('os.environ["GITHUB_EVENT_PATH"]', workflow)
+        self.assertIn('retained-cleanup-sanitized-event.json', workflow)
         self.assertIn("os.O_NOFOLLOW", workflow)
-        self.assertIn('os.fstat(descriptor)', workflow)
+        self.assertIn('os.fstat(fd)', workflow)
         self.assertIn('"control_email": canonical_email', workflow)
         self.assertIn('"$input_path"', workflow)
         normalized_workflow = re.sub(r"\\\n\s*", "", workflow)
@@ -2459,8 +2628,13 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                             platform_workflow_remote_dispatch._control_email_stdin(email),
                             b'{"schema":1,"control_email":"control%qa@example.invalid"}\n',
                         )
-                        sanitized_event = event_path.read_text(encoding="utf-8")
-                        sanitized_payload = json.loads(sanitized_event)
+                        # The raw GitHub event file remains owned by the
+                        # runner. The scrub step publishes a stable private
+                        # handoff for later actions instead of replacing it.
+                        self.assertIn("control_email", json.loads(event_path.read_text(encoding="utf-8"))["inputs"])
+                        sanitized_path = root / "retained-cleanup-sanitized-event.json"
+                        self.assertEqual(stat.S_IMODE(sanitized_path.stat().st_mode), 0o600)
+                        sanitized_payload = json.loads(sanitized_path.read_text(encoding="utf-8"))
                         self.assertNotIn("control_email", sanitized_payload["inputs"])
                         self.assertEqual(
                             sanitized_payload["repository"]["description"],
@@ -2537,7 +2711,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                         check=False,
                     )
                     self.assertNotEqual(scrub.returncode, 0)
-                    self.assertIn("workflow event sanitization failed closed", scrub.stderr)
+                    self.assertIn("EVENT_SCRUB reason=control_identity_retained", scrub.stderr)
                     self.assertNotIn(cleanup_secret.lower(), scrub.stderr.lower())
                     self.assertFalse((root / "platform-retained-cleanup-input.json").exists())
 
@@ -2582,6 +2756,9 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 event_path = root / "event.json"
                 event_path.write_text(event_contents, encoding="utf-8")
                 event_path.chmod(0o600)
+                sanitized_path = root / "retained-cleanup-sanitized-event.json"
+                sanitized_path.write_text(event_contents, encoding="utf-8")
+                sanitized_path.chmod(0o600)
                 (root / "retained-cleanup-control-email").write_text(
                     staged_email + "\n", encoding="ascii"
                 )
@@ -2631,9 +2808,75 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                     self.assertEqual(handoff["control_email"], staged_email)
                 else:
                     self.assertNotEqual(result.returncode, 0)
-                    self.assertIn("cleanup control identity input is invalid", result.stderr)
+                    self.assertIn("CLEANUP_PREFLIGHT reason=control_identity_retained", result.stderr)
                     self.assertNotIn(staged_email.lower(), result.stderr.lower())
                     self.assertFalse(handoff_path.exists())
+
+        # Run the actual scrub, source-artifact staging contract and cleanup
+        # validator in sequence. GitHub may restore GITHUB_EVENT_PATH between
+        # steps, so deliberately put the original 0644 event back before step
+        # five; validation must consume only the stable private handoff.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            event_path = root / "event.json"
+            original_event = json.dumps(valid_event, separators=(",", ":")).encode("utf-8")
+            event_path.write_bytes(original_event)
+            event_path.chmod(0o644)
+            github_output_path = root / "github-output"
+            github_output_path.touch(mode=0o600)
+            binding_dir = root / "retained-cleanup-source-binding"
+            binding_dir.mkdir(mode=0o700)
+            binding_path = binding_dir / "source-binding.json"
+            binding_path.write_text(
+                json.dumps({
+                    "schema": 1,
+                    "runner_sha": "a" * 40,
+                    "app_target_sha": "a" * 40,
+                    "source_binding": None,
+                }, separators=(",", ":")),
+                encoding="ascii",
+            )
+            binding_path.chmod(0o600)
+            env = {
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "GITHUB_API_URL": "http://127.0.0.1:1",
+                "GITHUB_EVENT_PATH": str(event_path),
+                "GITHUB_OUTPUT": str(github_output_path),
+                "GITHUB_REF": "refs/heads/dev",
+                "GITHUB_RUN_ID": "234567",
+                "GH_TOKEN": "synthetic-test-token",
+                "LOAD_RUN_ID": "123456",
+                "QA_CONFIRMATION": "DELETE-PRODUCTION-RETAINED-LOAD",
+                "RUNNER_TEMP": str(root),
+                "SOURCE_BINDING_ARTIFACT_ID": "654321",
+                "TARGET_SHA": "a" * 40,
+                "APP_TARGET_SHA": "a" * 40,
+            }
+            scrub = subprocess.run(
+                ["/bin/bash", "-euo", "pipefail", "-c", cleanup_event_scrub],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(scrub.returncode, 0, scrub.stderr)
+            stable_event = root / "retained-cleanup-sanitized-event.json"
+            self.assertEqual(stat.S_IMODE(stable_event.stat().st_mode), 0o600)
+            self.assertNotIn("control_email", json.loads(stable_event.read_text(encoding="utf-8"))["inputs"])
+            # Model the later action seeing an independently restored original
+            # event file, rather than the inode rewritten by the scrub step.
+            event_path.write_bytes(original_event)
+            event_path.chmod(0o644)
+            self.assertIn("control_email", json.loads(event_path.read_text(encoding="utf-8"))["inputs"])
+            validated = subprocess.run(
+                ["/bin/bash", "-euo", "pipefail", "-c", cleanup_validation],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertIn("CLEANUP_PREFLIGHT status=validated", validated.stdout)
+            self.assertNotIn("control%qa@example.invalid", validated.stderr.lower())
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

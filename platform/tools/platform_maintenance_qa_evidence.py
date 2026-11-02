@@ -62,7 +62,7 @@ PROTECTED_BACKUP_MANIFEST_PATH = Path(
     "/opt/oldsparky/platform/shared/backup-retention/protected-dump-files.json"
 )
 MAINTENANCE_REPORT_DIRECTORY = Path("/opt/oldsparky/platform/shared/maintenance")
-PROTECTED_BACKUP_KEEP = 15
+PROTECTED_BACKUP_KEEP = 1
 UNIT_PROPERTY_KEYS = frozenset(
     {
         "FragmentPath",
@@ -97,7 +97,7 @@ EXPECTED_MAINTENANCE_ARGV = (
     "--protected-backup-manifest",
     "/opt/oldsparky/platform/shared/backup-retention/protected-dump-files.json",
     "--backup-keep",
-    "15",
+    "1",
     *(
         argument
         for slug in REQUIRED_PROTECTED_RELEASES
@@ -125,6 +125,12 @@ def maintenance_preview_argv() -> tuple[str, ...]:
         _fail()
     argv.remove("--apply")
     argv.remove("--private-backup-diagnostics")
+    if argv.count("--protected-backup-manifest") != 1:
+        _fail()
+    manifest_index = argv.index("--protected-backup-manifest")
+    if manifest_index + 1 >= len(argv):
+        _fail()
+    del argv[manifest_index : manifest_index + 2]
     argv.insert(2, "--json")
     return tuple(argv)
 

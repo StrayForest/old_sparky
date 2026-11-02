@@ -37,6 +37,14 @@ assert SPEC is not None and SPEC.loader is not None
 backup_drill = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = backup_drill
 SPEC.loader.exec_module(backup_drill)
+SUMMARY_SPEC = importlib.util.spec_from_file_location(
+    "platform_storage_evidence_summary",
+    REPO_ROOT / "platform" / "tools" / "platform_storage_evidence_summary.py",
+)
+assert SUMMARY_SPEC is not None and SUMMARY_SPEC.loader is not None
+storage_summary = importlib.util.module_from_spec(SUMMARY_SPEC)
+sys.modules[SUMMARY_SPEC.name] = storage_summary
+SUMMARY_SPEC.loader.exec_module(storage_summary)
 
 
 _SYNTHETIC_RESTORE_CI_ARTIFACT_NAMES = frozenset(
@@ -4967,6 +4975,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         keep: int,
         restore_result: int = 12,
         scratch_backend: str = backup_drill.SCRATCH_BACKEND_TMPFS_V1,
+        created_at: dt.datetime | None = None,
     ) -> dict[str, Any]:
         args = argparse.Namespace(
             env_file=output_dir.parent / ".env.platform",
@@ -5006,7 +5015,8 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 mock.patch.object(
                     backup_drill,
                     "utc_now",
-                    return_value=dt.datetime(2026, 10, 6, 12, 0, 0, tzinfo=dt.UTC),
+                    return_value=created_at
+                    or dt.datetime(2026, 10, 6, 12, 0, 0, tzinfo=dt.UTC),
                 ),
             ):
                 result = backup_drill.create_backup(args)
@@ -5024,7 +5034,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             self._create_protected_backup(
                 output_dir,
                 None,
-                keep=2,
+                keep=1,
                 scratch_backend=backup_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
             )
 
@@ -7335,73 +7345,48 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             stdout[: backup_drill.SCRATCH_PRIVATE_STDOUT_BYTES],
             stderr[: backup_drill.SCRATCH_PRIVATE_STDERR_BYTES],
         )
-        cli_args = argparse.Namespace(
-            as_json=True,
-            private_scratch_diagnostics=True,
-            check_latest=False,
-            verify_latest_existing=False,
-            dump_only=False,
-            verify_dump=None,
+        private_report = backup_drill.failure_report_for_exception(
+            private_failure, private_scratch_diagnostics=True
         )
-        private_stdout = io.StringIO()
-        private_stderr = io.StringIO()
-        with (
-            mock.patch.object(backup_drill, "parse_args", return_value=cli_args),
-            mock.patch.object(backup_drill, "create_backup", side_effect=private_failure),
-            mock.patch.object(backup_drill.sys, "stdout", private_stdout),
-            mock.patch.object(backup_drill.sys, "stderr", private_stderr),
-        ):
-            self.assertEqual(backup_drill.main(), 1)
-        private_report = json.loads(private_stdout.getvalue())
         self.assertEqual(private_report["scratch_unit_diagnostic"], diagnostic)
         self.assertEqual(private_report["scratch_admission_diagnostic"], admission_diagnostic)
-        self.assertNotIn(stdout[:32].decode("ascii"), private_stdout.getvalue())
+        self.assertNotIn(stdout[:32].decode("ascii"), json.dumps(private_report))
         self.assertEqual(
-            private_stderr.getvalue().encode("ascii"),
+            backup_drill.private_failure_frame_for_exception(
+                private_failure, enabled=True
+            ),
             backup_drill._scratch_private_output_envelope(
                 stdout[: backup_drill.SCRATCH_PRIVATE_STDOUT_BYTES],
                 stderr[: backup_drill.SCRATCH_PRIVATE_STDERR_BYTES],
-            ),
+            ).decode("ascii"),
         )
 
         # A collected transient unit can have no typed systemd properties.
         # Its bounded output still travels only through the private frame.
         private_failure.scratch_unit_diagnostic = None
         private_failure.scratch_admission_diagnostic = None
-        missing_state_stdout = io.StringIO()
-        missing_state_stderr = io.StringIO()
-        with (
-            mock.patch.object(backup_drill, "parse_args", return_value=cli_args),
-            mock.patch.object(backup_drill, "create_backup", side_effect=private_failure),
-            mock.patch.object(backup_drill.sys, "stdout", missing_state_stdout),
-            mock.patch.object(backup_drill.sys, "stderr", missing_state_stderr),
-        ):
-            self.assertEqual(backup_drill.main(), 1)
-        missing_state_report = json.loads(missing_state_stdout.getvalue())
+        missing_state_report = backup_drill.failure_report_for_exception(
+            private_failure, private_scratch_diagnostics=True
+        )
         self.assertNotIn("scratch_unit_diagnostic", missing_state_report)
         self.assertNotIn("scratch_admission_diagnostic", missing_state_report)
-        self.assertNotIn(stdout[:32].decode("ascii"), missing_state_stdout.getvalue())
+        self.assertNotIn(stdout[:32].decode("ascii"), json.dumps(missing_state_report))
         self.assertEqual(
-            missing_state_stderr.getvalue().encode("ascii"),
+            backup_drill.private_failure_frame_for_exception(private_failure, enabled=True),
             backup_drill._scratch_private_output_envelope(
                 stdout[: backup_drill.SCRATCH_PRIVATE_STDOUT_BYTES],
                 stderr[: backup_drill.SCRATCH_PRIVATE_STDERR_BYTES],
-            ),
+            ).decode("ascii"),
         )
 
-        public_args = argparse.Namespace(**{**vars(cli_args), "private_scratch_diagnostics": False})
-        public_stdout = io.StringIO()
-        public_stderr = io.StringIO()
-        with (
-            mock.patch.object(backup_drill, "parse_args", return_value=public_args),
-            mock.patch.object(backup_drill, "create_backup", side_effect=private_failure),
-            mock.patch.object(backup_drill.sys, "stdout", public_stdout),
-            mock.patch.object(backup_drill.sys, "stderr", public_stderr),
-        ):
-            self.assertEqual(backup_drill.main(), 1)
-        self.assertNotIn("scratch_unit_diagnostic", public_stdout.getvalue())
-        self.assertNotIn("scratch_admission_diagnostic", public_stdout.getvalue())
-        self.assertEqual(public_stderr.getvalue(), "")
+        public_report = backup_drill.failure_report_for_exception(
+            private_failure, private_scratch_diagnostics=False
+        )
+        self.assertNotIn("scratch_unit_diagnostic", public_report)
+        self.assertNotIn("scratch_admission_diagnostic", public_report)
+        self.assertIsNone(
+            backup_drill.private_failure_frame_for_exception(private_failure, enabled=False)
+        )
 
     def _assert_scratch_early_exit_output_is_drained(self) -> None:
         class LauncherProcess:
@@ -10137,7 +10122,7 @@ raise SystemExit(status)
         with tempfile.TemporaryDirectory() as temporary_dir:
             output_dir = pathlib.Path(temporary_dir)
             old_dump, old_sidecar = self._write_backup_pair(
-                output_dir, "platformdb-existing.dump", b"retained backup"
+                output_dir, "platformdb-20200101T000000Z.dump", b"retained backup"
             )
             before = {
                 path: (path.read_bytes(), path.lstat().st_ino, path.lstat().st_mode)
@@ -10149,7 +10134,7 @@ raise SystemExit(status)
                 keep=1,
                 admin_database_url=None,
                 dump_only=True,
-                rotate_existing=False,
+                rotate_existing=True,
             )
             guard = backup_drill.RestoreGuardStop(
                 "disk_floor",
@@ -10713,8 +10698,8 @@ raise SystemExit(status)
             backup_drill.sys,
             "argv",
             ["platform_backup_restore_drill.py", "--preserve-existing"],
-        ):
-            self.assertFalse(backup_drill.parse_args().rotate_existing)
+        ), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            backup_drill.parse_args()
         with (
             mock.patch.object(
                 backup_drill.sys,
@@ -10733,24 +10718,25 @@ raise SystemExit(status)
 
         with tempfile.TemporaryDirectory() as temporary_dir:
             output_dir = pathlib.Path(temporary_dir)
-            verified_dump = output_dir / "platformdb-20200101T000000Z.dump"
-            failed_dump = output_dir / "platformdb-20200102T000000Z.dump"
-            verified_dump.write_bytes(b"verified")
-            failed_dump.write_bytes(b"failed")
-            verified_metadata = verified_dump.with_suffix(".json")
-            failed_metadata = failed_dump.with_suffix(".json")
-            verified_metadata.write_text(
-                json.dumps({"dump_file": verified_dump.name, "restore_verified": True}),
-                encoding="utf-8",
+            verified_dump, verified_metadata = self._write_backup_pair(
+                output_dir, "platformdb-20200101T000000Z.dump", b"verified"
             )
-            failed_metadata.write_text(
-                json.dumps({"dump_file": failed_dump.name, "restore_verified": False}),
-                encoding="utf-8",
+            failed_dump, failed_metadata = self._write_backup_pair(
+                output_dir,
+                "platformdb-20200102T000000Z.dump",
+                b"failed",
+                restore_verified=False,
+            )
+            expected = backup_drill._unverified_backup_candidate_order(
+                output_dir,
+                preserve_metadata=verified_metadata,
+                protected_dump_files=frozenset(),
             )
 
             removed = backup_drill.prune_unverified_backups(
                 output_dir,
                 preserve_metadata=verified_metadata,
+                expected_candidate_order=expected,
             )
 
             self.assertTrue(verified_dump.exists())
@@ -10794,6 +10780,11 @@ raise SystemExit(status)
                     backup_drill.prune_unverified_backups(
                         output_dir,
                         preserve_metadata=output_dir / "not-current.json",
+                        expected_candidate_order=backup_drill._unverified_backup_candidate_order(
+                            output_dir,
+                            preserve_metadata=output_dir / "not-current.json",
+                            protected_dump_files=frozenset(),
+                        ),
                     )
 
                 self.assertEqual(sentinel.read_bytes(), before_sentinel)
@@ -10802,7 +10793,7 @@ raise SystemExit(status)
                 self.assertTrue(candidate_dump.exists())
                 self.assertTrue(candidate_metadata.exists())
 
-    def test_named_protection_is_union_with_latest_fifteen_verified_and_preserves_unknown(self) -> None:
+    def test_keep_one_rotation_removes_all_other_verified_and_falsey_pairs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             output_dir = pathlib.Path(temporary_dir)
             verified_names: list[str] = []
@@ -10832,25 +10823,224 @@ raise SystemExit(status)
                 ),
                 encoding="utf-8",
             )
-            protected = frozenset({verified_names[0], unverified_name, unknown_name})
+            protected = frozenset()
+            unverified_order = backup_drill._unverified_backup_candidate_order(
+                output_dir,
+                preserve_metadata=output_dir / "not-current.json",
+                protected_dump_files=protected,
+            )
+            verified_order = backup_drill._verified_backup_candidate_order(output_dir)
 
             removed_unverified = backup_drill.prune_unverified_backups(
                 output_dir,
                 preserve_metadata=output_dir / "not-current.json",
                 protected_dump_files=protected,
+                expected_candidate_order=unverified_order,
             )
             removed_verified = backup_drill.prune_backups(
-                output_dir, keep=15, protected_dump_files=protected, verified_only=True
+                output_dir,
+                keep=1,
+                protected_dump_files=protected,
+                verified_only=True,
+                expected_verified_order=verified_order,
+                retained_dump_file=verified_names[-1],
             )
 
             retained_verified = {path.name for path in output_dir.glob("*.dump")} & set(verified_names)
-            self.assertEqual(retained_verified, set(verified_names[-15:]) | {verified_names[0]})
-            self.assertTrue((output_dir / unverified_name).exists())
-            self.assertTrue((output_dir / unverified_name.replace(".dump", ".json")).exists())
-            self.assertTrue(unknown_dump.exists())
-            self.assertTrue(unknown_dump.with_suffix(".json").exists())
-            self.assertEqual(len(removed_unverified), 0)
-            self.assertEqual(len(removed_verified), 4)
+            self.assertEqual(retained_verified, {verified_names[-1]})
+            self.assertFalse((output_dir / unverified_name).exists())
+            self.assertFalse((output_dir / unverified_name.replace(".dump", ".json")).exists())
+            self.assertFalse(unknown_dump.exists())
+            self.assertFalse(unknown_dump.with_suffix(".json").exists())
+            self.assertEqual(len(removed_unverified), 4)
+            self.assertEqual(len(removed_verified), 2 * (len(verified_names) - 1))
+
+    def test_prune_rechecks_sidecar_after_dump_unlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            output_dir = pathlib.Path(temporary_dir)
+            old_dump, old_sidecar = self._write_backup_pair(
+                output_dir, "platformdb-20200101T000000Z.dump", b"old"
+            )
+            self._write_backup_pair(
+                output_dir, "platformdb-20200102T000000Z.dump", b"latest"
+            )
+            expected = backup_drill._verified_backup_candidate_order(output_dir)
+            real_unlink = pathlib.Path.unlink
+            mutated = False
+
+            def unlink_with_sidecar_replacement(path: pathlib.Path, *args: object, **kwargs: object) -> None:
+                nonlocal mutated
+                real_unlink(path, *args, **kwargs)
+                if path == old_dump and not mutated:
+                    replacement = old_sidecar.with_suffix(".replacement")
+                    replacement.write_text("{}", encoding="utf-8")
+                    replacement.replace(old_sidecar)
+                    mutated = True
+
+            with mock.patch.object(pathlib.Path, "unlink", unlink_with_sidecar_replacement):
+                with self.assertRaisesRegex(RuntimeError, "before sidecar unlink"):
+                    backup_drill.prune_backups(
+                        output_dir,
+                        keep=1,
+                        verified_only=True,
+                        expected_verified_order=expected,
+                        retained_dump_file="platformdb-20200102T000000Z.dump",
+                    )
+            self.assertFalse(old_dump.exists())
+            self.assertTrue(old_sidecar.exists())
+
+    def test_prune_primitive_rejects_keep_greater_than_one(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            output_dir = pathlib.Path(temporary_dir)
+            self._write_backup_pair(output_dir, "platformdb-20200101T000000Z.dump", b"one")
+            expected = backup_drill._verified_backup_candidate_order(output_dir)
+            with self.assertRaisesRegex(ValueError, "keep-one"):
+                backup_drill.prune_backups(
+                    output_dir,
+                    keep=2,
+                    verified_only=True,
+                    expected_verified_order=expected,
+                    retained_dump_file="platformdb-20200101T000000Z.dump",
+                )
+
+    def test_backup_inventory_rejects_dangling_staged_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            output_dir = pathlib.Path(temporary_dir)
+            staged = output_dir / ".platformdb-20261012T120000Z.dump.abcd.tmp"
+            staged.write_bytes(b"partial synthetic archive")
+            with self.assertRaisesRegex(RuntimeError, "incomplete staged backup files"):
+                backup_drill._backup_retention_inventory(output_dir)
+            allowed = backup_drill._backup_retention_inventory(
+                output_dir, allowed_temporary_names=frozenset({staged.name})
+            )
+            self.assertEqual(allowed, ())
+
+    def test_low_level_cli_rejects_create_and_dump_only_before_side_effects(self) -> None:
+        for extra in ([], ["--dump-only"]):
+            with self.subTest(extra=extra):
+                errors = io.StringIO()
+                argv = [str(SCRIPT_PATH), *extra]
+                with (
+                    mock.patch.object(backup_drill.sys, "argv", argv),
+                    mock.patch.object(backup_drill, "run_disk_guarded_command") as pg_dump,
+                    mock.patch.object(pathlib.Path, "unlink") as unlink,
+                    contextlib.redirect_stderr(errors),
+                ):
+                    self.assertEqual(backup_drill.main(), 1)
+                pg_dump.assert_not_called()
+                unlink.assert_not_called()
+                self.assertIn("lock-aware storage maintenance", errors.getvalue())
+
+    def test_source_bound_summary_preserves_only_bounded_keep_one_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            output_dir = pathlib.Path(temporary_dir) / "backups"
+            output_dir.mkdir()
+            result = self._create_protected_backup(output_dir, None, keep=1)
+            proof = result["protected_retention_proof"]
+            self.assertTrue(
+                backup_drill.valid_protected_retention_proof(
+                    proof, requested_keep=1, new_dump_file=result["dump_file"]
+                )
+            )
+            summary = storage_summary.summarize_retention(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "mode": "apply",
+                        "backup": {
+                            **result,
+                            "archive_name": result["dump_file"],
+                            "archive_sha256": result["sha256"],
+                            "status": "completed",
+                            "created": True,
+                            "checksum_present": True,
+                            "alembic_revision_verified": True,
+                            "restored_table_count": 1,
+                        },
+                    }
+                )
+            )["backup"]
+            self.assertEqual(summary["retention_policy"], "latest-restore-verified-only-v1")
+            self.assertEqual(summary["retention_proof_status"], "pass")
+            self.assertEqual(summary["retained_pair_count"], 1)
+            self.assertTrue(summary["retention_archive_matches_new"])
+            self.assertEqual(summary["postexisting_archive_count"], 1)
+            self.assertNotIn("protected_retention_proof", summary)
+            serialized = json.dumps(summary)
+            self.assertNotIn(str(output_dir), serialized)
+            self.assertNotIn("manifest_path", serialized)
+            self.assertNotIn("candidate_order", serialized)
+            self.assertNotIn(proof["verified_selection"]["candidate_digest"], serialized)
+            workflow = (REPO_ROOT / ".github/workflows/platform-production-backup.yml").read_text(
+                encoding="utf-8"
+            )
+            for predicate in (
+                'backup.get("rotation_mode") != "rotate-existing"',
+                'backup.get("postexisting_archive_count") != 1',
+                'backup.get("retention_policy") != "latest-restore-verified-only-v1"',
+                'backup.get("retention_proof_status") != "pass"',
+                'backup.get("retained_pair_count") != 1',
+                'backup.get("retention_archive_matches_new") is not True',
+            ):
+                self.assertIn(predicate, workflow)
+
+    def test_retired_manifest_names_do_not_block_consecutive_keep_one_creates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = pathlib.Path(temporary_dir)
+            output_dir = root / "backups"
+            output_dir.mkdir()
+            legacy_name = "platformdb-20200101T000000Z.dump"
+            legacy_dump, legacy_sidecar = self._write_backup_pair(
+                output_dir, legacy_name, b"legacy verified archive"
+            )
+            manifest = self._write_protected_backup_manifest(
+                root / "protected.json", [legacy_name]
+            )
+
+            first = self._create_protected_backup(
+                output_dir,
+                manifest,
+                keep=1,
+                created_at=dt.datetime(2026, 10, 6, 12, 0, 0, tzinfo=dt.UTC),
+            )
+            first_proof = first["protected_retention_proof"]
+            self.assertTrue(
+                backup_drill.valid_protected_retention_proof(
+                    first_proof, requested_keep=1, new_dump_file=first["dump_file"]
+                )
+            )
+            self.assertFalse(legacy_dump.exists())
+            self.assertFalse(legacy_sidecar.exists())
+            self.assertEqual(first_proof["protected_pairs"]["after"], [])
+            self.assertEqual(first_proof["verified_selection"]["retained_count"], 1)
+
+            second = self._create_protected_backup(
+                output_dir,
+                manifest,
+                keep=1,
+                created_at=dt.datetime(2026, 10, 7, 12, 0, 0, tzinfo=dt.UTC),
+            )
+            second_proof = second["protected_retention_proof"]
+            self.assertTrue(
+                backup_drill.valid_protected_retention_proof(
+                    second_proof, requested_keep=1, new_dump_file=second["dump_file"]
+                )
+            )
+            self.assertEqual(second_proof["protected_pairs"]["before"], [])
+            self.assertEqual(second_proof["protected_pairs"]["after"], [])
+            self.assertEqual(second_proof["verified_selection"]["retained_count"], 1)
+            self.assertFalse((output_dir / first["dump_file"]).exists())
+            self.assertFalse(
+                (output_dir / first["dump_file"].replace(".dump", ".json")).exists()
+            )
+            self.assertTrue((output_dir / second["dump_file"]).is_file())
+            self.assertEqual(
+                {path.name for path in output_dir.iterdir()},
+                {
+                    second["dump_file"],
+                    second["dump_file"].replace(".dump", ".json"),
+                },
+            )
 
     def test_protected_rotation_emits_ordered_identity_proof_and_rejects_tampering(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -10917,20 +11107,6 @@ raise SystemExit(status)
             unknown_removed_sidecar.write_text(
                 json.dumps(unknown_removed_metadata), encoding="utf-8"
             )
-            truthy_unknown_name = "platformdb-20200205T000000Z.dump"
-            _truthy_unknown_dump, truthy_unknown_sidecar = self._write_backup_pair(
-                output_dir,
-                truthy_unknown_name,
-                b"truthy-unknown",
-                restore_verified=False,
-            )
-            truthy_unknown_metadata = json.loads(
-                truthy_unknown_sidecar.read_text(encoding="utf-8")
-            )
-            truthy_unknown_metadata["restore_verified"] = "false"
-            truthy_unknown_sidecar.write_text(
-                json.dumps(truthy_unknown_metadata), encoding="utf-8"
-            )
             protected_names = [verified_names[0], unverified_name, unknown_name]
             manifest = self._write_protected_backup_manifest(
                 root / "protected.json", protected_names
@@ -10947,20 +11123,20 @@ raise SystemExit(status)
                 backup_drill, "_inventory_file", side_effect=record_inventory_file
             ):
                 result = self._create_protected_backup(
-                    output_dir, manifest, keep=5
+                    output_dir, manifest, keep=1
                 )
 
             proof = result["protected_retention_proof"]
             self.assertEqual(result["rotation_mode"], "rotate-existing")
-            self.assertEqual(proof["requested_keep"], 5)
-            self.assertEqual(proof["effective_verified_keep"], 15)
+            self.assertEqual(proof["requested_keep"], 1)
+            self.assertEqual(proof["effective_verified_keep"], 1)
             selection = proof["verified_selection"]
             self.assertEqual(selection["available_count"], 18)
-            self.assertEqual(selection["retained_count"], 15)
+            self.assertEqual(selection["retained_count"], 1)
             self.assertTrue(
                 backup_drill.valid_protected_retention_proof(
                     proof,
-                    requested_keep=5,
+                    requested_keep=1,
                     new_dump_file=result["dump_file"],
                 )
             )
@@ -10970,28 +11146,20 @@ raise SystemExit(status)
             )
             self.assertEqual(
                 [row["dump_file"] for row in selection["selected_order"]],
-                [row["dump_file"] for row in selection["candidate_order"][-15:]],
+                [result["dump_file"]],
             )
             self.assertIn(result["dump_file"], {row["dump_file"] for row in selection["selected_order"]})
             self.assertEqual(selection["selected_order"], selection["retained_after"])
-            self.assertEqual(
-                proof["protected_pairs"]["before"], proof["protected_pairs"]["after"]
-            )
-            protected_status = {
-                row["dump_file"]: row["restore_verified"]
-                for row in proof["protected_pairs"]["after"]
-            }
-            self.assertEqual(protected_status[unverified_name], "false")
-            self.assertEqual(protected_status[unknown_name], "unknown")
-            self.assertTrue(unknown_dump.exists())
-            self.assertNotIn("restore_verified", json.loads(unknown_sidecar.read_text()))
-            self.assertTrue((output_dir / truthy_unknown_name).exists())
-            self.assertTrue(truthy_unknown_sidecar.exists())
+            self.assertEqual(proof["protected_pairs"]["after"], [])
+            self.assertFalse((output_dir / unverified_name).exists())
+            self.assertFalse(unknown_dump.exists())
+            self.assertFalse(unknown_sidecar.exists())
             self.assertEqual(
                 {row["dump_file"] for row in proof["removed_pairs"]},
                 {
-                    verified_names[1],
-                    verified_names[2],
+                    *verified_names,
+                    unverified_name,
+                    unknown_name,
                     unverified_removed_name,
                     unknown_removed_name,
                 },
@@ -11019,7 +11187,7 @@ raise SystemExit(status)
                     "backup-retention-removals", proof["removed_pairs"]
                 ),
             )
-            self.assertEqual(proof["protected_removed_count"], 0)
+            self.assertEqual(proof["protected_removed_count"], 3)
             self.assertEqual(dump_body_inventory_reads, [])
 
             for mutation in (
@@ -11032,7 +11200,7 @@ raise SystemExit(status)
                 with self.subTest(mutation=mutation):
                     tampered = json.loads(json.dumps(proof))
                     if mutation == "reordered":
-                        tampered["verified_selection"]["selected_order"].reverse()
+                        tampered["verified_selection"]["candidate_order"].reverse()
                     elif mutation == "digest":
                         tampered["verified_selection"]["selected_after_digest"] = "0" * 64
                     elif mutation == "count":
@@ -11060,12 +11228,12 @@ raise SystemExit(status)
                     self.assertFalse(
                         backup_drill.valid_protected_retention_proof(
                             tampered,
-                            requested_keep=5,
+                            requested_keep=1,
                             new_dump_file=result["dump_file"],
                         )
                     )
 
-    def test_protected_rotation_keeps_fewer_than_the_effective_minimum(self) -> None:
+    def test_protected_rotation_keeps_only_new_verified_pair(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = pathlib.Path(temporary_dir)
             output_dir = root / "backups"
@@ -11082,16 +11250,38 @@ raise SystemExit(status)
                 root / "protected.json", [names[0]]
             )
 
-            result = self._create_protected_backup(output_dir, manifest, keep=4)
+            result = self._create_protected_backup(output_dir, manifest, keep=1)
             selection = result["protected_retention_proof"]["verified_selection"]
 
             self.assertEqual(selection["available_count"], 3)
-            self.assertEqual(selection["retained_count"], 3)
+            self.assertEqual(selection["retained_count"], 1)
             self.assertEqual(
                 {row["dump_file"] for row in selection["selected_order"]},
-                set(names) | {result["dump_file"]},
+                {result["dump_file"]},
             )
-            self.assertEqual(result["removed"], [])
+            self.assertEqual(len(result["removed"]), 4)
+
+    def test_keep_one_selection_uses_new_restore_verified_pair_not_mtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            output_dir = pathlib.Path(temporary_dir) / "backups"
+            output_dir.mkdir()
+            old_dump, _old_sidecar = self._write_backup_pair(
+                output_dir,
+                "platformdb-20200101T000000Z.dump",
+                b"old-verified-pair",
+            )
+            future_ns = 4_102_444_800_000_000_000
+            os.utime(old_dump, ns=(future_ns, future_ns))
+            os.utime(old_dump.with_suffix(".json"), ns=(future_ns, future_ns))
+
+            result = self._create_protected_backup(output_dir, None, keep=1)
+
+            selected = result["protected_retention_proof"]["verified_selection"][
+                "selected_order"
+            ]
+            self.assertEqual([row["dump_file"] for row in selected], [result["dump_file"]])
+            self.assertFalse(old_dump.exists())
+            self.assertTrue((output_dir / result["dump_file"]).exists())
 
     def test_protected_manifest_or_pair_drift_stops_before_pruning(self) -> None:
         for drift in ("manifest", "pair"):
@@ -11128,7 +11318,7 @@ raise SystemExit(status)
                 args = argparse.Namespace(
                     env_file=root / ".env.platform",
                     output_dir=output_dir,
-                    keep=14,
+                keep=1,
                     dump_only=False,
                     rotate_existing=True,
                     protected_backup_manifest=manifest,
@@ -11162,7 +11352,7 @@ raise SystemExit(status)
                             backup_drill, "prune_backups", prune_verified
                         ),
                     ):
-                        with self.assertRaisesRegex(RuntimeError, "changed during restore verification"):
+                        with self.assertRaisesRegex(RuntimeError, "changed during restore verification|Pre-existing backup inventory changed before publication"):
                             backup_drill.create_backup(args)
                 prune_unverified.assert_not_called()
                 prune_verified.assert_not_called()
@@ -11235,7 +11425,7 @@ raise SystemExit(status)
                     "_backup_retention_pair_row",
                     side_effect=mutate_sidecar_after_pair_check,
                 ):
-                    with self.assertRaisesRegex(RuntimeError, "sidecar changed before retention"):
+                    with self.assertRaisesRegex(RuntimeError, "pair changed before retention"):
                         if prune_kind == "unverified":
                             backup_drill.prune_unverified_backups(
                                 output_dir,
@@ -11248,13 +11438,14 @@ raise SystemExit(status)
                                 keep=1,
                                 verified_only=True,
                                 expected_verified_order=expected_verified,
+                                retained_dump_file=expected_verified[-1]["dump_file"],
                             )
 
                 self.assertEqual(pair_row_checks, 2)
                 self.assertTrue(target_dump.exists())
                 self.assertTrue(target_sidecar.exists())
 
-    def test_unconfigured_pruning_keeps_historical_keep_behavior(self) -> None:
+    def test_unconfigured_pruning_fails_closed_without_identity_plan(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             output_dir = pathlib.Path(temporary_dir)
             old = output_dir / "platformdb-old.dump"
@@ -11263,9 +11454,9 @@ raise SystemExit(status)
             for index, path in enumerate((old, middle, newest)):
                 path.write_bytes(b"archive")
                 os.utime(path, (1_600_000_000 + index, 1_600_000_000 + index))
-            removed = backup_drill.prune_backups(output_dir, keep=2)
-            self.assertEqual(removed, [str(old)])
-            self.assertFalse(old.exists())
+            with self.assertRaisesRegex(ValueError, "Identity-bound"):
+                backup_drill.prune_backups(output_dir, keep=2)
+            self.assertTrue(old.exists())
             self.assertTrue(middle.exists())
             self.assertTrue(newest.exists())
 
@@ -11293,7 +11484,7 @@ raise SystemExit(status)
                                     argparse.Namespace(
                                         env_file=root / ".env",
                                         output_dir=output_dir,
-                                        keep=14,
+                keep=1,
                                         dump_only=True,
                                         rotate_existing=True,
                                         protected_backup_manifest=manifest,
@@ -11303,22 +11494,13 @@ raise SystemExit(status)
 
             self._write_protected_backup_manifest(manifest, [valid_name])
             with self._project_manifest_owner(manifest, 0):
-                with mock.patch.object(
-                    backup_drill, "load_env", side_effect=AssertionError("database path reached")
-                ) as load_env, mock.patch.object(backup_drill, "prune_backups") as prune:
-                    with self.assertRaisesRegex(RuntimeError, "missing or unsafe"):
-                        backup_drill.create_backup(
-                            argparse.Namespace(
-                                env_file=root / ".env",
-                                output_dir=output_dir,
-                                keep=14,
-                                dump_only=True,
-                                rotate_existing=True,
-                                protected_backup_manifest=manifest,
-                            )
-                        )
-            load_env.assert_not_called()
-            prune.assert_not_called()
+                manifest_snapshot = backup_drill._protected_backup_manifest_snapshot(manifest)
+                self.assertEqual(
+                    backup_drill._protected_backup_pair_rows(
+                        output_dir, frozenset(manifest_snapshot["protected_dump_files"])
+                    ),
+                    [],
+                )
 
             dump_path, metadata_path = self._write_backup_pair(
                 output_dir, valid_name, b"protected"
@@ -11335,7 +11517,7 @@ raise SystemExit(status)
                             argparse.Namespace(
                                 env_file=root / ".env",
                                 output_dir=output_dir,
-                                keep=14,
+                                keep=1,
                                 dump_only=True,
                                 rotate_existing=True,
                                 protected_backup_manifest=manifest,
@@ -11389,7 +11571,7 @@ raise SystemExit(status)
             args = argparse.Namespace(
                 env_file=root / ".env",
                 output_dir=output_dir,
-                keep=14,
+                keep=1,
                 dump_only=False,
                 rotate_existing=True,
                 protected_backup_manifest=manifest,
@@ -11437,7 +11619,7 @@ raise SystemExit(status)
         with tempfile.TemporaryDirectory() as temporary_dir:
             output_dir = pathlib.Path(temporary_dir)
             old_dump, old_metadata = self._write_backup_pair(
-                output_dir, "platformdb-old.dump", b"old-backup"
+                output_dir, "platformdb-20200116T000000Z.dump", b"old-backup"
             )
             args = argparse.Namespace(
                 env_file=str(output_dir / ".env.platform"),
@@ -11445,19 +11627,19 @@ raise SystemExit(status)
                 keep=1,
                 admin_database_url=None,
                 dump_only=False,
-                rotate_existing=False,
+                rotate_existing=True,
             )
             old_entries = []
             for index in range(15):
                 dump, metadata = self._write_backup_pair(
                     output_dir,
-                    f"platformdb-old-{index:02}.dump",
+                    f"platformdb-202001{index + 1:02}T000000Z.dump",
                     f"old-{index}".encode(),
                 )
                 old_entries.extend((dump, metadata))
             unverified_dump, unverified_metadata = self._write_backup_pair(
                 output_dir,
-                "platformdb-unverified.dump",
+                "platformdb-20200201T000000Z.dump",
                 b"unverified-old",
                 restore_verified=False,
             )
@@ -11569,7 +11751,7 @@ raise SystemExit(status)
                 mock.patch.object(backup_drill.sys, "stdout", output),
             ):
                 self.assertEqual(backup_drill.main(), 1)
-            self.assertEqual(json.loads(output.getvalue())["error"], "restore failed")
+            self.assertIn("lock-aware storage maintenance", json.loads(output.getvalue())["error"])
 
             self.assertTrue(old_dump.exists())
             self.assertTrue(old_metadata.exists())
@@ -11637,7 +11819,7 @@ raise SystemExit(status)
                 keep=1,
                 admin_database_url=None,
                 dump_only=True,
-                rotate_existing=False,
+                rotate_existing=True,
             )
             dump_only_events: list[str] = []
 
@@ -11751,18 +11933,17 @@ raise SystemExit(status)
                 {path.name for path in old_entries},
             )
 
-            self._assert_postpublication_inventory_failure_rolls_back_only_new_pair()
-            self._assert_directory_fsync_failure_rolls_back_only_new_pair()
+        self._assert_prepublication_inventory_failure_keeps_old_pairs()
+        self._assert_directory_fsync_failure_rolls_back_only_new_pair()
+        self._assert_rotation_deletes_all_old_pairs_after_success()
+        self._assert_destination_collision_fails_before_dump_and_preserves_sidecar()
+        self._assert_explicit_rotation_retains_only_new_verified_pair()
 
-            self._assert_preserve_existing_keeps_all_archives_after_success()
-            self._assert_destination_collision_fails_before_dump_and_preserves_sidecar()
-            self._assert_explicit_rotation_retains_keep_policy()
-
-    def _assert_postpublication_inventory_failure_rolls_back_only_new_pair(self) -> None:
+    def _assert_prepublication_inventory_failure_keeps_old_pairs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             output_dir = pathlib.Path(temporary_dir)
             old_dump, old_metadata = self._write_backup_pair(
-                output_dir, "platformdb-old.dump", b"old-backup"
+                output_dir, "platformdb-20200101T000000Z.dump", b"old-backup"
             )
             before = {
                 path: (path.read_bytes(), path.lstat().st_mode, path.lstat().st_ino)
@@ -11772,20 +11953,22 @@ raise SystemExit(status)
             args = argparse.Namespace(
                 env_file=str(output_dir / ".env.platform"),
                 output_dir=str(output_dir),
-                keep=14,
+                keep=1,
                 admin_database_url=None,
                 dump_only=False,
-                rotate_existing=False,
+                rotate_existing=True,
             )
-            real_inventory = backup_drill.backup_inventory
+            real_inventory = backup_drill._backup_retention_inventory
             inventory_calls = 0
 
-            def fail_after_publication(path: pathlib.Path) -> tuple[object, ...]:
+            def fail_after_publication(
+                path: pathlib.Path, **kwargs: object
+            ) -> tuple[object, ...]:
                 nonlocal inventory_calls
                 inventory_calls += 1
-                if inventory_calls == 3:
-                    raise RuntimeError("synthetic post-publication inventory failure")
-                return real_inventory(path)
+                if inventory_calls == 2:
+                    raise RuntimeError("synthetic pre-publication inventory failure")
+                return real_inventory(path, **kwargs)
 
             with (
                 mock.patch.dict(
@@ -11801,14 +11984,14 @@ raise SystemExit(status)
                 ),
                 mock.patch.object(backup_drill, "require_restore_headroom"),
                 mock.patch.object(backup_drill, "_run_isolated_restore_drill", return_value=1),
-                mock.patch.object(backup_drill, "backup_inventory", side_effect=fail_after_publication),
+                mock.patch.object(backup_drill, "_backup_retention_inventory", side_effect=fail_after_publication),
             ):
                 with self.assertRaisesRegex(
-                    RuntimeError, "synthetic post-publication inventory failure"
+                    RuntimeError, "synthetic pre-publication inventory failure"
                 ):
                     backup_drill.create_backup(args)
 
-            self.assertEqual(inventory_calls, 4)
+            self.assertEqual(inventory_calls, 2)
             self.assertEqual(backup_drill.backup_inventory(output_dir), initial_inventory)
             self.assertEqual(
                 {path.name for path in output_dir.iterdir()},
@@ -11825,7 +12008,7 @@ raise SystemExit(status)
             for index in range(20):
                 dump, sidecar = self._write_backup_pair(
                     output_dir,
-                    f"platformdb-existing-{index:02}.dump",
+                    f"platformdb-202001{index + 1:02}T000000Z.dump",
                     f"prior-{index}".encode(),
                 )
                 old_entries.extend((dump, sidecar))
@@ -11833,10 +12016,10 @@ raise SystemExit(status)
             args = argparse.Namespace(
                 env_file=str(output_dir / ".env.platform"),
                 output_dir=str(output_dir),
-                keep=14,
+                keep=1,
                 admin_database_url=None,
                 dump_only=True,
-                rotate_existing=False,
+                rotate_existing=True,
             )
             real_fsync_directory = backup_drill._fsync_directory
             fsync_calls = 0
@@ -11893,12 +12076,10 @@ raise SystemExit(status)
                 env_file=str(output_dir / ".env.platform"),
                 max_age_hours=24,
                 admin_database_url=None,
-                keep=14,
-                rotate_existing=False,
+                keep=1,
+                rotate_existing=True,
                 as_json=True,
             )
-            signal_output = io.StringIO()
-
             with (
                 mock.patch.dict(
                     backup_drill.os.environ,
@@ -11915,33 +12096,32 @@ raise SystemExit(status)
                 mock.patch.object(
                     backup_drill, "_fsync_directory", side_effect=interrupt_after_publication
                 ),
-                mock.patch.object(backup_drill, "parse_args", return_value=cli_args),
-                mock.patch.object(backup_drill.sys, "stdout", signal_output),
             ):
-                self.assertEqual(backup_drill.main(), 1)
+                with backup_drill._termination_signal_scope():
+                    with self.assertRaises(backup_drill.BackupOperationInterrupted):
+                        backup_drill.create_backup(cli_args)
 
             self.assertGreaterEqual(fsync_calls, 2)
-            self.assertIn("Backup operation interrupted by SIGTERM.", signal_output.getvalue())
             self.assertEqual(backup_drill.backup_inventory(output_dir), initial_inventory)
             self.assertEqual(
                 {path.name for path in output_dir.iterdir()},
                 {path.name for path in old_entries},
             )
 
-    def _assert_preserve_existing_keeps_all_archives_after_success(self) -> None:
+    def _assert_rotation_deletes_all_old_pairs_after_success(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             output_dir = pathlib.Path(temporary_dir)
             old_entries: list[pathlib.Path] = []
             for index in range(16):
                 dump, sidecar = self._write_backup_pair(
                     output_dir,
-                    f"platformdb-old-{index:02}.dump",
+                    f"platformdb-202001{index + 1:02}T000000Z.dump",
                     f"verified-{index}".encode(),
                 )
                 old_entries.extend((dump, sidecar))
             unverified_dump, unverified_sidecar = self._write_backup_pair(
                 output_dir,
-                "platformdb-old-unverified.dump",
+                "platformdb-20200301T000000Z.dump",
                 b"old-unverified",
                 restore_verified=False,
             )
@@ -11956,7 +12136,7 @@ raise SystemExit(status)
                 keep=1,
                 admin_database_url=None,
                 dump_only=False,
-                rotate_existing=False,
+                rotate_existing=True,
             )
 
             def fake_run_command(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
@@ -11991,21 +12171,21 @@ raise SystemExit(status)
                 result = backup_drill.create_backup(args)
 
             self.assertTrue(result["restore_verified"])
-            self.assertEqual(result["rotation_mode"], "preserve-existing")
+            self.assertEqual(result["rotation_mode"], "rotate-existing")
             self.assertEqual(result["preexisting_archive_count"], 17)
             self.assertEqual(result["preexisting_sidecar_count"], 17)
-            self.assertEqual(result["preexisting_archives_preserved"], True)
-            self.assertEqual(result["removed"], [])
+            self.assertFalse(result["preexisting_archives_preserved"])
+            self.assertEqual(result["postexisting_archive_count"], 1)
+            self.assertEqual(len(result["removed"]), 34)
             for path, expected in before.items():
-                metadata = path.lstat()
-                self.assertEqual((path.read_bytes(), metadata.st_mode, metadata.st_ino), expected)
+                self.assertFalse(path.exists())
 
-    def test_preserve_existing_rejects_incomplete_or_mismatched_pairs(self) -> None:
-        for malformed in ("orphan_dump", "orphan_sidecar", "wrong_digest", "wrong_dump_name"):
+    def test_rotation_rejects_incomplete_or_mismatched_pairs(self) -> None:
+        for malformed in ("orphan_dump", "orphan_sidecar", "wrong_size", "wrong_dump_name"):
             with self.subTest(malformed=malformed), tempfile.TemporaryDirectory() as temporary_dir:
                 output_dir = pathlib.Path(temporary_dir)
                 dump_path, sidecar_path = self._write_backup_pair(
-                    output_dir, "platformdb-existing.dump", b"existing-archive"
+                    output_dir, "platformdb-20200101T000000Z.dump", b"existing-archive"
                 )
                 if malformed == "orphan_dump":
                     sidecar_path.unlink()
@@ -12013,8 +12193,10 @@ raise SystemExit(status)
                     dump_path.unlink()
                 else:
                     metadata = json.loads(sidecar_path.read_text(encoding="utf-8"))
-                    metadata["sha256" if malformed == "wrong_digest" else "dump_file"] = (
-                        "0" * 64 if malformed == "wrong_digest" else "platformdb-other.dump"
+                    metadata["size_bytes" if malformed == "wrong_size" else "dump_file"] = (
+                        metadata["size_bytes"] + 1
+                        if malformed == "wrong_size"
+                        else "platformdb-20200102T000000Z.dump"
                     )
                     sidecar_path.write_text(json.dumps(metadata), encoding="utf-8")
                 args = argparse.Namespace(
@@ -12023,7 +12205,7 @@ raise SystemExit(status)
                     keep=1,
                     admin_database_url=None,
                     dump_only=True,
-                    rotate_existing=False,
+                rotate_existing=True,
                 )
                 with (
                     mock.patch.dict(
@@ -12038,11 +12220,11 @@ raise SystemExit(status)
                     backup_drill.create_backup(args)
                 dump_command.assert_not_called()
 
-    def test_preserve_existing_detects_same_inode_content_tamper_with_restored_mtime(self) -> None:
+    def test_retention_detects_same_inode_content_tamper_with_restored_mtime(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             output_dir = pathlib.Path(temporary_dir)
             old_dump, _ = self._write_backup_pair(
-                output_dir, "platformdb-existing.dump", b"original-payload"
+                output_dir, "platformdb-20200101T000000Z.dump", b"original-payload"
             )
             original_stat = old_dump.stat()
             original_inode = old_dump.lstat().st_ino
@@ -12058,7 +12240,7 @@ raise SystemExit(status)
                 keep=1,
                 admin_database_url=None,
                 dump_only=False,
-                rotate_existing=False,
+                rotate_existing=True,
             )
 
             def mutate_existing_archive(*_: object, **__: object) -> int:
@@ -12101,7 +12283,7 @@ raise SystemExit(status)
                     side_effect=[dt.datetime(2026, 10, 6, 12, 0, 0, tzinfo=dt.UTC)] * 3,
                 ),
             ):
-                with self.assertRaisesRegex(RuntimeError, "mismatched existing backup pair"):
+                with self.assertRaisesRegex(RuntimeError, "Pre-existing backup inventory changed before publication"):
                     backup_drill.create_backup(args)
 
             self.assertEqual(old_dump.lstat().st_ino, original_inode)
@@ -12109,11 +12291,11 @@ raise SystemExit(status)
             self.assertEqual(old_dump.stat().st_mtime_ns, original_stat.st_mtime_ns)
             self.assertFalse((output_dir / "platformdb-20261006T120000Z.dump").exists())
 
-    def test_preserve_existing_post_publish_member_change_rolls_back_only_new_pair(self) -> None:
+    def test_backup_inventory_member_change_stops_before_publication(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             output_dir = pathlib.Path(temporary_dir)
             old_dump, old_sidecar = self._write_backup_pair(
-                output_dir, "platformdb-existing.dump", b"existing-archive"
+                output_dir, "platformdb-20200101T000000Z.dump", b"existing-archive"
             )
             original_dump = (old_dump.read_bytes(), old_dump.lstat().st_ino)
             original_sidecar = (old_sidecar.read_bytes(), old_sidecar.lstat().st_ino)
@@ -12122,25 +12304,26 @@ raise SystemExit(status)
             args = argparse.Namespace(
                 env_file=str(output_dir / ".env.platform"),
                 output_dir=str(output_dir),
-                keep=14,
+                keep=1,
                 admin_database_url=None,
                 dump_only=True,
-                rotate_existing=False,
+                rotate_existing=True,
             )
-            real_inventory = backup_drill.backup_inventory
+            real_inventory = backup_drill._backup_retention_inventory
             inventory_calls = 0
 
-            def mutate_old_member_after_publish(path: pathlib.Path):
+            def mutate_old_member_after_publish(
+                path: pathlib.Path, **kwargs: object
+            ):
                 nonlocal inventory_calls
                 inventory_calls += 1
-                # Calls 1 and 2 are the initial and pre-publication snapshots;
-                # call 3 is the post-publication inventory with both new files present.
-                if inventory_calls == 3:
+                # Calls 1 and 2 are the initial and pre-publication snapshots.
+                if inventory_calls == 2:
                     os.utime(
                         old_dump,
                         ns=(old_dump.stat().st_atime_ns, original_mtime_ns + 1_000_000),
                     )
-                return real_inventory(path)
+                return real_inventory(path, **kwargs)
 
             with (
                 mock.patch.dict(
@@ -12156,19 +12339,15 @@ raise SystemExit(status)
                 ),
                 mock.patch.object(backup_drill, "require_restore_headroom"),
                 mock.patch.object(
-                    backup_drill, "backup_inventory", side_effect=mutate_old_member_after_publish
+                    backup_drill, "_backup_retention_inventory", side_effect=mutate_old_member_after_publish
                 ),
             ):
                 with self.assertRaisesRegex(
-                    RuntimeError, "Pre-existing backup inventory changed during preserve mode"
-                ) as raised:
+                    RuntimeError, "Pre-existing backup inventory changed before publication"
+                ):
                     backup_drill.create_backup(args)
 
-            self.assertEqual(inventory_calls, 4)
-            self.assertEqual(
-                getattr(raised.exception, "_backup_preservation_integrity", None),
-                "preexisting_inventory_changed",
-            )
+            self.assertEqual(inventory_calls, 2)
             self.assertEqual({path.name for path in output_dir.iterdir()}, initial_names)
             self.assertEqual((old_dump.read_bytes(), old_dump.lstat().st_ino), original_dump)
             self.assertEqual((old_sidecar.read_bytes(), old_sidecar.lstat().st_ino), original_sidecar)
@@ -12188,10 +12367,10 @@ raise SystemExit(status)
             args = argparse.Namespace(
                 env_file=str(output_dir / ".env.platform"),
                 output_dir=str(output_dir),
-                keep=14,
+                keep=1,
                 admin_database_url=None,
                 dump_only=True,
-                rotate_existing=False,
+                rotate_existing=True,
             )
             with (
                 mock.patch.dict(
@@ -12224,10 +12403,10 @@ raise SystemExit(status)
             args = argparse.Namespace(
                 env_file=str(output_dir / ".env.platform"),
                 output_dir=str(output_dir),
-                keep=14,
+                keep=1,
                 admin_database_url=None,
                 dump_only=True,
-                rotate_existing=False,
+                rotate_existing=True,
             )
             with (
                 mock.patch.dict(
@@ -12254,10 +12433,10 @@ raise SystemExit(status)
             args = argparse.Namespace(
                 env_file=str(output_dir / ".env.platform"),
                 output_dir=str(output_dir),
-                keep=14,
+                keep=1,
                 admin_database_url=None,
                 dump_only=True,
-                rotate_existing=False,
+                rotate_existing=True,
             )
 
             def fake_run_command(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
@@ -12298,44 +12477,40 @@ raise SystemExit(status)
                 with self.assertRaisesRegex(RuntimeError, "destination already exists") as raised:
                     backup_drill.create_backup(args)
 
-            self.assertEqual(
-                getattr(raised.exception, "_backup_preservation_integrity", None),
-                "preexisting_inventory_changed",
+            self.assertIsNone(
+                getattr(raised.exception, "_backup_preservation_integrity", None)
             )
             self.assertEqual(link_count, 2)
             self.assertEqual(sidecar_path.read_bytes(), b"racing-sidecar")
             self.assertEqual(sidecar_path.stat().st_mode & 0o777, 0o640)
             self.assertFalse(dump_path.exists())
 
-    def _assert_explicit_rotation_retains_keep_policy(self) -> None:
+    def _assert_explicit_rotation_retains_only_new_verified_pair(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             output_dir = pathlib.Path(temporary_dir)
             old_verified: list[pathlib.Path] = []
             base_time = dt.datetime(2026, 9, 1, tzinfo=dt.UTC).timestamp()
             for index in range(16):
                 timestamp = dt.datetime(2026, 9, 1, tzinfo=dt.UTC) + dt.timedelta(seconds=index)
-                dump = output_dir / f"platformdb-{timestamp.strftime('%Y%m%dT%H%M%SZ')}.dump"
-                sidecar = dump.with_suffix(".json")
-                dump.write_bytes(f"old-{index}".encode())
-                sidecar.write_text(
-                    json.dumps({"dump_file": dump.name, "restore_verified": True}),
-                    encoding="utf-8",
+                dump, sidecar = self._write_backup_pair(
+                    output_dir,
+                    f"platformdb-{timestamp.strftime('%Y%m%dT%H%M%SZ')}.dump",
+                    f"old-{index}".encode(),
                 )
                 old_time = base_time + index
                 os.utime(dump, (old_time, old_time))
                 os.utime(sidecar, (old_time, old_time))
                 old_verified.append(dump)
-            failed_dump = output_dir / "platformdb-20260901T000100Z.dump"
-            failed_metadata = failed_dump.with_suffix(".json")
-            failed_dump.write_bytes(b"old-unverified")
-            failed_metadata.write_text(
-                json.dumps({"dump_file": failed_dump.name, "restore_verified": False}),
-                encoding="utf-8",
+            failed_dump, failed_metadata = self._write_backup_pair(
+                output_dir,
+                "platformdb-20260901T000100Z.dump",
+                b"old-unverified",
+                restore_verified=False,
             )
             args = argparse.Namespace(
                 env_file=str(output_dir / ".env.platform"),
                 output_dir=str(output_dir),
-                keep=14,
+                keep=1,
                 admin_database_url=None,
                 dump_only=False,
                 rotate_existing=True,
@@ -12387,20 +12562,26 @@ raise SystemExit(status)
                 result = backup_drill.create_backup(args)
 
             self.assertEqual(result["rotation_mode"], "rotate-existing")
-            self.assertNotIn("protected_retention_proof", result)
+            self.assertTrue(
+                backup_drill.valid_protected_retention_proof(
+                    result["protected_retention_proof"],
+                    requested_keep=1,
+                    new_dump_file=result["dump_file"],
+                )
+            )
             self.assertEqual(
                 events, ["directory-fsync", "prune-unverified", "prune-backups"]
             )
-            self.assertEqual(len(result["removed"]), 8)
+            self.assertEqual(len(result["removed"]), 2 * 17)
             self.assertFalse(failed_dump.exists())
             self.assertFalse(failed_metadata.exists())
             self.assertEqual(
                 sum(dump.exists() for dump in old_verified),
-                13,
+                0,
             )
             self.assertEqual(
                 len(tuple(output_dir.glob("platformdb-*.dump"))),
-                14,
+                1,
             )
 
     @staticmethod

@@ -380,7 +380,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--web-artifact-dir", type=Path, default=DEFAULT_WEB_ARTIFACT_DIR
     )
-    parser.add_argument("--backup-keep", type=int, default=14)
+    parser.add_argument("--backup-keep", type=int, default=1)
     parser.add_argument(
         "--protected-release",
         action="append",
@@ -392,7 +392,7 @@ def parse_args() -> argparse.Namespace:
         "--protected-backup-manifest",
         type=Path,
         default=None,
-        help="Private schema-1 list of exact backup dump basenames to preserve during rotation.",
+        help="Private schema-1 retention audit list; entries do not override keep-one rotation.",
     )
     parser.add_argument("--backup-max-age-hours", type=float, default=24.0)
     parser.add_argument(
@@ -414,14 +414,6 @@ def parse_args() -> argparse.Namespace:
         "--maximum-used-percent", type=float, default=DEFAULT_MAX_USED_PERCENT
     )
     parser.add_argument("--skip-backup", action="store_true")
-    parser.add_argument(
-        "--preserve-existing-backups",
-        action="store_true",
-        help=(
-            "Run full maintenance without rotating or deleting any backup archive; "
-            "all non-backup retention and health checks still apply."
-        ),
-    )
     parser.add_argument(
         "--private-backup-diagnostics",
         action="store_true",
@@ -505,8 +497,8 @@ def parse_args() -> argparse.Namespace:
     ):
         if getattr(args, name) < 0:
             parser.error(f"--{name.replace('_', '-')} must not be negative")
-    if args.backup_keep < 1:
-        parser.error("--backup-keep must be at least 1")
+    if args.backup_keep != 1:
+        parser.error("--backup-keep must be exactly 1")
     protected_releases = args.protected_release or []
     if len(protected_releases) != len(set(protected_releases)):
         parser.error("--protected-release values must be unique")
@@ -542,19 +534,10 @@ def parse_args() -> argparse.Namespace:
         or args.purge_profile_access_cache_after_restore
     ):
         parser.error("--protected-backup-manifest requires a backup-creating maintenance mode")
-    if args.preserve_existing_backups and not args.apply:
-        parser.error("--preserve-existing-backups requires --apply")
-    if args.preserve_existing_backups and (
-        args.backup_only or args.verify_existing_backup_only or args.skip_backup
-    ):
-        parser.error(
-            "--preserve-existing-backups requires full maintenance with backup creation"
-        )
     if args.backup_only and args.verify_existing_backup_only:
         parser.error("backup-only modes are mutually exclusive")
     if args.authorization_probe_only and (
         args.backup_only or args.verify_existing_backup_only or args.skip_backup
-        or args.preserve_existing_backups
         or args.purge_profile_access_cache_after_restore
         or args.evict_pinned_build_node_cache or args.compact_legacy_fallback_runtime_cache
         or args.resume_legacy_fallback_runtime_cache_compaction
@@ -571,7 +554,6 @@ def parse_args() -> argparse.Namespace:
             args.backup_only
             or args.verify_existing_backup_only
             or args.skip_backup
-            or args.preserve_existing_backups
             or args.private_backup_diagnostics
             or args.evict_pinned_build_node_cache
             or args.compact_legacy_fallback_runtime_cache
@@ -1058,6 +1040,10 @@ def run_backup(
 ) -> dict[str, Any]:
     if not math.isfinite(max_age_hours) or max_age_hours <= 0:
         raise ValueError("backup max age must be finite and positive")
+    if keep != 1 or not rotate_existing:
+        raise ValueError(
+            "backup creation requires keep-one rotation; use verify-existing for no-prune checks"
+        )
     if (
         type(scratch_backend) is not str
         or scratch_backend not in backup_restore_drill.SCRATCH_BACKENDS
@@ -1150,7 +1136,7 @@ def run_backup(
         raise BackupCommandFailure()
     if result.get("restore_verified") is not True or check_result.get("restore_verified") is not True:
         raise RuntimeError("Platform backup was not restore-verified.")
-    if protected_backup_manifest is not None and rotate_existing:
+    if rotate_existing:
         if (
             result.get("rotation_mode") != "rotate-existing"
             or result.get("alembic_revision_verified") is not True
@@ -1174,7 +1160,7 @@ def run_backup(
     if type(size_bytes) is not int or size_bytes <= 0:
         raise RuntimeError("Platform backup size is invalid.")
     retention_proof = result.get("protected_retention_proof")
-    if protected_backup_manifest is not None and rotate_existing:
+    if rotate_existing:
         if not backup_restore_drill.valid_protected_retention_proof(
             retention_proof,
             requested_keep=keep,
@@ -1207,7 +1193,7 @@ def run_backup(
         ):
             raise RuntimeError("Protected backup removal paths do not match the private proof.")
     elif retention_proof is not None:
-        raise RuntimeError("Protected backup retention proof is unexpected for this backup mode.")
+        raise RuntimeError("Backup retention proof is unexpected for this backup mode.")
     report = {
         "created": True,
         "archive_name": archive_name,
@@ -1258,7 +1244,7 @@ def run_backup(
         else None,
         "preexisting_archives_preserved": result.get("preexisting_archives_preserved") is True,
     }
-    if protected_backup_manifest is not None and rotate_existing:
+    if rotate_existing:
         report["protected_retention_proof"] = retention_proof
     return report
 
@@ -1431,7 +1417,6 @@ def verify_existing_backup(
             "--verify-latest-existing",
             "--max-age-hours",
             str(max_age_hours),
-            "--preserve-existing",
             "--json",
             *( ["--private-scratch-diagnostics"] if private_failure_diagnostics else [] ),
         ],
@@ -1441,7 +1426,7 @@ def verify_existing_backup(
         "status": "verified-existing",
         "verified_existing": True,
         "created": False,
-        "rotation_mode": "preserve-existing",
+        "rotation_mode": "verify-only",
         "removed_count": 0,
         **result,
     }
@@ -2820,9 +2805,7 @@ def _plan_and_maybe_apply(
                     app_dir,
                     keep=args.backup_keep,
                     max_age_hours=getattr(args, "backup_max_age_hours", 24.0),
-                    rotate_existing=not getattr(
-                        args, "preserve_existing_backups", False
-                    ),
+                    rotate_existing=True,
                     private_failure_diagnostics=getattr(
                         args, "private_backup_diagnostics", False
                     ),
@@ -3141,9 +3124,8 @@ def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
                 live_qa_plan = _EmptyLiveQARuntimeCachePlan((), (), (), ())
             elif getattr(args, "backup_only", False):
                 # Do not construct or apply release, artifact, transient or
-                # live-QA retention plans in this mode. The backup owner may
-                # Preserve every pre-existing archive; archive rotation belongs
-                # only to the separate full-maintenance retention path.
+                # live-QA retention plans in this mode. Backup rotation is part
+                # of the common backup writer after restore verification.
                 # A backup/restore failure exits before any deletion path.
                 maintenance_result = (
                     RetentionPlan((), (), ()),
@@ -3157,7 +3139,7 @@ def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
                             app_dir,
                             keep=args.backup_keep,
                             max_age_hours=getattr(args, "backup_max_age_hours", 24.0),
-                            rotate_existing=False,
+                            rotate_existing=True,
                             private_failure_diagnostics=getattr(
                                 args, "private_backup_diagnostics", False
                             ),

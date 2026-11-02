@@ -20,7 +20,7 @@ inside the private cluster. SQL restore and validation use a passwordless
 `platform_user` role created only in that disposable cluster; its separate
 `postgres` admin connection creates and drops the temporary database.
 Production PostgreSQL is never used as the restore target. The disposable cluster is stopped and its unit and mount are confirmed gone before a verified
-backup pair is published. Generic ordinary rotation defaults to 14 verified copies. Backup-only mode preserves every complete existing pair and does not rotate. The canonical manifest-backed maintenance configuration can override that default with `--backup-keep 15`; see [named backup retention](backup-retention-protection.md) and verify the exact installed unit before a production operation.
+backup pair is published. Every backup-creating path retains exactly one newest restore-verified pair after the new archive passes checksum, isolated restore and Alembic verification. Backup-only rotates backup pairs while skipping release, build, browser, screenshot and live-QA retention. Verify-existing mode restores the newest current pair but never prunes. The fixed manifest is now an audit input; its former named-pair exemptions have been retired. See [backup retention](backup-retention-protection.md) and verify the exact installed unit before a production operation.
 
 The lock-aware storage-maintenance path calls backup creation and freshness
 verification in-process, avoiding a second Python interpreter during the
@@ -140,10 +140,11 @@ threshold. This sibling remains private and is excluded from public summaries.
 
 A failed or unavailable disk, memory or mount sample stops the drill; it does
 not rotate or remove any retained backup. A failed isolated restore or
-preserve-existing post-publication check removes only the operation's
-inode-pinned new pair and leaves the existing backup inventory unchanged. If
-exact rollback cannot be confirmed, the operation reports a closed
-backup-integrity status and does not claim preservation.
+pre-publication inventory check leaves the existing backup inventory
+unchanged. Rotation starts only after restore and Alembic verification
+succeed. If rotation fails partway through, the newly verified pair remains
+and the operation reports failure; already removed historical pairs are not
+transactionally restored.
 
 The transient restore unit must reach an active state with its process and
 control group verified within 30 seconds. While the launcher is running,
@@ -208,21 +209,19 @@ backup directory before rotation or success. If that directory sync fails, it
 removes only the exact newly published inodes and leaves pre-existing pairs
 untouched; failure to confirm that rollback is reported as an integrity error.
 
-Backup-only preserves every complete archive/metadata pair that exists before
-the run; it does not apply the ordinary 14-copy rotation limit. The
-lock-aware backup-only caller does not need a separate preservation flag.
-Generic full-maintenance callers without a protected manifest retain the
-existing rotation behavior. The canonical maintenance unit in this source
-tree opts into the fixed private manifest described in the [named backup
-retention policy](backup-retention-protection.md), with `--backup-keep 15`.
-It retains the named pairs plus the newest `max(keep, 15)` pairs whose
-sidecars explicitly mark restore verification true. The source-tree setting alone does not prove the installed production unit's configuration; check [current state](CURRENT.md) and verify the exact installed unit before operation. The low-level backup CLI retains its historical default.
+Backup-only performs the common keep-one rotation after the new pair has
+passed isolated restore and Alembic verification; it skips other retention
+categories. The `--backup-keep` option accepts only `1`. The fixed private
+manifest is retained as an audit input for the source-bound workflow, but
+listed pairs receive no retention exemption. Verify the exact installed unit
+and source-bound workflow before operation.
 
-Manifest input and listed pairs are checked before DB work; the manifest and
-pair identities are rechecked around pruning. The private proof records each
-deleted pair's pre-delete identities, sidecar claims, reason and falsey
-restore-status class where applicable. It does not hash dump payloads. Drift
-fails closed, but pruning that already began is not transactional. Public
+The pair inventory is checked before DB work and again before publication;
+each pair's identity and sidecar claims are rechecked before unlink. The
+private proof records the latest selected pair and each removed pair's
+pre-delete identities, sidecar claims, reason and falsey restore-status class
+where applicable. It does not hash dump payloads. Drift fails closed, but
+pruning that already began is not transactional. Public
 summaries omit manifest names, paths and proof digests.
 
 For a normal reviewed `dev` release, the operator reserves the backup; auto-deploy
@@ -296,13 +295,17 @@ Do not dispatch another production operation while this proof is pending. The ba
 lock-aware backup-only mode and acquires locks in the fixed order
 release -> retained-load -> build -> live-QA. Backup-only does not apply
 production-release, source-artifact, transient-browser or live-QA retention.
-The workflow verifies that the pre-existing archive inventory is unchanged
-and that the new archive is restore/Alembic/checksum/freshness verified. Its
+The workflow verifies the source-bound keep-one retention proof and that the
+new archive is restore/Alembic/checksum/freshness verified. Its
 fixed success marker records the exact workflow source SHA, attested bundle
 digest, and hashes of the staged storage-maintenance and backup-drill helpers.
 Its bounded public receipt contains counts, byte totals and inventory digests;
 failure diagnostics stay in a root-private file and are not copied to the
-public artifact. Backup-only and verify-existing-only routes do not rotate or remove existing archive pairs. Full maintenance may rotate older unprotected verified pairs only after a new backup passes the restore drill and fixed manifest checks; it has no existing-backup-only rotation mode. Full maintenance also applies its non-backup release, source-artifact, transient and live-QA retention after the successful restore drill.
+public artifact. Backup-only rotates the archive set to the new verified pair
+while skipping other retention categories. Verify-existing-only restores and
+checks the sole retained pair without pruning. Full maintenance uses the same
+keep-one backup rotation before applying its non-backup release,
+source-artifact, transient and live-QA retention.
 
 ### Pre-archive authorization probe
 
@@ -474,7 +477,7 @@ receipt excludes database names, raw command output, exception text and credenti
 
 A failed create can stop at the disk guard during base admission, fixed scratch-image reservation/allocation, or `pg_dump`; its private receipt records only a closed phase/reason and available/required bytes, never raw output. Scratch-image phases are `scratch_image_admission` and `scratch_image_postallocation`.
 It does not change the guard or preservation policy. Compare receipt bytes; retry only after headroom and health checks pass.
-Use storage-retention preview/exact-candidate cleanup; preserve `current`, `previous`, protected releases and backups. Never use broad globs or lower the guard.
+Use the storage-retention preview and exact-candidate cleanup; preserve `current`, `previous` and protected releases. Keep exactly the newest backup pair only after its dump checksum, isolated restore and Alembic revision verify successfully. The lock-aware rotation removes former pairs, including entries from the retired protected-backup manifest, after the new verified pair is safely published. Never unlink backup files by hand, use broad globs, or lower the storage guard.
 Start one source-bound create during exact-SHA Security; it may wait. If either fails, fix the cause, start fresh Security, then bind one new create; never duplicate/rebind a completed attempt.
 
 For a failed create, run the read-only storage diagnostics workflow with that backup's exact run ID, attempt and

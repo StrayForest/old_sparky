@@ -264,9 +264,80 @@ class PlatformCiClassifierTests(unittest.TestCase):
             require_deployable=True,
         )
 
+    def test_codex_archive_retention_uses_non_deployable_candidate_route(self) -> None:
+        codex_files = {
+            ".github/workflows/platform-codex-archive-retention-build.yml",
+            "platform/tools/codex_archive_retention/__init__.py",
+            "platform/tools/codex_archive_retention/cleanup.py",
+            "platform/tools/codex_archive_retention/capture_pr_association.py",
+            "platform/tools/codex_archive_retention/verify_artifact.py",
+            "platform/tools/codex_archive_retention/codex-source.lock.json",
+            "platform/tools/codex_archive_retention/codex-archive-retention.service",
+            "platform/tools/codex_archive_retention/codex-archive-retention.timer",
+            "platform/tools/codex_archive_retention/patches/codex-0.166.0.patch",
+            "platform/tests/test_platform_codex_archive_retention.py",
+        }
+        self.assertTrue(codex_files <= CANDIDATE_PACKAGING_FILES)
+        manifest = classify(
+            sorted(codex_files | {"platform/docs/codex-archive-retention.md"}),
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(manifest["class"], "full")
+        self.assertEqual(manifest["expected_gates"], list(FULL_GATE_IDS))
+        self.assertEqual(manifest["reason"], CANDIDATE_PACKAGING_REASON)
+        self.assertFalse(manifest["fallback"])
+        self.assertFalse(manifest["runtime_sensitive"])
+        self.assertFalse(manifest["deployable"])
+        validate_manifest(manifest, expected_target_sha=self.TARGET_SHA)
+
+        mixed_runtime = classify(
+            [
+                ".github/workflows/platform-codex-archive-retention-build.yml",
+                "platform/apps/platform_api/app/main.py",
+            ],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertTrue(mixed_runtime["deployable"])
+        self.assertFalse(mixed_runtime["fallback"])
+
+        combined_pr = classify(
+            sorted(codex_files | {"platform/tools/platform_backup_retention.py"}),
+            event="pull_request",
+            target_sha=self.TARGET_SHA,
+            branch="feature/codex-and-backup",
+        )
+        self.assertEqual(combined_pr["class"], "full")
+        self.assertEqual(combined_pr["expected_gates"], list(FULL_GATE_IDS))
+        self.assertEqual(combined_pr["reason"], "platform or workflow change requires the full deterministic suite")
+        self.assertFalse(combined_pr["fallback"])
+        self.assertFalse(combined_pr["deployable"])
+        validate_manifest(combined_pr, expected_target_sha=self.TARGET_SHA)
+
+        combined_dev_push = classify(
+            sorted(codex_files | {"platform/tools/platform_backup_retention.py"}),
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(combined_dev_push["class"], "full")
+        self.assertEqual(combined_dev_push["expected_gates"], list(FULL_GATE_IDS))
+        self.assertEqual(combined_dev_push["reason"], "platform or workflow change requires the full deterministic suite")
+        self.assertFalse(combined_dev_push["fallback"])
+        self.assertTrue(combined_dev_push["deployable"])
+        validate_manifest(
+            combined_dev_push,
+            expected_target_sha=self.TARGET_SHA,
+            require_deployable=True,
+        )
+
     def test_candidate_packaging_is_full_ci_but_non_deployable_for_pr_and_push(self) -> None:
         candidate_files = {
             ".github/workflows/platform-host-tools-candidate.yml",
+            ".github/workflows/platform-codex-archive-retention-build.yml",
             ".github/workflows/platform-production-autodeploy.yml",
             ".github/workflows/platform-security.yml",
             "platform/tests/test_platform_ci_classifier.py",
@@ -275,6 +346,15 @@ class PlatformCiClassifierTests(unittest.TestCase):
             "platform/tests/test_platform_host_tools_bundle.py",
             "platform/tools/platform_test_catalog.py",
             "platform/tools/platform_verify_contract.py",
+            "platform/tools/codex_archive_retention/__init__.py",
+            "platform/tools/codex_archive_retention/cleanup.py",
+            "platform/tools/codex_archive_retention/capture_pr_association.py",
+            "platform/tools/codex_archive_retention/verify_artifact.py",
+            "platform/tools/codex_archive_retention/codex-source.lock.json",
+            "platform/tools/codex_archive_retention/codex-archive-retention.service",
+            "platform/tools/codex_archive_retention/codex-archive-retention.timer",
+            "platform/tools/codex_archive_retention/patches/codex-0.166.0.patch",
+            "platform/tests/test_platform_codex_archive_retention.py",
         }
         self.assertEqual(CANDIDATE_PACKAGING_FILES, candidate_files)
         files = sorted(

@@ -50,7 +50,34 @@ Event scrub steps reparse rewritten JSON with duplicate-key rejection, require
 `inputs.control_email` to be absent, and verify that the original and canonical
 email values are absent from every parsed string key and value. Unrelated event
 metadata may contain the text `control_email`; a byte search for that field
-name is not a valid scrub check.
+name is not a valid scrub check. Before parsing, each step opens the runner event
+file without following symlinks and checks that it is a regular, runner-owned,
+single-link file no larger than 64 KiB, with no special permission bits or
+group/other write permission. Runner-owned `0600` and `0644` inputs are accepted;
+the step seals the already-open file descriptor to `0600` and verifies that mode
+before reading its contents.
+
+The manual retained-cleanup workflow writes its scrubbed event to the private
+`$RUNNER_TEMP/retained-cleanup-sanitized-event.json` handoff. Its later
+validation step reads that bounded, owner-only file rather than assuming a
+subsequent action sees the same contents at `GITHUB_EVENT_PATH`. This keeps the
+masked cleanup input stable across action steps while leaving GitHub's event
+file under runner ownership.
+
+To run the event-mode, credential-scrub, cleanup handoff and finalizer-route
+regressions from `platform/`:
+
+```bash
+/usr/bin/python3.12 -m unittest \
+  tests.test_platform_external_load_workflow_contract.ExternalLoadWorkflowContractTests.test_event_scrub_steps_seal_owner_readable_event_files_and_reject_unsafe_metadata \
+  tests.test_platform_external_load_workflow_contract.ExternalLoadWorkflowContractTests.test_retained_cleanup_identity_uses_event_file_and_private_stdin_handoff \
+  tests.test_platform_external_load_workflow_contract.ExternalLoadWorkflowContractTests.test_fixture_commit_without_any_candidate_job_allows_exact_finalizer_cleanup
+```
+
+The real pinned-age integration regression also executes the derive-source-
+binding scrub and descriptor validator after the synthetic manifest is
+encrypted. It uses only synthetic values and checks that the derived workflow
+outputs contain no private input.
 
 ## Provision the fixture-only identity
 

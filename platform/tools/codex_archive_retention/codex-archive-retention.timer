@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Codex archive retention once per minute
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1min
+Persistent=true
+Unit=codex-archive-retention.service
+
+[Install]
+WantedBy=timers.target

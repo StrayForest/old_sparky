@@ -108,10 +108,14 @@ jobs:
           /usr/bin/python3 - <<'PY'
           import json,os,stat,sys
           from pathlib import Path
-          path=Path(os.environ["GITHUB_EVENT_PATH"]);fd=os.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
+          path=Path(os.environ["GITHUB_EVENT_PATH"])
+          try: fd=os.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
+          except OSError: raise SystemExit("EVENT_SCRUB reason=event_file_open")
           try:
               st=os.fstat(fd)
-              if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.geteuid() or st.st_nlink!=1 or st.st_size>65536 or stat.S_IMODE(st.st_mode)&0o022: raise ValueError
+              if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.geteuid() or st.st_nlink!=1 or st.st_size>65536 or stat.S_IMODE(st.st_mode)&0o7022: raise SystemExit("EVENT_SCRUB reason=event_file_metadata")
+              os.fchmod(fd,0o600); st=os.fstat(fd)
+              if stat.S_IMODE(st.st_mode)!=0o600: raise SystemExit("EVENT_SCRUB reason=event_file_seal")
               raw=os.read(fd,65537)
               if len(raw)!=st.st_size: raise ValueError
           finally: os.close(fd)
@@ -146,7 +150,7 @@ jobs:
                           pending.extend(current)
                   return False
               if not isinstance(checked_inputs,dict) or "control_email" in checked_inputs or any(contains_private_value(checked,secret) for secret in {email,email.lower(),email.casefold()} if secret): raise ValueError
-          except (KeyError,TypeError,UnicodeError,ValueError,json.JSONDecodeError): raise SystemExit("workflow event sanitization failed closed")
+          except (KeyError,TypeError,UnicodeError,ValueError,json.JSONDecodeError): raise SystemExit("EVENT_SCRUB reason=event_payload_invalid")
           PY
       - name: Require exact workflow dispatch inputs
         shell: bash
@@ -300,9 +304,12 @@ jobs:
           import sys
 
           try:
-              descriptor = os.open(
-                  os.environ["GITHUB_EVENT_PATH"], os.O_RDONLY | os.O_NOFOLLOW
-              )
+              try:
+                  descriptor = os.open(
+                      os.environ["GITHUB_EVENT_PATH"], os.O_RDONLY | os.O_NOFOLLOW
+                  )
+              except OSError:
+                  raise SystemExit("EVENT_SCRUB reason=event_file_open")
               try:
                   metadata = os.fstat(descriptor)
                   if (
@@ -310,9 +317,13 @@ jobs:
                       or metadata.st_uid != os.geteuid()
                       or metadata.st_nlink != 1
                       or metadata.st_size > 65536
-                      or stat.S_IMODE(metadata.st_mode) & 0o022
+                      or stat.S_IMODE(metadata.st_mode) & 0o7022
                   ):
-                      raise ValueError
+                      raise SystemExit("EVENT_SCRUB reason=event_file_metadata")
+                  os.fchmod(descriptor, 0o600)
+                  metadata = os.fstat(descriptor)
+                  if stat.S_IMODE(metadata.st_mode) != 0o600:
+                      raise SystemExit("EVENT_SCRUB reason=event_file_seal")
                   raw_event = os.read(descriptor, 65537)
               finally:
                   os.close(descriptor)
@@ -399,7 +410,7 @@ jobs:
                       pending.extend(current)
               return False
           if not isinstance(checked_inputs, dict) or "control_email" in checked_inputs or any(contains_private_value(checked, secret) for secret in {email, email.lower(), email.casefold()} if secret):
-              raise SystemExit("workflow event sanitization failed closed")
+              raise SystemExit("EVENT_SCRUB reason=event_payload_invalid")
           PY
 
       - name: Reject invalid external-load dispatch before checkout
@@ -622,10 +633,14 @@ jobs:
           /usr/bin/python3 - <<'PY'
           import json,os,stat,sys
           from pathlib import Path
-          path=Path(os.environ["GITHUB_EVENT_PATH"]);fd=os.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
+          path=Path(os.environ["GITHUB_EVENT_PATH"])
+          try: fd=os.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
+          except OSError: raise SystemExit("EVENT_SCRUB reason=event_file_open")
           try:
               st=os.fstat(fd)
-              if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.geteuid() or st.st_nlink!=1 or st.st_size>65536 or stat.S_IMODE(st.st_mode)&0o022: raise ValueError
+              if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.geteuid() or st.st_nlink!=1 or st.st_size>65536 or stat.S_IMODE(st.st_mode)&0o7022: raise SystemExit("EVENT_SCRUB reason=event_file_metadata")
+              os.fchmod(fd,0o600); st=os.fstat(fd)
+              if stat.S_IMODE(st.st_mode)!=0o600: raise SystemExit("EVENT_SCRUB reason=event_file_seal")
               raw=os.read(fd,65537)
               if len(raw)!=st.st_size: raise ValueError
           finally: os.close(fd)
@@ -660,7 +675,7 @@ jobs:
                           pending.extend(current)
                   return False
               if not isinstance(checked_inputs,dict) or "control_email" in checked_inputs or any(contains_private_value(checked,secret) for secret in {email,email.lower(),email.casefold()} if secret): raise ValueError
-          except (KeyError,TypeError,UnicodeError,ValueError,json.JSONDecodeError): raise SystemExit("workflow event sanitization failed closed")
+          except (KeyError,TypeError,UnicodeError,ValueError,json.JSONDecodeError): raise SystemExit("EVENT_SCRUB reason=event_payload_invalid")
           PY
       - name: Checkout exact target as untrusted source data
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -726,10 +741,14 @@ jobs:
           /usr/bin/python3 - <<'PY'
           import json,os,stat,sys
           from pathlib import Path
-          path=Path(os.environ["GITHUB_EVENT_PATH"]);fd=os.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
+          path=Path(os.environ["GITHUB_EVENT_PATH"])
+          try: fd=os.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
+          except OSError: raise SystemExit("EVENT_SCRUB reason=event_file_open")
           try:
               st=os.fstat(fd)
-              if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.geteuid() or st.st_nlink!=1 or st.st_size>65536 or stat.S_IMODE(st.st_mode)&0o022: raise ValueError
+              if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.geteuid() or st.st_nlink!=1 or st.st_size>65536 or stat.S_IMODE(st.st_mode)&0o7022: raise SystemExit("EVENT_SCRUB reason=event_file_metadata")
+              os.fchmod(fd,0o600); st=os.fstat(fd)
+              if stat.S_IMODE(st.st_mode)!=0o600: raise SystemExit("EVENT_SCRUB reason=event_file_seal")
               raw=os.read(fd,65537)
               if len(raw)!=st.st_size: raise ValueError
           finally: os.close(fd)
@@ -764,7 +783,7 @@ jobs:
                           pending.extend(current)
                   return False
               if not isinstance(checked_inputs,dict) or "control_email" in checked_inputs or any(contains_private_value(checked,secret) for secret in {email,email.lower(),email.casefold()} if secret): raise ValueError
-          except (KeyError,TypeError,UnicodeError,ValueError,json.JSONDecodeError): raise SystemExit("workflow event sanitization failed closed")
+          except (KeyError,TypeError,UnicodeError,ValueError,json.JSONDecodeError): raise SystemExit("EVENT_SCRUB reason=event_payload_invalid")
           PY
       - name: Download closed external-load handoff
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
@@ -1425,15 +1444,22 @@ jobs:
           import stat
           import sys
           event_path = Path(os.environ["GITHUB_EVENT_PATH"])
-          fd = os.open(event_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+          try:
+              fd = os.open(event_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+          except OSError:
+              raise SystemExit("EVENT_SCRUB reason=event_file_open")
           try:
               before = os.fstat(fd)
-              if not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid() or before.st_nlink != 1 or before.st_size > 65536 or stat.S_IMODE(before.st_mode) & 0o077:
-                  raise ValueError
+              if not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid() or before.st_nlink != 1 or before.st_size > 65536 or stat.S_IMODE(before.st_mode) & 0o7022:
+                  raise SystemExit("EVENT_SCRUB reason=event_file_metadata")
+              os.fchmod(fd, 0o600)
+              sealed = os.fstat(fd)
+              if stat.S_IMODE(sealed.st_mode) != 0o600:
+                  raise SystemExit("EVENT_SCRUB reason=event_file_seal")
               raw = os.read(fd, 65537)
               after = os.fstat(fd)
-              if len(raw) != before.st_size or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
-                  raise ValueError
+              if len(raw) != sealed.st_size or (sealed.st_dev, sealed.st_ino, sealed.st_size, sealed.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+                  raise SystemExit("EVENT_SCRUB reason=event_file_changed")
           finally:
               os.close(fd)
           def reject_duplicate_keys(pairs):
@@ -1465,7 +1491,7 @@ jobs:
               if len(sanitized) > 65536:
                   raise ValueError
           except (UnicodeError, ValueError, TypeError, json.JSONDecodeError):
-              raise SystemExit("workflow event sanitization failed closed")
+              raise SystemExit("EVENT_SCRUB reason=event_payload_invalid")
           temporary = event_path.with_name(".sanitized-event-" + str(os.getpid()))
           out = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
           try:
@@ -1492,7 +1518,7 @@ jobs:
                       pending.extend(current)
               return False
           if not stat.S_ISREG(checked.st_mode) or checked.st_nlink != 1 or stat.S_IMODE(checked.st_mode) != 0o600 or not isinstance(checked_inputs, dict) or "control_email" in checked_inputs or any(contains_private_value(checked_event, secret) for secret in {email, email.lower(), email.casefold()} if secret):
-              raise SystemExit("workflow event sanitization failed closed")
+              raise SystemExit("EVENT_SCRUB reason=event_payload_invalid")
           PY
 
       - name: Download exact public fixture descriptor
@@ -2099,10 +2125,14 @@ jobs:
           /usr/bin/python3 - <<'PY'
           import json, os, stat, sys
           from pathlib import Path
-          path=Path(os.environ["GITHUB_EVENT_PATH"]); fd=os.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
+          path=Path(os.environ["GITHUB_EVENT_PATH"])
+          try: fd=os.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
+          except OSError: raise SystemExit("EVENT_SCRUB reason=event_file_open")
           try:
               st=os.fstat(fd)
-              if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.geteuid() or st.st_nlink!=1 or st.st_size>65536 or stat.S_IMODE(st.st_mode)&0o077: raise ValueError
+              if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.geteuid() or st.st_nlink!=1 or st.st_size>65536 or stat.S_IMODE(st.st_mode)&0o7022: raise SystemExit("EVENT_SCRUB reason=event_file_metadata")
+              os.fchmod(fd,0o600); st=os.fstat(fd)
+              if stat.S_IMODE(st.st_mode)!=0o600: raise SystemExit("EVENT_SCRUB reason=event_file_seal")
               raw=os.read(fd,65537)
               if len(raw)!=st.st_size: raise ValueError
           finally: os.close(fd)
@@ -2137,7 +2167,7 @@ jobs:
                           pending.extend(current)
                   return False
               if not isinstance(checked_inputs,dict) or "control_email" in checked_inputs or any(contains_private_value(checked,secret) for secret in {email,email.lower(),email.casefold()} if secret): raise ValueError
-          except (KeyError,TypeError,UnicodeError,ValueError,json.JSONDecodeError): raise SystemExit("workflow event sanitization failed closed")
+          except (KeyError,TypeError,UnicodeError,ValueError,json.JSONDecodeError): raise SystemExit("EVENT_SCRUB reason=event_payload_invalid")
           PY
       - name: Checkout exact diagnostic source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -2241,10 +2271,14 @@ jobs:
           /usr/bin/python3 - <<'PY'
           import json,os,stat,sys
           from pathlib import Path
-          path=Path(os.environ["GITHUB_EVENT_PATH"]);fd=os.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
+          path=Path(os.environ["GITHUB_EVENT_PATH"])
+          try: fd=os.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
+          except OSError: raise SystemExit("EVENT_SCRUB reason=event_file_open")
           try:
               st=os.fstat(fd)
-              if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.geteuid() or st.st_nlink!=1 or st.st_size>65536 or stat.S_IMODE(st.st_mode)&0o077: raise ValueError
+              if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.geteuid() or st.st_nlink!=1 or st.st_size>65536 or stat.S_IMODE(st.st_mode)&0o7022: raise SystemExit("EVENT_SCRUB reason=event_file_metadata")
+              os.fchmod(fd,0o600); st=os.fstat(fd)
+              if stat.S_IMODE(st.st_mode)!=0o600: raise SystemExit("EVENT_SCRUB reason=event_file_seal")
               raw=os.read(fd,65537)
               if len(raw)!=st.st_size: raise ValueError
           finally: os.close(fd)
@@ -2279,7 +2313,7 @@ jobs:
                           pending.extend(current)
                   return False
               if not isinstance(checked_inputs,dict) or "control_email" in checked_inputs or any(contains_private_value(checked,secret) for secret in {email,email.lower(),email.casefold()} if secret): raise ValueError
-          except (KeyError,TypeError,UnicodeError,ValueError,json.JSONDecodeError): raise SystemExit("workflow event sanitization failed closed")
+          except (KeyError,TypeError,UnicodeError,ValueError,json.JSONDecodeError): raise SystemExit("EVENT_SCRUB reason=event_payload_invalid")
           PY
       - name: Download the exact same-run public fixture descriptor
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
@@ -2996,9 +3030,12 @@ jobs:
           import sys
 
           try:
-              descriptor = os.open(
-                  os.environ["GITHUB_EVENT_PATH"], os.O_RDONLY | os.O_NOFOLLOW
-              )
+              try:
+                  descriptor = os.open(
+                      os.environ["GITHUB_EVENT_PATH"], os.O_RDONLY | os.O_NOFOLLOW
+                  )
+              except OSError:
+                  raise SystemExit("EVENT_SCRUB reason=event_file_open")
               try:
                   metadata = os.fstat(descriptor)
                   if (
@@ -3006,9 +3043,13 @@ jobs:
                       or metadata.st_uid != os.geteuid()
                       or metadata.st_nlink != 1
                       or metadata.st_size > 65536
-                      or stat.S_IMODE(metadata.st_mode) & 0o022
+                      or stat.S_IMODE(metadata.st_mode) & 0o7022
                   ):
-                      raise ValueError
+                      raise SystemExit("EVENT_SCRUB reason=event_file_metadata")
+                  os.fchmod(descriptor, 0o600)
+                  metadata = os.fstat(descriptor)
+                  if stat.S_IMODE(metadata.st_mode) != 0o600:
+                      raise SystemExit("EVENT_SCRUB reason=event_file_seal")
                   raw_event = os.read(descriptor, 65537)
               finally:
                   os.close(descriptor)
@@ -3118,6 +3159,11 @@ jobs:
           always() && (
             (needs.namespace-containment-barrier.outputs.namespace_closed_status == '0' && needs.namespace-containment-manual-barrier.outputs.manual_required == '0') ||
             ((inputs.cpu_diagnostic_only == true || inputs.ssr_capacity_diagnostic_only == true) && needs.fixture-setup.outputs.pre_candidate_cleanup_allowed == '1')
+            || ((inputs.cpu_diagnostic_only == true || inputs.ssr_capacity_diagnostic_only == true) &&
+              needs.fixture-setup.outputs.setup_status == '0' &&
+              needs.fixture-setup.outputs.manifest_ready == '1' &&
+              needs.load-client.result == 'skipped' &&
+              needs['cpu-diagnostic-pair'].result == 'skipped')
           )
         shell: bash
         env:
@@ -3170,6 +3216,11 @@ jobs:
             ((inputs.cpu_diagnostic_only == true || inputs.ssr_capacity_diagnostic_only == true) &&
               needs.fixture-setup.outputs.pre_candidate_cleanup_allowed == '1' &&
               needs.fixture-setup.outputs.manifest_ready != '1' &&
+              needs.load-client.result == 'skipped' &&
+              needs['cpu-diagnostic-pair'].result == 'skipped') ||
+            ((inputs.cpu_diagnostic_only == true || inputs.ssr_capacity_diagnostic_only == true) &&
+              needs.fixture-setup.outputs.setup_status == '0' &&
+              needs.fixture-setup.outputs.manifest_ready == '1' &&
               needs.load-client.result == 'skipped' &&
               needs['cpu-diagnostic-pair'].result == 'skipped')
           )
@@ -3461,8 +3512,13 @@ jobs:
               needs.fixture-setup.outputs.pre_candidate_cleanup_allowed == '1' &&
               needs.fixture-setup.outputs.manifest_ready != '1' &&
               needs.load-client.result == 'skipped' &&
+              needs['cpu-diagnostic-pair'].result == 'skipped') ||
+            ((inputs.cpu_diagnostic_only == true || inputs.ssr_capacity_diagnostic_only == true) &&
+              needs.fixture-setup.outputs.setup_status == '0' &&
+              needs.fixture-setup.outputs.manifest_ready == '1' &&
+              needs.load-client.result == 'skipped' &&
               needs['cpu-diagnostic-pair'].result == 'skipped')
-          )
+          ) && steps.revalidate-finalizer.outputs.cleanup_identity_status == '0'
         shell: bash
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
@@ -3569,6 +3625,11 @@ jobs:
             ((inputs.cpu_diagnostic_only == true || inputs.ssr_capacity_diagnostic_only == true) &&
               needs.fixture-setup.outputs.pre_candidate_cleanup_allowed == '1' &&
               needs.fixture-setup.outputs.manifest_ready != '1' &&
+              needs.load-client.result == 'skipped' &&
+              needs['cpu-diagnostic-pair'].result == 'skipped') ||
+            ((inputs.cpu_diagnostic_only == true || inputs.ssr_capacity_diagnostic_only == true) &&
+              needs.fixture-setup.outputs.setup_status == '0' &&
+              needs.fixture-setup.outputs.manifest_ready == '1' &&
               needs.load-client.result == 'skipped' &&
               needs['cpu-diagnostic-pair'].result == 'skipped')
           )
@@ -4273,10 +4334,14 @@ jobs:
           /usr/bin/python3 - <<'PY'
           import json,os,stat,sys
           from pathlib import Path
-          path=Path(os.environ["GITHUB_EVENT_PATH"]);fd=os.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
+          path=Path(os.environ["GITHUB_EVENT_PATH"])
+          try: fd=os.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
+          except OSError: raise SystemExit("EVENT_SCRUB reason=event_file_open")
           try:
               st=os.fstat(fd)
-              if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.geteuid() or st.st_nlink!=1 or st.st_size>65536 or stat.S_IMODE(st.st_mode)&0o077: raise ValueError
+              if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.geteuid() or st.st_nlink!=1 or st.st_size>65536 or stat.S_IMODE(st.st_mode)&0o7022: raise SystemExit("EVENT_SCRUB reason=event_file_metadata")
+              os.fchmod(fd,0o600); st=os.fstat(fd)
+              if stat.S_IMODE(st.st_mode)!=0o600: raise SystemExit("EVENT_SCRUB reason=event_file_seal")
               raw=os.read(fd,65537)
               if len(raw)!=st.st_size: raise ValueError
           finally: os.close(fd)
@@ -4311,7 +4376,7 @@ jobs:
                           pending.extend(current)
                   return False
               if not isinstance(checked_inputs,dict) or "control_email" in checked_inputs or any(contains_private_value(checked,secret) for secret in {email,email.lower(),email.casefold()} if secret): raise ValueError
-          except (KeyError,TypeError,UnicodeError,ValueError,json.JSONDecodeError): raise SystemExit("workflow event sanitization failed closed")
+          except (KeyError,TypeError,UnicodeError,ValueError,json.JSONDecodeError): raise SystemExit("EVENT_SCRUB reason=event_payload_invalid")
           PY
       - name: Checkout reviewed load evaluator
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
