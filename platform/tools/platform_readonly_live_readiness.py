@@ -26,6 +26,12 @@ APP_ROOT = Path("/opt/oldsparky/platform")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
 MAX_JSON_BYTES = 512 * 1024
+MAX_VERIFIER_MANIFEST_BYTES = 64 * 1024
+VERIFIER_FILES = (
+    "platform/tools/platform_readonly_live_readiness.py",
+    "platform/tools/platform_host_tools_pin.py",
+    "platform/tools/platform_host_tools_bundle.py",
+)
 LOCKS = (
     "/run/lock/oldsparky-platform-release.lock",
     "/run/lock/oldsparky-retained-load-matrix.lock",
@@ -234,21 +240,13 @@ def _release(
 
 
 def _check_source_pin(current: Path, expected_host_tools_sha: str) -> dict[str, object]:
-    payload = host_tools_pin._read_pin(current)
-    if set(payload) != {"schema", "repository", "host_tools_sha", "closure"}:
-        raise ReadinessError("deployed host-tools pin schema is invalid")
-    if (
-        type(payload.get("schema")) is not int
-        or payload.get("schema") != host_tools_pin.SCHEMA
-        or payload.get("repository") != host_tools_pin.EXPECTED_REPOSITORY
-        or payload.get("host_tools_sha") != expected_host_tools_sha
-    ):
-        raise ReadinessError("deployed host-tools pin identity differs")
     try:
-        host_tools_pin._validate_closure(current, payload.get("closure"))
+        return host_tools_pin.validate_release_pin(
+            current,
+            expected_host_tools_sha=expected_host_tools_sha,
+        )
     except host_tools_pin.HostToolsPinError as exc:
-        raise ReadinessError("deployed host-tools source closure differs from its pin") from exc
-    return payload
+        raise ReadinessError("deployed host-tools pin or source closure differs") from exc
 
 
 def _check_service_environment() -> dict[str, object]:
@@ -385,6 +383,142 @@ def _check_maintenance_state() -> tuple[dict[str, str], dict[str, str]]:
     return timer, service
 
 
+def _verify_verifier_manifest(
+    verifier_source_sha: str,
+    app_target_sha: str,
+    manifest_path: Path | None,
+    *,
+    tools_dir: Path | None = None,
+) -> str | None:
+    if SHA_RE.fullmatch(verifier_source_sha) is None or SHA_RE.fullmatch(app_target_sha) is None:
+        raise ReadinessError("readiness source identity is invalid")
+    if manifest_path is None:
+        if verifier_source_sha != app_target_sha:
+            raise ReadinessError("alternate verifier requires a source manifest")
+        return None
+    if not isinstance(manifest_path, Path) or not manifest_path.is_absolute():
+        raise ReadinessError("verifier manifest path is invalid")
+    actual_tools_dir = (Path(__file__).resolve().parent if tools_dir is None else tools_dir)
+    stage_root = actual_tools_dir.parent.parent
+    manifest_identity = stage_root / "manifest.json"
+    if manifest_path != manifest_identity or manifest_path.is_symlink():
+        raise ReadinessError("verifier manifest is not beside the staged source tree")
+    try:
+        root_stat = stage_root.lstat()
+        platform_stat = actual_tools_dir.parent.lstat()
+        tools_stat = actual_tools_dir.lstat()
+        manifest_stat = manifest_path.lstat()
+    except OSError as exc:
+        raise ReadinessError("verifier staging metadata is unavailable") from exc
+    if (
+        not stat.S_ISDIR(root_stat.st_mode)
+        or stat.S_ISLNK(root_stat.st_mode)
+        or root_stat.st_uid != os.geteuid()
+        or stat.S_IMODE(root_stat.st_mode) != 0o700
+        or not stat.S_ISDIR(platform_stat.st_mode)
+        or stat.S_ISLNK(platform_stat.st_mode)
+        or platform_stat.st_uid != os.geteuid()
+        or stat.S_IMODE(platform_stat.st_mode) != 0o700
+        or not stat.S_ISDIR(tools_stat.st_mode)
+        or stat.S_ISLNK(tools_stat.st_mode)
+        or tools_stat.st_uid != os.geteuid()
+        or stat.S_IMODE(tools_stat.st_mode) != 0o700
+        or not stat.S_ISREG(manifest_stat.st_mode)
+        or stat.S_ISLNK(manifest_stat.st_mode)
+        or manifest_stat.st_uid != os.geteuid()
+        or manifest_stat.st_nlink != 1
+        or stat.S_IMODE(manifest_stat.st_mode) != 0o600
+        or manifest_stat.st_size > MAX_VERIFIER_MANIFEST_BYTES
+    ):
+        raise ReadinessError("verifier staging metadata is unsafe")
+    manifest, manifest_sha = _read_json_with_digest(manifest_path)
+    manifest_after = manifest_path.lstat()
+    if (
+        (manifest_stat.st_dev, manifest_stat.st_ino, manifest_stat.st_size, manifest_stat.st_mtime_ns, manifest_stat.st_ctime_ns)
+        != (manifest_after.st_dev, manifest_after.st_ino, manifest_after.st_size, manifest_after.st_mtime_ns, manifest_after.st_ctime_ns)
+    ):
+        raise ReadinessError("verifier manifest changed while being read")
+    if (
+        set(manifest) != {"schema", "verifier_source_sha", "files"}
+        or type(manifest.get("schema")) is not int
+        or manifest.get("schema") != 1
+        or manifest.get("verifier_source_sha") != verifier_source_sha
+        or not isinstance(manifest.get("files"), list)
+    ):
+        raise ReadinessError("verifier manifest schema or source differs")
+    files = manifest["files"]
+    if tuple(record.get("path") for record in files if isinstance(record, dict)) != VERIFIER_FILES:
+        raise ReadinessError("verifier manifest file set or order differs")
+    if len(files) != len(VERIFIER_FILES):
+        raise ReadinessError("verifier manifest file set or order differs")
+    expected_names = {Path(relative).name for relative in VERIFIER_FILES}
+    if {path.name for path in actual_tools_dir.iterdir()} != expected_names:
+        raise ReadinessError("verifier staged tool directory has unexpected entries")
+    if {path.name for path in actual_tools_dir.parent.iterdir()} != {"tools"}:
+        raise ReadinessError("verifier staged platform directory has unexpected entries")
+    if {path.name for path in stage_root.iterdir()} != {"manifest.json", "platform"}:
+        raise ReadinessError("verifier staging root has unexpected entries")
+    for expected_path, entry in zip(VERIFIER_FILES, files, strict=True):
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"path", "mode", "size", "sha256", "git_blob"}
+            or entry.get("path") != expected_path
+            or entry.get("mode") != "100644"
+            or type(entry.get("size")) is not int
+            or not 1 <= entry["size"] <= MAX_JSON_BYTES
+            or not isinstance(entry.get("sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) is None
+            or not isinstance(entry.get("git_blob"), str)
+            or re.fullmatch(r"[0-9a-f]{40}", entry["git_blob"]) is None
+        ):
+            raise ReadinessError("verifier manifest entry is invalid")
+        source_file = actual_tools_dir / Path(expected_path).name
+        try:
+            before = source_file.lstat()
+            data = source_file.read_bytes()
+            after = source_file.lstat()
+        except OSError as exc:
+            raise ReadinessError("staged verifier module is unavailable") from exc
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o644
+            or before.st_size > MAX_JSON_BYTES
+            or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            or len(data) != entry["size"]
+            or hashlib.sha256(data).hexdigest() != entry["sha256"]
+            or hashlib.sha1(b"blob " + str(len(data)).encode("ascii") + b"\0" + data).hexdigest()
+            != entry["git_blob"]
+        ):
+            raise ReadinessError("staged verifier module differs from its manifest")
+    return manifest_sha
+
+
+def _provenance_fields(
+    verifier_source_sha: str,
+    app_target_sha: str,
+    verifier_manifest_path: Path | None = None,
+    *,
+    tools_dir: Path | None = None,
+) -> dict[str, object]:
+    manifest_sha = _verify_verifier_manifest(
+        verifier_source_sha,
+        app_target_sha,
+        verifier_manifest_path,
+        tools_dir=tools_dir,
+    )
+    return {
+        "verifier_source_sha": verifier_source_sha,
+        "app_target_sha": app_target_sha,
+        "verifier_manifest_sha256": manifest_sha,
+        "purpose": "read_only_readiness",
+        "runtime_or_fixture_mutations_authorized": False,
+    }
+
+
 def _check_final_consistency(
     *,
     root: Path,
@@ -420,6 +554,8 @@ def _check_final_consistency(
 
 def collect_readiness(
     *,
+    verifier_source_sha: str,
+    verifier_manifest_path: Path | None,
     expected_app_sha: str,
     expected_previous_app_sha: str,
     expected_release_manifest_sha: str,
@@ -428,7 +564,13 @@ def collect_readiness(
     expected_previous_host_tools_sha: str,
     expected_toolset_version: str,
 ) -> dict[str, object]:
-    for value in (expected_app_sha, expected_previous_app_sha, expected_host_tools_sha, expected_previous_host_tools_sha):
+    for value in (
+        verifier_source_sha,
+        expected_app_sha,
+        expected_previous_app_sha,
+        expected_host_tools_sha,
+        expected_previous_host_tools_sha,
+    ):
         if not isinstance(value, str) or SHA_RE.fullmatch(value) is None:
             raise ReadinessError("expected source SHA is invalid")
     for value in (expected_release_manifest_sha, expected_previous_release_manifest_sha):
@@ -436,6 +578,11 @@ def collect_readiness(
             raise ReadinessError("expected release-manifest SHA is invalid")
     if expected_toolset_version != host_tools_bundle.TOOLSET_VERSION:
         raise ReadinessError("expected host-tools version is unsupported")
+    provenance = _provenance_fields(
+        verifier_source_sha,
+        expected_app_sha,
+        verifier_manifest_path,
+    )
     if os.geteuid() != 0:
         raise ReadinessError("read-only readiness collector requires root")
 
@@ -539,6 +686,7 @@ def collect_readiness(
     return {
         "schema": 1,
         "status": "ready",
+        **provenance,
         "current": current_info,
         "previous": previous_info,
         "host_tools": {
@@ -569,6 +717,8 @@ def collect_readiness(
 
 def _arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--verifier-source-sha", required=True)
+    parser.add_argument("--verifier-manifest", type=Path)
     parser.add_argument("--expected-app-sha", required=True)
     parser.add_argument("--expected-previous-app-sha", required=True)
     parser.add_argument("--expected-release-manifest-sha", required=True)
@@ -583,6 +733,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = _arguments(argv)
         result = collect_readiness(
+            verifier_source_sha=args.verifier_source_sha,
+            verifier_manifest_path=args.verifier_manifest,
             expected_app_sha=args.expected_app_sha,
             expected_previous_app_sha=args.expected_previous_app_sha,
             expected_release_manifest_sha=args.expected_release_manifest_sha,

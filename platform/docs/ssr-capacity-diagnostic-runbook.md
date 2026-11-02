@@ -155,12 +155,12 @@ exact-head CI route. For a runtime-sensitive source change:
    increase invalidates the measurement. Stop if a source, service identity,
    profile value or readiness check differs.
 
-For a complete read-only readiness record, use the collector included in the
-active app release. It is available only after normal deployment installs a
-source containing this helper; do not run it from a candidate checkout or copy
-candidate code to the host. In the authorized root host shell, set source
-values from verified release receipts and the exact host-tools pin, then
-capture private output:
+For a complete read-only readiness record, prefer the collector included in
+the active app release. Its release-specific pin check validates the flattened
+`contracts/host_tools_pin.json` and `tools/` closure against the expected C
+generation; the source-checkout pin resolver remains for CI checkout layout.
+In the authorized root host shell, set source values from verified release
+receipts and the exact host-tools pin, then capture private output:
 
 ```bash
 set -euo pipefail
@@ -171,11 +171,13 @@ EXPECTED_RELEASE_MANIFEST_SHA='<active-release-manifest-sha-from-deploy-receipt>
 EXPECTED_PREVIOUS_RELEASE_MANIFEST_SHA='<previous-release-manifest-sha>'
 EXPECTED_HOST_TOOLS_SHA='<host-tools-sha-C-from-active-pin>'
 EXPECTED_PREVIOUS_HOST_TOOLS_SHA='<preserved-host-tools-sha>'
+VERIFIER_SOURCE_SHA="$EXPECTED_APP_SHA"
 EVIDENCE_DIR="$(mktemp -d /root/platform-readiness.XXXXXX)"
 test "$(/usr/bin/stat -c '%a' "$EVIDENCE_DIR")" = 700
 test -f /opt/oldsparky/platform/current/tools/platform_readonly_live_readiness.py
 /usr/bin/python3.12 -I -B \
   /opt/oldsparky/platform/current/tools/platform_readonly_live_readiness.py \
+  --verifier-source-sha "$VERIFIER_SOURCE_SHA" \
   --expected-app-sha "$EXPECTED_APP_SHA" \
   --expected-previous-app-sha "$EXPECTED_PREVIOUS_APP_SHA" \
   --expected-release-manifest-sha "$EXPECTED_RELEASE_MANIFEST_SHA" \
@@ -187,12 +189,20 @@ test -f /opt/oldsparky/platform/current/tools/platform_readonly_live_readiness.p
 test ! -s "$EVIDENCE_DIR/readiness.stderr"
 test "$(/usr/bin/stat -c '%a' "$EVIDENCE_DIR/readiness.json")" = 600
 /usr/bin/python3.12 -I -B -c \
-  'import json,sys; assert json.load(open(sys.argv[1], encoding="utf-8")).get("status") == "ready"' \
-  "$EVIDENCE_DIR/readiness.json"
+  'import json,sys; d=json.load(open(sys.argv[1], encoding="utf-8")); assert d.get("status") == "ready" and d.get("verifier_source_sha") == sys.argv[2] and d.get("app_target_sha") == sys.argv[3] and d.get("runtime_or_fixture_mutations_authorized") is False' \
+  "$EVIDENCE_DIR/readiness.json" "$VERIFIER_SOURCE_SHA" "$EXPECTED_APP_SHA"
 ```
 
-Require exit 0 and `status=ready`; the JSON must bind the supplied current and
-previous app sources/release-manifest digests and C generation values, verify
+If the installed collector cannot complete because its own validation path is
+the failing component, a separately reviewed read-only verifier may be staged
+from its exact source commit. Follow the [private staging procedure](read-only-production-readiness.md).
+This alternate establishes readiness only; it never authorizes runtime or
+fixture mutations.
+
+Require exit 0 and `status=ready`; the JSON must bind `verifier_source_sha`
+separately from installed `app_target_sha` and, for an alternate verifier,
+include the verified `verifier_manifest_sha256`. It must also bind the supplied
+current and previous app sources/release-manifest digests and C generation values, verify
 all 15 pinned C members by digest and normalized manifest mode,
 confirm that a directory exists at the expected previous C generation path
 (presence only; it is not a verification of that prior generation's contents),

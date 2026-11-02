@@ -42,6 +42,7 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | Retained-load cleanup and hermetic web verification | [Retained-load and web verification](retained-load-and-web-verification.md) |
 | External fixture credential transport | [Credential transport](fixture-credential-transport.md) |
 | Production SSR capacity diagnostic | [SSR capacity diagnostic runbook](ssr-capacity-diagnostic-runbook.md) |
+| Read-only production readiness and private verifier staging | [Read-only production readiness](read-only-production-readiness.md) |
 | Authenticated HTML transport / TTFB hops | [Performance transport runbook](performance-transport-runbook.md) |
 | Load profiles and performance evidence | [`platform/performance/README.md`](../performance/README.md) |
 | Security operations / CSP policy | [Security runbook](security-runbook.md) |

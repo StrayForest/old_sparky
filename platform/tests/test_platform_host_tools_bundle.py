@@ -1385,6 +1385,24 @@ class HostToolsBundleTests(unittest.TestCase):
             expected_gid=os.getegid(),
         )
 
+    def _flattened_release_pin_fixture(self, root: Path) -> Path:
+        release = root / "release"
+        tools_dir = release / "tools"
+        contracts_dir = release / "contracts"
+        tools_dir.mkdir(parents=True)
+        contracts_dir.mkdir()
+        contract = pin._read_pin(REPO_ROOT)
+        (contracts_dir / "host_tools_pin.json").write_text(
+            json.dumps(contract, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="ascii",
+        )
+        for name in (*bundle.HOST_TOOL_FILES, "platform_host_tools_bundle.py"):
+            source = TOOLS_ROOT / name
+            target = tools_dir / name
+            target.write_bytes(source.read_bytes())
+            target.chmod(stat.S_IMODE(source.stat().st_mode))
+        return release
+
     def test_installed_generation_verifies_manifest_normalized_modes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             generation = self._installed_generation_fixture(Path(temporary))
@@ -1403,10 +1421,263 @@ class HostToolsBundleTests(unittest.TestCase):
                 generation.chmod(0o700)
 
     def test_readiness_source_binding_uses_the_active_release_pin(self) -> None:
-        payload = live_readiness._check_source_pin(REPO_ROOT, PIN_SHA)
-        self.assertEqual(payload["host_tools_sha"], PIN_SHA)
+        with tempfile.TemporaryDirectory() as temporary:
+            release = self._flattened_release_pin_fixture(Path(temporary))
+            payload = live_readiness._check_source_pin(release, PIN_SHA)
+            self.assertEqual(payload["host_tools_sha"], PIN_SHA)
+            with self.assertRaises(live_readiness.ReadinessError):
+                live_readiness._check_source_pin(release, "0" * 40)
+
+    def test_readiness_report_separates_verifier_and_app_source_and_is_read_only(self) -> None:
+        verifier_sha = "a" * 40
+        app_sha = "b" * 40
         with self.assertRaises(live_readiness.ReadinessError):
-            live_readiness._check_source_pin(REPO_ROOT, "0" * 40)
+            live_readiness._provenance_fields(verifier_sha, app_sha)
+        with tempfile.TemporaryDirectory() as temporary:
+            stage = Path(temporary) / "verifier"
+            stage.mkdir(mode=0o700)
+            tools_dir = stage / "platform" / "tools"
+            tools_dir.mkdir(parents=True, mode=0o700)
+            (stage / "platform").chmod(0o700)
+            files = []
+            for index, relative in enumerate(live_readiness.VERIFIER_FILES):
+                contents = f"synthetic verifier module {index}\n".encode("ascii")
+                path = tools_dir / Path(relative).name
+                path.write_bytes(contents)
+                path.chmod(0o644)
+                files.append(
+                    {
+                        "path": relative,
+                        "mode": "100644",
+                        "size": len(contents),
+                        "sha256": hashlib.sha256(contents).hexdigest(),
+                        "git_blob": hashlib.sha1(
+                            b"blob " + str(len(contents)).encode("ascii") + b"\0" + contents
+                        ).hexdigest(),
+                    }
+                )
+            manifest_path = stage / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {"schema": 1, "verifier_source_sha": verifier_sha, "files": files},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                encoding="ascii",
+            )
+            manifest_path.chmod(0o600)
+            result = live_readiness._provenance_fields(
+                verifier_sha,
+                app_sha,
+                manifest_path,
+                tools_dir=tools_dir,
+            )
+            self.assertEqual(result["verifier_source_sha"], verifier_sha)
+            self.assertEqual(result["app_target_sha"], app_sha)
+            self.assertNotEqual(result["verifier_source_sha"], result["app_target_sha"])
+            self.assertEqual(
+                result["verifier_manifest_sha256"],
+                hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+            )
+            self.assertEqual(result["purpose"], "read_only_readiness")
+            self.assertIs(result["runtime_or_fixture_mutations_authorized"], False)
+            (tools_dir / Path(live_readiness.VERIFIER_FILES[0]).name).write_bytes(b"changed\n")
+            with self.assertRaises(live_readiness.ReadinessError):
+                live_readiness._provenance_fields(
+                    verifier_sha,
+                    app_sha,
+                    manifest_path,
+                    tools_dir=tools_dir,
+                )
+        with self.assertRaises(live_readiness.ReadinessError):
+            live_readiness._provenance_fields("not-a-sha", app_sha)
+
+    def test_readiness_runbook_documents_private_alternate_verifier_boundary(self) -> None:
+        readiness_doc = (
+            REPO_ROOT / "platform/docs/read-only-production-readiness.md"
+        ).read_text(encoding="utf-8")
+        runbook = (
+            (REPO_ROOT / "platform/docs/ssr-capacity-diagnostic-runbook.md").read_text(encoding="utf-8")
+            + readiness_doc
+        )
+        for required in (
+            "platform/tools/platform_readonly_live_readiness.py",
+            "platform/tools/platform_host_tools_pin.py",
+            "platform/tools/platform_host_tools_bundle.py",
+            "verifier_source_sha",
+            "app_target_sha",
+            "--verifier-manifest",
+            "runtime changes",
+            "fixture creation",
+            "git ls-tree",
+            "git cat-file blob",
+            "SHA-256",
+            "runtime_or_fixture_mutations_authorized",
+        ):
+            self.assertIn(required, runbook)
+        marker = (
+            '/usr/bin/python3.12 -I -B - "$SOURCE_REPO" "$VERIFIER_SOURCE_SHA" '
+            '"$STAGE_DIR" <<\'PY\'\n'
+        )
+        script_start = readiness_doc.index(marker) + len(marker)
+        script_end = readiness_doc.index("\nPY\n", script_start)
+        stager = readiness_doc[script_start:script_end]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "source"
+            repository.mkdir()
+            subprocess.run(["git", "init", str(repository)], check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-C", str(repository), "config", "user.name", "Readiness fixture"],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repository), "config", "user.email", "readiness@example.invalid"],
+                check=True,
+                capture_output=True,
+            )
+            for index, relative in enumerate(live_readiness.VERIFIER_FILES):
+                source = repository / relative
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_text(f"synthetic module {index}\n", encoding="ascii")
+                source.chmod(0o644)
+            subprocess.run(
+                ["git", "-C", str(repository), "add", *live_readiness.VERIFIER_FILES],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repository), "commit", "-m", "readiness fixture"],
+                check=True,
+                capture_output=True,
+            )
+            source_sha = subprocess.run(
+                ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            evidence = root / "evidence"
+            evidence.mkdir(mode=0o700)
+            stage = evidence / "verifier"
+            previous_umask = os.umask(0o077)
+            try:
+                staged = subprocess.run(
+                    [sys.executable, "-I", "-B", "-", str(repository), source_sha, str(stage)],
+                    input=stager,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            finally:
+                os.umask(previous_umask)
+            self.assertEqual(staged.returncode, 0, staged.stderr)
+            self.assertEqual(staged.stdout, "")
+            verify_marker = (
+                '/usr/bin/python3.12 -I -B - "$STAGE_DIR" "$VERIFIER_SOURCE_SHA" \\\n'
+                '  > "$EVIDENCE_DIR/verifier-stage-verification.json" <<\'PY\'\n'
+            )
+            verify_start = readiness_doc.index(verify_marker) + len(verify_marker)
+            verify_end = readiness_doc.index("\nPY\n", verify_start)
+            verifier = readiness_doc[verify_start:verify_end]
+            checked = subprocess.run(
+                [sys.executable, "-I", "-B", "-", str(stage), source_sha],
+                input=verifier,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(checked.returncode, 0, checked.stderr)
+            self.assertEqual(
+                json.loads(checked.stdout),
+                {"schema": 1, "status": "verified", "verifier_source_sha": source_sha, "files": 3},
+            )
+            provenance = live_readiness._provenance_fields(
+                source_sha,
+                "b" * 40,
+                stage / "manifest.json",
+                tools_dir=stage / "platform" / "tools",
+            )
+            self.assertEqual(provenance["verifier_source_sha"], source_sha)
+            self.assertEqual(provenance["app_target_sha"], "b" * 40)
+            self.assertIsNotNone(provenance["verifier_manifest_sha256"])
+
+    def test_release_layout_pin_fails_closed_for_schema_identity_and_closure_drift(self) -> None:
+        def mutate_contract(release: Path, mutation) -> None:
+            path = release / "contracts/host_tools_pin.json"
+            payload = json.loads(path.read_text(encoding="ascii"))
+            mutation(payload)
+            path.write_text(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="ascii",
+            )
+
+        mutations = (
+            ("unknown top-level field", lambda payload: payload.update(unexpected=True)),
+            ("wrong schema", lambda payload: payload.update(schema=True)),
+            ("wrong repository", lambda payload: payload.update(repository="other/repo")),
+            ("wrong pinned host SHA", lambda payload: payload.update(host_tools_sha="0" * 40)),
+            ("missing closure", lambda payload: payload.pop("closure")),
+            ("reordered closure", lambda payload: payload.update(closure=list(reversed(payload["closure"]))),),
+            (
+                "invalid closure path",
+                lambda payload: payload["closure"][0].update(path="platform/tools/../escape.py"),
+            ),
+            (
+                "closure path order mismatch",
+                lambda payload: payload["closure"][0].update(path="platform/tools/not-the-first-member.py"),
+            ),
+        )
+        for label, mutation in mutations:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                release = self._flattened_release_pin_fixture(Path(temporary))
+                mutate_contract(release, mutation)
+                with self.assertRaises(pin.HostToolsPinError):
+                    pin.validate_release_pin(release, expected_host_tools_sha=PIN_SHA)
+
+        with self.subTest(label="recorded closure digest mismatch"), tempfile.TemporaryDirectory() as temporary:
+            release = self._flattened_release_pin_fixture(Path(temporary))
+            mutate_contract(
+                release,
+                lambda payload: payload["closure"][0].update(sha256="a" * 64),
+            )
+            with self.assertRaises(pin.HostToolsPinError):
+                pin.validate_release_pin(release, expected_host_tools_sha=PIN_SHA)
+
+        with self.subTest(label="closure member content mismatch"), tempfile.TemporaryDirectory() as temporary:
+            release = self._flattened_release_pin_fixture(Path(temporary))
+            member = release / "tools" / Path(pin._read_pin(REPO_ROOT)["closure"][0]["path"]).name
+            member.write_bytes(member.read_bytes() + b"\n")
+            with self.assertRaises(pin.HostToolsPinError):
+                pin.validate_release_pin(release, expected_host_tools_sha=PIN_SHA)
+
+        with self.subTest(label="closure member mode mismatch"), tempfile.TemporaryDirectory() as temporary:
+            release = self._flattened_release_pin_fixture(Path(temporary))
+            first = pin._read_pin(REPO_ROOT)["closure"][0]
+            member = release / "tools" / Path(first["path"]).name
+            member.chmod(0o755 if first["mode"] == 0o644 else 0o644)
+            with self.assertRaises(pin.HostToolsPinError):
+                pin.validate_release_pin(release, expected_host_tools_sha=PIN_SHA)
+
+        with self.subTest(label="closure member symlink"), tempfile.TemporaryDirectory() as temporary:
+            release = self._flattened_release_pin_fixture(Path(temporary))
+            first = pin._read_pin(REPO_ROOT)["closure"][0]
+            member = release / "tools" / Path(first["path"]).name
+            replacement = member.with_name(member.name + ".saved")
+            member.replace(replacement)
+            member.symlink_to(replacement.name)
+            with self.assertRaises(pin.HostToolsPinError):
+                pin.validate_release_pin(release, expected_host_tools_sha=PIN_SHA)
+
+        with self.subTest(label="closure member hardlink"), tempfile.TemporaryDirectory() as temporary:
+            release = self._flattened_release_pin_fixture(Path(temporary))
+            first = pin._read_pin(REPO_ROOT)["closure"][0]
+            member = release / "tools" / Path(first["path"]).name
+            linked = release / "linked-copy"
+            os.link(member, linked)
+            with self.assertRaises(pin.HostToolsPinError):
+                pin.validate_release_pin(release, expected_host_tools_sha=PIN_SHA)
 
     def test_readiness_release_pointer_requires_exact_source_and_manifest_digest(self) -> None:
         source_sha = "a" * 40

@@ -10,32 +10,27 @@ belong in the linked owner documents below.
 
 ## Live and pending state
 
-- Production app source S11 is `d74adf9df950665affa523029801d5ecc49f611c`
-  (`gha-41391692559-1-d74adf9df950`); previous app source S10 is
-  `e7b64e069f5874e3eab983fbcc2c3ef6d26074a9`. Installed host-tools generation
+- Production app source S12 is `009062a7812552897e92490818bd699858a0f4f9`
+  (`gha-41400373353-1-009062a78125`); previous app source S11 is
+  `d74adf9df950665affa523029801d5ecc49f611c`. Installed host-tools generation
   C is `5a8d4c69e208d096af418f67dfba1ef1cf630aa0`, toolset v4; generation
   `92fd34fd81e85ac71a14b2ea8ecf68d0731849a7` remains preserved. Keep runner,
   app and host-tools source identities distinct in every receipt.
-- Fresh S11 readiness passed: API and web health returned HTTP 200; API, web
-  and worker were active with zero restarts. The profile was API workers 2,
-  database pool 24, admission 24 concurrent / 8 waiters / 250 ms, web one
-  `fetch` worker with compression enabled, worker concurrency 2 and worker
-  database pool 2 from the release default. Locks were clear, diagnostic plans
-  absent, and the validated shared-venv origin was retained. The bounded
-  readiness evidence and collector are in the private S11 checkpoint.
-- Exact-source Security `41390006169/1`, backup `41390168412/1`, AUTO
-  `41391199713/1` and deployment `41391692559/1` succeeded. The maintenance
-  timer is active and enabled; the service is terminal idle with PID 0. The
-  latest full-maintenance preview retained current, previous and the validated
-  shared-venv origin; it was not applied.
-- Diagnostic run `41393226256/1` is terminal prefixture failure. Event
-  validation and serialization passed, then encryption failed because the
-  workflow invoked the age parent directory instead of the extracted binary.
-  Fixture setup, load, CPU pair, finalizer SSH and fixture cleanup were skipped;
-  no fixture manifest or remote plan was created. This run is not a measurement
-  and earns no capacity, SLO or performance credit. Do not dispatch again until
-  the exact-source archive-layout fix passes CI, is deployed through the normal
-  `dev` chain, and fresh profile-A readiness passes. Use the
+- Exact-source Security `41398260324/1`, backup `41398501956/1`, AUTO
+  `41399761466/1` and deployment `41400373353/1` succeeded. The source-bound
+  backup was restore-verified with 36 tables and preserved existing archives.
+  The merged read-only readiness collector did not produce a ready record: it
+  failed closed with `HostToolsPinError` before collecting the effective
+  profile, health and lock fields. S12 therefore has no fresh readiness pass
+  and no S12 effective-profile claim.
+- The last verified profile remains the S11 snapshot, not a current S12
+  readiness result. The prior run `41393226256/1` was a prefixture no-op and
+  earns no measurement or capacity credit. Do not dispatch a new diagnostic
+  until the release-layout pin validation fix passes exact-source CI, its
+  read-only verification path is independently reviewed, and readiness passes
+  for the installed app source and C generation. A separately staged verifier
+  can establish readiness only; it does not authorize runtime or fixture
+  mutations. Use the
   [SSR capacity diagnostic runbook](ssr-capacity-diagnostic-runbook.md) for
   dispatch, acceptance, abort and cleanup.
 - Source-bound backup admission requires one successful producer bound to the
@@ -45,8 +40,9 @@ belong in the linked owner documents below.
 ## Open QA and cleanup gates
 
 - The SSR composite has no accepted result. The next run must use the corrected
-  archive-layout path after its normal release and readiness gates pass. It
-  remains zero-credit even when complete; see the
+  credential transport after its normal release and readiness gates pass. The
+  current readiness blocker is the release-layout host-tools pin validator;
+  the prior prefixture run remains zero-credit. See the
   [SSR capacity diagnostic runbook](ssr-capacity-diagnostic-runbook.md).
 
 ## Hard operational limits

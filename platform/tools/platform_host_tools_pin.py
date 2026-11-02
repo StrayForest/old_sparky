@@ -73,12 +73,18 @@ def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
-def _read_pin(source_root: Path) -> dict[str, object]:
+def _read_pin_layout(
+    source_root: Path,
+    *,
+    pin_relative_path: Path,
+    parent_paths: tuple[Path, ...],
+    root_label: str,
+) -> dict[str, object]:
     if not isinstance(source_root, Path) or not source_root.is_absolute():
         raise HostToolsPinError("host-tools pin source root is invalid")
     if source_root.is_symlink() or not source_root.is_dir():
-        raise HostToolsPinError("host-tools pin source root is unsafe")
-    for relative in (Path("platform"), Path("platform/contracts")):
+        raise HostToolsPinError(f"host-tools pin {root_label} root is unsafe")
+    for relative in parent_paths:
         directory = source_root / relative
         try:
             metadata = directory.lstat()
@@ -86,8 +92,8 @@ def _read_pin(source_root: Path) -> dict[str, object]:
             raise HostToolsPinError("host-tools pin parent is unavailable") from exc
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
             raise HostToolsPinError("host-tools pin parent is unsafe")
-    path = source_root / PIN_RELATIVE_PATH
-    if path.parent != source_root / PIN_RELATIVE_PATH.parent:
+    path = source_root / pin_relative_path
+    if path.parent != source_root / pin_relative_path.parent:
         raise HostToolsPinError("host-tools pin path escaped its source root")
     try:
         metadata = path.lstat()
@@ -110,6 +116,26 @@ def _read_pin(source_root: Path) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise HostToolsPinError("host-tools pin is not an object")
     return payload
+
+
+def _read_pin(source_root: Path) -> dict[str, object]:
+    """Read a source-checkout pin without changing its established layout."""
+    return _read_pin_layout(
+        source_root,
+        pin_relative_path=PIN_RELATIVE_PATH,
+        parent_paths=(Path("platform"), Path("platform/contracts")),
+        root_label="source",
+    )
+
+
+def _read_release_pin(release_root: Path) -> dict[str, object]:
+    """Read the same pin contract from the flattened immutable release layout."""
+    return _read_pin_layout(
+        release_root,
+        pin_relative_path=Path("contracts/host_tools_pin.json"),
+        parent_paths=(Path("contracts"),),
+        root_label="release",
+    )
 
 
 def _git(source_root: Path, *arguments: str, check: bool = True) -> str:
@@ -177,11 +203,15 @@ def _validate_commit(source_root: Path, host_tools_sha: str, target_sha: str) ->
         raise HostToolsPinError("host-tools SHA is not an ancestor of the target")
 
 
-def _bundle_file_names(source_root: Path) -> tuple[str, ...]:
-    platform_dir = source_root / "platform"
+def _bundle_file_names(source_root: Path, *, release_layout: bool = False) -> tuple[str, ...]:
+    if not isinstance(source_root, Path) or not source_root.is_absolute():
+        raise HostToolsPinError("host-tools source root is invalid")
+    if source_root.is_symlink() or not source_root.is_dir():
+        raise HostToolsPinError("host-tools source root is unsafe")
+    platform_dir = source_root if release_layout else source_root / "platform"
     if platform_dir.is_symlink() or not platform_dir.is_dir():
         raise HostToolsPinError("host-tools platform directory is unsafe")
-    tools_dir = source_root / "platform" / "tools"
+    tools_dir = platform_dir / "tools"
     if tools_dir.is_symlink() or not tools_dir.is_dir():
         raise HostToolsPinError("host-tools tools directory is unsafe")
     declaration_path = tools_dir / "platform_host_tools_bundle.py"
@@ -325,7 +355,12 @@ def _bundle_file_names(source_root: Path) -> tuple[str, ...]:
     return result
 
 
-def _validate_closure(source_root: Path, closure: object) -> None:
+def _validate_closure(
+    source_root: Path,
+    closure: object,
+    *,
+    release_layout: bool = False,
+) -> None:
     if not isinstance(closure, list) or not 1 <= len(closure) <= MAX_CLOSURE_FILES:
         raise HostToolsPinError("host-tools closure baseline is invalid")
     records: list[Mapping[str, object]] = []
@@ -347,15 +382,17 @@ def _validate_closure(source_root: Path, closure: object) -> None:
             raise HostToolsPinError("host-tools closure record is invalid")
         records.append(record)
     expected_paths = tuple(str(record["path"]) for record in records)
-    names = _bundle_file_names(source_root)
+    names = _bundle_file_names(source_root, release_layout=release_layout)
     if expected_paths != tuple(f"platform/tools/{name}" for name in names):
         raise HostToolsPinError("host-tools closure baseline does not match helper")
+    platform_dir = source_root if release_layout else source_root / "platform"
+    tools_dir = platform_dir / "tools"
     for record in records:
-        path = source_root / str(record["path"])
+        path = tools_dir / Path(str(record["path"])).name
         if (
-            path.parent != source_root / "platform" / "tools"
-            or (source_root / "platform").is_symlink()
-            or (source_root / "platform" / "tools").is_symlink()
+            path.parent != tools_dir
+            or platform_dir.is_symlink()
+            or tools_dir.is_symlink()
         ):
             raise HostToolsPinError("host-tools closure path escaped its source root")
         try:
@@ -402,6 +439,39 @@ def resolve_pin(
     if remote_repository != expected_repository:
         raise HostToolsPinError("host-tools source repository does not match policy")
     return host_tools_sha
+
+
+def validate_release_pin(
+    release_root: Path,
+    *,
+    expected_host_tools_sha: str,
+    expected_repository: str = EXPECTED_REPOSITORY,
+) -> dict[str, object]:
+    """Validate a deployed release's flattened copy of the repository pin.
+
+    The immutable release has ``contracts/`` and ``tools/`` at its root, while
+    the source-checkout resolver deliberately requires ``platform/contracts/``
+    and ``platform/tools/``. This validates the same closed pin and exact
+    closure bytes without invoking Git or changing ``resolve_pin`` semantics.
+    The caller must bind ``release_root`` to its separately verified release
+    manifest/source SHA.
+    """
+    if expected_repository != EXPECTED_REPOSITORY:
+        raise HostToolsPinError("host-tools repository policy is invalid")
+    if not isinstance(expected_host_tools_sha, str) or SHA_RE.fullmatch(expected_host_tools_sha) is None:
+        raise HostToolsPinError("expected host-tools SHA is invalid")
+    payload = _read_release_pin(release_root)
+    if set(payload) != {"schema", "repository", "host_tools_sha", "closure"}:
+        raise HostToolsPinError("host-tools pin schema is not closed")
+    if type(payload.get("schema")) is not int or payload.get("schema") != SCHEMA:
+        raise HostToolsPinError("host-tools pin schema version is invalid")
+    if payload.get("repository") != expected_repository:
+        raise HostToolsPinError("host-tools pin repository is invalid")
+    host_tools_sha = payload.get("host_tools_sha")
+    if host_tools_sha != expected_host_tools_sha:
+        raise HostToolsPinError("host-tools pin identity differs")
+    _validate_closure(release_root, payload.get("closure"), release_layout=True)
+    return payload
 
 
 def _remove_private_output_if_owned(
