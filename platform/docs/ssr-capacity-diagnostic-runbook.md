@@ -417,21 +417,26 @@ gh api \
 gh run watch <exact-abort-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
-Reconcile and review the exact abort receipt. It must bind the load run and
-attempt, runner source, active app source, fixture manifest and Security
-identity; require the selected process tree absent and shared lock clear. An
+Reconcile and review the exact abort receipt. The abort workflow preflight must
+validate the successful Security run and attempt for its current `dev` source.
+Require the normalized receipt to bind the load run and attempt, runner and
+active app sources, fixture input and manifest, and recovery workflow and helper
+identity, and to prove the selected process tree absent and shared lock clear. An
 abort receipt with `namespace_closed: false` does not prove namespace closure
 and grants no measurement credit. The origin supervisor removes both copies of
 the session-credential manifest after observer capture. Its root-owned
 `diagnostic-abort-binding.json` is written only after validating and hashing
 that exact manifest and remains the durable source/run/fixture binding for a
 later abort. The abort helper accepts the exact run-bound marker when the
-credential-bearing manifest has already been retired; if the marker, its
-root-owned fixture directory, supervisor exit record, or run/source binding is
-missing or invalid, it fails closed. Do not restore or download the private
-manifest to bypass this check. Proceed to cleanup only when the canonical abort
-normalizer produces `status=safe_for_exact_fixture_cleanup` for the selected
-run and attempt.
+credential-bearing manifest has already been retired. If the marker, its
+root-owned fixture directory, or run/source binding is missing or invalid, the
+helper fails closed. A missing `supervisor.exit` is handled only by the exact
+terminal-failure recovery boundary in the [retained-load cleanup contract](retained-load-and-web-verification.md#retained-load-cleanup-and-hermetic-web-verification);
+the schema-2 receipt keeps the absent exit explicit and sets
+`namespace_closed: false`. Do not restore or download the private manifest,
+create a missing exit record, or hand-write a receipt. Proceed to cleanup only
+when the canonical abort normalizer produces
+`status=safe_for_exact_fixture_cleanup` for the selected run and attempt.
 
 The origin supervisor keeps the observer timeout tree in its own process
 session. On `SIGINT` or `SIGTERM`, it stops and reaps that session before it
