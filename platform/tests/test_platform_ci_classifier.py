@@ -46,6 +46,7 @@ from tools.platform_ci_classifier import _write_github_output
 from tools.platform_safe_zip import UnsafeZipError, extract_single_manifest
 from tools.platform_production_classifier_artifact import (
     ClassifierArtifactError,
+    validate_metadata as validate_production_classifier_metadata,
     validate_manifest as validate_production_classifier_manifest,
 )
 from tools.platform_workflow_provenance import ProvenanceError, validate_security_marker
@@ -2130,6 +2131,145 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn("MAX_PAGES = 100", classifier_tool)
         self.assertIn("duplicate_keys", classifier_tool)
         self.assertIn("len(rows) != expected_total", classifier_tool)
+        self._assert_classifier_artifact_attempt_metadata_accepts_only_absent_null_or_exact()
+
+    def _assert_classifier_artifact_attempt_metadata_accepts_only_absent_null_or_exact(self) -> None:
+        run_id = "123456"
+        attempt = "2"
+        expected_name = f"platform-ci-route-{run_id}-{attempt}"
+
+        def write_snapshot(root: Path, run_attempt: object = ...) -> Path:
+            workflow_run = {
+                "id": int(run_id),
+                "head_branch": "dev",
+                "head_sha": self.TARGET_SHA,
+            }
+            if run_attempt is not ...:
+                workflow_run["run_attempt"] = run_attempt
+            pages = root / "pages"
+            pages.mkdir(parents=True)
+            page = pages / "page-1.json"
+            page.write_text(
+                json.dumps(
+                    {
+                        "total_count": 1,
+                        "artifacts": [
+                            {
+                                "id": 987,
+                                "name": expected_name,
+                                "expired": False,
+                                "workflow_run": workflow_run,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            page.chmod(0o600)
+            return pages
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for metadata_value in (..., None, int(attempt)):
+                first = write_snapshot(root / f"first-{metadata_value}", metadata_value)
+                second = write_snapshot(root / f"second-{metadata_value}", metadata_value)
+                self.assertEqual(
+                    validate_production_classifier_metadata(
+                        first,
+                        second,
+                        expected_name=expected_name,
+                        run_id=run_id,
+                        run_attempt=attempt,
+                        target_sha=self.TARGET_SHA,
+                    ),
+                    987,
+                )
+            for invalid_attempt in (int(attempt) + 1, "2", False):
+                first = write_snapshot(root / f"invalid-first-{invalid_attempt}", invalid_attempt)
+                second = write_snapshot(root / f"invalid-second-{invalid_attempt}", invalid_attempt)
+                with self.assertRaises(ClassifierArtifactError):
+                    validate_production_classifier_metadata(
+                        first,
+                        second,
+                        expected_name=expected_name,
+                        run_id=run_id,
+                        run_attempt=attempt,
+                        target_sha=self.TARGET_SHA,
+                    )
+
+            auto_blocks = _workflow_python_blocks(
+                AUTO_DEPLOY_WORKFLOW,
+                "Download and validate exact classifier artifact",
+            )
+            selector = next(block for block in auto_blocks if "def identity(row):" in block)
+            for artifact_attempt in (..., None, int(attempt)):
+                first = root / f"auto-first-{artifact_attempt}.json"
+                second = root / f"auto-second-{artifact_attempt}.json"
+                artifact = {
+                    "id": 987,
+                    "name": expected_name,
+                    "expired": False,
+                    "workflow_run": {
+                        "id": int(run_id),
+                        "head_sha": self.TARGET_SHA,
+                    },
+                }
+                if artifact_attempt is not ...:
+                    artifact["workflow_run"]["run_attempt"] = artifact_attempt
+                payload = json.dumps({"total_count": 1, "artifacts": [artifact]})
+                first.write_text(payload, encoding="utf-8")
+                second.write_text(payload, encoding="utf-8")
+                selected = subprocess.run(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-B",
+                        "-",
+                        str(first),
+                        str(second),
+                        expected_name,
+                        run_id,
+                        attempt,
+                        self.TARGET_SHA,
+                    ],
+                    input=selector,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+                self.assertEqual(selected.returncode, 0, selected.stderr)
+                self.assertEqual(selected.stdout.strip(), "987")
+            wrong_attempt = dict(artifact)
+            wrong_attempt["workflow_run"] = {**artifact["workflow_run"], "run_attempt": int(attempt) + 1}
+            for bad_artifact in (
+                wrong_attempt,
+                {**artifact, "workflow_run": {**artifact["workflow_run"], "run_attempt": "2"}},
+                {**artifact, "workflow_run": {**artifact["workflow_run"], "run_attempt": False}},
+            ):
+                payload = json.dumps({"total_count": 1, "artifacts": [bad_artifact]})
+                first.write_text(payload, encoding="utf-8")
+                second.write_text(payload, encoding="utf-8")
+                rejected = subprocess.run(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-B",
+                        "-",
+                        str(first),
+                        str(second),
+                        expected_name,
+                        run_id,
+                        attempt,
+                        self.TARGET_SHA,
+                    ],
+                    input=selector,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+                self.assertNotEqual(rejected.returncode, 0)
 
     def test_production_manifest_reconcile_option_accepts_only_trusted_non_deployable_families(self) -> None:
         candidate = classify(

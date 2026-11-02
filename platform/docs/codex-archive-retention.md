@@ -9,6 +9,12 @@ The [source lock](../tools/codex_archive_retention/codex-source.lock.json) pins 
 packages to `0.166.0` without changing third-party dependencies. PR builds bind head/merge, apply the patch and test;
 they never install, alter timers, read Codex homes or delete sessions. Manifest pins release/codegen4/LTO=false and
 `CARGO_BUILD_JOBS=1`; timeout is 150 minutes, sampling caps at 600 flushed 15-second rows, and timing output is not binary.
+The stripped executable and native artifact ZIP are each bounded at 512 MiB. The build ZIP's total uncompressed
+members are bounded at 512 MiB plus the 64 KiB manifest and 256-byte version file. Security ZIP and classifier
+manifest limits remain 8 MiB and 1 MiB.
+A 250 MiB executable cap rejects a known valid stripped Codex 0.166.0 MUSL binary of 319,346,888 bytes. The prior
+GNU packaging failure did not retain a measured failing predicate, so this higher finite bound does not assert its
+cause; the builder now records each post-Cargo stage and the measured executable size and version.
 
 ## Build artifact and activation
 
@@ -67,89 +73,62 @@ gh api "repos/$REPO/actions/runs/$BUILD_RUN_ID/attempts/$BUILD_ATTEMPT" > "$ARTI
 gh api "repos/$REPO/actions/runs/$SECURITY_RUN_ID/attempts/$SECURITY_ATTEMPT" > "$ARTIFACT_DIR/security-run.json"
 gh api "repos/$REPO/actions/artifacts?name=$BUILD_NAME&per_page=100" > "$ARTIFACT_DIR/build-artifacts.json"
 gh api "repos/$REPO/actions/artifacts?name=$SECURITY_ROUTE_NAME&per_page=100" > "$ARTIFACT_DIR/security-artifacts.json"
-BUILD_ARTIFACT_ID="$(python3 -I -B - "$ARTIFACT_DIR/build-artifacts.json" "$BUILD_NAME" "$BUILD_RUN_ID" <<'PY'
-import json
-from pathlib import Path
-import re
-import sys
-payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-rows = payload.get("artifacts") if isinstance(payload, dict) else None
-if payload.get("total_count") != 1 or not isinstance(rows, list) or len(rows) != 1:
-    raise SystemExit("build artifact metadata is not singular")
-row = rows[0]
-workflow = row.get("workflow_run") if isinstance(row, dict) else None
-if (row.get("name") != sys.argv[2] or row.get("expired") is not False
-    or not isinstance(workflow, dict) or str(workflow.get("id")) != sys.argv[3]
-    or type(row.get("id")) is not int or row["id"] <= 0
-    or re.fullmatch(r"sha256:[0-9a-f]{64}", row.get("digest", "")) is None):
-    raise SystemExit("build artifact does not bind to the requested run")
-print(row["id"])
-PY
-)"
-SECURITY_ARTIFACT_ID="$(python3 -I -B - "$ARTIFACT_DIR/security-artifacts.json" "$SECURITY_ROUTE_NAME" "$SECURITY_RUN_ID" <<'PY'
-import json
-from pathlib import Path
-import re
-import sys
-payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-rows = payload.get("artifacts") if isinstance(payload, dict) else None
-if payload.get("total_count") != 1 or not isinstance(rows, list) or len(rows) != 1:
-    raise SystemExit("Security route artifact metadata is not singular")
-row = rows[0]
-workflow = row.get("workflow_run") if isinstance(row, dict) else None
-if (row.get("name") != sys.argv[2] or row.get("expired") is not False
-    or not isinstance(workflow, dict) or str(workflow.get("id")) != sys.argv[3]
-    or type(row.get("id")) is not int or row["id"] <= 0
-    or re.fullmatch(r"sha256:[0-9a-f]{64}", row.get("digest", "")) is None):
-    raise SystemExit("Security route artifact does not bind to the requested run")
-print(row["id"])
-PY
-)"
-python3 -I -B - "$ARTIFACT_DIR" "$ARTIFACT_DIR/build-artifacts.json" "$BUILD_NAME" "$BUILD_RUN_ID" "$ARTIFACT_DIR/security-artifacts.json" "$SECURITY_ROUTE_NAME" "$SECURITY_RUN_ID" <<'PY'
+ARTIFACT_BINDINGS="$(python3 -I -B - "$ARTIFACT_DIR" "$ARTIFACT_DIR/build-artifacts.json" "$BUILD_NAME" "$BUILD_RUN_ID" "$BUILD_ATTEMPT" "$ARTIFACT_DIR/security-artifacts.json" "$SECURITY_ROUTE_NAME" "$SECURITY_RUN_ID" "$SECURITY_ATTEMPT" "$REPO_ROOT" "$HEAD_SHA" <<'PY'
+import importlib.util
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 root = Path(sys.argv[1])
+repository = Path(sys.argv[10])
 if subprocess.check_output(["findmnt", "-n", "-T", str(root), "-o", "FSTYPE"], text=True).strip() != "tmpfs":
     raise SystemExit("artifact staging is not on tmpfs")
 options = set(subprocess.check_output(["findmnt", "-n", "-T", str(root), "-o", "OPTIONS"], text=True).strip().split(","))
 if not {"nosuid", "nodev"}.issubset(options):
     raise SystemExit("artifact tmpfs is missing nosuid or nodev")
-def artifact_size(path: Path, name: str, run_id: str, maximum_bytes: int) -> int:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    rows = payload.get("artifacts") if isinstance(payload, dict) else None
-    if payload.get("total_count") != 1 or not isinstance(rows, list) or len(rows) != 1:
-        raise SystemExit("artifact staging metadata is not singular")
-    row = rows[0]
-    workflow = row.get("workflow_run") if isinstance(row, dict) else None
-    size = row.get("size_in_bytes") if isinstance(row, dict) else None
-    if (row.get("name") != name or not isinstance(workflow, dict)
-            or str(workflow.get("id")) != run_id or type(size) is not int
-            or not 0 < size <= maximum_bytes):
-        raise SystemExit("artifact staging size or run binding is invalid")
-    return size
-zip_bytes = artifact_size(Path(sys.argv[2]), sys.argv[3], sys.argv[4], 262_144_000)
-zip_bytes += artifact_size(Path(sys.argv[5]), sys.argv[6], sys.argv[7], 8 * 1024 * 1024)
+spec = importlib.util.spec_from_file_location("codex_retention_verifier", repository / "platform/tools/codex_archive_retention/verify_artifact.py")
+if spec is None or spec.loader is None: raise SystemExit("cannot load the source-bound artifact verifier")
+verifier = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(verifier)
+lock = json.loads((repository / "platform/tools/codex_archive_retention/codex-source.lock.json").read_text(encoding="utf-8"))
+if lock.get("max_binary_bytes") != verifier.MAX_BINARY_BYTES:
+    raise SystemExit("source lock and verifier executable bounds differ")
+build = verifier._artifact_record(json.loads(Path(sys.argv[2]).read_text()), name=sys.argv[3], run_id=sys.argv[4], run_attempt=sys.argv[5], head_sha=sys.argv[11], max_size_bytes=verifier.MAX_BUILD_ARCHIVE_BYTES)
+security = verifier._artifact_record(json.loads(Path(sys.argv[6]).read_text()), name=sys.argv[7], run_id=sys.argv[8], run_attempt=sys.argv[9], head_sha=sys.argv[11], max_size_bytes=verifier.MAX_SECURITY_ARCHIVE_BYTES)
+build_zip_bytes, security_zip_bytes = build["size_in_bytes"], security["size_in_bytes"]
+disk_required, memory_required = verifier.artifact_staging_space_requirements(build_zip_bytes, security_zip_bytes)
 filesystem = os.statvfs(root)
 tmpfs_available = filesystem.f_bavail * filesystem.f_frsize
-if tmpfs_available < zip_bytes + 64 * 1024 * 1024:
-    raise SystemExit("tmpfs lacks room for both raw ZIPs and private metadata")
-memory_available = None
-for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
-    if line.startswith("MemAvailable:"):
-        memory_available = int(line.split()[1]) * 1024
-        break
-uncompressed_bytes = 262_144_000 + 65_536 + 1_048_576
-memory_required = zip_bytes + uncompressed_bytes + 256 * 1024 * 1024
+if tmpfs_available < disk_required:
+    raise SystemExit("tmpfs lacks room for both raw ZIPs, extracted files, and bounded overhead")
+memory_available = next((int(line.split()[1]) * 1024 for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines() if line.startswith("MemAvailable:")), None)
 if memory_available is None or memory_available < memory_required:
     raise SystemExit("available memory is insufficient for bounded artifact verification")
+print(build["id"], build_zip_bytes, security["id"], security_zip_bytes)
 PY
-gh api --silent --header 'Accept: application/vnd.github+json' \
-  "/repos/$REPO/actions/artifacts/$BUILD_ARTIFACT_ID/zip" > "$ARTIFACT_DIR/build-artifact.zip"
-gh api --silent --header 'Accept: application/vnd.github+json' \
-  "/repos/$REPO/actions/artifacts/$SECURITY_ARTIFACT_ID/zip" > "$ARTIFACT_DIR/security-route.zip"
+ )"
+read -r BUILD_ARTIFACT_ID BUILD_ZIP_BYTES SECURITY_ARTIFACT_ID SECURITY_ZIP_BYTES <<< "$ARTIFACT_BINDINGS"
+fetch_bounded_zip() {
+  local artifact_id="$1" expected="$2" maximum="$3" output="$4" actual
+  if [[ ! "$expected" =~ ^[1-9][0-9]{0,9}$ ]] || (( expected > maximum || maximum > 536870912 )); then
+    return 1
+  fi
+  [[ ! -e "$output" && ! -L "$output" ]]
+  if ! (set -o noclobber; gh api --silent --header 'Accept: application/vnd.github+json' \
+      "/repos/$REPO/actions/artifacts/$artifact_id/zip" 2>/dev/null | head -c "$((expected + 1))" > "$output"); then
+    rm -f -- "$output"
+    return 1
+  fi
+  actual="$(stat -c '%s' -- "$output")"
+  if [[ "$actual" != "$expected" ]] || (( actual > maximum )); then
+    rm -f -- "$output"
+    return 1
+  fi
+}
+umask 077
+fetch_bounded_zip "$BUILD_ARTIFACT_ID" "$BUILD_ZIP_BYTES" 536870912 "$ARTIFACT_DIR/build-artifact.zip"
+fetch_bounded_zip "$SECURITY_ARTIFACT_ID" "$SECURITY_ZIP_BYTES" 8388608 "$ARTIFACT_DIR/security-route.zip"
 python3 -I -B "$REPO_ROOT/platform/tools/codex_archive_retention/verify_artifact.py" \
   --source-root "$REPO_ROOT" --pull-request "$PR" --head-sha "$HEAD_SHA" --merge-sha "$MERGE_SHA" \
   --build-run-id "$BUILD_RUN_ID" --build-attempt "$BUILD_ATTEMPT" \
@@ -165,7 +144,9 @@ python3 -I -B "$REPO_ROOT/platform/tools/codex_archive_retention/verify_artifact
 ```
 
 The verifier requires completed-success attempts and a full, non-fallback, non-deployable route. It matches raw ZIPs,
-validates closed members and binary/source without execution, then extracts three mode-`0600` files. Authenticated
+validates closed members and binary/source without execution, then streams the executable to the private extraction
+directory in bounded 1 MiB chunks while checking its size and SHA-256. It materializes only the bounded manifest and
+version metadata separately. All three files have mode `0600`. Authenticated
 captures prove association only: current singleton PR links must match, and only empty post-merge arrays may use captures.
 The current APIs still prove success; malformed or mismatched evidence rejects. The receipt binds route reason/sensitivity:
 

@@ -2512,6 +2512,16 @@ class NoopSourceBindingTests(unittest.TestCase):
         self.assertEqual(binding["receipt_artifact_id"], ARTIFACT_ID)
         self.assertEqual(binding["receipt_archive_sha256"], hashlib.sha256(archive).hexdigest())
 
+        null_attempt_metadata = copy.deepcopy(metadata)
+        null_attempt_metadata["workflow_run"]["run_attempt"] = None  # type: ignore[index]
+        validate_noop_receipt_artifact(
+            null_attempt_metadata,
+            archive,
+            **_expected_run_bindings(),
+            expected_artifact_id=ARTIFACT_ID,
+            expected_artifact_name=ARTIFACT_NAME,
+        )
+
         bad_metadata_cases: list[tuple[str, dict[str, object], str, str]] = []
         for field, value in (
             ("id", int(ARTIFACT_ID) + 1),
@@ -2526,6 +2536,9 @@ class NoopSourceBindingTests(unittest.TestCase):
         for field, value in (
             ("id", int(DEPLOY_RUN_ID) + 1),
             ("run_attempt", int(DEPLOY_ATTEMPT) + 1),
+            ("run_attempt", True),
+            ("run_attempt", "2"),
+            ("run_attempt", 2.0),
             ("head_sha", APP_SHA),
             ("head_branch", "main"),
         ):

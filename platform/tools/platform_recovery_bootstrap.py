@@ -550,8 +550,11 @@ def _publish_route_artifact(
         or workflow_run.get("id") != run_id
         or workflow_run.get("head_sha") != source_sha
         or (
-            "run_attempt" in workflow_run
-            and workflow_run.get("run_attempt") != run_attempt
+            workflow_run.get("run_attempt") is not None
+            and (
+                type(workflow_run.get("run_attempt")) is not int
+                or workflow_run.get("run_attempt") != run_attempt
+            )
         )
         or (
             "repository" in workflow_run
@@ -736,8 +739,11 @@ def validate_publish_artifact_metadata(
             or workflow_run.get("id") != expected_run
             or workflow_run.get("head_sha") != expected_workflow_sha
             or (
-                "run_attempt" in workflow_run
-                and workflow_run.get("run_attempt") != expected_attempt
+                workflow_run.get("run_attempt") is not None
+                and (
+                    type(workflow_run.get("run_attempt")) is not int
+                    or workflow_run.get("run_attempt") != expected_attempt
+                )
             )
         ):
             continue
@@ -809,8 +815,11 @@ def _publisher_bundle_candidate(
             or workflow_run.get("id") != run_id
             or workflow_run.get("head_sha") != producer_workflow_sha
             or (
-                "run_attempt" in workflow_run
-                and workflow_run.get("run_attempt") != run_attempt
+                workflow_run.get("run_attempt") is not None
+                and (
+                    type(workflow_run.get("run_attempt")) is not int
+                    or workflow_run.get("run_attempt") != run_attempt
+                )
             )
             or (
                 "repository" in workflow_run
@@ -936,7 +945,7 @@ def validate_publisher_artifact_metadata(
                     and workflow_run.get("id") == expected_run
                     and workflow_run.get("head_sha") == expected_workflow_sha
                     and (
-                        "run_attempt" not in workflow_run
+                        workflow_run.get("run_attempt") is None
                         or (
                             type(workflow_run.get("run_attempt")) is int
                             and workflow_run.get("run_attempt")
@@ -967,7 +976,7 @@ def validate_publisher_artifact_metadata(
             or workflow_run.get("id") != expected_run
             or workflow_run.get("head_sha") != expected_workflow_sha
             or (
-                "run_attempt" in workflow_run
+                workflow_run.get("run_attempt") is not None
                 and (
                     type(workflow_run.get("run_attempt")) is not int
                     or workflow_run.get("run_attempt") != expected_attempt

@@ -1069,9 +1069,10 @@ def verify_artifact_metadata(
     # GitHub supplies it, keep the field fail-closed rather than trusting a
     # coerced bool/string value; the authoritative attempt is validated from
     # the dedicated workflow-run-attempt endpoint below.
-    if "run_attempt" in workflow_run and (
-        type(workflow_run.get("run_attempt")) is not int
-        or workflow_run.get("run_attempt") != int(run_attempt)
+    artifact_attempt = workflow_run.get("run_attempt")
+    if artifact_attempt is not None and (
+        type(artifact_attempt) is not int
+        or artifact_attempt != int(run_attempt)
     ):
         raise HostToolsBundleError("host-tools artifact workflow binding is invalid")
 

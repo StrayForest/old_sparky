@@ -2231,7 +2231,9 @@ jobs:
               or not isinstance(artifact_list_digest, str)
               or re.fullmatch(r"sha256:[0-9a-f]{64}", artifact_list_digest) is None
               or type(artifact_list_size) is not int or not 0 < artifact_list_size <= 2 * 1024 * 1024 * 1024
-              or ("run_attempt" in artifact_run and artifact_run.get("run_attempt") != int(attempt))):
+              or (artifact_run.get("run_attempt") is not None
+                  and (type(artifact_run.get("run_attempt")) is not int
+                       or artifact_run.get("run_attempt") != int(attempt)))):
               raise SystemExit("failed deployment artifact run binding is malformed")
           if (artifact.get("expired") is not False or artifact_run.get("id") != int(run_id)
               or artifact_run.get("head_sha") != source):
@@ -2247,8 +2249,9 @@ jobs:
               raise SystemExit("failed deployment artifact output fields are malformed")
           if (metadata.get("id") != artifact.get("id") or metadata.get("name") != expected_name
               or metadata.get("expired") is not False or metadata.get("digest") != artifact.get("digest")
-              or ("run_attempt" in metadata.get("workflow_run", {})
-                  and metadata["workflow_run"].get("run_attempt") != int(attempt))
+              or (metadata.get("workflow_run", {}).get("run_attempt") is not None
+                  and (type(metadata["workflow_run"].get("run_attempt")) is not int
+                       or metadata["workflow_run"].get("run_attempt") != int(attempt)))
               or metadata.get("workflow_run", {}).get("id") != int(run_id)
               or metadata.get("workflow_run", {}).get("head_sha") != source
               or metadata.get("size_in_bytes") != artifact.get("size_in_bytes")):

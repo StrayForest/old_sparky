@@ -422,7 +422,7 @@ jobs:
           bundle_name = exact_output_value("publisher_bundle_name=")
           selected = {}
           for name in (bundle_name, evidence_name):
-              found = [row for row in artifact_rows if isinstance(row, dict) and row.get("name") == name and row.get("expired") is False and type(row.get("id")) is int and row.get("id") > 0 and isinstance(row.get("workflow_run"), dict) and row["workflow_run"].get("id") == int(os.environ["PUBLISHER_RUN_ID"]) and row["workflow_run"].get("head_sha") == sha and ("run_attempt" not in row["workflow_run"] or row["workflow_run"].get("run_attempt") == int(os.environ["PUBLISHER_RUN_ATTEMPT"]))]
+              found = [row for row in artifact_rows if isinstance(row, dict) and row.get("name") == name and row.get("expired") is False and type(row.get("id")) is int and row.get("id") > 0 and isinstance(row.get("workflow_run"), dict) and row["workflow_run"].get("id") == int(os.environ["PUBLISHER_RUN_ID"]) and row["workflow_run"].get("head_sha") == sha and (row["workflow_run"].get("run_attempt") is None or (type(row["workflow_run"].get("run_attempt")) is int and row["workflow_run"].get("run_attempt") == int(os.environ["PUBLISHER_RUN_ATTEMPT"]))) ]
               if len(found) != 1:
                   raise SystemExit("exact publisher artifact is missing")
               if not isinstance(found[0].get("digest"), str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", found[0]["digest"]):
@@ -458,7 +458,9 @@ jobs:
                   and row.get("expired") is False and type(row.get("id")) is int and row.get("id") > 0 and isinstance(row.get("workflow_run"), dict)
                   and row["workflow_run"].get("id") == run_id
                   and row["workflow_run"].get("head_sha") == os.environ["PUBLISHER_WORKFLOW_SHA"]
-                  and ("run_attempt" not in row["workflow_run"] or row["workflow_run"].get("run_attempt") == attempt)
+                  and (row["workflow_run"].get("run_attempt") is None
+                       or (type(row["workflow_run"].get("run_attempt")) is int
+                           and row["workflow_run"].get("run_attempt") == attempt))
               ]
               if len(matches) != 1 or not isinstance(matches[0].get("id"), int):
                   raise SystemExit(f"exact {name} artifact is missing")
@@ -735,7 +737,9 @@ jobs:
                   or not isinstance(workflow_run, dict)
                   or workflow_run.get("id") != 38185744516
                   or workflow_run.get("head_sha") != "9ceaf09ab7ba4bf5c5e636865106910eaa034c8d"
-                  or ("run_attempt" in workflow_run and workflow_run.get("run_attempt") != 1)):
+                  or (workflow_run.get("run_attempt") is not None
+                      and (type(workflow_run.get("run_attempt")) is not int
+                           or workflow_run.get("run_attempt") != 1))):
               raise SystemExit("source-bound artifact metadata does not match its exact run")
 
           metadata = read("artifact.json")

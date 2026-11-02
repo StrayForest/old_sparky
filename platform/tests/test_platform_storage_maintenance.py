@@ -33,7 +33,6 @@ from tools import platform_backup_success_guard as backup_success_guard
 from tools import platform_maintenance_qa_evidence as maintenance_evidence
 from tools import platform_release_retention as retention
 from tools import platform_storage_maintenance as maintenance
-from tools import platform_storage_evidence_summary as storage_summary
 from tools.platform_disk_policy import BYTES_PER_GIB, snapshot_from_usage
 from tools.platform_storage_maintenance import (
     apply_artifact_retention_plan,
@@ -3437,6 +3436,9 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         archive_name = "platformdb-20261102T194247Z.dump"
         app_dir = self.root / "runtime" / "platform"
         (app_dir / "shared").mkdir(parents=True)
+        removed_dump = "platformdb-20261031T194247Z.dump"
+        removed_sidecar = f"{removed_dump}.sha256"
+        backup_dir = app_dir / "shared" / "backups"
         retention_proof = {
             "policy": "latest-restore-verified-only-v1",
             "status": "pass",
@@ -3444,7 +3446,9 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "retained_count": 1,
                 "selected_order": [{"dump_file": archive_name}],
             },
-            "removed_pairs": [],
+            "removed_pairs": [
+                {"dump_file": removed_dump, "sidecar_file": removed_sidecar}
+            ],
         }
         create_result = {
             "ok": True,
@@ -3456,10 +3460,13 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             "alembic_revision_verified": True,
             "sha256": "a" * 64,
             "restored_table_count": 12,
-            "removed": [],
+            "removed": [
+                str(backup_dir / removed_dump),
+                str(backup_dir / removed_sidecar),
+            ],
             "rotation_mode": "rotate-existing",
-            "preexisting_archive_count": 0,
-            "preexisting_sidecar_count": 0,
+            "preexisting_archive_count": 1,
+            "preexisting_sidecar_count": 1,
             "postexisting_archive_count": 1,
             "preexisting_archives_preserved": False,
             "protected_retention_proof": retention_proof,
@@ -3470,7 +3477,32 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             "alembic_revision_verified": True,
             "age_hours": 0.1,
         }
+        create_args = SimpleNamespace(
+            app_dir=app_dir,
+            apply=True,
+            backup_only=True,
+            verify_existing_backup_only=False,
+            backup_keep=1,
+            backup_max_age_hours=24,
+            minimum_free_gib=maintenance.DEFAULT_MIN_FREE_GIB,
+            maximum_used_percent=maintenance.DEFAULT_MAX_USED_PERCENT,
+            live_qa_runtime_keep=1,
+        )
+        fake_disk_snapshot = SimpleNamespace(
+            as_dict=lambda: {"free_bytes": 10_000_000_000, "used_percent": 10.0}
+        )
         with (
+            mock.patch.object(
+                maintenance,
+                "maintenance_lock_scope",
+                return_value=contextlib.nullcontext(app_dir / "releases"),
+            ),
+            mock.patch.object(
+                maintenance,
+                "disk_snapshot_for_path",
+                side_effect=[fake_disk_snapshot, fake_disk_snapshot],
+            ),
+            mock.patch.object(maintenance, "disk_is_healthy", return_value=True),
             mock.patch.object(
                 maintenance.backup_restore_drill,
                 "create_backup",
@@ -3487,34 +3519,77 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 return_value=True,
             ),
         ):
-            produced_backup = maintenance.run_backup(
-                app_dir,
-                keep=1,
-                max_age_hours=24,
-                rotate_existing=True,
-                private_failure_diagnostics=False,
-                protected_backup_manifest=None,
-                scratch_backend=maintenance.backup_restore_drill.SCRATCH_BACKEND_TMPFS_V1,
-            )
-        raw_report = {
-            "ok": True,
-            "mode": "backup-only",
-            "backup": {"status": "completed", **produced_backup},
-            "production_releases": {"deleted_count": 0, "reclaimable_bytes": 0},
-            "source_release_artifacts": {"deleted_count": 0, "reclaimable_bytes": 0},
-            "live_qa_runtime_caches": {"deleted_count": 0, "reclaimable_bytes": 0},
-            "transient": {
-                category: {"count": 0, "reclaimable_bytes": 0}
-                for category in (
-                    "failed_builds",
-                    "browser_test_artifacts",
-                    "preprod_screenshots",
-                )
-            },
+            create_report = maintenance.run_maintenance(create_args)
+        self.assertEqual(create_report["mode"], "backup-only")
+        self.assertEqual(create_report["backup"]["removed_count"], 2)
+        raw_report = create_report
+        verify_args = SimpleNamespace(
+            app_dir=app_dir,
+            apply=True,
+            backup_only=False,
+            verify_existing_backup_only=True,
+            backup_max_age_hours=24,
+            minimum_free_gib=maintenance.DEFAULT_MIN_FREE_GIB,
+            maximum_used_percent=maintenance.DEFAULT_MAX_USED_PERCENT,
+            backup_keep=1,
+            live_qa_runtime_keep=1,
+            evict_pinned_build_node_cache=False,
+            compact_legacy_fallback_runtime_cache=False,
+        )
+        existing_backup_result = {
+            "status": "verified-existing",
+            "verified_existing": True,
+            "created": False,
+            "rotation_mode": "verify-only",
+            "removed_count": 0,
+            "sha256": "a" * 64,
+            "age_hours": 0.1,
+            "restore_verified_at_utc": "2026-10-10T00:00:00Z",
+            "restore_verified": True,
+            "alembic_revision_verified": True,
+            "restored_table_count": 12,
         }
+        with (
+            mock.patch.object(
+                maintenance,
+                "maintenance_lock_scope",
+                return_value=contextlib.nullcontext(app_dir / "releases"),
+            ),
+            mock.patch.object(
+                maintenance,
+                "disk_snapshot_for_path",
+                side_effect=[fake_disk_snapshot, fake_disk_snapshot],
+            ),
+            mock.patch.object(maintenance, "disk_is_healthy", return_value=True),
+            mock.patch.object(
+                maintenance,
+                "verify_existing_backup",
+                return_value=existing_backup_result,
+            ),
+        ):
+            verify_report = maintenance.run_maintenance(verify_args)
+        self.assertEqual(verify_report["mode"], "verify-existing-backup-only")
         self.assertNotIn("retention_policy", raw_report["backup"])
         raw_report_json = json.dumps(raw_report, sort_keys=True)
-        public_seed = storage_summary.summarize_retention(raw_report_json)
+        summary_command = [
+            sys.executable,
+            "-I",
+            "-B",
+            str(REPO_ROOT / "platform/tools/platform_storage_evidence_summary.py"),
+            "--mode",
+            "retention",
+        ]
+        public_seed_result = subprocess.run(
+            summary_command,
+            input=raw_report_json,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(public_seed_result.returncode, 0, public_seed_result.stderr)
+        public_seed = json.loads(public_seed_result.stdout)
+        self.assertEqual(public_seed["mode"], "backup-only")
         with tempfile.TemporaryDirectory() as producer_dir_name:
             producer_dir = Path(producer_dir_name)
             raw_report_path = producer_dir / "report.json"
@@ -3529,6 +3604,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             )
             self.assertEqual(normalized.returncode, 0, normalized.stderr)
             normalized_report = json.loads(normalized.stdout)
+            self.assertEqual(normalized_report["mode"], "backup-only")
             self.assertEqual(
                 normalized_report["backup"]["retention_policy"],
                 "latest-restore-verified-only-v1",
@@ -3598,6 +3674,59 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertEqual(accepted_create.returncode, 0, accepted_create.stderr)
         self.assertNotEqual(rejected_projection.returncode, 0)
         self.assertNotEqual(rejected_boolean_count.returncode, 0)
+
+        for operation, mode in (
+            ("create", "backup-only"),
+            ("verify-existing", "verify-existing-backup-only"),
+        ):
+            with self.subTest(operation=operation):
+                operation_report = raw_report if operation == "create" else verify_report
+                self.assertEqual(operation_report["mode"], mode)
+                output = subprocess.run(
+                    summary_command,
+                    input=json.dumps(operation_report, sort_keys=True),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+                self.assertEqual(output.returncode, 0, output.stderr)
+                self.assertEqual(json.loads(output.stdout)["mode"], mode)
+                with tempfile.TemporaryDirectory() as operation_dir_name:
+                    operation_report_path = Path(operation_dir_name) / "report.json"
+                    operation_report_path.write_text(
+                        json.dumps(operation_report, sort_keys=True), encoding="utf-8"
+                    )
+                    workflow_summary = run_inline(
+                        normalizer_script,
+                        output.stdout,
+                        operation,
+                        str(operation_report_path),
+                        "false",
+                        "false",
+                    )
+                    self.assertEqual(workflow_summary.returncode, 0, workflow_summary.stderr)
+                    self.assertEqual(json.loads(workflow_summary.stdout)["mode"], mode)
+                    if operation == "verify-existing":
+                        validated_verify = run_inline(
+                            summary_validation_script,
+                            str(operation_report_path),
+                            "verify-existing",
+                            "false",
+                            "false",
+                            "false",
+                            "123456",
+                            "1",
+                            "a" * 40,
+                            "b" * 64,
+                            "none",
+                            "none",
+                            "none",
+                            workflow_summary.stdout,
+                        )
+                        self.assertEqual(
+                            validated_verify.returncode, 0, validated_verify.stderr
+                        )
 
         normalizer_diagnostic_script = workflow_python(
             "if public_summary_normalizer_diagnostic=\"$(/usr/bin/python3 -I -B - "
@@ -3695,7 +3824,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "b" * 64,
                     "false",
                     "false",
-                    '{"mode":"unknown"}',
+                    '{"mode":"backup-only"}',
                     str(normalizer_report_path),
                 ],
                 input=normalizer_shell,
@@ -3709,7 +3838,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertEqual(json.loads(actual_caller.stdout)["mode"], "backup-only")
 
             def normalize_public_summary(
-                public_json: str = '{"mode":"unknown"}',
+                public_json: str = '{"mode":"verify-existing-backup-only"}',
             ) -> subprocess.CompletedProcess[str]:
                 normalizer_report_path.write_text(
                     json.dumps(normalizer_report, sort_keys=True), encoding="utf-8"
@@ -4315,7 +4444,9 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertIn("--verify-existing-backup-only", isolated_help.stdout)
         self.assertIn('backup.get("restore_verified") is not True', workflow)
         self.assertIn('backup.get("checksum_present") is not True', workflow)
-        self.assertIn('public["mode"] = "backup-only" if sys.argv[2] == "create" else "verify-existing-backup-only"', workflow)
+        self.assertIn('expected_mode = "backup-only" if sys.argv[2] == "create" else "verify-existing-backup-only"', workflow)
+        self.assertIn('public.get("mode") != expected_mode', workflow)
+        self.assertNotIn('public["mode"] = "backup-only"', workflow)
         self.assertIn(
             '"production_releases",\n              "source_release_artifacts",\n              "live_qa_runtime_caches"',
             workflow,

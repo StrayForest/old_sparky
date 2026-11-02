@@ -146,7 +146,9 @@ jobs:
                   or match is None
                   or not isinstance(workflow_run, dict) or workflow_run.get("id") != producer_id
                   or workflow_run.get("head_sha") != run["head_sha"]
-                  or ("run_attempt" in workflow_run and workflow_run.get("run_attempt") != producer_attempt)
+                  or (workflow_run.get("run_attempt") is not None
+                      and (type(workflow_run.get("run_attempt")) is not int
+                           or workflow_run.get("run_attempt") != producer_attempt))
                   or workflow_run.get("repository_id") != repository_id
                   or workflow_run.get("head_repository_id") != repository_id
                   or not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None):
@@ -288,7 +290,13 @@ jobs:
           if len(matches) != 1:
               raise SystemExit("parent classifier artifact is not exact")
           workflow_run = matches[0].get("workflow_run")
-          if not isinstance(workflow_run, dict) or workflow_run.get("id") != int(run_id) or workflow_run.get("head_sha") != source_sha or ("run_attempt" in workflow_run and workflow_run.get("run_attempt") != int(attempt)) or workflow_run.get("repository_id") != repository_id or workflow_run.get("head_repository_id") != repository_id:
+          if (not isinstance(workflow_run, dict) or workflow_run.get("id") != int(run_id)
+              or workflow_run.get("head_sha") != source_sha
+              or (workflow_run.get("run_attempt") is not None
+                  and (type(workflow_run.get("run_attempt")) is not int
+                       or workflow_run.get("run_attempt") != int(attempt)))
+              or workflow_run.get("repository_id") != repository_id
+              or workflow_run.get("head_repository_id") != repository_id):
               raise SystemExit("parent classifier artifact provenance is invalid")
           with output.open("a", encoding="ascii") as stream:
               stream.write(f"route_artifact_id={matches[0]['id']}\nroute_artifact_sha256={matches[0]['digest'][len('sha256:') :]}\n")

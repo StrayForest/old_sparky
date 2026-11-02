@@ -99,10 +99,7 @@ to `dev`. The chain is:
    A missing or mismatched generation fails before app build/attestation,
    pending status or transfer.
    Host bundle/source bind to `HOST_TOOLS_SHA`; app artifact, provenance,
-   migration and receipt bind to `TARGET_SHA`. API artifact ID/name/run/source/digest and downloaded size
-   are cross-checked by bounded canonical verification. Because a nested
-   `workflow_run.run_attempt` may be absent, the secret-free builder resolves
-   the exact attempt through GitHub's authoritative attempt endpoint.
+   migration and receipt bind to `TARGET_SHA`. API artifact ID/name/run/source/digest and downloaded size are cross-checked by bounded canonical verification. An artifact-list `workflow_run.run_attempt` may be absent or null; exact name, run ID and head SHA remain required, any non-null attempt must match, and the source attempt is independently resolved from GitHub's authoritative attempt endpoint.
    For installer/evidence/validator changes, follow the host-tools ADR's **C→P** sequence: backward-compatible validator C, pin-only P, exact-P CI and read-only preflight, signed bundle verification, out-of-band provisioning, installed self-test and successful exact-P preflight. If cumulative application changes cannot deploy with strict reuse, withhold P's backup so its automatic parent refuses before readiness/child dispatch; do not rerun that parent or use baseline reconciliation. A later app source enables fresh policy and follows normal Security, source-bound backup and automatic deployment. A pin or bundle is not installation proof. The ADR owns provisioning/rollback; shared-venv reuse and managed LiveQA runtime procedures are in the [CSP and live-QA runbook](csp-live-qa-runbook.md).
 
 ### Recovery-bootstrap baseline reconciliation

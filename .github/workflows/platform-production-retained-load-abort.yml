@@ -172,7 +172,9 @@ jobs:
               or not isinstance(workflow_run, dict)
               or workflow_run.get("id") != int(run_id)
               or workflow_run.get("head_sha") != source_sha
-              or ("run_attempt" in workflow_run and workflow_run.get("run_attempt") != int(attempt))):
+              or (workflow_run.get("run_attempt") is not None
+                  and (type(workflow_run.get("run_attempt")) is not int
+                       or workflow_run.get("run_attempt") != int(attempt)))):
               raise SystemExit("CI route artifact provenance is not exact")
           with Path(output_path).open("a", encoding="ascii") as stream:
               stream.write(f"route_artifact_id={route['id']}\n")

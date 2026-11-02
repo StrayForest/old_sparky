@@ -8,5 +8,5 @@
   "target": "x86_64-unknown-linux-gnu",
   "patch_file": "patches/codex-0.166.0.patch",
   "patch_sha256": "a9b5efcf2386d54158ac6611204985604e147ef3257baf053ecd7af74334eb4e",
-  "max_binary_bytes": 262144000
+  "max_binary_bytes": 536870912
 }

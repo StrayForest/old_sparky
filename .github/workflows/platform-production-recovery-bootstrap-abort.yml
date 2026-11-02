@@ -402,7 +402,7 @@ jobs:
           names = name_values
           ids = {}
           for kind, name in names.items():
-              found = [row for row in artifact_rows if isinstance(row, dict) and row.get("name") == name and row.get("expired") is False and type(row.get("id")) is int and row.get("id") > 0 and isinstance(row.get("workflow_run"), dict) and row["workflow_run"].get("id") == int(os.environ["PUBLISHER_RUN_ID"]) and row["workflow_run"].get("head_sha") == publisher_sha and ("run_attempt" not in row["workflow_run"] or row["workflow_run"].get("run_attempt") == int(os.environ["PUBLISHER_RUN_ATTEMPT"]))]
+              found = [row for row in artifact_rows if isinstance(row, dict) and row.get("name") == name and row.get("expired") is False and type(row.get("id")) is int and row.get("id") > 0 and isinstance(row.get("workflow_run"), dict) and row["workflow_run"].get("id") == int(os.environ["PUBLISHER_RUN_ID"]) and row["workflow_run"].get("head_sha") == publisher_sha and (row["workflow_run"].get("run_attempt") is None or (type(row["workflow_run"].get("run_attempt")) is int and row["workflow_run"].get("run_attempt") == int(os.environ["PUBLISHER_RUN_ATTEMPT"]))) ]
               if len(found) != 1:
                   raise SystemExit(f"exact publisher {kind} artifact is missing")
               ids[kind] = found[0]["id"]
@@ -460,7 +460,7 @@ jobs:
           if not isinstance(rows, list) or type(payload.get("total_count")) is not int or not 0 <= payload["total_count"] <= 100 or payload["total_count"] != len(rows):
               raise SystemExit("recovery artifacts response is malformed")
           def select(name):
-              matches = [row for row in rows if isinstance(row, dict) and row.get("name") == name and row.get("expired") is False and type(row.get("id")) is int and row.get("id") > 0 and isinstance(row.get("workflow_run"), dict) and row["workflow_run"].get("id") == int(__import__("os").environ["PUBLISHER_RUN_ID"]) and row["workflow_run"].get("head_sha") == __import__("os").environ["PUBLISHER_WORKFLOW_SHA"] and ("run_attempt" not in row["workflow_run"] or row["workflow_run"].get("run_attempt") == int(__import__("os").environ["PUBLISHER_RUN_ATTEMPT"]))]
+              matches = [row for row in rows if isinstance(row, dict) and row.get("name") == name and row.get("expired") is False and type(row.get("id")) is int and row["id"] > 0 and isinstance(row.get("workflow_run"), dict) and row["workflow_run"].get("id") == int(__import__("os").environ["PUBLISHER_RUN_ID"]) and row["workflow_run"].get("head_sha") == __import__("os").environ["PUBLISHER_WORKFLOW_SHA"] and (row["workflow_run"].get("run_attempt") is None or (type(row["workflow_run"].get("run_attempt")) is int and row["workflow_run"].get("run_attempt") == int(__import__("os").environ["PUBLISHER_RUN_ATTEMPT"]))) ]
               if len(matches) != 1:
                   raise SystemExit("required recovery artifact is missing")
               return matches[0]["id"]
@@ -713,7 +713,7 @@ jobs:
           if not isinstance(rows, list) or type(listing.get("total_count")) is not int or listing["total_count"] != len(rows) or len(rows) > 100:
               raise SystemExit("capture artifact page is incomplete")
           name = f"platform-maintenance-failure-{env['CAPTURE_RUN_ID']}-{env['CAPTURE_RUN_ATTEMPT']}"
-          matches = [row for row in rows if isinstance(row, dict) and row.get("name") == name and row.get("expired") is False and isinstance(row.get("workflow_run"), dict) and row["workflow_run"].get("id") == int(env["CAPTURE_RUN_ID"]) and row["workflow_run"].get("head_sha") == env["SOURCE_SHA"] and ("run_attempt" not in row["workflow_run"] or row["workflow_run"].get("run_attempt") == int(env["CAPTURE_RUN_ATTEMPT"]))]
+          matches = [row for row in rows if isinstance(row, dict) and row.get("name") == name and row.get("expired") is False and isinstance(row.get("workflow_run"), dict) and row["workflow_run"].get("id") == int(env["CAPTURE_RUN_ID"]) and row["workflow_run"].get("head_sha") == env["SOURCE_SHA"] and (row["workflow_run"].get("run_attempt") is None or (type(row["workflow_run"].get("run_attempt")) is int and row["workflow_run"].get("run_attempt") == int(env["CAPTURE_RUN_ATTEMPT"]))) ]
           if (len(matches) != 1 or type(matches[0].get("id")) is not int or matches[0]["id"] <= 0
               or type(matches[0].get("size_in_bytes")) is not int or not 1 <= matches[0]["size_in_bytes"] <= 1024 * 1024):
               raise SystemExit("exact encrypted capture artifact is missing or duplicated")

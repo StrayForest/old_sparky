@@ -174,7 +174,8 @@ jobs:
                   raise SystemExit("classifier artifact workflow identity is malformed")
               if not isinstance(workflow_run.get("head_sha"), str) or re.fullmatch(r"[0-9a-f]{40}", workflow_run["head_sha"]) is None:
                   raise SystemExit("classifier artifact workflow SHA is malformed")
-              if "run_attempt" in workflow_run and (type(workflow_run["run_attempt"]) is not int or workflow_run["run_attempt"] <= 0):
+              artifact_attempt = workflow_run.get("run_attempt")
+              if artifact_attempt is not None and (type(artifact_attempt) is not int or artifact_attempt <= 0):
                   raise SystemExit("classifier artifact workflow attempt is malformed")
               ids.append(row["id"])
           if len(ids) != len(set(ids)):
@@ -255,7 +256,10 @@ jobs:
           workflow_run = selected.get("workflow_run")
           if not isinstance(workflow_run, dict) or workflow_run.get("id") != int(run_id) or workflow_run.get("head_sha") != target_sha:
               raise SystemExit("classifier artifact is not bound to the exact run and target SHA")
-          if "run_attempt" in workflow_run and workflow_run.get("run_attempt") != int(attempt):
+          artifact_attempt = workflow_run.get("run_attempt")
+          if artifact_attempt is not None and (
+              type(artifact_attempt) is not int or artifact_attempt != int(attempt)
+          ):
               raise SystemExit("classifier artifact is not bound to the exact run attempt")
           if type(selected.get("id")) is not int or selected["id"] <= 0:
               raise SystemExit("classifier artifact ID is malformed")

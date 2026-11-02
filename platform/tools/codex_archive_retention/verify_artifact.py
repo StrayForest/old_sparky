@@ -38,9 +38,20 @@ GATES = [
     "verification-contract",
 ]
 MAX_JSON_BYTES = 4 * 1024 * 1024
-MAX_ARTIFACT_BYTES = 262_144_000
+MAX_BINARY_BYTES = 512 * 1024 * 1024
+MAX_BUILD_ARCHIVE_BYTES = 512 * 1024 * 1024
+MAX_BUILD_MANIFEST_BYTES = 64 * 1024
+MAX_BUILD_VERSION_BYTES = 256
+MAX_BUILD_UNCOMPRESSED_BYTES = (
+    MAX_BINARY_BYTES + MAX_BUILD_MANIFEST_BYTES + MAX_BUILD_VERSION_BYTES
+)
+MAX_SECURITY_ARCHIVE_BYTES = 8 * 1024 * 1024
 MAX_ROUTE_MANIFEST_BYTES = 1_048_576
 MAX_ZIP_ENTRIES = 8
+ZIP_STREAM_CHUNK_BYTES = 1024 * 1024
+EXTRACTION_MEMORY_SLACK_BYTES = 64 * 1024 * 1024
+ARTIFACT_STAGING_DISK_SLACK_BYTES = 64 * 1024 * 1024
+ARTIFACT_STAGING_MEMORY_SLACK_BYTES = 256 * 1024 * 1024
 MINIMUM_FREE_BYTES = 5 * 1024**3
 MINIMUM_FREE_PERCENT = 10
 RELEASE_PROFILE = "release"
@@ -315,6 +326,7 @@ def _artifact_record(
     run_id: str,
     run_attempt: str,
     head_sha: str,
+    max_size_bytes: int,
 ) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise _fail("artifact API response is malformed")
@@ -333,17 +345,19 @@ def _artifact_record(
     if not isinstance(workflow, dict):
         raise _fail("workflow artifact run binding is missing")
     digest = row.get("digest")
+    artifact_attempt = workflow.get("run_attempt")
     if any(
         (
             type(row.get("id")) is not int or row["id"] <= 0,
             row.get("name") != name,
             row.get("expired") is not False,
             not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None,
+            type(row.get("size_in_bytes")) is not int
+            or not 0 < row["size_in_bytes"] <= max_size_bytes,
             type(workflow.get("id")) is not int or str(workflow["id"]) != run_id,
             workflow.get("head_sha") != head_sha,
-            "run_attempt" in workflow
-            and (type(workflow.get("run_attempt")) is not int
-                 or str(workflow["run_attempt"]) != run_attempt),
+            artifact_attempt is not None
+            and (type(artifact_attempt) is not int or str(artifact_attempt) != run_attempt),
         )
     ):
         raise _fail("workflow artifact metadata does not bind to the exact run")
@@ -397,6 +411,61 @@ def _closed_zip(
         raise _fail("artifact ZIP is malformed") from exc
 
 
+def _inspect_build_zip(archive_path: Path) -> tuple[dict[str, bytes], int]:
+    """Validate the bounded native ZIP and read only its small metadata members."""
+    info = archive_path.lstat()
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or not 1 <= info.st_size <= MAX_BUILD_ARCHIVE_BYTES
+    ):
+        raise _fail("downloaded native ZIP identity or size is invalid")
+    expected = {"codex", "codex.manifest.json", "version.txt"}
+    limits = {
+        "codex": MAX_BINARY_BYTES,
+        "codex.manifest.json": MAX_BUILD_MANIFEST_BYTES,
+        "version.txt": MAX_BUILD_VERSION_BYTES,
+    }
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            infos = archive.infolist()
+            names = [entry.filename for entry in infos]
+            if (
+                len(infos) != len(expected)
+                or len(names) != len(set(names))
+                or set(names) != expected
+            ):
+                raise _fail("native artifact ZIP member set is not closed")
+            entries = {entry.filename: entry for entry in infos}
+            total = 0
+            for entry in infos:
+                mode = (entry.external_attr >> 16) & 0xFFFF
+                if (
+                    not entry.filename.isascii()
+                    or entry.is_dir()
+                    or stat.S_IFMT(mode) not in (0, stat.S_IFREG)
+                    or entry.flag_bits & 0x1
+                    or entry.file_size > limits[entry.filename]
+                    or (entry.compress_size == 0 and entry.file_size > 0)
+                ):
+                    raise _fail("native artifact ZIP member is unsafe")
+                total += entry.file_size
+                if total > MAX_BUILD_UNCOMPRESSED_BYTES:
+                    raise _fail("native artifact ZIP expands beyond its size bound")
+            binary_size = entries["codex"].file_size
+            if binary_size < 1:
+                raise _fail("native artifact binary is empty")
+            small_members = {
+                name: archive.read(entries[name])
+                for name in ("codex.manifest.json", "version.txt")
+            }
+            if any(len(small_members[name]) != entries[name].file_size for name in small_members):
+                raise _fail("native artifact metadata length is inconsistent")
+            return small_members, binary_size
+    except (OSError, zipfile.BadZipFile, RuntimeError) as exc:
+        raise _fail("native artifact ZIP is malformed") from exc
+
+
 def _remove_private_extraction_if_same(
     destination: Path,
     identity: tuple[int, int],
@@ -424,20 +493,81 @@ def _remove_private_extraction_if_same(
         pass
 
 
-def _extract_verified_build_members(
+def _stream_build_binary(
+    archive_path: Path,
+    manifest: dict[str, object],
+    *,
+    destination: Path | None,
+) -> None:
+    """Hash the executable in bounded chunks, optionally writing it privately."""
+    digest = hashlib.sha256()
+    size = 0
+    descriptor: int | None = None
+    try:
+        if destination is not None:
+            descriptor = os.open(
+                destination,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+        with zipfile.ZipFile(archive_path) as archive:
+            entry = archive.getinfo("codex")
+            if entry.file_size != manifest.get("binary_bytes") or not 1 <= entry.file_size <= MAX_BINARY_BYTES:
+                raise _fail("native artifact binary size changed before streaming")
+            with archive.open(entry) as source:
+                output = os.fdopen(descriptor, "wb") if descriptor is not None else None
+                descriptor = None
+                if output is None:
+                    for chunk in iter(lambda: source.read(ZIP_STREAM_CHUNK_BYTES), b""):
+                        size += len(chunk)
+                        if size > MAX_BINARY_BYTES:
+                            raise _fail("streamed companion exceeds its executable bound")
+                        digest.update(chunk)
+                else:
+                    with output:
+                        for chunk in iter(lambda: source.read(ZIP_STREAM_CHUNK_BYTES), b""):
+                            size += len(chunk)
+                            if size > MAX_BINARY_BYTES:
+                                raise _fail("streamed companion exceeds its executable bound")
+                            digest.update(chunk)
+                            output.write(chunk)
+                        output.flush()
+                        os.fsync(output.fileno())
+        if (
+            size != manifest.get("binary_bytes")
+            or digest.hexdigest() != manifest.get("binary_sha256")
+        ):
+            raise _fail("streamed companion does not match its verified binary identity")
+    except (OSError, zipfile.BadZipFile, RuntimeError) as exc:
+        raise _fail("streaming native artifact failed") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _extract_verified_build_archive(
     destination: Path,
-    members: dict[str, bytes],
+    archive_path: Path,
     *,
     manifest: dict[str, object],
 ) -> tuple[int, int]:
-    """Materialize only the already-verified closed build artifact privately."""
-
-    expected = {"codex", "codex.manifest.json", "version.txt"}
-    if set(members) != expected:
-        raise _fail("verified build artifact member set changed before extraction")
+    """Stream only a closed, bounded native artifact into a private directory."""
     created_directory_identity: tuple[int, int] | None = None
 
     try:
+        members, binary_size = _inspect_build_zip(archive_path)
+        if binary_size != manifest.get("binary_bytes"):
+            raise _fail("native artifact binary size changed before extraction")
+        if json.loads(members["codex.manifest.json"].decode("utf-8")) != manifest:
+            raise _fail("native artifact manifest changed before extraction")
+        if members["version.txt"] != (
+            str(manifest.get("cli_version", "")).encode("ascii") + b"\n"
+        ):
+            raise _fail("native artifact version changed before extraction")
         parent_info = destination.parent.lstat()
         if (
             not stat.S_ISDIR(parent_info.st_mode)
@@ -447,8 +577,8 @@ def _extract_verified_build_members(
         ):
             raise _fail("extraction parent is not a private owned directory")
         filesystem = os.statvfs(destination.parent)
-        required_bytes = sum(len(data) for data in members.values())
-        required_bytes += (len(expected) + 1) * filesystem.f_frsize
+        required_bytes = binary_size + sum(len(data) for data in members.values())
+        required_bytes += 4 * filesystem.f_frsize
         available_bytes = filesystem.f_bavail * filesystem.f_frsize
         if available_bytes < required_bytes:
             raise _fail("private extraction directory lacks bounded artifact space")
@@ -457,7 +587,7 @@ def _extract_verified_build_members(
             if line.startswith("MemAvailable:"):
                 available_memory = int(line.split()[1]) * 1024
                 break
-        if available_memory is None or available_memory < required_bytes + 64 * 1024 * 1024:
+        if available_memory is None or available_memory < required_bytes + EXTRACTION_MEMORY_SLACK_BYTES:
             raise _fail("available memory is insufficient for bounded artifact extraction")
         destination.mkdir(mode=0o700)
         destination_info = destination.lstat()
@@ -468,7 +598,7 @@ def _extract_verified_build_members(
             or destination_info.st_uid != os.geteuid()
         ):
             raise _fail("extraction directory identity or mode is unsafe")
-        for name in sorted(expected):
+        for name, data in members.items():
             path = destination / name
             descriptor = os.open(
                 path,
@@ -480,26 +610,22 @@ def _extract_verified_build_members(
                 0o600,
             )
             with os.fdopen(descriptor, "wb") as stream:
-                stream.write(members[name])
+                stream.write(data)
                 stream.flush()
                 os.fsync(stream.fileno())
-        extracted_binary_path = destination / "codex"
-        extracted_binary_size = 0
-        extracted_binary_hash = hashlib.sha256()
-        with extracted_binary_path.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                extracted_binary_size += len(chunk)
-                extracted_binary_hash.update(chunk)
-        if (
-            extracted_binary_size != manifest.get("binary_bytes")
-            or extracted_binary_hash.hexdigest() != manifest.get("binary_sha256")
-            or json.loads((destination / "codex.manifest.json").read_text(encoding="utf-8")) != manifest
-        ):
-            raise _fail("extracted companion does not match its verified identity")
-        if (destination / "version.txt").read_bytes() != (
-            str(manifest.get("cli_version", "")).encode("ascii") + b"\n"
-        ):
-            raise _fail("extracted companion version does not match its verified identity")
+        _stream_build_binary(
+            archive_path,
+            manifest,
+            destination=destination / "codex",
+        )
+        directory_descriptor = os.open(
+            destination,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         if created_directory_identity is not None:
             _remove_private_extraction_if_same(destination, created_directory_identity)
@@ -510,6 +636,26 @@ def _extract_verified_build_members(
         raise
     assert created_directory_identity is not None
     return created_directory_identity
+
+
+def artifact_staging_space_requirements(
+    build_archive_bytes: int,
+    security_archive_bytes: int,
+) -> tuple[int, int]:
+    """Return bounded tmpfs disk and memory requirements before ZIP download."""
+    if (
+        type(build_archive_bytes) is not int
+        or not 0 < build_archive_bytes <= MAX_BUILD_ARCHIVE_BYTES
+        or type(security_archive_bytes) is not int
+        or not 0 < security_archive_bytes <= MAX_SECURITY_ARCHIVE_BYTES
+    ):
+        raise _fail("artifact staging sizes exceed their reviewed archive bounds")
+    compressed_bytes = build_archive_bytes + security_archive_bytes
+    expanded_bytes = MAX_BUILD_UNCOMPRESSED_BYTES + MAX_ROUTE_MANIFEST_BYTES
+    return (
+        compressed_bytes + expanded_bytes + ARTIFACT_STAGING_DISK_SLACK_BYTES,
+        compressed_bytes + expanded_bytes + ARTIFACT_STAGING_MEMORY_SLACK_BYTES,
+    )
 
 
 def check_persistent_install_space(install_root: Path, payload_paths: list[Path]) -> None:
@@ -677,7 +823,7 @@ def _verify_source_checkout(source_root: Path, *, expected_head: str) -> dict[st
         "rust_toolchain": "1.95.0",
         "target": "x86_64-unknown-linux-gnu",
         "patch_file": "patches/codex-0.166.0.patch",
-        "max_binary_bytes": MAX_ARTIFACT_BYTES,
+        "max_binary_bytes": MAX_BINARY_BYTES,
     }
     if not isinstance(lock, dict) or any(lock.get(key) != value for key, value in expected.items()):
         raise _fail("reviewed Codex source lock differs from the supported pin")
@@ -690,6 +836,7 @@ def _verify_source_checkout(source_root: Path, *, expected_head: str) -> dict[st
 def _validate_build_artifact(
     members: dict[str, bytes],
     *,
+    binary_size: int,
     source_root: Path,
     lock: dict[str, Any],
     pr: str,
@@ -699,9 +846,11 @@ def _validate_build_artifact(
     build_attempt: str,
 ) -> dict[str, Any]:
     if (
-        len(members.get("codex.manifest.json", b"")) > 64 * 1024
-        or len(members.get("version.txt", b"")) > 256
-        or len(members.get("codex", b"")) > lock["max_binary_bytes"]
+        set(members) != {"codex.manifest.json", "version.txt"}
+        or len(members.get("codex.manifest.json", b"")) > MAX_BUILD_MANIFEST_BYTES
+        or len(members.get("version.txt", b"")) > MAX_BUILD_VERSION_BYTES
+        or type(binary_size) is not int
+        or not 1 <= binary_size <= lock["max_binary_bytes"]
     ):
         raise _fail("companion artifact member exceeds its reviewed bound")
     try:
@@ -717,9 +866,11 @@ def _validate_build_artifact(
         "release_profile", "release_lto", "release_codegen_units",
         "binary_bytes", "binary_sha256",
     }
-    binary = members["codex"]
     if not isinstance(manifest, dict) or set(manifest) != expected_keys:
         raise _fail("companion manifest schema is not closed")
+    binary_sha256 = manifest.get("binary_sha256")
+    if not isinstance(binary_sha256, str) or HEX64.fullmatch(binary_sha256) is None:
+        raise _fail("companion binary digest is malformed")
     expected = {
         "schema_version": 1,
         "platform_repository": REPOSITORY,
@@ -743,8 +894,8 @@ def _validate_build_artifact(
         "release_profile": RELEASE_PROFILE,
         "release_lto": RELEASE_LTO,
         "release_codegen_units": RELEASE_CODEGEN_UNITS,
-        "binary_bytes": len(binary),
-        "binary_sha256": hashlib.sha256(binary).hexdigest(),
+        "binary_bytes": binary_size,
+        "binary_sha256": binary_sha256,
     }
     if (
         type(manifest.get("release_lto")) is not bool
@@ -820,17 +971,16 @@ def verify(args: argparse.Namespace) -> None:
         run_id=args.build_run_id,
         run_attempt=args.build_attempt,
         head_sha=args.head_sha,
+        max_size_bytes=MAX_BUILD_ARCHIVE_BYTES,
     )
+    if args.build_zip.lstat().st_size != build_artifact["size_in_bytes"]:
+        raise _fail("raw native ZIP size does not match GitHub metadata")
     if _sha256(args.build_zip) != build_artifact["digest"].removeprefix("sha256:"):
         raise _fail("raw native build artifact ZIP digest does not match GitHub metadata")
-    build_members = _closed_zip(
-        args.build_zip,
-        expected_members={"codex", "codex.manifest.json", "version.txt"},
-        max_archive_bytes=MAX_ARTIFACT_BYTES,
-        max_total_bytes=MAX_ARTIFACT_BYTES + 64 * 1024,
-    )
+    build_members, build_binary_size = _inspect_build_zip(args.build_zip)
     build_manifest = _validate_build_artifact(
         build_members,
+        binary_size=build_binary_size,
         source_root=source_root,
         lock=lock,
         pr=args.pull_request,
@@ -847,13 +997,16 @@ def verify(args: argparse.Namespace) -> None:
         run_id=args.security_run_id,
         run_attempt=args.security_attempt,
         head_sha=args.head_sha,
+        max_size_bytes=MAX_SECURITY_ARCHIVE_BYTES,
     )
+    if args.security_zip.lstat().st_size != security_artifact["size_in_bytes"]:
+        raise _fail("raw Security ZIP size does not match GitHub metadata")
     if _sha256(args.security_zip) != security_artifact["digest"].removeprefix("sha256:"):
         raise _fail("raw Security route ZIP digest does not match GitHub metadata")
     security_members = _closed_zip(
         args.security_zip,
         expected_members={"classifier-manifest.json"},
-        max_archive_bytes=8 * 1024 * 1024,
+        max_archive_bytes=MAX_SECURITY_ARCHIVE_BYTES,
         max_total_bytes=MAX_ROUTE_MANIFEST_BYTES,
     )
     route_manifest = _validate_classifier_manifest(
@@ -896,11 +1049,13 @@ def verify(args: argparse.Namespace) -> None:
     extraction_directory = getattr(args, "extract_directory", None)
     extraction_identity: tuple[int, int] | None = None
     if extraction_directory is not None:
-        extraction_identity = _extract_verified_build_members(
+        extraction_identity = _extract_verified_build_archive(
             extraction_directory,
-            build_members,
+            args.build_zip,
             manifest=build_manifest,
         )
+    else:
+        _stream_build_binary(args.build_zip, build_manifest, destination=None)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     descriptor: int | None = None
     activation_identity: tuple[int, int] | None = None
