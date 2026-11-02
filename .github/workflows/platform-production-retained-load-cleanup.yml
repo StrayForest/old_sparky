@@ -83,7 +83,23 @@ jobs:
               finally:
                   os.close(out)
               os.replace(temporary, path)
-              if b"control_email" in path.read_bytes():
+              checked = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=pairs)
+              checked_inputs = checked.get("inputs") if isinstance(checked, dict) else None
+              def contains_private_value(value, secret):
+                  pending = [value]
+                  folded = secret.casefold()
+                  while pending:
+                      current = pending.pop()
+                      if isinstance(current, str):
+                          if folded in current.casefold():
+                              return True
+                      elif isinstance(current, dict):
+                          for key, item in current.items():
+                              pending.extend((key, item))
+                      elif isinstance(current, list):
+                          pending.extend(current)
+                  return False
+              if not isinstance(checked_inputs, dict) or "control_email" in checked_inputs or any(contains_private_value(checked, secret) for secret in {email, email.lower(), email.casefold()} if secret):
                   raise ValueError
           except (KeyError, TypeError, UnicodeError, ValueError, json.JSONDecodeError):
               raise SystemExit("workflow event sanitization failed closed")
@@ -293,7 +309,23 @@ jobs:
               finally:
                   os.close(out)
               os.replace(temporary, path)
-              if b"control_email" in path.read_bytes():
+              checked = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=pairs)
+              checked_inputs = checked.get("inputs") if isinstance(checked, dict) else None
+              def contains_private_value(value, secret):
+                  pending = [value]
+                  folded = secret.casefold()
+                  while pending:
+                      current = pending.pop()
+                      if isinstance(current, str):
+                          if folded in current.casefold():
+                              return True
+                      elif isinstance(current, dict):
+                          for key, item in current.items():
+                              pending.extend((key, item))
+                      elif isinstance(current, list):
+                          pending.extend(current)
+                  return False
+              if not isinstance(checked_inputs, dict) or "control_email" in checked_inputs or any(contains_private_value(checked, secret) for secret in {email, email.lower(), email.casefold()} if secret):
                   raise ValueError
           except (KeyError, TypeError, UnicodeError, ValueError, json.JSONDecodeError):
               raise SystemExit("workflow event sanitization failed closed")
@@ -542,7 +574,7 @@ jobs:
               inputs = event.get("inputs") if isinstance(event, dict) else None
               if not isinstance(inputs, dict) or set(inputs) != {
                   "confirmation", "load_run_id"
-              } or b"control_email" in raw_event:
+              }:
                   raise ValueError
               email_path = Path(os.environ["RUNNER_TEMP"]) / "retained-cleanup-control-email"
               email_metadata = email_path.lstat()
@@ -552,6 +584,22 @@ jobs:
               if not email_raw.endswith(b"\n") or email_raw.count(b"\n") != 1:
                   raise ValueError
               email = email_raw[:-1].decode("ascii")
+              def contains_private_value(value, secret):
+                  pending = [value]
+                  folded = secret.casefold()
+                  while pending:
+                      current = pending.pop()
+                      if isinstance(current, str):
+                          if folded in current.casefold():
+                              return True
+                      elif isinstance(current, dict):
+                          for key, item in current.items():
+                              pending.extend((key, item))
+                      elif isinstance(current, list):
+                          pending.extend(current)
+                  return False
+              if any(contains_private_value(event, secret) for secret in {email, email.lower(), email.casefold()} if secret):
+                  raise ValueError
               binding_path = Path(binding_path_value)
               binding_meta = binding_path.lstat()
               if (

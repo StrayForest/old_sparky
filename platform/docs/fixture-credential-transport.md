@@ -30,6 +30,12 @@ scrubs the event before checkout or processing; it receives the operator email
 only in its trusted validation step. If ciphertext decryption fails, the job
 fails closed and the canonical manual cleanup route remains available.
 
+Event scrub steps reparse rewritten JSON with duplicate-key rejection, require
+`inputs.control_email` to be absent, and verify that the original and canonical
+email values are absent from every parsed string key and value. Unrelated event
+metadata may contain the text `control_email`; a byte search for that field
+name is not a valid scrub check.
+
 ## Provision the fixture-only identity
 
 For the current recipient, provision the already-prepared matching identity; do
@@ -91,6 +97,16 @@ If fixture setup has begun and decryption fails, the workflow remains failed.
 Use the existing exact-run manual cleanup procedure with the operator-supplied
 control identity; do not fabricate a manifest or bypass source-binding checks.
 A failed decrypt is not proof that cleanup ran.
+
+For a terminal run that fails before fixture preparation, verify the exact
+attempt's job and step statuses. Treat it as a prefixture no-op only when
+`Validate external-load dispatch` failed before setup and `Prepare external
+fixture with ephemeral SSH`, `Run checked-out external HTTP load client`, and
+`Run isolated zero-credit authenticated SSR CPU pair` are all skipped, with no
+fixture-preparation step started. Missing reports or a default open-namespace
+field alone do not show that a fixture or load existed. If fixture preparation
+started, use the exact-run cleanup procedure even when later evidence is
+missing.
 
 Do not manually download or decrypt the private-input or encrypted-manifest
 artifacts. Use the authenticated artifact inspection procedure only for the

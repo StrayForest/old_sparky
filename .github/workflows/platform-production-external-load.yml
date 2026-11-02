@@ -131,7 +131,21 @@ jobs:
               try: os.write(out,safe);os.fsync(out)
               finally: os.close(out)
               os.replace(tmp,path)
-              if b"control_email" in path.read_bytes(): raise ValueError
+              checked=json.loads(path.read_bytes().decode("utf-8"),object_pairs_hook=pairs)
+              checked_inputs=checked.get("inputs") if isinstance(checked,dict) else None
+              def contains_private_value(value,secret):
+                  pending=[value]
+                  folded=secret.casefold()
+                  while pending:
+                      current=pending.pop()
+                      if isinstance(current,str):
+                          if folded in current.casefold(): return True
+                      elif isinstance(current,dict):
+                          for key,item in current.items(): pending.extend((key,item))
+                      elif isinstance(current,list):
+                          pending.extend(current)
+                  return False
+              if not isinstance(checked_inputs,dict) or "control_email" in checked_inputs or any(contains_private_value(checked,secret) for secret in {email,email.lower(),email.casefold()} if secret): raise ValueError
           except (KeyError,TypeError,UnicodeError,ValueError,json.JSONDecodeError): raise SystemExit("workflow event sanitization failed closed")
           PY
       - name: Require exact workflow dispatch inputs
@@ -368,7 +382,23 @@ jobs:
           finally:
               os.close(event_fd)
           os.replace(temporary_event, event_path)
-          if b"control_email" in event_path.read_bytes():
+          checked = json.loads(event_path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicate_keys)
+          checked_inputs = checked.get("inputs") if isinstance(checked, dict) else None
+          def contains_private_value(value, secret):
+              pending = [value]
+              folded = secret.casefold()
+              while pending:
+                  current = pending.pop()
+                  if isinstance(current, str):
+                      if folded in current.casefold():
+                          return True
+                  elif isinstance(current, dict):
+                      for key, item in current.items():
+                          pending.extend((key, item))
+                  elif isinstance(current, list):
+                      pending.extend(current)
+              return False
+          if not isinstance(checked_inputs, dict) or "control_email" in checked_inputs or any(contains_private_value(checked, secret) for secret in {email, email.lower(), email.casefold()} if secret):
               raise SystemExit("workflow event sanitization failed closed")
           PY
 
@@ -606,7 +636,21 @@ jobs:
               try: os.write(out,safe);os.fsync(out)
               finally: os.close(out)
               os.replace(tmp,path)
-              if b"control_email" in path.read_bytes(): raise ValueError
+              checked=json.loads(path.read_bytes().decode("utf-8"),object_pairs_hook=pairs)
+              checked_inputs=checked.get("inputs") if isinstance(checked,dict) else None
+              def contains_private_value(value,secret):
+                  pending=[value]
+                  folded=secret.casefold()
+                  while pending:
+                      current=pending.pop()
+                      if isinstance(current,str):
+                          if folded in current.casefold(): return True
+                      elif isinstance(current,dict):
+                          for key,item in current.items(): pending.extend((key,item))
+                      elif isinstance(current,list):
+                          pending.extend(current)
+                  return False
+              if not isinstance(checked_inputs,dict) or "control_email" in checked_inputs or any(contains_private_value(checked,secret) for secret in {email,email.lower(),email.casefold()} if secret): raise ValueError
           except (KeyError,TypeError,UnicodeError,ValueError,json.JSONDecodeError): raise SystemExit("workflow event sanitization failed closed")
           PY
       - name: Checkout exact target as untrusted source data
@@ -696,7 +740,21 @@ jobs:
               try: os.write(out,safe);os.fsync(out)
               finally: os.close(out)
               os.replace(tmp,path)
-              if b"control_email" in path.read_bytes(): raise ValueError
+              checked=json.loads(path.read_bytes().decode("utf-8"),object_pairs_hook=pairs)
+              checked_inputs=checked.get("inputs") if isinstance(checked,dict) else None
+              def contains_private_value(value,secret):
+                  pending=[value]
+                  folded=secret.casefold()
+                  while pending:
+                      current=pending.pop()
+                      if isinstance(current,str):
+                          if folded in current.casefold(): return True
+                      elif isinstance(current,dict):
+                          for key,item in current.items(): pending.extend((key,item))
+                      elif isinstance(current,list):
+                          pending.extend(current)
+                  return False
+              if not isinstance(checked_inputs,dict) or "control_email" in checked_inputs or any(contains_private_value(checked,secret) for secret in {email,email.lower(),email.casefold()} if secret): raise ValueError
           except (KeyError,TypeError,UnicodeError,ValueError,json.JSONDecodeError): raise SystemExit("workflow event sanitization failed closed")
           PY
       - name: Download closed external-load handoff
@@ -1404,7 +1462,23 @@ jobs:
               os.close(out)
           os.replace(temporary, event_path)
           checked = event_path.lstat()
-          if not stat.S_ISREG(checked.st_mode) or checked.st_nlink != 1 or stat.S_IMODE(checked.st_mode) != 0o600 or b"control_email" in event_path.read_bytes():
+          checked_event = json.loads(event_path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicate_keys)
+          checked_inputs = checked_event.get("inputs") if isinstance(checked_event, dict) else None
+          def contains_private_value(value, secret):
+              pending = [value]
+              folded = secret.casefold()
+              while pending:
+                  current = pending.pop()
+                  if isinstance(current, str):
+                      if folded in current.casefold():
+                          return True
+                  elif isinstance(current, dict):
+                      for key, item in current.items():
+                          pending.extend((key, item))
+                  elif isinstance(current, list):
+                      pending.extend(current)
+              return False
+          if not stat.S_ISREG(checked.st_mode) or checked.st_nlink != 1 or stat.S_IMODE(checked.st_mode) != 0o600 or not isinstance(checked_inputs, dict) or "control_email" in checked_inputs or any(contains_private_value(checked_event, secret) for secret in {email, email.lower(), email.casefold()} if secret):
               raise SystemExit("workflow event sanitization failed closed")
           PY
 
@@ -2033,7 +2107,21 @@ jobs:
               try: os.write(out,safe); os.fsync(out)
               finally: os.close(out)
               os.replace(tmp,path)
-              if b"control_email" in path.read_bytes(): raise ValueError
+              checked=json.loads(path.read_bytes().decode("utf-8"),object_pairs_hook=pairs)
+              checked_inputs=checked.get("inputs") if isinstance(checked,dict) else None
+              def contains_private_value(value,secret):
+                  pending=[value]
+                  folded=secret.casefold()
+                  while pending:
+                      current=pending.pop()
+                      if isinstance(current,str):
+                          if folded in current.casefold(): return True
+                      elif isinstance(current,dict):
+                          for key,item in current.items(): pending.extend((key,item))
+                      elif isinstance(current,list):
+                          pending.extend(current)
+                  return False
+              if not isinstance(checked_inputs,dict) or "control_email" in checked_inputs or any(contains_private_value(checked,secret) for secret in {email,email.lower(),email.casefold()} if secret): raise ValueError
           except (KeyError,TypeError,UnicodeError,ValueError,json.JSONDecodeError): raise SystemExit("workflow event sanitization failed closed")
           PY
       - name: Checkout exact diagnostic source
@@ -2161,7 +2249,21 @@ jobs:
               try: os.write(out,safe);os.fsync(out)
               finally: os.close(out)
               os.replace(tmp,path)
-              if b"control_email" in path.read_bytes(): raise ValueError
+              checked=json.loads(path.read_bytes().decode("utf-8"),object_pairs_hook=pairs)
+              checked_inputs=checked.get("inputs") if isinstance(checked,dict) else None
+              def contains_private_value(value,secret):
+                  pending=[value]
+                  folded=secret.casefold()
+                  while pending:
+                      current=pending.pop()
+                      if isinstance(current,str):
+                          if folded in current.casefold(): return True
+                      elif isinstance(current,dict):
+                          for key,item in current.items(): pending.extend((key,item))
+                      elif isinstance(current,list):
+                          pending.extend(current)
+                  return False
+              if not isinstance(checked_inputs,dict) or "control_email" in checked_inputs or any(contains_private_value(checked,secret) for secret in {email,email.lower(),email.casefold()} if secret): raise ValueError
           except (KeyError,TypeError,UnicodeError,ValueError,json.JSONDecodeError): raise SystemExit("workflow event sanitization failed closed")
           PY
       - name: Download the exact same-run public fixture descriptor
@@ -4175,7 +4277,21 @@ jobs:
               try: os.write(out,safe);os.fsync(out)
               finally: os.close(out)
               os.replace(tmp,path)
-              if b"control_email" in path.read_bytes(): raise ValueError
+              checked=json.loads(path.read_bytes().decode("utf-8"),object_pairs_hook=pairs)
+              checked_inputs=checked.get("inputs") if isinstance(checked,dict) else None
+              def contains_private_value(value,secret):
+                  pending=[value]
+                  folded=secret.casefold()
+                  while pending:
+                      current=pending.pop()
+                      if isinstance(current,str):
+                          if folded in current.casefold(): return True
+                      elif isinstance(current,dict):
+                          for key,item in current.items(): pending.extend((key,item))
+                      elif isinstance(current,list):
+                          pending.extend(current)
+                  return False
+              if not isinstance(checked_inputs,dict) or "control_email" in checked_inputs or any(contains_private_value(checked,secret) for secret in {email,email.lower(),email.casefold()} if secret): raise ValueError
           except (KeyError,TypeError,UnicodeError,ValueError,json.JSONDecodeError): raise SystemExit("workflow event sanitization failed closed")
           PY
       - name: Checkout reviewed load evaluator
