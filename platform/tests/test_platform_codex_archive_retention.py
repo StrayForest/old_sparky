@@ -33,6 +33,14 @@ class CodexArchiveRetentionTests(unittest.TestCase):
             workflow,
         )
         self.assertIn("git -C codex-source diff --check", workflow)
+        self.assertIn(
+            "hashlib.sha256(patch_path.read_bytes()).hexdigest() != lock[\"patch_sha256\"]",
+            workflow,
+        )
+        self.assertNotIn(
+            '= "${{ steps.lock.outputs.patch_sha256 }}"',
+            workflow,
+        )
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="codex-archive-retention-")

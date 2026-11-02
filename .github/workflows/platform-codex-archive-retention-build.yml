@@ -78,13 +78,15 @@ jobs:
           set -euo pipefail
           lock=platform-source/platform/tools/codex_archive_retention/codex-source.lock.json
           patch=platform-source/platform/tools/codex_archive_retention/patches/codex-0.166.0.patch
-          /usr/bin/python3 -I -B - "$lock" "$GITHUB_OUTPUT" <<'PY'
+          /usr/bin/python3 -I -B - "$lock" "$patch" "$GITHUB_OUTPUT" <<'PY'
+          import hashlib
           import json
           from pathlib import Path
           import re
           import sys
 
           lock = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          patch_path = Path(sys.argv[2])
           expected = {
               "schema_version": 1,
               "source_repository": "https://github.com/openai/codex.git",
@@ -101,11 +103,12 @@ jobs:
               raise SystemExit("Codex binary size limit is invalid")
           if re.fullmatch(r"[0-9a-f]{64}", lock.get("patch_sha256", "")) is None:
               raise SystemExit("Codex source patch digest is malformed")
-          with Path(sys.argv[2]).open("a", encoding="ascii") as output:
+          if hashlib.sha256(patch_path.read_bytes()).hexdigest() != lock["patch_sha256"]:
+              raise SystemExit("Codex source patch digest differs from the source lock")
+          with Path(sys.argv[3]).open("a", encoding="ascii") as output:
               output.write(f"patch_sha256={lock['patch_sha256']}\n")
               output.write(f"max_binary_bytes={lock['max_binary_bytes']}\n")
           PY
-          test "$(sha256sum "$patch" | awk '{print $1}')" = "${{ steps.lock.outputs.patch_sha256 }}"
 
       - name: Install pinned Rust toolchain
         shell: bash
