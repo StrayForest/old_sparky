@@ -368,7 +368,12 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                     self.assertEqual(completed.returncode, 143, completed.stderr)
                     events = event_path.read_text(encoding="ascii").splitlines()
                     if ignore_term == "0":
-                        self.assertEqual(events, ["observer_stopped", "terminal"])
+                        # TERM reaches timeout and its child as a process-group
+                        # signal; timeout may forward it to the child again.
+                        # Check shutdown ordering, not callback multiplicity.
+                        self.assertEqual(events[-1], "terminal")
+                        self.assertGreaterEqual(events.count("observer_stopped"), 1)
+                        self.assertTrue(all(event == "observer_stopped" for event in events[:-1]))
                     else:
                         self.assertEqual(events, ["terminal"])
                     observer_pid = pid_path.read_text(encoding="ascii").strip()
@@ -2533,6 +2538,100 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                     self.assertIn("workflow event sanitization failed closed", scrub.stderr)
                     self.assertNotIn(cleanup_secret.lower(), scrub.stderr.lower())
                     self.assertFalse((root / "platform-retained-cleanup-input.json").exists())
+
+        # Exercise the later no-secret consumer as well as the scrub step. A
+        # benign field-name mention passes its parsed event postcondition; a
+        # staged credential copied into metadata fails before API lookup or
+        # cleanup handoff creation.
+        staged_email = "control%qa@example.invalid"
+        sanitized_inputs = {
+            "confirmation": valid_event["inputs"]["confirmation"],
+            "load_run_id": valid_event["inputs"]["load_run_id"],
+        }
+        revalidation_event_cases = (
+            (
+                "benign-field-name",
+                json.dumps({
+                    "inputs": sanitized_inputs,
+                    "repository": {"description": "metadata mentions control_email"},
+                }),
+                True,
+            ),
+            (
+                "credential-copy",
+                json.dumps({
+                    "inputs": sanitized_inputs,
+                    "repository": {"description": f"copied {staged_email}"},
+                }),
+                False,
+            ),
+            (
+                "json-escaped-credential-copy",
+                (
+                    '{"inputs":' + json.dumps(sanitized_inputs, separators=(",", ":"))
+                    + ',"repository":{"details":{"note":"copied control%qa\\u0040example.invalid"}}}'
+                ),
+                False,
+            ),
+        )
+        for event_name, event_contents, should_pass in revalidation_event_cases:
+            with self.subTest(revalidation_event=event_name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                event_path = root / "event.json"
+                event_path.write_text(event_contents, encoding="utf-8")
+                event_path.chmod(0o600)
+                (root / "retained-cleanup-control-email").write_text(
+                    staged_email + "\n", encoding="ascii"
+                )
+                (root / "retained-cleanup-control-email").chmod(0o600)
+                binding_dir = root / "retained-cleanup-source-binding"
+                binding_dir.mkdir(mode=0o700)
+                binding_path = binding_dir / "source-binding.json"
+                binding_path.write_text(
+                    json.dumps({
+                        "schema": 1,
+                        "runner_sha": "a" * 40,
+                        "app_target_sha": "a" * 40,
+                        "source_binding": None,
+                    }, separators=(",", ":")),
+                    encoding="ascii",
+                )
+                binding_path.chmod(0o600)
+                github_output_path = root / "github-output"
+                github_output_path.touch(mode=0o600)
+                env = {
+                    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                    "GITHUB_API_URL": "http://127.0.0.1:1",
+                    "GITHUB_EVENT_PATH": str(event_path),
+                    "GITHUB_OUTPUT": str(github_output_path),
+                    "GITHUB_REF": "refs/heads/dev",
+                    "GITHUB_RUN_ID": "234567",
+                    "GH_TOKEN": "synthetic-test-token",
+                    "LOAD_RUN_ID": "123456",
+                    "QA_CONFIRMATION": "DELETE-PRODUCTION-RETAINED-LOAD",
+                    "RUNNER_TEMP": str(root),
+                    "SOURCE_BINDING_ARTIFACT_ID": "654321",
+                    "TARGET_SHA": "a" * 40,
+                    "APP_TARGET_SHA": "a" * 40,
+                }
+                result = subprocess.run(
+                    ["/bin/bash", "-euo", "pipefail", "-c", cleanup_validation],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                handoff_path = root / "platform-retained-cleanup-input.json"
+                if should_pass:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertTrue(handoff_path.exists())
+                    handoff = json.loads(handoff_path.read_text(encoding="ascii"))
+                    self.assertEqual(handoff["control_email"], staged_email)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("cleanup control identity input is invalid", result.stderr)
+                    self.assertNotIn(staged_email.lower(), result.stderr.lower())
+                    self.assertFalse(handoff_path.exists())
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
