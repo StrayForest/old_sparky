@@ -258,7 +258,7 @@ provision/self-test of A, then commit B (pin-only host-control change) pointing
 at A with A's exact baseline; B is never self-pinned. The pin resolver checks the exact lowercase commit,
 repository, reachability, ancestry, path set, modes and digests; the
 host-tools contract tests therefore fail before a closure edit can merge
-without an intentional pin bump. `TARGET_SHA` remains the classifier,
+without an intentional pin bump. `HostToolsBundleTests.test_readiness_source_binding_uses_the_active_release_pin`, `test_readiness_release_pointer_requires_exact_source_and_manifest_digest`, `test_installed_generation_verifies_manifest_normalized_modes` and `test_installed_generation_rejects_mode_digest_and_inventory_mismatch` own read-only readiness source, pin and mode checks: exact release-manifest digests, manifest-normalized `0555`/`0444` modes, member hashes and exact inventory. `TARGET_SHA` remains the classifier,
 release-artifact, provenance, migration and deployed-receipt identity.
 
 The `verification-contract` CI job owns the real installed-pin resolve: it

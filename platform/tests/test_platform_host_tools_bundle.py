@@ -27,6 +27,7 @@ from tools import platform_host_tools_bundle as bundle
 from tools import platform_host_tools_installed_check as installed_check
 from tools import platform_host_tools_candidate as candidate
 from tools import platform_host_tools_pin as pin
+from tools import platform_readonly_live_readiness as live_readiness
 from tools import platform_workflow_remote_dispatch as dispatcher
 from tools.platform_verify_contract import (
     _workflow_step_blocks,
@@ -1355,6 +1356,110 @@ class HostToolsBundleTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn(PIN_SHA, adr)
         self.assertNotIn("25c67089fdfca99f58d801cc529bb0e987f5ecf8", adr)
+
+    def _installed_generation_fixture(self, root: Path) -> Path:
+        archive = root / "host-tools.zip"
+        bundle.build_bundle(REPO_ROOT, PIN_SHA, archive)
+        verified = bundle.verify_bundle(archive, expected_source_sha=PIN_SHA)
+        generation = root / "installed-generation"
+        generation.mkdir()
+        members = verified["members"]
+        self.assertIsInstance(members, dict)
+        for name, contents in members.items():
+            path = generation / name
+            path.write_bytes(contents)
+            path.chmod(
+                bundle.DATA_MODE
+                if name in {"manifest.json", "capabilities.txt"}
+                else bundle.EXECUTABLE_MODE
+            )
+        generation.chmod(0o555)
+        return generation
+
+    def _verify_installed_fixture(self, generation: Path) -> dict[str, object]:
+        return bundle.verify_installed_generation(
+            generation,
+            expected_source_sha=PIN_SHA,
+            expected_toolset_version=bundle.TOOLSET_VERSION,
+            expected_uid=os.geteuid(),
+            expected_gid=os.getegid(),
+        )
+
+    def test_installed_generation_verifies_manifest_normalized_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            generation = self._installed_generation_fixture(Path(temporary))
+            try:
+                result = self._verify_installed_fixture(generation)
+                self.assertEqual(result["source_sha"], PIN_SHA)
+                self.assertEqual(result["files_verified"], len(bundle.HOST_TOOL_FILES))
+                self.assertIs(result["normalized_modes_verified"], True)
+                source_member = REPO_ROOT / "platform/tools/platform_validate_edge_policy.py"
+                installed_member = generation / source_member.name
+                self.assertEqual(stat.S_IMODE(source_member.stat().st_mode), 0o644)
+                self.assertEqual(
+                    stat.S_IMODE(installed_member.stat().st_mode), bundle.EXECUTABLE_MODE
+                )
+            finally:
+                generation.chmod(0o700)
+
+    def test_readiness_source_binding_uses_the_active_release_pin(self) -> None:
+        payload = live_readiness._check_source_pin(REPO_ROOT, PIN_SHA)
+        self.assertEqual(payload["host_tools_sha"], PIN_SHA)
+        with self.assertRaises(live_readiness.ReadinessError):
+            live_readiness._check_source_pin(REPO_ROOT, "0" * 40)
+
+    def test_readiness_release_pointer_requires_exact_source_and_manifest_digest(self) -> None:
+        source_sha = "a" * 40
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            releases = root / "releases"
+            release = releases / "release-a"
+            release.mkdir(parents=True)
+            release_json = release / "RELEASE.json"
+            release_json.write_text(
+                json.dumps({"release_slug": "release-a", "source_git_commit": source_sha}),
+                encoding="ascii",
+            )
+            (root / "current").symlink_to(release)
+            digest = hashlib.sha256(release_json.read_bytes()).hexdigest()
+            resolved, info = live_readiness._release(root, source_sha, digest, "current")
+            self.assertEqual(resolved, release)
+            self.assertEqual(info["release_json_sha256"], digest)
+            with self.assertRaises(live_readiness.ReadinessError):
+                live_readiness._release(root, source_sha, "0" * 64, "current")
+
+    def test_installed_generation_rejects_mode_digest_and_inventory_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            generation = self._installed_generation_fixture(root)
+            member = generation / "platform_validate_edge_policy.py"
+            try:
+                generation.chmod(0o700)
+                member.chmod(0o644)
+                generation.chmod(0o555)
+                with self.assertRaises(bundle.HostToolsBundleError):
+                    self._verify_installed_fixture(generation)
+
+                generation.chmod(0o700)
+                member.chmod(0o644)
+                member.write_bytes(member.read_bytes() + b"# tampered\n")
+                member.chmod(bundle.EXECUTABLE_MODE)
+                generation.chmod(0o555)
+                with self.assertRaises(bundle.HostToolsBundleError):
+                    self._verify_installed_fixture(generation)
+
+                generation.chmod(0o700)
+                member.chmod(0o644)
+                member.write_bytes(bundle.verify_bundle(
+                    root / "host-tools.zip", expected_source_sha=PIN_SHA
+                )["members"][member.name])
+                member.chmod(bundle.EXECUTABLE_MODE)
+                (generation / "unexpected.txt").write_text("extra", encoding="ascii")
+                generation.chmod(0o555)
+                with self.assertRaises(bundle.HostToolsBundleError):
+                    self._verify_installed_fixture(generation)
+            finally:
+                generation.chmod(0o700)
 
     def test_repository_pin_rejects_circular_generation_and_repository_tampering(self) -> None:
         with self.assertRaises(pin.HostToolsPinError):
