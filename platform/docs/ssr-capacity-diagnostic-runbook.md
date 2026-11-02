@@ -194,8 +194,9 @@ test "$(/usr/bin/stat -c '%a' "$EVIDENCE_DIR/readiness.json")" = 600
 Require exit 0 and `status=ready`; the JSON must bind the supplied current and
 previous app sources/release-manifest digests and C generation values, verify
 all 15 pinned C members by digest and normalized manifest mode,
-confirm that the previous C generation remains present, validate the current,
-previous and shared-venv origin identities, and show the expected allowlisted
+confirm that a directory exists at the expected previous C generation path
+(presence only; it is not a verification of that prior generation's contents),
+validate the current, previous and shared-venv origin identities, and show the expected allowlisted
 service profile, HTTP 200 health, clear locks, no marker/plans/jobs, and the
 enabled maintenance timer with its service terminal and idle. The workflow's
 runner-only `host-capability-preflight` remains authoritative for its own
@@ -203,6 +204,9 @@ runner-only `host-capability-preflight` remains authoritative for its own
 `platform_host_tools_installed_check.py` from the host shell. A terminal-idle
 maintenance service is not proof that maintenance succeeded; use its exact
 receipt for that claim.
+The collector rechecks release pointers, service identities, locks, plans and
+maintenance state immediately before returning `status=ready`; these checks
+form a bounded observation, not an atomic snapshot.
 
 The source-bound backup and release admission rules are in the
 [backup and restore runbook](backup-restore-runbook.md) and

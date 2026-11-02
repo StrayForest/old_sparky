@@ -1428,6 +1428,59 @@ class HostToolsBundleTests(unittest.TestCase):
             with self.assertRaises(live_readiness.ReadinessError):
                 live_readiness._release(root, source_sha, "0" * 64, "current")
 
+    def test_readiness_final_consistency_rejects_changed_pointer_or_service(self) -> None:
+        current = (Path("/releases/current"), {"slug": "current"})
+        previous = (Path("/releases/previous"), {"slug": "previous"})
+        services = {"deadlock-api.service": {"main_pid": 101}}
+        lock_results = [{"dev": 1, "ino": 2, "held": False}]
+        expected = {
+            "root": Path("/opt/oldsparky/platform"),
+            "expected_app_sha": "a" * 40,
+            "expected_previous_app_sha": "b" * 40,
+            "expected_release_manifest_sha": "c" * 64,
+            "expected_previous_release_manifest_sha": "d" * 64,
+            "current_identity": current,
+            "previous_identity": previous,
+            "services": services,
+            "lock_results": lock_results,
+            "timer": {"ActiveState": "active"},
+            "maintenance_service": {"SubState": "dead"},
+        }
+        with ExitStack() as stack:
+            release = stack.enter_context(patch.object(
+                live_readiness,
+                "_release",
+                side_effect=[(Path("/releases/replaced"), {"slug": "replaced"}), previous],
+            ))
+            stack.enter_context(patch.object(live_readiness, "_check_service_environment", return_value=services))
+            stack.enter_context(patch.object(live_readiness, "_check_locks", return_value=lock_results))
+            stack.enter_context(patch.object(live_readiness, "_check_operation_marker_and_plans"))
+            stack.enter_context(patch.object(
+                live_readiness,
+                "_check_maintenance_state",
+                return_value=(expected["timer"], expected["maintenance_service"]),
+            ))
+            with self.assertRaises(live_readiness.ReadinessError):
+                live_readiness._check_final_consistency(**expected)
+            self.assertEqual(release.call_count, 2)
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(live_readiness, "_release", side_effect=[current, previous]))
+            stack.enter_context(patch.object(
+                live_readiness,
+                "_check_service_environment",
+                return_value={"deadlock-api.service": {"main_pid": 202}},
+            ))
+            stack.enter_context(patch.object(live_readiness, "_check_locks", return_value=lock_results))
+            stack.enter_context(patch.object(live_readiness, "_check_operation_marker_and_plans"))
+            stack.enter_context(patch.object(
+                live_readiness,
+                "_check_maintenance_state",
+                return_value=(expected["timer"], expected["maintenance_service"]),
+            ))
+            with self.assertRaises(live_readiness.ReadinessError):
+                live_readiness._check_final_consistency(**expected)
+
     def test_installed_generation_rejects_mode_digest_and_inventory_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

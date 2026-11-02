@@ -275,6 +275,7 @@ def _check_service_environment() -> dict[str, object]:
         observed = _read_allowlisted_environment(pid, allowed)
         services[unit] = {
             "active_state": fields["ActiveState"],
+            "main_pid": pid,
             "control_group": fields.get("ControlGroup"),
             "user": expected_user,
             "group": expected_group,
@@ -334,6 +335,89 @@ def _check_service_environment() -> dict[str, object]:
     return services
 
 
+def _check_operation_marker_and_plans() -> None:
+    operation_marker = APP_ROOT / "current" / ".release-operation.json"
+    if os.path.lexists(operation_marker) or any(os.path.lexists(path) for path in PLANS):
+        raise ReadinessError("release marker or diagnostic plan is present")
+
+
+def _check_locks() -> list[dict[str, object]]:
+    results: list[dict[str, object]] = []
+    for name in LOCKS:
+        path = Path(name)
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            raise ReadinessError("canonical lock file is unavailable") from exc
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise ReadinessError("canonical lock file metadata is invalid")
+        result = _run(["/usr/bin/flock", "-n", name, "/bin/true"], check=False)
+        if result.returncode != 0:
+            raise ReadinessError("canonical lock is held")
+        results.append({
+            "dev": metadata.st_dev,
+            "ino": metadata.st_ino,
+            "mode": "0600",
+            "held": False,
+            "nonblocking_acquire_release": "passed",
+        })
+    return results
+
+
+def _check_maintenance_state() -> tuple[dict[str, str], dict[str, str]]:
+    timer = _systemd_show(
+        "deadlock-maintenance.timer",
+        ("ActiveState", "UnitFileState", "NextElapseUSecRealtime"),
+    )
+    service = _systemd_show("deadlock-maintenance.service", ("ActiveState", "SubState", "MainPID"))
+    jobs = _run(["/usr/bin/systemctl", "list-jobs", "--no-legend", "--no-pager"]).stdout.splitlines()
+    if jobs or timer.get("ActiveState") != "active" or timer.get("UnitFileState") != "enabled":
+        raise ReadinessError("maintenance timer or systemd job state is not ready")
+    if service.get("MainPID") != "0" or service.get("SubState") not in {"failed", "dead"}:
+        raise ReadinessError("maintenance service is not terminal idle")
+    return timer, service
+
+
+def _check_final_consistency(
+    *,
+    root: Path,
+    expected_app_sha: str,
+    expected_previous_app_sha: str,
+    expected_release_manifest_sha: str,
+    expected_previous_release_manifest_sha: str,
+    current_identity: tuple[Path, dict[str, object]],
+    previous_identity: tuple[Path, dict[str, object]],
+    services: dict[str, object],
+    lock_results: list[dict[str, object]],
+    timer: dict[str, str],
+    maintenance_service: dict[str, str],
+) -> None:
+    current_final = _release(root, expected_app_sha, expected_release_manifest_sha, "current")
+    previous_final = _release(
+        root,
+        expected_previous_app_sha,
+        expected_previous_release_manifest_sha,
+        "previous",
+    )
+    if current_final != current_identity or previous_final != previous_identity:
+        raise ReadinessError("release pointers changed during readiness collection")
+    if _check_service_environment() != services:
+        raise ReadinessError("service identities changed during readiness collection")
+    if _check_locks() != lock_results:
+        raise ReadinessError("canonical locks changed during readiness collection")
+    _check_operation_marker_and_plans()
+    timer_final, service_final = _check_maintenance_state()
+    if timer_final != timer or service_final != maintenance_service:
+        raise ReadinessError("maintenance state changed during readiness collection")
+
+
 def collect_readiness(
     *,
     expected_app_sha: str,
@@ -373,7 +457,7 @@ def collect_readiness(
     try:
         old_metadata = old_generation.lstat()
     except OSError as exc:
-        raise ReadinessError("preserved previous host-tools generation is unavailable") from exc
+        raise ReadinessError("expected previous host-tools generation directory is unavailable") from exc
     if (
         not stat.S_ISDIR(old_metadata.st_mode)
         or stat.S_ISLNK(old_metadata.st_mode)
@@ -382,7 +466,7 @@ def collect_readiness(
         or old_metadata.st_nlink != 2
         or stat.S_IMODE(old_metadata.st_mode) != 0o555
     ):
-        raise ReadinessError("preserved previous host-tools generation metadata is invalid")
+        raise ReadinessError("expected previous host-tools generation directory metadata is invalid")
 
     services = _check_service_environment()
     compression_path = current / "apps/platform_web/.next/required-server-files.json"
@@ -403,44 +487,9 @@ def collect_readiness(
             raise ReadinessError("local service health check failed")
         health[key] = 200
 
-    operation_marker = current / ".release-operation.json"
-    if os.path.lexists(operation_marker) or any(os.path.lexists(path) for path in PLANS):
-        raise ReadinessError("release marker or diagnostic plan is present")
-
-    lock_results: list[dict[str, object]] = []
-    for name in LOCKS:
-        path = Path(name)
-        try:
-            metadata = path.lstat()
-        except OSError as exc:
-            raise ReadinessError("canonical lock file is unavailable") from exc
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or stat.S_ISLNK(metadata.st_mode)
-            or metadata.st_uid != 0
-            or metadata.st_gid != 0
-            or metadata.st_nlink != 1
-            or stat.S_IMODE(metadata.st_mode) != 0o600
-        ):
-            raise ReadinessError("canonical lock file metadata is invalid")
-        result = _run(["/usr/bin/flock", "-n", name, "/bin/true"], check=False)
-        if result.returncode != 0:
-            raise ReadinessError("canonical lock is held")
-        lock_results.append({
-            "dev": metadata.st_dev,
-            "ino": metadata.st_ino,
-            "mode": "0600",
-            "held": False,
-            "nonblocking_acquire_release": "passed",
-        })
-
-    timer = _systemd_show("deadlock-maintenance.timer", ("ActiveState", "UnitFileState", "NextElapseUSecRealtime"))
-    service = _systemd_show("deadlock-maintenance.service", ("ActiveState", "SubState", "MainPID"))
-    jobs = _run(["/usr/bin/systemctl", "list-jobs", "--no-legend", "--no-pager"]).stdout.splitlines()
-    if jobs or timer.get("ActiveState") != "active" or timer.get("UnitFileState") != "enabled":
-        raise ReadinessError("maintenance timer or systemd job state is not ready")
-    if service.get("MainPID") != "0" or service.get("SubState") not in {"failed", "dead"}:
-        raise ReadinessError("maintenance service is not terminal idle")
+    _check_operation_marker_and_plans()
+    lock_results = _check_locks()
+    timer, service = _check_maintenance_state()
 
     venv = (root / "shared/venv").stat()
     resolver = current / "tools/platform_verify_venv_reuse.py"
@@ -474,6 +523,19 @@ def collect_readiness(
         raise ReadinessError("shared-venv origin identity is invalid")
 
     space = os.statvfs("/")
+    _check_final_consistency(
+        root=root,
+        expected_app_sha=expected_app_sha,
+        expected_previous_app_sha=expected_previous_app_sha,
+        expected_release_manifest_sha=expected_release_manifest_sha,
+        expected_previous_release_manifest_sha=expected_previous_release_manifest_sha,
+        current_identity=(current, current_info),
+        previous_identity=(previous, previous_info),
+        services=services,
+        lock_results=lock_results,
+        timer=timer,
+        maintenance_service=service,
+    )
     return {
         "schema": 1,
         "status": "ready",
@@ -485,8 +547,8 @@ def collect_readiness(
             "closure_files_verified": host_result["files_verified"],
             "manifest_sha256": host_result["manifest_sha256"],
             "normalized_modes_verified": host_result["normalized_modes_verified"],
-            "previous_generation_preserved": True,
-            "previous_generation_sha": expected_previous_host_tools_sha,
+            "previous_generation_directory_present": True,
+            "expected_previous_generation_sha": expected_previous_host_tools_sha,
             "pin_closure_verified": len(pin["closure"]),
         },
         "venv_origin": origin_slug,
@@ -500,6 +562,7 @@ def collect_readiness(
         "pending_systemd_jobs": 0,
         "maintenance_timer": timer,
         "maintenance_service": service,
+        "final_consistency_recheck": "passed",
         "available_bytes": space.f_bavail * space.f_frsize,
     }
 
