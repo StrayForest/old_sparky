@@ -19,6 +19,8 @@ belong in the linked owner documents below.
 - Exact-source Security `41398260324/1`, backup `41398501956/1`, AUTO
   `41399761466/1` and deployment `41400373353/1` succeeded. The source-bound
   backup was restore-verified with 36 tables and preserved existing archives.
+  That records the then-deployed S12 policy; the reviewed keep-one retention
+  change is not active until its exact source is merged and deployed.
   The merged read-only readiness collector did not produce a ready record: it
   failed closed with `HostToolsPinError` before collecting the effective
   profile, health and lock fields. S12 therefore has no fresh readiness pass

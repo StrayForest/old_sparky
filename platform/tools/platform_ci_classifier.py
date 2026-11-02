@@ -136,15 +136,14 @@ OUT_OF_SCOPE_PREFIXES = (
 FULL_PREFIXES = (".github/", "platform/")
 DOCS_PREFIX = "platform/docs/"
 
-# The host-tools candidate is a trusted ``workflow_run`` evidence package.  A
-# change limited to this package can require the complete deterministic CI
-# suite, but must not turn a successful ``dev`` push into a production
-# release.  Keep the non-doc paths explicit: adding a new candidate helper or
-# workflow without deliberately reviewing its production authority should fail
-# into the ordinary deployable full route until this allowlist is updated.
+# Trusted build-only companion packages receive the complete deterministic CI
+# suite without turning a successful ``dev`` push into a production release.
+# Keep non-doc paths explicit so a new helper or workflow requires a deliberate
+# review of its production authority.
 CANDIDATE_PACKAGING_FILES = frozenset(
     {
         ".github/workflows/platform-host-tools-candidate.yml",
+        ".github/workflows/platform-codex-archive-retention-build.yml",
         ".github/workflows/platform-production-autodeploy.yml",
         ".github/workflows/platform-security.yml",
         "platform/tests/test_platform_ci_classifier.py",
@@ -153,6 +152,14 @@ CANDIDATE_PACKAGING_FILES = frozenset(
         "platform/tests/test_platform_host_tools_bundle.py",
         "platform/tools/platform_test_catalog.py",
         "platform/tools/platform_verify_contract.py",
+        "platform/tools/codex_archive_retention/__init__.py",
+        "platform/tools/codex_archive_retention/cleanup.py",
+        "platform/tools/codex_archive_retention/verify_artifact.py",
+        "platform/tools/codex_archive_retention/codex-source.lock.json",
+        "platform/tools/codex_archive_retention/codex-archive-retention.service",
+        "platform/tools/codex_archive_retention/codex-archive-retention.timer",
+        "platform/tools/codex_archive_retention/patches/codex-0.166.0.patch",
+        "platform/tests/test_platform_codex_archive_retention.py",
     }
 )
 CANDIDATE_PACKAGING_REASON = (

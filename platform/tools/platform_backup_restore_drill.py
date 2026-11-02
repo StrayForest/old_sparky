@@ -93,7 +93,7 @@ SCRATCH_MEMORY_RESERVE_BYTES = 384 * 1024**2
 SCRATCH_MEMORY_ADMISSION_BYTES = SCRATCH_MEMORY_MAX_BYTES + SCRATCH_MEMORY_RESERVE_BYTES
 SCRATCH_SHARED_BUFFERS_MB = 16
 PROTECTED_BACKUP_MANIFEST_MAX_BYTES = 64 * 1024
-PROTECTED_BACKUP_MINIMUM_KEEP = 15
+PROTECTED_BACKUP_MINIMUM_KEEP = 1
 PROTECTED_BACKUP_DUMP_RE = re.compile(r"platformdb-[0-9]{8}T[0-9]{6}Z\.dump\Z")
 SCRATCH_ADMISSION_RSS_MAX_BYTES = 1 << 40
 SCRATCH_PROC_STATUS_MAX_BYTES = 16 * 1024
@@ -2818,28 +2818,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--env-file", default=str(DEFAULT_ENV_FILE))
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
-    parser.add_argument("--keep", type=int, default=14)
+    parser.add_argument("--keep", type=int, default=1)
     parser.add_argument(
         "--protected-backup-manifest",
         type=pathlib.Path,
         default=None,
-        help="Private root-owned schema-1 list of exact backup dump basenames to preserve.",
+        help="Private root-owned schema-1 retention audit list; entries do not override keep-one rotation.",
     )
     rotation = parser.add_mutually_exclusive_group()
-    rotation.add_argument(
-        "--preserve-existing",
-        dest="rotate_existing",
-        action="store_false",
-        help="Keep every pre-existing archive and sidecar; do not rotate backups.",
-    )
     rotation.add_argument(
         "--rotate-existing",
         dest="rotate_existing",
         action="store_true",
         help="Apply the requested retention policy to older verified backups.",
     )
-    # Keep the low-level CLI's historical rotation behavior. Backup-only
-    # maintenance opts into preservation explicitly through its own caller.
     parser.set_defaults(rotate_existing=True)
     parser.add_argument(
         "--admin-database-url",
@@ -4366,63 +4358,52 @@ def prune_backups(
     protected_dump_files: frozenset[str] = frozenset(),
     verified_only: bool = False,
     expected_verified_order: tuple[dict[str, Any], ...] | None = None,
+    retained_dump_file: str | None = None,
 ) -> list[str]:
-    if keep < 1:
-        raise ValueError("--keep must be at least 1.")
-    if expected_verified_order is not None:
-        if not verified_only:
-            raise ValueError("Expected verified order requires verified-only pruning.")
-        current_order = _verified_backup_candidate_order(output_dir)
-        if current_order != expected_verified_order:
-            raise RuntimeError("Verified backup inventory changed before retention.")
-        removed: list[str] = []
-        for expected in expected_verified_order[:-keep]:
-            dump_name = expected["dump_file"]
-            if dump_name in protected_dump_files:
-                continue
-            current = _backup_retention_pair_row(output_dir, dump_name)
-            if current != expected:
-                raise RuntimeError("Verified backup pair changed before retention.")
-            dump_path = output_dir / dump_name
-            metadata_path = dump_path.with_suffix(".json")
-            sidecar_stat, sidecar_digest, _sidecar_bytes = _inventory_file(metadata_path)
-            if (
-                _backup_retention_stat_identity(sidecar_stat) != expected["sidecar_identity"]
-                or sidecar_digest != expected["sidecar_content_sha256"]
-            ):
-                raise RuntimeError("Verified backup sidecar changed before retention.")
-            dump_path.unlink()
-            removed.append(str(dump_path))
-            metadata_path.unlink()
-            removed.append(str(metadata_path))
-        return removed
-    dumps: list[pathlib.Path] = []
-    for path in output_dir.glob("platformdb-*.dump"):
-        if verified_only:
-            metadata_path = path.with_suffix(".json")
-            try:
-                _metadata_stat, _digest, raw = _inventory_file(metadata_path)
-                metadata = json.loads((raw or b"").decode("utf-8"))
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError, RuntimeError):
-                continue
-            if (
-                not isinstance(metadata, dict)
-                or metadata.get("dump_file") != path.name
-                or metadata.get("restore_verified") is not True
-            ):
-                continue
-        dumps.append(path)
-    dumps.sort(key=lambda path: path.stat().st_mtime)
+    if (
+        keep != 1
+        or expected_verified_order is None
+        or retained_dump_file is None
+        or PROTECTED_BACKUP_DUMP_RE.fullmatch(retained_dump_file) is None
+        or not verified_only
+        or protected_dump_files
+    ):
+        raise ValueError("Identity-bound keep-one retention plan is required.")
     removed: list[str] = []
-    for dump_path in dumps[:-keep]:
-        if dump_path.name in protected_dump_files:
+    current_order = _verified_backup_candidate_order(output_dir)
+    if current_order != expected_verified_order:
+        raise RuntimeError("Verified backup inventory changed before retention.")
+    expected_retained = [
+        row for row in expected_verified_order if row["dump_file"] == retained_dump_file
+    ]
+    if len(expected_retained) != 1:
+        raise RuntimeError("Selected latest verified backup is absent from the inventory.")
+    for expected in expected_verified_order:
+        if expected["dump_file"] == retained_dump_file:
             continue
+        dump_path = output_dir / expected["dump_file"]
         metadata_path = dump_path.with_suffix(".json")
+        current = _backup_retention_pair_row(output_dir, expected["dump_file"])
+        if current != expected:
+            raise RuntimeError("Verified backup pair changed before retention.")
+        dump_stat = _stable_backup_stat(dump_path)
+        sidecar_stat, sidecar_digest, _ = _inventory_file(metadata_path)
+        if (
+            _backup_retention_stat_identity(dump_stat) != expected["dump_identity"]
+            or _backup_retention_stat_identity(sidecar_stat) != expected["sidecar_identity"]
+            or sidecar_digest != expected["sidecar_content_sha256"]
+        ):
+            raise RuntimeError("Verified backup pair changed before retention.")
         dump_path.unlink()
         removed.append(str(dump_path))
-        if metadata_path.exists():
-            metadata_path.unlink()
-            removed.append(str(metadata_path))
+        sidecar_stat, sidecar_digest, _ = _inventory_file(metadata_path)
+        if (
+            _backup_retention_stat_identity(sidecar_stat) != expected["sidecar_identity"]
+            or sidecar_digest != expected["sidecar_content_sha256"]
+        ):
+            raise RuntimeError("Verified backup sidecar changed before sidecar unlink.")
+        metadata_path.unlink()
+        removed.append(str(metadata_path))
     return removed
 
 
@@ -4433,101 +4414,42 @@ def prune_unverified_backups(
     protected_dump_files: frozenset[str] = frozenset(),
     expected_candidate_order: tuple[dict[str, Any], ...] | None = None,
 ) -> list[str]:
-    if expected_candidate_order is not None:
-        current_order = _unverified_backup_candidate_order(
+    if expected_candidate_order is None or protected_dump_files:
+        raise ValueError("Identity-bound unverified retention plan is required.")
+    current_order = _unverified_backup_candidate_order(
+        output_dir,
+        preserve_metadata=preserve_metadata,
+        protected_dump_files=protected_dump_files,
+    )
+    if current_order != expected_candidate_order:
+        raise RuntimeError("Unverified backup inventory changed before retention.")
+    removed: list[str] = []
+    for expected in expected_candidate_order:
+        pair = expected["pair"]
+        dump_path = output_dir / pair["dump_file"]
+        metadata_path = dump_path.with_suffix(".json")
+        current = _unverified_backup_candidate_row(
             output_dir,
+            pair["dump_file"],
             preserve_metadata=preserve_metadata,
             protected_dump_files=protected_dump_files,
         )
-        if current_order != expected_candidate_order:
-            raise RuntimeError("Unverified backup inventory changed before retention.")
-        removed: list[str] = []
-        for expected in expected_candidate_order:
-            current = _unverified_backup_candidate_row(
-                output_dir,
-                expected["pair"]["dump_file"],
-                preserve_metadata=preserve_metadata,
-                protected_dump_files=protected_dump_files,
-            )
-            if current != expected:
-                raise RuntimeError("Unverified backup pair changed before retention.")
-            dump_path = output_dir / expected["pair"]["dump_file"]
-            metadata_path = dump_path.with_suffix(".json")
-            current_sidecar_stat, current_sidecar_digest, _raw = _inventory_file(metadata_path)
-            if (
-                _backup_retention_stat_identity(current_sidecar_stat)
-                != expected["pair"]["sidecar_identity"]
-                or current_sidecar_digest != expected["pair"]["sidecar_content_sha256"]
-            ):
-                raise RuntimeError("Unverified backup sidecar changed before retention.")
-            dump_path.unlink()
-            metadata_path.unlink()
-            removed.extend((str(metadata_path), str(dump_path)))
-        return removed
-
-    candidates: list[
-        tuple[pathlib.Path, pathlib.Path, tuple[int, ...], tuple[int, ...], str]
-    ] = []
-
-    def stat_identity(info: os.stat_result) -> tuple[int, ...]:
-        return (
-            info.st_dev,
-            info.st_ino,
-            info.st_mode,
-            info.st_uid,
-            info.st_gid,
-            info.st_nlink,
-            info.st_size,
-            info.st_mtime_ns,
-            info.st_ctime_ns,
-        )
-
-    for metadata_path in output_dir.glob("platformdb-*.json"):
-        if metadata_path == preserve_metadata:
-            continue
-        if f"{metadata_path.stem}.dump" in protected_dump_files:
-            continue
-        try:
-            metadata_stat, metadata_digest, raw = _inventory_file(metadata_path)
-            metadata = json.loads((raw or b"").decode("utf-8"))
-        except (OSError, UnicodeDecodeError, ValueError, RuntimeError):
-            continue
-        if not isinstance(metadata, dict):
-            continue
-        if metadata.get("restore_verified"):
-            continue
-        dump_file = metadata.get("dump_file")
-        dump_name = metadata_path.with_suffix(".dump").name
-        if (
-            PROTECTED_BACKUP_DUMP_RE.fullmatch(dump_name) is None
-            or dump_file != dump_name
-        ):
-            raise RuntimeError("Refusing unverified backup metadata with a mismatched dump name.")
-        dump_path = metadata_path.with_suffix(".dump")
         dump_stat = _stable_backup_stat(dump_path)
-        candidates.append(
-            (
-                dump_path,
-                metadata_path,
-                stat_identity(dump_stat),
-                stat_identity(metadata_stat),
-                metadata_digest,
-            )
-        )
-
-    removed: list[str] = []
-    for dump_path, metadata_path, dump_identity, metadata_identity, metadata_digest in candidates:
-        # Recheck the exact paired names immediately before unlinking.  The
-        # metadata value is never used as a filesystem path.
-        if stat_identity(_stable_backup_stat(dump_path)) != dump_identity:
-            raise RuntimeError("Unverified backup archive changed before prune.")
-        current_metadata, current_digest, _raw = _inventory_file(metadata_path)
+        sidecar_stat, sidecar_digest, _ = _inventory_file(metadata_path)
         if (
-            stat_identity(current_metadata) != metadata_identity
-            or current_digest != metadata_digest
+            current != expected
+            or _backup_retention_stat_identity(dump_stat) != pair["dump_identity"]
+            or _backup_retention_stat_identity(sidecar_stat) != pair["sidecar_identity"]
+            or sidecar_digest != pair["sidecar_content_sha256"]
         ):
-            raise RuntimeError("Unverified backup sidecar changed before prune.")
+            raise RuntimeError("Unverified backup pair changed before retention.")
         dump_path.unlink()
+        sidecar_stat, sidecar_digest, _ = _inventory_file(metadata_path)
+        if (
+            _backup_retention_stat_identity(sidecar_stat) != pair["sidecar_identity"]
+            or sidecar_digest != pair["sidecar_content_sha256"]
+        ):
+            raise RuntimeError("Unverified backup sidecar changed before sidecar unlink.")
         metadata_path.unlink()
         removed.extend((str(metadata_path), str(dump_path)))
     return removed
@@ -4550,6 +4472,7 @@ def _retention_domain_digest(domain: str, value: Any) -> str:
         "verified-backup-candidates",
         "verified-backup-selection",
         "backup-retention-removals",
+        "backup-retention-inventory",
     }:
         raise ValueError("Unknown protected retention digest domain.")
     return hashlib.sha256(
@@ -4667,6 +4590,20 @@ def _protected_backup_manifest_snapshot(path: pathlib.Path) -> dict[str, Any]:
     return snapshot
 
 
+def _empty_backup_retention_input_snapshot() -> dict[str, Any]:
+    """Represent the absence of an optional audit manifest without a protection policy."""
+
+    snapshot: dict[str, Any] = {
+        "identity": [0] * 9,
+        "content_sha256": hashlib.sha256(b"").hexdigest(),
+        "protected_dump_files": [],
+    }
+    snapshot["digest"] = _retention_domain_digest(
+        "protected-backup-manifest", snapshot
+    )
+    return snapshot
+
+
 def _load_protected_backup_manifest(path: pathlib.Path) -> frozenset[str]:
     """Compatibility wrapper returning the validated manifest names."""
 
@@ -4749,6 +4686,34 @@ def _backup_retention_pair_row(
     }
 
 
+def _backup_retention_inventory(
+    output_dir: pathlib.Path, *, allowed_temporary_names: frozenset[str] = frozenset()
+) -> tuple[dict[str, Any], ...]:
+    """Snapshot complete pair identities and sidecar claims without reading dumps."""
+
+    entries = tuple(output_dir.iterdir())
+    staged = {
+        path.name
+        for path in entries
+        if path.name.startswith(".platformdb-") and path.name.endswith(".tmp")
+    }
+    if staged - allowed_temporary_names:
+        raise RuntimeError("Refusing incomplete staged backup files.")
+    names = {
+        path.name for path in entries
+        if path.name.startswith("platformdb-") and path.suffix in {".dump", ".json"}
+    }
+    dump_names = {name for name in names if name.endswith(".dump")}
+    sidecar_names = {name for name in names if name.endswith(".json")}
+    if {name[:-5] + ".json" for name in dump_names} != sidecar_names:
+        raise RuntimeError("Refusing incomplete existing backup pairs.")
+    return tuple(_backup_retention_pair_row(output_dir, name) for name in sorted(dump_names))
+
+
+def _backup_retention_inventory_digest(rows: tuple[dict[str, Any], ...]) -> str:
+    return _retention_domain_digest("backup-retention-inventory", list(rows))
+
+
 def _backup_restore_status_class(metadata: dict[str, Any]) -> str:
     if "restore_verified" not in metadata:
         return "missing"
@@ -4779,7 +4744,6 @@ def _unverified_backup_candidate_row(
 ) -> dict[str, Any] | None:
     if (
         PROTECTED_BACKUP_DUMP_RE.fullmatch(dump_name) is None
-        or dump_name in protected_dump_files
     ):
         raise RuntimeError("Unverified backup candidate name is not eligible.")
     dump_path = output_dir / dump_name
@@ -4834,9 +4798,11 @@ def _unverified_backup_candidate_order(
         try:
             _metadata_stat, _metadata_digest, raw = _inventory_file(metadata_path)
             metadata = json.loads((raw or b"").decode("utf-8"))
-        except (OSError, UnicodeDecodeError, ValueError, RuntimeError):
-            continue
-        if not isinstance(metadata, dict) or metadata.get("restore_verified"):
+        except (OSError, UnicodeDecodeError, ValueError, RuntimeError) as exc:
+            raise RuntimeError("Backup sidecar could not be safely classified for retention.") from exc
+        if not isinstance(metadata, dict):
+            raise RuntimeError("Backup sidecar is not a retention metadata object.")
+        if metadata.get("restore_verified") is True:
             continue
         if (
             PROTECTED_BACKUP_DUMP_RE.fullmatch(dump_name) is None
@@ -4858,10 +4824,20 @@ def _unverified_backup_candidate_order(
 def _protected_backup_pair_rows(
     output_dir: pathlib.Path, dump_names: frozenset[str]
 ) -> list[dict[str, Any]]:
-    return [
-        _backup_retention_pair_row(output_dir, dump_name)
-        for dump_name in sorted(dump_names)
-    ]
+    rows = []
+    for dump_name in sorted(dump_names):
+        dump_path = output_dir / dump_name
+        metadata_path = dump_path.with_suffix(".json")
+        try:
+            dump_path.lstat()
+        except FileNotFoundError:
+            try:
+                metadata_path.lstat()
+            except FileNotFoundError:
+                continue
+            raise RuntimeError("Named backup sidecar remains without its dump.")
+        rows.append(_backup_retention_pair_row(output_dir, dump_name))
+    return rows
 
 
 def _verified_backup_candidate_order(
@@ -4871,10 +4847,7 @@ def _verified_backup_candidate_order(
     for dump_path in output_dir.glob("platformdb-*.dump"):
         if PROTECTED_BACKUP_DUMP_RE.fullmatch(dump_path.name) is None:
             continue
-        try:
-            row = _backup_retention_pair_row(output_dir, dump_path.name)
-        except (OSError, RuntimeError, UnicodeDecodeError, json.JSONDecodeError):
-            continue
+        row = _backup_retention_pair_row(output_dir, dump_path.name)
         if row["restore_verified"] == "true":
             rows.append(row)
     return tuple(sorted(rows, key=lambda row: (row["dump_identity"][7], row["dump_file"])))
@@ -4907,15 +4880,12 @@ def _removed_backup_pair_rows(
         raise RuntimeError("Retention did not remove complete backup pairs.")
     if len(removed_paths) != 2 * len(dump_names):
         raise RuntimeError("Retention reported an incomplete backup-pair removal set.")
-    if dump_names & protected_dump_files:
-        raise RuntimeError("Retention removed a named protected backup pair.")
     verified_by_name = {row["dump_file"]: row for row in verified_candidate_order}
     selected_names = {row["dump_file"] for row in selected_order}
-    retained_count = len(selected_order)
     expected_verified_removals = {
         row["dump_file"]
-        for row in verified_candidate_order[:-retained_count]
-        if row["dump_file"] not in protected_dump_files
+        for row in verified_candidate_order
+        if row["dump_file"] not in selected_names
     }
     unverified_by_name = {
         candidate["pair"]["dump_file"]: candidate
@@ -4981,17 +4951,17 @@ def valid_protected_retention_proof(
         type(value.get("schema_version")) is not int
         or value["schema_version"] != 1
         or value.get("status") != "pass"
-        or value.get("policy") != "protected-plus-latest-verified-v1"
+        or value.get("policy") != "latest-restore-verified-only-v1"
         or value.get("rotation_mode") != "rotate-existing"
         or type(value.get("requested_keep")) is not int
         or value["requested_keep"] != requested_keep
         or requested_keep < 1
         or type(value.get("effective_verified_keep")) is not int
-        or value["effective_verified_keep"] != max(requested_keep, PROTECTED_BACKUP_MINIMUM_KEEP)
+        or value["effective_verified_keep"] != 1
         or type(value.get("removed_pair_count")) is not int
         or value["removed_pair_count"] < 0
         or type(value.get("protected_removed_count")) is not int
-        or value["protected_removed_count"] != 0
+        or value["protected_removed_count"] < 0
     ):
         return False
 
@@ -5015,7 +4985,6 @@ def valid_protected_retention_proof(
             not valid_identity(snapshot.get("identity"))
             or not valid_digest(snapshot.get("content_sha256"))
             or not isinstance(names, list)
-            or not names
             or any(
                 not isinstance(name, str)
                 or PROTECTED_BACKUP_DUMP_RE.fullmatch(name) is None
@@ -5023,6 +4992,11 @@ def valid_protected_retention_proof(
             )
             or names != sorted(set(names))
             or not valid_digest(snapshot.get("digest"))
+        ):
+            return False
+        if not names and (
+            snapshot["identity"] != [0] * 9
+            or snapshot["content_sha256"] != hashlib.sha256(b"").hexdigest()
         ):
             return False
         body = {key: snapshot[key] for key in ("identity", "content_sha256", "protected_dump_files")}
@@ -5079,28 +5053,31 @@ def valid_protected_retention_proof(
     protected_after = protected.get("after")
     if (
         type(protected.get("count")) is not int
-        or protected["count"] <= 0
+        or protected["count"] < 0
         or not isinstance(protected_before, list)
         or not isinstance(protected_after, list)
         or any(not valid_pair_row(row) for row in protected_before)
         or any(not valid_pair_row(row) for row in protected_after)
         or [row["dump_file"] for row in protected_before]
         != sorted({row["dump_file"] for row in protected_before})
-        or protected_before != protected_after
         or protected["count"] != len(protected_before)
-        or [row["dump_file"] for row in protected_before]
-        != manifest["before"]["protected_dump_files"]
         or type(protected.get("unchanged")) is not bool
-        or protected["unchanged"] is not True
+        or protected["unchanged"] is not (protected_before == protected_after)
         or type(protected.get("removed_count")) is not int
-        or protected["removed_count"] != 0
+        or protected["removed_count"] != len(protected_before) - len(protected_after)
         or not valid_digest(protected.get("before_digest"))
         or not valid_digest(protected.get("after_digest"))
         or protected["before_digest"]
         != _retention_domain_digest("protected-backup-pairs", protected_before)
         or protected["after_digest"]
         != _retention_domain_digest("protected-backup-pairs", protected_after)
-        or protected["before_digest"] != protected["after_digest"]
+        or not set(row["dump_file"] for row in protected_after).issubset(
+            set(row["dump_file"] for row in protected_before)
+        )
+        or any(not valid_pair_row(row, expected_verified="true") for row in protected_after)
+        or not set(row["dump_file"] for row in protected_before).issubset(
+            set(manifest["before"]["protected_dump_files"])
+        )
     ):
         return False
 
@@ -5134,11 +5111,12 @@ def valid_protected_retention_proof(
     expected_order = sorted(candidates, key=lambda row: (row["dump_identity"][7], row["dump_file"]))
     if candidates != expected_order:
         return False
-    expected_retained_count = min(effective_keep, len(candidates))
-    expected_selected = candidates[-expected_retained_count:] if expected_retained_count else []
+    expected_retained_count = 1 if candidates else 0
+    expected_selected = [row for row in candidates if row["dump_file"] == new_dump_file]
     if (
         type(selection.get("retained_count")) is not int
         or selection["retained_count"] != expected_retained_count
+        or len(expected_selected) != 1
         or not isinstance(selected, list)
         or selected != expected_selected
         or not isinstance(retained_after, list)
@@ -5154,6 +5132,11 @@ def valid_protected_retention_proof(
         != _retention_domain_digest("verified-backup-selection", retained_after)
         or selection["selected_before_digest"] != selection["selected_after_digest"]
         or new_dump_file not in {row["dump_file"] for row in selected}
+    ):
+        return False
+    if set(row["dump_file"] for row in protected_after) != (
+        set(row["dump_file"] for row in protected_before)
+        & set(row["dump_file"] for row in selected)
     ):
         return False
 
@@ -5213,25 +5196,30 @@ def valid_protected_retention_proof(
         )
         or [row["dump_file"] for row in removed_pairs]
         != sorted({row["dump_file"] for row in removed_pairs})
-        or {row["dump_file"] for row in removed_pairs}
-        & set(manifest["before"]["protected_dump_files"])
         or not valid_digest(value.get("removed_pairs_digest"))
         or value["removed_pairs_digest"]
         != _retention_domain_digest("backup-retention-removals", removed_pairs)
     ):
         return False
     verified_by_name = {row["dump_file"]: row for row in candidates}
-    expected_verified_removed = {
-        row["dump_file"]
-        for row in candidates[:-expected_retained_count]
-        if row["dump_file"] not in set(manifest["before"]["protected_dump_files"])
-    }
+    selected_names = {row["dump_file"] for row in selected}
+    expected_verified_removed = {row["dump_file"] for row in candidates} - selected_names
     actual_verified_removed = {
         row["dump_file"]
         for row in removed_pairs
         if row["reason"] == "verified-retention"
     }
     if actual_verified_removed != expected_verified_removed:
+        return False
+    expected_removed_names = expected_verified_removed | {
+        row["dump_file"] for row in removed_pairs if row["reason"] == "unverified"
+    }
+    if {row["dump_file"] for row in removed_pairs} != expected_removed_names:
+        return False
+    if value["protected_removed_count"] != sum(
+        1 for row in removed_pairs
+        if row["dump_file"] in set(manifest["before"]["protected_dump_files"])
+    ):
         return False
     for row in removed_pairs:
         if row["reason"] == "verified-retention" and row["pair"] != verified_by_name.get(
@@ -5258,7 +5246,7 @@ def _assert_protected_retention_inputs_unchanged(
 
 def _build_protected_retention_proof(
     *,
-    manifest_path: pathlib.Path,
+    manifest_path: pathlib.Path | None,
     manifest_before: dict[str, Any],
     output_dir: pathlib.Path,
     protected_dump_files: frozenset[str],
@@ -5271,24 +5259,21 @@ def _build_protected_retention_proof(
     new_dump_file: str,
     removed_paths: list[str],
 ) -> dict[str, Any]:
-    manifest_after = _protected_backup_manifest_snapshot(manifest_path)
+    manifest_after = (
+        _protected_backup_manifest_snapshot(manifest_path)
+        if manifest_path is not None
+        else manifest_before
+    )
     if manifest_after != manifest_before:
         raise RuntimeError("Protected backup manifest changed during retention.")
     protected_pairs_after = _protected_backup_pair_rows(output_dir, protected_dump_files)
-    if protected_pairs_after != protected_pairs_before:
-        raise RuntimeError("Protected backup pair changed during retention.")
 
     verified_after_order = _verified_backup_candidate_order(output_dir)
     after_by_name = {row["dump_file"]: row for row in verified_after_order}
     selected_names = {row["dump_file"] for row in selected_order}
-    old_protected_verified_names = {
-        row["dump_file"]
-        for row in verified_candidate_order
-        if row["dump_file"] in protected_dump_files and row["dump_file"] not in selected_names
-    }
-    expected_after_names = selected_names | old_protected_verified_names
+    expected_after_names = selected_names
     if set(after_by_name) != expected_after_names:
-        raise RuntimeError("Verified backup retention did not match the protected latest selection.")
+        raise RuntimeError("Verified backup retention did not leave exactly the latest selection.")
     retained_after = [after_by_name[row["dump_file"]] for row in selected_order]
     if retained_after != selected_order:
         raise RuntimeError("Selected verified backup pair changed during retention.")
@@ -5298,7 +5283,7 @@ def _build_protected_retention_proof(
     remaining_unverified = _unverified_backup_candidate_order(
         output_dir,
         preserve_metadata=output_dir / f"{new_dump_file[:-5]}.json",
-        protected_dump_files=protected_dump_files,
+        protected_dump_files=frozenset(),
     )
     if remaining_unverified:
         raise RuntimeError("Unverified backup retention left eligible pairs behind.")
@@ -5306,7 +5291,7 @@ def _build_protected_retention_proof(
     removed_pairs = _removed_backup_pair_rows(
         output_dir,
         removed_paths,
-        protected_dump_files,
+        frozenset(),
         unverified_candidate_order=unverified_candidate_order,
         verified_candidate_order=verified_candidate_order,
         selected_order=selected_order,
@@ -5315,8 +5300,6 @@ def _build_protected_retention_proof(
     protected_removed_count = sum(
         1 for row in removed_pairs if row["dump_file"] in protected_names
     )
-    if protected_removed_count:
-        raise RuntimeError("Retention removed a named protected backup pair.")
 
     protected_before_digest = _retention_domain_digest(
         "protected-backup-pairs", protected_pairs_before
@@ -5333,7 +5316,7 @@ def _build_protected_retention_proof(
     proof = {
         "schema_version": 1,
         "status": "pass",
-        "policy": "protected-plus-latest-verified-v1",
+        "policy": "latest-restore-verified-only-v1",
         "rotation_mode": "rotate-existing",
         "requested_keep": requested_keep,
         "effective_verified_keep": effective_keep,
@@ -5348,8 +5331,8 @@ def _build_protected_retention_proof(
             "after": protected_pairs_after,
             "before_digest": protected_before_digest,
             "after_digest": protected_after_digest,
-            "unchanged": True,
-            "removed_count": protected_removed_count,
+            "unchanged": protected_pairs_before == protected_pairs_after,
+            "removed_count": len(protected_pairs_before) - len(protected_pairs_after),
         },
         "verified_selection": {
             "available_count": len(verified_candidate_order),
@@ -12234,7 +12217,7 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
     protected_manifest_before = (
         _protected_backup_manifest_snapshot(protected_manifest_path)
         if protected_manifest_path is not None
-        else None
+        else _empty_backup_retention_input_snapshot()
     )
     protected_dump_files = (
         frozenset(protected_manifest_before["protected_dump_files"])
@@ -12242,6 +12225,8 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
         else frozenset()
     )
     protected_pairs_before: list[dict[str, Any]] = []
+    if getattr(args, "rotate_existing", True) and args.keep != 1:
+        raise ValueError("Backup retention policy requires exactly one retained copy.")
     if protected_dump_files:
         if type(args.keep) is not int or args.keep < 1:
             raise ValueError("--keep must be at least 1.")
@@ -12259,11 +12244,10 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
     app_target = parse_database_url(database_url)
     output_dir.mkdir(parents=True, exist_ok=True)
     rotate_existing = bool(getattr(args, "rotate_existing", True))
-    preserve_existing = not rotate_existing
-    initial_inventory = backup_inventory(output_dir) if preserve_existing else ()
-    if preserve_existing and initial_inventory:
-        validate_complete_backup_pairs(output_dir, initial_inventory)
-    initial_inventory_digest = backup_inventory_digest(initial_inventory)
+    if not rotate_existing:
+        raise ValueError("Backup preservation mode is disabled by the keep-one policy.")
+    initial_inventory = _backup_retention_inventory(output_dir)
+    initial_inventory_digest = _backup_retention_inventory_digest(initial_inventory)
     timestamp = utc_now()
     timestamp_slug = timestamp.strftime("%Y%m%dT%H%M%SZ")
     dump_path = output_dir / f"platformdb-{timestamp_slug}.dump"
@@ -12354,25 +12338,26 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
             "restored_table_count": restored_table_count,
             "restore_error": None,
         }
-        if preserve_existing:
-            before_publish_inventory = backup_inventory(output_dir)
-            validate_complete_backup_pairs(output_dir, before_publish_inventory)
-            before_publish_digest = backup_inventory_digest(before_publish_inventory)
-            if before_publish_inventory != initial_inventory:
-                raise RuntimeError("Pre-existing backup inventory changed before publication.")
-            metadata.update(
-                {
-                    "preexisting_archive_count": sum(
-                        1 for entry in initial_inventory if entry[0].endswith(".dump")
-                    ),
-                    "preexisting_sidecar_count": sum(
-                        1 for entry in initial_inventory if entry[0].endswith(".json")
-                    ),
-                    "preexisting_archive_inventory_sha256": initial_inventory_digest,
-                    "postexisting_archive_inventory_sha256": before_publish_digest,
-                    "preexisting_archives_preserved": True,
-                }
-            )
+        before_publish_inventory = _backup_retention_inventory(
+            output_dir,
+            allowed_temporary_names=frozenset(
+                path.name
+                for path in (temporary_dump_path, temporary_metadata_path)
+                if path is not None
+            ),
+        )
+        before_publish_digest = _backup_retention_inventory_digest(before_publish_inventory)
+        if before_publish_inventory != initial_inventory:
+            raise RuntimeError("Pre-existing backup inventory changed before publication.")
+        metadata.update(
+            {
+                "preexisting_archive_count": len(initial_inventory),
+                "preexisting_sidecar_count": len(initial_inventory),
+                "preexisting_archive_inventory_sha256": initial_inventory_digest,
+                "postexisting_archive_inventory_sha256": before_publish_digest,
+                "preexisting_archives_preserved": False,
+            }
+        )
         metadata_fd, metadata_tmp_name = tempfile.mkstemp(
             prefix=f".{metadata_path.name}.", suffix=".tmp", dir=output_dir
         )
@@ -12402,10 +12387,10 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
         removed: list[str] = []
         protected_retention_proof: dict[str, Any] | None = None
         if restore_verified and rotate_existing:
-            if protected_dump_files:
-                if protected_manifest_path is None or protected_manifest_before is None:
-                    raise RuntimeError("Protected backup manifest snapshot is unavailable.")
-                effective_keep = max(args.keep, PROTECTED_BACKUP_MINIMUM_KEEP)
+            if args.keep != 1:
+                raise RuntimeError("Backup retention policy requires exactly one retained copy.")
+            effective_keep = 1
+            if protected_manifest_path is not None:
                 _assert_protected_retention_inputs_unchanged(
                     protected_manifest_path,
                     protected_manifest_before,
@@ -12414,7 +12399,10 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
                     protected_pairs_before,
                 )
                 verified_candidate_order = _verified_backup_candidate_order(output_dir)
-                selected_order = list(verified_candidate_order[-effective_keep:])
+                selected_order = [
+                    row for row in verified_candidate_order
+                    if row["dump_file"] == dump_path.name
+                ]
                 if dump_path.name not in {row["dump_file"] for row in selected_order}:
                     raise RuntimeError(
                         "New verified backup is outside the retained latest selection."
@@ -12422,34 +12410,42 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
                 unverified_candidate_order = _unverified_backup_candidate_order(
                     output_dir,
                     preserve_metadata=metadata_path,
-                    protected_dump_files=protected_dump_files,
+                    protected_dump_files=frozenset(),
                 )
-                removed.extend(
-                    prune_unverified_backups(
-                        output_dir,
-                        preserve_metadata=metadata_path,
-                        protected_dump_files=protected_dump_files,
-                        expected_candidate_order=unverified_candidate_order,
-                    )
-                )
-                _assert_protected_retention_inputs_unchanged(
-                    protected_manifest_path,
-                    protected_manifest_before,
+            else:
+                verified_candidate_order = _verified_backup_candidate_order(output_dir)
+                selected_order = [
+                    row for row in verified_candidate_order
+                    if row["dump_file"] == dump_path.name
+                ]
+                unverified_candidate_order = _unverified_backup_candidate_order(
                     output_dir,
-                    protected_dump_files,
-                    protected_pairs_before,
+                    preserve_metadata=metadata_path,
+                    protected_dump_files=frozenset(),
                 )
-                if _verified_backup_candidate_order(output_dir) != verified_candidate_order:
-                    raise RuntimeError("Verified backup inventory changed before retention.")
-                removed.extend(
-                    prune_backups(
-                        output_dir,
-                        keep=effective_keep,
-                        protected_dump_files=protected_dump_files,
-                        verified_only=True,
-                        expected_verified_order=verified_candidate_order,
-                    )
+            if dump_path.name not in {row["dump_file"] for row in selected_order}:
+                raise RuntimeError("New verified backup is not the latest retained selection.")
+            removed.extend(
+                prune_unverified_backups(
+                    output_dir,
+                    preserve_metadata=metadata_path,
+                    protected_dump_files=frozenset(),
+                    expected_candidate_order=unverified_candidate_order,
                 )
+            )
+            if _verified_backup_candidate_order(output_dir) != verified_candidate_order:
+                raise RuntimeError("Verified backup inventory changed before retention.")
+            removed.extend(
+                prune_backups(
+                    output_dir,
+                    keep=effective_keep,
+                    protected_dump_files=frozenset(),
+                    verified_only=True,
+                    expected_verified_order=verified_candidate_order,
+                    retained_dump_file=dump_path.name,
+                )
+            )
+            if protected_manifest_before is not None:
                 protected_retention_proof = _build_protected_retention_proof(
                     manifest_path=protected_manifest_path,
                     manifest_before=protected_manifest_before,
@@ -12464,20 +12460,13 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
                     new_dump_file=dump_path.name,
                     removed_paths=removed,
                 )
-            else:
-                removed.extend(
-                    prune_unverified_backups(
-                        output_dir, preserve_metadata=metadata_path
-                    )
-                )
-                removed.extend(prune_backups(output_dir, keep=args.keep))
         elif (
             protected_dump_files
             and protected_manifest_path is not None
             and protected_manifest_before is not None
         ):
-            # Non-rotating preserve mode keeps every old pair, but reports no
-            # rotation proof because it has not selected or pruned a suffix.
+            # A failed restore never prunes; confirm the audit inputs stayed
+            # unchanged before returning the failure result.
             _assert_protected_retention_inputs_unchanged(
                 protected_manifest_path,
                 protected_manifest_before,
@@ -12486,21 +12475,14 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
                 protected_pairs_before,
             )
         postexisting_archive_count: int | None = None
-        if preserve_existing:
-            post_publish_inventory = backup_inventory(output_dir)
-            validate_complete_backup_pairs(output_dir, post_publish_inventory)
-            postexisting_archive_count = sum(
-                1 for entry in post_publish_inventory if entry[0].endswith(".dump")
-            )
-            expected_archive_count = sum(
-                1 for entry in initial_inventory if entry[0].endswith(".dump")
-            ) + 1
-            if postexisting_archive_count != expected_archive_count:
-                raise RuntimeError("Preserve mode did not retain exactly one new complete backup pair.")
+        post_publish_inventory = _backup_retention_inventory(output_dir)
+        postexisting_archive_count = len(post_publish_inventory)
+        if restore_verified and rotate_existing and postexisting_archive_count != 1:
+            raise RuntimeError("Backup retention did not leave exactly one complete pair.")
         result = {
             "ok": True,
             **metadata,
-            "rotation_mode": "rotate-existing" if rotate_existing else "preserve-existing",
+            "rotation_mode": "rotate-existing",
             "metadata_file": str(metadata_path),
             "removed": removed,
             "postexisting_archive_count": postexisting_archive_count,
@@ -12515,10 +12497,7 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
             (temporary_dump_identity.st_dev, temporary_dump_identity.st_ino),
         )
         _unlink_if_same_inode(temporary_metadata_path, temporary_metadata_identity)
-        if active_exception is not None and (
-            preserve_existing
-            or (published_dump_identity is not None and not published_directory_synced)
-        ):
+        if active_exception is not None and published_dump_identity is not None and not published_directory_synced:
             try:
                 _rollback_published_backup_pair(
                     dump_path,
@@ -12533,54 +12512,6 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
                     "new_pair_rollback_failed",
                 )
                 active_exception.add_note(str(rollback_error))
-        if preserve_existing:
-            try:
-                current_inventory = backup_inventory(output_dir)
-                validate_complete_backup_pairs(output_dir, current_inventory)
-                owned = {dump_path.name: published_dump_identity}
-                owned[metadata_path.name] = published_metadata_identity
-                current_old_inventory = tuple(
-                    entry
-                    for entry in current_inventory
-                    if owned.get(entry[0]) != (entry[1], entry[2])
-                )
-                if current_old_inventory != initial_inventory:
-                    raise RuntimeError("Pre-existing backup inventory changed during preserve mode.")
-            except Exception as integrity_error:
-                if active_exception is None:
-                    try:
-                        _rollback_published_backup_pair(
-                            dump_path,
-                            published_dump_identity,
-                            metadata_path,
-                            published_metadata_identity,
-                        )
-                    except Exception as rollback_error:
-                        setattr(
-                            integrity_error,
-                            "_backup_preservation_integrity",
-                            "new_pair_rollback_failed",
-                        )
-                        integrity_error.add_note(str(rollback_error))
-                    setattr(
-                        integrity_error,
-                        "_backup_preservation_integrity",
-                        getattr(
-                            integrity_error,
-                            "_backup_preservation_integrity",
-                            "preexisting_inventory_changed",
-                        ),
-                    )
-                    raise
-                setattr(
-                    active_exception,
-                    "_backup_preservation_integrity",
-                    getattr(
-                        active_exception,
-                        "_backup_preservation_integrity",
-                        "preexisting_inventory_changed",
-                    ),
-                )
 
 
 def print_result(result: dict[str, Any], *, as_json: bool) -> None:
@@ -12791,7 +12722,7 @@ def main() -> int:
                 or args.admin_database_url is not None
                 or args.output_dir != str(DEFAULT_OUTPUT_DIR)
                 or args.env_file != str(DEFAULT_ENV_FILE)
-                or args.keep != 14
+                or args.keep != 1
                 or args.rotate_existing is not True
                 or args.max_age_hours != 24.0
                 or getattr(args, "_scratch_authorization_probe", False)
@@ -12821,6 +12752,14 @@ def main() -> int:
             raise ValueError(
                 "--dump-only, --check-latest, --verify-latest-existing, and --verify-dump "
                 "are mutually exclusive."
+            )
+        if not (
+            args.check_latest
+            or getattr(args, "verify_latest_existing", False)
+            or args.verify_dump is not None
+        ):
+            raise ValueError(
+                "Backup creation and dump-only mode are available only through lock-aware storage maintenance."
             )
         if args.check_latest:
             result = check_latest_backup(pathlib.Path(args.output_dir), max_age_hours=args.max_age_hours)

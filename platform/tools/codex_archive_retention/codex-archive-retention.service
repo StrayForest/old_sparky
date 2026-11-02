@@ -1,0 +1,19 @@
+[Unit]
+Description=Delete durably archived Codex sessions through the pinned native lifecycle
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=HOME=/root
+Environment=CODEX_HOME=/root/.codex
+UMask=0077
+ExecStart=/usr/bin/python3 -I -B /usr/local/libexec/codex-archive-retention/cleanup.py --codex-home /root/.codex --codex-cli /usr/local/libexec/codex-archive-retention/codex --manifest /usr/local/libexec/codex-archive-retention/codex.manifest.json --activation-manifest /usr/local/libexec/codex-archive-retention/codex.activation.json
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/root/.codex
+ReadOnlyPaths=/usr/local/libexec/codex-archive-retention
+TimeoutStartSec=30min

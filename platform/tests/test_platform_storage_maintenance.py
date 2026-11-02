@@ -156,7 +156,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             app_dir=app_dir,
             source_release_dir=self.release_dir,
             web_artifact_dir=web_dir,
-            backup_keep=14,
+            backup_keep=1,
             backup_max_age_hours=24.0,
             release_keep=0,
             test_artifact_max_age_days=7,
@@ -171,7 +171,6 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             backup_only=False,
             scratch_backend=maintenance.backup_restore_drill.SCRATCH_BACKEND_TMPFS_V1,
             verify_existing_backup_only=False,
-            preserve_existing_backups=False,
             purge_profile_access_cache_after_restore=False,
             evict_pinned_build_node_cache=False,
             eviction_run_id=None,
@@ -320,7 +319,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             maintenance.backup_restore_drill.SCRATCH_BACKEND_TMPFS_V1,
         )
         self.assertFalse(args.backup_only)
-        self.assertFalse(args.preserve_existing_backups)
+        self.assertEqual(args.backup_keep, 1)
         self.assertIsNone(args.protected_backup_manifest)
         self.assertFalse(args.evict_pinned_build_node_cache)
         self.assertIsNone(args.eviction_run_id)
@@ -426,7 +425,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             "--protected-backup-manifest",
             "/protected/provider-backups.json",
             "--backup-keep",
-            "15",
+            "1",
             "--protected-release",
             "gha-38000614899-1-7e5769ba3f85",
             "--protected-release",
@@ -779,7 +778,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             ),
         )
 
-    def test_preserve_existing_backups_is_full_apply_only(self) -> None:
+    def test_preserve_existing_backups_option_is_removed(self) -> None:
         with mock.patch.object(
             maintenance.sys,
             "argv",
@@ -807,15 +806,11 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         with mock.patch.object(
             maintenance.sys,
             "argv",
-            [
-                "platform_storage_maintenance.py",
-                "--apply",
-                "--preserve-existing-backups",
-            ],
+            ["platform_storage_maintenance.py", "--apply"],
         ):
-            self.assertTrue(maintenance.parse_args().preserve_existing_backups)
+            self.assertEqual(maintenance.parse_args().backup_keep, 1)
 
-    def test_full_maintenance_preserves_backups_and_keeps_other_retention(self) -> None:
+    def test_full_maintenance_rotates_backups_and_keeps_other_retention(self) -> None:
         app_dir = self.root / "runtime" / "platform"
         self.add_runtime_release(app_dir, "release-current")
         self.add_runtime_release(app_dir, "release-previous")
@@ -823,7 +818,6 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         (app_dir / "previous").symlink_to(app_dir / "releases" / "release-previous")
         args = self.maintenance_args(app_dir)
         args.skip_backup = False
-        args.preserve_existing_backups = True
 
         with (
             mock.patch.object(maintenance, "run_backup", return_value={"restore_verified": True}) as backup,
@@ -838,9 +832,9 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
         backup.assert_called_once_with(
             app_dir,
-            keep=14,
+            keep=1,
             max_age_hours=24.0,
-            rotate_existing=False,
+            rotate_existing=True,
             private_failure_diagnostics=False,
             emit_private_failure_text=False,
             protected_backup_manifest=None,
@@ -979,10 +973,10 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "--backup-only",
                 "--apply",
                 "--backup-keep",
-                "13",
+                "1",
             ],
         ):
-            self.assertEqual(maintenance.parse_args().backup_keep, 13)
+            self.assertEqual(maintenance.parse_args().backup_keep, 1)
         with mock.patch.object(
             maintenance.sys,
             "argv",
@@ -1330,33 +1324,30 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             "restored_table_count": 12,
             "removed": [],
             "rotation_mode": "rotate-existing",
-        }
-        preserve_result = {
-            **create_result,
-            "rotation_mode": "preserve-existing",
-            "preexisting_archive_count": 9,
-            "preexisting_sidecar_count": 9,
-            "postexisting_archive_count": 10,
-            "preexisting_archive_inventory_sha256": "a" * 64,
-            "postexisting_archive_inventory_sha256": "a" * 64,
-            "preexisting_archives_preserved": True,
+            "protected_retention_proof": {"removed_pairs": []},
         }
         check_result = {
             "ok": True,
             "restore_verified": True,
+            "alembic_revision_verified": True,
             "age_hours": 0.25,
         }
         with (
             mock.patch.object(
                 maintenance.backup_restore_drill,
                 "create_backup",
-                side_effect=(create_result, preserve_result),
+                return_value=create_result,
             ) as create_backup,
             mock.patch.object(
                 maintenance.backup_restore_drill,
                 "check_latest_backup",
-                side_effect=(check_result, check_result),
+                return_value=check_result,
             ) as check_latest,
+            mock.patch.object(
+                maintenance.backup_restore_drill,
+                "valid_protected_retention_proof",
+                return_value=True,
+            ),
             mock.patch.object(
                 maintenance.subprocess,
                 "run",
@@ -1365,19 +1356,12 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         ):
             result = maintenance.run_backup(
                 self.root / "runtime" / "platform",
-                keep=14,
+                keep=1,
                 max_age_hours=24.0,
-            )
-            preserved_result = maintenance.run_backup(
-                self.root / "runtime" / "platform",
-                keep=14,
-                max_age_hours=24.0,
-                rotate_existing=False,
-                scratch_backend=maintenance.backup_restore_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
             )
 
-        self.assertEqual(create_backup.call_count, 2)
-        self.assertEqual(check_latest.call_count, 2)
+        self.assertEqual(create_backup.call_count, 1)
+        self.assertEqual(check_latest.call_count, 1)
         create_args = create_backup.call_args_list[0].args[0]
         self.assertEqual(
             create_args.env_file,
@@ -1387,14 +1371,10 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             create_args.output_dir,
             self.root / "runtime" / "platform" / "shared" / "backups",
         )
-        self.assertEqual(create_args.keep, 14)
+        self.assertEqual(create_args.keep, 1)
         self.assertEqual(
             create_args.scratch_backend,
             maintenance.backup_restore_drill.SCRATCH_BACKEND_TMPFS_V1,
-        )
-        self.assertEqual(
-            create_backup.call_args_list[1].args[0].scratch_backend,
-            maintenance.backup_restore_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
         )
         self.assertIsNone(create_args.protected_backup_manifest)
         self.assertIs(create_args.dump_only, False)
@@ -1402,16 +1382,11 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertIs(create_args.private_scratch_diagnostics, False)
         self.assertEqual(check_latest.call_args_list[0].args[0], create_args.output_dir)
         self.assertEqual(check_latest.call_args_list[0].kwargs, {"max_age_hours": 24.0})
-        preserve_args = create_backup.call_args_list[1].args[0]
-        self.assertIs(preserve_args.rotate_existing, False)
         self.assertTrue(result["restore_verified"])
         self.assertTrue(result["alembic_revision_verified"])
         self.assertTrue(result["checksum_present"])
         self.assertEqual(result["age_hours"], 0.25)
         self.assertEqual(result["rotation_mode"], "rotate-existing")
-        self.assertTrue(preserved_result["preexisting_archives_preserved"])
-        self.assertEqual(preserved_result["preexisting_archive_count"], 9)
-        self.assertEqual(preserved_result["postexisting_archive_count"], 10)
 
         with (
             mock.patch.object(
@@ -1425,6 +1400,11 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 return_value=check_result,
             ),
             mock.patch.object(
+                maintenance.backup_restore_drill,
+                "valid_protected_retention_proof",
+                return_value=True,
+            ),
+            mock.patch.object(
                 maintenance.subprocess,
                 "run",
                 side_effect=AssertionError("run_backup must not start a helper subprocess"),
@@ -1432,7 +1412,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         ):
             maintenance.run_backup(
                 self.root / "runtime" / "platform",
-                keep=14,
+                keep=1,
                 private_failure_diagnostics=True,
             )
         private_args = private_create.call_args.args[0]
@@ -1512,7 +1492,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             mock.patch.object(maintenance.sys, "stderr", public_stderr),
         ):
             with self.assertRaises(maintenance.BackupCommandFailure) as public_error:
-                maintenance.run_backup(self.root / "runtime" / "platform", keep=14)
+                maintenance.run_backup(self.root / "runtime" / "platform", keep=1)
         termination_scope.assert_called_once_with()
         signal_scope.__enter__.assert_called_once_with()
         signal_scope.__exit__.assert_called_once()
@@ -1542,7 +1522,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             with self.assertRaises(maintenance.BackupCommandFailure) as private_error:
                 maintenance.run_backup(
                     self.root / "runtime" / "platform",
-                    keep=14,
+                    keep=1,
                     private_failure_diagnostics=True,
                 )
         not_checked_after_failure.assert_not_called()
@@ -1927,13 +1907,13 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         ):
             report = maintenance.run_backup(
                 self.root / "runtime" / "platform",
-                keep=14,
+                keep=1,
                 protected_backup_manifest=manifest,
             )
 
         validate_proof.assert_called_once_with(
             proof,
-            requested_keep=14,
+            requested_keep=1,
             new_dump_file=archive_name,
         )
         self.assertIs(report["protected_retention_proof"], proof)
@@ -1961,7 +1941,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "removal paths do not match"):
                 maintenance.run_backup(
                     self.root / "runtime" / "platform",
-                    keep=14,
+                    keep=1,
                     protected_backup_manifest=manifest,
                 )
 
@@ -1982,7 +1962,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "proof is missing or invalid"):
                 maintenance.run_backup(
                     self.root / "runtime" / "platform",
-                    keep=14,
+                    keep=1,
                     protected_backup_manifest=manifest,
                 )
 
@@ -2010,7 +1990,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
         backup.assert_called_once_with(
             app_dir,
-            keep=14,
+            keep=1,
             max_age_hours=24.0,
             rotate_existing=True,
             private_failure_diagnostics=False,
@@ -2071,7 +2051,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             screenshot_max_age_days=30,
             report_keep=30,
             live_qa_runtime_keep=1,
-            backup_keep=15,
+            backup_keep=1,
             backup_max_age_hours=24,
             minimum_free_gib=5,
             maximum_used_percent=90,
@@ -2424,7 +2404,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             maintenance.run_backup = fake_backup
             try:
                 with maintenance.maintenance_lock_scope(args, app_dir=app_dir):
-                    maintenance.run_backup(app_dir, keep=14)
+                    maintenance.run_backup(app_dir, keep=1)
             except RuntimeError as exc:
                 if sys.argv[7] not in str(exc):
                     print(str(exc))
@@ -2516,7 +2496,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             release_lock.cleanup()
             retained_load_lock.cleanup()
 
-    def test_backup_only_success_never_applies_retention(self) -> None:
+    def test_backup_only_success_rotates_backups_without_other_retention(self) -> None:
         app_dir = self.root / "runtime" / "platform"
         (app_dir / "shared").mkdir(parents=True)
         current = self.add_runtime_release(app_dir, "release-current")
@@ -2559,13 +2539,9 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "restored_table_count": 3,
                     "age_hours": 0.1,
                     "removed_count": 0,
-                    "rotation_mode": "preserve-existing",
-                    "preexisting_archive_count": 9,
-                    "preexisting_sidecar_count": 9,
-                    "postexisting_archive_count": 10,
-                    "preexisting_archive_inventory_sha256": "a" * 64,
-                    "postexisting_archive_inventory_sha256": "a" * 64,
-                    "preexisting_archives_preserved": True,
+                    "rotation_mode": "rotate-existing",
+                    "postexisting_archive_count": 1,
+                    "preexisting_archives_preserved": False,
                 },
             ) as run_backup,
         ):
@@ -2573,14 +2549,13 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
         self.assertEqual(report["mode"], "backup-only")
         self.assertTrue(report["backup"]["restore_verified"])
-        self.assertEqual(report["backup"]["rotation_mode"], "preserve-existing")
-        self.assertTrue(report["backup"]["preexisting_archives_preserved"])
+        self.assertEqual(report["backup"]["rotation_mode"], "rotate-existing")
         self.assertEqual(events, ["locks-enter", "locks-exit"])
         run_backup.assert_called_once_with(
             app_dir,
-            keep=14,
+            keep=1,
             max_age_hours=24.0,
-            rotate_existing=False,
+            rotate_existing=True,
             private_failure_diagnostics=False,
             protected_backup_manifest=None,
             scratch_backend=maintenance.backup_restore_drill.SCRATCH_BACKEND_DISK_EXT4_IMAGE_V1,
@@ -2594,7 +2569,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertEqual(report["source_release_artifacts"]["deleted_count"], 0)
         self.assertEqual(report["live_qa_runtime_caches"]["deleted_count"], 0)
 
-        self.assertEqual(report["limits"]["backup_keep"], 14)
+        self.assertEqual(report["limits"]["backup_keep"], 1)
         self.assertEqual(report["transient"]["failed_builds"]["count"], 0)
         self.assertEqual(report["transient"]["browser_test_artifacts"]["count"], 0)
         self.assertEqual(report["transient"]["preprod_screenshots"]["count"], 0)
@@ -2606,7 +2581,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             "status": "verified-existing",
             "verified_existing": True,
             "created": False,
-            "rotation_mode": "preserve-existing",
+            "rotation_mode": "verify-only",
             "removed_count": 0,
             "metadata_file": "platformdb-latest.json",
             "dump_file": "platformdb-latest.dump",
@@ -2635,7 +2610,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertTrue(report["ok"])
         self.assertTrue(report["backup"]["verified_existing"])
         self.assertFalse(report["backup"]["created"])
-        self.assertEqual(report["backup"]["rotation_mode"], "preserve-existing")
+        self.assertEqual(report["backup"]["rotation_mode"], "verify-only")
         self.assertEqual(report["backup"]["removed_count"], 0)
         self.assertEqual(events, ["locks-enter", "locks-exit"])
         verify_backup.assert_called_once_with(
@@ -3051,7 +3026,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "--scratch-backend disk_ext4_image_v1 "
                 "--protected-backup-manifest "
                 "/opt/oldsparky/platform/shared/backup-retention/"
-                "protected-dump-files.json --backup-keep 15 "
+                "protected-dump-files.json --backup-keep 1 "
                 "--protected-release gha-38000614899-1-7e5769ba3f85 "
                 "--protected-release gha-37760797674-1-80e457e57081 "
                 "--protected-release gha-38182702358-1-f1154c7dba4f "
@@ -3293,13 +3268,13 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertIn('"platform_build_node_cache.py"', workflow)
         self.assertIn('"--eviction-bundle-sha256"', workflow)
         self.assertIn('report.get("mode") != expected_mode', workflow)
-        self.assertIn('backup.get("rotation_mode") != "preserve-existing"', workflow)
-        self.assertIn('backup.get("preexisting_archives_preserved") is not True', workflow)
+        self.assertIn('backup.get("rotation_mode") != "rotate-existing"', workflow)
         self.assertIn('backup.get("removed_count") != 0', workflow)
-        self.assertIn('isinstance(backup.get("preexisting_archive_count"), int)', workflow)
-        self.assertIn('isinstance(backup.get("preexisting_sidecar_count"), int)', workflow)
-        self.assertIn('backup.get("preexisting_sidecar_count") != backup.get("preexisting_archive_count")', workflow)
-        self.assertIn('backup.get("postexisting_archive_count") != backup.get("preexisting_archive_count", -1) + 1', workflow)
+        self.assertIn('backup.get("postexisting_archive_count") != 1', workflow)
+        self.assertIn('backup.get("retention_policy") != "latest-restore-verified-only-v1"', workflow)
+        self.assertIn('backup.get("retention_proof_status") != "pass"', workflow)
+        self.assertIn('backup.get("retained_pair_count") != 1', workflow)
+        self.assertIn('backup.get("retention_archive_matches_new") is not True', workflow)
         self.assertIn('r"[0-9a-f]{64}"', workflow)
         self.assertIn("BACKUP_FAILURE schema=1 stage=", workflow)
         self.assertIn('test "$(id -u)" -eq 0', workflow)
@@ -3737,7 +3712,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "status": "completed",
                     "restore_verified": True,
                     "alembic_revision_verified": True,
-                    "rotation_mode": "preserve-existing",
+                    "rotation_mode": "verify-only",
                     "removed_count": 0,
                     "restored_table_count": 1,
                     "verified_existing": True,
@@ -4242,8 +4217,13 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "archive_sha256": archive_sha,
                 "size_bytes": 123456,
                 "restored_table_count": 1,
-                "preexisting_archives_preserved": True,
-                "rotation_mode": "preserve-existing",
+                "preexisting_archives_preserved": False,
+                "rotation_mode": "rotate-existing",
+                "postexisting_archive_count": 1,
+                "retention_policy": "latest-restore-verified-only-v1",
+                "retention_proof_status": "pass",
+                "retained_pair_count": 1,
+                "retention_archive_matches_new": True,
             },
         }
         report_json = json.dumps(public_report, sort_keys=True, separators=(",", ":"))
@@ -6474,7 +6454,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 with self.assertRaises(maintenance.BackupCommandFailure) as forwarded_error:
                     maintenance.run_backup(
                         test_root / "runtime",
-                        keep=14,
+                        keep=1,
                         private_failure_diagnostics=True,
                     )
             self.assertEqual(
@@ -6984,7 +6964,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertNotIn("private-maintenance-report", bound.stdout)
 
             altered = json.loads(report.read_text(encoding="utf-8"))
-            altered["backup"]["rotation_mode"] = "preserve-existing"
+            altered["backup"]["rotation_mode"] = "verify-only"
             report.write_text(json.dumps(altered), encoding="utf-8")
             report.chmod(0o600)
             refused_policy = subprocess.run(

@@ -35,9 +35,10 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | Cleanup of an expired exact LiveQA bundle roster | [Stale LiveQA bundle recovery](liveqa-stale-bundle-recovery.md) |
 | Missing immutable LiveQA engine provider | [Provider recovery runbook](liveqa-provider-recovery.md) |
 | Backup or restore | [Backup and restore](backup-restore-runbook.md) |
-| Named backup-pair rotation and rollback | [Named backup retention](backup-retention-protection.md) |
+| Keep-one verified backup retention | [Backup retention](backup-retention-protection.md) |
 | Exceptional fallback runtime cache compaction | [Fallback cache compaction](fallback-runtime-cache-compaction-runbook.md) |
 | Services, storage, media and performance | [Operations runbook](operations-runbook.md) |
+| Locally installed Codex archived-session retention | [Codex archive-retention procedure](codex-archive-retention.md) |
 | Host disk free-space thresholds | [Disk free-space policy](adr/disk-free-space-thresholds.md) and [operations runbook](operations-runbook.md) |
 | Retained-load cleanup and hermetic web verification | [Retained-load and web verification](retained-load-and-web-verification.md) |
 | External fixture credential transport | [Credential transport](fixture-credential-transport.md) |

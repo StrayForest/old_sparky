@@ -65,8 +65,8 @@ def _receipt(**overrides: object) -> dict[str, object]:
         "restore_verified": True,
         "alembic_revision_verified": True,
         "restored_table_count": 137,
-        "preexisting_archives_preserved": True,
-        "rotation_mode": "preserve-existing",
+        "retained_pair_count": 1,
+        "rotation_mode": "rotate-existing",
     }
     receipt.update(overrides)
     return receipt
@@ -593,7 +593,7 @@ class BackupSuccessGuardTests(unittest.TestCase):
             _receipt(restore_verified=False),
             _receipt(created=False),
             _receipt(alembic_revision_verified=False),
-            _receipt(preexisting_archives_preserved=False),
+            _receipt(retained_pair_count=0),
             _receipt(restored_table_count=0),
             _receipt(archive_size_bytes=0),
         )

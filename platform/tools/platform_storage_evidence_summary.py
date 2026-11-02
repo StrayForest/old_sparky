@@ -441,6 +441,28 @@ def summarize_retention(raw: str) -> dict[str, object]:
     archive_format_version = backup.get("format_version")
     if type(archive_format_version) is not int or archive_format_version not in {1, 2}:
         archive_format_version = None
+    retention_proof = backup.get("protected_retention_proof")
+    retention_policy = None
+    retention_proof_status = None
+    retained_pair_count = None
+    retention_archive_matches_new = None
+    if isinstance(retention_proof, dict):
+        if retention_proof.get("policy") == "latest-restore-verified-only-v1":
+            retention_policy = "latest-restore-verified-only-v1"
+        if retention_policy is not None and retention_proof.get("status") == "pass":
+            retention_proof_status = "pass"
+        selection = retention_proof.get("verified_selection")
+        if isinstance(selection, dict):
+            count = selection.get("retained_count")
+            if type(count) is int and count >= 0:
+                retained_pair_count = count
+            selected = selection.get("selected_order")
+            if isinstance(selected, list) and archive_name is not None:
+                retention_archive_matches_new = (
+                    len(selected) == 1
+                    and isinstance(selected[0], dict)
+                    and selected[0].get("dump_file") == archive_name
+                )
     inventory_digests = {}
     for key in (
         "preexisting_archive_inventory_sha256",
@@ -497,13 +519,17 @@ def summarize_retention(raw: str) -> dict[str, object]:
             "rotation_mode": (
                 backup.get("rotation_mode")
                 if isinstance(backup.get("rotation_mode"), str)
-                and backup.get("rotation_mode") in {"preserve-existing", "rotate-existing"}
+                and backup.get("rotation_mode") in {"verify-only", "rotate-existing"}
                 else None
             ),
             "preexisting_archive_count": _safe_int(backup.get("preexisting_archive_count")),
             "preexisting_sidecar_count": _safe_int(backup.get("preexisting_sidecar_count")),
             "postexisting_archive_count": _safe_int(backup.get("postexisting_archive_count")),
             "preexisting_archives_preserved": backup.get("preexisting_archives_preserved") is True,
+            "retention_policy": retention_policy,
+            "retention_proof_status": retention_proof_status,
+            "retained_pair_count": retained_pair_count,
+            "retention_archive_matches_new": retention_archive_matches_new,
             **inventory_digests,
             "duration_seconds": backup_duration_seconds,
             "restored_table_count": _safe_int(backup.get("restored_table_count")),

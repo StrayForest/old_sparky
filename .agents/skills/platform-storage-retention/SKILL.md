@@ -117,9 +117,16 @@ calling the task complete.
    ref or treat `expected_sha` as the workflow source.
 
    The workflow verifies the active release and starts
-   `deadlock-maintenance.service`; the installed service holds the canonical
-   release then retained-load locks while applying the sweep and publishing
-   bounded evidence. Diagnostics only sample retained-lock state at one point
+   `deadlock-maintenance.service`; the installed service holds the release
+   then retained-load locks while applying the sweep and publishing bounded
+   evidence. Its backup policy retains one pair: after the new pair passes
+   checksum, isolated
+   restore and Alembic verification, it retains exactly that one pair and
+   removes every other complete old pair, including former manifest-listed
+   pairs. The manifest is an audit input. Backup-only uses the same rotation;
+   verify-existing never prunes. A malformed, unmatched or staged partial
+   backup file fails closed instead of being counted as a retained pair.
+   Diagnostics only sample retained-lock state at one point
    in time; they do not hold that lock during collection.
 
    Its report is bound to that service invocation. If a valid report confirms

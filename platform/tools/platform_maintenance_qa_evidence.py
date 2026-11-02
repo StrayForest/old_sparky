@@ -62,7 +62,7 @@ PROTECTED_BACKUP_MANIFEST_PATH = Path(
     "/opt/oldsparky/platform/shared/backup-retention/protected-dump-files.json"
 )
 MAINTENANCE_REPORT_DIRECTORY = Path("/opt/oldsparky/platform/shared/maintenance")
-PROTECTED_BACKUP_KEEP = 15
+PROTECTED_BACKUP_KEEP = 1
 UNIT_PROPERTY_KEYS = frozenset(
     {
         "FragmentPath",
@@ -97,7 +97,7 @@ EXPECTED_MAINTENANCE_ARGV = (
     "--protected-backup-manifest",
     "/opt/oldsparky/platform/shared/backup-retention/protected-dump-files.json",
     "--backup-keep",
-    "15",
+    "1",
     *(
         argument
         for slug in REQUIRED_PROTECTED_RELEASES

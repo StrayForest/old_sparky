@@ -1,0 +1,218 @@
+name: Platform Codex archive retention companion build
+
+on:
+  pull_request:
+    branches: [dev]
+    paths:
+      - ".github/workflows/platform-codex-archive-retention-build.yml"
+      - "platform/tools/codex_archive_retention/**"
+      - "platform/tests/test_platform_codex_archive_retention.py"
+      - "platform/tools/platform_ci_classifier.py"
+      - "platform/tests/test_platform_ci_classifier.py"
+      - "platform/tools/platform_test_catalog.py"
+
+# This workflow builds an evidence artifact only. It has no production
+# credentials and never installs the companion or touches a Codex home.
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-archive-retention-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and test pinned Codex companion
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.base.ref == 'dev'
+    permissions:
+      contents: read
+    env:
+      PLATFORM_SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+      PLATFORM_SOURCE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PLATFORM_EVENT: ${{ github.event_name }}
+      PLATFORM_REF: ${{ github.ref }}
+      PLATFORM_BASE_REF: ${{ github.event.pull_request.base.ref }}
+      PLATFORM_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+      PLATFORM_PR_NUMBER: ${{ github.event.pull_request.number }}
+      PLATFORM_TESTED_MERGE_SHA: ${{ github.sha }}
+      CODEX_REPOSITORY: https://github.com/openai/codex.git
+      CODEX_SOURCE_TAG: rust-v0.166.0
+      CODEX_SOURCE_COMMIT: 6ff1e1ca3b30fc8b914720681fcf5fe62e95f856
+      CODEX_RUST_TOOLCHAIN: 1.95.0
+      CODEX_TARGET: x86_64-unknown-linux-gnu
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Checkout exact platform workflow source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+          path: platform-source
+          persist-credentials: false
+
+      - name: Validate same-repository PR source binding
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$PLATFORM_EVENT" = pull_request
+          test "$PLATFORM_BASE_REF" = dev
+          test "$PLATFORM_HEAD_REPOSITORY" = "$GITHUB_REPOSITORY"
+          test "$PLATFORM_SOURCE_SHA" = "$PLATFORM_SOURCE_HEAD_SHA"
+          [[ "$PLATFORM_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PLATFORM_TESTED_MERGE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PLATFORM_PR_NUMBER" =~ ^[1-9][0-9]{0,8}$ ]]
+          test "$PLATFORM_REF" = "refs/pull/$PLATFORM_PR_NUMBER/merge"
+          test "$(git -C platform-source rev-parse --verify HEAD^{commit})" = "$PLATFORM_SOURCE_SHA"
+          test -z "$(git -C platform-source status --porcelain=v1 --untracked-files=all)"
+
+      - name: Validate source lock and patch binding
+        id: lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          lock=platform-source/platform/tools/codex_archive_retention/codex-source.lock.json
+          patch=platform-source/platform/tools/codex_archive_retention/patches/codex-0.166.0.patch
+          /usr/bin/python3 -I -B - "$lock" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          lock = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected = {
+              "schema_version": 1,
+              "source_repository": "https://github.com/openai/codex.git",
+              "source_tag": "rust-v0.166.0",
+              "source_commit": "6ff1e1ca3b30fc8b914720681fcf5fe62e95f856",
+              "cli_version": "codex-cli 0.166.0",
+              "rust_toolchain": "1.95.0",
+              "target": "x86_64-unknown-linux-gnu",
+              "patch_file": "patches/codex-0.166.0.patch",
+          }
+          if any(lock.get(key) != value for key, value in expected.items()):
+              raise SystemExit("Codex source lock differs from the reviewed workflow pins")
+          if type(lock.get("max_binary_bytes")) is not int or not 1 <= lock["max_binary_bytes"] <= 262144000:
+              raise SystemExit("Codex binary size limit is invalid")
+          if re.fullmatch(r"[0-9a-f]{64}", lock.get("patch_sha256", "")) is None:
+              raise SystemExit("Codex source patch digest is malformed")
+          with Path(sys.argv[2]).open("a", encoding="ascii") as output:
+              output.write(f"patch_sha256={lock['patch_sha256']}\n")
+              output.write(f"max_binary_bytes={lock['max_binary_bytes']}\n")
+          PY
+          test "$(sha256sum "$patch" | awk '{print $1}')" = "${{ steps.lock.outputs.patch_sha256 }}"
+
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$CODEX_RUST_TOOLCHAIN" --profile minimal
+          rustup target add "$CODEX_TARGET" --toolchain "$CODEX_RUST_TOOLCHAIN"
+
+      - name: Fetch exact upstream source and apply reviewed patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init codex-source
+          git -C codex-source remote add origin "$CODEX_REPOSITORY"
+          git -C codex-source fetch --no-tags --depth=1 origin "refs/tags/$CODEX_SOURCE_TAG:refs/tags/$CODEX_SOURCE_TAG"
+          resolved="$(git -C codex-source rev-parse "$CODEX_SOURCE_TAG^{commit}")"
+          test "$resolved" = "$CODEX_SOURCE_COMMIT"
+          git -C codex-source checkout --detach "$CODEX_SOURCE_COMMIT"
+          git -C codex-source apply --check "$GITHUB_WORKSPACE/platform-source/platform/tools/codex_archive_retention/patches/codex-0.166.0.patch"
+          git -C codex-source apply "$GITHUB_WORKSPACE/platform-source/platform/tools/codex_archive_retention/patches/codex-0.166.0.patch"
+
+      - name: Run focused archived-only native lifecycle tests
+        working-directory: codex-source/codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_focused_test() {
+            local log_path="$RUNNER_TEMP/codex-native-test-$RANDOM.log"
+            cargo +"$CODEX_RUST_TOOLCHAIN" test --locked "$@" 2>&1 | tee "$log_path"
+            /usr/bin/python3 -I -B - "$log_path" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+          output = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+          passed = [int(value) for value in re.findall(r"test result: ok\. ([0-9]+) passed;", output)]
+          if not passed or sum(passed) <= 0:
+              raise SystemExit("focused native test filter matched no passing tests")
+          PY
+            rm -f -- "$log_path"
+          }
+          run_focused_test -p codex-thread-store --lib local::delete_thread::tests::archived_only
+          run_focused_test -p codex-app-server --test all thread_delete_archived_only_refuses_active_thread
+          run_focused_test -p codex-cli --bin codex delete_archived_only_requires_force_and_uuid
+          run_focused_test -p codex-app-server-protocol schema_fixtures
+
+      - name: Build and bind private companion binary
+        id: artifact
+        shell: bash
+        env:
+          PATCH_SHA256: ${{ steps.lock.outputs.patch_sha256 }}
+          MAX_BINARY_BYTES: ${{ steps.lock.outputs.max_binary_bytes }}
+        run: |
+          set -euo pipefail
+          cd codex-source/codex-rs
+          cargo +"$CODEX_RUST_TOOLCHAIN" build --locked --release -p codex-cli --bin codex
+          artifact_dir="$RUNNER_TEMP/codex-archive-retention"
+          install -d -m 700 "$artifact_dir"
+          install -m 700 target/release/codex "$artifact_dir/codex"
+          strip --strip-unneeded "$artifact_dir/codex"
+          binary_bytes="$(stat -c '%s' "$artifact_dir/codex")"
+          test "$binary_bytes" -gt 0
+          test "$binary_bytes" -le "$MAX_BINARY_BYTES"
+          binary_sha256="$(sha256sum "$artifact_dir/codex" | awk '{print $1}')"
+          CODEX_HOME="$RUNNER_TEMP/empty-codex-home" "$artifact_dir/codex" --version > "$artifact_dir/version.txt"
+          test "$(cat "$artifact_dir/version.txt")" = "codex-cli 0.166.0"
+          /usr/bin/python3 -I -B - "$artifact_dir" "$binary_sha256" "$binary_bytes" "$PATCH_SHA256" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          root = Path(sys.argv[1])
+          lock_path = Path(os.environ["GITHUB_WORKSPACE"]) / "platform-source/platform/tools/codex_archive_retention/codex-source.lock.json"
+          lock = json.loads(lock_path.read_text(encoding="utf-8"))
+          manifest = {
+              "schema_version": 1,
+              "platform_repository": os.environ["GITHUB_REPOSITORY"],
+              "platform_event": os.environ["PLATFORM_EVENT"],
+              "platform_ref": os.environ["PLATFORM_REF"],
+              "platform_base_ref": os.environ["PLATFORM_BASE_REF"],
+              "platform_head_repository": os.environ["PLATFORM_HEAD_REPOSITORY"],
+              "platform_pr_number": os.environ["PLATFORM_PR_NUMBER"],
+              "platform_source_sha": os.environ["PLATFORM_SOURCE_SHA"],
+              "platform_source_head_sha": os.environ["PLATFORM_SOURCE_HEAD_SHA"],
+              "platform_tested_merge_sha": os.environ["PLATFORM_TESTED_MERGE_SHA"],
+              "workflow_run_id": os.environ["GITHUB_RUN_ID"],
+              "workflow_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "source_repository": lock["source_repository"],
+              "source_tag": lock["source_tag"],
+              "source_commit": lock["source_commit"],
+              "patch_sha256": sys.argv[4],
+              "rust_toolchain": lock["rust_toolchain"],
+              "target": lock["target"],
+              "cli_version": lock["cli_version"],
+              "binary_bytes": int(sys.argv[3]),
+              "binary_sha256": sys.argv[2],
+          }
+          path = root / "codex.manifest.json"
+          path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
+          path.chmod(0o600)
+          PY
+          printf 'artifact_dir=%s\n' "$artifact_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Upload non-deployable companion evidence artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: codex-archive-retention-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.artifact.outputs.artifact_dir }}
+          if-no-files-found: error
+          retention-days: 7
