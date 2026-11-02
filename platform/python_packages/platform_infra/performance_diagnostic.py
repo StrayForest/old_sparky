@@ -801,6 +801,33 @@ RUNTIME_PREFIX_CATEGORIES = (
 )
 
 
+def _bounded_profile_categories(
+    totals: dict[str, list[int]],
+) -> list[tuple[str, int, int]]:
+    """Select bounded profile categories without dropping CPU or call totals."""
+
+    ordered = sorted(totals.items(), key=lambda item: (-item[1][0], item[0]))
+    if len(ordered) > 10:
+        # The consumer requires the projected category totals to conserve the
+        # complete cProfile self-time total. Retain the nine largest named
+        # categories and fold every omitted category, including any existing
+        # ``other`` bucket, into one ``other`` row.
+        retained = [item for item in ordered if item[0] != "other"][:9]
+        retained_names = {name for name, _values in retained}
+        omitted = [item for item in ordered if item[0] not in retained_names]
+        other_values = [
+            sum(values[index] for _name, values in omitted)
+            for index in (0, 1)
+        ]
+        projected = retained + [("other", other_values)]
+    else:
+        projected = ordered
+    # Preserve the existing CPU-ranked wire order; the journal collector
+    # canonicalizes merged category rows before they reach the parent schema.
+    projected.sort(key=lambda item: (-item[1][0], item[0]))
+    return [(name, values[0], values[1]) for name, values in projected]
+
+
 def _profile_summary(profile: cProfile.Profile) -> tuple[list[tuple[str, int, int]], int]:
     import pstats
 
@@ -828,8 +855,7 @@ def _profile_summary(profile: cProfile.Profile) -> tuple[list[tuple[str, int, in
         entry = totals.setdefault(label, [0, 0])
         entry[0] += self_us
         entry[1] += int(values[1])
-    ordered = sorted(totals.items(), key=lambda item: (-item[1][0], item[0]))[:10]
-    return [(name, values[0], values[1]) for name, values in ordered], all_self_us
+    return _bounded_profile_categories(totals), all_self_us
 
 
 class ApiCpuDiagnostic:

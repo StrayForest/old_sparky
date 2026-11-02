@@ -8094,20 +8094,48 @@ cleanup
             REPO_ROOT / ".github/workflows/platform-production-external-load.yml"
         ).read_text()
 
-        # Candidate checkout/evaluation jobs are fresh and secret-free. SSH is
-        # deliberately owned only by the setup/finalize environment jobs.
+        # Candidate checkout/evaluation steps receive no fixture or SSH secret.
+        # load-client has one exception: the fixture-only age identity is
+        # exposed only to its named temporary-file staging step.
         for job_name in (
             "validate-external-inputs",
             "load-client",
             "evaluate-load",
         ):
             job = workflow_job(workflow, job_name)
-            self.assertNotIn("secrets.", job, job_name)
+            action_expressions = re.findall(r"\$\{\{(.*?)\}\}", job, re.DOTALL)
+            secret_contexts = [
+                re.sub(r"\s+", "", expression)
+                for expression in action_expressions
+                if re.search(r"\bsecrets\b", expression)
+            ]
+            expected_refs = (
+                ["secrets.FIXTURE_MANIFEST_AGE_IDENTITY"]
+                if job_name == "load-client"
+                else []
+            )
+            self.assertEqual(secret_contexts, expected_refs, job_name)
             self.assertNotRegex(
                 job,
                 r"(?:PROD_SSH_(?:HOST|USER|KEY):|SSH_DIR=|id_ed25519)",
                 job_name,
             )
+            if job_name == "load-client":
+                identity_step_start = job.index(
+                    "      - name: Stage the fixture-only decrypt identity"
+                )
+                identity_step_end = job.find("\n      - name:", identity_step_start + 1)
+                identity_step = (
+                    job[identity_step_start:]
+                    if identity_step_end == -1
+                    else job[identity_step_start:identity_step_end]
+                )
+                self.assertIn("environment: fixture-manifest", job)
+                self.assertIn(
+                    "FIXTURE_MANIFEST_AGE_IDENTITY: ${{ "
+                    "secrets.FIXTURE_MANIFEST_AGE_IDENTITY }}",
+                    identity_step,
+                )
         for job_name in ("fixture-setup", "fixture-finalize"):
             job = workflow_job(workflow, job_name)
             self.assertIn("environment: production", job, job_name)
@@ -8119,8 +8147,21 @@ cleanup
         self.assertIn("persist-credentials: false", checkout)
         self.assertNotIn("persist-credentials: true", checkout)
 
+        decrypt_start = workflow.index(
+            "      - name: Decrypt fixture manifest for the trusted load client"
+        )
+        decrypt_end = workflow.find("\n      - name:", decrypt_start + 1)
+        decrypt_step = (
+            workflow[decrypt_start:]
+            if decrypt_end == -1
+            else workflow[decrypt_start:decrypt_end]
+        )
+        self.assertIn('rm -f -- "$age_identity" "$age_archive"', decrypt_step)
+        self.assertIn('test ! -e "$age_identity"', decrypt_step)
+        self.assertLess(decrypt_start, checkout_start)
+
         client_step_names = (
-            "Validate explicit external production load",
+            "Validate exact fixture descriptor and decrypted manifest",
             "Run checked-out external HTTP load client",
             "Evaluate checked-out load report",
         )
@@ -8133,11 +8174,18 @@ cleanup
             self.assertNotIn("PROD_SSH_KEY:", step, name)
             self.assertNotIn("SSH_DIR=", step, name)
             self.assertNotIn("SSH_CONTROL_PATH=", step, name)
-            if name != "Evaluate checked-out load report":
+            self.assertNotIn("FIXTURE_MANIFEST_AGE_IDENTITY", step, name)
+            if name == "Run checked-out external HTTP load client":
                 self.assertIn("run_checked_out_client", step, name)
                 self.assertIn("env -i", step, name)
                 self.assertIn("SOURCE_GIT_SHA=", step, name)
                 self.assertIn('GITHUB_RUN_ID="$GITHUB_RUN_ID"', step, name)
+            if name == "Validate exact fixture descriptor and decrypted manifest":
+                self.assertIn(
+                    "platform_fixture_credential_transport.py validate-descriptor",
+                    step,
+                )
+                self.assertIn("platform_load.py export-source-binding-env", step)
             self.assertNotIn("SSH_AUTH_SOCK", step, name)
             self.assertNotIn("id_ed25519", step, name)
             self.assertNotIn("ssh_dir", step, name)

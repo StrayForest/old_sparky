@@ -1640,30 +1640,94 @@ WEB_PROFILE_CATEGORIES = frozenset({
     "react_server_render", "repo.ssr_route_module", "compiled_server_chunk",
 })
 
+# These counters are the bounded, non-identifying explanation for profile
+# rejection.  The stable profile_reason remains the compatibility summary;
+# this closed set identifies the producer predicate without retaining journal
+# messages, PIDs, invocation IDs, or category values.
+PROFILE_REJECTION_CODES = (
+    "malformed_record",
+    "release_identity",
+    "plan_identity",
+    "plan_targets",
+    "systemd_identity",
+    "preflight_exception",
+    "identity_pid",
+    "identity_start_ticks",
+    "identity_invocation",
+    "identity_unit",
+    "identity_cgroup",
+    "journal_timestamp",
+    "journal_window",
+    "profile_start_lag",
+    "profile_elapsed",
+    "profile_end_lag",
+    "profile_numeric",
+    "profile_category",
+    "profile_aggregate",
+    "profile_parser",
+    "summary_exception",
+    "summary_validation",
+    "missing",
+    "duplicate",
+    "unexpected",
+)
+PROFILE_CAPTURE_REASONS = frozenset({
+    "not_started", "complete", "journal_failed", "timeout", "byte_cap", "line_cap", "invalid_event",
+    "summary_exception", "summary_validation",
+})
+PROFILE_SERVICE_HINT_RE = re.compile(r"^cpu_diagnostic_complete service=(api|web)(?: |$)")
+
+
+def _empty_profile_rejections(capture_reason: str = "not_started") -> dict[str, Any]:
+    service_counts = {
+        service: {reason: 0 for reason in PROFILE_REJECTION_CODES}
+        for service in ("api", "web", "unattributed")
+    }
+    if capture_reason == "summary_exception":
+        service_counts["unattributed"]["summary_exception"] = 1
+    return {
+        "capture_reason": capture_reason,
+        "service_counts": service_counts,
+    }
+
+
+def _parse_profile_categories_diagnostic(
+    raw: str,
+    *,
+    service: str,
+) -> tuple[list[dict[str, int | str]] | None, str | None]:
+    if len(raw) > 6000:
+        return None, "malformed"
+    allowed = API_PROFILE_CATEGORIES if service == "api" else WEB_PROFILE_CATEGORIES
+    if not raw:
+        return ([] if service == "api" else None), (None if service == "api" else "malformed")
+    parsed: list[dict[str, int | str]] = []
+    seen: set[str] = set()
+    for token in raw.split(","):
+        parts = token.split(":")
+        if len(parts) != 3:
+            return None, "malformed"
+        if parts[0] not in allowed or parts[0] in seen:
+            return None, "category"
+        if not parts[1].isdecimal() or not parts[2].isdecimal():
+            return None, "numeric"
+        if len(parts[1]) > 8 or len(parts[2]) > 8:
+            return None, "numeric"
+        cpu_us, observations = int(parts[1]), int(parts[2])
+        if cpu_us < 0 or cpu_us > 60_000_000 or observations < 0 or observations > 10_000_000:
+            return None, "numeric"
+        seen.add(parts[0])
+        parsed.append({"category": parts[0], "cpu_us": cpu_us, "observations": observations})
+    return parsed, None
+
 
 def _parse_profile_categories(
     raw: str,
     *,
     service: str,
 ) -> list[dict[str, int | str]] | None:
-    if len(raw) > 6000:
-        return None
-    allowed = API_PROFILE_CATEGORIES if service == "api" else WEB_PROFILE_CATEGORIES
-    if not raw:
-        return [] if service == "api" else None
-    parsed: list[dict[str, int | str]] = []
-    seen: set[str] = set()
-    for token in raw.split(","):
-        parts = token.split(":")
-        if len(parts) != 3 or parts[0] not in allowed or parts[0] in seen:
-            return None
-        if not parts[1].isdecimal() or not parts[2].isdecimal():
-            return None
-        cpu_us, observations = int(parts[1]), int(parts[2])
-        if cpu_us < 0 or cpu_us > 60_000_000 or observations < 0 or observations > 10_000_000:
-            return None
-        seen.add(parts[0])
-        parsed.append({"category": parts[0], "cpu_us": cpu_us, "observations": observations})
+    """Compatibility parser; detailed callers use the same parser result."""
+    parsed, _reason = _parse_profile_categories_diagnostic(raw, service=service)
     return parsed
 
 
@@ -1808,7 +1872,15 @@ def _usage_summary(
             for service, expected in (("api", 2), ("web", 1))
         ]
 
-    def incomplete(reason: str) -> dict[str, Any]:
+    def incomplete(
+        reason: str, *, rejection_code: str | None = None,
+        service: str = "unattributed",
+    ) -> dict[str, Any]:
+        profile_rejections = _empty_profile_rejections()
+        if rejection_code is not None:
+            bucket = service if service in {"api", "web"} else "unattributed"
+            if rejection_code in PROFILE_REJECTION_CODES:
+                profile_rejections["service_counts"][bucket][rejection_code] = 1
         return {
             "workload": workload,
             "usage_status": "incomplete",
@@ -1821,6 +1893,7 @@ def _usage_summary(
                 else reason
             ),
             "profile_rows": empty_profile_rows(),
+            "profile_rejections": profile_rejections,
             "memory_status": "incomplete",
             "memory_reason": "incomplete",
             "cgroup_memory_status": "unknown",
@@ -1831,11 +1904,14 @@ def _usage_summary(
     targets: dict[str, dict[int, tuple[int, str]]] = {}
     try:
         release_identity = _release_identity()
+    except (OSError, KeyError, TypeError, ValueError, PlanError):
+        return incomplete("identity_changed", rejection_code="release_identity")
+    try:
         if release_identity != (
             str(plans["api"].get("source_sha")),
             str(plans["api"].get("release_slug")),
         ):
-            return incomplete("identity_changed")
+            return incomplete("identity_changed", rejection_code="release_identity")
         for service in ("api", "web"):
             payload = plans[service]
             if (payload.get("run_id") != plans["api"].get("run_id")
@@ -1856,16 +1932,25 @@ def _usage_summary(
                     or payload["on_start_ms"] - payload["off_end_ms"] != IDLE_WINDOW_MS
                     or payload["on_end_ms"] - payload["on_start_ms"]
                     != _plan_on_window_ms(workload)):
-                return incomplete("identity_changed")
-            targets[service] = {
-                int(item["pid"]): (int(item["start_ticks"]), str(item["invocation_id"]))
-                for item in payload["targets"]
-            }
+                return incomplete("identity_changed", rejection_code="plan_identity", service=service)
+            try:
+                targets[service] = {
+                    int(item["pid"]): (int(item["start_ticks"]), str(item["invocation_id"]))
+                    for item in payload["targets"]
+                }
+            except (KeyError, TypeError, ValueError):
+                return incomplete("identity_changed", rejection_code="plan_targets", service=service)
             expected_count = 2 if service == "api" else 1
             if len(targets[service]) != expected_count or len(payload["targets"]) != expected_count:
-                return incomplete("identity_changed")
-            unit = _systemd_unit(service, timeout_seconds=3)
-            actual = _service_targets(service, unit)
+                return incomplete("identity_changed", rejection_code="plan_targets", service=service)
+            try:
+                unit = _systemd_unit(service, timeout_seconds=3)
+            except (OSError, KeyError, TypeError, ValueError, PlanError):
+                return incomplete("identity_changed", rejection_code="systemd_identity", service=service)
+            try:
+                actual = _service_targets(service, unit)
+            except (OSError, KeyError, TypeError, ValueError, PlanError):
+                return incomplete("identity_changed", rejection_code="preflight_exception", service=service)
             expected = sorted(
                 (service, pid, ticks, invocation)
                 for pid, (ticks, invocation) in targets[service].items()
@@ -1877,12 +1962,34 @@ def _usage_summary(
             )
             if unit["InvocationID"].lower() not in {
                 invocation for _ticks, invocation in targets[service].values()
-            } or expected != observed:
-                return incomplete("identity_changed")
+            }:
+                return incomplete("identity_changed", rejection_code="systemd_identity", service=service)
+            expected_by_pid = {item[1]: item[2:] for item in expected}
+            observed_by_pid = {item[1]: item[2:] for item in observed}
+            if expected_by_pid.keys() != observed_by_pid.keys():
+                return incomplete("identity_changed", rejection_code="identity_pid", service=service)
+            if any(expected_by_pid[pid][0] != observed_by_pid[pid][0]
+                   for pid in expected_by_pid):
+                return incomplete("identity_changed", rejection_code="identity_start_ticks", service=service)
+            if any(expected_by_pid[pid][1] != observed_by_pid[pid][1]
+                   for pid in expected_by_pid):
+                return incomplete("identity_changed", rejection_code="identity_invocation", service=service)
+            if expected != observed:
+                return incomplete("identity_changed", rejection_code="systemd_identity", service=service)
     except (OSError, KeyError, TypeError, ValueError, PlanError):
-        return incomplete("identity_changed")
+        return incomplete("identity_changed", rejection_code="preflight_exception")
 
     capture_status, records = _journal_rows(plans)
+    profile_rejections = _empty_profile_rejections(
+        capture_status if capture_status in PROFILE_CAPTURE_REASONS else "invalid_event"
+    )
+
+    def reject_profile(service: str, reason: str, count: int = 1) -> None:
+        bucket = service if service in {"api", "web"} else "unattributed"
+        counts = profile_rejections["service_counts"][bucket]
+        if reason in PROFILE_REJECTION_CODES and type(count) is int and count > 0:
+            counts[reason] = min(MAX_JOURNAL_ROWS, counts[reason] + count)
+
     events: dict[tuple[str, int, str], list[dict[str, Any]]] = {}
     profiles: dict[tuple[str, int], list[dict[str, Any]]] = {}
     memory_samples: dict[tuple[str, int, str], list[dict[str, Any]]] = {}
@@ -1949,6 +2056,24 @@ def _usage_summary(
             continue
         if is_profile and profile_api_match is None and profile_web_match is None:
             invalid_profile = True
+            record_unit = record.get("_SYSTEMD_UNIT")
+            unit_service = (
+                "api" if record_unit == expected_units["api"]
+                else "web" if record_unit == expected_units["web"]
+                else "unattributed"
+            )
+            service_hint = PROFILE_SERVICE_HINT_RE.match(message)
+            hinted_service = service_hint.group(1) if service_hint else None
+            # A malformed message cannot establish service identity. Use the
+            # trusted journal unit only when it is known and does not conflict
+            # with the message hint; disagreement stays unattributed.
+            rejection_service = (
+                unit_service
+                if unit_service != "unattributed"
+                and (hinted_service is None or hinted_service == unit_service)
+                else "unattributed"
+            )
+            reject_profile(rejection_service, "malformed_record")
             continue
         if is_memory and memory_match is None:
             invalid_memory = True
@@ -1966,29 +2091,80 @@ def _usage_summary(
         if event_run != run_id:
             continue
         try:
-            pid = int(record.get("_PID", ""))
-            timestamp_us = int(record.get("__REALTIME_TIMESTAMP", ""))
-            invocation = str(record.get("_SYSTEMD_INVOCATION_ID", "")).lower()
-            unit = str(record.get("_SYSTEMD_UNIT", ""))
-            cgroup = str(record.get("_SYSTEMD_CGROUP", ""))
-            start_ticks, expected_invocation = targets[service][pid]
-            min_timestamp_key = "on_start_ms" if is_profile or (is_memory and phase == "on") else "off_start_ms"
-            max_timestamp_key = "on_end_ms" if is_profile or is_usage else ("on_end_ms" if phase == "on" else "off_end_ms")
-            min_timestamp = int(plans[service][min_timestamp_key]) * 1000 - 1_000_000
-            max_timestamp = int(plans[service][max_timestamp_key]) * 1000 + 5_000_000
-            if (timestamp_us < min_timestamp
-                    or timestamp_us > max_timestamp
-                    or invocation != expected_invocation or unit != expected_units[service]
-                    or cgroup != expected_cgroups[service]
-                    or invocation != str(plans[service]["targets"][0]["invocation_id"]).lower()
-                    or _process_start_ticks(pid) != start_ticks):
-                if is_memory:
-                    invalid_memory = True
-                elif is_profile:
+            if is_profile:
+                try:
+                    pid = int(record.get("_PID", ""))
+                except (TypeError, ValueError):
                     invalid_profile = True
-                else:
-                    invalid_event = True
-                continue
+                    reject_profile(service, "identity_pid")
+                    continue
+                target_identity = targets[service].get(pid)
+                if target_identity is None:
+                    invalid_profile = True
+                    reject_profile(service, "identity_pid")
+                    continue
+                start_ticks, expected_invocation = target_identity
+                invocation = str(record.get("_SYSTEMD_INVOCATION_ID", "")).lower()
+                unit = str(record.get("_SYSTEMD_UNIT", ""))
+                cgroup = str(record.get("_SYSTEMD_CGROUP", ""))
+                if invocation != expected_invocation or invocation != str(
+                    plans[service]["targets"][0]["invocation_id"]
+                ).lower():
+                    invalid_profile = True
+                    reject_profile(service, "identity_invocation")
+                    continue
+                if unit != expected_units[service]:
+                    invalid_profile = True
+                    reject_profile(service, "identity_unit")
+                    continue
+                if cgroup != expected_cgroups[service]:
+                    invalid_profile = True
+                    reject_profile(service, "identity_cgroup")
+                    continue
+                try:
+                    timestamp_us = int(record.get("__REALTIME_TIMESTAMP", ""))
+                except (TypeError, ValueError):
+                    invalid_profile = True
+                    reject_profile(service, "journal_timestamp")
+                    continue
+                min_timestamp = int(plans[service]["on_start_ms"]) * 1000 - 1_000_000
+                max_timestamp = int(plans[service]["on_end_ms"]) * 1000 + 5_000_000
+                if timestamp_us < min_timestamp or timestamp_us > max_timestamp:
+                    invalid_profile = True
+                    reject_profile(service, "journal_window")
+                    continue
+                try:
+                    observed_start_ticks = _process_start_ticks(pid)
+                except (OSError, PlanError, ValueError):
+                    invalid_profile = True
+                    reject_profile(service, "identity_start_ticks")
+                    continue
+                if observed_start_ticks != start_ticks:
+                    invalid_profile = True
+                    reject_profile(service, "identity_start_ticks")
+                    continue
+            else:
+                pid = int(record.get("_PID", ""))
+                timestamp_us = int(record.get("__REALTIME_TIMESTAMP", ""))
+                invocation = str(record.get("_SYSTEMD_INVOCATION_ID", "")).lower()
+                unit = str(record.get("_SYSTEMD_UNIT", ""))
+                cgroup = str(record.get("_SYSTEMD_CGROUP", ""))
+                start_ticks, expected_invocation = targets[service][pid]
+                min_timestamp_key = "on_start_ms" if is_memory and phase == "on" else "off_start_ms"
+                max_timestamp_key = "on_end_ms" if is_usage or phase == "on" else "off_end_ms"
+                min_timestamp = int(plans[service][min_timestamp_key]) * 1000 - 1_000_000
+                max_timestamp = int(plans[service][max_timestamp_key]) * 1000 + 5_000_000
+                if (timestamp_us < min_timestamp
+                        or timestamp_us > max_timestamp
+                        or invocation != expected_invocation or unit != expected_units[service]
+                        or cgroup != expected_cgroups[service]
+                        or invocation != str(plans[service]["targets"][0]["invocation_id"]).lower()
+                        or _process_start_ticks(pid) != start_ticks):
+                    if is_memory:
+                        invalid_memory = True
+                    else:
+                        invalid_event = True
+                    continue
             if memory_match is not None:
                 memory_samples.setdefault((service, pid, phase), []).append(memory_match)
             elif usage_match is not None:
@@ -2009,7 +2185,7 @@ def _usage_summary(
                     start_lag_ms = int(profile_api_match.group(2))
                     elapsed_ms = int(profile_api_match.group(3))
                     total_cpu_us = int(profile_api_match.group(4))
-                    categories = _parse_profile_categories(profile_api_match.group(5), service="api")
+                    raw_categories = profile_api_match.group(5)
                     sample_count = None
                     timer = "thread_cpu"
                 else:
@@ -2017,34 +2193,51 @@ def _usage_summary(
                     start_lag_ms = int(profile_web_match.group(2))
                     elapsed_ms = int(profile_web_match.group(3))
                     sample_count = int(profile_web_match.group(4))
-                    categories = _parse_profile_categories(profile_web_match.group(5), service="web")
-                    total_cpu_us = (
-                        sum(int(item["cpu_us"]) for item in categories)
-                        if categories is not None else 0
-                    )
+                    raw_categories = profile_web_match.group(5)
+                    total_cpu_us = 0
                     timer = "v8_cpu"
                 profile_window_ms = _plan_on_window_ms(workload)
                 end_lag_ms = start_lag_ms + elapsed_ms - profile_window_ms
-                if (categories is None or total_cpu_us < 0 or total_cpu_us > 60_000_000
-                        or not 0 <= start_lag_ms <= 250
-                        or profile_window_ms is None
-                        or not profile_window_ms - 250 <= elapsed_ms <= profile_window_ms + 500
-                        or not -250 <= end_lag_ms <= 250
-                        or total_cpu_us > (elapsed_ms + 250) * 1000
-                        or (timer == "v8_cpu" and (sample_count is None or sample_count <= 0
-                                                   or sample_count > MAX_SAMPLES_PROFILE))):
+                categories, category_parse_reason = _parse_profile_categories_diagnostic(
+                    raw_categories,
+                    service=service,
+                )
+                if timer == "v8_cpu" and categories is not None:
+                    total_cpu_us = sum(int(item["cpu_us"]) for item in categories)
+                rejection = None
+                if category_parse_reason == "malformed":
+                    rejection = "malformed_record"
+                elif category_parse_reason == "category":
+                    rejection = "profile_category"
+                elif category_parse_reason == "numeric":
+                    rejection = "profile_numeric"
+                elif not 0 <= start_lag_ms <= 250:
+                    rejection = "profile_start_lag"
+                elif profile_window_ms is None or not profile_window_ms - 250 <= elapsed_ms <= profile_window_ms + 500:
+                    rejection = "profile_elapsed"
+                elif not -250 <= end_lag_ms <= 250:
+                    rejection = "profile_end_lag"
+                elif (total_cpu_us < 0 or total_cpu_us > 60_000_000
+                      or total_cpu_us > (elapsed_ms + 250) * 1000
+                      or (timer == "v8_cpu" and (sample_count is None or sample_count <= 0
+                                                 or sample_count > MAX_SAMPLES_PROFILE))):
+                    rejection = "profile_numeric"
+                if rejection is not None:
                     invalid_profile = True
+                    reject_profile(service, rejection)
                     continue
                 if timer == "v8_cpu" and (
                     sum(int(item["observations"]) for item in categories) != sample_count
                     or sum(int(item["cpu_us"]) for item in categories) != total_cpu_us
                 ):
                     invalid_profile = True
+                    reject_profile(service, "profile_aggregate")
                     continue
                 if timer == "thread_cpu" and (
                     sum(int(item["cpu_us"]) for item in categories) != total_cpu_us
                 ):
                     invalid_profile = True
+                    reject_profile(service, "profile_aggregate")
                     continue
                 profiles.setdefault((service, pid), []).append({
                     "start_lag_ms": start_lag_ms,
@@ -2055,11 +2248,12 @@ def _usage_summary(
                     "timer": timer,
                     "categories": categories,
                 })
-        except (KeyError, OSError, ValueError):
+        except Exception:
             if is_memory:
                 invalid_memory = True
             elif is_profile:
                 invalid_profile = True
+                reject_profile(service, "profile_parser")
             else:
                 invalid_event = True
 
@@ -2171,8 +2365,14 @@ def _usage_summary(
             profile_reason = "missing"
         elif duplicate_count and profile_reason == "none":
             profile_reason = "duplicate"
-        elif not row_complete:
-            profile_complete = False
+        if event_count < expected_profile_count:
+            reject_profile(service, "missing", expected_profile_count - event_count)
+        if duplicate_count:
+            reject_profile(service, "duplicate", duplicate_count)
+        if expected_profile_count == 0 and event_count > 0:
+            if profile_reason == "none":
+                profile_reason = "invalid_profile"
+            reject_profile(service, "unexpected", event_count)
         if not row_complete:
             profile_complete = False
         category_totals: dict[str, list[int]] = {}
@@ -2310,6 +2510,7 @@ def _usage_summary(
         "profile_status": "complete" if profile_complete else "incomplete",
         "profile_reason": profile_reason,
         "profile_rows": profile_rows,
+        "profile_rejections": profile_rejections,
         "memory_status": "complete" if memory_complete else "incomplete",
         "memory_reason": "none" if memory_complete else "incomplete",
         "cgroup_memory_status": "invalid" if cgroup_memory_invalid else "complete" if cgroup_memory_complete else "unknown",
@@ -2436,6 +2637,7 @@ def cleanup(args: argparse.Namespace) -> dict[str, object]:
                         }
                         for service, expected in (("api", 2), ("web", 1))
                     ],
+                    "profile_rejections": _empty_profile_rejections("summary_exception"),
                     "memory_status": "incomplete",
                     "memory_reason": "incomplete",
                     "cgroup_memory_status": "unknown",
@@ -2453,6 +2655,7 @@ def cleanup(args: argparse.Namespace) -> dict[str, object]:
                 "profile_status": "unavailable",
                 "profile_reason": "missing",
                 "profile_rows": [],
+                "profile_rejections": _empty_profile_rejections(),
                 "memory_status": "unavailable",
                 "memory_reason": "unavailable",
                 "cgroup_memory_status": "unknown",

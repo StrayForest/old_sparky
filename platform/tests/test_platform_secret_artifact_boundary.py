@@ -12,6 +12,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
+import zipfile
 
 import yaml
 
@@ -780,6 +782,443 @@ printf 'RESULT=%s\n' "$result"
         self.assertIn("- validate-classifier", _job_blocks(source)["build-release"])
         self.assertNotIn("/usr/bin/python3 \"$artifacts_metadata\"", production)
         self.assertNotIn("bundle.namelist()", production)
+
+
+class FixtureCredentialTransportTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        sys.path.insert(0, str(REPO_ROOT / "platform"))
+        from tools import platform_fixture_credential_transport as transport
+
+        cls.transport = transport
+        cls.tool_root = Path(tempfile.mkdtemp(prefix="fixture-age-tools-"))
+        os.chmod(cls.tool_root, 0o700)
+        cls.age = transport.ensure_age_binary(cls.tool_root / "age-tools")
+        cls.age_keygen = cls.tool_root / "age-tools" / "age-keygen"
+        cls.key_dir = cls.tool_root / "keys"
+        cls.key_dir.mkdir(mode=0o700)
+        cls.identity = cls.key_dir / "test-identity.txt"
+        generated = subprocess.run(
+            [str(cls.age_keygen), "-o", str(cls.identity)],
+            capture_output=True, text=True, check=False,
+        )
+        if generated.returncode != 0:
+            raise AssertionError("pinned age-keygen could not create a synthetic test identity")
+        cls.identity.chmod(0o600)
+        recipient = subprocess.run(
+            [str(cls.age_keygen), "-y", str(cls.identity)],
+            capture_output=True, text=True, check=False,
+        )
+        if recipient.returncode != 0 or re.fullmatch(r"age1[0-9a-z]{58}\n?", recipient.stdout) is None:
+            raise AssertionError("pinned age-keygen returned an invalid synthetic recipient")
+        cls.original_recipient = transport.AGE_RECIPIENT
+        transport.AGE_RECIPIENT = recipient.stdout.strip()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.transport.AGE_RECIPIENT = cls.original_recipient
+        shutil.rmtree(cls.tool_root)
+
+    def setUp(self) -> None:
+        self.scratch = tempfile.TemporaryDirectory(prefix="fixture-private-transport-")
+        self.addCleanup(self.scratch.cleanup)
+        self.root = Path(self.scratch.name)
+        os.chmod(self.root, 0o700)
+
+    @staticmethod
+    def _binding(runner_sha: str, app_sha: str) -> dict[str, object]:
+        return {
+            "schema": 1,
+            "binding_mode": "verified-noop",
+            "runner_sha": runner_sha,
+            "app_target_sha": app_sha,
+            "baseline_identity": {
+                "schema": 1,
+                "source_sha": app_sha,
+                "release_slug": "gha-123456-1-" + app_sha[:12],
+                "release_json_sha256": "c" * 64,
+                "current_link_dev": 100,
+                "current_link_ino": 101,
+                "release_dev": 100,
+                "release_ino": 102,
+                "pending_operation": False,
+            },
+            "receipt_document_sha256": "e" * 64,
+            "receipt_artifact_id": "456789",
+            "receipt_artifact_name": "platform-production-noop-source-receipt-123456-2",
+            "receipt_artifact_digest": "sha256:" + "d" * 64,
+            "receipt_archive_sha256": "d" * 64,
+            "cumulative_manifest_sha256": "f" * 64,
+            "source_security_run_id": "234567",
+            "source_security_run_attempt": "1",
+            "autodeploy_run_id": "345678",
+            "autodeploy_run_attempt": "3",
+            "production_deploy_run_id": "123456",
+            "production_deploy_run_attempt": "2",
+        }
+
+    def _files(self, *, runner_sha: str, app_sha: str) -> tuple[Path, Path, dict[str, str]]:
+        binding = self._binding(runner_sha, app_sha) if runner_sha != app_sha else None
+        input_payload: dict[str, object] = {
+            "schema": "2" if binding is not None else "1",
+            "confirmation": "RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC" if binding is not None else "RUN-PRODUCTION-EXTERNAL-LOAD",
+            "target_sha": runner_sha,
+            "control_email": "fixture-control@example.invalid",
+            "setup_concurrency": "8",
+            "run_id": "567890",
+            "profile": "external-vote",
+            "tournament_count": "1",
+            "users_per_tournament": "14",
+            "timeout_diagnostics": "false",
+            "fixture_kind": "ssr_html_capacity_composite_diagnostic_v1" if binding is not None else "external_load",
+        }
+        if binding is not None:
+            input_payload.update({
+                "source_binding": binding,
+                "ssr_capacity_concurrency": "32",
+                "ssr_capacity_workload": "authenticated_html_ssr_capacity_120s_plus_cpu_profile_20s_v1",
+            })
+        canonical_binding = json.dumps(binding, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("ascii") if binding is not None else None
+        users = [
+            {
+                "user_id": f"synthetic-user-{index:02d}",
+                "tournament_slug": "private-fixture-slug",
+                "session_token": f"SYNTHETIC_SESSION_TOKEN_{index:02d}_not_a_real_credential",
+                "csrf_token": f"SYNTHETIC_CSRF_TOKEN_{index:02d}_not_a_real_credential",
+            }
+            for index in range(14)
+        ]
+        manifest = {
+            "schema": 2,
+            "purpose": "external_ready_vote",
+            "origin": "https://old-sparky.com",
+            "session_cookie_name": "__Host-session",
+            "csrf_cookie_name": "__Host-session_csrf",
+            "marker": "preprod202611020000abcd",
+            "created_at": "2026-11-02T00:00:00Z",
+            "tournaments": [{"id": "synthetic-tournament-id", "slug": "private-fixture-slug", "user_count": 14}],
+            "users": users,
+            "runner_sha": runner_sha,
+            "app_target_sha": app_sha,
+            "source_binding": binding,
+            "source_binding_sha256": hashlib.sha256(canonical_binding).hexdigest() if canonical_binding is not None else None,
+        }
+        input_path = self.root / "input.json"
+        manifest_path = self.root / "manifest.json"
+        input_path.write_text(json.dumps(input_payload, separators=(",", ":")) + "\n", encoding="ascii")
+        manifest_path.write_text(json.dumps(manifest, separators=(",", ":")) + "\n", encoding="ascii")
+        input_path.chmod(0o600)
+        manifest_path.chmod(0o600)
+        secret_values = {
+            str(input_payload["control_email"]),
+            *(row["session_token"] for row in users),
+            *(row["csrf_token"] for row in users),
+            "private-fixture-slug", "synthetic-user-00", "synthetic-tournament-id",
+        }
+        return input_path, manifest_path, {key: value for key, value in enumerate(secret_values)}
+
+    def test_real_age_ciphertext_and_descriptor_round_trip_same_source_and_noop(self) -> None:
+        for runner_sha, app_sha in (("a" * 40, "a" * 40), ("b" * 40, "a" * 40)):
+            with self.subTest(source_binding=runner_sha != app_sha):
+                input_path, manifest_path, secrets = self._files(runner_sha=runner_sha, app_sha=app_sha)
+                input_cipher = self.root / f"input-{runner_sha[:1]}.json.age"
+                manifest_cipher = self.root / f"manifest-{runner_sha[:1]}.json.age"
+                input_plain = self.root / f"input-{runner_sha[:1]}.decoded.json"
+                manifest_plain = self.root / f"manifest-{runner_sha[:1]}.decoded.json"
+                descriptor_path = self.root / f"descriptor-{runner_sha[:1]}.json"
+                self.transport.encrypt_file(input_path, input_cipher, self.age)
+                self.transport.encrypt_file(manifest_path, manifest_cipher, self.age)
+                self.transport.decrypt_file(input_cipher, input_plain, self.identity, self.age)
+                self.transport.decrypt_file(manifest_cipher, manifest_plain, self.identity, self.age)
+                self.assertEqual(input_plain.read_bytes(), input_path.read_bytes())
+                self.assertEqual(manifest_plain.read_bytes(), manifest_path.read_bytes())
+                self.transport.build_descriptor(
+                    input_path, manifest_path, descriptor_path,
+                    "567890", "1", runner_sha, app_sha,
+                )
+                descriptor = self.transport.validate_descriptor(
+                    descriptor_path, "567890", "1", runner_sha, app_sha,
+                )
+                self.assertEqual(descriptor["runner_sha"], runner_sha)
+                self.assertEqual(descriptor["app_target_sha"], app_sha)
+                self.assertEqual(descriptor["manifest"]["user_count"], 14)
+                for value in secrets.values():
+                    encoded = value.encode("ascii")
+                    self.assertNotIn(encoded, descriptor_path.read_bytes())
+                    self.assertNotIn(encoded, input_cipher.read_bytes())
+                    self.assertNotIn(encoded, manifest_cipher.read_bytes())
+                artifact = self.root / f"ciphertext-only-{runner_sha[:1]}.zip"
+                with zipfile.ZipFile(artifact, "w", compression=zipfile.ZIP_STORED) as archive:
+                    archive.write(input_cipher, "private-input.age")
+                    archive.write(manifest_cipher, "private-manifest.age")
+                    archive.write(descriptor_path, "fixture-descriptor.json")
+                for value in secrets.values():
+                    self.assertNotIn(value.encode("ascii"), artifact.read_bytes())
+                self.assertFalse(any(value.encode("ascii") in artifact.read_bytes() for value in ("fixture-control@example.invalid",)))
+
+    def test_wrong_identity_and_tampered_ciphertext_fail_without_plaintext_output(self) -> None:
+        input_path, _manifest_path, _secrets = self._files(runner_sha="a" * 40, app_sha="a" * 40)
+        ciphertext = self.root / "input.json.age"
+        self.transport.encrypt_file(input_path, ciphertext, self.age)
+        wrong_identity = self.root / "wrong-identity.txt"
+        generated = subprocess.run(
+            [str(self.age_keygen), "-o", str(wrong_identity)], capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(generated.returncode, 0)
+        wrong_identity.chmod(0o600)
+        rejected = self.root / "wrong-key-output.json"
+        with self.assertRaises(SystemExit):
+            self.transport.decrypt_file(ciphertext, rejected, wrong_identity, self.age)
+        self.assertFalse(rejected.exists())
+        tampered = self.root / "tampered.age"
+        raw = ciphertext.read_bytes()
+        tampered.write_bytes(raw[:-1] + bytes([raw[-1] ^ 1]))
+        tampered.chmod(0o600)
+        rejected = self.root / "tamper-output.json"
+        with self.assertRaises(SystemExit):
+            self.transport.decrypt_file(tampered, rejected, self.identity, self.age)
+        self.assertFalse(rejected.exists())
+
+    def test_descriptor_rejects_private_extra_mismatch_and_unknown_fields(self) -> None:
+        input_path, manifest_path, _secrets = self._files(runner_sha="b" * 40, app_sha="a" * 40)
+        descriptor_path = self.root / "descriptor.json"
+        self.transport.build_descriptor(input_path, manifest_path, descriptor_path, "567890", "1", "b" * 40, "a" * 40)
+        valid = json.loads(descriptor_path.read_text(encoding="ascii"))
+        invalid_cases = (
+            {**valid, "surprise": "value"},
+            {**valid, "input": {**valid["input"], "control_email": "fixture-control@example.invalid"}},
+            {**valid, "manifest": {**valid["manifest"], "source_binding_sha256": "0" * 64}},
+        )
+        for payload in invalid_cases:
+            with self.subTest(keys=sorted(payload)):
+                descriptor_path.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="ascii")
+                descriptor_path.chmod(0o600)
+                with self.assertRaises(SystemExit):
+                    self.transport.validate_descriptor(descriptor_path, "567890", "1", "b" * 40, "a" * 40)
+
+    def test_decrypted_manifest_must_match_safe_descriptor(self) -> None:
+        from tools.platform_load import source_binding_environment_from_handoff
+
+        input_path, manifest_path, _secrets = self._files(runner_sha="b" * 40, app_sha="a" * 40)
+        descriptor_path = self.root / "descriptor.json"
+        self.transport.build_descriptor(input_path, manifest_path, descriptor_path, "567890", "1", "b" * 40, "a" * 40)
+        with mock.patch.dict(os.environ, {"GITHUB_RUN_ID": "567890", "GITHUB_RUN_ATTEMPT": "1"}):
+            values = source_binding_environment_from_handoff(
+                descriptor_path, manifest_path, runner_sha="b" * 40, app_target_sha="a" * 40,
+            )
+            self.assertTrue(values["SOURCE_BINDING_BASE64"])
+            self.assertRegex(values["SOURCE_BINDING_SHA256"], r"^[0-9a-f]{64}$")
+            manifest_path.write_text(manifest_path.read_text(encoding="utf-8").replace("SYNTHETIC_SESSION_TOKEN_00", "SYNTHETIC_SESSION_TOKEN_XX"), encoding="utf-8")
+            manifest_path.chmod(0o600)
+            from tools.platform_load import LoadProfileError
+            with self.assertRaises(LoadProfileError):
+                source_binding_environment_from_handoff(
+                    descriptor_path, manifest_path, runner_sha="b" * 40, app_target_sha="a" * 40,
+                )
+
+
+class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
+    def test_public_artifacts_are_ciphertext_and_fixture_key_is_scoped(self) -> None:
+        document = yaml.safe_load((WORKFLOW_ROOT / "platform-production-external-load.yml").read_text(encoding="utf-8"))
+        jobs = document["jobs"]
+        validator = jobs["validate-external-inputs"]
+        resolver = jobs["resolve-load-source-and-profile"]
+        resolver_steps = resolver["steps"]
+        self.assertLess(
+            next(i for i, step in enumerate(resolver_steps) if "Mask and remove control identity" in step.get("name", "")),
+            next(i for i, step in enumerate(resolver_steps) if step.get("uses", "").startswith("actions/checkout@")),
+        )
+        self.assertNotIn("control_email", str(resolver.get("env", {})))
+        self.assertNotIn("${{ inputs.control_email }}", str(resolver_steps[1:]))
+        self.assertNotIn("FIXTURE_MANIFEST_AGE_IDENTITY", str(resolver))
+        self.assertNotIn("actions/checkout@", str(validator))
+        self.assertNotIn("platform_load.py", str(validator))
+        self.assertNotIn("CONTROL_EMAIL", str(validator.get("env", {})))
+        for workflow_name in ("platform-production-external-load.yml", "platform-production-retained-load-cleanup.yml"):
+            workflow_doc = yaml.safe_load((WORKFLOW_ROOT / workflow_name).read_text(encoding="utf-8"))
+            for job_name, job in workflow_doc["jobs"].items():
+                steps = job.get("steps", [])
+                checkout_indexes = [i for i, step in enumerate(steps) if str(step.get("uses", "")).startswith("actions/checkout@")]
+                helper_indexes = [i for i, step in enumerate(steps) if "run" in step and "platform/tools/" in step["run"]]
+                if helper_indexes:
+                    self.assertTrue(checkout_indexes, f"{workflow_name}:{job_name} invokes repository helpers without checkout")
+                    self.assertLess(min(checkout_indexes), min(helper_indexes), f"{workflow_name}:{job_name} invokes a helper before checkout")
+                if checkout_indexes:
+                    scrub_indexes = [i for i, step in enumerate(steps) if "run" in step and "GITHUB_EVENT_PATH" in step["run"] and "::add-mask::" in step["run"] and "os.replace" in step["run"]]
+                    self.assertTrue(scrub_indexes, f"{workflow_name}:{job_name} checks out source without a mask-and-scrub event step")
+                    self.assertLess(min(scrub_indexes), min(checkout_indexes), f"{workflow_name}:{job_name} checks out source before event scrub")
+        self.assertIn("platform-production-external-load-private-input-", str(validator))
+        self.assertIn("age" , str(validator))
+        self.assertIn("--encrypt --recipient", str(validator))
+        self.assertNotIn("actions/checkout@", str(validator))
+        self.assertNotIn("platform_load.py", str(validator))
+        self.assertNotIn("FIXTURE_MANIFEST_AGE_IDENTITY", str(validator))
+        self.assertIn("fixture-manifest", jobs["load-client"].get("environment"))
+        self.assertNotIn("PROD_SSH_KEY", str(jobs["load-client"]))
+        for job_name in ("fixture-setup", "cpu-diagnostic-pair", "fixture-finalize"):
+            self.assertEqual(jobs[job_name].get("environment"), "production")
+            self.assertIn("FIXTURE_MANIFEST_AGE_IDENTITY", str(jobs[job_name]))
+            self.assertNotIn("FIXTURE_MANIFEST_AGE_IDENTITY", str(jobs[job_name].get("env", {})))
+            identity_steps = [step for step in jobs[job_name]["steps"] if "FIXTURE_MANIFEST_AGE_IDENTITY" in str(step.get("env", {}))]
+            self.assertEqual(len(identity_steps), 1)
+            self.assertIn("Stage", identity_steps[0].get("name", ""))
+            self.assertIn("AGE-SECRET-KEY-1", identity_steps[0].get("run", ""))
+            self.assertIn("os.O_EXCL", identity_steps[0].get("run", ""))
+            self.assertNotIn("curl ", identity_steps[0].get("run", ""))
+            self.assertNotIn("--decrypt", identity_steps[0].get("run", ""))
+            decrypt_steps = [step for step in jobs[job_name]["steps"] if "--decrypt --identity" in str(step.get("run", ""))]
+            self.assertEqual(len(decrypt_steps), 1)
+            self.assertNotIn("FIXTURE_MANIFEST_AGE_IDENTITY", str(decrypt_steps[0].get("env", {})))
+            steps = jobs[job_name]["steps"]
+            stage_index = steps.index(identity_steps[0])
+            decrypt_index = steps.index(decrypt_steps[0])
+            self.assertLess(stage_index, decrypt_index)
+            checkout_indexes = [i for i, step in enumerate(steps) if step.get("uses", "").startswith("actions/checkout@")]
+            if checkout_indexes:
+                self.assertLess(decrypt_index, min(checkout_indexes))
+        for job_name in ("derive-diagnostic-source-binding", "evaluate-load"):
+            self.assertNotIn("FIXTURE_MANIFEST_AGE_IDENTITY", str(jobs[job_name]))
+            self.assertIn("fixture-descriptor", str(jobs[job_name]))
+        workflow_text = (WORKFLOW_ROOT / "platform-production-external-load.yml").read_text(encoding="utf-8")
+        self.assertNotIn("${{ inputs.control_email }}", workflow_text)
+        self.assertIn("--recipient age1egptr8zhhvfe0ggmyu4cr9azhfsjpvvn3p5eyppznnzx8c5yedjsyeaasa", workflow_text)
+        self.assertIn("cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10", workflow_text)
+        self.assertNotIn("platform-production-external-load-manifest-${{ github.run_id }}-${{ github.run_attempt }}\n          path: ${{ runner.temp }}/external-fixture/manifest.json", workflow_text)
+        for job_name in ("validate-external-inputs", "fixture-setup"):
+            uploads = [
+                step for step in jobs[job_name]["steps"]
+                if isinstance(step.get("uses"), str) and "actions/upload-artifact@" in step["uses"]
+            ]
+            for step in uploads:
+                path = str(step.get("with", {}).get("path", ""))
+                self.assertNotIn("/manifest.json\n", path)
+                self.assertNotIn("platform-production-external-load-input.json\n", path)
+            self.assertTrue(any(".age" in str(step.get("with", {}).get("path", "")) for step in uploads))
+
+    def test_candidate_evaluator_and_cleanup_event_scrub_masks_before_rewrite(self) -> None:
+        workflow = yaml.safe_load((WORKFLOW_ROOT / "platform-production-external-load.yml").read_text(encoding="utf-8"))
+        external_scrubs = {
+            "cpu-diagnostic-pair": "Remove control identity from the runner event file",
+            "evaluate-load": "Remove control identity from the runner event file",
+            "resolve-host-tools-pin": "Mask and remove control identity before host-tools resolution",
+            "fixture-setup": "Mask and remove control identity before setup",
+        }
+        for job_name, scrub_name in external_scrubs.items():
+            with self.subTest(job=job_name), tempfile.TemporaryDirectory() as temporary:
+                event_path = Path(temporary) / "event.json"
+                email = "private-address+fixture@example.invalid"
+                event_path.write_text(json.dumps({"inputs": {"control_email": email, "profile_id": "external-vote"}}), encoding="utf-8")
+                event_path.chmod(0o600)
+                steps = workflow["jobs"][job_name]["steps"]
+                scrub = next(step for step in steps if step.get("name") == scrub_name)
+                self.assertLess(scrub["run"].index("::add-mask::"), scrub["run"].index("os.replace(tmp,path)"))
+                result = subprocess.run(
+                    ["bash", "-euo", "pipefail", "-c", scrub["run"]],
+                    env={**os.environ, "GITHUB_EVENT_PATH": str(event_path)},
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("::add-mask::private-address+fixture@example.invalid", result.stdout)
+                self.assertNotIn(email, event_path.read_text(encoding="utf-8"))
+
+        validator = workflow["jobs"]["validate-external-inputs"]
+        with tempfile.TemporaryDirectory() as temporary:
+            event_path = Path(temporary) / "event.json"
+            runner_temp = Path(temporary)
+            email = "private-address+fixture@example.invalid"
+            inputs = {
+                "confirmation": "RUN-PRODUCTION-EXTERNAL-LOAD", "control_email": email,
+                "profile_id": "authenticated-page-load-v1", "timeout_diagnostics": "false",
+                "cpu_diagnostic_pair": "false", "cpu_diagnostic_only": "false",
+                "ssr_capacity_diagnostic_only": "false", "ssr_capacity_concurrency": "8",
+                "ssr_capacity_workload": "authenticated_workspace_read_capacity_v1",
+            }
+            event_path.write_text(json.dumps({"inputs": inputs}), encoding="utf-8")
+            event_path.chmod(0o600)
+            scrub = validator["steps"][0]
+            result = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", scrub["run"]],
+                env={**os.environ, "GITHUB_EVENT_PATH": str(event_path), "RUNNER_TEMP": str(runner_temp)},
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("::add-mask::private-address+fixture@example.invalid", result.stdout)
+            email_path = runner_temp / "platform-production-control-email"
+            self.assertEqual(email_path.read_text(encoding="ascii"), f"{email.lower()}\n")
+            self.assertEqual(email_path.stat().st_mode & 0o777, 0o600)
+            self.assertNotIn(email, event_path.read_text(encoding="utf-8"))
+
+            serializer = next(step for step in validator["steps"] if step.get("name") == "Serialize the private external-load input")
+            script = serializer["run"].split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+            private_input = runner_temp / "external-load-input.json"
+            args = [
+                str(private_input), str(email_path), "RUN-PRODUCTION-EXTERNAL-LOAD", "a" * 40, "a" * 40,
+                "8", "567890", "1", "14", "false", "false", "false", "8",
+                "authenticated_workspace_read_capacity_v1", "", "",
+            ]
+            result = subprocess.run(
+                [sys.executable, "-", *args], input=script, text=True,
+                env=os.environ.copy(),
+                capture_output=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(email_path.exists())
+            private_payload = json.loads(private_input.read_text(encoding="ascii"))
+            self.assertEqual(private_payload["control_email"], email.lower())
+            self.assertEqual(private_payload["target_sha"], "a" * 40)
+
+        host_steps = workflow["jobs"]["resolve-host-tools-pin"]["steps"]
+        self.assertLess(
+            next(i for i, step in enumerate(host_steps) if step.get("name") == "Mask and remove control identity before host-tools resolution"),
+            next(i for i, step in enumerate(host_steps) if step.get("uses", "").startswith("actions/checkout@")),
+        )
+
+        cleanup = yaml.safe_load((WORKFLOW_ROOT / "platform-production-retained-load-cleanup.yml").read_text(encoding="utf-8"))
+        cleanup_text = (WORKFLOW_ROOT / "platform-production-retained-load-cleanup.yml").read_text(encoding="utf-8")
+        self.assertNotIn("${{ inputs.control_email }}", cleanup_text)
+        cleanup_steps = cleanup["jobs"]["cleanup"]["steps"]
+        cleanup_validation = next(step for step in cleanup_steps if step.get("name") == "Validate explicit cleanup confirmation")
+        self.assertIn("retained-cleanup-control-email", cleanup_validation.get("run", ""))
+        self.assertNotIn("CONTROL_EMAIL", str(cleanup_validation.get("env", {})))
+        cleanup_remove_index = next(i for i, step in enumerate(cleanup_steps) if step.get("name") == "Remove staged cleanup control identity")
+        cleanup_ssh_index = next(i for i, step in enumerate(cleanup_steps) if step.get("name") == "Configure production SSH")
+        self.assertLess(cleanup_remove_index, cleanup_ssh_index)
+        resolve_steps = cleanup["jobs"]["resolve-host-tools-pin"]["steps"]
+        self.assertLess(
+            next(i for i, step in enumerate(resolve_steps) if step.get("name") == "Mask and remove control identity before candidate checkout"),
+            next(i for i, step in enumerate(resolve_steps) if step.get("uses", "").startswith("actions/checkout@")),
+        )
+        for job_name, expected_step in (("resolve-host-tools-pin", "Mask and remove control identity before candidate checkout"), ("cleanup", "Mask and remove control identity before cleanup processing")):
+            with self.subTest(cleanup_job=job_name), tempfile.TemporaryDirectory() as temporary:
+                event_path = Path(temporary) / "event.json"
+                email = "private-address+fixture@example.invalid"
+                event_path.write_text(json.dumps({"inputs": {"control_email": email, "confirmation": "DELETE-PRODUCTION-RETAINED-LOAD", "load_run_id": "12345"}}), encoding="utf-8")
+                event_path.chmod(0o600)
+                step = next(step for step in cleanup["jobs"][job_name]["steps"] if step.get("name") == expected_step)
+                runner_temp = Path(temporary)
+                result = subprocess.run(
+                    ["bash", "-euo", "pipefail", "-c", step["run"]],
+                    env={**os.environ, "GITHUB_EVENT_PATH": str(event_path), "RUNNER_TEMP": str(runner_temp)},
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("::add-mask::private-address+fixture@example.invalid", result.stdout)
+                self.assertNotIn(email, event_path.read_text(encoding="utf-8"))
+                email_path = runner_temp / "retained-cleanup-control-email"
+                if job_name == "cleanup":
+                    self.assertEqual(email_path.read_text(encoding="ascii"), f"{email.lower()}\n")
+                    self.assertEqual(email_path.stat().st_mode & 0o777, 0o600)
+                else:
+                    self.assertFalse(email_path.exists())
+                if job_name == "cleanup":
+                    remove_step = next(step for step in cleanup["jobs"][job_name]["steps"] if step.get("name") == "Remove staged cleanup control identity")
+                    removed = subprocess.run(
+                        ["bash", "-euo", "pipefail", "-c", remove_step["run"]],
+                        env={**os.environ, "RUNNER_TEMP": str(runner_temp)},
+                        capture_output=True, text=True, check=False,
+                    )
+                    self.assertEqual(removed.returncode, 0, removed.stderr)
+                    self.assertFalse(email_path.exists())
 
 
 if __name__ == "__main__":

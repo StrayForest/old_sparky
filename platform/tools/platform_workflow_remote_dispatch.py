@@ -209,6 +209,51 @@ CPU_PROFILE_ROW_FIELDS = {
     "end_lag_ms_max", "categories",
 }
 CPU_PROFILE_CATEGORY_FIELDS = {"category", "cpu_us", "observations"}
+CPU_PROFILE_REJECTION_CODES = frozenset({
+    "malformed_record", "release_identity", "plan_identity", "plan_targets",
+    "systemd_identity", "preflight_exception", "identity_pid", "identity_start_ticks",
+    "identity_invocation", "identity_unit", "identity_cgroup",
+    "journal_timestamp", "journal_window", "profile_start_lag", "profile_elapsed",
+    "profile_end_lag", "profile_numeric", "profile_category",
+    "profile_aggregate", "profile_parser", "summary_exception", "summary_validation",
+    "missing", "duplicate", "unexpected",
+})
+CPU_PROFILE_CAPTURE_REASONS = frozenset({
+    "not_started", "complete", "journal_failed", "timeout", "byte_cap",
+    "line_cap", "invalid_event", "summary_exception", "summary_validation",
+})
+CPU_PROFILE_REJECTION_SERVICES = ("api", "web", "unattributed")
+CPU_PROFILE_REJECTION_COUNT_MAX = 640
+
+
+def _valid_cpu_profile_rejections(value: Any, *, profile_status: str) -> bool:
+    if (not isinstance(value, dict)
+            or set(value) != {"capture_reason", "service_counts"}
+            or value.get("capture_reason") not in CPU_PROFILE_CAPTURE_REASONS):
+        return False
+    services = value.get("service_counts")
+    if not isinstance(services, dict) or set(services) != set(CPU_PROFILE_REJECTION_SERVICES):
+        return False
+    for service in CPU_PROFILE_REJECTION_SERVICES:
+        counts = services.get(service)
+        if (not isinstance(counts, dict) or set(counts) != CPU_PROFILE_REJECTION_CODES
+                or any(type(count) is not int or not 0 <= count <= CPU_PROFILE_REJECTION_COUNT_MAX
+                       for count in counts.values())):
+            return False
+        if service == "unattributed" and any(
+            count for code, count in counts.items()
+            if code not in {
+                "malformed_record", "release_identity", "preflight_exception",
+                "summary_exception", "summary_validation",
+            }
+        ):
+            return False
+    if profile_status == "complete" and (
+        value["capture_reason"] != "complete"
+        or any(count for counts in services.values() for count in counts.values())
+    ):
+        return False
+    return True
 CPU_DIAGNOSTIC_USAGE_WINDOW_MS_BY_WORKLOAD = {
     "authenticated_workspace_read_pair_v1": 20_000,
     "authenticated_workspace_read_capacity_v1": 20_000,
@@ -990,7 +1035,7 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
         helper_command = "cleanup-stdin"
         cleanup_expected_keys = {
             "status", "service_count", "workload", "usage_status", "usage_reason", "usage_rows",
-            "profile_status", "profile_reason", "profile_rows", "memory_status",
+            "profile_status", "profile_reason", "profile_rows", "profile_rejections", "memory_status",
             "memory_reason", "cgroup_memory_status", "cgroup_memory_reason", "memory_rows",
         }
         expected_keys = cleanup_expected_keys
@@ -1209,6 +1254,10 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                     "none", "missing", "duplicate", "identity_changed", "journal_failed",
                     "byte_cap", "line_cap", "timeout", "invalid_profile",
                 }
+                or not _valid_cpu_profile_rejections(
+                    result.get("profile_rejections"),
+                    profile_status=result.get("profile_status"),
+                )
                 or not isinstance(result.get("profile_rows"), list)
                 or len(result["profile_rows"]) not in {0, 2}
                 or result.get("memory_status") not in {"complete", "incomplete", "unavailable"}
@@ -1496,6 +1545,7 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                 "profile_status": result["profile_status"],
                 "profile_reason": result["profile_reason"],
                 "profile_rows": projected_profiles,
+                "profile_rejections": result["profile_rejections"],
                 "memory_status": result["memory_status"],
                 "memory_reason": result["memory_reason"],
                 "cgroup_memory_status": result["cgroup_memory_status"],

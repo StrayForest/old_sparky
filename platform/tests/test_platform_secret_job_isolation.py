@@ -120,9 +120,10 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
                 condition_lines.append(following.strip())
             if condition_lines and condition_lines[0].startswith("always() &&"):
                 cleanup_conditions.append(" ".join(condition_lines))
-        self.assertEqual(len(cleanup_conditions), 3)
-        self.assertEqual(len(set(cleanup_conditions)), 1)
-        condition = cleanup_conditions[0]
+        self.assertEqual(len(cleanup_conditions), 4)
+        self.assertEqual(len(set(cleanup_conditions[1:])), 1)
+        self.assertIn("needs.fixture-setup.outputs.pre_candidate_cleanup_allowed == '1'", cleanup_conditions[0])
+        condition = cleanup_conditions[1]
         substitutions = {
             "needs['cpu-diagnostic-pair'].result == 'skipped'": "pair_skipped",
             "needs.namespace-containment-barrier.outputs.namespace_closed_status == '0'": "namespace_closed",

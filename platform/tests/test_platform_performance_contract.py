@@ -1554,15 +1554,28 @@ class PerformanceProfileContractTests(unittest.TestCase):
         }
         for name, body in candidate_jobs.items():
             self.assertNotRegex(body, r"\bPROD_SSH_(?:HOST|USER|KEY)\b", name)
-            self.assertNotIn("secrets.", body, name)
+        for name in ("validate-external-inputs", "evaluate-load"):
+            self.assertNotIn("secrets.", candidate_jobs[name], name)
         checkout = candidate_jobs["load-client"]
+        self.assertIn("environment: fixture-manifest", checkout)
+        secret_refs = re.findall(r"\$\{\{\s*secrets\.([A-Z0-9_]+)\s*\}\}", checkout)
+        self.assertEqual(secret_refs, ["FIXTURE_MANIFEST_AGE_IDENTITY"])
+        identity_stage = re.search(
+            r"^      - name: Stage the fixture-only decrypt identity\n"
+            r"(?P<body>.*?)(?=^      - name: |\Z)",
+            checkout,
+            re.MULTILINE | re.DOTALL,
+        )
+        self.assertIsNotNone(identity_stage)
+        assert identity_stage is not None
+        self.assertIn("FIXTURE_MANIFEST_AGE_IDENTITY: ${{ secrets.FIXTURE_MANIFEST_AGE_IDENTITY }}", identity_stage.group("body"))
         self.assertRegex(
             checkout,
             re.compile(r"^[ \t]+persist-credentials:[ \t]*false[ \t]*$", re.MULTILINE),
         )
 
         expected_secret_scopes = {
-            "Validate explicit external production load": set(),
+            "Validate external-load dispatch": set(),
             "Prepare external fixture with ephemeral SSH": {
                 "PROD_SSH_HOST",
                 "PROD_SSH_USER",

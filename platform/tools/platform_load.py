@@ -1724,12 +1724,11 @@ def _read_private_bounded_bytes(path: Path, *, maximum_bytes: int) -> bytes:
 def source_binding_environment_from_handoff(
     handoff_path: Path, manifest_path: Path, *, runner_sha: str, app_target_sha: str,
 ) -> dict[str, str]:
-    """Derive the canonical loader environment from the authenticated input.
+    """Derive the canonical loader environment from a private input or descriptor.
 
-    The external-load input artifact is produced only after the workflow has
-    resolved its exact runner-to-app receipt. This shared command validates
-    that closed payload again and emits only the two values consumed by the
-    load and diagnostic manifest readers.
+    The fixture descriptor contains the closed nonsecret projection of the
+    same-run input/manifest pair. Candidate consumers validate it against the
+    decrypted manifest without receiving the private control-email handoff.
     """
 
     if (
@@ -1742,14 +1741,29 @@ def source_binding_environment_from_handoff(
             _read_private_bounded_bytes(handoff_path, maximum_bytes=64 * 1024).decode("ascii"),
             object_pairs_hook=_reject_duplicate_json_keys,
         )
-        try:
-            from tools.platform_workflow_input_guard import validate_external_payload
-        except ModuleNotFoundError:  # Direct execution from platform/tools.
-            from platform_workflow_input_guard import validate_external_payload
-        validated = validate_external_payload(payload)
-        if validated.get("target_sha") != runner_sha:
-            raise ValueError
-        binding = validated.get("source_binding")
+        descriptor: Mapping[str, Any] | None = None
+        if isinstance(payload, dict) and set(payload) == {
+            "schema", "run_id", "run_attempt", "runner_sha", "app_target_sha", "input", "manifest",
+        }:
+            try:
+                from tools.platform_fixture_credential_transport import validate_descriptor
+            except ModuleNotFoundError:  # Direct execution from platform/tools.
+                from platform_fixture_credential_transport import validate_descriptor
+            run_id = os.environ.get("GITHUB_RUN_ID", "")
+            attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+            descriptor = validate_descriptor(
+                handoff_path, run_id, attempt, runner_sha, app_target_sha,
+            )
+            binding = descriptor["manifest"].get("source_binding")
+        else:
+            try:
+                from tools.platform_workflow_input_guard import validate_external_payload
+            except ModuleNotFoundError:  # Direct execution from platform/tools.
+                from platform_workflow_input_guard import validate_external_payload
+            validated = validate_external_payload(payload)
+            if validated.get("target_sha") != runner_sha:
+                raise ValueError
+            binding = validated.get("source_binding")
         if binding is None:
             if app_target_sha != runner_sha:
                 raise ValueError
@@ -1803,6 +1817,24 @@ def source_binding_environment_from_handoff(
                 manifest_path, maximum_bytes=24 * 1024 * 1024,
             )
             manifest, _actors = load_manifest_bytes(manifest_raw)
+            if descriptor is not None:
+                public_manifest = descriptor["manifest"]
+                if (
+                    hashlib.sha256(manifest_raw).hexdigest() != public_manifest.get("sha256")
+                    or len(manifest_raw) != public_manifest.get("size_bytes")
+                    or manifest.get("schema") != public_manifest.get("schema")
+                    or manifest.get("purpose") != public_manifest.get("purpose")
+                    or manifest.get("origin") != public_manifest.get("origin")
+                    or manifest.get("runner_sha") != public_manifest.get("runner_sha")
+                    or manifest.get("app_target_sha") != public_manifest.get("app_target_sha")
+                    or manifest.get("source_binding") != public_manifest.get("source_binding")
+                    or manifest.get("source_binding_sha256") != public_manifest.get("source_binding_sha256")
+                    or len(manifest.get("tournaments", [])) != public_manifest.get("tournament_count")
+                    or len(manifest.get("users", [])) != public_manifest.get("user_count")
+                    or sorted(row.get("user_count") for row in manifest.get("tournaments", []))
+                    != public_manifest.get("users_per_tournament")
+                ):
+                    raise ValueError
             if manifest.get("schema") == 2:
                 if (
                     manifest.get("runner_sha") != runner_sha

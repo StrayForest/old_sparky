@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from concurrent.futures import ALL_COMPLETED, FIRST_COMPLETED, ThreadPoolExecutor, wait
+from collections.abc import Mapping
 import hashlib
 import json
 import os
@@ -36,6 +37,20 @@ USAGE_WINDOW_MS_BY_WORKLOAD = {
     HTML_CPU_PROFILE_20S_WORKLOAD: 20_000,
 }
 PROFILE_WORKLOADS = frozenset({WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD})
+PROFILE_REJECTION_CODES = frozenset({
+    "malformed_record", "release_identity", "plan_identity", "plan_targets",
+    "systemd_identity", "preflight_exception", "identity_pid", "identity_start_ticks",
+    "identity_invocation", "identity_unit", "identity_cgroup",
+    "journal_timestamp", "journal_window", "profile_start_lag", "profile_elapsed",
+    "profile_end_lag", "profile_numeric", "profile_category",
+    "profile_aggregate", "profile_parser", "summary_exception", "summary_validation",
+    "missing", "duplicate", "unexpected",
+})
+PROFILE_CAPTURE_REASONS = frozenset({
+    "not_started", "complete", "journal_failed", "timeout", "byte_cap",
+    "line_cap", "invalid_event", "summary_exception", "summary_validation",
+})
+MAX_PROFILE_REJECTION_COUNT = 640
 TRACE_HEADER = "x-platform-ssr-trace"
 EXPECTED_USERS = 20_000
 EXPECTED_TOURNAMENTS = 40
@@ -134,7 +149,7 @@ def _validate_profile_projection(
     if not isinstance(expected_workload, str) or expected_workload not in PROFILE_WORKLOADS:
         return None
     expected_window_ms = USAGE_WINDOW_MS_BY_WORKLOAD[expected_workload]
-    fields = {"profile_status", "profile_reason", "profile_rows"}
+    fields = {"profile_status", "profile_reason", "profile_rows", "profile_rejections"}
     if (not isinstance(value, dict) or set(value) != fields
             or value.get("profile_status") not in {"complete", "incomplete", "unavailable"}
             or value.get("profile_reason") not in {
@@ -144,11 +159,19 @@ def _validate_profile_projection(
             or not isinstance(value.get("profile_rows"), list)
             or len(value["profile_rows"]) > 2):
         return None
+    rejections = _validate_profile_rejections(value.get("profile_rejections"))
+    if rejections is None:
+        return None
     rows = value["profile_rows"]
     if not rows:
         if value["profile_status"] not in {"incomplete", "unavailable"} or value["profile_reason"] == "none":
             return None
-        return {"profile_status": value["profile_status"], "profile_reason": value["profile_reason"], "profile_rows": []}
+        return {
+            "profile_status": value["profile_status"],
+            "profile_reason": value["profile_reason"],
+            "profile_rows": [],
+            "profile_rejections": rejections,
+        }
     if len(rows) != 2:
         return None
     expected = (("api", 2, "thread_cpu", "calls"), ("web", 1, "v8_cpu", "samples"))
@@ -194,6 +217,12 @@ def _validate_profile_projection(
         clean_rows.append(clean)
     if value["profile_status"] == "complete" and (
         value["profile_reason"] != "none"
+        or rejections["capture_reason"] != "complete"
+        or any(
+            count
+            for service_counts in rejections["service_counts"].values()
+            for count in service_counts.values()
+        )
         or any(
             row["observed_targets"] != row["expected_targets"]
             or row["event_count"] != row["expected_targets"]
@@ -221,7 +250,36 @@ def _validate_profile_projection(
         "profile_status": value["profile_status"],
         "profile_reason": value["profile_reason"],
         "profile_rows": clean_rows,
+        "profile_rejections": rejections,
     }
+
+
+def _validate_profile_rejections(value: Any) -> dict[str, Any] | None:
+    """Validate bounded non-identifying profile rejection counters."""
+    if (not isinstance(value, dict)
+            or set(value) != {"capture_reason", "service_counts"}
+            or value.get("capture_reason") not in PROFILE_CAPTURE_REASONS):
+        return None
+    service_counts = value.get("service_counts")
+    if not isinstance(service_counts, dict) or set(service_counts) != {"api", "web", "unattributed"}:
+        return None
+    cleaned: dict[str, dict[str, int]] = {}
+    for service in ("api", "web", "unattributed"):
+        counts = service_counts.get(service)
+        if (not isinstance(counts, dict) or set(counts) != PROFILE_REJECTION_CODES
+                or any(type(count) is not int or not 0 <= count <= MAX_PROFILE_REJECTION_COUNT
+                       for count in counts.values())):
+            return None
+        if service == "unattributed" and any(
+            count for code, count in counts.items()
+            if code not in {
+                "malformed_record", "release_identity", "preflight_exception",
+                "summary_exception", "summary_validation",
+            }
+        ):
+            return None
+        cleaned[service] = {code: counts[code] for code in sorted(PROFILE_REJECTION_CODES)}
+    return {"capture_reason": value["capture_reason"], "service_counts": cleaned}
 SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RELEASE_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,95}$")
 HOST_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
@@ -1214,7 +1272,7 @@ def _validate_usage_summary(
         return None
     top_fields = {
         "status", "service_count", "usage_status", "usage_reason", "usage_rows",
-        "profile_status", "profile_reason", "profile_rows", "memory_status",
+        "profile_status", "profile_reason", "profile_rows", "profile_rejections", "memory_status",
         "memory_reason", "cgroup_memory_status", "cgroup_memory_reason", "memory_rows",
     }
     has_workload = isinstance(value, dict) and "workload" in value
@@ -1249,6 +1307,9 @@ def _validate_usage_summary(
         }
         or not isinstance(value.get("memory_rows"), list)
     ):
+        return None
+    profile_rejections = _validate_profile_rejections(value.get("profile_rejections"))
+    if profile_rejections is None:
         return None
     summary_workload = value.get("workload", WORKLOAD)
     if summary_workload is None:
@@ -1534,6 +1595,7 @@ def _validate_usage_summary(
             "status": value["status"], "service_count": value["service_count"],
             "usage_status": "unavailable", "usage_reason": "missing", "usage_rows": [],
             "profile_status": "unavailable", "profile_reason": "missing", "profile_rows": [],
+            "profile_rejections": profile_rejections,
             "memory_status": "unavailable", "memory_reason": "unavailable",
             "cgroup_memory_status": "unknown", "cgroup_memory_reason": "hierarchy_unavailable",
             "memory_rows": [],
@@ -1673,6 +1735,16 @@ def _validate_usage_summary(
         )
         if value["profile_status"] == "complete" and not zero_profile:
             return None
+    if value["profile_status"] == "complete" and (
+        value["profile_reason"] != "none"
+        or profile_rejections["capture_reason"] != "complete"
+        or any(
+            count
+            for service_counts in profile_rejections["service_counts"].values()
+            for count in service_counts.values()
+        )
+    ):
+        return None
     if expected_workload in PROFILE_WORKLOADS and value["profile_status"] == "complete" and (
         value["profile_reason"] != "none"
         or any(
@@ -1799,7 +1871,7 @@ def _validate_usage_summary(
         "usage_status": value["usage_status"], "usage_reason": value["usage_reason"],
         "usage_rows": clean_rows,
         "profile_status": value["profile_status"], "profile_reason": value["profile_reason"],
-        "profile_rows": clean_profiles,
+        "profile_rows": clean_profiles, "profile_rejections": profile_rejections,
         "memory_status": value["memory_status"], "memory_reason": value["memory_reason"],
         "cgroup_memory_status": value["cgroup_memory_status"],
         "cgroup_memory_reason": value["cgroup_memory_reason"], "memory_rows": clean_memory,
@@ -2035,7 +2107,7 @@ def _parent(args: argparse.Namespace) -> int:
     # The manifest and SSH identity are only opened by this trusted parent.
     manifest_path = Path(args.manifest)
     handoff_path = Path(args.input_handoff)
-    handoff_raw = _read_private_file(handoff_path, cap=16 * 1024)
+    handoff_raw = _read_private_file(handoff_path, cap=64 * 1024)
     try:
         handoff = json.loads(
             handoff_raw.decode("ascii"), object_pairs_hook=_pairs
@@ -2044,8 +2116,24 @@ def _parent(args: argparse.Namespace) -> int:
         raise PairError("external input handoff rejected") from exc
     if not isinstance(handoff, dict):
         raise PairError("external input handoff shape rejected")
+    fixture_descriptor: Mapping[str, Any] | None = None
+    if set(handoff) == {
+        "schema", "run_id", "run_attempt", "runner_sha", "app_target_sha", "input", "manifest",
+    }:
+        try:
+            from tools.platform_fixture_credential_transport import validate_descriptor
+        except ModuleNotFoundError:  # Direct execution from platform/tools.
+            from platform_fixture_credential_transport import validate_descriptor
+        try:
+            fixture_descriptor = validate_descriptor(
+                handoff_path, args.external_run_id, args.external_run_attempt,
+                args.source_sha, args.app_target_sha,
+            )
+        except SystemExit as exc:
+            raise PairError("fixture descriptor binding rejected") from exc
+        handoff = fixture_descriptor["input"]
     base_handoff_keys = {
-        "schema", "confirmation", "target_sha", "control_email", "setup_concurrency",
+        "schema", "confirmation", "control_email", "target_sha", "setup_concurrency",
         "run_id", "profile", "tournament_count", "users_per_tournament", "timeout_diagnostics",
     }
     fixture_kind = handoff.get("fixture_kind", "external_load")
@@ -2060,7 +2148,8 @@ def _parent(args: argparse.Namespace) -> int:
     ) | ({"source_binding"} if schema in (2, "2") else set())
     source_binding_handoff = handoff.get("source_binding")
     if (
-        set(handoff) != expected_handoff_keys
+        (fixture_descriptor is None and set(handoff) != expected_handoff_keys)
+        or (fixture_descriptor is not None and "control_email" in handoff)
         or schema not in (1, "1", 2, "2")
         or handoff.get("target_sha") != args.source_sha
         or handoff.get("run_id") != args.external_run_id
@@ -2072,6 +2161,8 @@ def _parent(args: argparse.Namespace) -> int:
             CPU_ONLY_USERS_PER_TOURNAMENT if fixture_kind == "cpu_diagnostic_only_v1" else USERS_PER_TOURNAMENT
         )
         or (
+            fixture_descriptor is None
+            and
             fixture_kind == "cpu_diagnostic_only_v1"
             and (
                 handoff.get("confirmation") != "RUN-PRODUCTION-CPU-DIAGNOSTIC"
@@ -2106,6 +2197,12 @@ def _parent(args: argparse.Namespace) -> int:
             or manifest_metadata.st_size > 24 * 1024 * 1024
         ):
             raise PairError("fixture manifest metadata rejected")
+        if fixture_descriptor is not None and (
+            hashlib.sha256(os.read(manifest_fd, manifest_metadata.st_size)).hexdigest()
+            != fixture_descriptor["manifest"].get("sha256")
+        ):
+            raise PairError("fixture manifest descriptor digest rejected")
+        os.lseek(manifest_fd, 0, os.SEEK_SET)
         manifest_buffer = bytearray()
         while len(manifest_buffer) <= 24 * 1024 * 1024:
             block = os.read(manifest_fd, min(65_536, 24 * 1024 * 1024 + 1 - len(manifest_buffer)))

@@ -49,6 +49,28 @@ HTML_WORKLOAD = "authenticated_html_ssr_capacity_v1"
 HTML_FIXTURE_KIND = "ssr_html_capacity_diagnostic_v1"
 HTML_CAPACITY_120S_WORKLOAD = "authenticated_html_ssr_capacity_120s_v1"
 HTML_CPU_PROFILE_20S_WORKLOAD = "authenticated_html_ssr_cpu_profile_20s_v1"
+PROFILE_REJECTION_CODES = frozenset({
+    "malformed_record", "release_identity", "plan_identity", "plan_targets",
+    "systemd_identity", "preflight_exception", "identity_pid", "identity_start_ticks",
+    "identity_invocation", "identity_unit", "identity_cgroup",
+    "journal_timestamp", "journal_window", "profile_start_lag", "profile_elapsed",
+    "profile_end_lag", "profile_numeric", "profile_category",
+    "profile_aggregate", "profile_parser", "summary_exception", "summary_validation",
+    "missing", "duplicate", "unexpected",
+})
+
+
+def _empty_profile_rejections(*, summary_failure: str | None = None) -> dict[str, Any]:
+    service_counts = {
+        service: {reason: 0 for reason in PROFILE_REJECTION_CODES}
+        for service in ("api", "web", "unattributed")
+    }
+    capture_reason = summary_failure if summary_failure in {
+        "summary_exception", "summary_validation",
+    } else "not_started"
+    if summary_failure in {"summary_exception", "summary_validation"}:
+        service_counts["unattributed"][summary_failure] = 1
+    return {"capture_reason": capture_reason, "service_counts": service_counts}
 HTML_COMPOSITE_WORKLOAD = "authenticated_html_ssr_capacity_120s_plus_cpu_profile_20s_v1"
 HTML_COMPOSITE_FIXTURE_KIND = "ssr_html_capacity_composite_diagnostic_v1"
 SCHEMA = 1
@@ -3657,6 +3679,7 @@ def _project_server_telemetry(
         "profile_status": "incomplete",
         "profile_reason": "missing",
         "profile_rows": [],
+        "profile_rejections": _empty_profile_rejections(),
     }
     if isinstance(summary, dict):
         # Keep malformed scalar fields local to their projected value. Required
@@ -3705,6 +3728,13 @@ def _project_server_telemetry(
             allow_projected_memory_rows=True,
             allow_noop_cleanup=True,
         )
+        if summary is None and include_cpu_profile:
+            profile_projection = {
+                "profile_status": "incomplete",
+                "profile_reason": "invalid_profile",
+                "profile_rows": [],
+                "profile_rejections": _empty_profile_rejections(summary_failure="summary_validation"),
+            }
     if isinstance(summary, dict):
         cpu_status = summary.get("usage_status") if summary.get("usage_status") in {"complete", "incomplete", "unavailable"} else "incomplete"
         cpu_reason = summary.get("usage_reason") if summary.get("usage_reason") in {"none", "incomplete", "unavailable", "missing", "identity_changed", "invalid_event", "invalid_profile", "journal_failed", "other"} else "other"
@@ -3742,12 +3772,14 @@ def _project_server_telemetry(
                     "profile_status": "incomplete",
                     "profile_reason": "invalid_profile",
                     "profile_rows": [],
+                    "profile_rejections": _empty_profile_rejections(summary_failure="summary_validation"),
                 }
             else:
                 profile_projection = {
                     "profile_status": validated["profile_status"],
                     "profile_reason": validated["profile_reason"],
                     "profile_rows": validated["profile_rows"],
+                    "profile_rejections": validated["profile_rejections"],
                 }
         if include_request_correlation:
             projected = _project_request_correlation(summary.get("request_telemetry"))
@@ -4755,7 +4787,7 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
         telemetry_fields.add("request_correlation")
     profile_required = value.get("workload") == HTML_CPU_PROFILE_20S_WORKLOAD
     if profile_required:
-        telemetry_fields.update({"profile_status", "profile_reason", "profile_rows"})
+        telemetry_fields.update({"profile_status", "profile_reason", "profile_rows", "profile_rejections"})
     if (not isinstance(telemetry, dict) or set(telemetry) != telemetry_fields
             or type(telemetry.get("schema")) is not int or telemetry["schema"] != 1
             or telemetry.get("cpu_status") not in {"complete", "incomplete", "unavailable"}
@@ -4779,7 +4811,9 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
         except ModuleNotFoundError:
             import platform_cpu_diagnostic_pair as cpu_pair  # type: ignore[no-redef]
         profile = cpu_pair._validate_profile_projection({
-            key: telemetry[key] for key in ("profile_status", "profile_reason", "profile_rows")
+            key: telemetry[key] for key in (
+                "profile_status", "profile_reason", "profile_rows", "profile_rejections",
+            )
         }, expected_workload=value["workload"])
         if profile is None or (
             value.get("status") == "complete" and profile["profile_status"] != "complete"
@@ -5866,6 +5900,12 @@ def _composite_parent_failure_fingerprint(
                    and isinstance(worker.get("control_failure_reason"), str)
                    and worker.get("control_failure_reason") in CONTROL_FAILURE_REASONS
                    else {}),
+                **({
+                    "profile_status": report["server_telemetry"]["profile_status"],
+                    "profile_reason": report["server_telemetry"]["profile_reason"],
+                    "profile_rejections": report["server_telemetry"]["profile_rejections"],
+                } if report["workload"] == HTML_CPU_PROFILE_20S_WORKLOAD
+                     and isinstance(report.get("server_telemetry"), Mapping) else {}),
                 "remote_plan_cleanup": report["remote_plan_cleanup"],
                 "namespace_closed": report["namespace_closed"],
             }

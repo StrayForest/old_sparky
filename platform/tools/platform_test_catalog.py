@@ -273,6 +273,7 @@ KNOWN_TEST_MODULES = frozenset(
     test_platform_configure_ufw
     test_platform_api_cpu_plan_permissions
     test_platform_cpu_profile
+    test_platform_cpu_profile_conservation
     test_platform_ssr_request_correlation
     test_platform_create_closed_auth
     test_platform_db
@@ -444,6 +445,7 @@ PERFORMANCE_MODULES = frozenset(
     {
         "test_platform_auto_assignment_benchmark",
         "test_platform_cpu_profile",
+        "test_platform_cpu_profile_conservation",
         "test_platform_external_load",
         "test_platform_load_acceptance",
         "test_platform_load_runtime",
@@ -654,12 +656,12 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {
 # the sorted current IDs to these digests; a new test therefore needs an
 # explicit catalog update instead of silently inheriting a module default.
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
-    "module_count": 174,
-    "module_digest": "09004caf16b9bfcfe79e429044e4f77ec7d024d11a6e54d31a438150c0fe3b11",
-    "test_count": 2276,
-    "test_id_digest": "141005ef0b467785111e7b93b39ed98dd5a0030676392c2928c8d78a52154400",
-    "backend_test_count": 2198,
-    "backend_test_id_digest": "f8b1211bd52d43f5499b25d2ed585ea5b04c2eb9480d18501bf00a2f87adb973",
+    "module_count": 175,
+    "module_digest": "6266f71e1cf1a97db640b276ef65ab4b4bed1224ea20a3811cc32f40fe46e173",
+    "test_count": 2289,
+    "test_id_digest": "0911d9a5dc47056b3237f45b864ffacb3f890b21f3c3531db55f9abd7550d4da",
+    "backend_test_count": 2211,
+    "backend_test_id_digest": "301ea2a3f080c70c5ebfeabbda5405fd1510a89f015f1fd945a5eef81e3b35de",
     "verification_test_count": 78,
     "verification_test_id_digest": "3d9621c245877a188d3768cb835b85ddf3055971e4d5ee6b949aadd5d9fd0008",
     "verification_classifier_test_count": 41,
@@ -688,8 +690,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-tool-contract": {
         "module_count": 53,
         "module_digest": "fc8cb918289460364da1e8ce7b099bad4e78478312231b1f18de0ed21da15226",
-        "test_count": 603,
-        "test_id_digest": "cfb25ca0edb2e4dc896b1a9ab5769c4b576cbf389bc2d85f9163540c4860822b",
+        "test_count": 609,
+        "test_id_digest": "9878d23fb9aa1c9af33a822c56df0678a0eff229d8d9861490de443a4d6c4033",
     },
     "backend-integration": {
         "module_count": 41,
@@ -704,10 +706,10 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
         "test_id_digest": "7412cef584f34588d17c63b5b6d51f684f92857d5955c89c342ae18e998aadfb",
     },
     "performance-contract": {
-        "module_count": 12,
-        "module_digest": "052cf424192a4142bb2d4280a84bb21d5222216819f1849634d9fed3d58a15c9",
-        "test_count": 294,
-        "test_id_digest": "fefe39125406e32062dbda6638da5a2e0921b043b07fb8dd358fb4f48719b6b1",
+        "module_count": 13,
+        "module_digest": "4ea556fb7b11d6a6cbebe774d6e5e49745861ca2ed36e2596d19c74435beab3d",
+        "test_count": 301,
+        "test_id_digest": "2e982754fb765ff07ffa29a8e1b6528fc88d256097a8417dcf8117775ad2b355",
     },
     VERIFICATION_CONTOUR: {
         "module_count": 3,

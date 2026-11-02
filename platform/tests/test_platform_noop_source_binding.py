@@ -252,6 +252,48 @@ def _validated_source_binding_handoff() -> dict[str, object]:
     )
 
 
+def _synthetic_fixture_descriptor(
+    *, run_id: str, attempt: str, binding: dict[str, object],
+) -> dict[str, object]:
+    binding_digest = hashlib.sha256(
+        json.dumps(binding, ensure_ascii=True, allow_nan=False, sort_keys=True,
+                   separators=(",", ":")).encode("ascii")
+    ).hexdigest()
+    return {
+        "schema": 1,
+        "run_id": run_id,
+        "run_attempt": attempt,
+        "runner_sha": RUNNER_SHA,
+        "app_target_sha": APP_SHA,
+        "input": {
+            "schema": 2,
+            "target_sha": RUNNER_SHA,
+            "setup_concurrency": "20",
+            "run_id": run_id,
+            "profile": "external-vote",
+            "tournament_count": "1",
+            "users_per_tournament": "14",
+            "timeout_diagnostics": "false",
+            "fixture_kind": "external_load",
+            "source_binding": binding,
+        },
+        "manifest": {
+            "sha256": "d" * 64,
+            "size_bytes": 1024,
+            "schema": 2,
+            "purpose": "external_ready_vote",
+            "origin": "https://old-sparky.com",
+            "runner_sha": RUNNER_SHA,
+            "app_target_sha": APP_SHA,
+            "source_binding": binding,
+            "source_binding_sha256": binding_digest,
+            "tournament_count": 1,
+            "user_count": 14,
+            "users_per_tournament": [14],
+        },
+    }
+
+
 class NoopSourceBindingTests(unittest.TestCase):
     def test_command_line_entrypoint_rejects_help_with_nonzero_status(self) -> None:
         completed = subprocess.run(
@@ -1168,19 +1210,17 @@ class NoopSourceBindingTests(unittest.TestCase):
         workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
         resolver = next(
             step
-            for step in workflow["jobs"]["validate-external-inputs"]["steps"]
+            for step in workflow["jobs"]["resolve-load-source-and-profile"]["steps"]
             if step.get("id") == "resolve-source-binding"
         )
         self.assertIn("tools/platform_noop_source_binding.py", resolver["run"])
         self.assertIn("resolve-workflow-source-binding", resolver["run"])
         self.assertIn('"$TARGET_SHA" "$GITHUB_REPOSITORY" "$GITHUB_API_URL"', resolver["run"])
         self.assertEqual(resolver["env"]["GH_TOKEN"], "${{ github.token }}")
-        app_sha_consumer = next(
-            step
-            for step in workflow["jobs"]["validate-external-inputs"]["steps"]
-            if step.get("name") == "Validate explicit external production load"
+        self.assertEqual(
+            workflow["jobs"]["validate-external-inputs"]["env"]["APP_TARGET_SHA"],
+            "${{ needs.resolve-load-source-and-profile.outputs.app_target_sha }}",
         )
-        self.assertIn("APP_TARGET_SHA", app_sha_consumer["env"])
 
         archive = _zip_receipt(_receipt_document())
         deploy_run = {
@@ -1707,8 +1747,10 @@ class NoopSourceBindingTests(unittest.TestCase):
         cleanup_job = workflow["jobs"]["cleanup"]
         self.assertEqual(cleanup_job["permissions"]["actions"], "read")
         self.assertNotIn("SOURCE_BINDING_ARTIFACT_DIGEST", cleanup_job.get("env", {}))
-        download = cleanup_job["steps"][0]
-        self.assertEqual(download["name"], "Download exact source-binding handoff")
+        download = next(
+            step for step in cleanup_job["steps"]
+            if step.get("name") == "Download exact source-binding handoff"
+        )
         self.assertEqual(
             download["with"]["artifact-ids"],
             "${{ needs.resolve-host-tools-pin.outputs.source_binding_artifact_id }}",
@@ -1725,6 +1767,13 @@ class NoopSourceBindingTests(unittest.TestCase):
         )
         validation_index = cleanup_job["steps"].index(validation)
         self.assertLess(validation_index, configure_ssh)
+        scrub_index = next(
+            index for index, step in enumerate(cleanup_job["steps"])
+            if step.get("name") == "Mask and remove control identity before cleanup processing"
+        )
+        self.assertLess(scrub_index, cleanup_job["steps"].index(download))
+        scrub = cleanup_job["steps"][scrub_index]
+        cleanup_scrub_script = scrub["run"]
 
         marker = '/usr/bin/python3 - "$TARGET_SHA" "$LOAD_RUN_ID" "$GITHUB_RUN_ID" "$GITHUB_EVENT_PATH"'
         begin = validation["run"].index(marker)
@@ -1750,13 +1799,32 @@ class NoopSourceBindingTests(unittest.TestCase):
             event_path.chmod(0o600)
             binding_path = root / "source-binding.json"
             output_path = runner_temp / "platform-retained-cleanup-input.json"
+            github_output_path = root / "github-output"
+            github_output_path.touch(mode=0o600)
 
             def invoke(
                 source: dict[str, object], *, app_sha: str = APP_SHA, target_sha: str = RUNNER_SHA
             ) -> subprocess.CompletedProcess[str]:
                 output_path.unlink(missing_ok=True)
+                (runner_temp / "retained-cleanup-control-email").unlink(missing_ok=True)
                 binding_path.write_text(json.dumps(source) + "\n", encoding="ascii")
                 binding_path.chmod(0o600)
+                event_path.write_text(json.dumps(event) + "\n", encoding="ascii")
+                event_path.chmod(0o600)
+                scrubbed = subprocess.run(
+                    ["/bin/bash", "-euo", "pipefail", "-c", cleanup_scrub_script],
+                    env={
+                        **os.environ,
+                        "GITHUB_EVENT_PATH": str(event_path),
+                        "RUNNER_TEMP": str(runner_temp),
+                        "GITHUB_OUTPUT": str(github_output_path),
+                    },
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if scrubbed.returncode != 0:
+                    raise AssertionError(scrubbed.stderr)
                 return subprocess.run(
                     [
                         sys.executable,
@@ -1769,7 +1837,11 @@ class NoopSourceBindingTests(unittest.TestCase):
                         str(binding_path),
                         app_sha,
                     ],
-                    env={**os.environ, "RUNNER_TEMP": str(runner_temp)},
+                    env={
+                        **os.environ,
+                        "RUNNER_TEMP": str(runner_temp),
+                        "GITHUB_OUTPUT": str(github_output_path),
+                    },
                     capture_output=True,
                     text=True,
                     check=False,
@@ -2139,19 +2211,9 @@ class NoopSourceBindingTests(unittest.TestCase):
         evaluator_script = evaluator_step["run"][evaluator_heredoc:evaluator_end].lstrip("\n")
         binding = _validated_source_binding_handoff()
         binding_sha = hashlib.sha256(_canonical_json(binding)).hexdigest()
-        handoff = {
-            "schema": 2,
-            "confirmation": "RUN-PRODUCTION-EXTERNAL-LOAD",
-            "target_sha": RUNNER_SHA,
-            "control_email": "control@example.invalid",
-            "setup_concurrency": "20",
-            "run_id": "567890",
-            "profile": "external-vote",
-            "tournament_count": "1",
-            "users_per_tournament": "20",
-            "timeout_diagnostics": "false",
-            "source_binding": binding,
-        }
+        handoff = _synthetic_fixture_descriptor(
+            run_id="567890", attempt="2", binding=binding,
+        )
         report = {
             "schema": 5,
             "source_git_sha": RUNNER_SHA,
@@ -2166,6 +2228,7 @@ class NoopSourceBindingTests(unittest.TestCase):
             report_path = root / "report.json"
             receipt_path = root / "load-status.json"
             handoff_path.write_text(json.dumps(handoff), encoding="ascii")
+            handoff_path.chmod(0o600)
 
             def invoke(candidate: dict[str, object]) -> subprocess.CompletedProcess[str]:
                 report_path.write_text(json.dumps(candidate), encoding="utf-8")
