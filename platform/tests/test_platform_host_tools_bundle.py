@@ -1354,7 +1354,11 @@ class HostToolsBundleTests(unittest.TestCase):
         adr = (
             REPO_ROOT / "platform/docs/adr/production-host-tools-provisioning.md"
         ).read_text(encoding="utf-8")
-        self.assertIn(PIN_SHA, adr)
+        self.assertNotIn(PIN_SHA, adr)
+        self.assertIn("platform/contracts/host_tools_pin.json", adr)
+        self.assertIn("platform/tools/platform_host_tools_pin.py resolve", adr)
+        self.assertIn("Record the resolver-selected source in the operation receipts.", adr)
+        self.assertIn("`CURRENT.md` owns the installed active generation.", adr)
         self.assertNotIn("25c67089fdfca99f58d801cc529bb0e987f5ecf8", adr)
 
     def _installed_generation_fixture(self, root: Path) -> Path:

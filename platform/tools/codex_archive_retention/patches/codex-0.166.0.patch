@@ -798,7 +798,7 @@ index 222fc83..c6b8505 100644
 +    }
 +
 diff --git a/codex-rs/thread-store/src/local/delete_thread.rs b/codex-rs/thread-store/src/local/delete_thread.rs
-index ab13996..8604b35 100644
+index ab13996..7a30f57 100644
 --- a/codex-rs/thread-store/src/local/delete_thread.rs
 +++ b/codex-rs/thread-store/src/local/delete_thread.rs
 @@ -23,0 +24 @@ use super::LocalThreadStore;
@@ -1001,20 +1001,21 @@ index ab13996..8604b35 100644
 +    }
 +}
 +
-@@ -345,0 +536 @@ mod tests {
-+    use chrono::Utc;
-@@ -347,0 +539 @@ mod tests {
-+    use codex_protocol::protocol::SessionSource;
-@@ -353,0 +546,2 @@ mod tests {
+@@ -345,0 +536,3 @@ mod tests {
 +    use std::sync::Arc;
++
++    use chrono::Utc;
+@@ -347,0 +541 @@ mod tests {
++    use codex_protocol::protocol::SessionSource;
+@@ -352,0 +547 @@ mod tests {
 +    use tokio::sync::Barrier;
-@@ -365,0 +560,348 @@ mod tests {
+@@ -365,0 +561,344 @@ mod tests {
 +    async fn archived_thread_fixture(
 +        home: &TempDir,
 +        value: u128,
 +    ) -> (
 +        LocalThreadStore,
-+        codex_state::StateRuntime,
++        std::sync::Arc<codex_state::StateRuntime>,
 +        ThreadId,
 +        PathBuf,
 +        PathBuf,
@@ -1054,6 +1055,14 @@ index ab13996..8604b35 100644
 +            .join(ARCHIVED_SESSIONS_SUBDIR)
 +            .join(active_path.file_name().expect("rollout name"));
 +        (store, runtime, thread_id, active_path, archived_path)
++    }
++
++    async fn open_state_pool(home: &TempDir) -> sqlx::SqlitePool {
++        let sqlite = codex_state::SqliteConfig::new_for_testing(home.path().abs());
++        sqlite
++            .open_read_write_pool(&sqlite.state_db_path())
++            .await
++            .expect("open state database")
 +    }
 +
 +    #[tokio::test]
@@ -1127,11 +1136,7 @@ index ab13996..8604b35 100644
 +        let home = TempDir::new().expect("temp dir");
 +        let (store, runtime, thread_id, _, archived_path) =
 +            archived_thread_fixture(&home, 336).await;
-+        let pool = codex_state::open_state_db(&codex_state::SqliteConfig::new_for_testing(
-+            home.path().abs(),
-+        ))
-+        .await
-+        .expect("open state database");
++        let pool = open_state_pool(&home).await;
 +        sqlx::query("UPDATE threads SET archived = 0 WHERE id = ?")
 +            .bind(thread_id.to_string())
 +            .execute(&pool)
@@ -1182,11 +1187,7 @@ index ab13996..8604b35 100644
 +            Uuid::from_u128(338),
 +        )
 +        .expect("wrong thread archive file");
-+        let pool = codex_state::open_state_db(&codex_state::SqliteConfig::new_for_testing(
-+            home.path().abs(),
-+        ))
-+        .await
-+        .expect("open state database");
++        let pool = open_state_pool(&home).await;
 +        let wrong_path_string = wrong_path.to_string_lossy().into_owned();
 +        sqlx::query("UPDATE threads SET rollout_path = ? WHERE id = ?")
 +            .bind(wrong_path_string.as_str())
@@ -1225,11 +1226,7 @@ index ab13996..8604b35 100644
 +        ));
 +        std::fs::rename(&wrong_path, &mismatched_path).expect("change filename identity");
 +
-+        let pool = codex_state::open_state_db(&codex_state::SqliteConfig::new_for_testing(
-+            home.path().abs(),
-+        ))
-+        .await
-+        .expect("open state database");
++        let pool = open_state_pool(&home).await;
 +        let mismatched_path_string = mismatched_path.to_string_lossy().into_owned();
 +        sqlx::query("UPDATE threads SET rollout_path = ? WHERE id = ?")
 +            .bind(mismatched_path_string.as_str())
