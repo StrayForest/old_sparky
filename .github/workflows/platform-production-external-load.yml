@@ -501,16 +501,23 @@ jobs:
               if binding_sha or app != target:
                   fail()
           diagnostic = cpu_only == "true" or ssr_only == "true"
-          if diagnostic and (timeout != "false" or tournaments != "1" or users != "14"):
+          if (
+              re.fullmatch(r"[1-9][0-9]{0,2}", tournaments) is None
+              or int(tournaments) > 40
+              or re.fullmatch(r"[1-9][0-9]{0,3}", users) is None
+              or int(users) > 500
+          ):
               fail()
+          if diagnostic and timeout != "false":
+              fail()
+          fixture_tournaments = "1" if diagnostic else tournaments
+          fixture_users = "14" if diagnostic else users
           fixture_kind = (
               "cpu_diagnostic_only_v1" if cpu_only == "true" else
               "ssr_html_capacity_composite_diagnostic_v1" if ssr_only == "true" and ssr_workload == "authenticated_html_ssr_capacity_120s_plus_cpu_profile_20s_v1" else
               "ssr_html_capacity_diagnostic_v1" if ssr_only == "true" and ssr_workload == "authenticated_html_ssr_capacity_v1" else
               "ssr_capacity_diagnostic_v1" if ssr_only == "true" else "external_load"
           )
-          if not diagnostic and (re.fullmatch(r"[1-9][0-9]{0,2}", tournaments) is None or re.fullmatch(r"[1-9][0-9]{0,3}", users) is None):
-              fail()
           expected_confirmation = (
               "RUN-PRODUCTION-CPU-DIAGNOSTIC" if cpu_only == "true" else
               "RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC" if ssr_only == "true" else
@@ -522,8 +529,8 @@ jobs:
           payload = {
               "schema": "2" if binding is not None else "1", "confirmation": confirmation, "target_sha": target,
               "control_email": email.lower(), "setup_concurrency": concurrency, "run_id": run_id,
-              "profile": "external-vote", "tournament_count": tournaments,
-              "users_per_tournament": users, "timeout_diagnostics": timeout,
+              "profile": "external-vote", "tournament_count": fixture_tournaments,
+              "users_per_tournament": fixture_users, "timeout_diagnostics": timeout,
               "fixture_kind": fixture_kind,
           }
           if ssr_only == "true":

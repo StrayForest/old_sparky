@@ -889,9 +889,11 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertIn('payload.get("fixture_kind") != expected_fixture', barrier)
         self.assertIn('payload.get("source_sha") != os.environ.get("EXPECTED_SOURCE_SHA")', barrier)
         self.assertNotIn("platform_external_load.py", pair)
-        self.assertIn('if diagnostic and (timeout != "false" or tournaments != "1" or users != "14")', validate)
-        self.assertIn('"tournament_count": tournaments', validate)
-        self.assertIn('"users_per_tournament": users', validate)
+        self.assertIn('if diagnostic and timeout != "false":', validate)
+        self.assertIn('fixture_tournaments = "1" if diagnostic else tournaments', validate)
+        self.assertIn('fixture_users = "14" if diagnostic else users', validate)
+        self.assertIn('"tournament_count": fixture_tournaments', validate)
+        self.assertIn('"users_per_tournament": fixture_users', validate)
         self.assertIn('"ssr_html_capacity_composite_diagnostic_v1" if ssr_only == "true"', validate)
 
         guard_script = _step_script(

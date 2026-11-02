@@ -1016,6 +1016,225 @@ class FixtureCredentialTransportTests(unittest.TestCase):
                     descriptor_path, manifest_path, runner_sha="b" * 40, app_target_sha="a" * 40,
                 )
 
+    def test_profile_export_to_diagnostic_serializer_uses_fixed_fixture_cohort(self) -> None:
+        workflow = yaml.safe_load(
+            (WORKFLOW_ROOT / "platform-production-external-load.yml").read_text(encoding="utf-8")
+        )
+        validator_steps = workflow["jobs"]["validate-external-inputs"]["steps"]
+        resolver_steps = workflow["jobs"]["resolve-load-source-and-profile"]["steps"]
+        scrub_step = validator_steps[0]
+        dispatch_step = next(
+            step for step in validator_steps
+            if step.get("name") == "Reject invalid external-load dispatch before checkout"
+        )
+        serializer_step = next(
+            step for step in validator_steps
+            if step.get("name") == "Serialize the private external-load input"
+        )
+        profile_step = next(
+            step for step in resolver_steps
+            if step.get("name") == "Validate and export the exact load profile"
+        )
+        target_sha = "a" * 40
+        run_id = "567890"
+
+        def run_case(*, diagnostic: bool) -> dict[str, object]:
+            case_root = self.root / ("diagnostic" if diagnostic else "ordinary")
+            case_root.mkdir(mode=0o700)
+            resolver_temp = case_root / "resolver-temp"
+            resolver_temp.mkdir(mode=0o700)
+            email = "synthetic-fixture@example.invalid"
+            confirmation = (
+                "RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC"
+                if diagnostic else "RUN-PRODUCTION-EXTERNAL-LOAD"
+            )
+            capacity_only = "true" if diagnostic else "false"
+            concurrency = "32" if diagnostic else "8"
+            workload = (
+                "authenticated_html_ssr_capacity_120s_plus_cpu_profile_20s_v1"
+                if diagnostic else "authenticated_workspace_read_capacity_v1"
+            )
+            input_values = {
+                "confirmation": confirmation,
+                "control_email": email,
+                "profile_id": "authenticated-page-load-v1",
+                "timeout_diagnostics": "false",
+                "cpu_diagnostic_pair": "false",
+                "cpu_diagnostic_only": "false",
+                "ssr_capacity_diagnostic_only": capacity_only,
+                "ssr_capacity_concurrency": concurrency,
+                "ssr_capacity_workload": workload,
+            }
+            resolver_event = case_root / "resolver-event.json"
+            resolver_event.write_text(
+                json.dumps({"inputs": input_values, "repository": {"description": "synthetic contract"}}),
+                encoding="utf-8",
+            )
+            resolver_event.chmod(0o600)
+            resolver_env = {
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "HOME": str(case_root),
+                "GITHUB_EVENT_PATH": str(resolver_event),
+                "RUNNER_TEMP": str(resolver_temp),
+                "GITHUB_EVENT_NAME": "workflow_dispatch",
+                "GITHUB_REF": "refs/heads/dev",
+                "TARGET_SHA": target_sha,
+                "PROFILE_ID": "authenticated-page-load-v1",
+                "TIMEOUT_DIAGNOSTICS": "false",
+                "CPU_DIAGNOSTIC_ONLY": "false",
+                "SSR_CAPACITY_DIAGNOSTIC_ONLY": capacity_only,
+            }
+            resolver_scrub = next(
+                step for step in resolver_steps
+                if step.get("name") == "Mask and remove control identity before candidate checkout"
+            )
+            scrubbed = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", resolver_scrub["run"]],
+                env=resolver_env, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(scrubbed.returncode, 0, scrubbed.stderr)
+            self.assertNotIn(email, resolver_event.read_text(encoding="utf-8"))
+            scrubbed_event = json.loads(resolver_event.read_text(encoding="utf-8"))
+            self.assertNotIn("control_email", scrubbed_event["inputs"])
+
+            resolver_guard = next(
+                step for step in resolver_steps
+                if step.get("name") == "Require exact workflow dispatch inputs"
+            )
+            resolver_checked = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", resolver_guard["run"]],
+                env=resolver_env, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(resolver_checked.returncode, 0, resolver_checked.stderr)
+
+            profile_outputs = case_root / "profile-outputs.txt"
+            profile_outputs.touch(mode=0o600)
+            exported = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", profile_step["run"]],
+                cwd=REPO_ROOT,
+                env={
+                    **resolver_env,
+                    "GITHUB_OUTPUT": str(profile_outputs),
+                    "PROFILE_ID": "authenticated-page-load-v1",
+                    "TARGET_SHA": target_sha,
+                    "APP_TARGET_SHA": target_sha,
+                    "GITHUB_RUN_ID": run_id,
+                    "SSR_CAPACITY_CONCURRENCY": concurrency,
+                    "SSR_CAPACITY_WORKLOAD": workload,
+                },
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(exported.returncode, 0, exported.stderr)
+            self.assertFalse((resolver_temp / "platform-production-control-email").exists())
+            output_values = dict(
+                line.split("=", 1) for line in profile_outputs.read_text(encoding="utf-8").splitlines()
+            )
+            self.assertEqual(output_values["tournament_count"], "40")
+            self.assertEqual(output_values["users_per_tournament"], "500")
+
+            dispatch_script = dispatch_step["run"]
+            for input_name, value in {
+                "cpu_diagnostic_pair": "false",
+                "ssr_capacity_diagnostic_only": capacity_only,
+                "ssr_capacity_concurrency": concurrency,
+                "ssr_capacity_workload": workload,
+            }.items():
+                dispatch_script = dispatch_script.replace(
+                    f"${{{{ inputs.{input_name} }}}}", value,
+                )
+            validation_temp = case_root / "validator-temp"
+            validation_temp.mkdir(mode=0o700)
+            validation_event = case_root / "validator-event.json"
+            validation_event.write_text(
+                json.dumps({"inputs": input_values, "repository": {"description": "synthetic contract"}}),
+                encoding="utf-8",
+            )
+            validation_event.chmod(0o600)
+            minimal_env = {
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "HOME": str(case_root),
+                "GITHUB_EVENT_PATH": str(validation_event),
+                "RUNNER_TEMP": str(validation_temp),
+            }
+            scrubbed = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", scrub_step["run"]],
+                env=minimal_env, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(scrubbed.returncode, 0, scrubbed.stderr)
+            self.assertIn(f"::add-mask::{email}", scrubbed.stdout)
+            scrubbed_event = json.loads(validation_event.read_text(encoding="utf-8"))
+            self.assertNotIn("control_email", scrubbed_event["inputs"])
+            self.assertNotIn(email, validation_event.read_text(encoding="utf-8"))
+            email_path = validation_temp / "platform-production-control-email"
+            self.assertEqual(email_path.read_text(encoding="ascii"), f"{email.lower()}\n")
+
+            dispatch_env = {
+                **minimal_env,
+                "GITHUB_EVENT_NAME": "workflow_dispatch",
+                "GITHUB_REF": "refs/heads/dev",
+                "TARGET_SHA": target_sha,
+                "QA_CONFIRMATION": confirmation,
+                "PROFILE_ID": "authenticated-page-load-v1",
+                "TIMEOUT_DIAGNOSTICS": "false",
+                "CPU_DIAGNOSTIC_ONLY": "false",
+                "SSR_CAPACITY_CONCURRENCY": concurrency,
+                "SSR_CAPACITY_WORKLOAD": workload,
+            }
+            dispatched = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", dispatch_script],
+                env=dispatch_env, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(dispatched.returncode, 0, dispatched.stderr)
+
+            private_input = validation_temp / "platform-production-external-load-input.json"
+            serialized = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", serializer_step["run"]],
+                env={
+                    **minimal_env,
+                    "QA_CONFIRMATION": confirmation,
+                    "TARGET_SHA": target_sha,
+                    "APP_TARGET_SHA": target_sha,
+                    "PROFILE_SETUP_CONCURRENCY": output_values["setup_concurrency"],
+                    "PROFILE_TOURNAMENT_COUNT": output_values["tournament_count"],
+                    "PROFILE_USERS_PER_TOURNAMENT": output_values["users_per_tournament"],
+                    "GITHUB_RUN_ID": run_id,
+                    "TIMEOUT_DIAGNOSTICS": "false",
+                    "CPU_DIAGNOSTIC_ONLY": "false",
+                    "SSR_CAPACITY_DIAGNOSTIC_ONLY": capacity_only,
+                    "SSR_CAPACITY_CONCURRENCY": concurrency,
+                    "SSR_CAPACITY_WORKLOAD": workload,
+                    "SOURCE_BINDING_BASE64": "",
+                    "SOURCE_BINDING_SHA256": "",
+                },
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(serialized.returncode, 0, serialized.stderr)
+            self.assertFalse(email_path.exists())
+            self.assertEqual(private_input.stat().st_mode & 0o777, 0o600)
+            return json.loads(private_input.read_text(encoding="ascii"))
+
+        ordinary = run_case(diagnostic=False)
+        self.assertEqual(ordinary["fixture_kind"], "external_load")
+        self.assertEqual(ordinary["tournament_count"], "40")
+        self.assertEqual(ordinary["users_per_tournament"], "500")
+
+        diagnostic = run_case(diagnostic=True)
+        self.assertEqual(diagnostic["fixture_kind"], "ssr_html_capacity_composite_diagnostic_v1")
+        self.assertEqual(diagnostic["tournament_count"], "1")
+        self.assertEqual(diagnostic["users_per_tournament"], "14")
+        self.assertEqual(diagnostic["ssr_capacity_concurrency"], "32")
+        self.assertEqual(
+            diagnostic["ssr_capacity_workload"],
+            "authenticated_html_ssr_capacity_120s_plus_cpu_profile_20s_v1",
+        )
+        diagnostic_input = self.root / "diagnostic" / "validator-temp" / "platform-production-external-load-input.json"
+        encrypted = self.root / "diagnostic-input.json.age"
+        decrypted = self.root / "diagnostic-input.decrypted.json"
+        self.transport.encrypt_file(diagnostic_input, encrypted, self.age)
+        self.transport.decrypt_file(encrypted, decrypted, self.identity, self.age)
+        self.assertEqual(json.loads(decrypted.read_text(encoding="ascii")), diagnostic)
+        self.assertNotIn(b"synthetic-fixture@example.invalid", encrypted.read_bytes())
+
 
 class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
     def test_public_artifacts_are_ciphertext_and_fixture_key_is_scoped(self) -> None:
@@ -1157,7 +1376,7 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
             private_input = runner_temp / "external-load-input.json"
             args = [
                 str(private_input), str(email_path), "RUN-PRODUCTION-EXTERNAL-LOAD", "a" * 40, "a" * 40,
-                "8", "567890", "1", "14", "false", "false", "false", "8",
+                "8", "567890", "40", "500", "false", "false", "false", "8",
                 "authenticated_workspace_read_capacity_v1", "", "",
             ]
             result = subprocess.run(
@@ -1170,6 +1389,8 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
             private_payload = json.loads(private_input.read_text(encoding="ascii"))
             self.assertEqual(private_payload["control_email"], email.lower())
             self.assertEqual(private_payload["target_sha"], "a" * 40)
+            self.assertEqual(private_payload["tournament_count"], "40")
+            self.assertEqual(private_payload["users_per_tournament"], "500")
 
         host_steps = workflow["jobs"]["resolve-host-tools-pin"]["steps"]
         self.assertLess(
