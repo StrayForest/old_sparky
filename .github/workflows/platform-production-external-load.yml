@@ -569,9 +569,11 @@ jobs:
           curl --fail --location --silent --show-error https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-linux-amd64.tar.gz --output "$archive"
           printf '%s  %s\n' cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10 "$archive" | sha256sum --check --status
           tar --extract --gzip --file "$archive" --directory "$age_dir" age/age
-          test "$("$age_dir/age" --version)" = v1.3.2
+          age_bin="$age_dir/age/age"
+          test -f "$age_bin" && test ! -L "$age_bin" && test -x "$age_bin"
+          test "$("$age_bin" --version)" = v1.3.2
           install -d -m 700 "$RUNNER_TEMP/fixture-private-transport"
-          "$age_dir/age" --encrypt --recipient age1egptr8zhhvfe0ggmyu4cr9azhfsjpvvn3p5eyppznnzx8c5yedjsyeaasa \
+          "$age_bin" --encrypt --recipient age1egptr8zhhvfe0ggmyu4cr9azhfsjpvvn3p5eyppznnzx8c5yedjsyeaasa \
             --output "$RUNNER_TEMP/fixture-private-transport/private-input.json.age" \
             "$RUNNER_TEMP/platform-production-external-load-input.json"
           chmod 600 "$RUNNER_TEMP/fixture-private-transport/private-input.json.age"
@@ -866,14 +868,16 @@ jobs:
           curl --fail --location --silent --show-error https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-linux-amd64.tar.gz --output "$archive"
           printf '%s  %s\n' cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10 "$archive" | sha256sum --check --status
           tar --extract --gzip --file "$archive" --directory "$age_dir" age/age
-          test "$("$age_dir/age" --version)" = v1.3.2
+          age_bin="$age_dir/age/age"
+          test -f "$age_bin" && test ! -L "$age_bin" && test -x "$age_bin"
+          test "$("$age_bin" --version)" = v1.3.2
           mkdir -m 700 "$RUNNER_TEMP/external-input"
           ciphertext="$RUNNER_TEMP/external-input-ciphertext/private-input.json.age"
           plaintext="$RUNNER_TEMP/external-input/platform-production-external-load-input.json"
           temporary="$plaintext.tmp"
           test -f "$ciphertext" && test ! -L "$ciphertext" && test ! -e "$plaintext" && test ! -L "$plaintext"
           chmod 600 "$ciphertext"
-          "$age_dir/age" --decrypt --identity "$age_identity" --output "$temporary" "$ciphertext"
+          "$age_bin" --decrypt --identity "$age_identity" --output "$temporary" "$ciphertext"
           chmod 600 "$temporary"
           mv -n -- "$temporary" "$plaintext"
           test "$(stat -c '%u:%g:%a' "$plaintext")" = "$(id -u):$(id -g):600"
@@ -1253,8 +1257,10 @@ jobs:
             --output "$age_archive"
           printf '%s  %s\n' cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10 "$age_archive" | sha256sum --check --status
           tar --extract --gzip --file "$age_archive" --directory "$age_dir" age/age
-          test "$("$age_dir/age" --version)" = v1.3.2
-          "$age_dir/age" --encrypt --recipient age1egptr8zhhvfe0ggmyu4cr9azhfsjpvvn3p5eyppznnzx8c5yedjsyeaasa \
+          age_bin="$age_dir/age/age"
+          test -f "$age_bin" && test ! -L "$age_bin" && test -x "$age_bin"
+          test "$("$age_bin" --version)" = v1.3.2
+          "$age_bin" --encrypt --recipient age1egptr8zhhvfe0ggmyu4cr9azhfsjpvvn3p5eyppznnzx8c5yedjsyeaasa \
             --output "$RUNNER_TEMP/external-fixture/manifest.json.age" \
             "$RUNNER_TEMP/external-fixture/manifest.json"
           chmod 600 "$RUNNER_TEMP/external-fixture/manifest.json.age"
@@ -1599,14 +1605,16 @@ jobs:
           curl --fail --location --silent --show-error https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-linux-amd64.tar.gz --output "$age_archive"
           printf '%s  %s\n' cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10 "$age_archive" | sha256sum --check --status
           tar --extract --gzip --file "$age_archive" --directory "$age_dir" age/age
-          test "$("$age_dir/age" --version)" = v1.3.2
+          age_bin="$age_dir/age/age"
+          test -f "$age_bin" && test ! -L "$age_bin" && test -x "$age_bin"
+          test "$("$age_bin" --version)" = v1.3.2
           ciphertext="$RUNNER_TEMP/external-manifest-ciphertext/manifest.json.age"
           plaintext="$RUNNER_TEMP/external-manifest/manifest.json"
           install -d -m 700 "$RUNNER_TEMP/external-manifest"
           test -f "$ciphertext" && test ! -L "$ciphertext" && test ! -e "$plaintext"
           temporary="$plaintext.tmp"
           test ! -e "$temporary" && test ! -L "$temporary"
-          "$age_dir/age" --decrypt --identity "$age_identity" --output "$temporary" "$ciphertext"
+          "$age_bin" --decrypt --identity "$age_identity" --output "$temporary" "$ciphertext"
           chmod 600 "$temporary"
           mv -n -- "$temporary" "$plaintext"
           test "$(stat -c '%u:%g:%a' "$plaintext")" = "$(id -u):$(id -g):600"
@@ -2380,11 +2388,13 @@ jobs:
           curl --fail --location --silent --show-error https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-linux-amd64.tar.gz --output "$archive"
           printf '%s  %s\n' cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10 "$archive" | sha256sum --check --status
           tar --extract --gzip --file "$archive" --directory "$age_dir" age/age
-          test "$("$age_dir/age" --version)" = v1.3.2
+          age_bin="$age_dir/age/age"
+          test -f "$age_bin" && test ! -L "$age_bin" && test -x "$age_bin"
+          test "$("$age_bin" --version)" = v1.3.2
           cipher="$RUNNER_TEMP/cpu-diagnostic-manifest-ciphertext/manifest.json.age"; plain="$RUNNER_TEMP/cpu-diagnostic-manifest/manifest.json"
           install -d -m 700 "$RUNNER_TEMP/cpu-diagnostic-manifest"; test -f "$cipher" && test ! -L "$cipher" && test ! -e "$plain"
           temporary="$plain.tmp"; test ! -e "$temporary" && test ! -L "$temporary"
-          "$age_dir/age" --decrypt --identity "$identity" --output "$temporary" "$cipher"; chmod 600 "$temporary"; mv -n -- "$temporary" "$plain"
+          "$age_bin" --decrypt --identity "$identity" --output "$temporary" "$cipher"; chmod 600 "$temporary"; mv -n -- "$temporary" "$plain"
           rm -f -- "$identity" "$archive"; test ! -e "$identity" && test ! -L "$identity"
       - name: Checkout exact diagnostic runner source after private key removal
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -3143,11 +3153,13 @@ jobs:
           curl --fail --location --silent --show-error https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-linux-amd64.tar.gz --output "$archive"
           printf '%s  %s\n' cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10 "$archive" | sha256sum --check --status
           tar --extract --gzip --file "$archive" --directory "$age_dir" age/age
-          test "$("$age_dir/age" --version)" = v1.3.2
+          age_bin="$age_dir/age/age"
+          test -f "$age_bin" && test ! -L "$age_bin" && test -x "$age_bin"
+          test "$("$age_bin" --version)" = v1.3.2
           cipher="$RUNNER_TEMP/external-input-ciphertext/private-input.json.age"; plain="$RUNNER_TEMP/external-input/platform-production-external-load-input.json"
           install -d -m 700 "$RUNNER_TEMP/external-input"; test -f "$cipher" && test ! -L "$cipher" && test ! -e "$plain"
           temporary="$plain.tmp"; test ! -e "$temporary" && test ! -L "$temporary"
-          "$age_dir/age" --decrypt --identity "$identity" --output "$temporary" "$cipher"; chmod 600 "$temporary"; mv -n -- "$temporary" "$plain"
+          "$age_bin" --decrypt --identity "$identity" --output "$temporary" "$cipher"; chmod 600 "$temporary"; mv -n -- "$temporary" "$plain"
           rm -f -- "$identity" "$archive"; test ! -e "$identity" && test ! -L "$identity"
 
       - name: Revalidate finalizer handoffs

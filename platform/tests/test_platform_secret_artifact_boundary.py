@@ -1237,6 +1237,149 @@ class FixtureCredentialTransportTests(unittest.TestCase):
 
 
 class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
+    def test_workflow_age_install_encrypt_consumer_decrypt_uses_real_archive_layout(self) -> None:
+        from tools import platform_fixture_credential_transport as transport
+
+        document = yaml.safe_load(
+            (WORKFLOW_ROOT / "platform-production-external-load.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        jobs = document["jobs"]
+        encrypt_step = _named_step(
+            jobs["validate-external-inputs"]["steps"],
+            "Encrypt the private external-load handoff",
+        )
+        decrypt_step = _named_step(
+            jobs["fixture-setup"]["steps"],
+            "Decrypt the verified private input handoff",
+        )
+        extraction_blocks = [
+            step["run"]
+            for job in jobs.values()
+            for step in job.get("steps", [])
+            if "tar --extract --gzip --file" in str(step.get("run", ""))
+            and "--directory \"$age_dir\" age/age" in str(step.get("run", ""))
+        ]
+        self.assertEqual(len(extraction_blocks), 6)
+        for script in extraction_blocks:
+            self.assertIn('age_bin="$age_dir/age/age"', script)
+            self.assertIn('test -f "$age_bin" && test ! -L "$age_bin" && test -x "$age_bin"', script)
+            self.assertNotIn('"$age_dir/age"', script)
+
+        scratch = tempfile.TemporaryDirectory(prefix="workflow-age-layout-")
+        self.addCleanup(scratch.cleanup)
+        root = Path(scratch.name)
+        os.chmod(root, 0o700)
+
+        # The workflow's pinned archive digest is the trust boundary. Use that
+        # exact archive and let the parsed workflow steps perform extraction.
+        import urllib.request
+
+        with urllib.request.urlopen(transport.AGE_ARCHIVE_URL, timeout=30) as response:
+            archive_bytes = response.read(25 * 1024 * 1024 + 1)
+        self.assertLessEqual(len(archive_bytes), 25 * 1024 * 1024)
+        self.assertEqual(hashlib.sha256(archive_bytes).hexdigest(), transport.AGE_ARCHIVE_SHA256)
+        archive_source = root / "pinned-age.tar.gz"
+        archive_source.write_bytes(archive_bytes)
+        archive_source.chmod(0o600)
+
+        # Generate an isolated recipient so the exact workflow encrypt and
+        # consumer-decrypt scripts can run end to end without any real key.
+        key_tools = root / "key-tools"
+        key_tools.mkdir(mode=0o700)
+        extracted_keygen = subprocess.run(
+            ["tar", "--extract", "--gzip", "--file", str(archive_source), "--directory", str(key_tools), "age/age-keygen"],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(extracted_keygen.returncode, 0, "pinned age-keygen archive member extraction failed")
+        age_keygen = key_tools / "age/age-keygen"
+        self.assertTrue(age_keygen.is_file() and os.access(age_keygen, os.X_OK))
+        identity = root / "identity.txt"
+        generated = subprocess.run(
+            [str(age_keygen), "-o", str(identity)], capture_output=True, text=True, check=False
+        )
+        self.assertEqual(generated.returncode, 0, "synthetic age identity generation failed")
+        identity.chmod(0o600)
+        recipient_result = subprocess.run(
+            [str(age_keygen), "-y", str(identity)], capture_output=True, text=True, check=False
+        )
+        self.assertEqual(recipient_result.returncode, 0, "synthetic age recipient derivation failed")
+        recipient = recipient_result.stdout.strip()
+        self.assertRegex(recipient, r"age1[0-9a-z]{58}")
+
+        curl_dir = root / "curl-bin"
+        curl_dir.mkdir(mode=0o700)
+        curl = curl_dir / "curl"
+        curl.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            "output=\n"
+            "while [ $# -gt 0 ]; do\n"
+            "  if [ \"$1\" = --output ]; then shift; output=$1; fi\n"
+            "  shift\n"
+            "done\n"
+            "test -n \"$output\"\n"
+            "cp -- \"$WORKFLOW_TEST_AGE_ARCHIVE\" \"$output\"\n",
+            encoding="ascii",
+        )
+        curl.chmod(0o700)
+
+        encrypt_temp = root / "encrypt-runner-temp"
+        encrypt_temp.mkdir(mode=0o700)
+        plain_input = encrypt_temp / "platform-production-external-load-input.json"
+        synthetic_payload = b'{"schema":"synthetic-workflow-test"}\n'
+        plain_input.write_bytes(synthetic_payload)
+        plain_input.chmod(0o600)
+        self.assertEqual(str(encrypt_step["run"]).count(transport.AGE_RECIPIENT), 1)
+        encrypt_script = str(encrypt_step["run"]).replace(
+            transport.AGE_RECIPIENT, recipient
+        )
+        encrypt_env = {
+            "RUNNER_TEMP": str(encrypt_temp),
+            "WORKFLOW_TEST_AGE_ARCHIVE": str(archive_source),
+            "PATH": f"{curl_dir}:{os.defpath}",
+            "LC_ALL": "C",
+        }
+        encrypted = subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", encrypt_script],
+            env=encrypt_env, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(encrypted.returncode, 0, "workflow age encryption step failed")
+        encrypted_input = encrypt_temp / "fixture-private-transport/private-input.json.age"
+        self.assertTrue(encrypted_input.is_file())
+        self.assertEqual(encrypted_input.stat().st_mode & 0o777, 0o600)
+        installed = encrypt_temp / "fixture-age-tools/age/age"
+        self.assertTrue(installed.is_file() and os.access(installed, os.X_OK))
+        self.assertTrue((encrypt_temp / "fixture-age-tools/age").is_dir())
+
+        decrypt_temp = root / "decrypt-runner-temp"
+        decrypt_temp.mkdir(mode=0o700)
+        handoff = decrypt_temp / "external-input-ciphertext/private-input.json.age"
+        handoff.parent.mkdir(mode=0o700)
+        shutil.copyfile(encrypted_input, handoff)
+        handoff.chmod(0o600)
+        staged_identity = decrypt_temp / "fixture-private-identity/identity.txt"
+        staged_identity.parent.mkdir(mode=0o700)
+        staged_identity.write_bytes(identity.read_bytes())
+        staged_identity.chmod(0o600)
+        decrypt_env = {
+            "RUNNER_TEMP": str(decrypt_temp),
+            "WORKFLOW_TEST_AGE_ARCHIVE": str(archive_source),
+            "PATH": f"{curl_dir}:{os.defpath}",
+            "LC_ALL": "C",
+        }
+        decrypted = subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", str(decrypt_step["run"])],
+            env=decrypt_env, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(decrypted.returncode, 0, "workflow age consumer decryption step failed")
+        output = decrypt_temp / "external-input/platform-production-external-load-input.json"
+        self.assertEqual(output.read_bytes(), synthetic_payload)
+        self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(staged_identity.exists())
+        self.assertFalse((decrypt_temp / "age-v1.3.2.tar.gz").exists())
+
     def test_public_artifacts_are_ciphertext_and_fixture_key_is_scoped(self) -> None:
         document = yaml.safe_load((WORKFLOW_ROOT / "platform-production-external-load.yml").read_text(encoding="utf-8"))
         jobs = document["jobs"]
