@@ -7343,14 +7343,6 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             stdout[: backup_drill.SCRATCH_PRIVATE_STDOUT_BYTES],
             stderr[: backup_drill.SCRATCH_PRIVATE_STDERR_BYTES],
         )
-        cli_args = argparse.Namespace(
-            as_json=True,
-            private_scratch_diagnostics=True,
-            check_latest=False,
-            verify_latest_existing=False,
-            dump_only=False,
-            verify_dump=None,
-        )
         private_report = backup_drill.failure_report_for_exception(
             private_failure, private_scratch_diagnostics=True
         )
