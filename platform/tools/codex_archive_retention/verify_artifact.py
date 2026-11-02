@@ -41,6 +41,8 @@ MAX_JSON_BYTES = 4 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 262_144_000
 MAX_ROUTE_MANIFEST_BYTES = 1_048_576
 MAX_ZIP_ENTRIES = 8
+MINIMUM_FREE_BYTES = 5 * 1024**3
+MINIMUM_FREE_PERCENT = 10
 HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 RUN_ID = re.compile(r"[1-9][0-9]{0,31}\Z")
@@ -209,6 +211,156 @@ def _closed_zip(
             return result
     except (OSError, zipfile.BadZipFile, RuntimeError) as exc:
         raise _fail("artifact ZIP is malformed") from exc
+
+
+def _remove_private_extraction_if_same(
+    destination: Path,
+    identity: tuple[int, int],
+) -> None:
+    try:
+        current = destination.lstat()
+    except OSError:
+        return
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or current.st_uid != os.geteuid()
+        or (current.st_dev, current.st_ino) != identity
+    ):
+        return
+    for path in destination.iterdir():
+        try:
+            info = path.lstat()
+        except OSError:
+            continue
+        if stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid():
+            path.unlink(missing_ok=True)
+    try:
+        destination.rmdir()
+    except OSError:
+        pass
+
+
+def _extract_verified_build_members(
+    destination: Path,
+    members: dict[str, bytes],
+    *,
+    manifest: dict[str, object],
+) -> tuple[int, int]:
+    """Materialize only the already-verified closed build artifact privately."""
+
+    expected = {"codex", "codex.manifest.json", "version.txt"}
+    if set(members) != expected:
+        raise _fail("verified build artifact member set changed before extraction")
+    created_directory_identity: tuple[int, int] | None = None
+
+    try:
+        parent_info = destination.parent.lstat()
+        if (
+            not stat.S_ISDIR(parent_info.st_mode)
+            or stat.S_ISLNK(parent_info.st_mode)
+            or parent_info.st_uid != os.geteuid()
+            or stat.S_IMODE(parent_info.st_mode) & 0o077
+        ):
+            raise _fail("extraction parent is not a private owned directory")
+        filesystem = os.statvfs(destination.parent)
+        required_bytes = sum(len(data) for data in members.values())
+        required_bytes += (len(expected) + 1) * filesystem.f_frsize
+        available_bytes = filesystem.f_bavail * filesystem.f_frsize
+        if available_bytes < required_bytes:
+            raise _fail("private extraction directory lacks bounded artifact space")
+        available_memory = None
+        for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+            if line.startswith("MemAvailable:"):
+                available_memory = int(line.split()[1]) * 1024
+                break
+        if available_memory is None or available_memory < required_bytes + 64 * 1024 * 1024:
+            raise _fail("available memory is insufficient for bounded artifact extraction")
+        destination.mkdir(mode=0o700)
+        destination_info = destination.lstat()
+        created_directory_identity = (destination_info.st_dev, destination_info.st_ino)
+        if (
+            not stat.S_ISDIR(destination_info.st_mode)
+            or stat.S_IMODE(destination_info.st_mode) != 0o700
+            or destination_info.st_uid != os.geteuid()
+        ):
+            raise _fail("extraction directory identity or mode is unsafe")
+        for name in sorted(expected):
+            path = destination / name
+            descriptor = os.open(
+                path,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(members[name])
+                stream.flush()
+                os.fsync(stream.fileno())
+        extracted_binary_path = destination / "codex"
+        extracted_binary_size = 0
+        extracted_binary_hash = hashlib.sha256()
+        with extracted_binary_path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                extracted_binary_size += len(chunk)
+                extracted_binary_hash.update(chunk)
+        if (
+            extracted_binary_size != manifest.get("binary_bytes")
+            or extracted_binary_hash.hexdigest() != manifest.get("binary_sha256")
+            or json.loads((destination / "codex.manifest.json").read_text(encoding="utf-8")) != manifest
+        ):
+            raise _fail("extracted companion does not match its verified identity")
+        if (destination / "version.txt").read_bytes() != (
+            str(manifest.get("cli_version", "")).encode("ascii") + b"\n"
+        ):
+            raise _fail("extracted companion version does not match its verified identity")
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        if created_directory_identity is not None:
+            _remove_private_extraction_if_same(destination, created_directory_identity)
+        raise _fail("private artifact extraction failed") from exc
+    except VerificationError:
+        if created_directory_identity is not None:
+            _remove_private_extraction_if_same(destination, created_directory_identity)
+        raise
+    assert created_directory_identity is not None
+    return created_directory_identity
+
+
+def check_persistent_install_space(install_root: Path, payload_paths: list[Path]) -> None:
+    """Require space for block-rounded install inputs above the shared disk floor."""
+
+    try:
+        root_info = install_root.lstat()
+        if (
+            not stat.S_ISDIR(root_info.st_mode)
+            or stat.S_ISLNK(root_info.st_mode)
+            or root_info.st_uid != os.geteuid()
+            or stat.S_IMODE(root_info.st_mode) & 0o022
+        ):
+            raise _fail("persistent install root identity or permissions are unsafe")
+        filesystem = os.statvfs(install_root)
+        block_size = filesystem.f_frsize
+        if block_size <= 0:
+            raise _fail("persistent install filesystem block size is invalid")
+        total_bytes = filesystem.f_blocks * block_size
+        available_bytes = filesystem.f_bavail * block_size
+        floor_bytes = max(
+            MINIMUM_FREE_BYTES,
+            (total_bytes * MINIMUM_FREE_PERCENT + 99) // 100,
+        )
+        allocation_bytes = 0
+        for path in payload_paths:
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise _fail("persistent install input is not a regular file")
+            allocation_bytes += ((info.st_size + block_size - 1) // block_size) * block_size
+        allocation_bytes += (len(payload_paths) + 1) * block_size
+        if available_bytes < floor_bytes + allocation_bytes:
+            raise _fail("persistent install would cross the shared free-space floor")
+    except OSError as exc:
+        raise _fail("persistent install capacity could not be verified") from exc
 
 
 def _classifier_candidates(source_root: Path) -> set[str]:
@@ -462,7 +614,7 @@ def verify(args: argparse.Namespace) -> None:
         max_archive_bytes=MAX_ARTIFACT_BYTES,
         max_total_bytes=MAX_ARTIFACT_BYTES + 64 * 1024,
     )
-    _validate_build_artifact(
+    build_manifest = _validate_build_artifact(
         build_members,
         source_root=source_root,
         lock=lock,
@@ -520,18 +672,49 @@ def verify(args: argparse.Namespace) -> None:
         "classifier_fallback": False,
         "classifier_deployable": False,
     }
+    extraction_directory = getattr(args, "extract_directory", None)
+    extraction_identity: tuple[int, int] | None = None
+    if extraction_directory is not None:
+        extraction_identity = _extract_verified_build_members(
+            extraction_directory,
+            build_members,
+            manifest=build_manifest,
+        )
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(args.activation_output, flags, 0o600)
+    descriptor: int | None = None
+    activation_identity: tuple[int, int] | None = None
     try:
-        with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+        descriptor = os.open(args.activation_output, flags, 0o600)
+        activation_info = os.fstat(descriptor)
+        if not stat.S_ISREG(activation_info.st_mode) or activation_info.st_uid != os.geteuid():
+            raise _fail("activation receipt identity is unsafe")
+        activation_identity = (activation_info.st_dev, activation_info.st_ino)
+        stream = os.fdopen(descriptor, "w", encoding="ascii")
+        descriptor = None
+        with stream:
             stream.write(json.dumps(activation, sort_keys=True, separators=(",", ":")) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
     except BaseException:
-        try:
-            os.unlink(args.activation_output)
-        except OSError:
-            pass
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if activation_identity is not None:
+            try:
+                current = Path(args.activation_output).lstat()
+            except OSError:
+                current = None
+            if (
+                current is not None
+                and stat.S_ISREG(current.st_mode)
+                and current.st_uid == os.geteuid()
+                and (current.st_dev, current.st_ino) == activation_identity
+            ):
+                Path(args.activation_output).unlink(missing_ok=True)
+        if extraction_directory is not None and extraction_identity is not None:
+            _remove_private_extraction_if_same(extraction_directory, extraction_identity)
         raise
     print("Codex companion artifacts and exact CI provenance accepted")
 
@@ -552,6 +735,7 @@ def main() -> int:
     parser.add_argument("--security-run", type=Path, required=True)
     parser.add_argument("--security-artifacts", type=Path, required=True)
     parser.add_argument("--security-zip", type=Path, required=True)
+    parser.add_argument("--extract-directory", type=Path)
     parser.add_argument("--activation-output", type=Path, required=True)
     args = parser.parse_args()
     try:

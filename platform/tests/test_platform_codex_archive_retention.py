@@ -9,6 +9,7 @@ from pathlib import Path
 import sqlite3
 import stat
 import subprocess
+import shutil
 import tempfile
 import textwrap
 import unittest
@@ -106,6 +107,133 @@ class CodexArchiveRetentionTests(unittest.TestCase):
         self.assertIn("Focused native test failed: first-fails", result.stdout)
         self.assertIn("Focused native test passed: second-passes", result.stdout)
         self.assertIn("Focused native test failed: third-empty", result.stdout)
+
+    def test_schema_fixture_diagnostic_is_closed_and_precedes_native_tests(self) -> None:
+        repository_root = Path(__file__).resolve().parents[2]
+        workflow = (
+            repository_root
+            / ".github/workflows/platform-codex-archive-retention-build.yml"
+        ).read_text(encoding="utf-8")
+        generation_step = workflow.index(
+            "      - name: Generate pinned schema fixtures in an isolated copy\n"
+        )
+        compare_step = workflow.index(
+            "      - name: Package generated schema fixture diagnostics\n"
+        )
+        native_tests_step = workflow.index(
+            "      - name: Run focused archived-only native lifecycle tests\n"
+        )
+        self.assertLess(generation_step, compare_step)
+        self.assertLess(compare_step, native_tests_step)
+        self.assertIn("if: steps.schema.outputs.schema_changed == 'false'", workflow)
+        self.assertIn("if: steps.schema.outputs.schema_changed == 'true'", workflow)
+        self.assertIn("schema_fixtures_tests::write_schema_fixtures_from_env", workflow)
+        compare_text = workflow.split(
+            "      - name: Package generated schema fixture diagnostics\n", 1
+        )[1].split("      - name: Upload non-executable schema fixture diagnostic\n", 1)[0]
+        script = textwrap.dedent(compare_text.split("<<'PY'\n", 1)[1].split("\n          PY", 1)[0])
+        lock_path = repository_root / "platform/tools/codex_archive_retention/codex-source.lock.json"
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        common_env = {
+            **os.environ,
+            "GITHUB_REPOSITORY": "StrayForest/old_sparky",
+            "PLATFORM_SOURCE_SHA": "a" * 40,
+            "PLATFORM_SOURCE_HEAD_SHA": "a" * 40,
+            "PLATFORM_TESTED_MERGE_SHA": "b" * 40,
+            "PLATFORM_PR_NUMBER": "123",
+            "GITHUB_RUN_ID": "12345",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "CODEX_SOURCE_COMMIT": lock["source_commit"],
+            "CODEX_SOURCE_TAG": lock["source_tag"],
+            "CODEX_RUST_TOOLCHAIN": lock["rust_toolchain"],
+            "CODEX_TARGET": lock["target"],
+        }
+
+        def run_diagnostic(baseline: Path, generated: Path, output: Path, diagnostic: Path):
+            output.touch()
+            return subprocess.run(
+                [
+                    "/usr/bin/python3",
+                    "-I",
+                    "-B",
+                    "-",
+                    str(lock_path),
+                    str(repository_root / "platform/tools/codex_archive_retention/patches/codex-0.166.0.patch"),
+                    str(baseline),
+                    str(generated),
+                    str(diagnostic),
+                    str(output),
+                ],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+                cwd=repository_root,
+                env=common_env,
+            )
+
+        with tempfile.TemporaryDirectory(prefix="codex-schema-diagnostic-") as temp:
+            root = Path(temp)
+            baseline = root / "baseline"
+            baseline_file = baseline / "typescript/v2/ThreadDeleteParams.ts"
+            baseline_file.parent.mkdir(parents=True)
+            baseline_file.write_text("baseline fixture\n", encoding="ascii")
+            generated = root / "generated"
+            shutil.copytree(baseline, generated)
+            (generated / "typescript/v2/ThreadDeleteParams.ts").write_text(
+                "generated fixture\n", encoding="ascii"
+            )
+            changed_output = root / "changed.outputs"
+            changed_diagnostic = root / "changed"
+            changed_result = run_diagnostic(
+                baseline, generated, changed_output, changed_diagnostic
+            )
+            self.assertEqual(changed_result.returncode, 0, changed_result.stderr)
+            self.assertIn("schema_changed=true", changed_output.read_text(encoding="ascii"))
+            payload_paths = {
+                path.relative_to(changed_diagnostic).as_posix()
+                for path in changed_diagnostic.rglob("*")
+                if path.is_file()
+            }
+            self.assertEqual(
+                payload_paths,
+                {
+                    "schema-fixture-diagnostic.json",
+                    "typescript/v2/ThreadDeleteParams.ts",
+                },
+            )
+            manifest = json.loads(
+                (changed_diagnostic / "schema-fixture-diagnostic.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(manifest["patch_sha256"], lock["patch_sha256"])
+            self.assertEqual(manifest["workflow_run_id"], "12345")
+            self.assertEqual(manifest["changed_files"][0]["path"], "typescript/v2/ThreadDeleteParams.ts")
+            self.assertEqual(
+                stat.S_IMODE((changed_diagnostic / "typescript/v2/ThreadDeleteParams.ts").stat().st_mode),
+                0o600,
+            )
+
+            unknown = root / "unknown"
+            shutil.copytree(baseline, unknown)
+            (unknown / "unexpected.txt").write_text("not allowlisted", encoding="ascii")
+            unknown_output = root / "unknown.outputs"
+            unknown_diagnostic = root / "unknown-diagnostic"
+            unknown_result = run_diagnostic(
+                baseline, unknown, unknown_output, unknown_diagnostic
+            )
+            self.assertNotEqual(unknown_result.returncode, 0)
+            self.assertFalse(unknown_diagnostic.exists())
+
+            unchanged_output = root / "unchanged.outputs"
+            unchanged_diagnostic = root / "unchanged"
+            unchanged_result = run_diagnostic(
+                baseline, baseline, unchanged_output, unchanged_diagnostic
+            )
+            self.assertEqual(unchanged_result.returncode, 0, unchanged_result.stderr)
+            self.assertIn("schema_changed=false", unchanged_output.read_text(encoding="ascii"))
+            self.assertFalse(unchanged_diagnostic.exists())
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="codex-archive-retention-")
@@ -511,6 +639,74 @@ class CodexArchiveRetentionTests(unittest.TestCase):
                 build_attempt="1",
             )
 
+    def test_verified_extraction_rechecks_identity_and_available_space(self) -> None:
+        binary = b"synthetic verified private binary"
+        manifest = {
+            "binary_bytes": len(binary),
+            "binary_sha256": hashlib.sha256(binary).hexdigest(),
+            "cli_version": "codex-cli 0.166.0",
+        }
+        members = {
+            "codex": binary,
+            "codex.manifest.json": json.dumps(manifest).encode("ascii"),
+            "version.txt": b"codex-cli 0.166.0\n",
+        }
+
+        bad_identity = self.root / "bad-identity"
+        wrong_manifest = {**manifest, "binary_sha256": "0" * 64}
+        with self.assertRaises(verify_artifact.VerificationError):
+            verify_artifact._extract_verified_build_members(
+                bad_identity,
+                members,
+                manifest=wrong_manifest,
+            )
+        self.assertFalse(bad_identity.exists())
+
+        no_space = self.root / "no-space"
+        with mock.patch.object(
+            verify_artifact.os,
+            "statvfs",
+            return_value=mock.Mock(f_frsize=4096, f_bavail=0),
+        ):
+            with self.assertRaises(verify_artifact.VerificationError):
+                verify_artifact._extract_verified_build_members(
+                    no_space,
+                    members,
+                    manifest=manifest,
+                )
+        self.assertFalse(no_space.exists())
+
+        payload = self.root / "codex"
+        payload.write_bytes(binary)
+        install_root = self.root / "install-root"
+        install_root.mkdir(mode=0o700)
+        block_size = 4096
+        total_bytes = 100 * 1024**3
+        floor_bytes = 10 * 1024**3
+        allocation_bytes = ((len(binary) + block_size - 1) // block_size) * block_size
+        allocation_bytes += 2 * block_size
+        with mock.patch.object(
+            verify_artifact.os,
+            "statvfs",
+            return_value=mock.Mock(
+                f_frsize=block_size,
+                f_blocks=total_bytes // block_size,
+                f_bavail=(floor_bytes + allocation_bytes) // block_size,
+            ),
+        ):
+            verify_artifact.check_persistent_install_space(install_root, [payload])
+        with mock.patch.object(
+            verify_artifact.os,
+            "statvfs",
+            return_value=mock.Mock(
+                f_frsize=block_size,
+                f_blocks=total_bytes // block_size,
+                f_bavail=(floor_bytes + allocation_bytes - 1) // block_size,
+            ),
+        ):
+            with self.assertRaises(verify_artifact.VerificationError):
+                verify_artifact.check_persistent_install_space(install_root, [payload])
+
     def test_security_route_verifier_rejects_fallback_or_deployable_manifests(self) -> None:
         root = Path(__file__).resolve().parents[2]
         merge = "b" * 40
@@ -667,6 +863,7 @@ class CodexArchiveRetentionTests(unittest.TestCase):
         build_artifacts = artifact_metadata(build_name, build_id, build_attempt, 456, build_zip)
         security_artifacts = artifact_metadata(security_name, security_id, security_attempt, 567, security_zip)
         output = self.root / "verified.activation.json"
+        extraction_directory = self.root / "verified-build"
         args = mock.Mock(
             source_root=source_root,
             pull_request=pr,
@@ -682,6 +879,7 @@ class CodexArchiveRetentionTests(unittest.TestCase):
             security_run=run_record(security_id, security_attempt, verify_artifact.SECURITY_WORKFLOW_NAME, verify_artifact.SECURITY_WORKFLOW_PATH),
             security_artifacts=security_artifacts,
             security_zip=security_zip,
+            extract_directory=extraction_directory,
             activation_output=output,
         )
 
@@ -694,6 +892,26 @@ class CodexArchiveRetentionTests(unittest.TestCase):
         self.assertEqual(activation["build_artifact_sha256"], hashlib.sha256(build_zip.read_bytes()).hexdigest())
         self.assertEqual(activation["security_route_sha256"], hashlib.sha256(security_zip.read_bytes()).hexdigest())
         self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+        self.assertEqual((extraction_directory / "codex").read_bytes(), binary)
+        self.assertEqual(
+            set(path.name for path in extraction_directory.iterdir()),
+            {"codex", "codex.manifest.json", "version.txt"},
+        )
+        self.assertEqual(stat.S_IMODE(extraction_directory.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((extraction_directory / "codex").stat().st_mode), 0o600)
+
+        existing_output = self.root / "preexisting.activation.json"
+        existing_output.write_text("preserve existing receipt", encoding="ascii")
+        blocked_extraction = self.root / "blocked-build"
+        args.activation_output = existing_output
+        args.extract_directory = blocked_extraction
+        with self.assertRaises(FileExistsError):
+            verify_artifact.verify(args)
+        self.assertEqual(
+            existing_output.read_text(encoding="ascii"),
+            "preserve existing receipt",
+        )
+        self.assertFalse(blocked_extraction.exists())
 
         # Prove the exact verifier-generated receipt is accepted by the runtime
         # wrapper for the same source/build identities.

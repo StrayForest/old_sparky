@@ -132,7 +132,192 @@ jobs:
           git -C codex-source apply --unidiff-zero --whitespace=error-all "$patch"
           git -C codex-source diff --check
 
+      - name: Generate pinned schema fixtures in an isolated copy
+        working-directory: codex-source/codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          schema_source="$PWD/app-server-protocol/schema"
+          schema_copy="$RUNNER_TEMP/codex-app-server-schema"
+          test ! -e "$schema_copy" && test ! -L "$schema_copy"
+          install -d -m 700 "$schema_copy"
+          cp -a "$schema_source/." "$schema_copy/"
+          run_schema_writer() {
+            local mode="$1"
+            local log_path="$RUNNER_TEMP/codex-schema-writer-$mode.log"
+            local command_status=0
+            CODEX_APP_SERVER_SCHEMA_ROOT="$schema_copy" \
+              CODEX_APP_SERVER_SCHEMA_EXPERIMENTAL="$mode" \
+              cargo +"$CODEX_RUST_TOOLCHAIN" test --locked -p codex-app-server-protocol \
+                --lib schema_fixtures_tests::write_schema_fixtures_from_env -- --exact --ignored \
+                2>&1 | tee "$log_path" || command_status=$?
+            local result_status=0
+            /usr/bin/python3 -I -B - "$log_path" <<'PY' || result_status=$?
+          from pathlib import Path
+          import re
+          import sys
+          output = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+          results = re.findall(
+              r"test result: (ok|FAILED)\. ([0-9]+) passed; ([0-9]+) failed;",
+              output,
+          )
+          if not results or not any(int(passed) + int(failed) > 0 for _, passed, failed in results):
+              raise SystemExit("schema writer filter matched no tests")
+          if any(result != "ok" or int(passed) != 1 or int(failed) != 0
+                 for result, passed, failed in results):
+              raise SystemExit("schema writer did not pass exactly one test")
+          PY
+            rm -f -- "$log_path"
+            if (( command_status != 0 || result_status != 0 )); then
+              printf 'Pinned schema writer failed for experimental=%s (command=%s, result=%s)\n' \
+                "$mode" "$command_status" "$result_status" >&2
+              return 1
+            fi
+          }
+          run_schema_writer 0
+          run_schema_writer 1
+
+      - name: Package generated schema fixture diagnostics
+        id: schema
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -I -B - \
+            platform-source/platform/tools/codex_archive_retention/codex-source.lock.json \
+            platform-source/platform/tools/codex_archive_retention/patches/codex-0.166.0.patch \
+            codex-source/codex-rs/app-server-protocol/schema \
+            "$RUNNER_TEMP/codex-app-server-schema" \
+            "$RUNNER_TEMP/codex-schema-fixture-diagnostic" "$GITHUB_OUTPUT" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import stat
+          import sys
+
+          lock_path, patch_path, baseline_root, generated_root, diagnostic_root, output_path = map(Path, sys.argv[1:])
+          lock = json.loads(lock_path.read_text(encoding="utf-8"))
+          allowed = {
+              "typescript/v2/ThreadDeleteParams.ts",
+              "json/ClientRequest.json",
+              "json/v2/ThreadDeleteParams.json",
+              "json/codex_app_server_protocol.schemas.json",
+              "json/codex_app_server_protocol.v2.schemas.json",
+              "precomputed/app-server-exports-stable.json.zst",
+              "precomputed/app-server-exports-experimental.json.zst",
+          }
+          if hashlib.sha256(patch_path.read_bytes()).hexdigest() != lock.get("patch_sha256"):
+              raise SystemExit("schema diagnostic patch does not match the source lock")
+          if (lock.get("source_commit") != os.environ.get("CODEX_SOURCE_COMMIT")
+                  or lock.get("source_tag") != os.environ.get("CODEX_SOURCE_TAG")
+                  or lock.get("rust_toolchain") != os.environ.get("CODEX_RUST_TOOLCHAIN")
+                  or lock.get("target") != os.environ.get("CODEX_TARGET")
+                  or os.environ.get("GITHUB_REPOSITORY") != "StrayForest/old_sparky"
+                  or re.fullmatch(r"[0-9a-f]{40}", os.environ.get("PLATFORM_SOURCE_SHA", "")) is None
+                  or os.environ.get("PLATFORM_SOURCE_SHA") != os.environ.get("PLATFORM_SOURCE_HEAD_SHA")
+                  or re.fullmatch(r"[0-9a-f]{40}", os.environ.get("PLATFORM_TESTED_MERGE_SHA", "")) is None
+                  or re.fullmatch(r"[1-9][0-9]{0,8}", os.environ.get("PLATFORM_PR_NUMBER", "")) is None
+                  or re.fullmatch(r"[1-9][0-9]{0,31}", os.environ.get("GITHUB_RUN_ID", "")) is None
+                  or re.fullmatch(r"[1-9][0-9]{0,31}", os.environ.get("GITHUB_RUN_ATTEMPT", "")) is None):
+              raise SystemExit("schema diagnostic source identity is invalid")
+
+          def inventory(root: Path) -> dict[str, Path]:
+              rows = {}
+              for path in root.rglob("*"):
+                  info = path.lstat()
+                  if stat.S_ISDIR(info.st_mode):
+                      continue
+                  if not stat.S_ISREG(info.st_mode):
+                      raise SystemExit("schema tree contains a non-regular entry")
+                  rows[path.relative_to(root).as_posix()] = path
+              return rows
+
+          before = inventory(baseline_root)
+          after = inventory(generated_root)
+          changed = []
+          for name in sorted(set(before) | set(after)):
+              if name not in before or name not in after:
+                  changed.append(name)
+                  continue
+              if before[name].read_bytes() != after[name].read_bytes():
+                  changed.append(name)
+          unexpected = sorted(set(changed) - allowed)
+          if unexpected:
+              raise SystemExit("schema writer changed a path outside the closed fixture allowlist")
+          if not changed:
+              with output_path.open("a", encoding="ascii") as output:
+                  output.write("schema_changed=false\n")
+              print("Pinned generated schema fixtures match the reviewed source")
+              raise SystemExit(0)
+          if len(changed) > len(allowed):
+              raise SystemExit("schema diagnostic changed-file count exceeds its bound")
+          entries = []
+          total_bytes = 0
+          files = []
+          for name in changed:
+              path = after.get(name)
+              if path is None:
+                  raise SystemExit("schema generator removed an allowed fixture")
+              data = path.read_bytes()
+              total_bytes += len(data)
+              if len(data) > 32 * 1024 * 1024 or total_bytes > 64 * 1024 * 1024:
+                  raise SystemExit("schema diagnostic output exceeds its byte cap")
+              entries.append({"path": name, "size_bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+              files.append((name, data))
+          diagnostic_root.mkdir(mode=0o700)
+          for name, data in files:
+              destination = diagnostic_root / name
+              destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+              descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+              with os.fdopen(descriptor, "wb") as stream:
+                  stream.write(data)
+                  stream.flush()
+                  os.fsync(stream.fileno())
+          manifest = {
+              "schema_version": 1,
+              "platform_repository": os.environ["GITHUB_REPOSITORY"],
+              "platform_pr_number": os.environ["PLATFORM_PR_NUMBER"],
+              "platform_source_sha": os.environ["PLATFORM_SOURCE_SHA"],
+              "platform_tested_merge_sha": os.environ["PLATFORM_TESTED_MERGE_SHA"],
+              "workflow_run_id": os.environ["GITHUB_RUN_ID"],
+              "workflow_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "source_repository": lock["source_repository"],
+              "source_tag": lock["source_tag"],
+              "source_commit": lock["source_commit"],
+              "patch_sha256": lock["patch_sha256"],
+              "rust_toolchain": lock["rust_toolchain"],
+              "target": lock["target"],
+              "changed_files": entries,
+          }
+          manifest_path = diagnostic_root / "schema-fixture-diagnostic.json"
+          manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
+          manifest_path.chmod(0o600)
+          with output_path.open("a", encoding="ascii") as output:
+              output.write("schema_changed=true\n")
+              output.write(f"schema_diagnostic_path={diagnostic_root}\n")
+          print(f"Pinned schema generation changed {len(changed)} allowlisted fixture file(s)")
+          PY
+
+      - name: Upload non-executable schema fixture diagnostic
+        if: steps.schema.outputs.schema_changed == 'true'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: codex-schema-fixture-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.schema.outputs.schema_diagnostic_path }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Fail closed on generated schema fixture drift
+        if: steps.schema.outputs.schema_changed == 'true'
+        shell: bash
+        run: |
+          echo "Generated protocol fixtures differ from the pinned source; review the source-bound diagnostic before native tests or build." >&2
+          exit 1
+
       - name: Run focused archived-only native lifecycle tests
+        if: steps.schema.outputs.schema_changed == 'false'
         working-directory: codex-source/codex-rs
         shell: bash
         run: |
