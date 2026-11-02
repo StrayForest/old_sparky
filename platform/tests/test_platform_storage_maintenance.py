@@ -2110,10 +2110,11 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         (app_dir / "shared").mkdir()
         required = retention.REQUIRED_PROTECTED_RELEASES
         operator_pin = "gha-operator-approved-retention-pin"
+        origin = "venv-origin-old-release"
         current = "current-release"
         previous = "previous-release"
         candidate = "old-release-candidate"
-        for slug in (*required, operator_pin, current, previous, candidate):
+        for slug in (*required, operator_pin, origin, current, previous, candidate):
             self.add_runtime_release(app_dir, slug)
         (app_dir / "current").symlink_to(f"releases/{current}")
         (app_dir / "previous").symlink_to(f"releases/{previous}")
@@ -2121,7 +2122,10 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         args.protected_release = [operator_pin]
         args.apply = False
 
-        with mock.patch.object(retention, "PRODUCTION_APP_DIR", app_dir):
+        with mock.patch.object(retention, "PRODUCTION_APP_DIR", app_dir), \
+                mock.patch.object(
+                    retention, "_resolve_shared_venv_origin", return_value=origin,
+                ) as resolve_origin:
             preview = maintenance._plan_and_maybe_apply(
                 args, app_dir=app_dir, source_release_dir=None
             )[0]
@@ -2129,6 +2133,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             applied = maintenance._plan_and_maybe_apply(
                 args, app_dir=app_dir, source_release_dir=None
             )[0]
+        self.assertEqual(resolve_origin.call_count, 2)
 
         for plan in (preview, applied):
             protected_or_retained = {
@@ -2136,11 +2141,38 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             }
             self.assertTrue(set(required).issubset(protected_or_retained))
             self.assertIn(operator_pin, protected_or_retained)
+            self.assertIn(origin, protected_or_retained)
             self.assertFalse(
-                set((*required, operator_pin))
+                set((*required, operator_pin, origin))
                 & {entry.path.name for entry in plan.candidates}
             )
         self.assertFalse((app_dir / "releases" / candidate).exists())
+
+    def test_canonical_maintenance_refuses_unresolved_origin_before_planning(self) -> None:
+        app_dir = self.root / "canonical" / "platform"
+        (app_dir / "releases").mkdir(parents=True)
+        (app_dir / "shared").mkdir()
+        required = retention.REQUIRED_PROTECTED_RELEASES
+        current = "current-release"
+        previous = "previous-release"
+        for slug in (*required, current, previous):
+            self.add_runtime_release(app_dir, slug)
+        (app_dir / "current").symlink_to(f"releases/{current}")
+        (app_dir / "previous").symlink_to(f"releases/{previous}")
+        args = self.maintenance_args(app_dir)
+
+        with mock.patch.object(retention, "PRODUCTION_APP_DIR", app_dir), \
+                mock.patch.object(
+                    retention,
+                    "_resolve_shared_venv_origin",
+                    side_effect=RuntimeError("origin validation failed"),
+                ), \
+                mock.patch.object(maintenance, "build_retention_plan") as build_plan:
+            with self.assertRaisesRegex(RuntimeError, "origin validation failed"):
+                maintenance._plan_and_maybe_apply(
+                    args, app_dir=app_dir, source_release_dir=None,
+                )
+        build_plan.assert_not_called()
 
     def test_canonical_maintenance_fails_when_required_pin_is_missing(self) -> None:
         app_dir = self.root / "canonical" / "platform"
@@ -2152,7 +2184,10 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         (app_dir / "previous").symlink_to(previous)
         args = self.maintenance_args(app_dir)
 
-        with mock.patch.object(retention, "PRODUCTION_APP_DIR", app_dir):
+        with mock.patch.object(retention, "PRODUCTION_APP_DIR", app_dir), \
+                mock.patch.object(
+                    retention, "_resolve_shared_venv_origin", return_value="current-release",
+                ):
             with self.assertRaisesRegex(
                 RuntimeError,
                 "A required protected production release is missing",

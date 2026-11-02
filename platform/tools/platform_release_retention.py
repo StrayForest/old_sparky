@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import subprocess
 import sys
 from typing import Iterator
 
@@ -114,7 +115,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Retain this release even if it is otherwise a deletion candidate. "
             "Repeat for each additional release to protect; the canonical "
-            "production root also protects the maintenance pins."
+            "production root also protects required pins and the validated "
+            "shared-venv origin."
         ),
     )
     args = parser.parse_args()
@@ -160,13 +162,63 @@ def _is_production_app_dir(app_dir: Path) -> bool:
 def _cli_protected_releases(
     app_dir: Path, explicit_releases: tuple[str, ...]
 ) -> tuple[str, ...]:
-    """Add required service pins only for the canonical production CLI root."""
+    """Resolve canonical service pins and the live shared-venv origin."""
 
     if not _is_production_app_dir(app_dir):
         return explicit_releases
+    origin = _resolve_shared_venv_origin(app_dir)
     return tuple(
-        dict.fromkeys((*explicit_releases, *REQUIRED_PROTECTED_RELEASES))
+        dict.fromkeys((*explicit_releases, *REQUIRED_PROTECTED_RELEASES, origin))
     )
+
+
+def _resolve_shared_venv_origin(app_dir: Path) -> str:
+    """Resolve the origin through this release's strict lineage validator."""
+
+    try:
+        app_root = Path(app_dir).resolve(strict=True)
+        current = app_root / "current"
+        venv = app_root / "shared" / "venv"
+        resolver = Path(__file__).resolve(strict=True).with_name(
+            "platform_verify_venv_reuse.py"
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                str(resolver),
+                "--resolve-shared-venv-origin",
+                "--app",
+                str(app_root),
+                "--current",
+                str(current),
+                "--venv",
+                str(venv),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env={
+                "PATH": "/usr/bin:/bin",
+                "HOME": "/nonexistent",
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+            },
+            timeout=10,
+            check=False,
+        )
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("Unable to validate the shared-venv origin") from exc
+    if result.returncode != 0 or len(result.stdout) > 182 or not result.stdout.endswith(b"\n"):
+        raise RuntimeError("Unable to validate the shared-venv origin")
+    try:
+        origin = result.stdout[:-1].decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("Unable to validate the shared-venv origin") from exc
+    if SAFE_RELEASE_ID_RE.fullmatch(origin) is None:
+        raise RuntimeError("Unable to validate the shared-venv origin")
+    return origin
 
 
 def _require_production_pins_present(

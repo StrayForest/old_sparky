@@ -397,6 +397,9 @@ class PlatformReleaseRetentionTests(unittest.TestCase):
         preview_stderr = io.StringIO()
         with (
             mock.patch.object(retention, "PRODUCTION_APP_DIR", self.app_dir),
+            mock.patch.object(
+                retention, "_resolve_shared_venv_origin", return_value="validated-origin",
+            ),
             mock.patch.object(retention.sys, "argv", preview_argv),
             redirect_stdout(preview_stdout),
             redirect_stderr(preview_stderr),
@@ -425,6 +428,9 @@ class PlatformReleaseRetentionTests(unittest.TestCase):
         apply_stderr = io.StringIO()
         with (
             mock.patch.object(retention, "PRODUCTION_APP_DIR", self.app_dir),
+            mock.patch.object(
+                retention, "_resolve_shared_venv_origin", return_value="validated-origin",
+            ),
             mock.patch.object(retention.sys, "argv", apply_argv),
             redirect_stdout(apply_stdout),
             redirect_stderr(apply_stderr),
@@ -453,6 +459,9 @@ class PlatformReleaseRetentionTests(unittest.TestCase):
         missing_preview_stderr = io.StringIO()
         with (
             mock.patch.object(retention, "PRODUCTION_APP_DIR", self.app_dir),
+            mock.patch.object(
+                retention, "_resolve_shared_venv_origin", return_value="validated-origin",
+            ),
             mock.patch.object(retention.sys, "argv", preview_argv),
             redirect_stdout(missing_preview_stdout),
             redirect_stderr(missing_preview_stderr),
@@ -477,6 +486,9 @@ class PlatformReleaseRetentionTests(unittest.TestCase):
         missing_stderr = io.StringIO()
         with (
             mock.patch.object(retention, "PRODUCTION_APP_DIR", self.app_dir),
+            mock.patch.object(
+                retention, "_resolve_shared_venv_origin", return_value="validated-origin",
+            ),
             mock.patch.object(retention.sys, "argv", missing_pin_argv),
             redirect_stdout(missing_stdout),
             redirect_stderr(missing_stderr),
