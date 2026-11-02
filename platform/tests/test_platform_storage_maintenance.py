@@ -33,7 +33,6 @@ from tools import platform_backup_success_guard as backup_success_guard
 from tools import platform_maintenance_qa_evidence as maintenance_evidence
 from tools import platform_release_retention as retention
 from tools import platform_storage_maintenance as maintenance
-from tools import platform_storage_evidence_summary as storage_summary
 from tools.platform_disk_policy import BYTES_PER_GIB, snapshot_from_usage
 from tools.platform_storage_maintenance import (
     apply_artifact_retention_plan,
