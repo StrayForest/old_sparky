@@ -1452,7 +1452,8 @@ class HostToolsBundleTests(unittest.TestCase):
                         "size": len(contents),
                         "sha256": hashlib.sha256(contents).hexdigest(),
                         "git_blob": hashlib.sha1(
-                            b"blob " + str(len(contents)).encode("ascii") + b"\0" + contents
+                            b"blob " + str(len(contents)).encode("ascii") + b"\0" + contents,
+                            usedforsecurity=False,
                         ).hexdigest(),
                     }
                 )

@@ -490,7 +490,10 @@ def _verify_verifier_manifest(
             != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
             or len(data) != entry["size"]
             or hashlib.sha256(data).hexdigest() != entry["sha256"]
-            or hashlib.sha1(b"blob " + str(len(data)).encode("ascii") + b"\0" + data).hexdigest()
+            or hashlib.sha1(
+                b"blob " + str(len(data)).encode("ascii") + b"\0" + data,
+                usedforsecurity=False,
+            ).hexdigest()
             != entry["git_blob"]
         ):
             raise ReadinessError("staged verifier module differs from its manifest")
