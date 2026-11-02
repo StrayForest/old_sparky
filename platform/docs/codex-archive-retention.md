@@ -15,9 +15,11 @@ The companion is a private binary; it does not replace the system Codex
 installation. The build workflow runs only for same-repository pull requests
 targeting `dev`, with read-only repository permission. It checks out the exact
 PR head, records the separately tested merge SHA, executes focused native
-tests, and publishes a seven-day evidence artifact. Fork pull requests produce
-no artifact. The workflow does not install software, enable a timer, read a
-Codex home, or delete sessions.
+tests, and publishes a seven-day evidence artifact. It applies the reviewed
+context-free patch with `git apply --unidiff-zero --whitespace=error-all` and
+runs `git diff --check` on the patched checkout. Fork pull requests produce no
+artifact. The workflow does not install software, enable a timer, read a Codex
+home, or delete sessions.
 
 ## Build artifact and activation
 

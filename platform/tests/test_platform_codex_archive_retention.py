@@ -17,6 +17,23 @@ from tools.platform_ci_classifier import CANDIDATE_PACKAGING_FILES, classify, ma
 
 
 class CodexArchiveRetentionTests(unittest.TestCase):
+    def test_builder_uses_strict_context_free_patch_application(self) -> None:
+        repository_root = Path(__file__).resolve().parents[2]
+        workflow = (
+            repository_root
+            / ".github/workflows/platform-codex-archive-retention-build.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "git -C codex-source apply --unidiff-zero --whitespace=error-all --check",
+            workflow,
+        )
+        self.assertIn(
+            "git -C codex-source apply --unidiff-zero --whitespace=error-all \"$patch\"",
+            workflow,
+        )
+        self.assertIn("git -C codex-source diff --check", workflow)
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="codex-archive-retention-")
         self.root = Path(self.temp.name)

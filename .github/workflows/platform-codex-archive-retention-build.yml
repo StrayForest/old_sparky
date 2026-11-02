@@ -124,8 +124,10 @@ jobs:
           resolved="$(git -C codex-source rev-parse "$CODEX_SOURCE_TAG^{commit}")"
           test "$resolved" = "$CODEX_SOURCE_COMMIT"
           git -C codex-source checkout --detach "$CODEX_SOURCE_COMMIT"
-          git -C codex-source apply --check "$GITHUB_WORKSPACE/platform-source/platform/tools/codex_archive_retention/patches/codex-0.166.0.patch"
-          git -C codex-source apply "$GITHUB_WORKSPACE/platform-source/platform/tools/codex_archive_retention/patches/codex-0.166.0.patch"
+          patch="$GITHUB_WORKSPACE/platform-source/platform/tools/codex_archive_retention/patches/codex-0.166.0.patch"
+          git -C codex-source apply --unidiff-zero --whitespace=error-all --check "$patch"
+          git -C codex-source apply --unidiff-zero --whitespace=error-all "$patch"
+          git -C codex-source diff --check
 
       - name: Run focused archived-only native lifecycle tests
         working-directory: codex-source/codex-rs
