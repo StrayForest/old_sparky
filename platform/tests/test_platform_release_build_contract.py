@@ -8103,16 +8103,18 @@ cleanup
             "evaluate-load",
         ):
             job = workflow_job(workflow, job_name)
-            secret_refs = re.findall(
-                r"\bsecrets\s*(?:\.([A-Za-z_][A-Za-z0-9_]*)|\[)",
-                job,
-            )
+            action_expressions = re.findall(r"\$\{\{(.*?)\}\}", job, re.DOTALL)
+            secret_contexts = [
+                re.sub(r"\s+", "", expression)
+                for expression in action_expressions
+                if re.search(r"\bsecrets\b", expression)
+            ]
             expected_refs = (
-                ["FIXTURE_MANIFEST_AGE_IDENTITY"]
+                ["secrets.FIXTURE_MANIFEST_AGE_IDENTITY"]
                 if job_name == "load-client"
                 else []
             )
-            self.assertEqual(secret_refs, expected_refs, job_name)
+            self.assertEqual(secret_contexts, expected_refs, job_name)
             self.assertNotRegex(
                 job,
                 r"(?:PROD_SSH_(?:HOST|USER|KEY):|SSH_DIR=|id_ed25519)",
