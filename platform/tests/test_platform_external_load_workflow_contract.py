@@ -28,7 +28,6 @@ from unittest.mock import patch
 import zipfile
 
 import yaml
-from tools.platform_workflow_input_guard import validate_external_payload
 from tools import platform_workflow_remote_dispatch
 
 
@@ -3804,7 +3803,6 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             platform_load,
             platform_ssr_capacity_diagnostic as capacity_diagnostic,
             platform_workflow_input_guard,
-            platform_workflow_remote_dispatch,
         )
         from tests.test_platform_external_load import manifest_payload
         from tests.test_platform_noop_source_binding import (
