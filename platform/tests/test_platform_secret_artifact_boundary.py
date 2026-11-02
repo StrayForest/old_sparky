@@ -1272,6 +1272,13 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
             load_steps, "Validate exact fixture descriptor and decrypted manifest"
         )
         load_cleanup_step = _named_step(load_steps, "Remove decrypted fixture material")
+        derive_steps = jobs["derive-diagnostic-source-binding"]["steps"]
+        derive_scrub_step = _named_step(
+            derive_steps, "Remove control identity from the runner event file"
+        )
+        derive_binding_step = _named_step(
+            derive_steps, "Validate descriptor and derive safe binding outputs"
+        )
         extraction_blocks = [
             step["run"]
             for job in jobs.values()
@@ -1517,6 +1524,54 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
                 "synthetic fixture credentials appeared in a public handoff",
             )
 
+        # Exercise the actual no-secret derive job after manifest encryption:
+        # it consumes the public descriptor, seals a runner-owned 0644 event,
+        # validates the descriptor with the real helper, and exports only the
+        # two closed source-binding fields.
+        derive_temp = root / "derive-runner-temp"
+        derive_temp.mkdir(mode=0o700)
+        derive_descriptor = derive_temp / "diagnostic-descriptor/fixture-descriptor.json"
+        derive_descriptor.parent.mkdir(mode=0o700)
+        shutil.copyfile(descriptor, derive_descriptor)
+        derive_descriptor.chmod(0o600)
+        derive_event = root / "derive-event.json"
+        derive_event.write_text(
+            json.dumps({"inputs": {"control_email": input_value["control_email"]}}),
+            encoding="utf-8",
+        )
+        derive_event.chmod(0o644)
+        derive_output = root / "derive-github-output"
+        derive_output.touch(mode=0o600)
+        run_yaml_step(
+            derive_scrub_step,
+            derive_temp,
+            extra_env={"GITHUB_EVENT_PATH": str(derive_event)},
+        )
+        self.assertEqual(derive_event.stat().st_mode & 0o777, 0o600)
+        self.assertNotIn(input_value["control_email"], derive_event.read_text(encoding="utf-8"))
+        derive_result = run_yaml_step(
+            derive_binding_step,
+            derive_temp,
+            extra_env={
+                "GITHUB_OUTPUT": str(derive_output),
+                "GITHUB_RUN_ID": run_id,
+                "GITHUB_RUN_ATTEMPT": attempt,
+                "SOURCE_GIT_SHA": runner_sha,
+                "APP_TARGET_SHA": runner_sha,
+            },
+        )
+        self.assertEqual(derive_result.returncode, 0)
+        derived_fields = dict(
+            line.split("=", 1) for line in derive_output.read_text(encoding="ascii").splitlines()
+        )
+        self.assertEqual(set(derived_fields), {"source_binding_base64", "source_binding_sha256"})
+        self.assertEqual(derived_fields, {"source_binding_base64": "", "source_binding_sha256": ""})
+        derived_output_text = derive_output.read_text(encoding="ascii")
+        self.assertTrue(
+            all(value not in derived_output_text for value in synthetic_credentials),
+            "synthetic fixture credentials appeared in derived workflow outputs",
+        )
+
         load_temp = root / "load-client-runner-temp"
         load_temp.mkdir(mode=0o700)
         load_descriptor = load_temp / "external-input/fixture-descriptor.json"
@@ -1669,7 +1724,7 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
                 event_path = Path(temporary) / "event.json"
                 email = "private-address+fixture@example.invalid"
                 event_path.write_text(json.dumps({"inputs": {"control_email": email, "profile_id": "external-vote"}, "repository": {"description": "metadata mentions control_email"}}), encoding="utf-8")
-                event_path.chmod(0o600)
+                event_path.chmod(0o644)
                 steps = workflow["jobs"][job_name]["steps"]
                 scrub = next(step for step in steps if step.get("name") == scrub_name)
                 self.assertLess(scrub["run"].index("::add-mask::"), scrub["run"].index("os.replace(tmp,path)"))
@@ -1760,7 +1815,7 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
                 event_path = Path(temporary) / "event.json"
                 email = "private-address+fixture@example.invalid"
                 event_path.write_text(json.dumps({"inputs": {"control_email": email, "confirmation": "DELETE-PRODUCTION-RETAINED-LOAD", "load_run_id": "12345"}, "repository": {"description": "metadata mentions control_email"}}), encoding="utf-8")
-                event_path.chmod(0o600)
+                event_path.chmod(0o644)
                 step = next(step for step in cleanup["jobs"][job_name]["steps"] if step.get("name") == expected_step)
                 runner_temp = Path(temporary)
                 result = subprocess.run(
@@ -1770,13 +1825,19 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("::add-mask::private-address+fixture@example.invalid", result.stdout)
-                self.assertNotIn(email, event_path.read_text(encoding="utf-8"))
-                self.assertEqual(json.loads(event_path.read_text(encoding="utf-8"))["repository"]["description"], "metadata mentions control_email")
                 email_path = runner_temp / "retained-cleanup-control-email"
                 if job_name == "cleanup":
+                    sanitized_path = runner_temp / "retained-cleanup-sanitized-event.json"
+                    self.assertIn(email, event_path.read_text(encoding="utf-8"))
+                    self.assertEqual(event_path.stat().st_mode & 0o777, 0o600)
+                    self.assertNotIn(email, sanitized_path.read_text(encoding="utf-8"))
+                    self.assertEqual(sanitized_path.stat().st_mode & 0o777, 0o600)
                     self.assertEqual(email_path.read_text(encoding="ascii"), f"{email.lower()}\n")
                     self.assertEqual(email_path.stat().st_mode & 0o777, 0o600)
                 else:
+                    self.assertNotIn(email, event_path.read_text(encoding="utf-8"))
+                    self.assertEqual(event_path.stat().st_mode & 0o777, 0o600)
+                    self.assertEqual(json.loads(event_path.read_text(encoding="utf-8"))["repository"]["description"], "metadata mentions control_email")
                     self.assertFalse(email_path.exists())
                 if job_name == "cleanup":
                     remove_step = next(step for step in cleanup["jobs"][job_name]["steps"] if step.get("name") == "Remove staged cleanup control identity")
@@ -1787,6 +1848,43 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
                     )
                     self.assertEqual(removed.returncode, 0, removed.stderr)
                     self.assertFalse(email_path.exists())
+
+        for job_name, expected_step in (
+            ("resolve-host-tools-pin", "Mask and remove control identity before candidate checkout"),
+            ("cleanup", "Mask and remove control identity before cleanup processing"),
+        ):
+            step = next(step for step in cleanup["jobs"][job_name]["steps"] if step.get("name") == expected_step)
+            for unsafe_case in ("group-other-write", "special-bits", "oversized", "symlink", "wrong-owner"):
+                if unsafe_case == "wrong-owner" and os.geteuid() != 0:
+                    continue
+                with self.subTest(cleanup_job=job_name, unsafe_event=unsafe_case), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    event_path = root / "event.json"
+                    event_bytes = json.dumps({"inputs": {"control_email": "private-address+fixture@example.invalid", "confirmation": "DELETE-PRODUCTION-RETAINED-LOAD", "load_run_id": "12345"}}).encode("utf-8")
+                    if unsafe_case == "symlink":
+                        target = root / "event-target.json"
+                        target.write_bytes(event_bytes)
+                        event_path.symlink_to(target)
+                    elif unsafe_case == "oversized":
+                        event_path.write_bytes(event_bytes + b" " * 65537)
+                    else:
+                        event_path.write_bytes(event_bytes)
+                        if unsafe_case == "group-other-write":
+                            event_path.chmod(0o666)
+                        elif unsafe_case == "special-bits":
+                            event_path.chmod(0o4600)
+                        else:
+                            os.chown(event_path, os.geteuid() + 1, -1)
+                    result = subprocess.run(
+                        ["bash", "-euo", "pipefail", "-c", step["run"]],
+                        env={**os.environ, "GITHUB_EVENT_PATH": str(event_path), "RUNNER_TEMP": str(root)},
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("EVENT_SCRUB reason=", result.stderr)
+                    self.assertNotIn("private-address+fixture@example.invalid", result.stderr)
 
         for job_name, expected_step in (
             ("resolve-host-tools-pin", "Mask and remove control identity before candidate checkout"),
@@ -1816,7 +1914,12 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
                     )
                     self.assertNotEqual(result.returncode, 0)
                     self.assertNotIn(email, result.stderr)
-                    self.assertIn("workflow event sanitization failed closed", result.stderr)
+                    expected_reason = (
+                        "EVENT_SCRUB reason=control_identity_retained"
+                        if job_name == "cleanup"
+                        else "EVENT_SCRUB reason=event_payload_invalid"
+                    )
+                    self.assertIn(expected_reason, result.stderr)
 
 
 if __name__ == "__main__":
