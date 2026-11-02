@@ -1391,6 +1391,13 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
         manifest_bytes = (
             json.dumps(manifest_value, ensure_ascii=True, separators=(",", ":")) + "\n"
         ).encode("ascii")
+        synthetic_credentials = {
+            input_value["control_email"],
+            *(row["user_id"] for row in users),
+            *(row["tournament_slug"] for row in users),
+            *(row["session_token"] for row in users),
+            *(row["csrf_token"] for row in users),
+        }
 
         def run_yaml_step(
             step: dict[str, object],
@@ -1428,7 +1435,7 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
         plain_input.write_bytes(input_bytes)
         plain_input.chmod(0o600)
         self.assertEqual(str(encrypt_step["run"]).count(transport.AGE_RECIPIENT), 1)
-        encrypted = run_yaml_step(
+        run_yaml_step(
             {**encrypt_step, "run": str(encrypt_step["run"]).replace(
                 transport.AGE_RECIPIENT, recipient
             )},
@@ -1437,6 +1444,11 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
         encrypted_input = encrypt_temp / "fixture-private-transport/private-input.json.age"
         self.assertTrue(encrypted_input.is_file())
         self.assertEqual(encrypted_input.stat().st_mode & 0o777, 0o600)
+        encrypted_input_bytes = encrypted_input.read_bytes()
+        self.assertTrue(
+            all(value.encode("ascii") not in encrypted_input_bytes for value in synthetic_credentials),
+            "synthetic private input values appeared in the ciphertext artifact",
+        )
         installed = encrypt_temp / "fixture-age-tools/age/age"
         self.assertTrue(installed.is_file() and os.access(installed, os.X_OK))
         self.assertTrue((encrypt_temp / "fixture-age-tools/age").is_dir())
@@ -1497,6 +1509,13 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
         self.assertNotIn("control_email", public_descriptor["input"])
         self.assertNotIn("session_token", json.dumps(public_descriptor, sort_keys=True))
         self.assertNotIn("csrf_token", json.dumps(public_descriptor, sort_keys=True))
+        manifest_cipher_bytes = manifest_cipher.read_bytes()
+        descriptor_bytes = descriptor.read_bytes()
+        for public_payload in (manifest_cipher_bytes, descriptor_bytes):
+            self.assertTrue(
+                all(value.encode("ascii") not in public_payload for value in synthetic_credentials),
+                "synthetic fixture credentials appeared in a public handoff",
+            )
 
         load_temp = root / "load-client-runner-temp"
         load_temp.mkdir(mode=0o700)
