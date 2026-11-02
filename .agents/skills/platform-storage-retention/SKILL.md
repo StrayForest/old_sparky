@@ -61,24 +61,44 @@ calling the task complete.
 
    Record the `current`/`previous` roles and every explicit
    `--protected-release` value in the validated installed `ExecStart`. Also
-   identify the shared-venv origin from the active release's
-   `.rollback/venv-origin.json`: accept it only when the receipt is a root-owned
-   regular mode-`0600` file, its release slug/source/release-JSON digest match
-   the active release, and its `venv_dev`/`venv_ino` match the live shared
-   venv. Confirm the named origin release has the receipt's source and
-   `RELEASE.json` digest. If any field is missing or differs, stop and retain
-   all release candidates until the origin is resolved. Confirm every
-   explicit maintenance pin and the validated origin appears in
-   `production_releases.retained` and is absent from
-   `production_releases.deleted`. The `protected` field contains the dynamic
-   `current`/`previous` pointers.
+   resolve the shared-venv origin through the active release's installed
+   `platform_verify_venv_reuse.py` source. Its `_read_origin_receipt` validates
+   the root-owned mode-`0600` receipt against the active release identity and
+   live shared-venv device/inode; `_release_identity` must then validate the
+   named origin release against the receipt's source and `RELEASE.json`
+   digest. If any check fails or the receipt is absent, stop and retain all
+   release candidates. The canonical maintenance service protects only the
+   `current`/`previous` pointers and three static release pins; it does not
+   discover this dynamic origin. Apply its full sweep only when its fresh preview shows the validated
+   origin in `production_releases.retained` and absent from `deleted`.
+
+   Run the resolver from the exact active release. It prints only the validated
+   origin slug; it fails closed if the active release lacks the CLI option or
+   any identity check fails:
+
+   ```bash
+   set -euo pipefail
+   current_release="$(readlink -f /opt/oldsparky/platform/current)"
+   origin_slug="$(/opt/oldsparky/platform/shared/venv/bin/python -I -B \
+     "$current_release/tools/platform_verify_venv_reuse.py" \
+     --resolve-shared-venv-origin \
+     --app /opt/oldsparky/platform \
+     --current "$current_release" \
+     --venv /opt/oldsparky/platform/shared/venv)"
+   test -n "$origin_slug"
+   ```
 
    If an older active-release validator rejects the required `MainPID`
    property, fail closed and retry after a reviewed release installs the
    updated validator; see `platform/docs/operations-runbook.md`. Do not remove
    the property or edit the immutable release.
 
-3. Apply the bounded sweep through the installed service using the reviewed
+3. Apply the bounded sweep through the installed service only when the fresh
+   exact preview confirms the validated shared-venv origin is retained and not
+   deleted. The service does not add that dynamic origin automatically. If the
+   preview lists it in `deleted`, do not apply the full sweep; use step 4's
+   release-only procedure or keep retention read-only until the origin is
+   protected. When the precondition passes, use the reviewed
    production workflow. It creates a fresh restore-verified backup before
    deleting release candidates, source build artifacts, bounded browser
    artifacts, screenshots, and stale live-QA runtime caches:
@@ -133,8 +153,15 @@ calling the task complete.
    in both preview and apply; never use a bare command that omits those pins:
 
    ```bash
-   # Include the validated shared-venv origin and every installed ExecStart pin once.
-   protected_releases=("<validated-venv-origin-slug>" "<exact-installed-pin-1>" "<exact-installed-pin-2>" "<exact-installed-pin-3>")
+   set -euo pipefail
+   current_release="$(readlink -f /opt/oldsparky/platform/current)"
+   origin_slug="$(/opt/oldsparky/platform/shared/venv/bin/python -I -B \
+     "$current_release/tools/platform_verify_venv_reuse.py" \
+     --resolve-shared-venv-origin --app /opt/oldsparky/platform \
+     --current "$current_release" --venv /opt/oldsparky/platform/shared/venv)"
+   test -n "$origin_slug"
+   # Include the validated origin and every installed ExecStart pin once.
+   protected_releases=("$origin_slug" "<exact-installed-pin-1>" "<exact-installed-pin-2>" "<exact-installed-pin-3>")
    # Include the complete candidate list from this exact dry-run.
    expected_candidates=("<exact-preview-candidate-1>" "<exact-preview-candidate-2>" "<exact-preview-candidate-3>")
    retention_args=(--app-dir /opt/oldsparky/platform --keep 5 --min-age-days 0)
@@ -142,21 +169,25 @@ calling the task complete.
      retention_args+=(--protected-release "$slug")
    done
    /opt/oldsparky/platform/shared/venv/bin/python \
-     /opt/oldsparky/platform/current/tools/platform_release_retention.py \
+     "$current_release/tools/platform_release_retention.py" \
      "${retention_args[@]}"
    for slug in "${expected_candidates[@]}"; do
      retention_args+=(--expected-candidate "$slug")
    done
    /opt/oldsparky/platform/shared/venv/bin/python \
-     /opt/oldsparky/platform/current/tools/platform_release_retention.py \
-     "${retention_args[@]}" --apply
+     "$current_release/tools/platform_release_retention.py" \
+     "${retention_args[@]}" --apply --json-receipt
    ```
 
-   The first invocation is read-only. Compare its full candidate set with the
-   validated maintenance preview; record the validated shared-venv origin,
-   named maintenance pins and `current`/`previous` roles, and ensure the
-   candidate set excludes all of them. Replace the sample arrays with the
-   exact values observed; do not guess IDs or counts. Recheck the exact
+   The first invocation is read-only. Use its full candidate set as the exact
+   repeated `--expected-candidate` list for apply. Review it against the full
+   maintenance preview, accounting for the origin and any other identities
+   protected only by this release-only command; do not expect the two sets to
+   be equal. Every set difference must be explained by those protected
+   identities. If any difference is unexplained, stop and refresh both previews.
+   The release-only set must exclude the origin, named pins, and `current`/
+   `previous`. Replace sample pin/candidate values with the exact observed
+   values; do not guess IDs or counts. Recheck the exact
    candidate identities, release inodes, pointers, locks and pending
    transactions immediately before apply. If the candidate set or any
    protected identity changed, stop and produce a fresh preview.
@@ -170,10 +201,11 @@ calling the task complete.
    receipt only after the lock-held postcondition confirms every planned path
    is absent; it never prints candidate slugs or paths.
 
-   This emergency staging step may delete only unprotected old release
-   directories. Run `deadlock-maintenance.service` immediately afterward so
-   the fresh restore-verified backup and remaining retention checks complete.
-   Do not use `--skip-backup` for the full sweep.
+   This emergency staging step may delete only the exact reviewed unprotected
+   release candidates. Afterward, collect a fresh full-maintenance preview.
+   Start `deadlock-maintenance.service` only if that preview still retains the
+   validated origin and excludes it from `deleted`; otherwise keep the full
+   sweep read-only. Do not use `--skip-backup` for the full sweep.
 
 5. Verify and record the result before another run:
 

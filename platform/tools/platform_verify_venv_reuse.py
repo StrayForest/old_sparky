@@ -204,6 +204,58 @@ def _read_origin_receipt(
     return payload
 
 
+def resolve_shared_venv_origin(app: Path, current: Path, venv: Path) -> str:
+    """Return the receipt-bound origin slug for the exact active release."""
+    try:
+        app_info = app.lstat()
+        if (stat.S_ISLNK(app_info.st_mode) or not stat.S_ISDIR(app_info.st_mode)
+                or app_info.st_uid != 0 or app_info.st_gid != 0
+                or stat.S_IMODE(app_info.st_mode) & (0o022 | 0o7000)):
+            raise ReuseRefused("app_directory")
+        app_root = app.resolve(strict=True)
+        releases = app_root / "releases"
+        releases_info = releases.lstat()
+        if (stat.S_ISLNK(releases_info.st_mode) or not stat.S_ISDIR(releases_info.st_mode)
+                or releases_info.st_uid != 0 or releases_info.st_gid != 0
+                or stat.S_IMODE(releases_info.st_mode) & (0o022 | 0o7000)):
+            raise ReuseRefused("releases_directory")
+        active_link = app_root / "current"
+        link_info = active_link.lstat()
+        if not stat.S_ISLNK(link_info.st_mode) or link_info.st_uid != 0:
+            raise ReuseRefused("current_release_pointer")
+        current_release = current.resolve(strict=True)
+        if active_link.resolve(strict=True) != current_release:
+            raise ReuseRefused("current_release_pointer")
+        _release_identity(current_release, releases)
+        _release_rollback(current_release)
+
+        shared = app_root / "shared"
+        shared_info = shared.lstat()
+        if (stat.S_ISLNK(shared_info.st_mode) or not stat.S_ISDIR(shared_info.st_mode)
+                or shared_info.st_uid != 0 or shared_info.st_gid != 0
+                or stat.S_IMODE(shared_info.st_mode) & (0o022 | 0o7000)):
+            raise ReuseRefused("shared_directory")
+        expected_venv = shared / "venv"
+        if venv.resolve(strict=True) != expected_venv:
+            raise ReuseRefused("venv_directory")
+        receipt = _read_origin_receipt(current_release, releases, expected_venv)
+        if receipt is None:
+            raise ReuseRefused("origin_receipt_missing")
+        origin_slug = str(receipt["origin_release_slug"])
+        identity = _release_identity(releases / origin_slug, releases)
+        if identity != (
+            origin_slug,
+            receipt["origin_source_sha"],
+            receipt["origin_release_json_sha256"],
+        ):
+            raise ReuseRefused("origin_release_binding")
+        return origin_slug
+    except (OSError, RuntimeError, ValueError) as exc:
+        if isinstance(exc, ReuseRefused):
+            raise
+        raise ReuseRefused("origin_validation") from exc
+
+
 def _derive_venv_origin(
     current: Path,
     app: Path,
@@ -827,15 +879,38 @@ def prove(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--app", type=Path, required=True)
-    parser.add_argument("--current", type=Path, required=True)
-    parser.add_argument("--candidate", type=Path, required=True)
-    parser.add_argument("--venv", type=Path, required=True)
-    parser.add_argument("--python", type=Path, required=True)
-    parser.add_argument("--transaction-state", type=Path, required=True)
-    parser.add_argument("--quiesce-state", type=Path, required=True)
+    parser.add_argument("--resolve-shared-venv-origin", action="store_true")
+    parser.add_argument("--app", type=Path)
+    parser.add_argument("--current", type=Path)
+    parser.add_argument("--candidate", type=Path)
+    parser.add_argument("--venv", type=Path)
+    parser.add_argument("--python", type=Path)
+    parser.add_argument("--transaction-state", type=Path)
+    parser.add_argument("--quiesce-state", type=Path)
     parser.add_argument("--previous-before", default="")
     args = parser.parse_args()
+    if args.resolve_shared_venv_origin:
+        if (args.app is None or args.current is None or args.venv is None
+                or args.previous_before or any((
+                    args.candidate, args.python, args.transaction_state, args.quiesce_state,
+                ))):
+            parser.error("origin resolution requires only --app, --current, and --venv")
+        try:
+            origin = resolve_shared_venv_origin(args.app, args.current, args.venv)
+        except (ReuseRefused, OSError, RuntimeError, ValueError):
+            return 1
+        sys.stdout.write(origin + "\n")
+        return 0
+    if any(value is None for value in (
+        args.app, args.current, args.candidate, args.venv, args.python,
+        args.transaction_state, args.quiesce_state,
+    )):
+        parser.error("proof mode requires --app, --current, --candidate, --venv, --python, "
+                     "--transaction-state, and --quiesce-state")
+    assert all(value is not None for value in (
+        args.app, args.current, args.candidate, args.venv, args.python,
+        args.transaction_state, args.quiesce_state,
+    ))
     try:
         receipt = prove(args.app, args.current, args.candidate, args.venv, args.python,
                         args.transaction_state, args.quiesce_state, args.previous_before)

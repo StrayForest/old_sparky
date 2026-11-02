@@ -598,6 +598,78 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
                 json.loads(origin_receipt.read_text()),
                 proof,
             )
+            current_pointer = self.app_dir / "current"
+            current_pointer.unlink()
+            current_pointer.symlink_to(candidate)
+            resolver_tool = REPO_ROOT / "platform" / "tools" / "platform_verify_venv_reuse.py"
+
+            def run_resolver(current_arg: Path = candidate) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [
+                        "/usr/bin/python3", "-I", "-B", str(resolver_tool),
+                        "--resolve-shared-venv-origin",
+                        "--app", str(self.app_dir),
+                        "--current", str(current_arg),
+                        "--venv", str(self.shared_dir / "venv"),
+                    ],
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                )
+
+            resolver = run_resolver()
+            self.assertEqual(resolver.returncode, 0, resolver.stderr)
+            self.assertEqual(resolver.stdout, origin.name + "\n")
+            bad_receipt = dict(proof)
+            bad_receipt["venv_ino"] = int(proof["venv_ino"]) + 1
+            origin_receipt.write_text(
+                json.dumps(bad_receipt, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            origin_receipt.chmod(0o600)
+            rejected_receipt = run_resolver()
+            self.assertNotEqual(rejected_receipt.returncode, 0)
+            self.assertEqual(rejected_receipt.stdout, "")
+            origin_receipt.write_text(
+                json.dumps(proof, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            origin_receipt.chmod(0o600)
+
+            origin_release_json = origin / "RELEASE.json"
+            original_origin_json = origin_release_json.read_bytes()
+            origin_release_json.chmod(0o644)
+            origin_release_json.write_text(json.dumps({
+                "release_slug": origin.name,
+                "source_git_commit": "d" * 40,
+            }) + "\n", encoding="utf-8")
+            origin_release_json.chmod(0o444)
+            rejected_origin = run_resolver()
+            self.assertNotEqual(rejected_origin.returncode, 0)
+            self.assertEqual(rejected_origin.stdout, "")
+            origin_release_json.chmod(0o644)
+            origin_release_json.write_bytes(original_origin_json)
+            origin_release_json.chmod(0o444)
+
+            origin_receipt.write_text("{malformed\n", encoding="ascii")
+            origin_receipt.chmod(0o600)
+            rejected_schema = run_resolver()
+            self.assertNotEqual(rejected_schema.returncode, 0)
+            self.assertEqual(rejected_schema.stdout, "")
+            origin_receipt.write_text(
+                json.dumps(proof, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            origin_receipt.chmod(0o600)
+
+            mismatch = run_resolver(current)
+            self.assertNotEqual(mismatch.returncode, 0)
+            self.assertEqual(mismatch.stdout, "")
+            missing_args = subprocess.run(
+                ["/usr/bin/python3", "-I", "-B", str(resolver_tool)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+            self.assertEqual(missing_args.returncode, 2)
+            current_pointer.unlink()
+            current_pointer.symlink_to(current)
             # The anchor survives pruning intermediate releases; no unbounded
             # historical release retention is needed for the next reuse.
             shutil.rmtree(previous)
