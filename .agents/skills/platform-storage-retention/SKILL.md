@@ -60,17 +60,15 @@ calling the task complete.
    ```
 
    Record the `current`/`previous` roles and every explicit
-   `--protected-release` value in the validated installed `ExecStart`. Also
-   resolve the shared-venv origin through the active release's installed
-   `platform_verify_venv_reuse.py` source. Its `_read_origin_receipt` validates
-   the root-owned mode-`0600` receipt against the active release identity and
-   live shared-venv device/inode; `_release_identity` must then validate the
-   named origin release against the receipt's source and `RELEASE.json`
-   digest. If any check fails or the receipt is absent, stop and retain all
-   release candidates. The canonical maintenance service protects only the
-   `current`/`previous` pointers and three static release pins; it does not
-   discover this dynamic origin. Apply its full sweep only when its fresh preview shows the validated
-   origin in `production_releases.retained` and absent from `deleted`.
+   `--protected-release` value in the validated installed `ExecStart`. The
+   canonical retention plan also resolves the shared-venv origin through the
+   active release's `platform_verify_venv_reuse.py` and adds it to the
+   protected set. A fresh-venv `snapshot` transition resolves to the current
+   release; an `unchanged` chain or receipt resolves to its validated older
+   origin. Missing or invalid lineage fails the plan before backup or
+   deletion. Apply a full sweep only when its fresh preview shows the
+   validated origin in `production_releases.retained` and absent from
+   `deleted`.
 
    Run the resolver from the exact active release. It prints only the validated
    origin slug; it fails closed if the active release lacks the CLI option or
@@ -95,10 +93,10 @@ calling the task complete.
 
 3. Apply the bounded sweep through the installed service only when the fresh
    exact preview confirms the validated shared-venv origin is retained and not
-   deleted. The service does not add that dynamic origin automatically. If the
-   preview lists it in `deleted`, do not apply the full sweep; use step 4's
-   release-only procedure or keep retention read-only until the origin is
-   protected. When the precondition passes, use the reviewed
+   deleted. If origin validation fails or the preview lists it in `deleted`,
+   do not apply the full sweep; use step 4's release-only procedure or keep
+   retention read-only until the origin is protected. When the precondition
+   passes, use the reviewed
    production workflow. It creates a fresh restore-verified backup before
    deleting release candidates, source build artifacts, bounded browser
    artifacts, screenshots, and stale live-QA runtime caches:
@@ -135,9 +133,11 @@ calling the task complete.
    transport or producer failure from a disk-threshold result; raw host report
    content and command output remain private.
 
-   The service keeps five newest production releases plus `current` and
-   `previous`; it retains one live-QA runtime cache and applies age/pattern
-   bounds to other known artifact directories.
+   The service keeps five newest production releases plus `current`,
+   `previous`, the shared-venv origin, and configured pins; it retains one
+   live-QA runtime cache and applies age/pattern bounds to other known artifact
+   directories. For a paused timer, use the stop, preview, and resume procedure
+   in `platform/docs/operations-runbook.md`.
 
    If a prior exact retained-load cleanup committed `PreprodTestRun` as
    `cleaned` but lost only the final filesystem removal, rerun the exact-ID
@@ -180,9 +180,32 @@ calling the task complete.
      --resolve-shared-venv-origin --app /opt/oldsparky/platform \
      --current "$current_release_now" --venv /opt/oldsparky/platform/shared/venv)"
    test "$current_release_now" = "$current_release" && test "$origin_slug_now" = "$origin_slug"
+   umask 077
+   receipt_file="$(mktemp /run/oldsparky-release-retention.XXXXXX)"
    /opt/oldsparky/platform/shared/venv/bin/python \
      "$current_release/tools/platform_release_retention.py" \
-     "${retention_args[@]}" --apply --json-receipt
+     "${retention_args[@]}" --apply --json-receipt > "$receipt_file"
+   /usr/bin/python3 -I -B - "$receipt_file" "${#expected_candidates[@]}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="ascii") as stream:
+    receipt = json.load(stream)
+expected = int(sys.argv[2])
+if (
+    set(receipt) != {"schema", "status", "candidate_count", "deleted_count", "reclaimed_bytes"}
+    or type(receipt["schema"]) is not int
+    or receipt["schema"] != 1
+    or receipt["status"] != "passed"
+    or type(receipt["candidate_count"]) is not int
+    or type(receipt["deleted_count"]) is not int
+    or type(receipt["reclaimed_bytes"]) is not int
+    or receipt["candidate_count"] != expected
+    or receipt["deleted_count"] != expected
+    or receipt["reclaimed_bytes"] < 0
+):
+    raise SystemExit(1)
+PY
    ```
 
    The first invocation is read-only. Use its full candidate set as the exact
@@ -207,7 +230,11 @@ calling the task complete.
    Signed task-retention wrappers may add `--json-receipt` only with `--apply`
    and the complete `--expected-candidate` set. It emits a fixed success count
    receipt only after the lock-held postcondition confirms every planned path
-   is absent; it never prints candidate slugs or paths.
+   is absent; it never prints candidate slugs or paths. Capture stdout in the
+   mode-`0600` `/run` file before parsing it. `reclaimed_bytes` is the planner's
+   summed file-size estimate, not allocated blocks actually returned to the
+   filesystem; do not compare it with `st_blocks` or use it as the disk-space
+   postcondition.
 
    This emergency staging step may delete only the exact reviewed unprotected
    release candidates. Afterward, collect a fresh full-maintenance preview.

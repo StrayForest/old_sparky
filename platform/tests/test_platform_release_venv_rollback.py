@@ -22,6 +22,7 @@ import zipfile
 
 from tests import platform_chromium_sandbox_fixture as chromium_sandbox_fixture
 from tests import platform_test_lock_support as lock_support
+from tools import platform_release_retention
 from tools import platform_release_transaction
 from tools import platform_release_systemd_state
 from tools import platform_release_venv_capacity
@@ -511,6 +512,51 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
             f"VIRTUAL_ENV_PROMPT='(.venv-install-{origin.name}.ABC123) '\n",
             encoding="utf-8",
         )
+        self.assertEqual(
+            platform_verify_venv_reuse.resolve_shared_venv_origin(
+                self.app_dir, current, self.shared_dir / "venv",
+            ),
+            origin.name,
+        )
+        with mock.patch.object(
+            platform_release_retention, "PRODUCTION_APP_DIR", self.app_dir,
+        ):
+            protected = platform_release_retention._cli_protected_releases(
+                self.app_dir, (),
+            )
+        self.assertIn(origin.name, protected)
+
+        # A fresh shared-venv snapshot resolves to the release that owns the
+        # validated snapshot, even before an origin receipt exists.
+        current_pointer = self.app_dir / "current"
+        current_pointer.unlink()
+        current_pointer.symlink_to(origin)
+        self.assertEqual(
+            platform_verify_venv_reuse.resolve_shared_venv_origin(
+                self.app_dir, origin, self.shared_dir / "venv",
+            ),
+            origin.name,
+        )
+        current_pointer.unlink()
+        current_pointer.symlink_to(current)
+
+        # Missing or inconsistent lineage never falls back to the current or
+        # newest release by guesswork.
+        current_previous = current / ".rollback" / "previous-release"
+        original_previous = current_previous.read_bytes()
+        current_previous.write_text("/invalid/release-lineage\n", encoding="utf-8")
+        current_previous.chmod(0o600)
+        with self.assertRaises(platform_verify_venv_reuse.ReuseRefused):
+            platform_verify_venv_reuse.resolve_shared_venv_origin(
+                self.app_dir, current, self.shared_dir / "venv",
+            )
+        with mock.patch.object(
+            platform_release_retention, "PRODUCTION_APP_DIR", self.app_dir,
+        ), self.assertRaises(RuntimeError):
+            platform_release_retention._cli_protected_releases(self.app_dir, ())
+        current_previous.write_bytes(original_previous)
+        current_previous.chmod(0o600)
+
         quiesce_state = self.shared_dir / ".release-quiesce.json"
         platform_release_transaction.prepare_quiesce(
             quiesce_state,

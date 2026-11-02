@@ -205,7 +205,7 @@ def _read_origin_receipt(
 
 
 def resolve_shared_venv_origin(app: Path, current: Path, venv: Path) -> str:
-    """Return the receipt-bound origin slug for the exact active release."""
+    """Return the validated shared-venv origin for the exact active release."""
     try:
         app_info = app.lstat()
         if (stat.S_ISLNK(app_info.st_mode) or not stat.S_ISDIR(app_info.st_mode)
@@ -238,15 +238,16 @@ def resolve_shared_venv_origin(app: Path, current: Path, venv: Path) -> str:
         expected_venv = shared / "venv"
         if venv.resolve(strict=True) != expected_venv:
             raise ReuseRefused("venv_directory")
-        receipt = _read_origin_receipt(current_release, releases, expected_venv)
-        if receipt is None:
-            raise ReuseRefused("origin_receipt_missing")
-        origin_slug = str(receipt["origin_release_slug"])
-        identity = _release_identity(releases / origin_slug, releases)
-        if identity != (
-            origin_slug,
-            receipt["origin_source_sha"],
-            receipt["origin_release_json_sha256"],
+        venv_info = expected_venv.lstat()
+        if (stat.S_ISLNK(venv_info.st_mode) or not stat.S_ISDIR(venv_info.st_mode)
+                or venv_info.st_uid != 0 or venv_info.st_gid != 0
+                or stat.S_IMODE(venv_info.st_mode) != 0o755):
+            raise ReuseRefused("venv_directory")
+        origin_slug, origin_source, origin_release_sha, _receipt = _derive_venv_origin(
+            current_release, app_root, expected_venv,
+        )
+        if _release_identity(releases / origin_slug, releases) != (
+            origin_slug, origin_source, origin_release_sha,
         ):
             raise ReuseRefused("origin_release_binding")
         return origin_slug

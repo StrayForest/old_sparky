@@ -1107,7 +1107,7 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
             with self.subTest(job=job_name), tempfile.TemporaryDirectory() as temporary:
                 event_path = Path(temporary) / "event.json"
                 email = "private-address+fixture@example.invalid"
-                event_path.write_text(json.dumps({"inputs": {"control_email": email, "profile_id": "external-vote"}}), encoding="utf-8")
+                event_path.write_text(json.dumps({"inputs": {"control_email": email, "profile_id": "external-vote"}, "repository": {"description": "metadata mentions control_email"}}), encoding="utf-8")
                 event_path.chmod(0o600)
                 steps = workflow["jobs"][job_name]["steps"]
                 scrub = next(step for step in steps if step.get("name") == scrub_name)
@@ -1120,6 +1120,9 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("::add-mask::private-address+fixture@example.invalid", result.stdout)
                 self.assertNotIn(email, event_path.read_text(encoding="utf-8"))
+                scrubbed = json.loads(event_path.read_text(encoding="utf-8"))
+                self.assertNotIn("control_email", scrubbed["inputs"])
+                self.assertEqual(scrubbed["repository"]["description"], "metadata mentions control_email")
 
         validator = workflow["jobs"]["validate-external-inputs"]
         with tempfile.TemporaryDirectory() as temporary:
@@ -1133,7 +1136,7 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
                 "ssr_capacity_diagnostic_only": "false", "ssr_capacity_concurrency": "8",
                 "ssr_capacity_workload": "authenticated_workspace_read_capacity_v1",
             }
-            event_path.write_text(json.dumps({"inputs": inputs}), encoding="utf-8")
+            event_path.write_text(json.dumps({"inputs": inputs, "repository": {"description": "metadata mentions control_email"}}), encoding="utf-8")
             event_path.chmod(0o600)
             scrub = validator["steps"][0]
             result = subprocess.run(
@@ -1147,6 +1150,7 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
             self.assertEqual(email_path.read_text(encoding="ascii"), f"{email.lower()}\n")
             self.assertEqual(email_path.stat().st_mode & 0o777, 0o600)
             self.assertNotIn(email, event_path.read_text(encoding="utf-8"))
+            self.assertEqual(json.loads(event_path.read_text(encoding="utf-8"))["repository"]["description"], "metadata mentions control_email")
 
             serializer = next(step for step in validator["steps"] if step.get("name") == "Serialize the private external-load input")
             script = serializer["run"].split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
@@ -1192,7 +1196,7 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
             with self.subTest(cleanup_job=job_name), tempfile.TemporaryDirectory() as temporary:
                 event_path = Path(temporary) / "event.json"
                 email = "private-address+fixture@example.invalid"
-                event_path.write_text(json.dumps({"inputs": {"control_email": email, "confirmation": "DELETE-PRODUCTION-RETAINED-LOAD", "load_run_id": "12345"}}), encoding="utf-8")
+                event_path.write_text(json.dumps({"inputs": {"control_email": email, "confirmation": "DELETE-PRODUCTION-RETAINED-LOAD", "load_run_id": "12345"}, "repository": {"description": "metadata mentions control_email"}}), encoding="utf-8")
                 event_path.chmod(0o600)
                 step = next(step for step in cleanup["jobs"][job_name]["steps"] if step.get("name") == expected_step)
                 runner_temp = Path(temporary)
@@ -1204,6 +1208,7 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("::add-mask::private-address+fixture@example.invalid", result.stdout)
                 self.assertNotIn(email, event_path.read_text(encoding="utf-8"))
+                self.assertEqual(json.loads(event_path.read_text(encoding="utf-8"))["repository"]["description"], "metadata mentions control_email")
                 email_path = runner_temp / "retained-cleanup-control-email"
                 if job_name == "cleanup":
                     self.assertEqual(email_path.read_text(encoding="ascii"), f"{email.lower()}\n")
@@ -1219,6 +1224,36 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
                     )
                     self.assertEqual(removed.returncode, 0, removed.stderr)
                     self.assertFalse(email_path.exists())
+
+        for job_name, expected_step in (
+            ("resolve-host-tools-pin", "Mask and remove control identity before candidate checkout"),
+            ("cleanup", "Mask and remove control identity before cleanup processing"),
+        ):
+            for description in (
+                "copied private-address+fixture@example.invalid",
+                "copied private-address+fixture\\u0040example.invalid",
+            ):
+                with self.subTest(cleanup_job=job_name, credential_copy=description.startswith("copied private-address+")), tempfile.TemporaryDirectory() as temporary:
+                    event_path = Path(temporary) / "event.json"
+                    email = "private-address+fixture@example.invalid"
+                    raw = (
+                        '{"inputs":{"control_email":"private-address+fixture@example.invalid",'
+                        '"confirmation":"DELETE-PRODUCTION-RETAINED-LOAD","load_run_id":"12345"},'
+                        f'"repository":{{"description":"{description}"}}}}'
+                    )
+                    event_path.write_text(raw, encoding="utf-8")
+                    event_path.chmod(0o600)
+                    step = next(step for step in cleanup["jobs"][job_name]["steps"] if step.get("name") == expected_step)
+                    result = subprocess.run(
+                        ["bash", "-euo", "pipefail", "-c", step["run"]],
+                        env={**os.environ, "GITHUB_EVENT_PATH": str(event_path), "RUNNER_TEMP": temporary},
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn(email, result.stderr)
+                    self.assertIn("workflow event sanitization failed closed", result.stderr)
 
 
 if __name__ == "__main__":
