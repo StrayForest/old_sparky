@@ -1775,7 +1775,7 @@ class NoopSourceBindingTests(unittest.TestCase):
         scrub = cleanup_job["steps"][scrub_index]
         cleanup_scrub_script = scrub["run"]
 
-        marker = '/usr/bin/python3 - "$TARGET_SHA" "$LOAD_RUN_ID" "$GITHUB_RUN_ID" "$GITHUB_EVENT_PATH"'
+        marker = '/usr/bin/python3 - "$TARGET_SHA" "$LOAD_RUN_ID" "$GITHUB_RUN_ID" "$RUNNER_TEMP/retained-cleanup-sanitized-event.json"'
         begin = validation["run"].index(marker)
         heredoc = validation["run"].index("<<'PY'", begin) + len("<<'PY'")
         end = validation["run"].index("\nPY", heredoc)
@@ -1807,6 +1807,7 @@ class NoopSourceBindingTests(unittest.TestCase):
             ) -> subprocess.CompletedProcess[str]:
                 output_path.unlink(missing_ok=True)
                 (runner_temp / "retained-cleanup-control-email").unlink(missing_ok=True)
+                (runner_temp / "retained-cleanup-sanitized-event.json").unlink(missing_ok=True)
                 binding_path.write_text(json.dumps(source) + "\n", encoding="ascii")
                 binding_path.chmod(0o600)
                 event_path.write_text(json.dumps(event) + "\n", encoding="ascii")
@@ -1818,6 +1819,7 @@ class NoopSourceBindingTests(unittest.TestCase):
                         "GITHUB_EVENT_PATH": str(event_path),
                         "RUNNER_TEMP": str(runner_temp),
                         "GITHUB_OUTPUT": str(github_output_path),
+                        "QA_CONFIRMATION": "DELETE-PRODUCTION-RETAINED-LOAD",
                     },
                     capture_output=True,
                     text=True,
@@ -1833,7 +1835,7 @@ class NoopSourceBindingTests(unittest.TestCase):
                         target_sha,
                         "567890",
                         "678901",
-                        str(event_path),
+                        str(runner_temp / "retained-cleanup-sanitized-event.json"),
                         str(binding_path),
                         app_sha,
                     ],
@@ -1841,6 +1843,7 @@ class NoopSourceBindingTests(unittest.TestCase):
                         **os.environ,
                         "RUNNER_TEMP": str(runner_temp),
                         "GITHUB_OUTPUT": str(github_output_path),
+                        "QA_CONFIRMATION": "DELETE-PRODUCTION-RETAINED-LOAD",
                     },
                     capture_output=True,
                     text=True,
@@ -1856,7 +1859,10 @@ class NoopSourceBindingTests(unittest.TestCase):
             completed = invoke(source_handoff)
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertNotIn(email, completed.stderr)
-            self.assertEqual(completed.stdout, f"::add-mask::{email}\n")
+            self.assertEqual(
+                completed.stdout,
+                f"CLEANUP_PREFLIGHT status=validated\n::add-mask::{email}\n",
+            )
             payload = json.loads(output_path.read_text(encoding="ascii"))
             self.assertEqual(payload["schema"], 2)
             self.assertEqual(payload["target_sha"], RUNNER_SHA)
@@ -2060,7 +2066,7 @@ class NoopSourceBindingTests(unittest.TestCase):
             step for step in workflow["jobs"]["cleanup"]["steps"]
             if step.get("id") == "validate_cleanup_inputs"
         )
-        marker = '/usr/bin/python3 - "$TARGET_SHA" "$LOAD_RUN_ID" "$GITHUB_RUN_ID" "$GITHUB_EVENT_PATH"'
+        marker = '/usr/bin/python3 - "$TARGET_SHA" "$LOAD_RUN_ID" "$GITHUB_RUN_ID" "$RUNNER_TEMP/retained-cleanup-sanitized-event.json"'
         begin = validation["run"].index(marker)
         heredoc = validation["run"].index("<<'PY'", begin) + len("<<'PY'")
         end = validation["run"].index("\nPY", heredoc)
@@ -2072,12 +2078,15 @@ class NoopSourceBindingTests(unittest.TestCase):
             root = Path(directory)
             runner_temp = root / "runner-temp"
             runner_temp.mkdir(mode=0o700)
-            event = root / "event.json"
+            event = runner_temp / "retained-cleanup-sanitized-event.json"
             event.write_text(
-                json.dumps({"inputs": {"confirmation": "DELETE-PRODUCTION-RETAINED-LOAD", "control_email": email, "load_run_id": "567890"}}),
+                json.dumps({"inputs": {"confirmation": "DELETE-PRODUCTION-RETAINED-LOAD", "load_run_id": "567890"}}),
                 encoding="ascii",
             )
             event.chmod(0o600)
+            email_path = runner_temp / "retained-cleanup-control-email"
+            email_path.write_text(email + "\n", encoding="ascii")
+            email_path.chmod(0o600)
             binding_path = root / "source-binding.json"
             output = runner_temp / "platform-retained-cleanup-input.json"
             bad_handoffs = (
@@ -2093,7 +2102,11 @@ class NoopSourceBindingTests(unittest.TestCase):
                     binding_path.chmod(0o600)
                     result = subprocess.run(
                         [sys.executable, "-c", script, RUNNER_SHA, "567890", "678901", str(event), str(binding_path), APP_SHA],
-                        env={**os.environ, "RUNNER_TEMP": str(runner_temp)},
+                        env={
+                            **os.environ,
+                            "RUNNER_TEMP": str(runner_temp),
+                            "QA_CONFIRMATION": "DELETE-PRODUCTION-RETAINED-LOAD",
+                        },
                         capture_output=True,
                         text=True,
                         check=False,

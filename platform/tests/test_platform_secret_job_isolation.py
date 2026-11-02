@@ -121,7 +121,10 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
             if condition_lines and condition_lines[0].startswith("always() &&"):
                 cleanup_conditions.append(" ".join(condition_lines))
         self.assertEqual(len(cleanup_conditions), 4)
-        self.assertEqual(len(set(cleanup_conditions[1:])), 1)
+        self.assertEqual(cleanup_conditions[1], cleanup_conditions[3])
+        ssh_condition = cleanup_conditions[2]
+        identity_gate = "steps.revalidate-finalizer.outputs.cleanup_identity_status == '0'"
+        self.assertEqual(ssh_condition, f"{cleanup_conditions[1]} && {identity_gate}")
         self.assertIn("needs.fixture-setup.outputs.pre_candidate_cleanup_allowed == '1'", cleanup_conditions[0])
         condition = cleanup_conditions[1]
         substitutions = {
@@ -130,6 +133,8 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
             "needs.namespace-containment-manual-barrier.outputs.manual_required == '0'": "manual_clear",
             "needs.fixture-setup.outputs.pre_candidate_cleanup_allowed == '1'": "cleanup_flag",
             "needs.fixture-setup.outputs.manifest_ready != '1'": "manifest_missing",
+            "needs.fixture-setup.outputs.setup_status == '0'": "setup_success",
+            "needs.fixture-setup.outputs.manifest_ready == '1'": "manifest_ready",
             "needs.load-client.result == 'skipped'": "load_skipped",
             "inputs.cpu_diagnostic_only == true": "cpu_only",
             "inputs.ssr_capacity_diagnostic_only == true": "ssr_only",
@@ -148,6 +153,8 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
                 "ssr_only": False,
                 "cleanup_flag": True,
                 "manifest_missing": True,
+                "setup_success": False,
+                "manifest_ready": False,
                 "load_skipped": True,
                 "pair_skipped": True,
                 **overrides,
@@ -155,10 +162,16 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
             return bool(eval(condition, {"__builtins__": {}}, values))
 
         self.assertTrue(allows_cleanup())
+        self.assertTrue(allows_cleanup(
+            cleanup_flag=False, manifest_missing=False,
+            setup_success=True, manifest_ready=True,
+        ))
         self.assertTrue(allows_cleanup(namespace_closed=True, manual_clear=True, cleanup_flag=False))
         for denied in (
             {"cleanup_flag": False},
             {"manifest_missing": False},
+            {"setup_success": False, "cleanup_flag": False},
+            {"manifest_ready": False, "cleanup_flag": False},
             {"load_skipped": False},
             {"pair_skipped": False},
             {"cpu_only": False, "ssr_only": False},
