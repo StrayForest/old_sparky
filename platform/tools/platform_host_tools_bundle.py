@@ -741,6 +741,184 @@ def _read_bounded_json(path: Path, *, description: str) -> object:
         raise HostToolsBundleError(f"{description} is invalid") from exc
 
 
+def _read_installed_member(
+    path: Path,
+    *,
+    expected_mode: int,
+    expected_uid: int,
+    expected_gid: int,
+) -> bytes:
+    """Read one installed member while enforcing the bundle's normalized metadata."""
+
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise HostToolsBundleError("installed host-tools member is unavailable") from exc
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or stat.S_ISLNK(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_uid != expected_uid
+        or before.st_gid != expected_gid
+        or stat.S_IMODE(before.st_mode) != expected_mode
+        or before.st_size > MAX_FILE_BYTES
+    ):
+        raise HostToolsBundleError("installed host-tools member metadata is invalid")
+
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        if (
+            (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_uid != expected_uid
+            or opened.st_gid != expected_gid
+            or stat.S_IMODE(opened.st_mode) != expected_mode
+            or opened.st_size != before.st_size
+            or opened.st_mtime_ns != before.st_mtime_ns
+            or opened.st_ctime_ns != before.st_ctime_ns
+        ):
+            raise HostToolsBundleError("installed host-tools member changed")
+        chunks = bytearray()
+        while len(chunks) <= MAX_FILE_BYTES:
+            chunk = os.read(descriptor, MAX_FILE_BYTES + 1 - len(chunks))
+            if not chunk:
+                break
+            chunks.extend(chunk)
+        after = os.fstat(descriptor)
+        if (
+            (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino)
+            or after.st_size != opened.st_size
+            or after.st_mtime_ns != opened.st_mtime_ns
+            or after.st_ctime_ns != opened.st_ctime_ns
+            or after.st_nlink != 1
+            or stat.S_IMODE(after.st_mode) != expected_mode
+            or len(chunks) != after.st_size
+            or len(chunks) > MAX_FILE_BYTES
+        ):
+            raise HostToolsBundleError("installed host-tools member changed")
+        return bytes(chunks)
+    except HostToolsBundleError:
+        raise
+    except OSError as exc:
+        raise HostToolsBundleError("installed host-tools member cannot be read") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def verify_installed_generation(
+    generation: Path,
+    *,
+    expected_source_sha: str,
+    expected_toolset_version: str,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+) -> dict[str, object]:
+    """Verify an installed generation against its own closed bundle manifest.
+
+    Installed POSIX modes are compared with the bundle's normalized manifest
+    modes, not with repository checkout modes. No member is executed.
+    """
+
+    if SOURCE_SHA_RE.fullmatch(expected_source_sha) is None:
+        raise HostToolsBundleError("expected host-tools source SHA is invalid")
+    if expected_toolset_version != TOOLSET_VERSION:
+        raise HostToolsBundleError("expected host-tools toolset version is unsupported")
+    if type(expected_uid) is not int or expected_uid < 0 or type(expected_gid) is not int or expected_gid < 0:
+        raise HostToolsBundleError("expected host-tools owner is invalid")
+    try:
+        directory = generation.lstat()
+    except OSError as exc:
+        raise HostToolsBundleError("installed host-tools generation is unavailable") from exc
+    if (
+        not stat.S_ISDIR(directory.st_mode)
+        or stat.S_ISLNK(directory.st_mode)
+        or directory.st_uid != expected_uid
+        or directory.st_gid != expected_gid
+        or directory.st_nlink != 2
+        or stat.S_IMODE(directory.st_mode) != 0o555
+    ):
+        raise HostToolsBundleError("installed host-tools generation metadata is invalid")
+
+    manifest_path = generation / "manifest.json"
+    raw_manifest = _read_installed_member(
+        manifest_path,
+        expected_mode=DATA_MODE,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+    try:
+        manifest = json.loads(raw_manifest.decode("ascii"), object_pairs_hook=_strict_object)
+    except (UnicodeError, json.JSONDecodeError, HostToolsBundleError, RecursionError) as exc:
+        raise HostToolsBundleError("installed host-tools manifest is invalid") from exc
+    layout = _layout_from_manifest(manifest)
+    checked_manifest = _validate_manifest(manifest, expected_source_sha, layout)
+    if checked_manifest["toolset_version"] != expected_toolset_version:
+        raise HostToolsBundleError("installed host-tools toolset version differs")
+
+    records = {str(record["path"]): record for record in checked_manifest["files"]}
+    expected_names = set(layout["files"]) | {"capabilities.txt", "manifest.json"}
+    try:
+        actual_names = {entry.name for entry in generation.iterdir()}
+    except OSError as exc:
+        raise HostToolsBundleError("installed host-tools inventory is unavailable") from exc
+    if actual_names != expected_names or set(records) != set(layout["files"]) | {"capabilities.txt"}:
+        raise HostToolsBundleError("installed host-tools inventory is not closed")
+
+    capabilities = _read_installed_member(
+        generation / "capabilities.txt",
+        expected_mode=DATA_MODE,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+    if capabilities != _capabilities_text(expected_source_sha, layout):
+        raise HostToolsBundleError("installed host-tools capabilities differ")
+
+    for name, record in records.items():
+        expected_mode = int(record["mode"])
+        data = _read_installed_member(
+            generation / name,
+            expected_mode=expected_mode,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+        )
+        if _sha256_bytes(data) != record["sha256"]:
+            raise HostToolsBundleError("installed host-tools member digest differs")
+
+    try:
+        final_directory = generation.lstat()
+        final_names = {entry.name for entry in generation.iterdir()}
+    except OSError as exc:
+        raise HostToolsBundleError("installed host-tools generation changed") from exc
+    if (
+        (final_directory.st_dev, final_directory.st_ino) != (directory.st_dev, directory.st_ino)
+        or final_directory.st_uid != expected_uid
+        or final_directory.st_gid != expected_gid
+        or final_directory.st_nlink != 2
+        or stat.S_IMODE(final_directory.st_mode) != 0o555
+        or final_directory.st_mtime_ns != directory.st_mtime_ns
+        or final_directory.st_ctime_ns != directory.st_ctime_ns
+        or final_names != expected_names
+    ):
+        raise HostToolsBundleError("installed host-tools generation changed")
+
+    return {
+        "source_sha": checked_manifest["source_sha"],
+        "generation": checked_manifest["generation"],
+        "toolset_version": checked_manifest["toolset_version"],
+        "manifest_sha256": _sha256_bytes(raw_manifest),
+        "capabilities_sha256": _sha256_bytes(capabilities),
+        "files_verified": len(records) - 1,
+        "normalized_modes_verified": True,
+    }
+
+
 def write_contract_files(summary: dict[str, object], output_dir: Path) -> None:
     """Write bounded scalar/checksum files for shell-only remote preflight."""
 

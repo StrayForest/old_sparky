@@ -10,25 +10,32 @@ belong in the linked owner documents below.
 
 ## Live and pending state
 
-- Production app source is `4d33d1c3c8495ab4cdd341dd3809e7ca0067ce4a`; installed
-  host-tools generation is `92fd34fd81e85ac71a14b2ea8ecf68d0731849a7`. The
-  normal deployment and strict shared-venv reuse checks passed. Keep runner
-  source, app source and host-tools generation distinct in every receipt.
-- The latest paired SSR diagnostic is incomplete and earns no capacity, SLO
-  or matrix credit. Its exact fixture was closed through the canonical abort
-  and cleanup workflows. The profile phase reported `invalid_profile`; this is
-  not a passing measurement or a server-wide capacity result.
-- The integrated source candidate for profile rejection telemetry, API CPU
-  category conservation and encrypted fixture credential transport is under
-  PR #347. It updates host-tools source **C**
-  `5a8d4c69e208d096af418f67dfba1ef1cf630aa0`; that generation is not installed.
-  Transport review passed; final integrated-source review and exact-head CI are
-  pending. The encrypted transport uses a fixture-only age identity; do not
-  provision its environment secrets until the integrated source review and CI
-  pass. Raw fixture-manifest artifacts contain synthetic session credentials
-  and must remain encrypted. Do not dispatch another load until the integrated
-  source passes exact-head CI, its host-tools generation is deployed, and fresh
-  profile-A readiness passes. Use the
+- Production app source S11 is `d74adf9df950665affa523029801d5ecc49f611c`
+  (`gha-41391692559-1-d74adf9df950`); previous app source S10 is
+  `e7b64e069f5874e3eab983fbcc2c3ef6d26074a9`. Installed host-tools generation
+  C is `5a8d4c69e208d096af418f67dfba1ef1cf630aa0`, toolset v4; generation
+  `92fd34fd81e85ac71a14b2ea8ecf68d0731849a7` remains preserved. Keep runner,
+  app and host-tools source identities distinct in every receipt.
+- Fresh S11 readiness passed: API and web health returned HTTP 200; API, web
+  and worker were active with zero restarts. The profile was API workers 2,
+  database pool 24, admission 24 concurrent / 8 waiters / 250 ms, web one
+  `fetch` worker with compression enabled, worker concurrency 2 and worker
+  database pool 2 from the release default. Locks were clear, diagnostic plans
+  absent, and the validated shared-venv origin was retained. The bounded
+  readiness evidence and collector are in the private S11 checkpoint.
+- Exact-source Security `41390006169/1`, backup `41390168412/1`, AUTO
+  `41391199713/1` and deployment `41391692559/1` succeeded. The maintenance
+  timer is active and enabled; the service is terminal idle with PID 0. The
+  latest full-maintenance preview retained current, previous and the validated
+  shared-venv origin; it was not applied.
+- Diagnostic run `41393226256/1` is terminal prefixture failure. Event
+  validation and serialization passed, then encryption failed because the
+  workflow invoked the age parent directory instead of the extracted binary.
+  Fixture setup, load, CPU pair, finalizer SSH and fixture cleanup were skipped;
+  no fixture manifest or remote plan was created. This run is not a measurement
+  and earns no capacity, SLO or performance credit. Do not dispatch again until
+  the exact-source archive-layout fix passes CI, is deployed through the normal
+  `dev` chain, and fresh profile-A readiness passes. Use the
   [SSR capacity diagnostic runbook](ssr-capacity-diagnostic-runbook.md) for
   dispatch, acceptance, abort and cleanup.
 - Source-bound backup admission requires one successful producer bound to the
@@ -37,9 +44,8 @@ belong in the linked owner documents below.
 
 ## Open QA and cleanup gates
 
-- The SSR composite remains incomplete pending the profile producer and
-  rejection-projection corrections. A workload may not be retried until its
-  exact-run fixture is closed and all report/parser gates pass. The diagnostic
+- The SSR composite has no accepted result. The next run must use the corrected
+  archive-layout path after its normal release and readiness gates pass. It
   remains zero-credit even when complete; see the
   [SSR capacity diagnostic runbook](ssr-capacity-diagnostic-runbook.md).
 

@@ -30,6 +30,22 @@ scrubs the event before checkout or processing; it receives the operator email
 only in its trusted validation step. If ciphertext decryption fails, the job
 fails closed and the canonical manual cleanup route remains available.
 
+The Actions workflow verifies the pinned release archive digest, then extracts
+only its `age/age` member under `$RUNNER_TEMP/fixture-age-tools`. The executable
+is therefore `$RUNNER_TEMP/fixture-age-tools/age/age`; each trusted encrypt or
+decrypt step checks that exact path before using it. Do not flatten the member
+or invoke the parent `age` directory. To verify input encryption, fixture setup,
+manifest encryption, trusted load-client decryption, descriptor validation and
+staged cleanup together with the real pinned archive, run from `platform/`:
+
+```bash
+/usr/bin/python3.12 -m unittest \
+  tests.test_platform_secret_artifact_boundary.FixtureCredentialWorkflowBoundaryTests.test_workflow_age_install_encrypt_consumer_decrypt_uses_real_archive_layout
+```
+
+The test uses a generated synthetic identity and payload. It does not read the
+configured fixture identity or any production input.
+
 Event scrub steps reparse rewritten JSON with duplicate-key rejection, require
 `inputs.control_email` to be absent, and verify that the original and canonical
 email values are absent from every parsed string key and value. Unrelated event

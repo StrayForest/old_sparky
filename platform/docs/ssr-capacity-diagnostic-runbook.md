@@ -30,6 +30,11 @@ exact-head CI route. For a runtime-sensitive source change:
    source-bound parent artifact. A pull-request candidate artifact is never
    production authority. Keep runner source `S`, active app source `A`, and
    host-tools generation `C` distinct in every receipt.
+   Verify host-tool modes against the installed generation's normalized
+   manifest (`0555` executable members, `0444` data), not checkout source
+   modes. Runner-only checks requiring `RUNNER_TEMP` or an SSH handoff stay in
+   their owning workflow job, not the host shell. See the
+   [host-tools provisioning ADR](adr/production-host-tools-provisioning.md).
 4. Let the normal deployment child install the app. Require strict shared-venv
    reuse, the exact `S` release marker, the expected previous-release pointer,
    healthy `deadlock-api`, `deadlock-web`, and `deadlock-worker`, and no pending
@@ -149,6 +154,59 @@ exact-head CI route. For a runtime-sensitive source change:
    `NRestarts` value and compare it after the diagnostic and cleanup; any
    increase invalidates the measurement. Stop if a source, service identity,
    profile value or readiness check differs.
+
+For a complete read-only readiness record, use the collector included in the
+active app release. It is available only after normal deployment installs a
+source containing this helper; do not run it from a candidate checkout or copy
+candidate code to the host. In the authorized root host shell, set source
+values from verified release receipts and the exact host-tools pin, then
+capture private output:
+
+```bash
+set -euo pipefail
+umask 077
+EXPECTED_APP_SHA='<active-app-sha-A>'
+EXPECTED_PREVIOUS_APP_SHA='<previous-app-sha>'
+EXPECTED_RELEASE_MANIFEST_SHA='<active-release-manifest-sha-from-deploy-receipt>'
+EXPECTED_PREVIOUS_RELEASE_MANIFEST_SHA='<previous-release-manifest-sha>'
+EXPECTED_HOST_TOOLS_SHA='<host-tools-sha-C-from-active-pin>'
+EXPECTED_PREVIOUS_HOST_TOOLS_SHA='<preserved-host-tools-sha>'
+EVIDENCE_DIR="$(mktemp -d /root/platform-readiness.XXXXXX)"
+test "$(/usr/bin/stat -c '%a' "$EVIDENCE_DIR")" = 700
+test -f /opt/oldsparky/platform/current/tools/platform_readonly_live_readiness.py
+/usr/bin/python3.12 -I -B \
+  /opt/oldsparky/platform/current/tools/platform_readonly_live_readiness.py \
+  --expected-app-sha "$EXPECTED_APP_SHA" \
+  --expected-previous-app-sha "$EXPECTED_PREVIOUS_APP_SHA" \
+  --expected-release-manifest-sha "$EXPECTED_RELEASE_MANIFEST_SHA" \
+  --expected-previous-release-manifest-sha "$EXPECTED_PREVIOUS_RELEASE_MANIFEST_SHA" \
+  --expected-host-tools-sha "$EXPECTED_HOST_TOOLS_SHA" \
+  --expected-previous-host-tools-sha "$EXPECTED_PREVIOUS_HOST_TOOLS_SHA" \
+  --expected-toolset-version production-host-tools-v4 \
+  > "$EVIDENCE_DIR/readiness.json" 2> "$EVIDENCE_DIR/readiness.stderr"
+test ! -s "$EVIDENCE_DIR/readiness.stderr"
+test "$(/usr/bin/stat -c '%a' "$EVIDENCE_DIR/readiness.json")" = 600
+/usr/bin/python3.12 -I -B -c \
+  'import json,sys; assert json.load(open(sys.argv[1], encoding="utf-8")).get("status") == "ready"' \
+  "$EVIDENCE_DIR/readiness.json"
+```
+
+Require exit 0 and `status=ready`; the JSON must bind the supplied current and
+previous app sources/release-manifest digests and C generation values, verify
+all 15 pinned C members by digest and normalized manifest mode,
+confirm that a directory exists at the expected previous C generation path
+(presence only; it is not a verification of that prior generation's contents),
+validate the current, previous and shared-venv origin identities, and show the expected allowlisted
+service profile, HTTP 200 health, clear locks, no marker/plans/jobs, and the
+enabled maintenance timer with its service terminal and idle. The workflow's
+runner-only `host-capability-preflight` remains authoritative for its own
+`RUNNER_TEMP` and SSH handoff; do not run
+`platform_host_tools_installed_check.py` from the host shell. A terminal-idle
+maintenance service is not proof that maintenance succeeded; use its exact
+receipt for that claim.
+The collector rechecks release pointers, service identities, locks, plans and
+maintenance state immediately before returning `status=ready`; these checks
+form a bounded observation, not an atomic snapshot.
 
 The source-bound backup and release admission rules are in the
 [backup and restore runbook](backup-restore-runbook.md) and
