@@ -137,24 +137,53 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          failed=0
           run_focused_test() {
+            local test_name="$1"
+            shift
             local log_path="$RUNNER_TEMP/codex-native-test-$RANDOM.log"
-            cargo +"$CODEX_RUST_TOOLCHAIN" test --locked "$@" 2>&1 | tee "$log_path"
-            /usr/bin/python3 -I -B - "$log_path" <<'PY'
+            local command_status=0
+            "$@" 2>&1 | tee "$log_path" || command_status=$?
+            local result_status=0
+            /usr/bin/python3 -I -B - "$log_path" <<'PY' || result_status=$?
           from pathlib import Path
           import re
           import sys
           output = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
-          passed = [int(value) for value in re.findall(r"test result: ok\. ([0-9]+) passed;", output)]
-          if not passed or sum(passed) <= 0:
-              raise SystemExit("focused native test filter matched no passing tests")
+          results = re.findall(
+              r"test result: (ok|FAILED)\. ([0-9]+) passed; ([0-9]+) failed;",
+              output,
+          )
+          if not results or not any(int(passed) + int(failed) > 0 for _, passed, failed in results):
+              raise SystemExit("focused native test filter matched no tests")
+          if any(result != "ok" or int(failed) > 0 for result, _, failed in results):
+              raise SystemExit("focused native test output contains failed tests")
           PY
+            if (( command_status != 0 || result_status != 0 )); then
+              printf 'Focused native test failed: %s (command=%s, results=%s)\n' \
+                "$test_name" "$command_status" "$result_status"
+              failed=1
+            else
+              printf 'Focused native test passed: %s\n' "$test_name"
+            fi
             rm -f -- "$log_path"
           }
-          run_focused_test -p codex-thread-store --lib local::delete_thread::tests::archived_only
-          run_focused_test -p codex-app-server --test all thread_delete_archived_only_refuses_active_thread
-          run_focused_test -p codex-cli --bin codex delete_archived_only_requires_force_and_uuid
-          run_focused_test -p codex-app-server-protocol schema_fixtures
+          run_focused_test thread-store \
+            cargo +"$CODEX_RUST_TOOLCHAIN" test --locked -p codex-thread-store --lib \
+            local::delete_thread::tests::archived_only
+          run_focused_test app-server \
+            cargo +"$CODEX_RUST_TOOLCHAIN" test --locked -p codex-app-server --test all \
+            thread_delete_archived_only_refuses_active_thread
+          run_focused_test cli \
+            cargo +"$CODEX_RUST_TOOLCHAIN" test --locked -p codex-cli --bin codex \
+            delete_archived_only_requires_force_and_uuid
+          run_focused_test protocol \
+            cargo +"$CODEX_RUST_TOOLCHAIN" test --locked -p codex-app-server-protocol \
+            schema_fixtures
+          if (( failed != 0 )); then
+            printf 'One or more focused native test filters failed.\n' >&2
+            exit 1
+          fi
 
       - name: Build and bind private companion binary
         id: artifact

@@ -798,7 +798,7 @@ index 222fc83..c6b8505 100644
 +    }
 +
 diff --git a/codex-rs/thread-store/src/local/delete_thread.rs b/codex-rs/thread-store/src/local/delete_thread.rs
-index ab13996..7a30f57 100644
+index ab13996..d2d499a 100644
 --- a/codex-rs/thread-store/src/local/delete_thread.rs
 +++ b/codex-rs/thread-store/src/local/delete_thread.rs
 @@ -23,0 +24 @@ use super::LocalThreadStore;
@@ -1009,7 +1009,7 @@ index ab13996..7a30f57 100644
 +    use codex_protocol::protocol::SessionSource;
 @@ -352,0 +547 @@ mod tests {
 +    use tokio::sync::Barrier;
-@@ -365,0 +561,344 @@ mod tests {
+@@ -365,0 +561,392 @@ mod tests {
 +    async fn archived_thread_fixture(
 +        home: &TempDir,
 +        value: u128,
@@ -1112,7 +1112,9 @@ index ab13996..7a30f57 100644
 +            })
 +            .await
 +            .expect_err("missing metadata must fail closed");
-+        assert!(error.to_string().contains("metadata row is missing"));
++        assert!(error
++            .to_string()
++            .contains("archived-only deletion refused: thread archive flag is not set"));
 +        assert!(orphan_path.exists());
 +
 +        let (store, runtime, thread_id, _, archived_path) =
@@ -1222,7 +1224,7 @@ index ab13996..7a30f57 100644
 +        )
 +        .expect("rollout whose session header has another ID");
 +        let mismatched_path = wrong_path.with_file_name(format!(
-+            "rollout-2025-01-03T12-00-01-{thread_id}.jsonl"
++            "rollout-2025-01-03T12-00-01-{thread_id}_{wrong_id}.jsonl"
 +        ));
 +        std::fs::rename(&wrong_path, &mismatched_path).expect("change filename identity");
 +
@@ -1318,14 +1320,13 @@ index ab13996..7a30f57 100644
 +    }
 +
 +    #[tokio::test]
-+    async fn archived_only_delete_keeps_target_visible_to_external_history_guard() {
++    async fn archived_only_delete_preserves_archived_file_referenced_by_active_history() {
 +        let home = TempDir::new().expect("temp dir");
-+        let (store, _runtime, target_id, _, archived_path) =
++        let (store, runtime, target_id, _, archived_path) =
 +            archived_thread_fixture(&home, 334).await;
 +        let target_size = std::fs::metadata(&archived_path)
 +            .expect("target rollout metadata")
 +            .len();
-+        std::fs::remove_file(&archived_path).expect("simulate missing archived rollout");
 +        let source_path = write_session_file_with_history_mode(
 +            home.path(),
 +            "2025-01-03T12-00-01",
@@ -1352,6 +1353,53 @@ index ab13996..7a30f57 100644
 +        assert!(error.to_string().contains("forked history still references it"));
 +        assert!(archived_path.exists());
 +        assert!(source_path.exists());
++        assert!(runtime
++            .get_thread(target_id)
++            .await
++            .expect("read retained target metadata")
++            .is_some());
++    }
++
++    #[tokio::test]
++    async fn archived_only_delete_preserves_referenced_orphan_row_without_rollout_file() {
++        let home = TempDir::new().expect("temp dir");
++        let (store, runtime, target_id, _, archived_path) =
++            archived_thread_fixture(&home, 341).await;
++        let target_size = std::fs::metadata(&archived_path)
++            .expect("target rollout metadata")
++            .len();
++        std::fs::remove_file(&archived_path).expect("simulate missing archived rollout");
++        let source_path = write_session_file_with_history_mode(
++            home.path(),
++            "2025-01-03T12-00-01",
++            Uuid::from_u128(342),
++            ThreadHistoryMode::Paginated,
++        )
++        .expect("active source session");
++        set_history_base(
++            source_path.as_path(),
++            HistoryPosition {
++                thread_id: target_id,
++                end_ordinal_exclusive: 1,
++                end_byte_offset: target_size,
++            },
++        );
++
++        let error = store
++            .delete_archived_threads(crate::DeleteThreadsParams {
++                thread_ids: vec![target_id],
++            })
++            .await
++            .expect_err("active shared history reference must block orphan-row deletion");
++
++        assert!(error.to_string().contains("forked history still references it"));
++        assert!(!archived_path.exists());
++        assert!(source_path.exists());
++        assert!(runtime
++            .get_thread(target_id)
++            .await
++            .expect("read retained orphan metadata")
++            .is_some());
 +    }
 +
 diff --git a/codex-rs/thread-store/src/local/read_thread.rs b/codex-rs/thread-store/src/local/read_thread.rs

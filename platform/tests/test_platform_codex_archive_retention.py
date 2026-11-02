@@ -10,6 +10,7 @@ import sqlite3
 import stat
 import subprocess
 import tempfile
+import textwrap
 import unittest
 from unittest import mock
 import zipfile
@@ -43,6 +44,68 @@ class CodexArchiveRetentionTests(unittest.TestCase):
             '= "${{ steps.lock.outputs.patch_sha256 }}"',
             workflow,
         )
+
+    def test_native_test_filters_aggregate_failures_and_reject_empty_matches(self) -> None:
+        repository_root = Path(__file__).resolve().parents[2]
+        workflow = (
+            repository_root
+            / ".github/workflows/platform-codex-archive-retention-build.yml"
+        ).read_text(encoding="utf-8")
+        step = workflow.split(
+            "      - name: Run focused archived-only native lifecycle tests\n", 1
+        )[1].split("      - name: Build and bind private companion binary\n", 1)[0]
+        shell = textwrap.dedent(step.split("        run: |\n", 1)[1])
+        lines = shell.splitlines()
+        start = lines.index("run_focused_test() {")
+        end = lines.index("}", start) + 1
+        helper = "\n".join(lines[start:end])
+
+        with tempfile.TemporaryDirectory(prefix="codex-native-test-aggregate-") as temp:
+            root = Path(temp)
+            runner_temp = root / "runner-temp"
+            runner_temp.mkdir()
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            cargo = fake_bin / "cargo"
+            cargo.write_text(
+                "#!/bin/sh\n"
+                "case \"$1\" in\n"
+                "  fail) printf '%s\\n' \\\n"
+                "    'test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out'; \\\n"
+                "    exit 101 ;;\n"
+                "  pass) printf '%s\\n' \\\n"
+                "    'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'; \\\n"
+                "    exit 0 ;;\n"
+                "  empty) printf '%s\\n' \\\n"
+                "    'test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'; \\\n"
+                "    exit 0 ;;\n"
+                "  *) exit 98 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            cargo.chmod(0o700)
+            script = (
+                "set -euo pipefail\n"
+                "failed=0\n"
+                f"RUNNER_TEMP={str(runner_temp)!r}\n"
+                f"{helper}\n"
+                "run_focused_test first-fails cargo fail\n"
+                "run_focused_test second-passes cargo pass\n"
+                "run_focused_test third-empty cargo empty\n"
+                "test \"$failed\" -eq 1\n"
+            )
+            result = subprocess.run(
+                ["bash", "-c", script],
+                check=False,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Focused native test failed: first-fails", result.stdout)
+        self.assertIn("Focused native test passed: second-passes", result.stdout)
+        self.assertIn("Focused native test failed: third-empty", result.stdout)
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="codex-archive-retention-")
