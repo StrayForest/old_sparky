@@ -22,6 +22,8 @@ inside the private cluster. SQL restore and validation use a passwordless
 Production PostgreSQL is never used as the restore target. The disposable cluster is stopped and its unit and mount are confirmed gone before a verified
 backup pair is published. Every backup-creating path retains exactly one newest restore-verified pair after the new archive passes checksum, isolated restore and Alembic verification. Backup-only rotates backup pairs while skipping release, build, browser, screenshot and live-QA retention. Verify-existing mode restores the newest current pair but never prunes. The fixed manifest is now an audit input; its former named-pair exemptions have been retired. See [backup retention](backup-retention-protection.md) and verify the exact installed unit before a production operation.
 
+The `Platform production backup` workflow requires its pinned evidence formatter to preserve producer mode (`backup-only` for create, `verify-existing-backup-only` for verify-existing); the source-bound validator checks mode, health and backup identity before publishing. On summary failure, inspect that exact attempt and stop; do not repeat create. The failure marker contains a fixed reason code, never report content.
+
 The lock-aware storage-maintenance path calls backup creation and freshness
 verification in-process, avoiding a second Python interpreter during the
 memory-intensive restore drill. The standalone helper CLI remains available

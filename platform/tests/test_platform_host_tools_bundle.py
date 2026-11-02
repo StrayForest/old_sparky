@@ -3040,6 +3040,20 @@ raise SystemExit(module.main(["host-capabilities"]))
                 artifact_digest=ARTIFACT_DIGEST,
                 archive_path=archive,
             )
+            null_attempt_payload = json.loads(metadata.read_text(encoding="utf-8"))
+            null_attempt_payload["workflow_run"]["run_attempt"] = None
+            metadata.write_text(json.dumps(null_attempt_payload), encoding="utf-8")
+            bundle.verify_artifact_metadata(
+                metadata,
+                artifact_id="123",
+                artifact_name="platform-host-tools-bundle-99-1",
+                run_id="99",
+                run_attempt="1",
+                source_sha=SOURCE_SHA,
+                expected_branch="dev",
+                artifact_digest=ARTIFACT_DIGEST,
+                archive_path=archive,
+            )
             for invalid_attempt in (False, "1", 1.0, 2):
                 invalid_payload = json.loads(metadata.read_text(encoding="utf-8"))
                 invalid_payload["workflow_run"]["run_attempt"] = invalid_attempt
@@ -4856,6 +4870,32 @@ raise SystemExit(module.main(["host-capabilities"]))
                 ),
                 "123",
             )
+            listing_payload = json.loads(listing.read_text(encoding="utf-8"))
+            listing_payload["artifacts"][0]["workflow_run"]["run_attempt"] = None
+            listing.write_text(json.dumps(listing_payload), encoding="utf-8")
+            self.assertEqual(
+                candidate.select_artifact_id(
+                    listing,
+                    name="platform-ci-route-9001-2",
+                    run_id="9001",
+                    run_attempt="2",
+                ),
+                "123",
+            )
+            for invalid_attempt in (False, "2", 2.0, 3):
+                listing_payload["artifacts"][0]["workflow_run"]["run_attempt"] = invalid_attempt
+                listing.write_text(json.dumps(listing_payload), encoding="utf-8")
+                with self.subTest(list_attempt=repr(invalid_attempt)), self.assertRaises(
+                    candidate.CandidateError
+                ):
+                    candidate.select_artifact_id(
+                        listing,
+                        name="platform-ci-route-9001-2",
+                        run_id="9001",
+                        run_attempt="2",
+                    )
+            listing_payload["artifacts"][0]["workflow_run"]["run_attempt"] = 2
+            listing.write_text(json.dumps(listing_payload), encoding="utf-8")
             result = candidate.verify_route_artifact(
                 context_path,
                 metadata,
@@ -4938,6 +4978,21 @@ raise SystemExit(module.main(["host-capabilities"]))
             self.assertEqual(
                 candidate._verify_artifact_metadata(
                     payload,
+                    archive,
+                    expected_id="123",
+                    expected_name="candidate",
+                    expected_run_id="456",
+                    expected_run_attempt="3",
+                    expected_head_sha="a" * 40,
+                    expected_head_ref="dev",
+                ),
+                f"sha256:{digest}",
+            )
+            null_attempt_payload = json.loads(json.dumps(payload))
+            null_attempt_payload["workflow_run"]["run_attempt"] = None
+            self.assertEqual(
+                candidate._verify_artifact_metadata(
+                    null_attempt_payload,
                     archive,
                     expected_id="123",
                     expected_name="candidate",

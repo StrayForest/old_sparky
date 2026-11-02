@@ -1016,10 +1016,11 @@ def _artifact_row(
         if item.get("name") != name or type(workflow_id) is not int or workflow_id != int(run_id):
             continue
         if isinstance(workflow_run, Mapping):
-            if "run_attempt" in workflow_run and (
-                type(workflow_run.get("run_attempt")) is not int
+            artifact_attempt = workflow_run.get("run_attempt")
+            if artifact_attempt is not None and (
+                type(artifact_attempt) is not int
                 or run_attempt is None
-                or workflow_run.get("run_attempt") != int(run_attempt)
+                or artifact_attempt != int(run_attempt)
             ):
                 continue
             if expected_head_sha is not None and "head_sha" in workflow_run:
@@ -1061,7 +1062,11 @@ def select_artifact_id(
     if "workflow_run" not in row or not isinstance(row.get("workflow_run"), Mapping):
         raise CandidateError("artifact workflow identity is missing")
     workflow_run = row["workflow_run"]
-    if "run_attempt" in workflow_run and workflow_run.get("run_attempt") != int(run_attempt):
+    artifact_attempt = workflow_run.get("run_attempt")
+    if artifact_attempt is not None and (
+        type(artifact_attempt) is not int
+        or artifact_attempt != int(run_attempt)
+    ):
         raise CandidateError("artifact workflow attempt identity is invalid")
     return artifact_id
 
@@ -1107,9 +1112,10 @@ def _verify_artifact_metadata(
         raise CandidateError("artifact workflow path identity is invalid")
     if "event" in workflow_run and workflow_run.get("event") != SECURITY_EVENT:
         raise CandidateError("artifact workflow event identity is invalid")
-    if "run_attempt" in workflow_run and (
-        type(workflow_run.get("run_attempt")) is not int
-        or workflow_run.get("run_attempt") != int(expected_run_attempt)
+    artifact_attempt = workflow_run.get("run_attempt")
+    if artifact_attempt is not None and (
+        type(artifact_attempt) is not int
+        or artifact_attempt != int(expected_run_attempt)
     ):
         raise CandidateError("artifact workflow attempt identity is invalid")
     return digest

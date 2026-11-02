@@ -331,9 +331,7 @@ Each consumer applies its policy to the authenticated, digest-bound manifest:
 | Push auto-deploy | Docs-only uses authenticated baseline reconciliation with no app writes; out-of-scope completes no-deploy/no-backup | Preserve route policy: candidate uses source-bound baseline reconciliation and backup but grants no app-release authority; recovery uses baseline reconciliation, storage skips deployment/backup, ordinary eligible full push may deploy |
 | Recovery bootstrap producer/publisher | Docs, out-of-scope, storage and candidate-packaging each produce their distinct authenticated skip receipt; no recovery bundle | Ordinary eligible full and recovery-bootstrap routes retain bundle validation; candidate-packaging is CI-only and grants no recovery authority |
 
-Consumers bind route family, source, run/attempt and digest; malformed,
-failed or mismatched evidence fails closed without retry, `continue-on-error`
-or reduced-pass fallback. Candidate handling belongs to
+Consumers bind route family, source, run/attempt and digest; malformed, failed or mismatched evidence fails closed without retry, `continue-on-error` or reduced-pass fallback. A missing/null nested artifact `workflow_run.run_attempt` is omitted only after exact name, run ID and head SHA binding; a non-null value must match, while the authoritative source attempt is validated independently. `test_platform_ci_classifier` exercises the shared validator and AUTO selector. Candidate handling belongs to
 `test_platform_host_tools_bundle`; classifier and recovery skip routes to
 `test_platform_ci_classifier`; auto-deploy/provenance to
 `test_platform_release_build_contract` and `test_platform_workflow_provenance`;

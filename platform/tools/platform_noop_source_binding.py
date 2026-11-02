@@ -433,9 +433,9 @@ def validate_noop_receipt_artifact(
         or workflow_run.get("head_sha") != expected_runner_sha
         or workflow_run.get("head_branch") != "dev"
         or (
-            "run_attempt" in workflow_run
+            workflow_run.get("run_attempt") is not None
             and (
-                type(workflow_run["run_attempt"]) is not int
+                type(workflow_run.get("run_attempt")) is not int
                 or str(workflow_run["run_attempt"]) != expected_deploy_attempt
             )
         )

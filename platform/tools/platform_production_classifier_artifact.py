@@ -331,7 +331,7 @@ def _validate_artifact_row(row: object, *, target_sha: str) -> None:
         raise _fail("provenance")
     if workflow_run.get("head_branch") != "dev":
         raise _fail("provenance")
-    if "run_attempt" in workflow_run and not _positive_int(workflow_run["run_attempt"]):
+    if workflow_run.get("run_attempt") is not None and not _positive_int(workflow_run["run_attempt"]):
         raise _fail("provenance")
     if "workflow_id" in workflow_run and not _positive_int(workflow_run["workflow_id"]):
         raise _fail("provenance")
@@ -442,7 +442,7 @@ def validate_metadata(
     workflow_run = _mapping(selected.get("workflow_run"), "provenance")
     if workflow_run.get("id") != int(run_id) or workflow_run.get("head_sha") != target_sha:
         raise _fail("provenance")
-    if "run_attempt" in workflow_run and workflow_run.get("run_attempt") != int(run_attempt):
+    if workflow_run.get("run_attempt") is not None and workflow_run.get("run_attempt") != int(run_attempt):
         raise _fail("provenance")
     return int(selected["id"])
 

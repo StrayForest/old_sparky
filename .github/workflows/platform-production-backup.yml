@@ -428,7 +428,9 @@ jobs:
               and isinstance(row.get("workflow_run"), dict)
               and row["workflow_run"].get("id") == int(run_id)
               and row["workflow_run"].get("head_sha") == source_sha
-              and ("run_attempt" not in row["workflow_run"] or row["workflow_run"].get("run_attempt") == attempt)
+              and (row["workflow_run"].get("run_attempt") is None
+                   or (type(row["workflow_run"].get("run_attempt")) is int
+                       and row["workflow_run"].get("run_attempt") == attempt))
               and re.fullmatch(r"sha256:[0-9a-f]{64}", str(row.get("digest", ""))) is not None
           ]
           if len(matches) != 1:
@@ -1326,6 +1328,7 @@ jobs:
               raise SystemExit(1)
           summary_errors = {
               "none", "summary_tool_failed", "summary_validation_failed",
+              "raw_mode_mismatch", "normalized_mode_mismatch",
               "normalizer_summary_invalid", "normalizer_mode_mismatch",
               "normalizer_projection_invalid", "unclassified",
           }
@@ -4076,7 +4079,7 @@ jobs:
             exit 1
           }
           public_summary_error=summary_validation_failed
-          /usr/bin/python3 -I - "$backup_report_file" "$operation" "$evict_build_node_cache" "$compact_fallback_runtime_cache" "$resume_compaction" "$run_id" "$run_attempt" "$source_sha" "$bundle_sha" "$resume_compaction_run_id" "$resume_compaction_run_attempt" "$resume_compaction_bundle_sha256" "$public_report" <<'PY'
+          if summary_validation_output="$(/usr/bin/python3 -I - "$backup_report_file" "$operation" "$evict_build_node_cache" "$compact_fallback_runtime_cache" "$resume_compaction" "$run_id" "$run_attempt" "$source_sha" "$bundle_sha" "$resume_compaction_run_id" "$resume_compaction_run_attempt" "$resume_compaction_bundle_sha256" "$public_report" 2>&1 <<'PY'
           import json
           from pathlib import Path
           import re
@@ -4109,14 +4112,14 @@ jobs:
               raise SystemExit("unexpected fallback cache recovery input")
           expected_mode = "backup-only" if operation == "create" else "verify-existing-backup-only"
           if operation not in {"create", "verify-existing"} or report.get("mode") != expected_mode or report.get("ok") is not True:
-              raise SystemExit("lock-aware backup report mode or health is invalid")
+              raise SystemExit("BACKUP_SUMMARY_VALIDATION_FAILURE reason=raw_mode_mismatch")
           if (
               not isinstance(public_report, dict)
               or public_report.get("mode") != expected_mode
               or public_report.get("ok") is not True
               or not isinstance(public_report.get("backup"), dict)
           ):
-              raise SystemExit("normalized backup summary mode or health is invalid")
+              raise SystemExit("BACKUP_SUMMARY_VALIDATION_FAILURE reason=normalized_mode_mismatch")
           public_backup = public_report["backup"]
           backup = report.get("backup") or {}
           if (
@@ -4267,6 +4270,16 @@ jobs:
               ):
                   raise SystemExit(f"backup-only changed {category}")
           PY
+          )"; then
+            :
+          else
+            public_summary_error=summary_validation_failed
+            if [[ "$summary_validation_output" =~ ^BACKUP_SUMMARY_VALIDATION_FAILURE\ reason=(raw_mode_mismatch|normalized_mode_mismatch)$ ]]; then
+              public_summary_error="${BASH_REMATCH[1]}"
+            fi
+            echo "Production backup summary validation failed" >&2
+            exit 1
+          fi
           public_summary_error=none
           failure_stage=public_summary
           public_summary_error=unclassified
@@ -4296,10 +4309,10 @@ jobs:
               public = json.loads(sys.argv[1])
           except (TypeError, ValueError):
               fail("normalizer_summary_invalid")
-          if not isinstance(public, dict) or public.get("mode") != "unknown":
+          expected_mode = "backup-only" if sys.argv[2] == "create" else "verify-existing-backup-only"
+          if not isinstance(public, dict) or public.get("mode") != expected_mode:
               fail("normalizer_mode_mismatch")
           try:
-              public["mode"] = "backup-only" if sys.argv[2] == "create" else "verify-existing-backup-only"
               if sys.argv[4] == "true":
                   report = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
                   cache = report["backup"]["build_node_cache"]

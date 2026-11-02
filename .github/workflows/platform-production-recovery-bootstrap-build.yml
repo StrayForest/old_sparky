@@ -124,7 +124,9 @@ jobs:
           digest = route[0].get("digest")
           if (not isinstance(workflow_run, dict) or workflow_run.get("id") != int(env["SECURITY_RUN_ID"])
               or workflow_run.get("head_sha") != env["SOURCE_SHA"]
-              or ("run_attempt" in workflow_run and workflow_run.get("run_attempt") != int(env["SECURITY_RUN_ATTEMPT"]))
+              or (workflow_run.get("run_attempt") is not None
+                  and (type(workflow_run.get("run_attempt")) is not int
+                       or workflow_run.get("run_attempt") != int(env["SECURITY_RUN_ATTEMPT"])))
               or not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None):
               raise SystemExit("security route artifact provenance is not exact")
           provenance = {

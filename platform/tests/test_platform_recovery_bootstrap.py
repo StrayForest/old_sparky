@@ -4145,6 +4145,14 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             self.assertEqual(provenance_value["artifact_sha256"], route_digest)
             self.assertFalse(provenance_value["deployable"])
 
+            # The artifact-list API may omit its nested attempt even though
+            # the exact Security run attempt was validated above.
+            null_route_attempt = json.loads(json.dumps(valid))
+            null_route_attempt["artifacts.json"]["artifacts"][0]["workflow_run"][
+                "run_attempt"
+            ] = None
+            self.assertEqual(validate(null_route_attempt)["route_artifact_id"], 22)
+
             # GitHub's run payload may contain non-ASCII descriptive metadata;
             # it must not prevent validation of the exact ASCII provenance
             # fields.  Invalid UTF-8 remains fail-closed with the input label.
@@ -4240,6 +4248,10 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 (
                     "run attempt",
                     lambda value: value["artifacts.json"]["artifacts"][0]["workflow_run"].__setitem__("run_attempt", 4),
+                ),
+                (
+                    "boolean run attempt",
+                    lambda value: value["artifacts.json"]["artifacts"][0]["workflow_run"].__setitem__("run_attempt", True),
                 ),
                 (
                     "name",
@@ -4785,6 +4797,20 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             self.assertEqual(selected["publisher_bundle_artifact_id"], 404)
             self.assertEqual(selected["publisher_bundle_artifact_sha256"], "e" * 64)
 
+            null_attempt_row = json.loads(json.dumps(row))
+            null_attempt_row["workflow_run"]["run_attempt"] = None
+            write([null_attempt_row])
+            self.assertEqual(
+                recovery.validate_publisher_artifact_metadata(
+                    metadata,
+                    expected_name=name,
+                    expected_run_id="303",
+                    expected_run_attempt="4",
+                    expected_workflow_sha="c" * 40,
+                )["publisher_bundle_artifact_id"],
+                404,
+            )
+
             for field, value in (
                 ("id", 0),
                 ("name", name.replace("-303-4.zip", "-303-5.zip")),
@@ -4882,6 +4908,20 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 expected_workflow_sha="c" * 40,
             )
             self.assertEqual(selected["publisher_bundle_artifact_id"], 404)
+
+            null_attempt_row = json.loads(json.dumps(exact_row))
+            null_attempt_row["workflow_run"]["run_attempt"] = None
+            write([null_attempt_row])
+            self.assertEqual(
+                recovery.validate_publisher_artifact_metadata(
+                    metadata,
+                    expected_name=exact_name,
+                    expected_run_id="1",
+                    expected_run_attempt="1",
+                    expected_workflow_sha="c" * 40,
+                )["publisher_bundle_artifact_id"],
+                404,
+            )
 
             for field, invalid_value in (
                 ("id", True),
@@ -5383,6 +5423,37 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             )
             self.assertEqual(selected["producer_job_id"], producer_id + 1)
             self.assertEqual(selected["bundle_artifact_id"], producer_id + 2)
+            null_attempt = json.loads(json.dumps(value))
+            null_attempt["producer-artifacts.json"]["artifacts"][0]["workflow_run"][
+                "run_attempt"
+            ] = None
+            write(null_attempt)
+            self.assertEqual(
+                recovery.select_publisher_bundle_metadata(
+                    metadata,
+                    repository=repository,
+                    producer_run_id=str(producer_id),
+                    producer_run_attempt=str(producer_attempt),
+                    producer_workflow="Platform production recovery bootstrap build",
+                    producer_workflow_path=".github/workflows/platform-production-recovery-bootstrap-build.yml",
+                )["bundle_artifact_id"],
+                producer_id + 2,
+            )
+            malformed_attempt = json.loads(json.dumps(value))
+            malformed_attempt["producer-artifacts.json"]["artifacts"][0]["workflow_run"][
+                "run_attempt"
+            ] = True
+            write(malformed_attempt)
+            with self.assertRaises(recovery.RecoveryBootstrapError):
+                recovery.select_publisher_bundle_metadata(
+                    metadata,
+                    repository=repository,
+                    producer_run_id=str(producer_id),
+                    producer_run_attempt=str(producer_attempt),
+                    producer_workflow="Platform production recovery bootstrap build",
+                    producer_workflow_path=".github/workflows/platform-production-recovery-bootstrap-build.yml",
+                )
+            write(value)
             over_100 = json.loads(json.dumps(value))
             producer_jobs = over_100["producer-jobs.json"]["jobs"]
             producer_jobs.extend(
