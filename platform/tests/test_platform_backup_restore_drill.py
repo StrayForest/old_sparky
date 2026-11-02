@@ -7385,7 +7385,6 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             ).decode("ascii"),
         )
 
-        public_args = argparse.Namespace(**{**vars(cli_args), "private_scratch_diagnostics": False})
         public_report = backup_drill.failure_report_for_exception(
             private_failure, private_scratch_diagnostics=False
         )
@@ -12293,7 +12292,7 @@ raise SystemExit(status)
             ):
                 with self.assertRaisesRegex(
                     RuntimeError, "Pre-existing backup inventory changed before publication"
-                ) as raised:
+                ):
                     backup_drill.create_backup(args)
 
             self.assertEqual(inventory_calls, 2)

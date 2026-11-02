@@ -5099,7 +5099,6 @@ def valid_protected_retention_proof(
     candidates = selection.get("candidate_order")
     selected = selection.get("selected_order")
     retained_after = selection.get("retained_after")
-    effective_keep = value["effective_verified_keep"]
     if (
         type(selection.get("available_count")) is not int
         or not isinstance(candidates, list)

@@ -462,7 +462,7 @@ def verify(args: argparse.Namespace) -> None:
         max_archive_bytes=MAX_ARTIFACT_BYTES,
         max_total_bytes=MAX_ARTIFACT_BYTES + 64 * 1024,
     )
-    build_manifest = _validate_build_artifact(
+    _validate_build_artifact(
         build_members,
         source_root=source_root,
         lock=lock,
