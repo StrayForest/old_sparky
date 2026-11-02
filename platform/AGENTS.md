@@ -72,7 +72,11 @@ Only age-encrypted bytes may cross Actions artifacts; the public descriptor
 must remain closed and credential-free. Decryption identities are fixture-only
 environment secrets, never SSH/Cloudflare credentials. Do not upload, log, or
 manually download/decrypt the raw input or manifest; inspect sanitized reports
-and fingerprints only. Mask and remove `control_email` from each runner event before candidate
-checkout or cleanup processing. Serialize and encrypt it on a separate runner
-before any candidate code executes; mode-0600 files do not isolate same-user
-processes.
+and fingerprints only. Scrub `control_email` in trusted event-processing
+steps before candidate checkout or cleanup processing. The raw
+`GITHUB_EVENT_PATH` is runner-owned: validate and seal the already-open file
+descriptor before reading it, accept the runner's safe `0600` or `0644` input
+modes, and pass later cleanup validation through its stable private handoff
+rather than relying on cross-step event-file mutation. Serialize and encrypt
+the operator input on a separate runner before any candidate code executes;
+mode-0600 files do not isolate same-user processes.
