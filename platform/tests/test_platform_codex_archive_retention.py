@@ -1035,6 +1035,43 @@ class CodexArchiveRetentionTests(unittest.TestCase):
                 set(json.loads(rendered)),
                 {"schema_version", "run", "pull_request"},
             )
+            null_repositories = json.loads(json.dumps(run_payload))
+            null_repositories["pull_requests"][0]["head_repository_full_name"] = None
+            null_repositories["pull_requests"][0]["base_repository_full_name"] = None
+            responses = iter((null_repositories, pr_payload))
+            null_output = root / "association-null-nested-repos.json"
+            with mock.patch.object(capture_pr_association.subprocess, "run", side_effect=gh_api):
+                capture_pr_association.capture("23456", "2", "123", null_output)
+            null_capture = json.loads(null_output.read_text(encoding="ascii"))
+            self.assertEqual(
+                null_capture["run"]["pull_request_head_repository"],
+                verify_artifact.REPOSITORY,
+            )
+            self.assertEqual(
+                null_capture["run"]["pull_request_base_repository"],
+                verify_artifact.REPOSITORY,
+            )
+            wrong_repository = json.loads(json.dumps(null_repositories))
+            wrong_repository["repository_full_name"] = "fork/repo"
+            with self.assertRaises(capture_pr_association.CaptureError):
+                capture_pr_association._capture(
+                    wrong_repository,
+                    pr_payload,
+                    run_id="23456",
+                    attempt="2",
+                    pr_number="123",
+                )
+            wrong_nested = json.loads(json.dumps(run_payload))
+            wrong_nested["pull_requests"][0]["head_repository_full_name"] = "fork/repo"
+            with self.assertRaises(capture_pr_association.CaptureError):
+                capture_pr_association._capture(
+                    wrong_nested,
+                    pr_payload,
+                    run_id="23456",
+                    attempt="2",
+                    pr_number="123",
+                )
+            responses = iter((run_payload, pr_payload))
             with mock.patch.object(capture_pr_association.subprocess, "run", side_effect=gh_api):
                 with self.assertRaises(FileExistsError):
                     capture_pr_association.capture("23456", "2", "123", output)

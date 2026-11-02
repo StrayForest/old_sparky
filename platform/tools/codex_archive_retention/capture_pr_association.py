@@ -63,6 +63,12 @@ def _capture(run: dict[str, object], pr: dict[str, object], *, run_id: str, atte
     if not isinstance(pull_requests, list) or len(pull_requests) != 1 or not isinstance(pull_requests[0], dict):
         raise CaptureError("workflow attempt does not have one open-PR association")
     association = pull_requests[0]
+    association_head_repository = association.get("head_repository_full_name")
+    association_base_repository = association.get("base_repository_full_name")
+    if association_head_repository is None:
+        association_head_repository = run.get("head_repository_full_name")
+    if association_base_repository is None:
+        association_base_repository = run.get("repository_full_name")
     if any(
         (
             str(run.get("id")) != run_id,
@@ -73,9 +79,9 @@ def _capture(run: dict[str, object], pr: dict[str, object], *, run_id: str, atte
             not isinstance(run.get("head_sha"), str) or HEX40.fullmatch(run["head_sha"]) is None,
             str(association.get("number")) != pr_number,
             association.get("head_sha") != run.get("head_sha"),
-            association.get("head_repository_full_name") != REPOSITORY,
+            association_head_repository != REPOSITORY,
             association.get("base_ref") != "dev",
-            association.get("base_repository_full_name") != REPOSITORY,
+            association_base_repository != REPOSITORY,
             not isinstance(association.get("base_sha"), str)
             or HEX40.fullmatch(association["base_sha"]) is None,
             pr.get("number") != int(pr_number),
@@ -104,10 +110,10 @@ def _capture(run: dict[str, object], pr: dict[str, object], *, run_id: str, atte
             "head_sha": run["head_sha"],
             "pull_request_number": int(pr_number),
             "pull_request_head_sha": association["head_sha"],
-            "pull_request_head_repository": association["head_repository_full_name"],
+            "pull_request_head_repository": association_head_repository,
             "pull_request_base_ref": association["base_ref"],
             "pull_request_base_sha": association["base_sha"],
-            "pull_request_base_repository": association["base_repository_full_name"],
+            "pull_request_base_repository": association_base_repository,
         },
         "pull_request": {
             "number": int(pr_number),
