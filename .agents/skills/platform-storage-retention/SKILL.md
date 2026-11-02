@@ -60,10 +60,18 @@ calling the task complete.
    ```
 
    Record the `current`/`previous` roles and every explicit
-   `--protected-release` value in the validated installed `ExecStart`; confirm
-   every explicit pin appears in `production_releases.retained` and is absent
-   from `production_releases.deleted`. The `protected` field contains the
-   dynamic `current`/`previous` pointers.
+   `--protected-release` value in the validated installed `ExecStart`. Also
+   identify the shared-venv origin from the active release's
+   `.rollback/venv-origin.json`: accept it only when the receipt is a root-owned
+   regular mode-`0600` file, its release slug/source/release-JSON digest match
+   the active release, and its `venv_dev`/`venv_ino` match the live shared
+   venv. Confirm the named origin release has the receipt's source and
+   `RELEASE.json` digest. If any field is missing or differs, stop and retain
+   all release candidates until the origin is resolved. Confirm every
+   explicit maintenance pin and the validated origin appears in
+   `production_releases.retained` and is absent from
+   `production_releases.deleted`. The `protected` field contains the dynamic
+   `current`/`previous` pointers.
 
    If an older active-release validator rejects the required `MainPID`
    property, fail closed and retry after a reviewed release installs the
@@ -125,8 +133,8 @@ calling the task complete.
    in both preview and apply; never use a bare command that omits those pins:
 
    ```bash
-   # Include every explicit pin from the validated installed ExecStart.
-   protected_releases=("<exact-installed-pin-1>" "<exact-installed-pin-2>" "<exact-installed-pin-3>")
+   # Include the validated shared-venv origin and every installed ExecStart pin once.
+   protected_releases=("<validated-venv-origin-slug>" "<exact-installed-pin-1>" "<exact-installed-pin-2>" "<exact-installed-pin-3>")
    # Include the complete candidate list from this exact dry-run.
    expected_candidates=("<exact-preview-candidate-1>" "<exact-preview-candidate-2>" "<exact-preview-candidate-3>")
    retention_args=(--app-dir /opt/oldsparky/platform --keep 5 --min-age-days 0)
@@ -145,12 +153,17 @@ calling the task complete.
    ```
 
    The first invocation is read-only. Compare its full candidate set with the
-   validated maintenance preview; record the named pins and `current`/
-   `previous` roles, and ensure the candidate set excludes every pin. Replace
-   the sample arrays with the exact values observed; do not guess IDs or counts.
+   validated maintenance preview; record the validated shared-venv origin,
+   named maintenance pins and `current`/`previous` roles, and ensure the
+   candidate set excludes all of them. Replace the sample arrays with the
+   exact values observed; do not guess IDs or counts. Recheck the exact
+   candidate identities, release inodes, pointers, locks and pending
+   transactions immediately before apply. If the candidate set or any
+   protected identity changed, stop and produce a fresh preview.
    `--expected-candidate` must list the complete remaining deletion set. A
    protected release does not bypass the release lock, pointer checks, or
-   candidate revalidation.
+   candidate revalidation. Keep `protected_releases` unique; the CLI rejects
+   duplicate values.
 
    Signed task-retention wrappers may add `--json-receipt` only with `--apply`
    and the complete `--expected-candidate` set. It emits a fixed success count

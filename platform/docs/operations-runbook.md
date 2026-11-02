@@ -40,7 +40,7 @@ Retention policies keep:
 
 | Data | Policy |
 | --- | --- |
-| production releases | newest 5; protect `current`, `previous`, the three canonical production maintenance pins, and every explicit operator `--protected-release` |
+| production releases | newest 5; protect `current`, `previous`, the shared-venv origin recorded by the active release, the three canonical production maintenance pins, and every explicit operator `--protected-release` |
 | local release artifacts | newest 5 matching release groups |
 | verified DB backups | generic callers retain their existing default; backup-only preserves all complete pairs; the canonical unit in this source tree opts into fixed-manifest rotation, protecting named pairs plus the newest `max(keep, 15)` verified pairs ([policy](backup-retention-protection.md)) |
 | Playwright results on the production/pre-production host | 7 days |
@@ -109,8 +109,19 @@ systemctl show deadlock-maintenance.service --no-pager \
     /etc/systemd/system/deadlock-maintenance.service
 ```
 
-This validated preview lists pointers in `protected`, canonical and operator pins in `retained`, and the complete removal set in `deleted`. On the canonical production root, both full-maintenance preview/apply and the standalone release-retention command merge the required pins with any explicit operator pins and fail closed if a required identity is absent. Noncanonical test roots retain only their explicitly supplied pins. During rollout, an older active-release validator may reject the required `MainPID=0` property; maintenance and preview fail closed, while storage diagnostics retain earlier bounded evidence and report the retention stage as failed. Keep `MainPID` and retry the preview after a reviewed release installs the updated validator; do not edit the immutable active release. For emergency release-only staging,
-follow the [storage-retention skill](../../.agents/skills/platform-storage-retention/SKILL.md) and pass every installed pin to both direct commands.
+This validated preview lists pointers in `protected`, canonical and operator pins in `retained`, and the complete removal set in `deleted`. On the canonical production root, both full-maintenance preview/apply and the standalone release-retention command merge the required pins with any explicit operator pins and fail closed if a required identity is absent. Noncanonical test roots retain only their explicitly supplied pins. During rollout, an older active-release validator may reject the required `MainPID=0` property; maintenance and preview fail closed, while storage diagnostics retain earlier bounded evidence and report the retention stage as failed. Keep `MainPID` and retry the preview after a reviewed release installs the updated validator; do not edit the immutable active release.
+
+For emergency release-only staging, preserve the shared-venv origin, all
+installed maintenance pins, and dynamic `current`/`previous` pointers. Read the
+origin from the active release's `.rollback/venv-origin.json` only after its
+current-release identity/digest and live venv device/inode match; confirm the
+origin release's source SHA and `RELEASE.json` digest too. If any check fails,
+stop; never infer origin from age or generic candidates. Follow the
+[storage-retention skill](../../.agents/skills/platform-storage-retention/SKILL.md): pass the validated origin and every installed pin using
+`--protected-release`, then the full reviewed removal set using
+`--expected-candidate`. Immediately before apply, recheck candidate inodes,
+pointers, release/retained-load locks, and pending transactions. Never delete
+the origin, a pin, `current`, or `previous`, even if a generic preview lists it.
 
 Preview live-QA runtime cache retention (also machine-locked and idle-gated):
 

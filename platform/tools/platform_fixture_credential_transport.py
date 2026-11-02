@@ -13,12 +13,12 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
+from typing import NoReturn
 import urllib.request
 
 
