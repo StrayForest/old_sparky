@@ -1085,7 +1085,6 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         for step_name in (
             "Stage the fixture-only finalizer identity",
             "Revalidate finalizer handoffs",
-            "Configure finalizer SSH",
             "Exact cleanup of external fixture",
         ):
             step = next(step for step in finalizer["steps"] if step.get("name") == step_name)
@@ -1095,6 +1094,15 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                     self.assertIn(fragment, condition)
             self.assertIn("inputs.cpu_diagnostic_only == true", condition)
             self.assertIn("inputs.ssr_capacity_diagnostic_only == true", condition)
+
+        ssh_step = next(
+            step for step in finalizer["steps"]
+            if step.get("name") == "Configure finalizer SSH"
+        )
+        self.assertIn(
+            "steps.revalidate-finalizer.outputs.cleanup_identity_status == '0'",
+            ssh_step.get("if", ""),
+        )
 
         def may_cleanup(*, diagnostic, setup, manifest, load, pair, namespace_closed):
             return namespace_closed or (
@@ -1126,6 +1134,20 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             state.update(update)
             with self.subTest(disallowed=update):
                 self.assertFalse(may_cleanup(**state))
+
+        def may_configure_ssh(*, cleanup_identity_status):
+            return may_cleanup(
+                diagnostic=True,
+                setup="0",
+                manifest="1",
+                load="skipped",
+                pair="skipped",
+                namespace_closed=False,
+            ) and cleanup_identity_status == "0"
+
+        self.assertTrue(may_configure_ssh(cleanup_identity_status="0"))
+        self.assertFalse(may_configure_ssh(cleanup_identity_status="1"))
+        self.assertFalse(may_configure_ssh(cleanup_identity_status=""))
 
     def test_fault_injection_truth_table_rejects_each_phase_failure(self) -> None:
         passing = {

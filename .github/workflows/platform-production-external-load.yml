@@ -3518,7 +3518,7 @@ jobs:
               needs.fixture-setup.outputs.manifest_ready == '1' &&
               needs.load-client.result == 'skipped' &&
               needs['cpu-diagnostic-pair'].result == 'skipped')
-          )
+          ) && steps.revalidate-finalizer.outputs.cleanup_identity_status == '0'
         shell: bash
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
