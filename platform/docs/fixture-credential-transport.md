@@ -34,9 +34,9 @@ The Actions workflow verifies the pinned release archive digest, then extracts
 only its `age/age` member under `$RUNNER_TEMP/fixture-age-tools`. The executable
 is therefore `$RUNNER_TEMP/fixture-age-tools/age/age`; each trusted encrypt or
 decrypt step checks that exact path before using it. Do not flatten the member
-or invoke the parent `age` directory. To verify the workflow extraction,
-encryption and consumer decryption together with the real pinned archive, run
-from `platform/`:
+or invoke the parent `age` directory. To verify input encryption, fixture setup,
+manifest encryption, trusted load-client decryption, descriptor validation and
+staged cleanup together with the real pinned archive, run from `platform/`:
 
 ```bash
 /usr/bin/python3.12 -m unittest \

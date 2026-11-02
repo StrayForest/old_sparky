@@ -1250,10 +1250,28 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
             jobs["validate-external-inputs"]["steps"],
             "Encrypt the private external-load handoff",
         )
-        decrypt_step = _named_step(
-            jobs["fixture-setup"]["steps"],
+        fixture_steps = jobs["fixture-setup"]["steps"]
+        stage_fixture_identity = _named_step(
+            fixture_steps, "Stage the fixture-only decrypt identity"
+        )
+        decrypt_input_step = _named_step(
+            fixture_steps,
             "Decrypt the verified private input handoff",
         )
+        validate_manifest_step = _named_step(fixture_steps, "Validate closed fixture manifest")
+        encrypt_manifest_step = _named_step(
+            fixture_steps, "Encrypt fixture manifest and write its nonsecret descriptor"
+        )
+        fixture_cleanup_step = _named_step(fixture_steps, "Remove fixture-setup SSH material")
+        load_steps = jobs["load-client"]["steps"]
+        stage_load_identity = _named_step(load_steps, "Stage the fixture-only decrypt identity")
+        decrypt_manifest_step = _named_step(
+            load_steps, "Decrypt fixture manifest for the trusted load client"
+        )
+        validate_descriptor_step = _named_step(
+            load_steps, "Validate exact fixture descriptor and decrypted manifest"
+        )
+        load_cleanup_step = _named_step(load_steps, "Remove decrypted fixture material")
         extraction_blocks = [
             step["run"]
             for job in jobs.values()
@@ -1325,27 +1343,97 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
         )
         curl.chmod(0o700)
 
+        runner_sha = "a" * 40
+        run_id = "567890"
+        attempt = "1"
+        input_value = {
+            "schema": "1",
+            "confirmation": "RUN-PRODUCTION-EXTERNAL-LOAD",
+            "target_sha": runner_sha,
+            "control_email": "fixture-control@example.invalid",
+            "setup_concurrency": "8",
+            "run_id": run_id,
+            "profile": "external-vote",
+            "tournament_count": "1",
+            "users_per_tournament": "14",
+            "timeout_diagnostics": "false",
+            "fixture_kind": "external_load",
+        }
+        input_bytes = (
+            json.dumps(input_value, ensure_ascii=True, separators=(",", ":")) + "\n"
+        ).encode("ascii")
+        users = [
+            {
+                "user_id": f"synthetic-user-{index:02d}",
+                "tournament_slug": "synthetic-fixture-slug",
+                "session_token": f"SYNTHETIC_SESSION_{index:02d}_not_a_credential",
+                "csrf_token": f"SYNTHETIC_CSRF_{index:02d}_not_a_credential",
+            }
+            for index in range(14)
+        ]
+        manifest_value = {
+            "schema": 2,
+            "purpose": "external_ready_vote",
+            "origin": "https://old-sparky.com",
+            "session_cookie_name": "__Host-session",
+            "csrf_cookie_name": "__Host-session_csrf",
+            "marker": "preprod202611020000abcd",
+            "created_at": "2026-11-02T00:00:00Z",
+            "tournaments": [
+                {"id": "synthetic-tournament-id", "slug": "synthetic-fixture-slug", "user_count": 14}
+            ],
+            "users": users,
+            "runner_sha": runner_sha,
+            "app_target_sha": runner_sha,
+            "source_binding": None,
+            "source_binding_sha256": None,
+        }
+        manifest_bytes = (
+            json.dumps(manifest_value, ensure_ascii=True, separators=(",", ":")) + "\n"
+        ).encode("ascii")
+
+        def run_yaml_step(
+            step: dict[str, object],
+            runner_temp: Path,
+            *,
+            extra_env: dict[str, str] | None = None,
+            cwd: Path | None = None,
+        ) -> subprocess.CompletedProcess[str]:
+            env = {
+                "RUNNER_TEMP": str(runner_temp),
+                "WORKFLOW_TEST_AGE_ARCHIVE": str(archive_source),
+                "PATH": f"{curl_dir}:{os.defpath}",
+                "LC_ALL": "C",
+            }
+            if extra_env:
+                env.update(extra_env)
+            result = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", str(step["run"])],
+                env=env,
+                cwd=cwd or REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"workflow step failed: {step.get('name', '<unnamed>')}",
+            )
+            return result
+
         encrypt_temp = root / "encrypt-runner-temp"
         encrypt_temp.mkdir(mode=0o700)
         plain_input = encrypt_temp / "platform-production-external-load-input.json"
-        synthetic_payload = b'{"schema":"synthetic-workflow-test"}\n'
-        plain_input.write_bytes(synthetic_payload)
+        plain_input.write_bytes(input_bytes)
         plain_input.chmod(0o600)
         self.assertEqual(str(encrypt_step["run"]).count(transport.AGE_RECIPIENT), 1)
-        encrypt_script = str(encrypt_step["run"]).replace(
-            transport.AGE_RECIPIENT, recipient
+        encrypted = run_yaml_step(
+            {**encrypt_step, "run": str(encrypt_step["run"]).replace(
+                transport.AGE_RECIPIENT, recipient
+            )},
+            encrypt_temp,
         )
-        encrypt_env = {
-            "RUNNER_TEMP": str(encrypt_temp),
-            "WORKFLOW_TEST_AGE_ARCHIVE": str(archive_source),
-            "PATH": f"{curl_dir}:{os.defpath}",
-            "LC_ALL": "C",
-        }
-        encrypted = subprocess.run(
-            ["bash", "-euo", "pipefail", "-c", encrypt_script],
-            env=encrypt_env, capture_output=True, text=True, check=False,
-        )
-        self.assertEqual(encrypted.returncode, 0, "workflow age encryption step failed")
         encrypted_input = encrypt_temp / "fixture-private-transport/private-input.json.age"
         self.assertTrue(encrypted_input.is_file())
         self.assertEqual(encrypted_input.stat().st_mode & 0o777, 0o600)
@@ -1353,32 +1441,124 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
         self.assertTrue(installed.is_file() and os.access(installed, os.X_OK))
         self.assertTrue((encrypt_temp / "fixture-age-tools/age").is_dir())
 
-        decrypt_temp = root / "decrypt-runner-temp"
-        decrypt_temp.mkdir(mode=0o700)
-        handoff = decrypt_temp / "external-input-ciphertext/private-input.json.age"
+        setup_temp = root / "fixture-setup-runner-temp"
+        setup_temp.mkdir(mode=0o700)
+        handoff = setup_temp / "external-input-ciphertext/private-input.json.age"
         handoff.parent.mkdir(mode=0o700)
         shutil.copyfile(encrypted_input, handoff)
         handoff.chmod(0o600)
-        staged_identity = decrypt_temp / "fixture-private-identity/identity.txt"
-        staged_identity.parent.mkdir(mode=0o700)
-        staged_identity.write_bytes(identity.read_bytes())
-        staged_identity.chmod(0o600)
-        decrypt_env = {
-            "RUNNER_TEMP": str(decrypt_temp),
-            "WORKFLOW_TEST_AGE_ARCHIVE": str(archive_source),
-            "PATH": f"{curl_dir}:{os.defpath}",
-            "LC_ALL": "C",
-        }
-        decrypted = subprocess.run(
-            ["bash", "-euo", "pipefail", "-c", str(decrypt_step["run"])],
-            env=decrypt_env, capture_output=True, text=True, check=False,
+        identity_line = next(
+            line for line in identity.read_text(encoding="ascii").splitlines()
+            if line.startswith("AGE-SECRET-KEY-1")
         )
-        self.assertEqual(decrypted.returncode, 0, "workflow age consumer decryption step failed")
-        output = decrypt_temp / "external-input/platform-production-external-load-input.json"
-        self.assertEqual(output.read_bytes(), synthetic_payload)
-        self.assertEqual(output.stat().st_mode & 0o777, 0o600)
-        self.assertFalse(staged_identity.exists())
-        self.assertFalse((decrypt_temp / "age-v1.3.2.tar.gz").exists())
+        run_yaml_step(
+            stage_fixture_identity,
+            setup_temp,
+            extra_env={"FIXTURE_MANIFEST_AGE_IDENTITY": identity_line},
+        )
+        run_yaml_step(decrypt_input_step, setup_temp)
+        staged_input = setup_temp / "external-input/platform-production-external-load-input.json"
+        self.assertEqual(staged_input.read_bytes(), input_bytes)
+        self.assertEqual(staged_input.stat().st_mode & 0o777, 0o600)
+        self.assertFalse((setup_temp / "fixture-private-identity/identity.txt").exists())
+
+        external_fixture = setup_temp / "external-fixture"
+        external_fixture.mkdir(mode=0o700)
+        manifest_path = external_fixture / "manifest.json"
+        manifest_path.write_bytes(manifest_bytes)
+        manifest_path.chmod(0o600)
+        run_yaml_step(
+            validate_manifest_step,
+            setup_temp,
+            extra_env={"TARGET_SHA": runner_sha, "APP_TARGET_SHA": runner_sha},
+        )
+        encrypted_manifest_step = {
+            **encrypt_manifest_step,
+            "run": str(encrypt_manifest_step["run"]).replace(
+                transport.AGE_RECIPIENT, recipient
+            ),
+        }
+        run_yaml_step(
+            encrypted_manifest_step,
+            setup_temp,
+            extra_env={
+                "GITHUB_RUN_ID": run_id,
+                "GITHUB_RUN_ATTEMPT": attempt,
+                "TARGET_SHA": runner_sha,
+                "APP_TARGET_SHA": runner_sha,
+            },
+        )
+        manifest_cipher = external_fixture / "manifest.json.age"
+        descriptor = external_fixture / "fixture-descriptor.json"
+        self.assertTrue(manifest_cipher.is_file() and descriptor.is_file())
+        self.assertEqual(manifest_cipher.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(descriptor.stat().st_mode & 0o777, 0o600)
+        public_descriptor = json.loads(descriptor.read_text(encoding="ascii"))
+        self.assertNotIn("control_email", public_descriptor["input"])
+        self.assertNotIn("session_token", json.dumps(public_descriptor, sort_keys=True))
+        self.assertNotIn("csrf_token", json.dumps(public_descriptor, sort_keys=True))
+
+        load_temp = root / "load-client-runner-temp"
+        load_temp.mkdir(mode=0o700)
+        load_descriptor = load_temp / "external-input/fixture-descriptor.json"
+        load_descriptor.parent.mkdir(mode=0o700)
+        shutil.copyfile(descriptor, load_descriptor)
+        load_descriptor.chmod(0o600)
+        load_cipher = load_temp / "external-manifest-ciphertext/manifest.json.age"
+        load_cipher.parent.mkdir(mode=0o700)
+        shutil.copyfile(manifest_cipher, load_cipher)
+        load_cipher.chmod(0o600)
+        run_yaml_step(
+            stage_load_identity,
+            load_temp,
+            extra_env={"FIXTURE_MANIFEST_AGE_IDENTITY": identity_line},
+        )
+        run_yaml_step(decrypt_manifest_step, load_temp)
+        load_manifest = load_temp / "external-manifest/manifest.json"
+        self.assertEqual(load_manifest.read_bytes(), manifest_bytes)
+        self.assertEqual(load_manifest.stat().st_mode & 0o777, 0o600)
+        run_yaml_step(
+            validate_descriptor_step,
+            load_temp,
+            extra_env={
+                "GITHUB_RUN_ID": run_id,
+                "GITHUB_RUN_ATTEMPT": attempt,
+                "TARGET_SHA": runner_sha,
+                "APP_TARGET_SHA": runner_sha,
+                "PYTHONPATH": str(REPO_ROOT / "platform"),
+            },
+        )
+
+        setup_github_env = setup_temp / "github-env"
+        setup_github_output = setup_temp / "github-output"
+        setup_github_env.touch(mode=0o600)
+        setup_github_output.touch(mode=0o600)
+        run_yaml_step(
+            fixture_cleanup_step,
+            setup_temp,
+            extra_env={
+                "GITHUB_ENV": str(setup_github_env),
+                "GITHUB_OUTPUT": str(setup_github_output),
+            },
+        )
+        self.assertFalse(staged_input.exists())
+        self.assertFalse(manifest_path.exists())
+        self.assertFalse(handoff.exists())
+        self.assertFalse((setup_temp / "fixture-private-identity").exists())
+        self.assertFalse((setup_temp / "fixture-age-tools").exists())
+        self.assertFalse((setup_temp / "age-v1.3.2.tar.gz").exists())
+        self.assertFalse((setup_temp / "external-input-ciphertext").exists())
+        self.assertTrue(manifest_cipher.is_file())
+        self.assertTrue(descriptor.is_file())
+        self.assertIn("ssh_cleanup_status=0", setup_github_output.read_text(encoding="ascii"))
+
+        run_yaml_step(load_cleanup_step, load_temp)
+        self.assertFalse(load_manifest.exists())
+        self.assertFalse(load_cipher.exists())
+        self.assertFalse((load_temp / "fixture-private-identity").exists())
+        self.assertFalse((load_temp / "fixture-age-tools").exists())
+        self.assertFalse((load_temp / "age-v1.3.2.tar.gz").exists())
+        self.assertTrue(load_descriptor.is_file())
 
     def test_public_artifacts_are_ciphertext_and_fixture_key_is_scoped(self) -> None:
         document = yaml.safe_load((WORKFLOW_ROOT / "platform-production-external-load.yml").read_text(encoding="utf-8"))
