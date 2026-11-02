@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform maintainers
-- Last reviewed: 2026-10-25
+- Last reviewed: 2026-11-02
 
 The executable registry at `platform/tools/platform_verify.py` is the single source of truth for verification ownership, commands, environment
 requirements and CI membership. Use `list --json` when tooling needs the
@@ -18,6 +18,10 @@ python3 tools/platform_verify.py impact --changed-path platform/tools/platform_v
 ```
 
 The planner maps changed sources to complete owners; unknown or malformed paths select the full canonical gate set. It is a test-selection aid only: it cannot skip owner gates or replace exact-SHA CI. Changes to test modules select their complete owner contour.
+
+Run focused tests, then each affected full owner gate. Same-repository `dev` PRs confined to `platform/apps/platform_web/`
+run `python-quality`, `security`, `docs`, `web-quality`, `web-hermetic` and `verification-contract`; backend/migration skip.
+Fork, mixed, unknown, sensitive, `merge_group` and `dev` push routes retain full CI on the exact merged source.
 
 ## Verification layers
 
@@ -56,7 +60,7 @@ override for `@next/eslint-plugin-next`; remove that override after upstream
 releases a patched `braces` dependency. Run `tools/platform_verify.py
 web-quality` from `platform/`; the helper requires Node 26.3.1.
 
-The first eight gates are deterministic and always part of the normal CI aggregate. The conditional `release-runtime` gate is
+The first eight gates are deterministic and form the full-route CI aggregate. The conditional `release-runtime` gate is
 deterministic as well, but is intentionally excluded from `platform_verify.py ci`: the classifier enables it for an exact
 runtime-sensitive path change, a fail-closed fallback, an exact baseline-runtime proof, or every deployable full push to `dev`.
 This ensures that a later test-only push cannot deploy atop undelivered runtime changes without producing exact-target runtime
@@ -66,22 +70,18 @@ behavior is unchanged. On pull requests and `merge_group`, `release-runtime` is 
 ZIP fixtures under `python -I`, then checks file-map/mode parity, ordered paths, archive validation and install behavior.
 Compact-v2 fixtures verify the source-suite/provider digests, provider retention, validator agreement and fixed read-only unit
 aliases; collision, identity-bound cleanup and UID paths are covered without a live browser. The gate has no production network,
-credentials or deployment authority. A separate `release-runtime-real` job runs for classifier-sensitive or fallback pushes to
-canonical `dev`, every deployable full push to `dev`, same-repository PRs targeting `dev` when that route requires the real
-builder, or `workflow_dispatch` whose ref is exactly `dev`. The PR route binds the tested merge SHA, ordered base/head parents and
-exact same-repository refs before building. It starts on a fresh runner, checks out the exact tested SHA, creates the
-production-style clean root venv and invokes the full `platform_build_release.sh` builder. It validates the archive checksum and
-`RELEASE.json` provenance read-only, emits only bounded status/digest data, and removes its identified temporary output/cache in
-an exit trap. The same-repository PR route also uploads one short-lived JSON size projection bound to the tested source, run and
+credentials or deployment authority. `release-runtime-real` runs only for sensitive/fallback trusted routes and authenticated
+`baseline-runtime` proofs; ordinary deployable `dev` pushes build once in production after source proofs. Its PR route binds merge
+SHA, ordered base/head parents and same-repository refs; a fresh runner checks out the exact tested SHA and invokes the full builder.
+It validates the archive checksum and `RELEASE.json` provenance read-only, emits bounded status/digest data and removes identified
+temporary output/cache in its exit trap. The same-repository PR route uploads a short-lived JSON size projection bound to source, run and
 archive; the release archive, logs and build tree are never uploaded. The job receives no production secrets or SSH material and
-does not deploy; `status-final` independently requires the fixture job and real job on routes where each is required. Non-`dev`
-manual runs and ordinary/docs routes keep the real job skipped as selected by the classifier; there is no schedule trigger. The
-canonical builder keeps its ordinary build output in a private root-owned `0600` raw log and emits only allowlisted
-`RELEASE_BUILD_PHASE` markers to a separate root-owned `0600` marker stream. The real job reads only that bounded marker stream
-through `platform_release_build_diagnostics.py`'s explicit `--marker-log` interface before identity-checked cleanup and prints
-only the normalized phase, reason, cleanup state and builder/parser return codes. Missing, malformed, oversized, mutable or
-untrusted marker streams fail closed; the raw builder log is never parsed, printed or uploaded, and both files are removed with
-the identified temporary root after successful cleanup. Cleanup-identity failures remain fail-closed for operator investigation.
+does not deploy; `status-final` independently requires the fixture job and real job on routes where each is required. Ordinary/docs
+routes keep the real job skipped as selected by the classifier; there is no schedule trigger. The
+canonical builder keeps its output in a private root-owned `0600` log and emits allowlisted `RELEASE_BUILD_PHASE` markers to a
+separate private stream. The real job parses only that bounded stream with `--marker-log`, then prints normalized phase/reason,
+cleanup state and return codes. Missing, malformed, oversized, mutable or untrusted markers fail closed; raw logs are never
+parsed, printed or uploaded. Identity-checked cleanup removes both files; cleanup failures remain fail-closed.
 The workflow contract verifies the exact identity-checked cleanup path; deletion-failure simulation is intentionally not mocked
 because it would replace the root-owned filesystem boundary with a test double. The builder's cleanup trap preserves the original
 failure status and emits a failed `complete` marker, so diagnostic success cannot turn a failed build into a green gate. A parser
@@ -318,8 +318,10 @@ checkout remains data-only, while all validator code is checked out from
 trusted `dev` and invoked with `python -I -B`.
 
 Unknown paths/events or malformed provenance fail into full verification with
-`fallback=true`, `deployable=false` and `release-runtime`; sensitive/fallback or
-deployable `dev` pushes also require `release-runtime-real`. Recognized paths
+`fallback=true`, `deployable=false` and `release-runtime`; sensitive/fallback
+trusted `dev` routes and the authenticated baseline-runtime proof also require
+`release-runtime-real`. Ordinary deployable `dev` pushes retain the fixture gate
+and leave the full real build to the production child. Recognized paths
 use `fallback=false`; full verification alone grants no production authority.
 Each consumer applies its policy to the authenticated, digest-bound manifest:
 
@@ -418,22 +420,20 @@ SPA flows check client URLs and hydrated DOM, preserving project/auth/fixture co
 
 ## Local and GitHub verification
 
-Local canonical gates provide fast developer feedback. They must use the
-registry, for example:
+Use the canonical registry for focused local feedback, then each affected owner gate; impact
+planning is advisory and does not replace either check.
 
 ```bash
 cd platform
-.venv_platform/bin/python tools/platform_verify.py list
-.venv_platform/bin/python tools/platform_verify.py backend-unit --focused tests.test_platform_domain
-.venv_platform/bin/python tools/platform_verify.py python-quality
-.venv_platform/bin/python tools/platform_verify.py verification-contract
+.cache/platform-ci-venv/bin/python tools/platform_verify.py impact \
+  --changed-path platform/apps/platform_api/app/main.py
+.cache/platform-ci-venv/bin/python tools/platform_verify.py backend-unit \
+  --focused tests.test_platform_domain
 ```
 
-Impact planning is advisory; run focused feedback and every affected full gate.
-`backend-unit --focused` is DB-free; `backend --focused` needs DB/Redis/privileged
-resources. Local `ci` runs docs, python-quality, security and verification-contract
-before migration, backend DB prep, backend, web-quality and web-hermetic; no gate
-is skipped. Migration cleanup requires prepared resources; exact-SHA Actions gate publication.
+Replace example paths/selectors with current changes. Backend needs `backend`; web needs `web-quality` and `web-hermetic`.
+`backend-unit --focused` is DB-free; `backend` needs DB, Redis and privileged resources. Run `ci` only for a full local pass;
+exact-SHA Actions gates remain the release authority.
 
 For full local Python gate dependencies, see [the development guide](development-guide.md#python-dependency-ownership).
 

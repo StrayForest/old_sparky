@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-10-25
+- Last reviewed: 2026-11-02
 
 ## Ephemeral synthetic restore diagnostic
 
@@ -235,7 +235,9 @@ does not dispatch it. Use this order:
    one `operation=create` with the same ID/attempt/SHA. Require
    `security_started <= backup.created_at <= backup.run_started_at <= backup_job.started_at < security_last_job_completed`.
    Confirm both workflow and production job actually start before the bound; a late queued run cannot qualify. Once started, the workflow waits for Security success before staging or SSH. The proof counts every matching backup run ID, including failed and cancelled runs, so use only one backup ID per exact Security run/attempt/SHA.
-3. Wait for exact Security success and the restore-verified backup receipt.
+3. Wait for exact Security success and the create-only source-bound backup
+   receipt. The receipt is published only when the archive identity, restore
+   and Alembic results, and bounded keep-one retention proof all agree.
    Auto-deploy starts after Security completes; it only polls the dispatched backup
    and dispatches production after both exact proofs pass.
 
@@ -299,12 +301,14 @@ The workflow verifies the source-bound keep-one retention proof and that the
 new archive is restore/Alembic/checksum/freshness verified. Its
 fixed success marker records the exact workflow source SHA, attested bundle
 digest, and hashes of the staged storage-maintenance and backup-drill helpers.
-Its bounded public receipt contains counts, byte totals and inventory digests;
-failure diagnostics stay in a root-private file and are not copied to the
-public artifact. Backup-only rotates the archive set to the new verified pair
-while skipping other retention categories. Verify-existing-only restores and
-checks the sole retained pair without pruning. Full maintenance uses the same
-keep-one backup rotation before applying its non-backup release,
+The workflow compares the bounded public keep-one projection with the raw
+archive identity before it emits the receipt; the public artifact contains no
+private retention proof, paths or proof digests. Failure diagnostics stay in
+a root-private file and are not copied to the public artifact. Backup-only
+rotates the archive set to the new verified pair while skipping other
+retention categories. Verify-existing-only restores and checks the sole
+retained pair without pruning. Full maintenance uses the same keep-one backup
+rotation before applying its non-backup release,
 source-artifact, transient and live-QA retention.
 
 ### Pre-archive authorization probe

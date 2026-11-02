@@ -33,6 +33,7 @@ from tools import platform_backup_success_guard as backup_success_guard
 from tools import platform_maintenance_qa_evidence as maintenance_evidence
 from tools import platform_release_retention as retention
 from tools import platform_storage_maintenance as maintenance
+from tools import platform_storage_evidence_summary as storage_summary
 from tools.platform_disk_policy import BYTES_PER_GIB, snapshot_from_usage
 from tools.platform_storage_maintenance import (
     apply_artifact_retention_plan,
@@ -3271,10 +3272,12 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertIn('backup.get("rotation_mode") != "rotate-existing"', workflow)
         self.assertIn('backup.get("removed_count") != 0', workflow)
         self.assertIn('backup.get("postexisting_archive_count") != 1', workflow)
-        self.assertIn('backup.get("retention_policy") != "latest-restore-verified-only-v1"', workflow)
-        self.assertIn('backup.get("retention_proof_status") != "pass"', workflow)
-        self.assertIn('backup.get("retained_pair_count") != 1', workflow)
-        self.assertIn('backup.get("retention_archive_matches_new") is not True', workflow)
+        self.assertIn('public_backup.get("retention_policy") != "latest-restore-verified-only-v1"', workflow)
+        self.assertIn('public_backup.get("retention_proof_status") != "pass"', workflow)
+        self.assertIn('type(public_backup.get("postexisting_archive_count")) is not int', workflow)
+        self.assertIn('type(public_backup.get("restored_table_count")) is not int', workflow)
+        self.assertIn('public_backup.get("retained_pair_count") != 1', workflow)
+        self.assertIn('public_backup.get("retention_archive_matches_new") is not True', workflow)
         self.assertIn('r"[0-9a-f]{64}"', workflow)
         self.assertIn("BACKUP_FAILURE schema=1 stage=", workflow)
         self.assertIn('test "$(id -u)" -eq 0', workflow)
@@ -3415,13 +3418,187 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
         summary_validation_script = workflow_python(
             '/usr/bin/python3 -I - "$backup_report_file" "$operation" '
-            '"$evict_build_node_cache" "$compact_fallback_runtime_cache"'
+            '"$evict_build_node_cache" "$compact_fallback_runtime_cache" '
+            '"$resume_compaction" "$run_id" "$run_attempt" "$source_sha" '
+            '"$bundle_sha" "$resume_compaction_run_id" '
+            '"$resume_compaction_run_attempt" "$resume_compaction_bundle_sha256" '
+            '"$public_report"'
         )
         normalizer_script = workflow_python(
             '/usr/bin/python3 -I - "$public_report" "$operation" '
             '"$backup_report_file" "$evict_build_node_cache" '
             '"$compact_fallback_runtime_cache"'
         )
+
+        # Exercise the production producer shape through its public summary
+        # projection and the exact workflow create-acceptance script. The raw
+        # report carries the nested proof; only the public projection adds the
+        # closed retention fields consumed by the acceptance gate.
+        archive_name = "platformdb-20261102T194247Z.dump"
+        app_dir = self.root / "runtime" / "platform"
+        (app_dir / "shared").mkdir(parents=True)
+        retention_proof = {
+            "policy": "latest-restore-verified-only-v1",
+            "status": "pass",
+            "verified_selection": {
+                "retained_count": 1,
+                "selected_order": [{"dump_file": archive_name}],
+            },
+            "removed_pairs": [],
+        }
+        create_result = {
+            "ok": True,
+            "dump_file": archive_name,
+            "format_version": 2,
+            "size_bytes": 123,
+            "duration_seconds": 4.5,
+            "restore_verified": True,
+            "alembic_revision_verified": True,
+            "sha256": "a" * 64,
+            "restored_table_count": 12,
+            "removed": [],
+            "rotation_mode": "rotate-existing",
+            "preexisting_archive_count": 0,
+            "preexisting_sidecar_count": 0,
+            "postexisting_archive_count": 1,
+            "preexisting_archives_preserved": False,
+            "protected_retention_proof": retention_proof,
+        }
+        check_result = {
+            "ok": True,
+            "restore_verified": True,
+            "alembic_revision_verified": True,
+            "age_hours": 0.1,
+        }
+        with (
+            mock.patch.object(
+                maintenance.backup_restore_drill,
+                "create_backup",
+                return_value=create_result,
+            ),
+            mock.patch.object(
+                maintenance.backup_restore_drill,
+                "check_latest_backup",
+                return_value=check_result,
+            ),
+            mock.patch.object(
+                maintenance.backup_restore_drill,
+                "valid_protected_retention_proof",
+                return_value=True,
+            ),
+        ):
+            produced_backup = maintenance.run_backup(
+                app_dir,
+                keep=1,
+                max_age_hours=24,
+                rotate_existing=True,
+                private_failure_diagnostics=False,
+                protected_backup_manifest=None,
+                scratch_backend=maintenance.backup_restore_drill.SCRATCH_BACKEND_TMPFS_V1,
+            )
+        raw_report = {
+            "ok": True,
+            "mode": "backup-only",
+            "backup": {"status": "completed", **produced_backup},
+            "production_releases": {"deleted_count": 0, "reclaimable_bytes": 0},
+            "source_release_artifacts": {"deleted_count": 0, "reclaimable_bytes": 0},
+            "live_qa_runtime_caches": {"deleted_count": 0, "reclaimable_bytes": 0},
+            "transient": {
+                category: {"count": 0, "reclaimable_bytes": 0}
+                for category in (
+                    "failed_builds",
+                    "browser_test_artifacts",
+                    "preprod_screenshots",
+                )
+            },
+        }
+        self.assertNotIn("retention_policy", raw_report["backup"])
+        raw_report_json = json.dumps(raw_report, sort_keys=True)
+        public_seed = storage_summary.summarize_retention(raw_report_json)
+        with tempfile.TemporaryDirectory() as producer_dir_name:
+            producer_dir = Path(producer_dir_name)
+            raw_report_path = producer_dir / "report.json"
+            raw_report_path.write_text(raw_report_json, encoding="utf-8")
+            normalized = run_inline(
+                normalizer_script,
+                json.dumps(public_seed, sort_keys=True),
+                "create",
+                str(raw_report_path),
+                "false",
+                "false",
+            )
+            self.assertEqual(normalized.returncode, 0, normalized.stderr)
+            normalized_report = json.loads(normalized.stdout)
+            self.assertEqual(
+                normalized_report["backup"]["retention_policy"],
+                "latest-restore-verified-only-v1",
+            )
+            accepted_create = run_inline(
+                summary_validation_script,
+                str(raw_report_path),
+                "create",
+                "false",
+                "false",
+                "false",
+                "123456",
+                "1",
+                "a" * 40,
+                "b" * 64,
+                "none",
+                "none",
+                "none",
+                normalized.stdout,
+            )
+            mismatched_projection = {
+                **normalized_report,
+                "backup": {
+                    **normalized_report["backup"],
+                    "archive_sha256": "c" * 64,
+                },
+            }
+            rejected_projection = run_inline(
+                summary_validation_script,
+                str(raw_report_path),
+                "create",
+                "false",
+                "false",
+                "false",
+                "123456",
+                "1",
+                "a" * 40,
+                "b" * 64,
+                "none",
+                "none",
+                "none",
+                json.dumps(mismatched_projection, sort_keys=True),
+            )
+            boolean_count_projection = {
+                **normalized_report,
+                "backup": {
+                    **normalized_report["backup"],
+                    "postexisting_archive_count": True,
+                },
+            }
+            rejected_boolean_count = run_inline(
+                summary_validation_script,
+                str(raw_report_path),
+                "create",
+                "false",
+                "false",
+                "false",
+                "123456",
+                "1",
+                "a" * 40,
+                "b" * 64,
+                "none",
+                "none",
+                "none",
+                json.dumps(boolean_count_projection, sort_keys=True),
+            )
+        self.assertEqual(accepted_create.returncode, 0, accepted_create.stderr)
+        self.assertNotEqual(rejected_projection.returncode, 0)
+        self.assertNotEqual(rejected_boolean_count.returncode, 0)
+
         normalizer_diagnostic_script = workflow_python(
             "if public_summary_normalizer_diagnostic=\"$(/usr/bin/python3 -I -B - "
             '"$normalizer_capture_dir" "$normalizer_capture_identity" '
@@ -3754,6 +3931,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "123456",
                     "1",
                     "f" * 64,
+                    json.dumps(summary_payload, sort_keys=True),
                 )
 
             resumed_prior = validate_compaction_summary()

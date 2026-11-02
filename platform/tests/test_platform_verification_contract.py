@@ -105,6 +105,7 @@ from tools.platform_verify_contract import (
     ALLOWED_ACTION_OWNERS,
     PRODUCTION_WORKFLOW,
     SECURITY_WORKFLOW,
+    _workflow_job_block,
     _production_secret_scope_issues,
     _backend_workflow_issues,
     actionlint_workflow_issues,
@@ -3561,6 +3562,18 @@ except lock.VerificationLockError as exc:
         )
         self.assertEqual(host_tools_pin_verification_issues(workflow_text), [])
         self.assertEqual(actionlint_workflow_issues(workflow_text), [])
+        for job_id, gate_id in (
+            ("python-quality", "python-quality"),
+            ("security", "security"),
+            ("docs", "docs"),
+            ("web-quality", "web-quality"),
+            ("web-hermetic", "web-hermetic"),
+        ):
+            self.assertIn(
+                f"contains(fromJSON(needs.classifier.outputs.expected_gates), '{gate_id}')",
+                _workflow_job_block(workflow_text, job_id),
+            )
+        self.assertIn("web-pr-only", _workflow_job_block(workflow_text, "host-tools-pin-preflight"))
         missing_actionlint_attestation = workflow_text.replace(
             "gh attestation verify --repo rhysd/actionlint \\\n",
             "gh attestation verify --repo other/tool \\\n",
@@ -3732,6 +3745,22 @@ except lock.VerificationLockError as exc:
             any(
                 "same-repository dev PR head repository" in issue
                 for issue in release_runtime_workflow_issues(untrusted_pr_route)
+            )
+        )
+        repeated_real_job = real_job_block.replace(
+            "needs.classifier.outputs.fallback == 'true' ||",
+            "needs.classifier.outputs.fallback == 'true' ||\n      needs.classifier.outputs.deployable == 'true' ||",
+            1,
+        )
+        repeated_ordinary_build = (
+            workflow_text[:real_job_start]
+            + repeated_real_job
+            + workflow_text[real_job_end:]
+        )
+        self.assertTrue(
+            any(
+                "must not repeat the ordinary deployable push build" in issue
+                for issue in release_runtime_workflow_issues(repeated_ordinary_build)
             )
         )
         missing_full_builder = workflow_text.replace(

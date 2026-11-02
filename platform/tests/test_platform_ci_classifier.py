@@ -32,10 +32,12 @@ from tools.platform_ci_classifier import (
     STORAGE_OPERATIONS_FILES,
     STORAGE_OPERATIONS_REASON,
     STORAGE_OPERATIONS_TRIGGER_FILES,
+    WEB_PR_GATE_IDS,
     ClassifierError,
     SECURITY_WORKFLOW_NAME,
     SECURITY_WORKFLOW_PATH,
     classify,
+    _is_same_repository_dev_pr,
     manifest_digest,
     validate_security_workflow_run,
     validate_manifest,
@@ -263,6 +265,91 @@ class PlatformCiClassifierTests(unittest.TestCase):
             expected_target_sha=self.TARGET_SHA,
             require_deployable=True,
         )
+
+    def test_web_only_same_repository_pr_is_fast_but_merged_dev_is_full(self) -> None:
+        files = [
+            "platform/apps/platform_web/app/page.tsx",
+            "platform/apps/platform_web/tests/profile.spec.ts",
+        ]
+        pr = classify(
+            files,
+            event="pull_request",
+            target_sha=self.TARGET_SHA,
+            branch="feature/web-copy",
+            same_repository_dev_pr=True,
+        )
+        self.assertEqual(pr["class"], "web-pr-only")
+        self.assertEqual(pr["expected_gates"], list(WEB_PR_GATE_IDS))
+        self.assertFalse(pr["fallback"])
+        self.assertFalse(pr["runtime_sensitive"])
+        self.assertFalse(pr["deployable"])
+        validate_manifest(pr, expected_target_sha=self.TARGET_SHA)
+
+        for conservative_pr in (
+            classify(
+                files,
+                event="pull_request",
+                target_sha=self.TARGET_SHA,
+                branch="feature/web-copy",
+            ),
+            classify(
+                [*files, "platform/docs/development-guide.md"],
+                event="pull_request",
+                target_sha=self.TARGET_SHA,
+                branch="feature/web-copy",
+                same_repository_dev_pr=True,
+            ),
+            classify(
+                ["platform/apps/platform_web/tests/support/live-engine-preflight.cjs"],
+                event="pull_request",
+                target_sha=self.TARGET_SHA,
+                branch="feature/web-copy",
+                same_repository_dev_pr=True,
+            ),
+        ):
+            self.assertEqual(conservative_pr["class"], "full")
+            self.assertEqual(conservative_pr["expected_gates"], list(FULL_GATE_IDS))
+            validate_manifest(conservative_pr, expected_target_sha=self.TARGET_SHA)
+
+        merged = classify(
+            files,
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+            same_repository_dev_pr=True,
+        )
+        self.assertEqual(merged["class"], "full")
+        self.assertEqual(merged["expected_gates"], list(FULL_GATE_IDS))
+        self.assertTrue(merged["deployable"])
+        validate_manifest(merged, require_deployable=True)
+
+        merge_group = classify(
+            files,
+            event="merge_group",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+            same_repository_dev_pr=True,
+        )
+        self.assertEqual(merge_group["class"], "full")
+        self.assertEqual(merge_group["expected_gates"], list(FULL_GATE_IDS))
+        self.assertTrue(merge_group["fallback"])
+        self.assertFalse(merge_group["deployable"])
+        validate_manifest(merge_group)
+
+        same_repo_payload = {
+            "pull_request": {
+                "base": {"ref": "dev", "repo": {"full_name": "StrayForest/old_sparky"}},
+                "head": {"repo": {"full_name": "StrayForest/old_sparky"}},
+            }
+        }
+        self.assertTrue(_is_same_repository_dev_pr(same_repo_payload, "StrayForest/old_sparky"))
+        fork_payload = {
+            "pull_request": {
+                "base": {"ref": "dev", "repo": {"full_name": "StrayForest/old_sparky"}},
+                "head": {"repo": {"full_name": "other/fork"}},
+            }
+        }
+        self.assertFalse(_is_same_repository_dev_pr(fork_payload, "StrayForest/old_sparky"))
 
     def test_codex_archive_retention_uses_non_deployable_candidate_route(self) -> None:
         codex_files = {
@@ -863,6 +950,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn("release-runtime-real", workflow)
         self.assertIn("name: Conditional release runtime fixture", workflow)
         self.assertIn("name: Trusted dev immutable release runtime", workflow)
+        runtime_blocks = {}
         for job in ("release-runtime", "release-runtime-real"):
             match = re.search(
                 rf"(?ms)^  {re.escape(job)}:\n(?P<block>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
@@ -871,13 +959,16 @@ class PlatformCiClassifierTests(unittest.TestCase):
             self.assertIsNotNone(match)
             assert match is not None
             block = match.group("block")
+            runtime_blocks[job] = block
             for required in (
                 "github.event_name == 'push'",
                 "github.ref == 'refs/heads/dev'",
-                "needs.classifier.outputs.class == 'full'",
-                "needs.classifier.outputs.deployable == 'true'",
             ):
                 self.assertIn(required, block)
+        self.assertIn("needs.classifier.outputs.class == 'full'", runtime_blocks["release-runtime"])
+        self.assertIn("needs.classifier.outputs.deployable == 'true'", runtime_blocks["release-runtime"])
+        self.assertIn("needs.classifier.outputs.runtime_sensitive == 'true'", runtime_blocks["release-runtime-real"])
+        self.assertNotIn("outputs.deployable", runtime_blocks["release-runtime-real"])
         self.assertNotIn("schedule:", workflow)
 
     def test_cancel_safe_status_finalizer_overwrites_every_terminal_conclusion(self) -> None:
@@ -952,7 +1043,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn('"Platform production deploy mode=baseline-reconcile target={target} source={security_id}.{security_attempt} auto={auto_id}.{auto_attempt}"', workflow)
         self.assertIn('"Dispatch exact-target baseline runtime proof"', workflow)
         self.assertIn('parent.get("status") != "in_progress"', workflow)
-        self.assertIn('needs.classifier.outputs.class == \'full\' || (github.event_name == \'workflow_dispatch\' && inputs.proof_mode == \'baseline-runtime\')', workflow)
+        self.assertIn("contains(fromJSON(needs.classifier.outputs.expected_gates), 'backend')", workflow)
         self.assertIn('inputs.proof_mode == \'baseline-runtime\' && needs.baseline-runtime-guard.result == \'success\'', workflow)
         self.assertIn("Recheck exact current dev SHA immediately before runtime build", workflow)
         self.assertIn('"required_gates": [', workflow)
@@ -2485,11 +2576,9 @@ class PlatformCiClassifierTests(unittest.TestCase):
             "classifier runtime-sensitive output is missing or malformed",
             status_final,
         )
-        self.assertIn(
-            'deployable_full_dev_push = (',
-            status_final,
-        )
+        self.assertIn('deployable_full_dev_push = (', status_final)
         self.assertIn("or deployable_full_dev_push", status_final)
+        self.assertIn("requires_real_release_runtime = baseline_mode or (", status_final)
         self.assertIn('release_runtime_result != "success"', status_final)
         self.assertIn('release_runtime_result != "skipped"', status_final)
         self.assertIn("RELEASE_RUNTIME_REAL_RESULT", status_final)
@@ -2590,6 +2679,56 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     )
                     self.assertEqual(completed.returncode, 0, completed.stderr)
                     self.assertEqual(completed.stdout.strip(), "false")
+
+            web_pr_environment = {
+                **base_environment,
+                "ROUTE_CLASS": "web-pr-only",
+                "ROUTE_REASON": "same-repository web-only PR",
+                "EXPECTED_GATES": json.dumps(
+                    [
+                        "python-quality", "security", "docs", "web-quality",
+                        "web-hermetic", "verification-contract",
+                    ]
+                ),
+                "REPOSITORY": "StrayForest/old_sparky",
+                "PR_BASE_REF": "dev",
+                "PR_BASE_REPOSITORY": "StrayForest/old_sparky",
+                "PR_HEAD_REPOSITORY": "StrayForest/old_sparky",
+                "BACKEND_RESULT": "skipped",
+                "MIGRATION_RESULT": "skipped",
+                "PYTHON_QUALITY_RESULT": "success",
+                "SECURITY_RESULT": "success",
+                "WEB_QUALITY_RESULT": "success",
+                "WEB_HERMETIC_RESULT": "success",
+                "ROUTE_RUNTIME_SENSITIVE": "false",
+                "RELEASE_RUNTIME_RESULT": "skipped",
+                "RELEASE_RUNTIME_REAL_RESULT": "skipped",
+            }
+            environment = os.environ.copy()
+            environment.update(web_pr_environment)
+            environment["SUMMARY_PATH"] = str(Path(directory) / "web-pr.json")
+            completed = subprocess.run(
+                ["/usr/bin/python3"], input=status_script, text=True,
+                capture_output=True, env=environment, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout.strip(), "true")
+            web_summary = json.loads(
+                Path(environment["SUMMARY_PATH"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                web_summary["expected_gates"],
+                json.loads(web_pr_environment["EXPECTED_GATES"]),
+            )
+            self.assertEqual(web_summary["requires_real_release_runtime"], False)
+
+            environment["BACKEND_RESULT"] = "success"
+            environment["SUMMARY_PATH"] = str(Path(directory) / "web-pr-backend-ran.json")
+            completed = subprocess.run(
+                ["/usr/bin/python3"], input=status_script, text=True,
+                capture_output=True, env=environment, check=False,
+            )
+            self.assertEqual(completed.stdout.strip(), "false")
 
             trusted_base = {
                 **base_environment,
@@ -2707,16 +2846,16 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     False,
                 ),
                 (
-                    "deployable dev push both skipped",
+                    "deployable dev push real builder skipped",
                     "push",
                     "refs/heads/dev",
                     "false",
                     "false",
                     "true",
+                    "success",
                     "skipped",
-                    "skipped",
-                    False,
                     True,
+                    False,
                 ),
                 (
                     "deployable dev push fixture missing",
@@ -2726,21 +2865,21 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     "false",
                     "true",
                     "missing",
-                    "success",
+                    "skipped",
                     False,
-                    True,
+                    False,
                 ),
                 (
-                    "deployable dev push both success",
+                    "deployable dev push fixture success",
                     "push",
                     "refs/heads/dev",
                     "false",
                     "false",
                     "true",
                     "success",
-                    "success",
+                    "skipped",
                     True,
-                    True,
+                    False,
                 ),
                 (
                     "non-dev manual fixture only",

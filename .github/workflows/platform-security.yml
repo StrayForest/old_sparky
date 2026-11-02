@@ -534,7 +534,7 @@ jobs:
   host-tools-pin-preflight:
     name: Exact-source host-tools pin preflight
     needs: [classifier, baseline-runtime-guard]
-    if: ${{ !cancelled() && needs.classifier.result == 'success' && (contains(fromJSON('["full","docs-only","out-of-scope"]'), needs.classifier.outputs.class) || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && (contains(fromJSON('["full","web-pr-only","docs-only","out-of-scope"]'), needs.classifier.outputs.class) || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -572,7 +572,7 @@ jobs:
   backend-static:
     name: Backend DB-free contours
     needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
-    if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (contains(fromJSON(needs.classifier.outputs.expected_gates), 'backend') || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
@@ -622,7 +622,7 @@ jobs:
   backend-integration:
     name: Backend PostgreSQL and Redis integration
     needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
-    if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (contains(fromJSON(needs.classifier.outputs.expected_gates), 'backend') || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -717,7 +717,7 @@ jobs:
   backend-privileged:
     name: Backend privileged ephemeral contour
     needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
-    if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (contains(fromJSON(needs.classifier.outputs.expected_gates), 'backend') || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
@@ -864,7 +864,7 @@ jobs:
   backend:
     name: Backend aggregate
     needs: [classifier, baseline-runtime-guard, backend-static, backend-integration, backend-privileged]
-    if: ${{ always() && needs.classifier.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
+    if: ${{ always() && needs.classifier.result == 'success' && (contains(fromJSON(needs.classifier.outputs.expected_gates), 'backend') || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -911,7 +911,7 @@ jobs:
   python-quality:
     name: Python quality
     needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
-    if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (contains(fromJSON(needs.classifier.outputs.expected_gates), 'python-quality') || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -933,7 +933,7 @@ jobs:
   security:
     name: Security gates
     needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
-    if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (contains(fromJSON(needs.classifier.outputs.expected_gates), 'security') || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -954,7 +954,7 @@ jobs:
 
   web-quality:
     needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
-    if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (contains(fromJSON(needs.classifier.outputs.expected_gates), 'web-quality') || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -975,7 +975,7 @@ jobs:
   docs:
     name: Documentation consistency
     needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
-    if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (needs.classifier.outputs.class == 'full' || needs.classifier.outputs.class == 'docs-only' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (contains(fromJSON(needs.classifier.outputs.expected_gates), 'docs') || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -988,7 +988,7 @@ jobs:
   migration:
     name: Migration scenarios
     needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
-    if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (contains(fromJSON(needs.classifier.outputs.expected_gates), 'migration') || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     services:
@@ -1035,7 +1035,7 @@ jobs:
   web-hermetic:
     name: Web hermetic
     needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
-    if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (contains(fromJSON(needs.classifier.outputs.expected_gates), 'web-hermetic') || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -1374,9 +1374,6 @@ jobs:
       (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') &&
       (needs.classifier.outputs.runtime_sensitive == 'true' ||
       needs.classifier.outputs.fallback == 'true' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/dev' &&
-      needs.classifier.outputs.class == 'full' &&
-      needs.classifier.outputs.deployable == 'true') ||
       (inputs.proof_mode == 'baseline-runtime' && needs.baseline-runtime-guard.result == 'success'))
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -2258,6 +2255,10 @@ jobs:
           expected_by_class = {
               "docs-only": ["docs", "verification-contract"],
               "out-of-scope": ["verification-contract"],
+              "web-pr-only": [
+                  "python-quality", "security", "docs", "web-quality",
+                  "web-hermetic", "verification-contract",
+              ],
               "full": [
                   "backend", "python-quality", "security", "migration", "docs",
                   "web-quality", "web-hermetic", "verification-contract",
@@ -2290,6 +2291,20 @@ jobs:
               route_errors.append("classifier route class is missing or invalid")
           elif expected != expected_by_class[route_class]:
               route_errors.append("classifier expected gates do not match its class")
+          repository = os.environ.get("REPOSITORY", "")
+          same_repository_dev_pr = (
+              event_name == "pull_request"
+              and os.environ.get("PR_BASE_REF") == "dev"
+              and os.environ.get("PR_BASE_REPOSITORY") == repository
+              and os.environ.get("PR_HEAD_REPOSITORY") == repository
+              and bool(repository)
+          )
+          if route_class == "web-pr-only" and (
+              not same_repository_dev_pr or runtime_sensitive
+              or os.environ.get("ROUTE_DEPLOYABLE") != "false"
+              or os.environ.get("ROUTE_FALLBACK") != "false"
+          ):
+              route_errors.append("web-only route is not a safe same-repository dev PR")
           if route_event != event_name:
               route_errors.append("classifier event does not match the workflow event")
           tested_sha = os.environ.get("TESTED_SHA", "")
@@ -2332,6 +2347,11 @@ jobs:
           missing_or_failed = [
               gate for gate in required_expected if results.get(gate) != "success"
           ] if isinstance(required_expected, list) else ["classifier expected gates are malformed"]
+          if route_class == "web-pr-only":
+              if os.environ.get("BACKEND_RESULT") != "skipped":
+                  route_errors.append("backend aggregate must be skipped for a web-only PR")
+              if os.environ.get("MIGRATION_RESULT") != "skipped":
+                  route_errors.append("migration must be skipped for a web-only PR")
           release_runtime_result = os.environ.get("RELEASE_RUNTIME_RESULT", "missing")
           real_runtime_result = os.environ.get("RELEASE_RUNTIME_REAL_RESULT", "skipped")
           deployable_full_dev_push = (
@@ -2346,14 +2366,6 @@ jobs:
               or raw_fallback == "true"
               or deployable_full_dev_push
           )
-          repository = os.environ.get("REPOSITORY", "")
-          same_repository_dev_pr = (
-              event_name == "pull_request"
-              and os.environ.get("PR_BASE_REF") == "dev"
-              and os.environ.get("PR_BASE_REPOSITORY") == repository
-              and os.environ.get("PR_HEAD_REPOSITORY") == repository
-              and bool(repository)
-          )
           trusted_real_event = (
               (event_name == "push" and os.environ.get("WORKFLOW_REF") == "refs/heads/dev")
               or (
@@ -2362,7 +2374,9 @@ jobs:
               )
               or same_repository_dev_pr
           )
-          requires_real_release_runtime = requires_release_runtime and trusted_real_event
+          requires_real_release_runtime = baseline_mode or (
+              (runtime_sensitive or raw_fallback == "true") and trusted_real_event
+          )
           if requires_release_runtime:
               if release_runtime_result != "success":
                   missing_or_failed.append("release-runtime")

@@ -53,6 +53,16 @@ FULL_GATE_IDS: tuple[str, ...] = (
     "verification-contract",
 )
 DOCS_ONLY_GATE_IDS: tuple[str, ...] = ("docs", "verification-contract")
+WEB_PR_GATE_IDS: tuple[str, ...] = (
+    "python-quality",
+    "security",
+    "docs",
+    "web-quality",
+    "web-hermetic",
+    "verification-contract",
+)
+WEB_PR_PREFIX = "platform/apps/platform_web/"
+WEB_PR_REASON = "same-repository web-only PR uses web owner gates; merged dev still requires full CI"
 DOCS_ONLY_REASON = "strict platform/docs-only change"
 OUT_OF_SCOPE_GATE_IDS: tuple[str, ...] = ("verification-contract",)
 KNOWN_EVENTS = frozenset({"pull_request", "push", "merge_group", "workflow_dispatch"})
@@ -543,6 +553,7 @@ def classify(
     branch: str = "",
     repository_ready: bool = True,
     fallback_reason: str | None = None,
+    same_repository_dev_pr: bool = False,
 ) -> dict[str, object]:
     """Build a validated route manifest from a changed-file list.
 
@@ -658,6 +669,20 @@ def classify(
         reason = CANDIDATE_PACKAGING_REASON
     elif storage_operations_only:
         reason = STORAGE_OPERATIONS_REASON
+    if (
+        event == "pull_request"
+        and same_repository_dev_pr
+        and not runtime_sensitive
+        and not fallback
+        and not candidate_packaging_only
+        and not recovery_bootstrap_only
+        and not storage_operations_only
+        and normalised
+        and all(path.startswith(WEB_PR_PREFIX) for path in normalised)
+    ):
+        route_class = "web-pr-only"
+        expected_gates = WEB_PR_GATE_IDS
+        reason = WEB_PR_REASON
     return _build_manifest(
         target_sha=target_sha,
         event=event,
@@ -759,6 +784,7 @@ def validate_manifest(
         "docs-only": DOCS_ONLY_GATE_IDS,
         "out-of-scope": OUT_OF_SCOPE_GATE_IDS,
         "full": FULL_GATE_IDS,
+        "web-pr-only": WEB_PR_GATE_IDS,
     }
     if route_class not in expected_by_class:
         raise ClassifierError("classifier manifest class is invalid")
@@ -786,6 +812,15 @@ def validate_manifest(
     files = manifest.get("files")
     if not isinstance(files, list) or any(not isinstance(path, str) for path in files):
         raise ClassifierError("classifier files must be a list of strings")
+    if route_class == "web-pr-only" and (
+        event != "pull_request"
+        or manifest["fallback"]
+        or manifest["deployable"]
+        or runtime_sensitive
+        or not files
+        or any(not path.startswith(WEB_PR_PREFIX) for path in files)
+    ):
+        raise ClassifierError("web-only PR route does not match its exact file family")
     recovery_bootstrap_only = _is_recovery_bootstrap_only(files)
     storage_operations_only = _is_storage_operations_only(files)
     expected_runtime_sensitive = (
@@ -901,6 +936,27 @@ def _load_event_payload(path: Path) -> Mapping[str, object]:
     return payload
 
 
+def _is_same_repository_dev_pr(
+    event_payload: Mapping[str, object], repository: str
+) -> bool:
+    pull_request = event_payload.get("pull_request")
+    if not isinstance(pull_request, Mapping) or not repository:
+        return False
+    base = pull_request.get("base")
+    head = pull_request.get("head")
+    if not isinstance(base, Mapping) or not isinstance(head, Mapping):
+        return False
+    base_repo = base.get("repo")
+    head_repo = head.get("repo")
+    return bool(
+        base.get("ref") == "dev"
+        and isinstance(base_repo, Mapping)
+        and isinstance(head_repo, Mapping)
+        and base_repo.get("full_name") == repository
+        and head_repo.get("full_name") == repository
+    )
+
+
 def _write_github_output(path: Path, manifest: Mapping[str, object]) -> None:
     values = {
         "class": manifest["class"],
@@ -938,6 +994,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     event_payload: Mapping[str, object] = {}
+    same_repository_dev_pr = False
     if args.event_file is not None:
         try:
             event_payload = _load_event_payload(args.event_file)
@@ -951,6 +1008,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 fallback_reason=str(exc),
             )
         else:
+            same_repository_dev_pr = _is_same_repository_dev_pr(
+                event_payload, os.environ.get("GITHUB_REPOSITORY", "")
+            )
             event = args.event
             if args.files_file is not None:
                 try:
@@ -970,6 +1030,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         event=event,
                         target_sha=args.target_sha,
                         branch=args.branch,
+                        same_repository_dev_pr=same_repository_dev_pr,
                     )
             else:
                 files, ready, reason = _git_changed_files(
@@ -984,6 +1045,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     branch=args.branch,
                     repository_ready=ready,
                     fallback_reason=reason,
+                    same_repository_dev_pr=same_repository_dev_pr,
                 )
     elif args.files_file is not None:
         try:
@@ -1019,6 +1081,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 fallback_reason=str(exc),
             )
         else:
+            same_repository_dev_pr = _is_same_repository_dev_pr(
+                event_payload, os.environ.get("GITHUB_REPOSITORY", "")
+            )
             files, ready, reason = _git_changed_files(
                 repo_root=args.repo_root,
                 event=args.event,
@@ -1031,6 +1096,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 branch=args.branch,
                 repository_ready=ready,
                 fallback_reason=reason,
+                same_repository_dev_pr=same_repository_dev_pr,
             )
 
     validate_manifest(manifest)

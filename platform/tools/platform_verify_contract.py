@@ -1479,8 +1479,8 @@ def _migration_contract_issues(security_text: str) -> list[str]:
     migration_needs = _workflow_job_needs(migration)
     if "classifier" not in migration_needs:
         issues.append("migration job must depend on classifier")
-    if "needs.classifier.outputs.class == 'full'" not in migration:
-        issues.append("migration job must be full-route gated")
+    if "contains(fromJSON(needs.classifier.outputs.expected_gates), 'migration')" not in migration:
+        issues.append("migration job must follow classifier expected_gates")
     if "baseline-runtime-guard" in migration_needs and (
         "inputs.proof_mode == 'baseline-runtime'" not in migration
         or "needs.baseline-runtime-guard.result == 'success'" not in migration
@@ -1621,8 +1621,8 @@ def _backend_workflow_issues(security_text: str) -> list[str]:
                     f"backend job {job_id} must invoke {contour} exactly once"
                 )
         if job_id != "backend":
-            if "needs.classifier.outputs.class == 'full'" not in block:
-                issues.append(f"backend job {job_id} must be full-route gated")
+            if "contains(fromJSON(needs.classifier.outputs.expected_gates), 'backend')" not in block:
+                issues.append(f"backend job {job_id} must follow classifier expected_gates")
             if "baseline-runtime-guard" in dependencies and (
                 "inputs.proof_mode == 'baseline-runtime'" not in block
                 or "needs.baseline-runtime-guard.result == 'success'" not in block
@@ -1754,6 +1754,7 @@ def host_tools_pin_verification_issues(security_text: str) -> list[str]:
             "needs.baseline-runtime-guard.result == 'success'",
             "docs-only",
             "out-of-scope",
+            "web-pr-only",
             "full",
         )
     ):
@@ -1930,6 +1931,8 @@ def release_runtime_workflow_issues(security_text: str) -> list[str]:
     ):
         if marker not in real:
             issues.append(f"release-runtime-real is missing {message}")
+    if "outputs.deployable" in real:
+        issues.append("release-runtime-real must not repeat the ordinary deployable push build")
     if "baseline-runtime-guard" in real_needs and (
         "inputs.proof_mode == 'baseline-runtime'" not in real
         or "needs.baseline-runtime-guard.result == 'success'" not in real
@@ -2255,6 +2258,16 @@ def collect_issues() -> list[str]:
                 f"found {invocations.count(gate_id)}"
             )
     issues.extend(_backend_workflow_issues(security_text))
+    for job_id, gate_id in (
+        ("python-quality", "python-quality"),
+        ("security", "security"),
+        ("web-quality", "web-quality"),
+        ("web-hermetic", "web-hermetic"),
+        ("docs", "docs"),
+    ):
+        job = _workflow_job_block(security_text, job_id)
+        if f"contains(fromJSON(needs.classifier.outputs.expected_gates), '{gate_id}')" not in job:
+            issues.append(f"{job_id} must follow classifier expected_gates")
     issues.extend(_migration_contract_issues(security_text))
     issues.extend(host_tools_pin_verification_issues(security_text))
     issues.extend(actionlint_workflow_issues(security_text))
