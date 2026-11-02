@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-12
+- Last reviewed: 2026-11-02
 
 ## Scope boundary
 
@@ -74,7 +74,8 @@ into a separate fresh venv and use that interpreter for registry gates:
 cd /root/old_sparky/platform
 PLATFORM_CI_VENV_DIR=.cache/platform-ci-venv tools/platform_install_ci_python.sh
 PLATFORM_CI_VENV_DIR=.cache/platform-ci-venv \
-  .cache/platform-ci-venv/bin/python tools/platform_verify.py ci
+  .cache/platform-ci-venv/bin/python tools/platform_verify.py impact \
+  --changed-path platform/apps/platform_api/app/main.py
 ```
 
 The installer requires Python 3.12 on Linux x86_64 and refuses to reuse an
@@ -197,32 +198,36 @@ A local-only commit is not a completed GitHub handoff.
 
 ## Verification commands
 
-GitHub Actions owns the release gate, while canonical local gates are
-recommended for fast feedback. Keep them isolated from production resources.
-The standard local commands are:
+GitHub Actions owns the release gate. For local feedback, inspect the impact
+plan, run focused tests, then run each affected owner gate. Keep local checks
+isolated from production resources. For example:
 
 ```bash
 cd /root/old_sparky/platform
-.venv_platform/bin/python tools/platform_verify.py backend
-.venv_platform/bin/python tools/platform_verify.py python-quality
-.venv_platform/bin/python tools/platform_verify.py security
-.venv_platform/bin/python tools/platform_verify.py migration
-.venv_platform/bin/python tools/platform_verify.py docs
-.venv_platform/bin/python tools/platform_verify.py web-quality
-.venv_platform/bin/python tools/platform_verify.py web-hermetic
-.venv_platform/bin/python tools/platform_verify.py verification-contract
+.cache/platform-ci-venv/bin/python tools/platform_verify.py impact \
+  --changed-path platform/apps/platform_api/app/main.py
+.cache/platform-ci-venv/bin/python tools/platform_verify.py backend-unit \
+  --focused tests.test_platform_domain
+.cache/platform-ci-venv/bin/python tools/platform_verify.py backend
 ```
 
-Use `tools/platform_verify.py backend-unit --focused <unittest-selector>` for
-DB-free focused domain feedback. `backend --focused` remains the complete
-five-contour aggregate and needs its DB, Redis and privileged prerequisites.
-Raw underlying commands are reserved for debugging the canonical runner or
-isolating a CI failure. The local deterministic aggregate is
-`tools/platform_verify.py ci`; it does not run production smoke, live QA or
-load testing. Its order is `docs`, `python-quality`, `security`,
+Replace the example impact path and focused selector with the changed files
+and tests for the current work. Run the full gates named by the impact plan for
+all affected owners; `backend-unit --focused` is DB-free, while `backend`
+requires its DB, Redis and privileged prerequisites. Raw underlying commands
+are reserved for debugging the canonical runner or isolating a CI failure.
+Run `tools/platform_verify.py ci` only when a complete local deterministic pass
+is explicitly needed; it does not run production smoke, live QA or load testing.
+Its order is `docs`, `python-quality`, `security`,
 `verification-contract`, `migration`, backend database preparation, `backend`,
 `web-quality` and `web-hermetic`. The first four gates need no test database;
-each gate runs once and stops the aggregate on its first failure.
+each gate runs once and stops the aggregate on its first failure. Do not rerun a
+successful gate without changed inputs or a required fresh result.
+
+For a pull request, same-repository changes confined to `platform/apps/platform_web/`
+use the web owner lane. Mixed, sensitive, unknown and fork changes use full CI;
+merge queues also use full CI. Every reviewed push to `dev` runs the full exact-SHA
+route before auto-deploy, regardless of the PR lane.
 
 The DB-free backend contours need test-only settings but do not connect to
 PostgreSQL or Redis. To run one after bootstrap without loading the ignored

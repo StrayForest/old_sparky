@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-10-25
+- Last reviewed: 2026-11-02
 
 Use this document for the normal immutable release path. CSP mode changes and production browser/live-user evidence are intentionally isolated in [`csp-live-qa-runbook.md`](csp-live-qa-runbook.md); do not load that document for routine releases.
 
@@ -42,10 +42,11 @@ to `dev`. The chain is:
    `baseline-reconcile` to authenticate the active baseline and full baseline-to-target range.
    Reconcile is a verified no-op for an allowed cumulative no-op; app releases require a
    deployable full cumulative route with every canonical gate, no fallback, and exact-target
-   runtime proof. Every deployable full push to `dev` runs both exact-target runtime gates,
-   so a later test-only push cannot suppress proof required by runtime changes earlier in
-   the undelivered range. A storage no-op is allowed only for an
-   authenticated recovery input and a range wholly in the closed recovery,
+   runtime proof. Every deployable full `dev` push runs the exact-source
+   release-runtime fixture; the full `platform_build_release.sh` build runs
+   once in the production child after proofs. Security runs that builder only
+   for sensitive/fallback routes and authenticated baseline-runtime proof.
+   A storage no-op requires authenticated recovery input and a range wholly in the closed recovery,
    storage and docs sets; it changes no classifier field and authorizes no app
    work. Other ranges need normal release checks. Recovery-bootstrap no-ops may keep `runtime_sensitive=true` in the canonical full-CI manifest; `runtime_required=false` means no app release is needed, and all Security gates still apply. Changes to `platform_production_deploy_supervisor.sh` require a deployable full route and exact-target release, not the recovery-bootstrap no-op. The gate re-reads current `dev` HEAD and refuses a stale successful CI result.
    The source run and both status snapshots are checked by the shared dependency-free [`platform_workflow_provenance.py`](../tools/platform_workflow_provenance.py)
@@ -69,8 +70,7 @@ to `dev`. The chain is:
    workflow SHA to active app baseline without deployment. Wait for it before
    live QA, which targets the unchanged app. Recovery-bootstrap build/publisher
    separately emits its own authenticated skip receipt, not the QA receipt.
-5. A secret-free prerequisite independently downloads and validates the exact
-   classifier artifact before the expensive candidate build is allowed to run.
+5. After Security, backup and classifier proofs pass, a secret-free prerequisite validates the exact classifier artifact before the production child builds `TARGET_SHA` once.
    The production environment then repeats that exact-SHA validation immediately
    before its first production write, followed by the security/build check and
    immutable artifact consumption. The classifier artifact is treated as

@@ -44,6 +44,12 @@
 
 ## Change and verification rules
 
+- Prefer the smallest sufficient solution; avoid unrelated refactors. Independent
+  task parts should proceed without blocking one another. One executor is the
+  default; add agents only for a concrete useful parallel task or required review.
+- Do not repeat a check unless its inputs changed, it failed, or a fresh result is
+  needed before a risky operation. Repeat an expensive check only after fixing
+  the cause it exposed.
 - For every fix, update the affected operational instructions or scripts in
   the same change before declaring it done. Replace obsolete commands and
   steps rather than appending a postmortem. Keep operational runbooks actionable

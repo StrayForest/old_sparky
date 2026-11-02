@@ -6602,9 +6602,14 @@ fail 'private lock detail must not cross the public channel'
             self.assertIn(condition, runtime_requirement)
         self.assertIn("or raw_fallback == \"true\"", finalizer)
         self.assertIn(
-            "requires_real_release_runtime = requires_release_runtime and trusted_real_event",
+            "requires_real_release_runtime = baseline_mode or (",
             finalizer,
         )
+        self.assertIn(
+            '(runtime_sensitive or raw_fallback == "true") and trusted_real_event',
+            finalizer,
+        )
+        self.assertNotIn("outputs.deployable", real)
         self.assertIn('real_runtime_result != "success"', finalizer)
         self.assertIn("builder_started=0", real)
         self.assertIn("local builder_run_ready=0", real)
