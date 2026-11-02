@@ -170,9 +170,10 @@ def _capture_association(
         raise _fail("pre-merge association capture fields are malformed")
     status = run.get("status")
     conclusion = run.get("conclusion")
-    if status not in {"queued", "in_progress", "completed"}:
+    precompletion_statuses = {"queued", "pending", "waiting", "requested", "in_progress"}
+    if status not in {*precompletion_statuses, "completed"}:
         raise _fail("pre-merge association capture status is invalid")
-    if status in {"queued", "in_progress"} and conclusion is not None:
+    if status in precompletion_statuses and conclusion is not None:
         raise _fail("pre-merge association capture status and conclusion disagree")
     if status == "completed" and conclusion not in {
         "success", "failure", "cancelled", "skipped", "timed_out",

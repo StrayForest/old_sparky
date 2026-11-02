@@ -18,7 +18,7 @@ Match PR/repository/base/head/merge/run identity and verify raw ZIPs against API
 
 ### Phase A: capture while the PR is open
 
-Capture both queued/in-progress attempts before merge; this proves association only. The helper authenticates with `gh`
+Capture both queued/pending/waiting/requested/in-progress attempts before merge; this proves association only. The helper authenticates with `gh`
 and queries the exact run-attempt and `pulls/$PR` APIs, projecting only allowlisted IDs and refs. Preserve `CAPTURE_DIR`
 for Phase B; merge may proceed while native builds. If an attempt reruns, abort this capture path.
 
@@ -28,9 +28,9 @@ PR='<same-repository PR number>'
 REPO_ROOT='<clean checkout at exact PR head SHA>'
 test "$(id -u)" -eq 0
 test "$(stat -c '%u:%a' /root/.codex/private)" = '0:700'
-BUILD_RUN_ID='<exact native build run ID while queued or in progress>'
+BUILD_RUN_ID='<exact native build run ID before completion>'
 BUILD_ATTEMPT='<native build attempt>'
-SECURITY_RUN_ID='<exact Security run ID while queued or in progress>'
+SECURITY_RUN_ID='<exact Security run ID before completion>'
 SECURITY_ATTEMPT='<Security run attempt>'
 CAPTURE_DIR="$(mktemp -d /root/.codex/private/codex-archive-association.XXXXXX)"
 python3 -I -B "$REPO_ROOT/platform/tools/codex_archive_retention/capture_pr_association.py" --run-id "$BUILD_RUN_ID" --attempt "$BUILD_ATTEMPT" --pull-request "$PR" --output "$CAPTURE_DIR/build.json"

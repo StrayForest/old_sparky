@@ -913,6 +913,24 @@ class CodexArchiveRetentionTests(unittest.TestCase):
         )
         self.assertEqual(identity["conclusion"], "success")
         self.assertEqual(source, "premerge-capture")
+        for captured_status in ("queued", "pending", "waiting", "requested", "in_progress"):
+            active_capture = {
+                **capture,
+                "run": {**capture["run"], "status": captured_status, "conclusion": None},
+            }
+            _, active_source, _ = verify_artifact._run_identity(
+                completed, association_capture=active_capture, **identity_args
+            )
+            self.assertEqual(active_source, "premerge-capture")
+        with self.assertRaisesRegex(verify_artifact.VerificationError, "status and conclusion"):
+            verify_artifact._run_identity(
+                completed,
+                association_capture={
+                    **capture,
+                    "run": {**capture["run"], "status": "pending", "conclusion": "success"},
+                },
+                **identity_args,
+            )
         with self.assertRaisesRegex(verify_artifact.VerificationError, "successful same-repository"):
             verify_artifact._run_identity(
                 {**completed, "conclusion": "failure"},
@@ -1035,6 +1053,24 @@ class CodexArchiveRetentionTests(unittest.TestCase):
                 set(json.loads(rendered)),
                 {"schema_version", "run", "pull_request"},
             )
+            for status in ("queued", "pending", "waiting", "requested", "in_progress"):
+                active_run = {**run_payload, "status": status, "conclusion": None}
+                status_capture = capture_pr_association._capture(
+                    active_run,
+                    pr_payload,
+                    run_id="23456",
+                    attempt="2",
+                    pr_number="123",
+                )
+                self.assertEqual(status_capture["run"]["status"], status)
+            with self.assertRaises(capture_pr_association.CaptureError):
+                capture_pr_association._capture(
+                    {**run_payload, "status": "pending", "conclusion": "success"},
+                    pr_payload,
+                    run_id="23456",
+                    attempt="2",
+                    pr_number="123",
+                )
             null_repositories = json.loads(json.dumps(run_payload))
             null_repositories["pull_requests"][0]["head_repository_full_name"] = None
             null_repositories["pull_requests"][0]["base_repository_full_name"] = None

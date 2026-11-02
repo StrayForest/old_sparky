@@ -52,9 +52,9 @@ def _capture(run: dict[str, object], pr: dict[str, object], *, run_id: str, atte
         raise CaptureError("workflow identity is not an approved companion workflow")
     status = run.get("status")
     conclusion = run.get("conclusion")
-    if status not in {"queued", "in_progress", "completed"}:
+    if status not in {"queued", "pending", "waiting", "requested", "in_progress", "completed"}:
         raise CaptureError("workflow attempt is not capturable")
-    if (status in {"queued", "in_progress"} and conclusion is not None) or (
+    if (status in {"queued", "pending", "waiting", "requested", "in_progress"} and conclusion is not None) or (
         status == "completed"
         and conclusion not in {"success", "failure", "cancelled", "skipped", "timed_out", "action_required", "neutral", "stale"}
     ):
