@@ -174,6 +174,12 @@ calling the task complete.
    for slug in "${expected_candidates[@]}"; do
      retention_args+=(--expected-candidate "$slug")
    done
+   current_release_now="$(readlink -f /opt/oldsparky/platform/current)"
+   origin_slug_now="$(/opt/oldsparky/platform/shared/venv/bin/python -I -B \
+     "$current_release_now/tools/platform_verify_venv_reuse.py" \
+     --resolve-shared-venv-origin --app /opt/oldsparky/platform \
+     --current "$current_release_now" --venv /opt/oldsparky/platform/shared/venv)"
+   test "$current_release_now" = "$current_release" && test "$origin_slug_now" = "$origin_slug"
    /opt/oldsparky/platform/shared/venv/bin/python \
      "$current_release/tools/platform_release_retention.py" \
      "${retention_args[@]}" --apply --json-receipt
@@ -188,9 +194,11 @@ calling the task complete.
    The release-only set must exclude the origin, named pins, and `current`/
    `previous`. Replace sample pin/candidate values with the exact observed
    values; do not guess IDs or counts. Recheck the exact
-   candidate identities, release inodes, pointers, locks and pending
-   transactions immediately before apply. If the candidate set or any
-   protected identity changed, stop and produce a fresh preview.
+   candidate identities, release inodes, pointers, locks, and pending
+   transactions immediately before apply. The command also re-resolves the
+   active release and origin and stops unless both still match the preview.
+   If the candidate set or any protected identity changed, stop and produce a
+   fresh preview.
    `--expected-candidate` must list the complete remaining deletion set. A
    protected release does not bypass the release lock, pointer checks, or
    candidate revalidation. Keep `protected_releases` unique; the CLI rejects
