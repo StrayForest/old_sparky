@@ -147,7 +147,23 @@ class CodexArchiveRetentionTests(unittest.TestCase):
         self.assertIn("os.fsync(samples.fileno())", build_step)
         self.assertIn("if (( sampler_status != 0 )); then", build_step)
         self.assertIn("refusing binary artifact", build_step)
-        self.assertIn('test "$binary_bytes" -le "$MAX_BINARY_BYTES"', build_step)
+        self.assertIn('MAX_BINARY_BYTES: ${{ steps.lock.outputs.max_binary_bytes }}', build_step)
+        self.assertIn("binary_bytes <= MAX_BINARY_BYTES", build_step)
+        self.assertIn("binary_bytes", build_step)
+        self.assertIn("max_binary_bytes", build_step)
+        for stage in (
+            "copy_binary",
+            "strip_binary",
+            "binary_size",
+            "binary_sha256",
+            "version_command",
+            "version_match",
+            "manifest",
+            "artifact_output",
+        ):
+            self.assertIn(stage, build_step)
+        self.assertIn("record_stage artifact_output passed", build_step)
+        self.assertIn("Codex post-Cargo packaging failed at stage %s", build_step)
         self.assertIn("cargo-timing.html", build_step)
         self.assertIn("timing_bytes <= 10485760", build_step)
         self.assertIn("if: always()", diagnostics_step)
@@ -164,6 +180,158 @@ class CodexArchiveRetentionTests(unittest.TestCase):
             'name: codex-archive-retention-${{ github.run_id }}-${{ github.run_attempt }}',
             workflow,
         )
+
+    def test_executable_archive_and_total_extraction_bounds_are_consistent(self) -> None:
+        lock = json.loads(cleanup.SOURCE_LOCK.read_text(encoding="utf-8"))
+        expected_binary_limit = 512 * 1024 * 1024
+        self.assertEqual(lock["max_binary_bytes"], expected_binary_limit)
+        self.assertEqual(verify_artifact.MAX_BINARY_BYTES, expected_binary_limit)
+        self.assertEqual(verify_artifact.MAX_BUILD_ARCHIVE_BYTES, expected_binary_limit)
+        self.assertEqual(
+            verify_artifact.MAX_BUILD_UNCOMPRESSED_BYTES,
+            expected_binary_limit + 64 * 1024 + 256,
+        )
+        self.assertEqual(verify_artifact.MAX_SECURITY_ARCHIVE_BYTES, 8 * 1024 * 1024)
+        self.assertEqual(verify_artifact.MAX_ROUTE_MANIFEST_BYTES, 1024 * 1024)
+        archive_bytes = expected_binary_limit
+        route_bytes = verify_artifact.MAX_SECURITY_ARCHIVE_BYTES
+        expected_expanded = (
+            verify_artifact.MAX_BUILD_UNCOMPRESSED_BYTES
+            + verify_artifact.MAX_ROUTE_MANIFEST_BYTES
+        )
+        disk_required, memory_required = verify_artifact.artifact_staging_space_requirements(
+            archive_bytes, route_bytes
+        )
+        self.assertEqual(
+            disk_required,
+            archive_bytes + route_bytes + expected_expanded
+            + verify_artifact.ARTIFACT_STAGING_DISK_SLACK_BYTES,
+        )
+        self.assertEqual(
+            memory_required,
+            archive_bytes + route_bytes + expected_expanded
+            + verify_artifact.ARTIFACT_STAGING_MEMORY_SLACK_BYTES,
+        )
+        workflow = (
+            Path(__file__).resolve().parents[2]
+            / ".github/workflows/platform-codex-archive-retention-build.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn('lock["max_binary_bytes"] != 536870912', workflow)
+
+    def test_artifact_run_attempt_metadata_may_only_omit_with_null_or_absence(self) -> None:
+        row = {
+            "id": 456,
+            "name": "codex-archive-retention-123-2",
+            "expired": False,
+            "digest": "sha256:" + "a" * 64,
+            "size_in_bytes": 1024,
+            "workflow_run": {
+                "id": 123,
+                "head_sha": "b" * 40,
+                "run_attempt": None,
+            },
+        }
+        payload = {"total_count": 1, "artifacts": [row]}
+        args = {
+            "name": row["name"],
+            "run_id": "123",
+            "run_attempt": "2",
+            "head_sha": "b" * 40,
+            "max_size_bytes": 2048,
+        }
+        self.assertIs(
+            verify_artifact._artifact_record(payload, **args),
+            row,
+        )
+
+        absent_attempt = json.loads(json.dumps(payload))
+        absent_attempt["artifacts"][0]["workflow_run"].pop("run_attempt")
+        self.assertIsInstance(verify_artifact._artifact_record(absent_attempt, **args), dict)
+
+        for invalid_attempt in (1, True, "2"):
+            invalid = json.loads(json.dumps(payload))
+            invalid["artifacts"][0]["workflow_run"]["run_attempt"] = invalid_attempt
+            with self.subTest(attempt=invalid_attempt), self.assertRaises(
+                verify_artifact.VerificationError
+            ):
+                verify_artifact._artifact_record(invalid, **args)
+
+        wrong_run = json.loads(json.dumps(payload))
+        wrong_run["artifacts"][0]["workflow_run"]["id"] = 124
+        with self.assertRaises(verify_artifact.VerificationError):
+            verify_artifact._artifact_record(wrong_run, **args)
+
+    def test_runbook_download_caps_raw_zip_stream_before_tmpfs_write(self) -> None:
+        repository_root = Path(__file__).resolve().parents[2]
+        runbook = (repository_root / "platform/docs/codex-archive-retention.md").read_text(
+            encoding="utf-8"
+        )
+        start = runbook.index("fetch_bounded_zip() {")
+        end = runbook.index("\numask 077", start)
+        function = runbook[start:end].rstrip()
+        self.assertIn('head -c "$((expected + 1))" > "$output"', function)
+        self.assertIn("set -o noclobber", function)
+        self.assertIn('[[ "$actual" != "$expected" ]]', function)
+        self.assertIn('rm -f -- "$output"', function)
+        self.assertNotIn(' > "$ARTIFACT_DIR/build-artifact.zip"', runbook)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            gh = fake_bin / "gh"
+            gh.write_text("#!/bin/sh\nprintf %s \"$GH_BODY\"\n", encoding="utf-8")
+            gh.chmod(0o700)
+            env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "REPO": "owner/repo"}
+
+            def invoke(body: str, expected: int, output: Path) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    ["bash", "-c", f"set -euo pipefail\n{function}\nfetch_bounded_zip 17 {expected} 8 {str(output)!r}"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env={**env, "GH_BODY": body},
+                )
+
+            exact = root / "exact.zip"
+            self.assertEqual(invoke("abc", 3, exact).returncode, 0)
+            self.assertEqual(exact.read_bytes(), b"abc")
+            for body, output in (("abcd", root / "oversized.zip"), ("ab", root / "short.zip")):
+                with self.subTest(body=body):
+                    result = invoke(body, 3, output)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(output.exists())
+
+            collision = root / "existing.zip"
+            collision.write_bytes(b"keep")
+            self.assertNotEqual(invoke("abc", 3, collision).returncode, 0)
+            self.assertEqual(collision.read_bytes(), b"keep")
+
+    def test_native_archive_rejects_binary_and_total_uncompressed_overages(self) -> None:
+        archive_path = self.root / "overbound-build.zip"
+
+        def write_archive(binary: bytes, manifest: bytes = b"{}", version: bytes = b"v") -> None:
+            with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED) as archive:
+                for name, contents in {
+                    "codex": binary,
+                    "codex.manifest.json": manifest,
+                    "version.txt": version,
+                }.items():
+                    info = zipfile.ZipInfo(name)
+                    info.create_system = 3
+                    info.external_attr = (stat.S_IFREG | 0o600) << 16
+                    archive.writestr(info, contents)
+
+        write_archive(b"123456")
+        with mock.patch.object(verify_artifact, "MAX_BINARY_BYTES", 5):
+            with self.assertRaisesRegex(verify_artifact.VerificationError, "unsafe"):
+                verify_artifact._inspect_build_zip(archive_path)
+
+        write_archive(b"12345", manifest=b"{}", version=b"v")
+        with mock.patch.object(verify_artifact, "MAX_BINARY_BYTES", 5):
+            with mock.patch.object(verify_artifact, "MAX_BUILD_UNCOMPRESSED_BYTES", 7):
+                with self.assertRaisesRegex(verify_artifact.VerificationError, "expands"):
+                    verify_artifact._inspect_build_zip(archive_path)
 
     def test_schema_fixture_diagnostic_is_closed_and_precedes_native_tests(self) -> None:
         repository_root = Path(__file__).resolve().parents[2]
@@ -710,10 +878,10 @@ class CodexArchiveRetentionTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[2]
         verified = verify_artifact._validate_build_artifact(
             {
-                "codex": binary,
                 "codex.manifest.json": json.dumps(manifest).encode(),
                 "version.txt": b"codex-cli 0.166.0\n",
             },
+            binary_size=len(binary),
             source_root=root,
             lock=lock,
             pr="123",
@@ -723,6 +891,23 @@ class CodexArchiveRetentionTests(unittest.TestCase):
             build_attempt="1",
         )
         self.assertEqual(verified, manifest)
+
+        oversized_manifest = {**manifest, "binary_bytes": verify_artifact.MAX_BINARY_BYTES + 1}
+        with self.assertRaises(verify_artifact.VerificationError):
+            verify_artifact._validate_build_artifact(
+                {
+                    "codex.manifest.json": json.dumps(oversized_manifest).encode(),
+                    "version.txt": b"codex-cli 0.166.0\n",
+                },
+                binary_size=verify_artifact.MAX_BINARY_BYTES + 1,
+                source_root=root,
+                lock=lock,
+                pr="123",
+                head="a" * 40,
+                merge="b" * 40,
+                build_run_id="12345",
+                build_attempt="1",
+            )
 
         for field, invalid_value in (
             ("workflow_run_attempt", "2"),
@@ -736,10 +921,10 @@ class CodexArchiveRetentionTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(verify_artifact.VerificationError):
                 verify_artifact._validate_build_artifact(
                     {
-                        "codex": binary,
                         "codex.manifest.json": json.dumps(invalid_manifest).encode(),
                         "version.txt": b"codex-cli 0.166.0\n",
                     },
+                    binary_size=len(binary),
                     source_root=root,
                     lock=lock,
                     pr="123",
@@ -749,7 +934,7 @@ class CodexArchiveRetentionTests(unittest.TestCase):
                     build_attempt="1",
                 )
 
-    def test_verified_extraction_rechecks_identity_and_available_space(self) -> None:
+    def test_verified_streaming_extraction_rechecks_identity_and_available_space(self) -> None:
         binary = b"synthetic verified private binary"
         manifest = {
             "binary_bytes": len(binary),
@@ -762,12 +947,20 @@ class CodexArchiveRetentionTests(unittest.TestCase):
             "version.txt": b"codex-cli 0.166.0\n",
         }
 
+        build_zip = self.root / "streamed-build.zip"
+        with zipfile.ZipFile(build_zip, "w", compression=zipfile.ZIP_STORED) as archive:
+            for name, contents in members.items():
+                info = zipfile.ZipInfo(name)
+                info.create_system = 3
+                info.external_attr = (stat.S_IFREG | 0o600) << 16
+                archive.writestr(info, contents)
+
         bad_identity = self.root / "bad-identity"
         wrong_manifest = {**manifest, "binary_sha256": "0" * 64}
         with self.assertRaises(verify_artifact.VerificationError):
-            verify_artifact._extract_verified_build_members(
+            verify_artifact._extract_verified_build_archive(
                 bad_identity,
-                members,
+                build_zip,
                 manifest=wrong_manifest,
             )
         self.assertFalse(bad_identity.exists())
@@ -779,12 +972,100 @@ class CodexArchiveRetentionTests(unittest.TestCase):
             return_value=mock.Mock(f_frsize=4096, f_bavail=0),
         ):
             with self.assertRaises(verify_artifact.VerificationError):
-                verify_artifact._extract_verified_build_members(
+                verify_artifact._extract_verified_build_archive(
                     no_space,
-                    members,
+                    build_zip,
                     manifest=manifest,
                 )
         self.assertFalse(no_space.exists())
+
+    def test_native_binary_archive_is_read_in_bounded_chunks(self) -> None:
+        binary = b"z" * (verify_artifact.ZIP_STREAM_CHUNK_BYTES * 2 + 19)
+        manifest = {
+            "binary_bytes": len(binary),
+            "binary_sha256": hashlib.sha256(binary).hexdigest(),
+            "cli_version": "codex-cli 0.166.0",
+        }
+        archive_path = self.root / "bounded-stream.zip"
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED) as archive:
+            for name, contents in {
+                "codex": binary,
+                "codex.manifest.json": json.dumps(manifest).encode("ascii"),
+                "version.txt": b"codex-cli 0.166.0\n",
+            }.items():
+                info = zipfile.ZipInfo(name)
+                info.create_system = 3
+                info.external_attr = (stat.S_IFREG | 0o600) << 16
+                archive.writestr(info, contents)
+
+        real_zipfile = zipfile.ZipFile
+        read_sizes: list[int] = []
+
+        class RecordingReader:
+            def __init__(self, reader):
+                self.reader = reader
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return self.reader.__exit__(*args)
+
+            def read(self, size: int = -1) -> bytes:
+                read_sizes.append(size)
+                return self.reader.read(size)
+
+        class RecordingZip:
+            def __init__(self, *args, **kwargs):
+                self.archive = real_zipfile(*args, **kwargs)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return self.archive.__exit__(*args)
+
+            def __getattr__(self, name):
+                return getattr(self.archive, name)
+
+            def open(self, name, *args, **kwargs):
+                reader = self.archive.open(name, *args, **kwargs)
+                if getattr(name, "filename", name) == "codex":
+                    return RecordingReader(reader)
+                return reader
+
+        destination = self.root / "bounded-stream-extracted"
+        with mock.patch.object(verify_artifact.zipfile, "ZipFile", RecordingZip):
+            verify_artifact._extract_verified_build_archive(
+                destination,
+                archive_path,
+                manifest=manifest,
+            )
+
+        self.assertTrue(read_sizes)
+        self.assertTrue(all(0 < size <= verify_artifact.ZIP_STREAM_CHUNK_BYTES for size in read_sizes))
+        self.assertEqual((destination / "codex").read_bytes(), binary)
+
+        corrupted_manifest = {**manifest, "binary_sha256": "0" * 64}
+        corrupted_zip = self.root / "bad-stream-digest.zip"
+        with zipfile.ZipFile(corrupted_zip, "w", compression=zipfile.ZIP_STORED) as archive:
+            for name, contents in {
+                "codex": binary,
+                "codex.manifest.json": json.dumps(corrupted_manifest).encode("ascii"),
+                "version.txt": b"codex-cli 0.166.0\n",
+            }.items():
+                info = zipfile.ZipInfo(name)
+                info.create_system = 3
+                info.external_attr = (stat.S_IFREG | 0o600) << 16
+                archive.writestr(info, contents)
+        corrupt_destination = self.root / "bad-stream-digest"
+        with self.assertRaisesRegex(verify_artifact.VerificationError, "binary identity"):
+            verify_artifact._extract_verified_build_archive(
+                corrupt_destination,
+                corrupted_zip,
+                manifest=corrupted_manifest,
+            )
+        self.assertFalse(corrupt_destination.exists())
 
         payload = self.root / "codex"
         payload.write_bytes(binary)
@@ -1208,6 +1489,7 @@ class CodexArchiveRetentionTests(unittest.TestCase):
                         "name": name,
                         "expired": False,
                         "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+                        "size_in_bytes": path.stat().st_size,
                         "workflow_run": {
                             "id": int(run_id),
                             "run_attempt": int(attempt),

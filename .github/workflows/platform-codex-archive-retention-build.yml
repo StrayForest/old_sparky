@@ -99,7 +99,7 @@ jobs:
           }
           if any(lock.get(key) != value for key, value in expected.items()):
               raise SystemExit("Codex source lock differs from the reviewed workflow pins")
-          if type(lock.get("max_binary_bytes")) is not int or not 1 <= lock["max_binary_bytes"] <= 262144000:
+          if type(lock.get("max_binary_bytes")) is not int or lock["max_binary_bytes"] != 536870912:
               raise SystemExit("Codex binary size limit is invalid")
           if re.fullmatch(r"[0-9a-f]{64}", lock.get("patch_sha256", "")) is None:
               raise SystemExit("Codex source patch digest is malformed")
@@ -659,16 +659,95 @@ jobs:
             exit 1
           fi
           artifact_dir="$RUNNER_TEMP/codex-archive-retention"
-          install -d -m 700 "$artifact_dir"
-          install -m 700 target/release/codex "$artifact_dir/codex"
-          strip --strip-unneeded "$artifact_dir/codex"
-          binary_bytes="$(stat -c '%s' "$artifact_dir/codex")"
-          test "$binary_bytes" -gt 0
-          test "$binary_bytes" -le "$MAX_BINARY_BYTES"
-          binary_sha256="$(sha256sum "$artifact_dir/codex" | awk '{print $1}')"
-          CODEX_HOME="$RUNNER_TEMP/empty-codex-home" "$artifact_dir/codex" --version > "$artifact_dir/version.txt"
-          test "$(cat "$artifact_dir/version.txt")" = "codex-cli 0.166.0"
-          /usr/bin/python3 -I -B - "$artifact_dir" "$binary_sha256" "$binary_bytes" "$PATCH_SHA256" <<'PY'
+          package_stage_path="$diagnostics_dir/package-stages.ndjson"
+          install -m 600 /dev/null "$package_stage_path"
+          record_stage() {
+            printf '{"stage":"%s","result":"%s"%s}\n' "$1" "$2" "${3:-}" \
+              >> "$package_stage_path"
+          }
+          fail_stage() {
+            local name="$1"
+            local status="$2"
+            printf '{"stage":"%s","result":"failed","exit_status":%s}\n' \
+              "$name" "$status" >> "$package_stage_path"
+            printf 'Codex post-Cargo packaging failed at stage %s (exit=%s)\n' \
+              "$name" "$status" >&2
+            exit "$status"
+          }
+          if install -d -m 700 "$artifact_dir"; then
+            record_stage artifact_directory passed
+          else
+            fail_stage artifact_directory "$?"
+          fi
+          if install -m 700 target/release/codex "$artifact_dir/codex"; then
+            record_stage copy_binary passed
+          else
+            fail_stage copy_binary "$?"
+          fi
+          if strip --strip-unneeded "$artifact_dir/codex"; then
+            record_stage strip_binary passed
+          else
+            fail_stage strip_binary "$?"
+          fi
+          if binary_bytes="$(stat -c '%s' "$artifact_dir/codex")" \
+            && [[ "$binary_bytes" =~ ^[1-9][0-9]{0,15}$ ]]; then
+            if (( binary_bytes <= MAX_BINARY_BYTES )); then
+              record_stage binary_size passed ",\"binary_bytes\":$binary_bytes,\"max_binary_bytes\":$MAX_BINARY_BYTES"
+            else
+              record_stage binary_size failed ",\"binary_bytes\":$binary_bytes,\"max_binary_bytes\":$MAX_BINARY_BYTES"
+              printf 'Codex executable size %s exceeds reviewed maximum %s bytes\n' \
+                "$binary_bytes" "$MAX_BINARY_BYTES" >&2
+              exit 1
+            fi
+          else
+            fail_stage binary_size 1
+          fi
+          if binary_sha256="$(sha256sum "$artifact_dir/codex" | awk '{print $1}')" \
+            && [[ "$binary_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+            record_stage binary_sha256 passed
+          else
+            fail_stage binary_sha256 1
+          fi
+          if CODEX_HOME="$RUNNER_TEMP/empty-codex-home" \
+            "$artifact_dir/codex" --version > "$artifact_dir/version.txt" 2>/dev/null; then
+            record_stage version_command passed
+          else
+            fail_stage version_command "$?"
+          fi
+          if /usr/bin/python3 -I -B - "$artifact_dir/version.txt" "$package_stage_path" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          version_path = Path(sys.argv[1])
+          stage_path = Path(sys.argv[2])
+          with version_path.open("rb") as stream:
+              observed = stream.read(257)
+          expected = b"codex-cli 0.166.0\n"
+          if len(observed) > 256:
+              result = "failed"
+          else:
+              result = "passed" if observed == expected else "failed"
+          with stage_path.open("a", encoding="utf-8") as stream:
+              stream.write(json.dumps({
+                  "stage": "version_match",
+                  "result": result,
+                  "version_bytes": len(observed),
+                  "observed": observed[:256].decode("ascii", errors="replace"),
+                  "expected": "codex-cli 0.166.0",
+              }, sort_keys=True, separators=(",", ":")) + "\n")
+              stream.flush()
+              import os
+              os.fsync(stream.fileno())
+          if result != "passed":
+              raise SystemExit("Codex executable version does not match the pinned source")
+          PY
+          then
+            :
+          else
+            fail_stage version_match "$?"
+          fi
+          if /usr/bin/python3 -I -B - "$artifact_dir" "$binary_sha256" "$binary_bytes" "$PATCH_SHA256" <<'PY'
           import json
           import os
           from pathlib import Path
@@ -707,7 +786,16 @@ jobs:
           path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
           path.chmod(0o600)
           PY
-          printf 'artifact_dir=%s\n' "$artifact_dir" >> "$GITHUB_OUTPUT"
+          then
+            record_stage manifest passed
+          else
+            fail_stage manifest "$?"
+          fi
+          if printf 'artifact_dir=%s\n' "$artifact_dir" >> "$GITHUB_OUTPUT"; then
+            record_stage artifact_output passed
+          else
+            fail_stage artifact_output "$?"
+          fi
 
       - name: Upload bounded native build diagnostics
         if: always()
