@@ -440,9 +440,10 @@ artifact-identity mismatches remain invalid pipeline results and cannot be
 reclassified as completed failures.
 
 The optional CPU diagnostic pair removes its run-bound SSH files before the
-summary is uploaded to Actions. Cleanup runs even after a pair failure; the
-sanitized failure summary may still be retained when cleanup succeeds, while a
-cleanup failure blocks third-party upload and leaves the run failed.
+candidate report sanitizer runs. Cleanup runs even after a pair failure; a
+sanitized failure summary may be retained when cleanup succeeds. If cleanup
+fails, the raw report stays private, sanitization is skipped, no summary is
+uploaded, and the run fails.
 
 The QA system sampler keeps full process identity and CPU collection for all
 `/proc` rows while reading per-process RSS and I/O counters only for the seven

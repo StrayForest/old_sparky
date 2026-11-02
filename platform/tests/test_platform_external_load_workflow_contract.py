@@ -2866,6 +2866,11 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         upload_step = next(
             step for step in cpu_steps if step.get("name") == "Publish only the bounded diagnostic summary"
         )
+        sanitize_step = next(
+            step
+            for step in cpu_steps
+            if step.get("name") == "Project the CPU diagnostic report through its closed schema"
+        )
         capacity_fingerprint_upload = next(
             step
             for step in cpu_steps
@@ -2903,11 +2908,74 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             upload_step.get("if"),
             "${{ always() && steps.sanitize-cpu-report.outcome == 'success' }}",
         )
-        # The sanitized diagnostic remains useful evidence even when SSH
-        # material cleanup fails. The workflow itself still fails closed.
+        self.assertEqual(
+            upload_step["with"]["path"],
+            "${{ runner.temp }}/cpu-diagnostic-report/cpu-diagnostic.json",
+        )
+        self.assertNotIn("report.json", upload_step["with"]["path"])
+        self.assertEqual(
+            sanitize_step.get("if"),
+            "${{ always() && inputs.ssr_capacity_diagnostic_only != true && steps.cpu-pair.outputs.pair_status != '' && steps.remove-diagnostic-ssh-material.outcome == 'success' }}",
+        )
+        self.assertIn(
+            "steps.remove-diagnostic-ssh-material.outcome == 'success'",
+            sanitize_step["if"],
+        )
+        sanitizer_condition = sanitize_step["if"][len("${{"):-len("}}")].strip()
+        for cleanup_outcome, expected in (("success", True), ("failure", False)):
+            expression = sanitizer_condition
+            for original, replacement in (
+                ("always()", "always_true"),
+                ("inputs.ssr_capacity_diagnostic_only != true", "not ssr_only"),
+                ("steps.cpu-pair.outputs.pair_status != ''", "pair_status_present"),
+                (
+                    "steps.remove-diagnostic-ssh-material.outcome == 'success'",
+                    "ssh_cleanup_success",
+                ),
+            ):
+                expression = expression.replace(original, replacement)
+            expression = expression.replace("&&", "and")
+            self.assertEqual(
+                bool(
+                    eval(
+                        expression,
+                        {"__builtins__": {}},
+                        {
+                            "always_true": True,
+                            "ssr_only": False,
+                            "pair_status_present": True,
+                            "ssh_cleanup_success": cleanup_outcome == "success",
+                        },
+                    )
+                ),
+                expected,
+            )
+        # Candidate sanitization must not execute if private SSH material may
+        # remain on this runner; the raw report stays private in that case.
         self.assertNotIn("steps.cpu-pair.outcome", upload_step["if"])
-        self.assertNotIn("steps.remove-diagnostic-ssh-material.outcome", upload_step["if"])
         self.assertIn("steps.sanitize-cpu-report.outcome == 'success'", upload_step["if"])
+        upload_condition = upload_step["if"][len("${{"):-len("}}")].strip()
+        upload_condition = upload_condition.replace("always()", "always_true")
+        upload_condition = upload_condition.replace(
+            "steps.sanitize-cpu-report.outcome == 'success'", "sanitizer_success"
+        ).replace("&&", "and")
+        for sanitizer_outcome, expected in (
+            ("success", True), ("failure", False), ("skipped", False),
+        ):
+            with self.subTest(cpu_sanitizer_outcome=sanitizer_outcome):
+                self.assertEqual(
+                    bool(
+                        eval(
+                            upload_condition,
+                            {"__builtins__": {}},
+                            {
+                                "always_true": True,
+                                "sanitizer_success": sanitizer_outcome == "success",
+                            },
+                        )
+                    ),
+                    expected,
+                )
         self.assertEqual(capacity_ssh_cleanup.get("id"), "remove-ssr-capacity-ssh")
         self.assertIn(
             "steps.remove-ssr-capacity-ssh.outcome == 'success'",

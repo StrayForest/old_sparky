@@ -2726,7 +2726,7 @@ jobs:
 
       - name: Project the CPU diagnostic report through its closed schema
         id: sanitize-cpu-report
-        if: ${{ always() && inputs.ssr_capacity_diagnostic_only != true && steps.cpu-pair.outputs.pair_status != '' && steps.remove-diagnostic-ssh-material.outcome != '' }}
+        if: ${{ always() && inputs.ssr_capacity_diagnostic_only != true && steps.cpu-pair.outputs.pair_status != '' && steps.remove-diagnostic-ssh-material.outcome == 'success' }}
         shell: bash
         env:
           SOURCE_BINDING_BASE64: ${{ needs.derive-diagnostic-source-binding.outputs.source_binding_base64 }}
