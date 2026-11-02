@@ -33,6 +33,9 @@ DEFAULT_MANIFEST = Path("/usr/local/libexec/codex-archive-retention/codex.manife
 DEFAULT_ACTIVATION = Path("/usr/local/libexec/codex-archive-retention/codex.activation.json")
 MAX_DELETES_PER_RUN = 16
 DELETE_TIMEOUT_SECONDS = 120
+RELEASE_PROFILE = "release"
+RELEASE_LTO = False
+RELEASE_CODEGEN_UNITS = 4
 ROLLOUT_RE = re.compile(
     r"^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-"
     r"(?P<thread>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
@@ -94,8 +97,15 @@ def verify_companion(
         "rust_toolchain": lock["rust_toolchain"],
         "target": lock["target"],
         "cli_version": lock["cli_version"],
+        "release_profile": RELEASE_PROFILE,
+        "release_lto": RELEASE_LTO,
+        "release_codegen_units": RELEASE_CODEGEN_UNITS,
     }
-    if any(manifest.get(key) != value for key, value in expected.items()):
+    if (
+        type(manifest.get("release_lto")) is not bool
+        or type(manifest.get("release_codegen_units")) is not int
+        or any(manifest.get(key) != value for key, value in expected.items())
+    ):
         raise UnsafeState("private Codex companion provenance does not match the source lock")
     for field in ("platform_source_sha", "platform_source_head_sha"):
         if not isinstance(manifest.get(field), str) or not re.fullmatch(

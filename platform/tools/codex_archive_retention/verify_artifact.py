@@ -43,6 +43,9 @@ MAX_ROUTE_MANIFEST_BYTES = 1_048_576
 MAX_ZIP_ENTRIES = 8
 MINIMUM_FREE_BYTES = 5 * 1024**3
 MINIMUM_FREE_PERCENT = 10
+RELEASE_PROFILE = "release"
+RELEASE_LTO = False
+RELEASE_CODEGEN_UNITS = 4
 HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 RUN_ID = re.compile(r"[1-9][0-9]{0,31}\Z")
@@ -529,6 +532,7 @@ def _validate_build_artifact(
         "platform_source_sha", "platform_source_head_sha", "platform_tested_merge_sha",
         "workflow_run_id", "workflow_run_attempt", "source_repository", "source_tag",
         "source_commit", "patch_sha256", "rust_toolchain", "target", "cli_version",
+        "release_profile", "release_lto", "release_codegen_units",
         "binary_bytes", "binary_sha256",
     }
     binary = members["codex"]
@@ -554,11 +558,16 @@ def _validate_build_artifact(
         "rust_toolchain": lock["rust_toolchain"],
         "target": lock["target"],
         "cli_version": lock["cli_version"],
+        "release_profile": RELEASE_PROFILE,
+        "release_lto": RELEASE_LTO,
+        "release_codegen_units": RELEASE_CODEGEN_UNITS,
         "binary_bytes": len(binary),
         "binary_sha256": hashlib.sha256(binary).hexdigest(),
     }
     if (
-        manifest != expected
+        type(manifest.get("release_lto")) is not bool
+        or type(manifest.get("release_codegen_units")) is not int
+        or manifest != expected
         or members["version.txt"].decode("ascii", errors="replace").strip()
         != lock["cli_version"]
     ):

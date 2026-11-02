@@ -108,6 +108,54 @@ class CodexArchiveRetentionTests(unittest.TestCase):
         self.assertIn("Focused native test passed: second-passes", result.stdout)
         self.assertIn("Focused native test failed: third-empty", result.stdout)
 
+    def test_release_build_profile_and_diagnostics_are_explicit_and_bounded(self) -> None:
+        repository_root = Path(__file__).resolve().parents[2]
+        workflow = (
+            repository_root
+            / ".github/workflows/platform-codex-archive-retention-build.yml"
+        ).read_text(encoding="utf-8")
+        build_step = workflow.split(
+            "      - name: Build and bind private companion binary\n", 1
+        )[1].split("      - name: Upload bounded native build diagnostics\n", 1)[0]
+        diagnostics_step = workflow.split(
+            "      - name: Upload bounded native build diagnostics\n", 1
+        )[1].split("      - name: Upload non-deployable companion evidence artifact\n", 1)[0]
+
+        self.assertIn('CARGO_PROFILE_RELEASE_LTO: "false"', build_step)
+        self.assertNotIn("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", workflow)
+        self.assertIn("umask 077", build_step)
+        self.assertIn("build --locked --release --timings", build_step)
+        self.assertIn("/usr/bin/time -v", build_step)
+        self.assertIn('"release_profile": "release"', build_step)
+        self.assertIn('"release_lto": False', build_step)
+        self.assertIn('"release_codegen_units": 4', build_step)
+        self.assertIn('"sample_limit": sample_limit', build_step)
+        self.assertIn('"sample_interval_seconds": interval_seconds', build_step)
+        self.assertIn('360 15 <<\'PY\' &', build_step)
+        self.assertIn('"nproc": command_integer("nproc")', build_step)
+        self.assertIn('"workflow_run_attempt": run_attempt', build_step)
+        self.assertIn('"tested_merge_sha": merge_sha', build_step)
+        self.assertIn("samples.flush()", build_step)
+        self.assertIn("os.fsync(samples.fileno())", build_step)
+        self.assertIn("if (( sampler_status != 0 )); then", build_step)
+        self.assertIn("refusing binary artifact", build_step)
+        self.assertIn("cargo-timing.html", build_step)
+        self.assertIn("timing_bytes <= 10485760", build_step)
+        self.assertIn("if: always()", diagnostics_step)
+        self.assertIn(
+            "codex-archive-retention-build-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}",
+            diagnostics_step,
+        )
+        self.assertIn("${{ runner.temp }}/codex-build-diagnostics", diagnostics_step)
+        self.assertLess(
+            workflow.index("      - name: Upload bounded native build diagnostics\n"),
+            workflow.index("      - name: Upload non-deployable companion evidence artifact\n"),
+        )
+        self.assertIn(
+            'name: codex-archive-retention-${{ github.run_id }}-${{ github.run_attempt }}',
+            workflow,
+        )
+
     def test_schema_fixture_diagnostic_is_closed_and_precedes_native_tests(self) -> None:
         repository_root = Path(__file__).resolve().parents[2]
         workflow = (
@@ -324,6 +372,9 @@ class CodexArchiveRetentionTests(unittest.TestCase):
             "rust_toolchain": lock["rust_toolchain"],
             "target": lock["target"],
             "cli_version": lock["cli_version"],
+            "release_profile": "release",
+            "release_lto": False,
+            "release_codegen_units": 4,
             "platform_repository": "StrayForest/old_sparky",
             "platform_event": "pull_request",
             "platform_ref": "refs/pull/123/merge",
@@ -579,6 +630,17 @@ class CodexArchiveRetentionTests(unittest.TestCase):
         self.assertEqual(self.call_lines(), [])
         self.assertTrue(rollout.exists())
 
+    def test_runtime_rejects_companion_with_unreviewed_release_lto(self) -> None:
+        for invalid_lto in (True, 0):
+            manifest = json.loads(self.manifest.read_text(encoding="utf-8"))
+            manifest["release_lto"] = invalid_lto
+            self.manifest.write_text(json.dumps(manifest), encoding="utf-8")
+
+            with self.subTest(release_lto=invalid_lto), self.assertRaises(cleanup.UnsafeState):
+                self.run_retention()
+
+            self.assertEqual(self.call_lines(), [])
+
     def test_build_artifact_manifest_binds_exact_reviewed_source_and_binary(self) -> None:
         lock = json.loads(cleanup.SOURCE_LOCK.read_text(encoding="utf-8"))
         binary = b"synthetic private companion binary"
@@ -602,6 +664,9 @@ class CodexArchiveRetentionTests(unittest.TestCase):
             "rust_toolchain": lock["rust_toolchain"],
             "target": lock["target"],
             "cli_version": lock["cli_version"],
+            "release_profile": "release",
+            "release_lto": False,
+            "release_codegen_units": 4,
             "binary_bytes": len(binary),
             "binary_sha256": hashlib.sha256(binary).hexdigest(),
         }
@@ -622,22 +687,30 @@ class CodexArchiveRetentionTests(unittest.TestCase):
         )
         self.assertEqual(verified, manifest)
 
-        manifest["workflow_run_attempt"] = "2"
-        with self.assertRaises(verify_artifact.VerificationError):
-            verify_artifact._validate_build_artifact(
-                {
-                    "codex": binary,
-                    "codex.manifest.json": json.dumps(manifest).encode(),
-                    "version.txt": b"codex-cli 0.166.0\n",
-                },
-                source_root=root,
-                lock=lock,
-                pr="123",
-                head="a" * 40,
-                merge="b" * 40,
-                build_run_id="12345",
-                build_attempt="1",
-            )
+        for field, invalid_value in (
+            ("workflow_run_attempt", "2"),
+            ("release_profile", "dev"),
+            ("release_lto", True),
+            ("release_lto", 0),
+            ("release_codegen_units", 1),
+            ("release_codegen_units", True),
+        ):
+            invalid_manifest = {**manifest, field: invalid_value}
+            with self.subTest(field=field), self.assertRaises(verify_artifact.VerificationError):
+                verify_artifact._validate_build_artifact(
+                    {
+                        "codex": binary,
+                        "codex.manifest.json": json.dumps(invalid_manifest).encode(),
+                        "version.txt": b"codex-cli 0.166.0\n",
+                    },
+                    source_root=root,
+                    lock=lock,
+                    pr="123",
+                    head="a" * 40,
+                    merge="b" * 40,
+                    build_run_id="12345",
+                    build_attempt="1",
+                )
 
     def test_verified_extraction_rechecks_identity_and_available_space(self) -> None:
         binary = b"synthetic verified private binary"
@@ -789,6 +862,9 @@ class CodexArchiveRetentionTests(unittest.TestCase):
             "rust_toolchain": lock["rust_toolchain"],
             "target": lock["target"],
             "cli_version": lock["cli_version"],
+            "release_profile": "release",
+            "release_lto": False,
+            "release_codegen_units": 4,
             "binary_bytes": len(binary),
             "binary_sha256": hashlib.sha256(binary).hexdigest(),
         }

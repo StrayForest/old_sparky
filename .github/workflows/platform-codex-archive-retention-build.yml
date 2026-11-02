@@ -376,10 +376,265 @@ jobs:
         env:
           PATCH_SHA256: ${{ steps.lock.outputs.patch_sha256 }}
           MAX_BINARY_BYTES: ${{ steps.lock.outputs.max_binary_bytes }}
+          CARGO_PROFILE_RELEASE_LTO: "false"
         run: |
           set -euo pipefail
+          umask 077
           cd codex-source/codex-rs
-          cargo +"$CODEX_RUST_TOOLCHAIN" build --locked --release -p codex-cli --bin codex
+          diagnostics_dir="$RUNNER_TEMP/codex-build-diagnostics"
+          install -d -m 700 "$diagnostics_dir"
+          /usr/bin/python3 -I -B -u - "$diagnostics_dir" "$CODEX_RUST_TOOLCHAIN" \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_REPOSITORY" \
+            "$PLATFORM_PR_NUMBER" "$PLATFORM_SOURCE_SHA" "$PLATFORM_TESTED_MERGE_SHA" \
+            360 15 <<'PY' &
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import signal
+          import subprocess
+          import sys
+          import threading
+          import time
+          from datetime import datetime, timezone
+
+          root = Path(sys.argv[1])
+          toolchain = sys.argv[2]
+          run_id, run_attempt, repository, pull_request, head_sha, merge_sha = sys.argv[3:9]
+          sample_limit = int(sys.argv[9])
+          interval_seconds = int(sys.argv[10])
+          stop_requested = threading.Event()
+
+          def stop_sampler(_signum, _frame):
+              stop_requested.set()
+
+          signal.signal(signal.SIGTERM, stop_sampler)
+          signal.signal(signal.SIGINT, stop_sampler)
+
+          def command_text(*args):
+              try:
+                  result = subprocess.run(
+                      list(args), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                      stderr=subprocess.DEVNULL, text=True, timeout=10, check=False,
+                  )
+              except (OSError, subprocess.SubprocessError):
+                  return None
+              return result.stdout.strip() if result.returncode == 0 else None
+
+          def command_integer(*args):
+              value = command_text(*args)
+              return int(value) if value is not None and value.isdecimal() else None
+
+          def memory_info():
+              result = {}
+              try:
+                  for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+                      match = re.fullmatch(r"(MemTotal|MemAvailable):\s+(\d+)\s+kB", line)
+                      if match:
+                          result[match.group(1).lower() + "_bytes"] = int(match.group(2)) * 1024
+              except OSError:
+                  pass
+              return result
+
+          def cgroup_info():
+              result = {"memory_current_bytes": None, "memory_max_bytes": None,
+                        "memory_peak_bytes": None, "oom_events": {}}
+              try:
+                  membership = next(
+                      line[3:] for line in Path("/proc/self/cgroup").read_text(encoding="ascii").splitlines()
+                      if line.startswith("0::")
+                  )
+                  relative = Path(membership.lstrip("/"))
+                  if ".." in relative.parts:
+                      return result
+                  base = (Path("/sys/fs/cgroup") / relative).resolve(strict=True)
+                  if not base.is_relative_to(Path("/sys/fs/cgroup").resolve(strict=True)):
+                      return result
+                  for file_name, key in (("memory.current", "memory_current_bytes"),
+                                         ("memory.max", "memory_max_bytes"),
+                                         ("memory.peak", "memory_peak_bytes")):
+                      try:
+                          value = (base / file_name).read_text(encoding="ascii").strip()
+                          result[key] = int(value) if value.isdigit() else None
+                      except OSError:
+                          pass
+                  try:
+                      for line in (base / "memory.events").read_text(encoding="ascii").splitlines():
+                          parts = line.split()
+                          if len(parts) == 2 and parts[0] in {
+                              "low", "high", "max", "oom", "oom_kill", "oom_group_kill"
+                          } and parts[1].isdigit():
+                              result["oom_events"][parts[0]] = int(parts[1])
+                  except OSError:
+                      pass
+              except (OSError, StopIteration, RuntimeError):
+                  pass
+              return result
+
+          def disk_info():
+              try:
+                  data = os.statvfs(Path.cwd())
+                  total = data.f_blocks * data.f_frsize
+                  available = data.f_bavail * data.f_frsize
+                  return {"filesystem_total_bytes": total,
+                          "filesystem_available_bytes": available,
+                          "filesystem_used_bytes": max(0, total - data.f_bfree * data.f_frsize)}
+              except OSError:
+                  return {"filesystem_total_bytes": None,
+                          "filesystem_available_bytes": None,
+                          "filesystem_used_bytes": None}
+
+          def snapshot(sample_number):
+              return {
+                  "sample": sample_number,
+                  "utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                  "nproc": command_integer("nproc"),
+                  "python_cpu_count": os.cpu_count(),
+                  **memory_info(),
+                  **cgroup_info(),
+                  **disk_info(),
+              }
+
+          def write_private_json(path, payload):
+              flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+              descriptor = os.open(path, flags, 0o600)
+              with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                  json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+                  stream.write("\n")
+                  stream.flush()
+                  os.fsync(stream.fileno())
+
+          release = {}
+          for line in Path("/etc/os-release").read_text(encoding="utf-8").splitlines():
+              key, separator, value = line.partition("=")
+              if separator and key in {"ID", "VERSION_ID"}:
+                  release[key.lower()] = value.strip().strip('"')
+          baseline = {
+              "schema_version": 1,
+              "workflow_run_id": run_id,
+              "workflow_run_attempt": run_attempt,
+              "platform_repository": repository,
+              "pull_request": pull_request,
+              "platform_source_sha": head_sha,
+              "tested_merge_sha": merge_sha,
+              "os_release": release,
+              "rust_toolchain": toolchain,
+              "rustc_version": command_text("rustc", f"+{toolchain}", "--version"),
+              "cargo_version": command_text("cargo", f"+{toolchain}", "--version"),
+              "release_profile": "release",
+              "release_lto": False,
+              "release_codegen_units": 4,
+              "cargo_locked": True,
+              "cargo_timings": True,
+              "sample_interval_seconds": interval_seconds,
+              "sample_limit": sample_limit,
+              **snapshot(0),
+          }
+          write_private_json(root / "resource-baseline.json", baseline)
+          sample_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+          sample_descriptor = os.open(root / "resource-samples.ndjson", sample_flags, 0o600)
+          with os.fdopen(sample_descriptor, "w", encoding="utf-8") as samples:
+              for number in range(1, sample_limit + 1):
+                  row = snapshot(number)
+                  line = json.dumps(row, sort_keys=True, separators=(",", ":"))
+                  samples.write(line + "\n")
+                  samples.flush()
+                  os.fsync(samples.fileno())
+                  print("codex-build-resource " + line, flush=True)
+                  if number == sample_limit or stop_requested.wait(interval_seconds):
+                      break
+          PY
+          sampler_pid=$!
+          stop_sampler() {
+            if [[ -n "${sampler_pid:-}" ]]; then
+              if kill -0 "$sampler_pid" 2>/dev/null; then
+                kill -TERM "$sampler_pid" || return 1
+              fi
+              wait "$sampler_pid" || sampler_status=$?
+              sampler_pid=
+            fi
+          }
+          write_build_summary() {
+            /usr/bin/python3 -I -B - "$diagnostics_dir" "$1" "${sampler_status:-0}" "$2" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          root = Path(sys.argv[1])
+          payload = {
+              "schema_version": 1,
+              "build_exit_status": int(sys.argv[2]),
+              "sampler_exit_status": int(sys.argv[3]),
+              "cargo_timing_report": sys.argv[4],
+          }
+          descriptor = os.open(
+              root / "build-summary.json",
+              os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+              0o600,
+          )
+          with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+              json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+              stream.write("\n")
+              stream.flush()
+              os.fsync(stream.fileno())
+          PY
+          }
+          sampler_status=0
+          timing_status=missing
+          on_term() {
+            trap - TERM
+            build_status=143
+            stop_sampler || sampler_status=1
+            write_build_summary "$build_status" "$timing_status"
+            exit 143
+          }
+          trap on_term TERM
+          on_exit() {
+            original_status=$?
+            trap - EXIT
+            if stop_sampler; then
+              :
+            else
+              sampler_status=$?
+              printf 'build resource sampler exit status: %s\n' "$sampler_status" >&2
+            fi
+            if [[ ! -s "$diagnostics_dir/build-summary.json" ]]; then
+              write_build_summary "$original_status" "$timing_status" || {
+                printf 'failed to persist bounded build summary\n' >&2
+              }
+            fi
+          }
+          trap on_exit EXIT
+          for _ in {1..20}; do
+            [[ -f "$diagnostics_dir/resource-baseline.json" ]] && break
+            sleep 1
+          done
+          test -s "$diagnostics_dir/resource-baseline.json"
+          if /usr/bin/time -v -o "$diagnostics_dir/time-v.txt" \
+            cargo +"$CODEX_RUST_TOOLCHAIN" build --locked --release --timings \
+              -p codex-cli --bin codex; then
+            build_status=0
+          else
+            build_status=$?
+          fi
+          if [[ -f target/cargo-timings/cargo-timing.html ]]; then
+            timing_bytes="$(stat -c '%s' target/cargo-timings/cargo-timing.html)"
+            if (( timing_bytes <= 10485760 )); then
+              install -m 600 target/cargo-timings/cargo-timing.html "$diagnostics_dir/cargo-timing.html"
+              timing_status=copied
+            else
+              timing_status=exceeds_10_mib
+            fi
+          fi
+          stop_sampler || sampler_status=1
+          write_build_summary "$build_status" "$timing_status"
+          if (( build_status != 0 )); then
+            exit "$build_status"
+          fi
+          if (( sampler_status != 0 )); then
+            printf 'build diagnostics sampler failed; refusing binary artifact\n' >&2
+            exit 1
+          fi
           artifact_dir="$RUNNER_TEMP/codex-archive-retention"
           install -d -m 700 "$artifact_dir"
           install -m 700 target/release/codex "$artifact_dir/codex"
@@ -419,6 +674,9 @@ jobs:
               "rust_toolchain": lock["rust_toolchain"],
               "target": lock["target"],
               "cli_version": lock["cli_version"],
+              "release_profile": "release",
+              "release_lto": False,
+              "release_codegen_units": 4,
               "binary_bytes": int(sys.argv[3]),
               "binary_sha256": sys.argv[2],
           }
@@ -427,6 +685,16 @@ jobs:
           path.chmod(0o600)
           PY
           printf 'artifact_dir=%s\n' "$artifact_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Upload bounded native build diagnostics
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: codex-archive-retention-build-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/codex-build-diagnostics
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
 
       - name: Upload non-deployable companion evidence artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0

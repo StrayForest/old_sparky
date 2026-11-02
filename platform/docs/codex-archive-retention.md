@@ -11,11 +11,11 @@ The [source lock](../tools/codex_archive_retention/codex-source.lock.json)
 binds the upstream pin and reviewed patch. The patch aligns 170 local
 `codex-rs/Cargo.lock` package versions with source manifests (`0.166.0`),
 without changing third-party records or dependencies; all native commands use
-`--locked`. A private companion build runs on same-repository PRs to `dev`,
-checks out exact head and tested-merge SHAs, applies the context-free patch
-strictly, runs focused native checks, and publishes seven-day evidence. It has
-read-only repository permission and never installs, enables a timer, reads a
-Codex home, or deletes sessions.
+`--locked`. Same-repository PR builds to `dev` bind exact head/merge, strictly
+apply the patch, run native checks, and publish seven-day review evidence.
+They are read-only: no install, timer enablement, Codex-home reads, or deletion.
+Manifest pins release/four codegen units/`CARGO_PROFILE_RELEASE_LTO=false`;
+separate bounded resource/timing diagnostics are never accepted as binary.
 
 ## Build artifact and activation
 
