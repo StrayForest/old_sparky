@@ -69,12 +69,147 @@ def _read_json(path: Path, *, maximum: int = MAX_JSON_BYTES) -> Any:
         raise _fail("input JSON file is malformed") from exc
 
 
+def _read_json_hashed(
+    path: Path,
+    *,
+    maximum: int = MAX_JSON_BYTES,
+    expected_owner: int | None = None,
+    expected_mode: int | None = None,
+    expected_nlink: int | None = None,
+) -> tuple[Any, str]:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_size > maximum
+            or (expected_owner is not None and info.st_uid != expected_owner)
+            or (expected_mode is not None and stat.S_IMODE(info.st_mode) != expected_mode)
+            or (expected_nlink is not None and info.st_nlink != expected_nlink)
+        ):
+            raise _fail("input JSON file identity or size is invalid")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            content = stream.read(maximum + 1)
+        if len(content) > maximum:
+            raise _fail("input JSON file exceeds its bound")
+        return json.loads(content.decode("utf-8")), hashlib.sha256(content).hexdigest()
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise _fail("input JSON file is malformed") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _read_association_capture(path: Path) -> tuple[Any, str]:
+    if not path.is_absolute() or path.parent.resolve(strict=True) != path.parent:
+        raise _fail("pre-merge association capture path is not absolute and canonical")
+    parent = path.parent.lstat()
+    if (
+        not stat.S_ISDIR(parent.st_mode)
+        or stat.S_ISLNK(parent.st_mode)
+        or parent.st_uid != os.geteuid()
+        or stat.S_IMODE(parent.st_mode) != 0o700
+    ):
+        raise _fail("pre-merge association capture file or directory identity is unsafe")
+    return _read_json_hashed(
+        path,
+        expected_owner=os.geteuid(),
+        expected_mode=0o600,
+        expected_nlink=1,
+    )
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _expected_workflow(workflow_name: str, workflow_path: str) -> bool:
+    return (workflow_name, workflow_path) in {
+        (BUILD_WORKFLOW_NAME, BUILD_WORKFLOW_PATH),
+        (SECURITY_WORKFLOW_NAME, SECURITY_WORKFLOW_PATH),
+    }
+
+
+def _capture_association(
+    payload: Any,
+    *,
+    run_id: str,
+    attempt: str,
+    workflow_name: str,
+    workflow_path: str,
+    expected_head: str,
+    pull_request: str,
+) -> dict[str, Any]:
+    """Validate the sanitized metadata emitted by the authenticated capture helper."""
+    fields = {
+        "schema_version",
+        "run",
+        "pull_request",
+    }
+    if not isinstance(payload, dict) or set(payload) != fields or payload.get("schema_version") != 1:
+        raise _fail("pre-merge association capture is malformed")
+    run = payload.get("run")
+    pr = payload.get("pull_request")
+    run_fields = {
+        "id", "run_attempt", "name", "path", "event", "status", "conclusion",
+        "repository", "head_repository", "head_sha", "pull_request_number",
+        "pull_request_head_sha", "pull_request_head_repository", "pull_request_base_ref",
+        "pull_request_base_sha", "pull_request_base_repository",
+    }
+    pr_fields = {
+        "number", "state", "merged_at", "head_sha", "head_repository",
+        "base_ref", "base_sha", "base_repository",
+    }
+    if not isinstance(run, dict) or set(run) != run_fields or not isinstance(pr, dict) or set(pr) != pr_fields:
+        raise _fail("pre-merge association capture fields are malformed")
+    status = run.get("status")
+    conclusion = run.get("conclusion")
+    if status not in {"queued", "in_progress", "completed"}:
+        raise _fail("pre-merge association capture status is invalid")
+    if status in {"queued", "in_progress"} and conclusion is not None:
+        raise _fail("pre-merge association capture status and conclusion disagree")
+    if status == "completed" and conclusion not in {
+        "success", "failure", "cancelled", "skipped", "timed_out",
+        "action_required", "neutral", "stale",
+    }:
+        raise _fail("pre-merge association capture status and conclusion disagree")
+    if any(
+        (
+            type(run.get("id")) is not int or str(run["id"]) != run_id,
+            type(run.get("run_attempt")) is not int or str(run["run_attempt"]) != attempt,
+            run.get("name") != workflow_name,
+            run.get("path") != workflow_path,
+            not _expected_workflow(workflow_name, workflow_path),
+            run.get("event") != "pull_request",
+            run.get("repository") != REPOSITORY,
+            run.get("head_repository") != REPOSITORY,
+            run.get("head_sha") != expected_head,
+            type(run.get("pull_request_number")) is not int
+            or str(run["pull_request_number"]) != pull_request,
+            run.get("pull_request_head_sha") != expected_head,
+            run.get("pull_request_head_repository") != REPOSITORY,
+            run.get("pull_request_base_ref") != "dev",
+            run.get("pull_request_base_repository") != REPOSITORY,
+            type(run.get("pull_request_base_sha")) is not str
+            or HEX40.fullmatch(run["pull_request_base_sha"]) is None,
+            type(pr.get("number")) is not int or str(pr["number"]) != pull_request,
+            pr.get("state") != "open",
+            pr.get("merged_at") is not None,
+            pr.get("head_sha") != expected_head,
+            pr.get("head_repository") != REPOSITORY,
+            pr.get("base_ref") != "dev",
+            pr.get("base_repository") != REPOSITORY,
+            pr.get("base_sha") != run.get("pull_request_base_sha"),
+        )
+    ):
+        raise _fail("pre-merge association capture does not match the reviewed PR source")
+    return payload
 
 
 def _run_identity(
@@ -86,7 +221,8 @@ def _run_identity(
     workflow_path: str,
     expected_head: str,
     pull_request: str,
-) -> dict[str, Any]:
+    association_capture: Any | None = None,
+) -> tuple[dict[str, Any], str, str]:
     if not isinstance(payload, dict):
         raise _fail("workflow attempt response is malformed")
     repository = payload.get("repository")
@@ -109,7 +245,24 @@ def _run_identity(
     ):
         raise _fail("workflow attempt is not an exact successful same-repository run")
     pull_requests = payload.get("pull_requests")
-    if not isinstance(pull_requests, list) or len(pull_requests) != 1:
+    if not isinstance(pull_requests, list):
+        raise _fail("workflow attempt PR association is malformed")
+    capture = None
+    if association_capture is not None:
+        capture = _capture_association(
+            association_capture,
+            run_id=run_id,
+            attempt=attempt,
+            workflow_name=workflow_name,
+            workflow_path=workflow_path,
+            expected_head=expected_head,
+            pull_request=pull_request,
+        )
+    if len(pull_requests) == 0:
+        if capture is None:
+            raise _fail("workflow attempt PR association is empty and has no pre-merge capture")
+        return payload, "premerge-capture", ""
+    if len(pull_requests) != 1:
         raise _fail("workflow attempt PR association is not singular")
     pr = pull_requests[0]
     if not isinstance(pr, dict):
@@ -118,13 +271,40 @@ def _run_identity(
     pr_base = pr.get("base")
     if not isinstance(pr_head, dict) or not isinstance(pr_base, dict):
         raise _fail("workflow attempt PR ref snapshot is malformed")
+    direct = {
+        "number": str(pr.get("number")),
+        "head_sha": pr_head.get("sha"),
+        "head_repository": (pr_head.get("repo") or {}).get("full_name")
+        if isinstance(pr_head.get("repo"), dict) else None,
+        "base_ref": pr_base.get("ref"),
+        "base_sha": pr_base.get("sha"),
+        "base_repository": (pr_base.get("repo") or {}).get("full_name")
+        if isinstance(pr_base.get("repo"), dict) else None,
+    }
     if (
-        str(pr.get("number")) != pull_request
-        or pr_head.get("sha") != expected_head
-        or pr_base.get("ref") != "dev"
+        direct["number"] != pull_request
+        or direct["head_sha"] != expected_head
+        or direct["head_repository"] != REPOSITORY
+        or direct["base_ref"] != "dev"
+        or direct["base_repository"] != REPOSITORY
+        or (direct["base_sha"] is not None and HEX40.fullmatch(str(direct["base_sha"])) is None)
     ):
         raise _fail("workflow attempt PR association does not match the reviewed source")
-    return payload
+    if capture is not None:
+        captured_run = capture["run"]
+        if any(
+            (
+                direct["number"] != str(captured_run["pull_request_number"]),
+                direct["head_sha"] != captured_run["pull_request_head_sha"],
+                direct["head_repository"] != captured_run["pull_request_head_repository"],
+                direct["base_ref"] != captured_run["pull_request_base_ref"],
+                direct["base_sha"] != captured_run["pull_request_base_sha"],
+                direct["base_repository"] != captured_run["pull_request_base_repository"],
+            )
+        ):
+            raise _fail("current workflow PR association conflicts with its pre-merge capture")
+        return payload, "current-api+premerge-capture", ""
+    return payload, "current-api", ""
 
 
 def _artifact_record(
@@ -409,6 +589,7 @@ def _validate_classifier_manifest(
         CODEX_TEST_PATH,
         "platform/tools/codex_archive_retention/__init__.py",
         "platform/tools/codex_archive_retention/cleanup.py",
+        "platform/tools/codex_archive_retention/capture_pr_association.py",
         "platform/tools/codex_archive_retention/verify_artifact.py",
         "platform/tools/codex_archive_retention/codex-source.lock.json",
         "platform/tools/codex_archive_retention/codex-archive-retention.service",
@@ -586,26 +767,50 @@ def verify(args: argparse.Namespace) -> None:
 
     source_root = args.source_root.resolve(strict=True)
     lock = _verify_source_checkout(source_root, expected_head=args.head_sha)
-    build_run = _run_identity(
-        _read_json(args.build_run),
+    build_run_payload, build_run_sha256 = _read_json_hashed(args.build_run)
+    security_run_payload, security_run_sha256 = _read_json_hashed(args.security_run)
+    build_capture = None
+    build_capture_sha256 = None
+    if getattr(args, "build_pr_association", None) is not None:
+        build_capture, build_capture_sha256 = _read_association_capture(args.build_pr_association)
+    security_capture = None
+    security_capture_sha256 = None
+    if getattr(args, "security_pr_association", None) is not None:
+        security_capture, security_capture_sha256 = _read_association_capture(args.security_pr_association)
+    build_run, build_association_source, _ = _run_identity(
+        build_run_payload,
         run_id=args.build_run_id,
         attempt=args.build_attempt,
         workflow_name=BUILD_WORKFLOW_NAME,
         workflow_path=BUILD_WORKFLOW_PATH,
         expected_head=args.head_sha,
         pull_request=args.pull_request,
+        association_capture=build_capture,
     )
-    security_run = _run_identity(
-        _read_json(args.security_run),
+    security_run, security_association_source, _ = _run_identity(
+        security_run_payload,
         run_id=args.security_run_id,
         attempt=args.security_attempt,
         workflow_name=SECURITY_WORKFLOW_NAME,
         workflow_path=SECURITY_WORKFLOW_PATH,
         expected_head=args.head_sha,
         pull_request=args.pull_request,
+        association_capture=security_capture,
     )
     if build_run.get("head_sha") != security_run.get("head_sha"):
         raise _fail("native build and Security runs do not share the exact PR head")
+    if build_capture is not None and security_capture is not None:
+        if (
+            build_capture["pull_request"]["number"] != security_capture["pull_request"]["number"]
+            or build_capture["pull_request"]["head_sha"] != security_capture["pull_request"]["head_sha"]
+            or build_capture["pull_request"]["head_repository"]
+            != security_capture["pull_request"]["head_repository"]
+            or build_capture["pull_request"]["base_ref"] != security_capture["pull_request"]["base_ref"]
+            or build_capture["pull_request"]["base_sha"] != security_capture["pull_request"]["base_sha"]
+            or build_capture["pull_request"]["base_repository"]
+            != security_capture["pull_request"]["base_repository"]
+        ):
+            raise _fail("native build and Security captures do not share one PR identity")
 
     build_name = f"codex-archive-retention-{args.build_run_id}-{args.build_attempt}"
     build_artifact = _artifact_record(
@@ -665,12 +870,18 @@ def verify(args: argparse.Namespace) -> None:
         "tested_merge_sha": args.merge_sha,
         "build_run_id": args.build_run_id,
         "build_run_attempt": args.build_attempt,
+        "build_run_api_sha256": build_run_sha256,
+        "build_pr_association_sha256": build_capture_sha256 if build_capture_sha256 is not None else build_run_sha256,
+        "build_pr_association_source": build_association_source,
         "build_artifact_id": str(build_artifact["id"]),
         "build_artifact_sha256": build_artifact["digest"].removeprefix("sha256:"),
         "security_workflow_name": SECURITY_WORKFLOW_NAME,
         "security_workflow_path": SECURITY_WORKFLOW_PATH,
         "security_run_id": args.security_run_id,
         "security_run_attempt": args.security_attempt,
+        "security_run_api_sha256": security_run_sha256,
+        "security_pr_association_sha256": security_capture_sha256 if security_capture_sha256 is not None else security_run_sha256,
+        "security_pr_association_source": security_association_source,
         "security_conclusion": "success",
         "security_target_sha": args.merge_sha,
         "security_route_artifact_id": str(security_artifact["id"]),
@@ -737,11 +948,13 @@ def main() -> int:
     parser.add_argument("--build-run-id", required=True)
     parser.add_argument("--build-attempt", required=True)
     parser.add_argument("--build-run", type=Path, required=True)
+    parser.add_argument("--build-pr-association", type=Path)
     parser.add_argument("--build-artifacts", type=Path, required=True)
     parser.add_argument("--build-zip", type=Path, required=True)
     parser.add_argument("--security-run-id", required=True)
     parser.add_argument("--security-attempt", required=True)
     parser.add_argument("--security-run", type=Path, required=True)
+    parser.add_argument("--security-pr-association", type=Path)
     parser.add_argument("--security-artifacts", type=Path, required=True)
     parser.add_argument("--security-zip", type=Path, required=True)
     parser.add_argument("--extract-directory", type=Path)

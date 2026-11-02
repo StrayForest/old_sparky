@@ -154,6 +154,7 @@ CANDIDATE_PACKAGING_FILES = frozenset(
         "platform/tools/platform_verify_contract.py",
         "platform/tools/codex_archive_retention/__init__.py",
         "platform/tools/codex_archive_retention/cleanup.py",
+        "platform/tools/codex_archive_retention/capture_pr_association.py",
         "platform/tools/codex_archive_retention/verify_artifact.py",
         "platform/tools/codex_archive_retention/codex-source.lock.json",
         "platform/tools/codex_archive_retention/codex-archive-retention.service",

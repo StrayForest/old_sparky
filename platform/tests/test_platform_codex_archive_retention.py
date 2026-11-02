@@ -16,7 +16,7 @@ import unittest
 from unittest import mock
 import zipfile
 
-from tools.codex_archive_retention import cleanup, verify_artifact
+from tools.codex_archive_retention import capture_pr_association, cleanup, verify_artifact
 from tools.platform_ci_classifier import CANDIDATE_PACKAGING_FILES, classify, manifest_digest
 
 
@@ -122,6 +122,9 @@ class CodexArchiveRetentionTests(unittest.TestCase):
         )[1].split("      - name: Upload non-deployable companion evidence artifact\n", 1)[0]
 
         self.assertIn('CARGO_PROFILE_RELEASE_LTO: "false"', build_step)
+        self.assertIn('CARGO_BUILD_JOBS: "1"', build_step)
+        self.assertEqual(workflow.count('CARGO_BUILD_JOBS: "1"'), 1)
+        self.assertIn("timeout-minutes: 150", workflow)
         self.assertNotIn("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", workflow)
         self.assertIn("umask 077", build_step)
         self.assertIn("build --locked --release --timings", build_step)
@@ -131,14 +134,20 @@ class CodexArchiveRetentionTests(unittest.TestCase):
         self.assertIn('"release_codegen_units": 4', build_step)
         self.assertIn('"sample_limit": sample_limit', build_step)
         self.assertIn('"sample_interval_seconds": interval_seconds', build_step)
-        self.assertIn('360 15 <<\'PY\' &', build_step)
+        self.assertIn('"resource_sample_duration_seconds": sample_limit * interval_seconds', build_step)
+        self.assertIn('600 15 <<\'PY\' &', build_step)
+        self.assertIn('print("codex-build-resource " + line, flush=True)', build_step)
         self.assertIn('"nproc": command_integer("nproc")', build_step)
+        self.assertIn('"rustc_process_count": len(values)', build_step)
+        self.assertIn('"rustc_rss_sum_bytes": sum(values)', build_step)
+        self.assertIn('"rustc_rss_max_bytes": max(values, default=0)', build_step)
         self.assertIn('"workflow_run_attempt": run_attempt', build_step)
         self.assertIn('"tested_merge_sha": merge_sha', build_step)
         self.assertIn("samples.flush()", build_step)
         self.assertIn("os.fsync(samples.fileno())", build_step)
         self.assertIn("if (( sampler_status != 0 )); then", build_step)
         self.assertIn("refusing binary artifact", build_step)
+        self.assertIn('test "$binary_bytes" -le "$MAX_BINARY_BYTES"', build_step)
         self.assertIn("cargo-timing.html", build_step)
         self.assertIn("timing_bytes <= 10485760", build_step)
         self.assertIn("if: always()", diagnostics_step)
@@ -404,12 +413,18 @@ class CodexArchiveRetentionTests(unittest.TestCase):
             "tested_merge_sha": manifest["platform_tested_merge_sha"],
             "build_run_id": manifest["workflow_run_id"],
             "build_run_attempt": manifest["workflow_run_attempt"],
+            "build_run_api_sha256": "e" * 64,
+            "build_pr_association_sha256": "a" * 64,
+            "build_pr_association_source": "current-api",
             "build_artifact_id": "34567",
             "build_artifact_sha256": "c" * 64,
             "security_workflow_name": "Platform security and build",
             "security_workflow_path": ".github/workflows/platform-security.yml",
             "security_run_id": "23456",
             "security_run_attempt": "1",
+            "security_run_api_sha256": "f" * 64,
+            "security_pr_association_sha256": "b" * 64,
+            "security_pr_association_source": "current-api",
             "security_conclusion": "success",
             "security_target_sha": manifest["platform_tested_merge_sha"],
             "security_route_artifact_id": "45678",
@@ -630,6 +645,28 @@ class CodexArchiveRetentionTests(unittest.TestCase):
         self.assertEqual(self.call_lines(), [])
         self.assertTrue(rollout.exists())
 
+    def test_activation_receipt_requires_association_hashes_and_sources(self) -> None:
+        thread_id = "17171717-1717-4717-8717-171717171717"
+        rollout = self.insert_thread(thread_id)
+        self.write_rollout(rollout)
+        original = json.loads(self.activation.read_text(encoding="utf-8"))
+        for field, value in (
+            ("build_run_api_sha256", "bad"),
+            ("security_run_api_sha256", "0" * 63),
+            ("build_pr_association_sha256", "bad"),
+            ("security_pr_association_sha256", "0" * 63),
+            ("build_pr_association_source", "caller-authored"),
+            ("security_pr_association_source", None),
+        ):
+            changed = dict(original)
+            changed[field] = value
+            self.activation.write_text(json.dumps(changed), encoding="utf-8")
+            with self.subTest(field=field), self.assertRaises(cleanup.UnsafeState):
+                self.run_retention()
+            self.assertEqual(self.call_lines(), [])
+            self.assertTrue(rollout.exists())
+        self.activation.write_text(json.dumps(original), encoding="utf-8")
+
     def test_runtime_rejects_companion_with_unreviewed_release_lto(self) -> None:
         for invalid_lto in (True, 0):
             manifest = json.loads(self.manifest.read_text(encoding="utf-8"))
@@ -806,6 +843,202 @@ class CodexArchiveRetentionTests(unittest.TestCase):
                 merge=merge,
             )
 
+    def test_postmerge_empty_association_requires_exact_open_pr_capture(self) -> None:
+        run_id, attempt, pr_number = "23456", "2", "123"
+        head, base_sha = "a" * 40, "c" * 40
+        run_api = {
+            "id": int(run_id),
+            "run_attempt": int(attempt),
+            "name": verify_artifact.BUILD_WORKFLOW_NAME,
+            "path": verify_artifact.BUILD_WORKFLOW_PATH,
+            "event": "pull_request",
+            "status": "in_progress",
+            "conclusion": None,
+            "head_sha": head,
+            "repository_full_name": verify_artifact.REPOSITORY,
+            "head_repository_full_name": verify_artifact.REPOSITORY,
+            "pull_requests": [
+                {
+                    "number": int(pr_number),
+                    "head_sha": head,
+                    "head_repository_full_name": verify_artifact.REPOSITORY,
+                    "base_ref": "dev",
+                    "base_sha": base_sha,
+                    "base_repository_full_name": verify_artifact.REPOSITORY,
+                }
+            ],
+        }
+        pr_api = {
+            "number": int(pr_number),
+            "state": "open",
+            "merged_at": None,
+            "head_sha": head,
+            "head_repository_full_name": verify_artifact.REPOSITORY,
+            "base_ref": "dev",
+            "base_sha": base_sha,
+            "base_repository_full_name": verify_artifact.REPOSITORY,
+        }
+        capture = capture_pr_association._capture(
+            run_api,
+            pr_api,
+            run_id=run_id,
+            attempt=attempt,
+            pr_number=pr_number,
+        )
+        completed = {
+            "id": int(run_id),
+            "run_attempt": int(attempt),
+            "name": verify_artifact.BUILD_WORKFLOW_NAME,
+            "path": verify_artifact.BUILD_WORKFLOW_PATH,
+            "event": "pull_request",
+            "status": "completed",
+            "conclusion": "success",
+            "head_sha": head,
+            "repository": {"full_name": verify_artifact.REPOSITORY},
+            "head_repository": {"full_name": verify_artifact.REPOSITORY},
+            "pull_requests": [],
+        }
+        identity_args = {
+            "run_id": run_id,
+            "attempt": attempt,
+            "workflow_name": verify_artifact.BUILD_WORKFLOW_NAME,
+            "workflow_path": verify_artifact.BUILD_WORKFLOW_PATH,
+            "expected_head": head,
+            "pull_request": pr_number,
+        }
+        with self.assertRaisesRegex(verify_artifact.VerificationError, "empty"):
+            verify_artifact._run_identity(completed, **identity_args)
+        identity, source, _ = verify_artifact._run_identity(
+            completed, association_capture=capture, **identity_args
+        )
+        self.assertEqual(identity["conclusion"], "success")
+        self.assertEqual(source, "premerge-capture")
+        with self.assertRaisesRegex(verify_artifact.VerificationError, "successful same-repository"):
+            verify_artifact._run_identity(
+                {**completed, "conclusion": "failure"},
+                association_capture=capture,
+                **identity_args,
+            )
+
+        direct_payload = {**completed, "pull_requests": [{
+                "number": int(pr_number),
+                "head": {"sha": head, "repo": {"full_name": verify_artifact.REPOSITORY}},
+                "base": {"ref": "dev", "sha": base_sha, "repo": {"full_name": verify_artifact.REPOSITORY}},
+            }]}
+        _, source, _ = verify_artifact._run_identity(
+            direct_payload,
+            association_capture=capture,
+            **identity_args,
+        )
+        self.assertEqual(source, "current-api+premerge-capture")
+
+        mutations = (
+            ("run id", {**capture, "run": {**capture["run"], "id": int(run_id) + 1}}),
+            ("attempt", {**capture, "run": {**capture["run"], "run_attempt": 3}}),
+            ("workflow", {**capture, "run": {**capture["run"], "name": "other"}}),
+            ("workflow path", {**capture, "run": {**capture["run"], "path": "other.yml"}}),
+            ("event", {**capture, "run": {**capture["run"], "event": "push"}}),
+            ("repository", {**capture, "run": {**capture["run"], "repository": "fork/repo"}}),
+            ("head repository", {**capture, "run": {**capture["run"], "head_repository": "fork/repo"}}),
+            ("head", {**capture, "run": {**capture["run"], "head_sha": "d" * 40}}),
+            ("associated PR head", {**capture, "run": {**capture["run"], "pull_request_head_sha": "d" * 40}}),
+            ("associated PR head repository", {**capture, "run": {**capture["run"], "pull_request_head_repository": "fork/repo"}}),
+            ("associated PR base ref", {**capture, "run": {**capture["run"], "pull_request_base_ref": "main"}}),
+            ("associated PR base repository", {**capture, "run": {**capture["run"], "pull_request_base_repository": "fork/repo"}}),
+            ("PR number", {**capture, "pull_request": {**capture["pull_request"], "number": 124}}),
+            ("string PR number", {**capture, "pull_request": {**capture["pull_request"], "number": "123"}}),
+            ("PR head", {**capture, "pull_request": {**capture["pull_request"], "head_sha": "d" * 40}}),
+            ("base ref", {**capture, "pull_request": {**capture["pull_request"], "base_ref": "main"}}),
+            ("base", {**capture, "pull_request": {**capture["pull_request"], "base_sha": "e" * 40}}),
+            ("base repository", {**capture, "pull_request": {**capture["pull_request"], "base_repository": "fork/repo"}}),
+            ("closed PR", {**capture, "pull_request": {**capture["pull_request"], "state": "closed"}}),
+            ("merged PR", {**capture, "pull_request": {**capture["pull_request"], "merged_at": "now"}}),
+        )
+        for label, malformed in mutations:
+            with self.subTest(label=label), self.assertRaises(verify_artifact.VerificationError):
+                verify_artifact._run_identity(
+                    completed, association_capture=malformed, **identity_args
+                )
+        with self.assertRaisesRegex(verify_artifact.VerificationError, "singular"):
+            verify_artifact._run_identity(
+                {**completed, "pull_requests": [{}, {}]},
+                association_capture=capture,
+                **identity_args,
+            )
+        with self.assertRaisesRegex(verify_artifact.VerificationError, "malformed"):
+            verify_artifact._run_identity(
+                {**completed, "pull_requests": None},
+                association_capture=capture,
+                **identity_args,
+            )
+        with self.assertRaisesRegex(verify_artifact.VerificationError, "conflicts"):
+            verify_artifact._run_identity(
+                {**direct_payload, "pull_requests": [{
+                    "number": int(pr_number),
+                    "head": {"sha": head, "repo": {"full_name": verify_artifact.REPOSITORY}},
+                    "base": {"ref": "dev", "sha": "f" * 40, "repo": {"full_name": verify_artifact.REPOSITORY}},
+                }]},
+                association_capture=capture,
+                **identity_args,
+            )
+
+    def test_authenticated_capture_projects_only_allowlisted_metadata_and_never_overwrites(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="codex-pr-capture-") as temporary:
+            root = Path(temporary)
+            run_payload = {
+                "id": 23456,
+                "run_attempt": 2,
+                "name": verify_artifact.BUILD_WORKFLOW_NAME,
+                "path": verify_artifact.BUILD_WORKFLOW_PATH,
+                "event": "pull_request",
+                "status": "in_progress",
+                "conclusion": None,
+                "head_sha": "a" * 40,
+                "repository_full_name": verify_artifact.REPOSITORY,
+                "head_repository_full_name": verify_artifact.REPOSITORY,
+                "pull_requests": [{
+                    "number": 123,
+                    "head_sha": "a" * 40,
+                    "head_repository_full_name": verify_artifact.REPOSITORY,
+                    "base_ref": "dev",
+                    "base_sha": "c" * 40,
+                    "base_repository_full_name": verify_artifact.REPOSITORY,
+                }],
+            }
+            pr_payload = {
+                "number": 123,
+                "state": "open",
+                "merged_at": None,
+                "head_sha": "a" * 40,
+                "head_repository_full_name": verify_artifact.REPOSITORY,
+                "base_ref": "dev",
+                "base_sha": "c" * 40,
+                "base_repository_full_name": verify_artifact.REPOSITORY,
+            }
+            responses = iter((run_payload, pr_payload, run_payload, pr_payload))
+
+            def gh_api(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                if argv[:3] == ["gh", "auth", "status"]:
+                    self.assertEqual(argv[-1], "github.com")
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                self.assertEqual(argv[:2], ["gh", "api"])
+                self.assertIn("--jq", argv)
+                return subprocess.CompletedProcess(argv, 0, json.dumps(next(responses)), "")
+
+            output = root / "association.json"
+            with mock.patch.object(capture_pr_association.subprocess, "run", side_effect=gh_api):
+                capture_pr_association.capture("23456", "2", "123", output)
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+            rendered = output.read_text(encoding="ascii")
+            self.assertNotIn("body", rendered)
+            self.assertEqual(
+                set(json.loads(rendered)),
+                {"schema_version", "run", "pull_request"},
+            )
+            with mock.patch.object(capture_pr_association.subprocess, "run", side_effect=gh_api):
+                with self.assertRaises(FileExistsError):
+                    capture_pr_association.capture("23456", "2", "123", output)
+
     def test_exact_api_runs_and_raw_zip_digests_produce_activation_receipt(self) -> None:
         source_root = self.root / "reviewed-source"
         classifier_path = source_root / "platform/tools/platform_ci_classifier.py"
@@ -914,7 +1147,9 @@ class CodexArchiveRetentionTests(unittest.TestCase):
             result.write_text(json.dumps(metadata), encoding="utf-8")
             return result
 
-        def run_record(run_id: str, attempt: str, name: str, path: str) -> Path:
+        def run_record(
+            run_id: str, attempt: str, name: str, path: str, *, include_pr: bool = True
+        ) -> Path:
             payload = {
                 "id": int(run_id),
                 "run_attempt": int(attempt),
@@ -927,10 +1162,21 @@ class CodexArchiveRetentionTests(unittest.TestCase):
                 "repository": {"full_name": "StrayForest/old_sparky"},
                 "head_repository": {"full_name": "StrayForest/old_sparky"},
                 "pull_requests": [
-                    {"number": int(pr), "head": {"sha": head}, "base": {"ref": "dev"}}
-                ],
+                    {
+                        "number": int(pr),
+                        "head": {
+                            "sha": head,
+                            "repo": {"full_name": "StrayForest/old_sparky"},
+                        },
+                        "base": {
+                            "ref": "dev",
+                            "sha": "c" * 40,
+                            "repo": {"full_name": "StrayForest/old_sparky"},
+                        },
+                    }
+                ] if include_pr else [],
             }
-            result = self.root / f"run-{run_id}.json"
+            result = self.root / f"run-{run_id}-{'direct' if include_pr else 'empty'}.json"
             result.write_text(json.dumps(payload), encoding="utf-8")
             return result
 
@@ -953,7 +1199,9 @@ class CodexArchiveRetentionTests(unittest.TestCase):
             security_run_id=security_id,
             security_attempt=security_attempt,
             security_run=run_record(security_id, security_attempt, verify_artifact.SECURITY_WORKFLOW_NAME, verify_artifact.SECURITY_WORKFLOW_PATH),
+            build_pr_association=None,
             security_artifacts=security_artifacts,
+            security_pr_association=None,
             security_zip=security_zip,
             extract_directory=extraction_directory,
             activation_output=output,
@@ -965,6 +1213,16 @@ class CodexArchiveRetentionTests(unittest.TestCase):
         self.assertEqual(activation["classifier_reason"], verify_artifact.STANDARD_FULL_REASON)
         self.assertEqual(activation["build_artifact_id"], "456")
         self.assertEqual(activation["security_route_artifact_id"], "567")
+        self.assertEqual(activation["build_pr_association_source"], "current-api")
+        self.assertEqual(activation["security_pr_association_source"], "current-api")
+        self.assertEqual(
+            activation["build_run_api_sha256"],
+            hashlib.sha256(args.build_run.read_bytes()).hexdigest(),
+        )
+        self.assertEqual(
+            activation["security_run_api_sha256"],
+            hashlib.sha256(args.security_run.read_bytes()).hexdigest(),
+        )
         self.assertEqual(activation["build_artifact_sha256"], hashlib.sha256(build_zip.read_bytes()).hexdigest())
         self.assertEqual(activation["security_route_sha256"], hashlib.sha256(security_zip.read_bytes()).hexdigest())
         self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
@@ -975,6 +1233,152 @@ class CodexArchiveRetentionTests(unittest.TestCase):
         )
         self.assertEqual(stat.S_IMODE(extraction_directory.stat().st_mode), 0o700)
         self.assertEqual(stat.S_IMODE((extraction_directory / "codex").stat().st_mode), 0o600)
+
+        def association_snapshot(run_path: Path, *, run_id: str, attempt: str) -> Path:
+            current = json.loads(run_path.read_text(encoding="utf-8"))
+            association = current["pull_requests"][0]
+            run_api = {
+                "id": current["id"],
+                "run_attempt": current["run_attempt"],
+                "name": current["name"],
+                "path": current["path"],
+                "event": current["event"],
+                "status": "in_progress",
+                "conclusion": None,
+                "head_sha": current["head_sha"],
+                "repository_full_name": current["repository"]["full_name"],
+                "head_repository_full_name": current["head_repository"]["full_name"],
+                "pull_requests": [
+                    {
+                        "number": association["number"],
+                        "head_sha": association["head"]["sha"],
+                        "head_repository_full_name": association["head"]["repo"]["full_name"],
+                        "base_ref": association["base"]["ref"],
+                        "base_sha": association["base"]["sha"],
+                        "base_repository_full_name": association["base"]["repo"]["full_name"],
+                    }
+                ],
+            }
+            pr_api = {
+                "number": int(pr),
+                "state": "open",
+                "merged_at": None,
+                "head_sha": head,
+                "head_repository_full_name": "StrayForest/old_sparky",
+                "base_ref": "dev",
+                "base_sha": "c" * 40,
+                "base_repository_full_name": "StrayForest/old_sparky",
+            }
+            snapshot = capture_pr_association._capture(
+                run_api,
+                pr_api,
+                run_id=run_id,
+                attempt=attempt,
+                pr_number=pr,
+            )
+            path = self.root / f"capture-{run_id}-{attempt}.json"
+            path.write_text(json.dumps(snapshot), encoding="utf-8")
+            path.chmod(0o600)
+            return path
+
+        args.build_pr_association = association_snapshot(
+            args.build_run,
+            run_id=build_id,
+            attempt=build_attempt,
+        )
+        args.security_pr_association = association_snapshot(
+            args.security_run,
+            run_id=security_id,
+            attempt=security_attempt,
+        )
+        direct_capture_output = self.root / "verified-direct-capture.activation.json"
+        args.activation_output = direct_capture_output
+        args.extract_directory = None
+        verify_artifact.verify(args)
+        direct_capture_activation = json.loads(
+            direct_capture_output.read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            direct_capture_activation["build_pr_association_source"],
+            "current-api+premerge-capture",
+        )
+        self.assertEqual(
+            direct_capture_activation["build_run_api_sha256"],
+            hashlib.sha256(args.build_run.read_bytes()).hexdigest(),
+        )
+        self.assertEqual(
+            direct_capture_activation["security_run_api_sha256"],
+            hashlib.sha256(args.security_run.read_bytes()).hexdigest(),
+        )
+        self.assertEqual(
+            direct_capture_activation["build_pr_association_sha256"],
+            hashlib.sha256(args.build_pr_association.read_bytes()).hexdigest(),
+        )
+        self.assertEqual(
+            direct_capture_activation["security_pr_association_sha256"],
+            hashlib.sha256(args.security_pr_association.read_bytes()).hexdigest(),
+        )
+
+        fallback_output = self.root / "verified-after-merge.activation.json"
+        args.build_run = run_record(
+            build_id,
+            build_attempt,
+            verify_artifact.BUILD_WORKFLOW_NAME,
+            verify_artifact.BUILD_WORKFLOW_PATH,
+            include_pr=False,
+        )
+        args.security_run = run_record(
+            security_id,
+            security_attempt,
+            verify_artifact.SECURITY_WORKFLOW_NAME,
+            verify_artifact.SECURITY_WORKFLOW_PATH,
+            include_pr=False,
+        )
+        args.build_pr_association = association_snapshot(
+            run_record(build_id, build_attempt, verify_artifact.BUILD_WORKFLOW_NAME, verify_artifact.BUILD_WORKFLOW_PATH),
+            run_id=build_id,
+            attempt=build_attempt,
+        )
+        args.security_pr_association = association_snapshot(
+            run_record(security_id, security_attempt, verify_artifact.SECURITY_WORKFLOW_NAME, verify_artifact.SECURITY_WORKFLOW_PATH),
+            run_id=security_id,
+            attempt=security_attempt,
+        )
+        args.activation_output = fallback_output
+        args.extract_directory = None
+        original_security_capture = args.security_pr_association.read_bytes()
+        changed_security_capture = json.loads(original_security_capture)
+        changed_security_capture["run"]["pull_request_base_sha"] = "d" * 40
+        changed_security_capture["pull_request"]["base_sha"] = "d" * 40
+        args.security_pr_association.write_text(
+            json.dumps(changed_security_capture), encoding="utf-8"
+        )
+        with self.assertRaisesRegex(
+            verify_artifact.VerificationError, "do not share one PR identity"
+        ):
+            verify_artifact.verify(args)
+        self.assertFalse(fallback_output.exists())
+        args.security_pr_association.write_bytes(original_security_capture)
+        verify_artifact.verify(args)
+        fallback_activation = json.loads(fallback_output.read_text(encoding="utf-8"))
+        self.assertEqual(fallback_activation["build_pr_association_source"], "premerge-capture")
+        self.assertEqual(fallback_activation["security_pr_association_source"], "premerge-capture")
+        self.assertEqual(
+            fallback_activation["build_run_api_sha256"],
+            hashlib.sha256(args.build_run.read_bytes()).hexdigest(),
+        )
+        self.assertEqual(
+            fallback_activation["security_run_api_sha256"],
+            hashlib.sha256(args.security_run.read_bytes()).hexdigest(),
+        )
+        self.assertEqual(
+            fallback_activation["build_pr_association_sha256"],
+            hashlib.sha256(args.build_pr_association.read_bytes()).hexdigest(),
+        )
+        self.assertEqual(
+            fallback_activation["security_pr_association_sha256"],
+            hashlib.sha256(args.security_pr_association.read_bytes()).hexdigest(),
+        )
 
         existing_output = self.root / "preexisting.activation.json"
         existing_output.write_text("preserve existing receipt", encoding="ascii")
@@ -1002,7 +1406,7 @@ class CodexArchiveRetentionTests(unittest.TestCase):
             }
         )
         self.manifest.write_text(json.dumps(manifest), encoding="utf-8")
-        self.activation = output
+        self.activation = fallback_output
         thread_id = "abababab-abab-4bab-8bab-abababababab"
         rollout = self.insert_thread(thread_id)
         self.write_rollout(rollout)

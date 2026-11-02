@@ -24,7 +24,7 @@ jobs:
   build:
     name: Build and test pinned Codex companion
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 150
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.base.ref == 'dev'
@@ -377,6 +377,7 @@ jobs:
           PATCH_SHA256: ${{ steps.lock.outputs.patch_sha256 }}
           MAX_BINARY_BYTES: ${{ steps.lock.outputs.max_binary_bytes }}
           CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_BUILD_JOBS: "1"
         run: |
           set -euo pipefail
           umask 077
@@ -386,7 +387,7 @@ jobs:
           /usr/bin/python3 -I -B -u - "$diagnostics_dir" "$CODEX_RUST_TOOLCHAIN" \
             "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_REPOSITORY" \
             "$PLATFORM_PR_NUMBER" "$PLATFORM_SOURCE_SHA" "$PLATFORM_TESTED_MERGE_SHA" \
-            360 15 <<'PY' &
+            600 15 <<'PY' &
           import json
           import os
           from pathlib import Path
@@ -484,6 +485,26 @@ jobs:
                           "filesystem_available_bytes": None,
                           "filesystem_used_bytes": None}
 
+          def rustc_memory_info():
+              rss = command_text("ps", "-C", "rustc", "-o", "rss=")
+              if rss is None:
+                  return {"rustc_process_count": None,
+                          "rustc_rss_sum_bytes": None,
+                          "rustc_rss_max_bytes": None}
+              values = []
+              for line in rss.splitlines():
+                  value = line.strip()
+                  if not value.isdecimal():
+                      return {"rustc_process_count": None,
+                              "rustc_rss_sum_bytes": None,
+                              "rustc_rss_max_bytes": None}
+                  values.append(int(value) * 1024)
+              return {
+                  "rustc_process_count": len(values),
+                  "rustc_rss_sum_bytes": sum(values),
+                  "rustc_rss_max_bytes": max(values, default=0),
+              }
+
           def snapshot(sample_number):
               return {
                   "sample": sample_number,
@@ -493,6 +514,7 @@ jobs:
                   **memory_info(),
                   **cgroup_info(),
                   **disk_info(),
+                  **rustc_memory_info(),
               }
 
           def write_private_json(path, payload):
@@ -528,6 +550,7 @@ jobs:
               "cargo_timings": True,
               "sample_interval_seconds": interval_seconds,
               "sample_limit": sample_limit,
+              "resource_sample_duration_seconds": sample_limit * interval_seconds,
               **snapshot(0),
           }
           write_private_json(root / "resource-baseline.json", baseline)

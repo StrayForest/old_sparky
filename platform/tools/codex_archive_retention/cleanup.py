@@ -142,12 +142,18 @@ def verify_companion(
         "tested_merge_sha",
         "build_run_id",
         "build_run_attempt",
+        "build_run_api_sha256",
+        "build_pr_association_sha256",
+        "build_pr_association_source",
         "build_artifact_id",
         "build_artifact_sha256",
         "security_workflow_name",
         "security_workflow_path",
         "security_run_id",
         "security_run_attempt",
+        "security_run_api_sha256",
+        "security_pr_association_sha256",
+        "security_pr_association_source",
         "security_conclusion",
         "security_target_sha",
         "security_route_artifact_id",
@@ -191,6 +197,21 @@ def verify_companion(
         value = activation.get(field)
         if not isinstance(value, str) or re.fullmatch(r"[1-9][0-9]{0,31}", value) is None:
             raise UnsafeState("Codex companion activation receipt run identity is malformed")
+    for field in (
+        "build_run_api_sha256",
+        "security_run_api_sha256",
+        "build_pr_association_sha256",
+        "security_pr_association_sha256",
+    ):
+        if re.fullmatch(r"[0-9a-f]{64}", activation.get(field, "")) is None:
+            raise UnsafeState("Codex companion activation receipt association digest is malformed")
+    for field in ("build_pr_association_source", "security_pr_association_source"):
+        if activation.get(field) not in {
+            "current-api",
+            "current-api+premerge-capture",
+            "premerge-capture",
+        }:
+            raise UnsafeState("Codex companion activation receipt association source is malformed")
     for field in ("build_artifact_id", "security_route_artifact_id"):
         value = activation.get(field)
         if not isinstance(value, str) or re.fullmatch(r"[1-9][0-9]{0,31}", value) is None:

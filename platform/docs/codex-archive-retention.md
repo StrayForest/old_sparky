@@ -1,48 +1,65 @@
 # Codex archived-session retention
 
-This procedure owns the local Codex archive-retention companion. It deletes only
-sessions whose state row, archived timestamp, and canonical archive identity
-agree. Codex's native archived-only delete rechecks lifecycle and history
-references under writer locks. The wrapper reads metadata only (IDs, flags and
-timestamps, paths, spawn edges, names and file stats); it never opens rollout
-contents or directly deletes rows or files.
+This procedure owns the local Codex archive-retention companion. It deletes only sessions whose state row, archived
+timestamp, and canonical archive identity agree. Codex's native archived-only delete rechecks lifecycle and history
+references under writer locks. The wrapper reads metadata only (IDs, flags and timestamps, paths, spawn edges, names
+and file stats); it never opens rollout contents or directly deletes rows or files.
 
-The [source lock](../tools/codex_archive_retention/codex-source.lock.json)
-binds the upstream pin and reviewed patch. The patch aligns 170 local
-`codex-rs/Cargo.lock` package versions with source manifests (`0.166.0`),
-without changing third-party records or dependencies; all native commands use
-`--locked`. Same-repository PR builds to `dev` bind exact head/merge, strictly
-apply the patch, run native checks, and publish seven-day review evidence.
-They are read-only: no install, timer enablement, Codex-home reads, or deletion.
-Manifest pins release/four codegen units/`CARGO_PROFILE_RELEASE_LTO=false`;
-separate bounded resource/timing diagnostics are never accepted as binary.
+The [source lock](../tools/codex_archive_retention/codex-source.lock.json) pins source/patch and aligns 170 local lock
+packages to `0.166.0` without changing third-party dependencies. PR builds bind head/merge, apply the patch and test;
+they never install, alter timers, read Codex homes or delete sessions. Manifest pins release/codegen4/LTO=false and
+`CARGO_BUILD_JOBS=1`; timeout is 150 minutes, sampling caps at 600 flushed 15-second rows, and timing output is not binary.
 
 ## Build artifact and activation
 
-Build evidence is review-only. Never install an unreviewed PR. Independently
-review the platform/upstream commits, patch digest, native test results,
-artifact manifest, wrapper, and systemd boundaries. The manifest binds source
-SHA, upstream tag/commit, patch, toolchain, target, CLI version, and binary
-size/digest. Require successful exact-attempt native and canonical `Platform
-security and build` runs for the same PR head and tested merge. The Security
-route must be `full`, `fallback=false`, and `deployable=false`. Match PR,
-repository, base, head, merge, upstream commit, patch, run, and attempt. Fetch
-raw ZIPs and API metadata; `gh run download` alone does not verify GitHub's
-artifact digest.
+Build evidence is review-only. Review source, patch, tests, manifest and systemd boundary. Require exact successful
+native/Security attempts for the same PR head and tested merge; Security must be full, fallback=false, deployable=false.
+Match PR/repository/base/head/merge/run identity and verify raw ZIPs against API digests.
+
+### Phase A: capture while the PR is open
+
+Capture both queued/in-progress attempts before merge; this proves association only. The helper authenticates with `gh`
+and queries the exact run-attempt and `pulls/$PR` APIs, projecting only allowlisted IDs and refs. Preserve `CAPTURE_DIR`
+for Phase B; merge may proceed while native builds. If an attempt reruns, abort this capture path.
+
+```bash
+set -euo pipefail
+PR='<same-repository PR number>'
+REPO_ROOT='<clean checkout at exact PR head SHA>'
+test "$(id -u)" -eq 0
+test "$(stat -c '%u:%a' /root/.codex/private)" = '0:700'
+BUILD_RUN_ID='<exact native build run ID while queued or in progress>'
+BUILD_ATTEMPT='<native build attempt>'
+SECURITY_RUN_ID='<exact Security run ID while queued or in progress>'
+SECURITY_ATTEMPT='<Security run attempt>'
+CAPTURE_DIR="$(mktemp -d /root/.codex/private/codex-archive-association.XXXXXX)"
+python3 -I -B "$REPO_ROOT/platform/tools/codex_archive_retention/capture_pr_association.py" --run-id "$BUILD_RUN_ID" --attempt "$BUILD_ATTEMPT" --pull-request "$PR" --output "$CAPTURE_DIR/build.json"
+python3 -I -B "$REPO_ROOT/platform/tools/codex_archive_retention/capture_pr_association.py" --run-id "$SECURITY_RUN_ID" --attempt "$SECURITY_ATTEMPT" --pull-request "$PR" --output "$CAPTURE_DIR/security.json"
+printf 'Save this private capture directory for Phase B: %s\n' "$CAPTURE_DIR"
+```
+
+### Phase B: verify completed runs and artifacts
+
+In a later root shell, reuse captured IDs/attempts and `CAPTURE_DIR` only after current API success and both artifacts exist.
 
 ```bash
 set -euo pipefail
 REPO=StrayForest/old_sparky
 PR='<same-repository PR number>'
+REPO_ROOT='<clean checkout at exact PR head SHA>'
 HEAD_SHA='<exact PR head SHA>'
 MERGE_SHA='<exact merge SHA tested by Security>'
 BUILD_RUN_ID='<successful native build run ID>'
 BUILD_ATTEMPT='<native build run attempt>'
 SECURITY_RUN_ID='<successful Platform security and build run ID>'
 SECURITY_ATTEMPT='<Security run attempt>'
+CAPTURE_DIR='<saved Phase A directory, owned mode 0700>'
 ARTIFACT_DIR="$(mktemp -d /dev/shm/codex-archive-retention.XXXXXX)"
 chmod 700 "$ARTIFACT_DIR"
 test "$(id -u)" -eq 0
+test ! -L "$CAPTURE_DIR" && test "$(stat -c '%u:%a' "$CAPTURE_DIR")" = '0:700'
+test ! -L "$CAPTURE_DIR/build.json" && test "$(stat -c '%u:%a' "$CAPTURE_DIR/build.json")" = '0:600'
+test ! -L "$CAPTURE_DIR/security.json" && test "$(stat -c '%u:%a' "$CAPTURE_DIR/security.json")" = '0:600'
 test "$(stat -c '%u:%a' "$ARTIFACT_DIR")" = '0:700'
 BUILD_NAME="codex-archive-retention-$BUILD_RUN_ID-$BUILD_ATTEMPT"
 SECURITY_ROUTE_NAME="platform-ci-route-$SECURITY_RUN_ID-$SECURITY_ATTEMPT"
@@ -133,26 +150,24 @@ gh api --silent --header 'Accept: application/vnd.github+json' \
   "/repos/$REPO/actions/artifacts/$BUILD_ARTIFACT_ID/zip" > "$ARTIFACT_DIR/build-artifact.zip"
 gh api --silent --header 'Accept: application/vnd.github+json' \
   "/repos/$REPO/actions/artifacts/$SECURITY_ARTIFACT_ID/zip" > "$ARTIFACT_DIR/security-route.zip"
-REPO_ROOT='<clean checkout at exact PR head SHA>'
 python3 -I -B "$REPO_ROOT/platform/tools/codex_archive_retention/verify_artifact.py" \
   --source-root "$REPO_ROOT" --pull-request "$PR" --head-sha "$HEAD_SHA" --merge-sha "$MERGE_SHA" \
   --build-run-id "$BUILD_RUN_ID" --build-attempt "$BUILD_ATTEMPT" \
   --build-run "$ARTIFACT_DIR/build-run.json" --build-artifacts "$ARTIFACT_DIR/build-artifacts.json" \
+  --build-pr-association "$CAPTURE_DIR/build.json" \
   --build-zip "$ARTIFACT_DIR/build-artifact.zip" \
   --security-run-id "$SECURITY_RUN_ID" --security-attempt "$SECURITY_ATTEMPT" \
   --security-run "$ARTIFACT_DIR/security-run.json" --security-artifacts "$ARTIFACT_DIR/security-artifacts.json" \
+  --security-pr-association "$CAPTURE_DIR/security.json" \
   --security-zip "$ARTIFACT_DIR/security-route.zip" \
   --extract-directory "$ARTIFACT_DIR/extracted" \
   --activation-output "$ARTIFACT_DIR/codex.activation.json"
 ```
 
-The verifier binds successful attempts and the full/non-fallback/non-deployable
-route, matches both raw ZIPs to API digests, validates closed members and
-binary/source identity without execution, then extracts three members mode
-`0600` under a private mode-`0700` directory and writes the API-bound receipt.
-It rejects missing, expired, duplicate, stale, malformed, or mismatched input;
-do not continue from partial downloads. Keep staging private until review and install decision. The receipt preserves the exact route reason and
-runtime-sensitive value. Its closed schema is:
+The verifier requires completed-success attempts and a full, non-fallback, non-deployable route. It matches raw ZIPs,
+validates closed members and binary/source without execution, then extracts three mode-`0600` files. Authenticated
+captures prove association only: current singleton PR links must match, and only empty post-merge arrays may use captures.
+The current APIs still prove success; malformed or mismatched evidence rejects. The receipt binds route reason/sensitivity:
 
 ```json
 {
@@ -163,12 +178,18 @@ runtime-sensitive value. Its closed schema is:
   "tested_merge_sha": "<tested merge SHA>",
   "build_run_id": "<native build run ID>",
   "build_run_attempt": "<native build attempt>",
+  "build_run_api_sha256": "<SHA-256 of the exact completed-attempt API JSON>",
+  "build_pr_association_sha256": "<SHA-256 of the authenticated association evidence>",
+  "build_pr_association_source": "<current-api, current-api+premerge-capture, or premerge-capture>",
   "build_artifact_id": "<GitHub build artifact ID>",
   "build_artifact_sha256": "<GitHub artifact digest without sha256:>",
   "security_workflow_name": "Platform security and build",
   "security_workflow_path": ".github/workflows/platform-security.yml",
   "security_run_id": "<Security run ID>",
   "security_run_attempt": "<Security attempt>",
+  "security_run_api_sha256": "<SHA-256 of the exact completed-attempt API JSON>",
+  "security_pr_association_sha256": "<SHA-256 of the authenticated association evidence>",
+  "security_pr_association_source": "<current-api, current-api+premerge-capture, or premerge-capture>",
   "security_conclusion": "success",
   "security_target_sha": "<tested merge SHA>",
   "security_route_artifact_id": "<GitHub route artifact ID>",
@@ -181,22 +202,14 @@ runtime-sensitive value. Its closed schema is:
 }
 ```
 
-The verifier writes mode `0600`; install root-owned mode `0600`. The service
-wrapper rejects a missing, writable, malformed, or mismatched receipt before
-enumerating candidates or invoking the binary.
+The verifier writes mode `0600`; install root-owned mode `0600`. The service wrapper rejects missing, writable, malformed or mismatched receipts before enumerating candidates or invoking the binary.
 
-Install after review and receipt verification using a clean exact-head
-`REPO_ROOT` and the unit's root-owned `INSTALL_ROOT`. Check disk admission
-before quiescing, preserve rollback files privately, and never execute from
-`/dev/shm`. Keep one root shell for all blocks because later steps reuse
-validated variables.
+After receipt review, use a clean exact-head checkout and root-owned install root. Check disk before quiescing, preserve
+rollback files privately and never execute from `/dev/shm`.
 
-The trusted pre-quiesce ops snapshot records timer enabled/active and the
-legacy static service failed. Current timer must be enabled/inactive. Capture
-fresh service MainPID/cgroup metadata and require no process before stopping
-both units. Clear only the service failure; then require inactive state and an
-empty cgroup. Unknown or transitional states stop. Rollback restores the
-original timer without directly starting the legacy service.
+The trusted ops snapshot records timer enabled/active and the static service failed. Require current timer enabled/inactive;
+confirm fresh service MainPID/cgroup are empty before stop, then clear only its failed state and recheck quiescence. Unknown
+states stop. Rollback restores the original timer without starting the legacy service.
 
 ```bash
 set -euo pipefail
@@ -495,23 +508,15 @@ sudo systemctl is-active --quiet codex-archive-retention.timer
 sudo systemctl list-timers codex-archive-retention.timer --no-pager
 ```
 
-The root service can write only the Codex home and has no external credentials.
-The wrapper holds a root-owned nonblocking lock, makes at most 16 native
-attempts, and re-enumerates after each success so archived children precede
-parents. A mode-`0600` metadata cursor rotates the starting ID between runs;
-each ID is attempted once per invocation, and native refusals are deferred.
-Invalid cursor or inconsistent state stops the run. The systemd sandbox makes
-installed code read-only and prevents other service identities from writing it.
+The root service writes only Codex home and has no external credentials. Its root-locked wrapper makes at most 16 native
+attempts, re-enumerates after success so archived children precede parents, and rotates IDs with a mode-`0600` metadata
+cursor. Each ID is tried once; refusals defer and invalid state stops. Systemd keeps installed code read-only to others.
 
 ## Validate and abort
 
-Inspect only unit status and bounded logs; never capture rollout data. A
-healthy service exits zero and is `inactive (dead)`. Logs contain attempt,
-delete, defer, and remaining row/file counts only. Do not edit the cursor while
-the timer is enabled. Before accepting a run, compare active rows/files using
-metadata only. On any verification or state failure, restore the exact old
-wrapper/units and pre-quiesce timer state from the ops snapshot. Clear the
-legacy failure record but do not directly start that service.
+Inspect bounded unit status/logs only; never capture rollout data. Healthy service exits zero and is `inactive (dead)`;
+logs contain aggregate counts. Do not edit cursor with timer enabled. Compare active rows/files by metadata. On failure,
+restore exact wrapper/units and original timer state; clear legacy failure without starting that service.
 
 ```bash
 set -euo pipefail
@@ -577,10 +582,8 @@ case "$ROLLBACK_DIR" in
 esac
 ```
 
-On success, first confirm one completed zero-exit service run and a
-metadata-only active-session comparison. Then remove only the private tmpfs
-artifact directory; keep the rollback directory until the retention result is
-accepted:
+After one completed zero-exit service run and metadata-only active-session comparison, remove only the private tmpfs
+artifact directory; keep rollback evidence until the retention result is accepted:
 
 ```bash
 set -euo pipefail
@@ -593,8 +596,5 @@ case "$ARTIFACT_DIR" in
 esac
 ```
 
-On abort, preserve the failed private artifact directory and rollback evidence
-for review; do not restore archived rows or rollouts from guessed paths.
-Resume only after the source, artifact, restored unit state, and local Codex
-state have been revalidated. A later invocation retries candidates that were
-refused or fell outside the per-run batch bound.
+On abort, preserve private artifact and rollback evidence; do not restore guessed archive paths. Resume only after source,
+artifact, restored unit state and local Codex state are revalidated. Later invocations retry deferred candidates.
