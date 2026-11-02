@@ -6,7 +6,10 @@
 
 Use this runbook for the zero-credit authenticated SSR composite diagnostic.
 It runs one unprofiled 120-second capacity window, then a separate profiled
-20-second attribution window against the same 14-actor fixture. The diagnostic
+20-second attribution window against the same fixture of one tournament and
+14 users. The general `authenticated-page-load-v1` profile remains 40
+tournaments by 500 users; the trusted diagnostic serializer validates that
+profile but fixes the diagnostic fixture to its 1-by-14 cohort. The diagnostic
 does not change runtime settings and does not earn SLO, capacity, or release
 acceptance credit.
 
