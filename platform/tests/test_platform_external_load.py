@@ -4660,7 +4660,67 @@ class ExternalLoadTests(unittest.TestCase):
             "node_memory_status": "complete", "node_memory_reason": "none",
             "cgroup_memory_status": "complete", "cgroup_memory_reason": "none",
             "node_memory_rows": node_rows,
-            "request_correlation": {"status": "incomplete", "summary": None},
+        }
+        request_id = next(
+            f"{candidate:032x}"
+            for candidate in range(1, 1_000)
+            if capacity_diagnostic._ssr_join_id_is_eligible(
+                phase_run_id, f"{candidate:032x}",
+            )
+        )
+        correlation_window_start = "1970-01-01T00:00:00.010+00:00"
+        correlation_window_end = "1970-01-01T00:02:00.010+00:00"
+        correlation_event_at = "1970-01-01T00:00:01.010+00:00"
+        correlation_context = {
+            "run_id": phase_run_id,
+            "phase": "on",
+            "window_start_utc": correlation_window_start,
+            "window_end_utc": correlation_window_end,
+            "event_at_utc": correlation_event_at,
+            "request_id": request_id,
+        }
+        correlation_summary = cpu_plan.summarize_ssr_request_correlation(
+            selected_request_ids=[request_id],
+            submitted_html_count=1,
+            valid_response_id_count=1,
+            eligible_response_id_count=1,
+            selection_scheme=capacity_diagnostic.SSR_JOIN_SAMPLE_SCHEME,
+            missing_response_id_count=0,
+            duplicate_response_id_count=0,
+            malformed_response_id_count=0,
+            run_id=phase_run_id,
+            phase="on",
+            window_start_utc=correlation_window_start,
+            window_end_utc=correlation_window_end,
+            nginx_rows=[{
+                **correlation_context, "request_time_ms": 10.0, "cf_ray": "edge-1",
+            }],
+            ssr_rows=[{
+                **correlation_context, "stage": "page_component", "duration_ms": 5.0,
+            }],
+            stream_rows=[{
+                **correlation_context, "stage": "request_start", "elapsed_ms": 0.5,
+            }],
+            api_rows=[{
+                **correlation_context, "route_class": "tournament_workspace",
+                "total_ms": 4.0, "sql_ms": 1.0, "max_sql_ms": 1.0,
+                "pool_checkout_wait_ms": 0.1, "pool_connection_hold_ms": 0.5,
+                "compute_ms": 2.0, "sql_count": 1,
+            }],
+        )
+        correlation_summary["ssr_stream_coverage"] = {
+            "records": 0, "selector_overflow": 0,
+            "selector_overflow_unattributed": 0, "row_cap_records": 0,
+            "row_cap_rows": 0, "truncated_records": 0,
+            "malformed_records": 0, "capture_marker_records": 1,
+            "capture_eligible_requests": 1, "capture_retained_requests": 1,
+            "capture_lost_requests": 0, "capture_rows": 1,
+            "capture_lost_rows": 0, "capture_truncated_records": 0,
+            "capture_malformed_records": 0, "capture_status": "complete",
+            "status": "none",
+        }
+        complete_telemetry["request_correlation"] = {
+            "status": "complete", "summary": correlation_summary,
         }
         typed_report = {
             "schema": 1, "report_complete": True, "workload": workload,

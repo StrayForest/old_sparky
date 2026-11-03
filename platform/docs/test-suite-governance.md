@@ -420,24 +420,23 @@ SPA flows check client URLs and hydrated DOM, preserving project/auth/fixture co
 
 ## Local and GitHub verification
 
-Use the canonical registry for focused local feedback, then each affected owner gate; impact
-planning is advisory and does not replace either check.
+Use the canonical registry for focused local feedback, then run each affected owner gate; impact planning is advisory.
+
+Replace example paths/selectors with current changes. Backend needs `backend`; web needs `web-quality` and `web-hermetic`.
+`backend-unit --focused` is DB-free; `backend` needs DB, Redis and privileged resources. Run `ci` for a full local pass; Actions remain the release authority.
+
+When the local runner cannot create PID namespaces, run the other `performance-contract` IDs as a local subset. Keep the summary outside the repository; hosted CI still requires the full contour.
 
 ```bash
 cd platform
-.cache/platform-ci-venv/bin/python tools/platform_verify.py impact \
-  --changed-path platform/apps/platform_api/app/main.py
-.cache/platform-ci-venv/bin/python tools/platform_verify.py backend-unit \
-  --focused tests.test_platform_domain
+.cache/platform-ci-venv/bin/python -c 'from tools import platform_test_catalog as c; from tools.platform_verify import main;
+r = c.TEST_NONROOT_PID_NAMESPACE_REQUIREMENTS; ids = [x.test_id for x in c.cases_for_contour("performance-contract") if x.test_id not in r];
+raise SystemExit(main(["performance-contract", "--focused", *ids, "--summary", "/tmp/performance-contract-focused-summary.json", "--quiet"]))'
 ```
 
-Replace example paths/selectors with current changes. Backend needs `backend`; web needs `web-quality` and `web-hermetic`.
-`backend-unit --focused` is DB-free; `backend` needs DB, Redis and privileged resources. Run `ci` only for a full local pass;
-exact-SHA Actions gates remain the release authority.
+Report `LOCAL GATE BLOCKED` when local requirements are unavailable; never spoof runner markers or claim full-contour success.
 
 For full local Python gate dependencies, see [the development guide](development-guide.md#python-dependency-ownership).
-
-`LOCAL GATE BLOCKED` means required safe dependencies are unavailable; a smaller substitute is not a complete-gate pass.
 
 The privileged storage-maintenance host-contract test is catalogued with its
 GitHub-hosted Linux environment markers. The canonical verifier and runner
