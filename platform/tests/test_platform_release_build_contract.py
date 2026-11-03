@@ -1632,47 +1632,39 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertNotIn('/usr/bin/python3 "$artifacts_metadata"', workflow)
         self.assertIn("/usr/bin/python3 \"$trusted_tool\" metadata", workflow)
         self.assertIn("/usr/bin/python3 \"$trusted_tool\" manifest", workflow)
-        host_build = self._workflow_step_run(
-            workflow, "Verify exact host-tools artifact metadata"
-        )
+        host_build = workflow_job(workflow, "build-host-tools")
+        host_capability = workflow_job(workflow, "host-capability-preflight")
         host_preflight = self._workflow_step_run(
             workflow, "Validate host-tools artifact envelope and bundle"
         )
-        self.assertIn(
-            "actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}",
-            host_build,
+        outer_verification = self._workflow_step_run(
+            workflow,
+            "Rebind outer artifact and attest exact inner bundle before extraction",
         )
-        self.assertIn("platform/tools/platform_host_tools_bundle.py", host_build)
-        self.assertIn("verify-artifact-metadata", host_build)
-        self.assertIn("--max-filesize 524288", host_build)
-        self.assertIn("platform_fetch_artifact_metadata.py", host_build)
-        metadata_fetch_source = (
-            TOOLS_DIR / "platform_fetch_artifact_metadata.py"
-        ).read_text()
-        self.assertIn(
-            "TRANSIENT_HTTP_STATUSES = frozenset({404, 408, 425, 429, 500, 502, 503, 504})",
-            metadata_fetch_source,
+        final_handoff = self._workflow_step_run(
+            workflow, "Create closed host-tools handoff after final verification"
         )
-        self.assertIn("TOTAL_DEADLINE_SECONDS = 50.0", metadata_fetch_source)
-        self.assertIn("MAX_ATTEMPTS = 4", metadata_fetch_source)
-        self.assertIn(
-            "/usr/bin/timeout --signal=TERM --kill-after=5s 55s",
-            host_build,
+        self.assertNotIn("Verify exact host-tools artifact metadata", host_build)
+        self.assertNotIn(
+            "/actions/artifacts/${HOST_TOOLS_ARTIFACT_ID}/zip", host_build
         )
-        metadata_call = host_build[
-            host_build.index("platform_fetch_artifact_metadata.py") : host_build.index(
-                "api_zip=\"$RUNNER_TEMP/platform-host-tools-artifact.zip\""
-            )
-        ]
-        self.assertNotIn("GH_TOKEN", metadata_call)
-        self.assertIn('--archive "$api_zip"', host_build)
-        self.assertNotIn("--jq", host_build)
-        self.assertNotIn("@tsv", host_build)
-        self.assertIn("host-tools workflow attempt metadata request failed", host_build)
-        self.assertIn("verify-workflow-attempt", host_build)
-        self.assertNotIn(".workflow_run.run_attempt", host_build)
-        self.assertIn('"sha256:${HOST_TOOLS_ARTIFACT_DIGEST}"', host_build)
-        self.assertIn("sha256sum -c", host_build)
+        self.assertEqual(
+            1,
+            host_capability.count(
+                "/actions/artifacts/${HOST_TOOLS_ARTIFACT_ID}/zip"
+            ),
+        )
+        self.assertIn("gh attestation verify", outer_verification)
+        self.assertIn('payload.get("digest") != digest', outer_verification)
+        self.assertIn('workflow_run.get("id") != int(run_id)', outer_verification)
+        self.assertIn('workflow_run.get("head_sha") != source_sha', outer_verification)
+        self.assertIn("runInvocationURI", final_handoff)
+        self.assertIn(
+            "actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}/jobs",
+            final_handoff,
+        )
+        self.assertIn('row.get("run_attempt") == attempt', final_handoff)
+        self.assertIn('row.get("conclusion") == "success"', final_handoff)
         self.assertNotIn("actions/checkout@", host_preflight)
         self.assertNotIn("platform_host_tools_bundle.py", host_preflight)
         self.assertIn("HOST_TOOLS_TOOLSET_VERSION", host_preflight)
@@ -1685,7 +1677,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
 
         # Execute the actual embedded pre-SSH bundle validator against both
         # trusted source layouts and closed negative variants. This keeps the
-        # workflow's duplicate envelope check aligned with the bundle builder.
+        # pre-build capability-gate envelope check aligned with the builder.
         validator_command = '/usr/bin/python3 - "$inner_root/manifest.json"'
         validator_start = host_preflight.index(validator_command)
         script_start = host_preflight.index("<<'PY'\n", validator_start) + len("<<'PY'\n")

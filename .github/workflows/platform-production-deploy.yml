@@ -740,74 +740,6 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Verify exact host-tools artifact metadata
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          HOST_TOOLS_ARTIFACT_ID: ${{ steps.publish-host-tools.outputs.artifact-id }}
-          HOST_TOOLS_ARTIFACT_DIGEST: ${{ steps.publish-host-tools.outputs.artifact-digest }}
-          HOST_TOOLS_ARTIFACT_NAME: platform-host-tools-bundle-${{ github.run_id }}-${{ github.run_attempt }}
-        run: |
-          set -euo pipefail
-          umask 077
-          [[ "$HOST_TOOLS_ARTIFACT_ID" =~ ^[1-9][0-9]{0,31}$ ]]
-          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
-          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
-          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
-          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
-          test "$GITHUB_REF" = "refs/heads/dev"
-          HOST_TOOLS_ARTIFACT_DIGEST="${HOST_TOOLS_ARTIFACT_DIGEST#sha256:}"
-          [[ "$HOST_TOOLS_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
-          metadata_path="$RUNNER_TEMP/host-tools-artifact-metadata.json"
-          target_source="$GITHUB_WORKSPACE/target-source"
-          /usr/bin/timeout --signal=TERM --kill-after=5s 55s \
-            /usr/bin/python3 "$target_source/platform/tools/platform_fetch_artifact_metadata.py" \
-            --api-url "$GITHUB_API_URL" \
-            --repository "$GITHUB_REPOSITORY" \
-            --artifact-id "$HOST_TOOLS_ARTIFACT_ID" \
-            --output "$metadata_path"
-          test "$(stat -c '%F:%a:%h' -- "$metadata_path")" = "regular file:600:1"
-          api_zip="$RUNNER_TEMP/platform-host-tools-artifact.zip"
-          curl --fail-with-body --silent --show-error --location --max-filesize 8388608 \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header "Accept: application/vnd.github+json" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${HOST_TOOLS_ARTIFACT_ID}/zip" \
-            --output "$api_zip"
-          host_tools_source="$GITHUB_WORKSPACE/host-tools-source"
-          /usr/bin/python3 "$host_tools_source/platform/tools/platform_host_tools_bundle.py" verify-artifact-metadata \
-            --metadata "$metadata_path" \
-            --artifact-id "$HOST_TOOLS_ARTIFACT_ID" \
-            --artifact-name "$HOST_TOOLS_ARTIFACT_NAME" \
-            --run-id "$GITHUB_RUN_ID" \
-            --run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --source-sha "$TARGET_SHA" \
-            --expected-branch dev \
-            --artifact-digest "sha256:${HOST_TOOLS_ARTIFACT_DIGEST}" \
-            --archive "$api_zip"
-          printf '%s  %s\n' "$HOST_TOOLS_ARTIFACT_DIGEST" "$api_zip" | sha256sum -c - >/dev/null 2>/dev/null
-          attempt_json="$RUNNER_TEMP/host-tools-workflow-attempt.json"
-          attempt_error="$RUNNER_TEMP/host-tools-workflow-attempt.error"
-          if ! curl --fail --silent --show-error --location --max-filesize 524288 \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header "Accept: application/vnd.github+json" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
-            --output "$attempt_json" 2> "$attempt_error"; then
-            rm -f -- "$attempt_json" "$attempt_error"
-            echo "host-tools workflow attempt metadata request failed" >&2
-            exit 1
-          fi
-          rm -f -- "$attempt_error"
-          /usr/bin/python3 "$host_tools_source/platform/tools/platform_host_tools_bundle.py" verify-workflow-attempt \
-            --metadata "$attempt_json" \
-            --run-id "$GITHUB_RUN_ID" \
-            --run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --source-sha "$TARGET_SHA" \
-            --repository "$GITHUB_REPOSITORY" \
-            --expected-branch dev \
-            --expected-event workflow_dispatch
-
       - name: Attest exact host-tools bundle
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
@@ -819,11 +751,6 @@ jobs:
         run: |
           rm -rf -- "$GITHUB_WORKSPACE/target-source" "$GITHUB_WORKSPACE/host-tools-source"
           rm -rf -- "$RUNNER_TEMP/host-tools-artifact"
-          rm -f -- "$RUNNER_TEMP/platform-host-tools-artifact.zip" \
-            "$RUNNER_TEMP/host-tools-artifact-metadata.json" \
-            "$RUNNER_TEMP/host-tools-artifact-metadata.error" \
-            "$RUNNER_TEMP/host-tools-workflow-attempt.json" \
-            "$RUNNER_TEMP/host-tools-workflow-attempt.error"
 
   # This is a read-only capability gate. It consumes the attested bundle as
   # data, checks the already provisioned immutable generation, and then invokes
@@ -1553,8 +1480,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rm -f -- "$RUNNER_TEMP/platform-host-tools-artifact.zip" \
-            "$RUNNER_TEMP/host-tools-final-artifact.zip" \
+          rm -f -- "$RUNNER_TEMP/host-tools-final-artifact.zip" \
             "$RUNNER_TEMP/host-tools-final-artifact-metadata.json" \
             "$RUNNER_TEMP/host-tools-attestation.json" \
             "$RUNNER_TEMP/host-tools-build-jobs.json" \
