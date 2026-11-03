@@ -284,7 +284,10 @@ identities, and all of these conditions hold:
 - The unprofiled capacity phase completes its full 120-second ON window with
   every submitted request accounted for, successful HTTP status and HTML
   validation, complete required SSR request identity/timing and origin CPU
-  evidence, no abort, and successful plan cleanup. In
+  evidence, no abort, and successful plan cleanup. Require
+  `server_telemetry.request_correlation.status=complete` in the sanitized
+  report; an incomplete correlation aggregate cannot receive a PASS even if
+  the report envelope says `complete`. In
   `transient_ssr_join_counts`, require `submitted_html_count` to equal the
   started-in-window HTML request count, `valid_response_id_count` to equal
   `submitted_html_count`, and `missing_response_id_count`,

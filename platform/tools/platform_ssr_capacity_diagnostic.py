@@ -5152,6 +5152,15 @@ def evaluate_capacity_report(
             or report.get("namespace_closed") is not True
             or report.get("remote_plan_cleanup") != "complete"):
         return "FAIL" if report.get("status") == "resource_abort" else "INVALID"
+    if workload in SSR_CORRELATION_WORKLOADS:
+        server_telemetry = report.get("server_telemetry")
+        request_correlation = (
+            server_telemetry.get("request_correlation")
+            if isinstance(server_telemetry, dict) else None
+        )
+        if (not isinstance(request_correlation, dict)
+                or request_correlation.get("status") != "complete"):
+            return "INVALID"
     worker = report.get("worker")
     memory = report["memory_guard"]
     runner = report["runner_headroom"]

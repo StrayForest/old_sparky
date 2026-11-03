@@ -20,7 +20,7 @@ import signal
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from concurrent.futures import Future, ThreadPoolExecutor
 from argparse import Namespace
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import time
 from types import SimpleNamespace
@@ -2899,6 +2899,101 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "actors": 14,
         })
         html_report["worker"]["fixture_manifest_bytes"] = len(manifest_raw)
+        html_window_start = html_report["worker"]["on_window_start_ms"]
+        html_window_end = html_report["worker"]["on_window_end_ms"]
+        html_run_id = html_report["run_id"]
+        html_join_ids = [
+            f"{candidate:032x}"
+            for candidate in range(1, 10_000)
+            if capacity_diagnostic._ssr_join_id_is_eligible(
+                html_run_id, f"{candidate:032x}",
+            )
+        ][:40]
+        html_request_results = [SimpleNamespace(
+            started_at_utc=datetime.fromtimestamp(
+                (html_window_start + 1_000) / 1_000, tz=timezone.utc,
+            ).isoformat(),
+            finished_at_utc=datetime.fromtimestamp(
+                (html_window_start + 2_000) / 1_000, tz=timezone.utc,
+            ).isoformat(),
+            cf_ray=f"edge-{index}", ssr_request_id=request_id,
+        ) for index, request_id in enumerate(html_join_ids)]
+        _selected_html_requests, html_request_evidence = (
+            capacity_diagnostic._phase_request_window_evidence(
+                html_request_results,
+                start_ms=html_window_start,
+                end_ms=html_window_end,
+                run_id=html_run_id,
+            )
+        )
+        html_report["worker"]["request_window_evidence"] = html_request_evidence
+        html_report["worker"].update({
+            "failure_evidence": capacity_diagnostic._failure_evidence(),
+            "actual_on_request_started_at_utc": html_request_results[0].started_at_utc,
+            "actual_on_request_finished_at_utc": html_request_results[-1].finished_at_utc,
+            "failure_evidence_status": "available",
+        })
+        html_window_start_utc = datetime.fromtimestamp(
+            html_window_start / 1_000, tz=timezone.utc,
+        ).isoformat()
+        html_window_end_utc = datetime.fromtimestamp(
+            html_window_end / 1_000, tz=timezone.utc,
+        ).isoformat()
+        html_event_utc = datetime.fromtimestamp(
+            (html_window_start + 1_000) / 1_000, tz=timezone.utc,
+        ).isoformat()
+        html_context_rows = [{
+            "run_id": html_run_id,
+            "phase": "on",
+            "window_start_utc": html_window_start_utc,
+            "window_end_utc": html_window_end_utc,
+            "event_at_utc": html_event_utc,
+            "request_id": request_id,
+        } for request_id in html_join_ids]
+        correlation_summary = diagnostic_plan_tool.summarize_ssr_request_correlation(
+            selected_request_ids=html_join_ids,
+            submitted_html_count=len(html_join_ids),
+            valid_response_id_count=len(html_join_ids),
+            eligible_response_id_count=len(html_join_ids),
+            selection_scheme=capacity_diagnostic.SSR_JOIN_SAMPLE_SCHEME,
+            missing_response_id_count=0,
+            duplicate_response_id_count=0,
+            malformed_response_id_count=0,
+            run_id=html_run_id,
+            phase="on",
+            window_start_utc=html_window_start_utc,
+            window_end_utc=html_window_end_utc,
+            nginx_rows=[{
+                **row, "request_time_ms": 50.0, "cf_ray": f"edge-{index}",
+            } for index, row in enumerate(html_context_rows)],
+            ssr_rows=[{
+                **row, "stage": "page_component", "duration_ms": 40.0,
+            } for row in html_context_rows],
+            stream_rows=[{
+                **row, "stage": "request_start", "elapsed_ms": 0.5,
+            } for row in html_context_rows],
+            api_rows=[{
+                **row, "route_class": "tournament_workspace",
+                "total_ms": 20.0, "sql_ms": 4.0, "max_sql_ms": 2.0,
+                "pool_checkout_wait_ms": 1.0, "pool_connection_hold_ms": 3.0,
+                "compute_ms": 8.0, "sql_count": 2,
+            } for row in html_context_rows],
+        )
+        correlation_summary["ssr_stream_coverage"] = {
+            "records": len(html_context_rows), "selector_overflow": 0,
+            "selector_overflow_unattributed": 0, "row_cap_records": 0,
+            "row_cap_rows": 0, "truncated_records": 0,
+            "malformed_records": 0, "capture_marker_records": 1,
+            "capture_eligible_requests": len(html_context_rows),
+            "capture_retained_requests": len(html_context_rows),
+            "capture_lost_requests": 0, "capture_rows": len(html_context_rows),
+            "capture_lost_rows": 0, "capture_truncated_records": 0,
+            "capture_malformed_records": 0, "capture_status": "complete",
+            "status": "none",
+        }
+        html_report["server_telemetry"]["request_correlation"] = {
+            "status": "complete", "summary": correlation_summary,
+        }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             input_path = root / "html-report.json"
@@ -2927,6 +3022,31 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 run_id="12345", attempt="1", manifest_sha256=manifest_sha,
                 workload=capacity_diagnostic.HTML_WORKLOAD,
             ), "PASS")
+            incomplete_correlation = json.loads(json.dumps(sanitized_legacy))
+            incomplete_correlation["server_telemetry"]["request_correlation"] = {
+                "status": "incomplete", "summary": None,
+            }
+            self.assertEqual(capacity_diagnostic.evaluate_capacity_report(
+                incomplete_correlation,
+                source_sha="b" * 40, app_target_sha="c" * 40,
+                run_id="12345", attempt="1", manifest_sha256=manifest_sha,
+                workload=capacity_diagnostic.HTML_WORKLOAD,
+            ), "INVALID")
+            aborted_incomplete_correlation = json.loads(
+                json.dumps(incomplete_correlation),
+            )
+            aborted_incomplete_correlation["status"] = "resource_abort"
+            aborted_incomplete_correlation["passed"] = False
+            aborted_incomplete_correlation["memory_guard"].update({
+                "terminal_decision": "abort",
+                "terminal_reason": "resource_abort",
+            })
+            self.assertEqual(capacity_diagnostic.evaluate_capacity_report(
+                aborted_incomplete_correlation,
+                source_sha="b" * 40, app_target_sha="c" * 40,
+                run_id="12345", attempt="1", manifest_sha256=manifest_sha,
+                workload=capacity_diagnostic.HTML_WORKLOAD,
+            ), "FAIL")
         incomplete_window_report = json.loads(json.dumps(report))
         incomplete_window_report["worker"]["process_cpu_windows"][1] = {
             "window": "on", "status": "incomplete", "cpu_ns": None,
@@ -5649,10 +5769,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 if workload == capacity_diagnostic.HTML_CAPACITY_120S_WORKLOAD:
                     payload.update({
                         "on_end_ms": 146_000,
-                        "expires_at_ms": diagnostic_plan_tool._plan_expiry_ms(
-                            146_000, workload,
-                        ),
                     })
+                payload["expires_at_ms"] = diagnostic_plan_tool._plan_expiry_ms(
+                    int(payload["on_end_ms"]), workload,
+                )
                 plan = parse_plan_payload(_canonical_payload(payload), expected_service="api")
                 self.assertEqual(plan.workload, workload)
                 with (
@@ -6049,9 +6169,9 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 self.assertIn((prearm_plan.run_id, "on"), diagnostic_module._usage_windows_started)
                 self.assertEqual(len(prearm_loop.calls), 4)
                 emit.assert_not_called()
-                # The plan expires at the ON edge, but an already-started
-                # capture may finish within the existing edge tolerance.
-                clock["now_ms"] = prearm_plan.expires_at_ms + 250
+                # The CPU window ends on its ON edge. The plan has a separate
+                # trace-drain grace, which must not extend CPU capture time.
+                clock["now_ms"] = prearm_plan.on_end_ms + 250
                 with (
                     patch.object(
                         diagnostic_module, "_read_process_plan_uncached",
@@ -6065,7 +6185,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     emit.assert_called_once()
                     self.assertIn("end_lag_ms=250", emit.call_args.args[0])
                     self.assertIn("timing_complete=true", emit.call_args.args[0])
-                    clock["now_ms"] = prearm_plan.expires_at_ms + 251
+                    clock["now_ms"] = prearm_plan.on_end_ms + 251
                     on_finish()
                     emit.assert_called_once()
 
@@ -6121,7 +6241,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                             diagnostic_module._start_cpu_usage_window(
                                 finish_plan, "on", finish_loop,
                             )
-                            finish_clock["now_ms"] = finish_plan.expires_at_ms + finish_lag_ms
+                            finish_clock["now_ms"] = finish_plan.on_end_ms + finish_lag_ms
                             with (
                                 patch.object(
                                     diagnostic_module, "_read_process_plan_uncached",

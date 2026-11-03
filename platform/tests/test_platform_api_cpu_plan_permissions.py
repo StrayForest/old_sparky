@@ -152,7 +152,10 @@ class ApiCpuPlanPermissionTests(unittest.TestCase):
                     "off_end_ms": off_start_ms + 20_000,
                     "on_start_ms": off_start_ms + 25_000,
                     "on_end_ms": off_start_ms + 45_000,
-                    "expires_at_ms": off_start_ms + 45_000,
+                    "expires_at_ms": diagnostic_plan_tool._plan_expiry_ms(
+                        off_start_ms + 45_000,
+                        diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD,
+                    ),
                     "targets": [{
                         "service": "api",
                         "pid": child.pid,
