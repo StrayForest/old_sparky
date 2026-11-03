@@ -641,6 +641,11 @@ class PlatformVerificationContractTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(progress_path.stat().st_mode), 0o600)
 
             duplicate_id = progress_cases[0].id()
+            existing_duration = next(
+                entry["duration_ms"]
+                for entry in final_checkpoint["completed_timings"]
+                if entry["test_id"] == duplicate_id
+            )
             progress_result.timings.extend(
                 (
                     TestTiming(duplicate_id, 5.0, "passed"),
@@ -657,7 +662,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
             collapsed = next(
                 entry for entry in projected_timings if entry["test_id"] == duplicate_id
             )
-            self.assertEqual(collapsed["duration_ms"], 19.0)
+            self.assertEqual(collapsed["duration_ms"], max(existing_duration, 5.0, 19.0))
             self.assertEqual(collapsed["outcome"], "error")
 
     @staticmethod
