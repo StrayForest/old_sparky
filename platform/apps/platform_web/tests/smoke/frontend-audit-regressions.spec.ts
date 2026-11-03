@@ -8,8 +8,12 @@ import {
   PlatformApiError,
   setTournamentReadyCheckChoice,
 } from "../../lib/platform-api";
-import { categoryForFrame, functionIdForFrame } from "../../lib/cpu-profile-categories.mjs";
-import { __diagnosticPlanTestHooks } from "../../lib/performance-diagnostic-plan";
+import {
+  CPU_PROFILE_SAMPLING,
+  categoryForFrame,
+  functionIdForFrame,
+  summarizeFunctionSamples,
+} from "../../lib/cpu-profile-categories.mjs";
 import {
   htmlSsrCaptureDigest,
   isHtmlSsrCaptureEligible,
@@ -700,7 +704,7 @@ test("web CPU profile categories classify route, React render, chunks, and JSON 
 });
 
 test("web CPU profile function details expose only bounded safe IDs and sample counts", () => {
-  expect(__diagnosticPlanTestHooks.profileSampling).toEqual({
+  expect(CPU_PROFILE_SAMPLING).toEqual({
     intervalUs: 10_000, maxSamples: 2400, maxNodes: 10_000,
   });
   const nodes = new Map([
@@ -714,10 +718,7 @@ test("web CPU profile function details expose only bounded safe IDs and sample c
       functionName: "userSuppliedFunctionName",
     }],
   ]);
-  const summary = __diagnosticPlanTestHooks.summarizeFunctionSamples(
-    nodes,
-    [1, 1, 2, 3],
-  );
+  const summary = summarizeFunctionSamples(nodes, [1, 1, 2, 3]);
   expect(summary).toEqual({
     rows: [
       { function_id: "web.react.render_string", samples: 2 },

@@ -28,6 +28,12 @@ const FUNCTION_IDENTITIES = new Map([
   ["react:renderNodeDestructive", "web.react.render_work"],
 ]);
 
+export const CPU_PROFILE_SAMPLING = Object.freeze({
+  intervalUs: 10_000,
+  maxSamples: 2_400,
+  maxNodes: 10_000,
+});
+
 export function categoryForFrame(url, functionName = "") {
   const normalized = String(url).replaceAll("\\", "/");
   if (normalized.includes("/apps/platform_web/.next/server/app/(site)/tournaments/")) {
@@ -75,4 +81,22 @@ export function functionIdForFrame(url, functionName = "") {
     family = "node";
   }
   return FUNCTION_IDENTITIES.get(`${family}:${String(functionName)}`) ?? null;
+}
+
+export function summarizeFunctionSamples(nodes, samples) {
+  const counts = new Map();
+  for (const nodeId of samples) {
+    const frame = nodes.get(nodeId);
+    if (!frame) continue;
+    const functionId = functionIdForFrame(frame.url ?? "", frame.functionName ?? "");
+    if (functionId !== null) counts.set(functionId, (counts.get(functionId) ?? 0) + 1);
+  }
+  const rows = [...counts.entries()]
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .slice(0, 20)
+    .map(([function_id, count]) => ({ function_id, samples: count }));
+  return {
+    rows,
+    mapped_sample_count: rows.reduce((total, row) => total + row.samples, 0),
+  };
 }

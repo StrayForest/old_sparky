@@ -8,7 +8,11 @@ import inspector from "node:inspector";
 import { getHeapStatistics } from "node:v8";
 import { headers } from "next/headers";
 import { hasAuthorizedDiagnosticRunMarker } from "./performance-diagnostic-marker";
-import { categoryForFrame, functionIdForFrame } from "./cpu-profile-categories.mjs";
+import {
+  CPU_PROFILE_SAMPLING,
+  categoryForFrame,
+  summarizeFunctionSamples,
+} from "./cpu-profile-categories.mjs";
 import { isHtmlSsrCaptureEligible } from "./ssr-capture-sampling.mjs";
 import { releaseMetadataPathFromStandaloneCwd } from "./release-identity-path.mjs";
 import {
@@ -36,8 +40,8 @@ const OFF_WINDOW_MS = 20_000;
 const IDLE_WINDOW_MS = 5_000;
 const ON_WINDOW_MS = 20_000;
 const HTML_CAPACITY_ON_WINDOW_MS = 120_000;
-const MAX_SAMPLES = 2400;
-const MAX_PROFILE_NODES = 10_000;
+const MAX_SAMPLES = CPU_PROFILE_SAMPLING.maxSamples;
+const MAX_PROFILE_NODES = CPU_PROFILE_SAMPLING.maxNodes;
 const MAX_PROFILE_CPU_US = 60_000_000;
 const CPU_WINDOW_TOLERANCE_MS = 250;
 const MEMORY_SAMPLE_INTERVAL_MS = 4_000;
@@ -112,7 +116,6 @@ function canonicalJson(value: unknown): string {
   }
   return JSON.stringify(value) ?? "null";
 }
-
 function readBounded(fd: number, limit: number): Buffer {
   const buffer = Buffer.alloc(limit + 1);
   const bytes = readSync(fd, buffer, 0, limit + 1, 0);
@@ -826,7 +829,9 @@ async function startNodeCpuProfile(plan: DiagnosticPlan, startedAtMs: number): P
   try {
     session.connect();
     await post<InspectorResponse<unknown>>(session, "Profiler.enable");
-    await post<InspectorResponse<unknown>>(session, "Profiler.setSamplingInterval", { interval: 10_000 });
+    await post<InspectorResponse<unknown>>(session, "Profiler.setSamplingInterval", {
+      interval: CPU_PROFILE_SAMPLING.intervalUs,
+    });
     await post<InspectorResponse<unknown>>(session, "Profiler.start");
     activeCpuRunId = plan.run_id;
     const delay = Math.max(1, plan.on_end_ms - Date.now());
@@ -837,27 +842,6 @@ async function startNodeCpuProfile(plan: DiagnosticPlan, startedAtMs: number): P
   } catch {
     session.disconnect();
   }
-}
-
-function summarizeFunctionSamples(
-  nodes: Map<number, { url?: string; functionName?: string }>,
-  samples: number[],
-): { rows: Array<{ function_id: string; samples: number }>; mapped_sample_count: number } {
-  const counts = new Map<string, number>();
-  for (const nodeId of samples) {
-    const frame = nodes.get(nodeId);
-    if (!frame) continue;
-    const functionId = functionIdForFrame(frame.url ?? "", frame.functionName ?? "");
-    if (functionId !== null) counts.set(functionId, (counts.get(functionId) ?? 0) + 1);
-  }
-  const rows = [...counts.entries()]
-    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
-    .slice(0, 20)
-    .map(([function_id, count]) => ({ function_id, samples: count }));
-  return {
-    rows,
-    mapped_sample_count: rows.reduce((total, row) => total + row.samples, 0),
-  };
 }
 
 async function stopNodeCpuProfile(
@@ -922,12 +906,3 @@ async function stopNodeCpuProfile(
     session.disconnect();
   }
 }
-
-export const __diagnosticPlanTestHooks = {
-  canonicalJson,
-  validatePayload,
-  categoryForFrame,
-  functionIdForFrame,
-  summarizeFunctionSamples,
-  profileSampling: { intervalUs: 10_000, maxSamples: MAX_SAMPLES, maxNodes: MAX_PROFILE_NODES },
-};
