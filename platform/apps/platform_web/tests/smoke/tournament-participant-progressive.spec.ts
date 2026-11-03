@@ -352,7 +352,7 @@ test("registered detail uses compact workspace state and ready vote avoids full 
 test("ready vote retries bounded overloads as one logical action", async ({ page }) => {
   forcedReadyVoteOverloads = 2;
   holdFirstReadyVoteResponse = true;
-  await page.clock.install({ time: new Date("2026-07-20T16:09:00Z") });
+  await page.clock.setFixedTime(new Date("2026-07-20T16:10:00Z"));
   await page.context().addCookies([{
     name: "deadlock_platform_session",
     value: "lean-detail-session",
@@ -364,7 +364,6 @@ test("ready vote retries bounded overloads as one logical action", async ({ page
   }]);
 
   await page.goto(`/tournaments/${readyTournamentSlug}`);
-  await page.clock.pauseAt(new Date("2026-07-20T16:10:00Z"));
   const readyButton = page.getByTestId("ready-check-step").getByRole("button");
   await readyButton.click();
   await expect(readyButton).toHaveAttribute("aria-busy", "true");
@@ -374,9 +373,6 @@ test("ready vote retries bounded overloads as one logical action", async ({ page
   holdFirstReadyVoteResponse = false;
   releaseHeldReadyVoteResponse?.();
   releaseHeldReadyVoteResponse = null;
-  await page.clock.fastForward(500);
-  await expect.poll(() => readyVoteRequests).toBe(2);
-  await page.clock.fastForward(1_000);
   await expect(page.getByRole("button", { name: "Отменить подтверждение" })).toBeVisible({ timeout: 5_000 });
   await expect.poll(() => readyVoteRequests).toBe(3);
   expect(forcedReadyVoteOverloads).toBe(0);

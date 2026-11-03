@@ -3,7 +3,11 @@ import { createServer, get as httpGet } from "node:http";
 import { resolve } from "node:path";
 import { expect, test } from "@playwright/test";
 import { NextRequest } from "next/server";
-import { getTournamentWorkspace, PlatformApiError } from "../../lib/platform-api";
+import {
+  getTournamentWorkspace,
+  PlatformApiError,
+  setTournamentReadyCheckChoice,
+} from "../../lib/platform-api";
 import { categoryForFrame } from "../../lib/cpu-profile-categories.mjs";
 import {
   htmlSsrCaptureDigest,
@@ -39,6 +43,88 @@ function deferred<T = void>() {
   });
   return { promise, resolve };
 }
+
+test("ready vote retries use bounded indexed delay and stop after two retries", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalRandom = Math.random;
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  let delays: number[] = [];
+  let voteRequests = 0;
+  let requestBodies: string[] = [];
+  const fakeWindow = {
+    setTimeout(callback: () => void, delay?: number) {
+      delays.push(delay ?? 0);
+      queueMicrotask(callback);
+      return delays.length;
+    },
+    clearTimeout() {},
+  } as unknown as Window;
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: fakeWindow,
+  });
+
+  try {
+    for (const scenario of [
+      { randomValues: [0, 0], retryAfterMs: 0, expected: [150, 400], finalOverload: false },
+      { randomValues: [0.999, 0.999], retryAfterMs: 0, expected: [349.8, 799.6], finalOverload: false },
+      { randomValues: [0, 0], retryAfterMs: 5_000, expected: [2_000, 2_000], finalOverload: false },
+      { randomValues: [0, 0], retryAfterMs: 0, expected: [150, 400], finalOverload: true },
+    ]) {
+      delays = [];
+      voteRequests = 0;
+      requestBodies = [];
+      let randomIndex = 0;
+      Math.random = () => scenario.randomValues[randomIndex++] ?? 0;
+      globalThis.fetch = async (input, init) => {
+        const requestUrl = String(input);
+        if (requestUrl.endsWith("/auth/csrf")) {
+          return new Response(null, { status: 403 });
+        }
+        if (!requestUrl.endsWith("/deadlock/ready-check/vote")) {
+          return new Response(null, { status: 404 });
+        }
+        voteRequests += 1;
+        requestBodies.push(String(init?.body));
+        if (voteRequests <= 2 || scenario.finalOverload) {
+          return new Response(JSON.stringify({
+            code: "READY_VOTE_OVERLOADED",
+            retryable: true,
+            retry_after_ms: scenario.retryAfterMs,
+          }), { status: 503, headers: { "Content-Type": "application/json" } });
+        }
+        return new Response(JSON.stringify({ current_user_choice: "yes" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      };
+
+      const retry = setTournamentReadyCheckChoice("retry-fixture", "yes");
+      if (scenario.finalOverload) {
+        await expect(retry).rejects.toMatchObject({
+          status: 503,
+          code: "READY_VOTE_OVERLOADED",
+          retryable: true,
+        } satisfies Partial<PlatformApiError>);
+      } else {
+        await expect(retry).resolves.toEqual({ current_user_choice: "yes" });
+      }
+      expect(voteRequests).toBe(3);
+      expect(requestBodies).toEqual(Array(3).fill('{"choice":"yes"}'));
+      expect(delays).toHaveLength(2);
+      expect(delays[0]).toBeCloseTo(scenario.expected[0]);
+      expect(delays[1]).toBeCloseTo(scenario.expected[1]);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    Math.random = originalRandom;
+    if (originalWindow) {
+      Object.defineProperty(globalThis, "window", originalWindow);
+    } else {
+      Reflect.deleteProperty(globalThis, "window");
+    }
+  }
+});
 
 test("server internal reads share a bounded FIFO permit through body completion", async () => {
   const scheduler = new ServerInternalReadScheduler({
