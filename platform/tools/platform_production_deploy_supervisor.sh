@@ -300,23 +300,62 @@ check_runtime_profile_identity() {
       --only PLATFORM_COOKIE_SECURE \
       --json 2>/dev/null
   )" || return 1
-  /usr/bin/python3.12 -I -B - "$selected_profile" "$report" <<'PY'
+  /usr/bin/python3.12 -I -B - \
+    "$selected_profile" "$report" \
+    "$runtime/shared/.env.platform" "$runtime/shared/env/worker.env" <<'PY'
 import json
+from pathlib import Path
+import stat
 import sys
 
+WORKER_POOL_KEY = "PLATFORM_WORKER_DB_POOL_SIZE"
+# The application setting defaults to 2; do not materialize that omitted env key.
+WORKER_POOL_DEFAULT = "2"
+
+def values_for(path):
+    target = Path(path)
+    metadata = target.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise SystemExit(1)
+    values = []
+    with target.open("r", encoding="utf-8") as stream:
+        for raw_line in stream:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key.strip() == WORKER_POOL_KEY:
+                values.append(value.strip().strip("'\""))
+    return values
+
 try:
-    profile, raw = sys.argv[1:]
+    profile, raw, canonical_path, worker_env_path = sys.argv[1:]
     report = json.loads(raw)
 except (IndexError, json.JSONDecodeError, ValueError):
     raise SystemExit(1)
+try:
+    canonical_worker_pool = values_for(canonical_path)
+    worker_env_pool = values_for(worker_env_path)
+except (OSError, UnicodeError):
+    raise SystemExit(1)
+if (
+    len(canonical_worker_pool) > 1
+    or len(worker_env_pool) > 1
+    or any(value != WORKER_POOL_DEFAULT for value in canonical_worker_pool)
+    or any(value != WORKER_POOL_DEFAULT for value in worker_env_pool)
+):
+    raise SystemExit(1)
+expected_changed_keys = (
+    [WORKER_POOL_KEY] if not canonical_worker_pool else []
+)
 if (
     not isinstance(report, dict)
     or report.get("ok") is not True
     or report.get("mode") != "dry-run"
     or report.get("profile") != profile
     or type(report.get("changed_count")) is not int
-    or report.get("changed_count") != 0
-    or report.get("changed_keys") != []
+    or report.get("changed_keys") != expected_changed_keys
+    or report.get("changed_count") != len(expected_changed_keys)
 ):
     raise SystemExit(1)
 PY

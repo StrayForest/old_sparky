@@ -1423,6 +1423,35 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "fixture_kind": capacity_diagnostic.HTML_FIXTURE_KIND,
             "concurrency": 64,
         }
+        joined_ids = [
+            f"{candidate:032x}"
+            for candidate in range(1, 10_000)
+            if capacity_diagnostic._ssr_join_id_is_eligible("a" * 32, f"{candidate:032x}")
+        ][:40]
+        self.assertEqual(len(joined_ids), 40)
+        request_results = [SimpleNamespace(
+            started_at_utc="1970-01-01T00:00:30+00:00",
+            finished_at_utc=(
+                "1970-01-01T00:00:45+00:00" if index < 20
+                else "1970-01-01T00:00:47+00:00"
+            ),
+            cf_ray=f"edge-{index}", ssr_request_id=request_id,
+        ) for index, request_id in enumerate(joined_ids)]
+        selected_results, join_evidence = capacity_diagnostic._phase_request_window_evidence(
+            request_results, start_ms=26_000, end_ms=46_000, run_id="a" * 32,
+        )
+        self.assertEqual(len(selected_results), 40)
+        self.assertEqual(join_evidence["drain_completed_after_window_count"], 20)
+        self.assertEqual(
+            capacity_diagnostic._plan_expiry_ms(capacity_diagnostic.HTML_WORKLOAD, 46_000),
+            61_000,
+        )
+        self.assertEqual(
+            diagnostic_plan_tool._plan_expiry_ms(
+                46_000, diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD,
+            ),
+            61_000,
+        )
         html_report = through_worker_entry({
             **report,
             **capacity_diagnostic.profile_payload(64, capacity_diagnostic.HTML_WORKLOAD),
@@ -1431,8 +1460,34 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "concurrency": 64,
             "max_inflight": 64,
             "off_probe": {"submitted": 64, "completed": 64, "http_status": 200},
+            "request_window_evidence": join_evidence,
+            "client_join_request_ids": joined_ids,
+            "failure_evidence": capacity_diagnostic._failure_evidence(),
+            "actual_on_request_started_at_utc": "1970-01-01T00:00:30+00:00",
+            "actual_on_request_finished_at_utc": "1970-01-01T00:00:47+00:00",
+            "failure_evidence_status": "available",
         })
+        self.assertTrue(capacity_diagnostic._phase_request_window_evidence_is_closed(
+            html_report["request_window_evidence"], start_ms=26_000, end_ms=46_000,
+        ))
+        self.assertEqual(
+            html_report["client_join_request_ids"],
+            capacity_diagnostic._selected_ssr_join_request_ids(request_results, "a" * 32),
+        )
         self.assertTrue(capacity_diagnostic._worker_report_matches(html_report, html_config))
+        self.assertFalse(capacity_diagnostic._worker_report_matches(
+            {key: value for key, value in html_report.items() if key != "client_join_request_ids"},
+            html_config,
+        ))
+        ineligible_id = next(
+            f"{candidate:032x}"
+            for candidate in range(10_000, 20_000)
+            if not capacity_diagnostic._ssr_join_id_is_eligible("a" * 32, f"{candidate:032x}")
+        )
+        wrong_run_ids = sorted([*joined_ids[:-1], ineligible_id])
+        self.assertFalse(capacity_diagnostic._worker_report_matches(
+            {**html_report, "client_join_request_ids": wrong_run_ids}, html_config,
+        ))
         self.assertFalse(capacity_diagnostic._worker_report_matches(
             {**html_report, "workload": capacity_diagnostic.WORKLOAD}, html_config,
         ))
@@ -7218,6 +7273,27 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             authorize_html_request_perf_capture(scope, plan=profile_plan, now_ms=26_001),
             (profile_plan, "on", True),
         )
+        standalone = {
+            **payload,
+            "workload": "authenticated_html_ssr_capacity_v1",
+            "on_end_ms": 46_000,
+            "expires_at_ms": 61_000,
+        }
+        standalone_plan = parse_plan_payload(
+            _canonical_payload(standalone), expected_service="api",
+        )
+        self.assertEqual(
+            authorize_html_request_perf_capture(scope, plan=standalone_plan, now_ms=26_001),
+            (standalone_plan, "on", True),
+        )
+        self.assertEqual(
+            authorize_html_request_perf_capture(scope, plan=standalone_plan, now_ms=61_000),
+            (standalone_plan, "on", True),
+        )
+        self.assertEqual(
+            authorize_html_request_perf_capture(scope, plan=standalone_plan, now_ms=61_001),
+            (None, None, False),
+        )
 
     def test_ssr_stream_coverage_recognizes_both_caps_and_fails_closed(self) -> None:
         coverage = {
@@ -7520,6 +7596,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 )
 
         for workload in (
+            diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD,
             diagnostic_plan_tool.HTML_CAPACITY_120S_WORKLOAD,
             diagnostic_plan_tool.HTML_CPU_PROFILE_20S_WORKLOAD,
         ):

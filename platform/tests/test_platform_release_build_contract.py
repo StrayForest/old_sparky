@@ -3545,6 +3545,124 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertNotIn("platform-production-deploy.yml/dispatches", workflow)
         self.assertNotIn("platform_build_release.sh", workflow)
 
+        # Exercise the exact inline identity predicate with the real profile
+        # configurator. Its only tolerated dry-run delta is the omitted worker
+        # pool setting whose application default remains 2.
+        validator_match = re.search(
+            r'check_runtime_profile_identity\(\) \{[\s\S]*?<<\'PY\'\n([\s\S]*?)\nPY\n\}',
+            supervisor,
+        )
+        self.assertIsNotNone(validator_match)
+        assert validator_match is not None
+        validator = validator_match.group(1)
+        from python_packages.platform_infra.config import PlatformSettings
+        self.assertEqual(PlatformSettings.model_fields["platform_worker_db_pool_size"].default, 2)
+        selected = [
+            "PLATFORM_AUTHENTICATED_READ_ADMISSION_ENABLED",
+            "PLATFORM_AUTHENTICATED_READ_ADMISSION_CONCURRENCY",
+            "PLATFORM_AUTHENTICATED_READ_ADMISSION_MAX_WAITERS",
+            "PLATFORM_AUTHENTICATED_READ_ADMISSION_WAIT_TIMEOUT_MS",
+            "PLATFORM_API_WORKERS", "PLATFORM_DB_POOL_SIZE",
+            "PLATFORM_DB_MAX_OVERFLOW", "PLATFORM_DB_CONNECTION_BUDGET",
+            "PLATFORM_WEB_WORKERS", "PLATFORM_WEB_SERVER_AUTH_TRANSPORT",
+            "PLATFORM_WORKER_CONCURRENCY", "PLATFORM_WORKER_DB_POOL_SIZE",
+            "PLATFORM_COOKIE_SECURE",
+        ]
+        profile_values = dict(platform_configure_shared_env.PUBLIC_BASELINE)
+        profile_values.update(platform_configure_shared_env.RUNTIME_PROFILES[
+            "authenticated-read-admission-24x8"
+        ])
+        profile_values.pop("PLATFORM_WORKER_DB_POOL_SIZE")
+        fixture_secrets = {
+            "PLATFORM_DATABASE_URL": "fixture-database-url",
+            "PLATFORM_SECRET_KEY": "fixture-secret-key",
+            "PLATFORM_R2_ACCESS_KEY_ID": "fixture-access-key",
+            "PLATFORM_R2_SECRET_ACCESS_KEY": "fixture-storage-secret",
+        }
+        with tempfile.TemporaryDirectory(prefix="runtime-profile-identity-") as temporary:
+            root = Path(temporary)
+            canonical = root / ".env.platform"
+            worker_env = root / "worker.env"
+            lines = [f"{key}={value}" for key, value in sorted(profile_values.items())]
+            lines.extend(f"{key}={value}" for key, value in fixture_secrets.items())
+            canonical.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            canonical.chmod(0o600)
+            worker_env.write_text("PLATFORM_WORKER_CONCURRENCY=2\n", encoding="utf-8")
+            worker_env.chmod(0o600)
+            original_canonical = canonical.read_bytes()
+            original_worker = worker_env.read_bytes()
+
+            def helper_report(profile: str, env_path: Path = canonical) -> dict[str, object]:
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        str(TOOLS_DIR / "platform_configure_shared_env.py"),
+                        "--env-file", str(env_path), "--profile", profile,
+                        *[item for key in selected for item in ("--only", key)],
+                        "--json",
+                    ],
+                    check=True, capture_output=True, text=True,
+                )
+                return json.loads(completed.stdout)
+
+            def run_identity(
+                report: dict[str, object], profile: str, env_path: Path = canonical,
+            ) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [sys.executable, "-I", "-B", "-", profile,
+                     json.dumps(report, sort_keys=True), str(env_path), str(worker_env)],
+                    input=validator, check=False, capture_output=True, text=True,
+                )
+
+            a_report = helper_report("authenticated-read-admission-24x8")
+            self.assertEqual(a_report["changed_keys"], ["PLATFORM_WORKER_DB_POOL_SIZE"])
+            self.assertEqual(run_identity(a_report, "authenticated-read-admission-24x8").returncode, 0)
+            self.assertEqual(canonical.read_bytes(), original_canonical)
+            self.assertEqual(worker_env.read_bytes(), original_worker)
+
+            b_values = dict(profile_values)
+            b_values["PLATFORM_WEB_SERVER_AUTH_TRANSPORT"] = "node"
+            canonical.write_text(
+                "\n".join([f"{key}={value}" for key, value in sorted(b_values.items())]
+                          + [f"{key}={value}" for key, value in fixture_secrets.items()]) + "\n",
+                encoding="utf-8",
+            )
+            b_report = helper_report("authenticated-read-admission-24x8-native")
+            self.assertEqual(b_report["changed_keys"], ["PLATFORM_WORKER_DB_POOL_SIZE"])
+            self.assertEqual(run_identity(b_report, "authenticated-read-admission-24x8-native").returncode, 0)
+            for invalid_value in ("3", ""):
+                invalid_env = root / f"invalid-{len(invalid_value)}.env"
+                invalid_env.write_text(
+                    canonical.read_text(encoding="utf-8").replace(
+                        "PLATFORM_WORKER_CONCURRENCY=2",
+                        f"PLATFORM_WORKER_DB_POOL_SIZE={invalid_value}\nPLATFORM_WORKER_CONCURRENCY=2",
+                    ),
+                    encoding="utf-8",
+                )
+                invalid_env.chmod(0o600)
+                self.assertNotEqual(
+                    run_identity(
+                        b_report, "authenticated-read-admission-24x8-native", invalid_env,
+                    ).returncode,
+                    0,
+                )
+            duplicate_env = root / "invalid-duplicate.env"
+            duplicate_env.write_text(
+                canonical.read_text(encoding="utf-8").replace(
+                    "PLATFORM_WORKER_CONCURRENCY=2",
+                    "PLATFORM_WORKER_DB_POOL_SIZE=2\nPLATFORM_WORKER_DB_POOL_SIZE=2\n"
+                    "PLATFORM_WORKER_CONCURRENCY=2",
+                ),
+                encoding="utf-8",
+            )
+            duplicate_env.chmod(0o600)
+            self.assertNotEqual(
+                run_identity(
+                    b_report, "authenticated-read-admission-24x8-native", duplicate_env,
+                ).returncode,
+                0,
+            )
+
     def _run_profile_switch_fixture(self, scenario: str) -> tuple[subprocess.CompletedProcess[str], Path]:
         supervisor = DEPLOY_SUPERVISOR.read_text(encoding="utf-8")
         restart_match = re.search(

@@ -97,6 +97,7 @@ ON_WINDOW_MS_BY_WORKLOAD[HTML_CAPACITY_120S_WORKLOAD] = 120_000
 PLAN_EXPIRY_GRACE_MS_BY_WORKLOAD = {
     workload: 0 for workload in SUPPORTED_WORKLOADS
 }
+PLAN_EXPIRY_GRACE_MS_BY_WORKLOAD[HTML_CAPACITY_WORKLOAD] = PLAN_EXPIRY_GRACE_MS
 PLAN_EXPIRY_GRACE_MS_BY_WORKLOAD[HTML_CAPACITY_120S_WORKLOAD] = PLAN_EXPIRY_GRACE_MS
 PLAN_EXPIRY_GRACE_MS_BY_WORKLOAD[HTML_CPU_PROFILE_20S_WORKLOAD] = PLAN_EXPIRY_GRACE_MS
 RUN_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -1345,7 +1346,11 @@ def _capacity_request_telemetry(
     run_id = web_plan.get("run_id")
     workload = web_plan.get("workload")
     if (not isinstance(run_id, str) or not RUN_RE.fullmatch(run_id)
-            or workload not in {HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD}
+            or workload not in {
+                HTML_CAPACITY_WORKLOAD,
+                HTML_CAPACITY_120S_WORKLOAD,
+                HTML_CPU_PROFILE_20S_WORKLOAD,
+            }
             or api_plan.get("run_id") != run_id
             or api_plan.get("workload") != workload
             or api_plan.get("on_start_ms") != web_plan.get("on_start_ms")
