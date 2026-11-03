@@ -1469,6 +1469,10 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     "service": "api", "expected_targets": 2, "observed_targets": 2,
                     "event_count": 2, "timer": "thread_cpu", "observation_unit": "calls",
                     "total_cpu_us": 2_000_000, "sample_count": None,
+                    "function_details": {
+                        "top_self": [], "top_cumulative": [], "top_samples": [],
+                        "mapped_self_cpu_us": 0, "mapped_sample_count": 0,
+                    },
                     "start_lag_ms_min": 0, "start_lag_ms_max": 0,
                     "elapsed_ms_min": 20_000, "elapsed_ms_max": 20_000,
                     "end_lag_ms_min": 0, "end_lag_ms_max": 0,
@@ -1481,6 +1485,10 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     "service": "web", "expected_targets": 1, "observed_targets": 1,
                     "event_count": 1, "timer": "v8_cpu", "observation_unit": "samples",
                     "total_cpu_us": 1_000_000, "sample_count": 100,
+                    "function_details": {
+                        "top_self": [], "top_cumulative": [], "top_samples": [],
+                        "mapped_self_cpu_us": 0, "mapped_sample_count": 0,
+                    },
                     "start_lag_ms_min": 0, "start_lag_ms_max": 0,
                     "elapsed_ms_min": 20_000, "elapsed_ms_max": 20_000,
                     "end_lag_ms_min": 0, "end_lag_ms_max": 0,
