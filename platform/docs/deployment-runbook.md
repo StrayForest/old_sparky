@@ -273,7 +273,7 @@ They are workflow implementation details; direct server execution is limited to 
 
 ### Legacy renderer transition
 
-Pre-install supervisor and candidate checks accept the verify-only
+Pre-install supervisor, candidate and nested Alembic checks accept the verify-only
 `--allow-legacy-api-web-transport` flag only for the exact former API bytes
 with canonical `fetch|node`; ownership, mode, links, parser, web and worker
 checks stay strict. It never writes. Installer regenerates envs; post-smoke stays strict.

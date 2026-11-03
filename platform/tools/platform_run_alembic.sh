@@ -198,6 +198,7 @@ print(record.get("candidate_release") or "")
   "$TOOLS_DIR/platform_release_preflight.sh" \
     --app-dir "$PLATFORM_APP_DIR" \
     "${migration_preflight_previous_flag[@]}" \
+    --allow-legacy-api-web-transport \
     --defer-active-alembic-revision-check \
     --require-verified-backup \
     --require-edge-parity \

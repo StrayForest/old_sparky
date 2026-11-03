@@ -5707,10 +5707,69 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         fake_python.chmod(0o755)
         candidate_tools = candidate / "tools"
         shutil.copytree(self.tools_dir, candidate_tools)
+        from tools import platform_render_service_envs as renderer
+        from tools.platform_safe_env_exec import load_env_file
+
+        env_source = self.shared / ".env.platform"
+        env_source.write_text(
+            "PLATFORM_ENVIRONMENT=production\n"
+            "PLATFORM_WEB_SERVER_AUTH_TRANSPORT=node\n",
+            encoding="ascii",
+        )
+        env_source.chmod(0o600)
+        env_values = load_env_file(env_source)
+        runtime_env_dir = self.shared / "env"
+        runtime_env_dir.mkdir(mode=0o700)
+        for service in ("web", "worker"):
+            (runtime_env_dir / f"{service}.env").write_text(
+                renderer.render_service_env(service, env_values),
+                encoding="utf-8",
+            )
+        legacy_api_env = renderer.render_legacy_api_service_env(env_values)
+        self.assertIsNotNone(legacy_api_env)
+        (runtime_env_dir / "api.env").write_text(
+            legacy_api_env or "",
+            encoding="utf-8",
+        )
+        preflight_args = self.root / "nested-preflight.args"
+        preflight_tool = candidate_tools / "platform_release_preflight.sh"
+        preflight_tool.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "tools_dir=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd -P)\"\n"
+            "legacy_api_transport=0\n"
+            "for arg in \"$@\"; do\n"
+            "  if [[ \"$arg\" == --allow-legacy-api-web-transport ]]; then\n"
+            "    legacy_api_transport=1\n"
+            "  fi\n"
+            "done\n"
+            f"printf '%s\\n' \"$*\" > {str(preflight_args)!r}\n"
+            "/usr/bin/python3 -I -B - \"$tools_dir\" \"$PLATFORM_ENV_FILE\" \"$PLATFORM_SHARED_DIR/env\" \"$legacy_api_transport\" <<'PY'\n"
+            "import sys\n"
+            "from pathlib import Path\n"
+            "tools_dir, source, output_dir, allow_legacy = sys.argv[1:]\n"
+            "sys.path.insert(0, tools_dir)\n"
+            "import platform_render_service_envs as renderer\n"
+            "from platform_safe_env_exec import load_env_file\n"
+            "values = load_env_file(Path(source))\n"
+            "rendered = {name: renderer.render_service_env(name, values) for name in ('api', 'web', 'worker')}\n"
+            "try:\n"
+            "    renderer.verify_rendered_contents(Path(output_dir), rendered, values)\n"
+            "except RuntimeError:\n"
+            "    pass\n"
+            "else:\n"
+            "    raise SystemExit('legacy API projection unexpectedly passed strict verification')\n"
+            "renderer.verify_runtime_files = lambda _output_dir: None\n"
+            "sys.argv = ['platform_render_service_envs.py', '--source', source, '--output-dir', output_dir, '--verify']\n"
+            "if allow_legacy == '1':\n"
+            "    sys.argv.append('--allow-legacy-api-web-transport')\n"
+            "raise SystemExit(renderer.main())\n"
+            "PY\n",
+            encoding="utf-8",
+        )
+        preflight_tool.chmod(0o755)
         script = ALEMBIC_SCRIPT.read_text(encoding="utf-8")
-        preflight_tool = '"$TOOLS_DIR/platform_release_preflight.sh"'
-        self.assertIn(preflight_tool, script)
-        script = script.replace(preflight_tool, "/usr/bin/true", 1)
+        self.assertIn('"$TOOLS_DIR/platform_release_preflight.sh"', script)
         script = script.replace("/usr/bin/systemctl", str(systemctl))
         migration = candidate_tools / "platform_run_alembic.sh"
         migration.write_text(script, encoding="utf-8")
@@ -5723,6 +5782,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             env={
                 "PLATFORM_ENVIRONMENT": "production",
                 "PLATFORM_APP_DIR": str(self.app_dir),
+                "PLATFORM_SHARED_DIR": str(self.shared),
                 "PLATFORM_ENV_FILE": str(self.shared / ".env.platform"),
                 "PLATFORM_PYTHON_BIN": str(fake_python),
             },
@@ -5730,6 +5790,10 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "--allow-legacy-api-web-transport",
+            preflight_args.read_text(encoding="utf-8"),
+        )
         self.assertFalse(systemctl_log.exists())
         self.assertIn("-m alembic upgrade head", fake_python_log.read_text(encoding="utf-8"))
 
