@@ -327,9 +327,9 @@ class ProductionSSHHostKeyScanContractTests(unittest.TestCase):
                     else standard_blocks
                 )
                 target.append(block)
-        self.assertEqual(workflow_count, 21)
-        self.assertEqual(site_count, 25)
-        self.assertEqual(len(standard_blocks), 24)
+        self.assertEqual(workflow_count, 22)
+        self.assertEqual(site_count, 26)
+        self.assertEqual(len(standard_blocks), 25)
         self.assertEqual(len(as12_blocks), 1)
         self.assertEqual(
             as12_blocks[0],

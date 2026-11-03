@@ -22,7 +22,7 @@ invalid_input() {
   exit 2
 }
 
-if (( $# != 5 && $# != 8 && $# != 9 )); then
+if (( $# != 5 && $# != 7 && $# != 8 && $# != 9 )); then
   invalid_input
 fi
 target_sha="$1"
@@ -34,7 +34,11 @@ host_tools_sha=""
 host_manifest_sha=""
 host_capabilities_sha=""
 baseline_identity_b64=""
-if (( $# == 8 )); then
+expected_runtime_profile=""
+if (( $# == 7 )) && [[ "$deploy_mode" == "profile-switch" ]]; then
+  expected_runtime_profile="$6"
+  host_tools_sha="$7"
+elif (( $# == 8 )); then
   host_tools_sha="$6"
   host_manifest_sha="$7"
   host_capabilities_sha="$8"
@@ -228,13 +232,24 @@ artifact_attempt="${artifact_dir##*-}"
 [[ "$release_slug" == "gha-${artifact_run_id}-${artifact_attempt}-${target_sha:0:12}" ]] \
   || invalid_input
 case "$deploy_mode" in
-  preflight|deploy) ;;
+  preflight|deploy|profile-switch) ;;
   *) invalid_input ;;
 esac
 case "$runtime_profile" in
   baseline|ready-vote-static-4|ready-vote-static-6|ready-vote-static-8|ready-vote-cprofile|ready-vote-static-12|ready-vote-static-16|ready-vote-adaptive-v2|api-3x16|api-1x48|read-mix-cprofile|authenticated-read-admission-32|authenticated-read-admission-24x8|authenticated-read-admission-24x8-native|pool-pre-ping-off|web-ssr-diagnostics|web-ssr-native-transport|web-ssr-workers-2|uvicorn-classic|uvicorn-optimized|api-pool-12|api-pool-16|api-pool-20|api-pool-24) ;;
   *) invalid_input ;;
 esac
+if [[ "$deploy_mode" == "profile-switch" ]]; then
+  [[ "$expected_runtime_profile" =~ ^authenticated-read-admission-24x8(-native)?$ ]] \
+    || invalid_input
+  [[ "$runtime_profile" =~ ^authenticated-read-admission-24x8(-native)?$ ]] \
+    || invalid_input
+  [[ "$expected_runtime_profile" != "$runtime_profile" ]] || invalid_input
+  [[ "$host_tools_sha" =~ ^[0-9a-f]{40}$ ]] || invalid_input
+  [[ "$host_tools_dir" == "/opt/oldsparky/platform/shared/host-tools/$host_tools_sha" ]] \
+    || invalid_input
+  [[ ! -e "$artifact_dir" && ! -L "$artifact_dir" ]] || invalid_input
+fi
 
 validate_systemctl_binary
 
@@ -244,7 +259,12 @@ if [[ -e "$artifact_dir" || -L "$artifact_dir" ]]; then
 fi
 
 restart_web_and_wait() {
-  run_systemctl restart deadlock-web || return 1
+  if ! run_systemctl restart deadlock-web; then
+    if [[ "${profile_switch_recoverable:-0}" == "1" ]]; then
+      return 1
+    fi
+    fail "deadlock-web restart failed after runtime profile"
+  fi
   for _ in $(seq 1 30); do
     if service_is_active deadlock-web \
       && curl --fail --silent --show-error --max-time 2 \
@@ -253,7 +273,194 @@ restart_web_and_wait() {
     fi
     sleep 1
   done
+  if [[ "${profile_switch_recoverable:-0}" == "1" ]]; then
+    return 1
+  fi
   fail "deadlock-web did not recover after runtime profile"
+}
+
+check_runtime_profile_identity() {
+  local selected_profile="$1" report
+  report="$(
+    "$runtime/shared/venv/bin/python" -B \
+      "$host_tools_dir/platform_configure_shared_env.py" \
+      --profile "$selected_profile" \
+      --only PLATFORM_AUTHENTICATED_READ_ADMISSION_ENABLED \
+      --only PLATFORM_AUTHENTICATED_READ_ADMISSION_CONCURRENCY \
+      --only PLATFORM_AUTHENTICATED_READ_ADMISSION_MAX_WAITERS \
+      --only PLATFORM_AUTHENTICATED_READ_ADMISSION_WAIT_TIMEOUT_MS \
+      --only PLATFORM_API_WORKERS \
+      --only PLATFORM_DB_POOL_SIZE \
+      --only PLATFORM_DB_MAX_OVERFLOW \
+      --only PLATFORM_DB_CONNECTION_BUDGET \
+      --only PLATFORM_WEB_WORKERS \
+      --only PLATFORM_WEB_SERVER_AUTH_TRANSPORT \
+      --only PLATFORM_WORKER_CONCURRENCY \
+      --only PLATFORM_WORKER_DB_POOL_SIZE \
+      --only PLATFORM_COOKIE_SECURE \
+      --json 2>/dev/null
+  )" || return 1
+  /usr/bin/python3.12 -I -B - "$selected_profile" "$report" <<'PY'
+import json
+import sys
+
+try:
+    profile, raw = sys.argv[1:]
+    report = json.loads(raw)
+except (IndexError, json.JSONDecodeError, ValueError):
+    raise SystemExit(1)
+if (
+    not isinstance(report, dict)
+    or report.get("ok") is not True
+    or report.get("mode") != "dry-run"
+    or report.get("profile") != profile
+    or type(report.get("changed_count")) is not int
+    or report.get("changed_count") != 0
+    or report.get("changed_keys") != []
+):
+    raise SystemExit(1)
+PY
+}
+
+verify_active_profile_switch_identity() {
+  /usr/bin/python3.12 -I -B - \
+    "$runtime" "$current" "$target_sha" "$host_tools_sha" "$host_tools_dir" <<'PY'
+import json
+from pathlib import Path
+import re
+import stat
+import sys
+
+runtime_root, current, expected_source, expected_tools, tools_dir = map(Path, sys.argv[1:])
+try:
+    pointer = current.lstat()
+    release = current.resolve(strict=True)
+    releases = current.parent / "releases"
+    release_json = release / "RELEASE.json"
+    metadata = release_json.lstat()
+    if (
+        not stat.S_ISLNK(pointer.st_mode)
+        or not stat.S_ISDIR(release.lstat().st_mode)
+        or release.parent != releases.resolve(strict=True)
+        or not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) not in {0o444, 0o644}
+        or metadata.st_size > 64 * 1024
+    ):
+        raise SystemExit(1)
+    receipt = json.loads(release_json.read_text(encoding="utf-8"))
+    if not isinstance(receipt, dict) or (
+        receipt.get("source_git_commit") != str(expected_source)
+        or receipt.get("release_slug") != release.name
+        or re.fullmatch(r"[0-9a-f]{40}", str(expected_tools)) is None
+        or tools_dir != runtime_root / "shared/host-tools" / str(expected_tools)
+    ):
+        raise SystemExit(1)
+    pin_path = release / "platform/contracts/host_tools_pin.json"
+    pin_metadata = pin_path.lstat()
+    if (
+        not stat.S_ISREG(pin_metadata.st_mode)
+        or stat.S_ISLNK(pin_metadata.st_mode)
+        or pin_metadata.st_uid != 0
+        or pin_metadata.st_gid != 0
+        or pin_metadata.st_nlink != 1
+        or stat.S_IMODE(pin_metadata.st_mode) not in {0o444, 0o644}
+        or pin_metadata.st_size > 64 * 1024
+    ):
+        raise SystemExit(1)
+    pin = json.loads(pin_path.read_text(encoding="utf-8"))
+    if not isinstance(pin, dict) or (
+        pin.get("schema") != 1
+        or pin.get("repository") != "StrayForest/old_sparky"
+        or pin.get("host_tools_sha") != str(expected_tools)
+    ):
+        raise SystemExit(1)
+except (OSError, json.JSONDecodeError, TypeError, ValueError):
+    raise SystemExit(1)
+PY
+}
+
+run_profile_switch() {
+  local old_profile="$expected_runtime_profile" new_profile="$runtime_profile"
+  local api_pid_before worker_pid_before api_env_digest worker_env_digest
+  local web_env="$runtime/shared/env/web.env"
+  local old_transport="fetch" new_transport="fetch" env_path
+  [[ "$old_profile" == authenticated-read-admission-24x8-native ]] && old_transport="node"
+  [[ "$new_profile" == authenticated-read-admission-24x8-native ]] && new_transport="node"
+  set_failure_context deployment readiness runtime_profile_failed
+
+  [[ ! -e "$runtime/shared/.release-operation.json" && ! -L "$runtime/shared/.release-operation.json" ]] \
+    || fail "a release operation is pending"
+  verify_active_profile_switch_identity \
+    || fail "active app or host-tools identity differs"
+  platform_release_lock_supervisor_holds \
+    && platform_retained_load_lock_supervisor_holds \
+    || fail "profile switch lost its exclusive operation locks"
+  check_runtime_profile_identity "$old_profile" \
+    || fail "the actual runtime profile differs from the expected profile"
+  for env_path in \
+    "$runtime/shared/env/api.env" \
+    "$runtime/shared/env/worker.env" \
+    "$web_env"; do
+    [[ -f "$env_path" && ! -L "$env_path" ]] \
+      || fail "a service runtime environment is unavailable"
+  done
+  grep -qx "PLATFORM_WEB_SERVER_AUTH_TRANSPORT=$old_transport" "$web_env" \
+    || fail "the effective web transport differs from the expected profile"
+  api_pid_before="$(run_systemctl show --property=MainPID --value deadlock-api.service 2>/dev/null)" \
+    || fail "the API process identity is unavailable"
+  worker_pid_before="$(run_systemctl show --property=MainPID --value deadlock-worker.service 2>/dev/null)" \
+    || fail "the worker process identity is unavailable"
+  [[ "$api_pid_before" =~ ^[1-9][0-9]*$ && "$worker_pid_before" =~ ^[1-9][0-9]*$ ]] \
+    || fail "the API or worker process identity is invalid"
+  api_env_digest="$(/usr/bin/sha256sum -- "$runtime/shared/env/api.env" | /usr/bin/awk '{print $1}')" \
+    || fail "the API runtime environment is unavailable"
+  worker_env_digest="$(/usr/bin/sha256sum -- "$runtime/shared/env/worker.env" | /usr/bin/awk '{print $1}')" \
+    || fail "the worker runtime environment is unavailable"
+  [[ "$api_env_digest" =~ ^[0-9a-f]{64}$ && "$worker_env_digest" =~ ^[0-9a-f]{64}$ ]] \
+    || fail "the API or worker runtime environment is invalid"
+
+  profile_switch_recoverable=1
+  if "$runtime/shared/venv/bin/python" -B \
+    "$host_tools_dir/platform_configure_shared_env.py" \
+    --apply --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
+    --profile "$new_profile" --only PLATFORM_WEB_SERVER_AUTH_TRANSPORT --json \
+    >/dev/null 2>/dev/null; then
+    if restart_web_and_wait \
+      && check_runtime_profile_identity "$new_profile" \
+      && grep -qx "PLATFORM_WEB_SERVER_AUTH_TRANSPORT=$new_transport" "$web_env" \
+      && [[ "$(run_systemctl show --property=MainPID --value deadlock-api.service 2>/dev/null)" == "$api_pid_before" ]] \
+      && [[ "$(run_systemctl show --property=MainPID --value deadlock-worker.service 2>/dev/null)" == "$worker_pid_before" ]] \
+      && [[ "$(/usr/bin/sha256sum -- "$runtime/shared/env/api.env" | /usr/bin/awk '{print $1}')" == "$api_env_digest" ]] \
+      && [[ "$(/usr/bin/sha256sum -- "$runtime/shared/env/worker.env" | /usr/bin/awk '{print $1}')" == "$worker_env_digest" ]]; then
+      profile_switch_recoverable=0
+      printf 'RELEASE_DEPLOY schema=1 status=passed class=deployment release_slug=%s source_sha=%s\n' \
+        "$release_slug" "$target_sha"
+      return 0
+    fi
+  fi
+
+  if "$runtime/shared/venv/bin/python" -B \
+      "$host_tools_dir/platform_configure_shared_env.py" \
+      --apply --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
+      --profile "$old_profile" --only PLATFORM_WEB_SERVER_AUTH_TRANSPORT \
+      --json >/dev/null 2>/dev/null \
+    && restart_web_and_wait \
+    && check_runtime_profile_identity "$old_profile" \
+    && grep -qx "PLATFORM_WEB_SERVER_AUTH_TRANSPORT=$old_transport" "$web_env" \
+    && [[ "$(run_systemctl show --property=MainPID --value deadlock-api.service 2>/dev/null)" == "$api_pid_before" ]] \
+    && [[ "$(run_systemctl show --property=MainPID --value deadlock-worker.service 2>/dev/null)" == "$worker_pid_before" ]] \
+    && [[ "$(/usr/bin/sha256sum -- "$runtime/shared/env/api.env" | /usr/bin/awk '{print $1}')" == "$api_env_digest" ]] \
+    && [[ "$(/usr/bin/sha256sum -- "$runtime/shared/env/worker.env" | /usr/bin/awk '{print $1}')" == "$worker_env_digest" ]]; then
+    profile_switch_recoverable=0
+    failure_reason="runtime_profile_restored"
+    fail "runtime profile switch failed; prior profile restored"
+  fi
+  profile_switch_recoverable=0
+  fail "runtime profile switch failed; prior profile health could not be verified"
 }
 
 restart_api_and_wait() {
@@ -492,6 +699,12 @@ if (( initial_install == 0 )); then
   set_failure_context preflight preflight nginx_config
   run_nginx_config_test >/dev/null 2>&1 \
     || fail "Nginx configuration validation failed or timed out"
+fi
+
+if [[ "$deploy_mode" == "profile-switch" ]]; then
+  (( initial_install == 0 )) || fail "profile switch requires an active release"
+  run_profile_switch
+  exit 0
 fi
 
 set_failure_context preflight preflight preflight_failed

@@ -34,6 +34,8 @@ from tests.test_platform_validate_release_artifact import (
     release_payload,
 )
 from tools import platform_workflow_remote_dispatch
+from tools import platform_runtime_profile_workflow
+from tools import platform_workflow_input_guard
 from tools import platform_live_qa_runtime_install
 from tools import platform_recovery_bootstrap
 from tools import platform_fetch_artifact_metadata
@@ -3379,6 +3381,335 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertNotIn("exec 8>/run/lock/oldsparky-retained-load-matrix.lock", workflow)
         self.assertNotIn("flock -n 9", workflow)
         self.assertNotIn("PLATFORM_RELEASE_LOCK_FD=9", workflow)
+
+    def test_runtime_profile_switch_payload_is_closed_to_the_a_b_pair(self) -> None:
+        payload = {
+            "schema": 1,
+            "confirmation": "SWITCH-PRODUCTION-READ-ADMISSION",
+            "target_sha": "a" * 40,
+            "expected_profile": "authenticated-read-admission-24x8",
+            "target_profile": "authenticated-read-admission-24x8-native",
+            "host_tools_sha": "b" * 40,
+            "security_run_id": "1234",
+            "security_run_attempt": "2",
+            "run_id": "5678",
+            "run_attempt": "1",
+        }
+        validated = platform_workflow_input_guard.validate_runtime_profile_switch_payload(payload)
+        self.assertEqual(validated, payload)
+
+        reverse = {
+            **payload,
+            "expected_profile": payload["target_profile"],
+            "target_profile": payload["expected_profile"],
+        }
+        self.assertEqual(
+            platform_workflow_input_guard.validate_runtime_profile_switch_payload(reverse),
+            reverse,
+        )
+        invalid_payloads = (
+            {**payload, "expected_profile": "baseline"},
+            {**payload, "target_profile": payload["expected_profile"]},
+            {**payload, "confirmation": ""},
+            {**payload, "host_tools_sha": "b" * 39},
+            {**payload, "security_run_attempt": True},
+            {**payload, "unexpected": "deploy"},
+        )
+        for invalid in invalid_payloads:
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(platform_workflow_input_guard.WorkflowInputError):
+                    platform_workflow_input_guard.validate_runtime_profile_switch_payload(invalid)
+
+    def test_runtime_profile_switch_requires_exact_successful_security_attempt(self) -> None:
+        target = "a" * 40
+        workflow = {
+            "id": 71,
+            "path": ".github/workflows/platform-security.yml",
+            "name": "Platform security and build",
+            "state": "active",
+        }
+        row = {
+            "id": 1234,
+            "run_attempt": 2,
+            "workflow_id": 71,
+            "path": ".github/workflows/platform-security.yml",
+            "name": "Platform security and build",
+            "repository": {
+                "full_name": "StrayForest/old_sparky",
+                "name": "old_sparky",
+                "owner": {"login": "StrayForest"},
+            },
+            "event": "push",
+            "head_branch": "dev",
+            "head_sha": target,
+            "status": "completed",
+            "conclusion": "success",
+            "html_url": "https://github.com/StrayForest/old_sparky/actions/runs/1234",
+        }
+        branch = {"name": "dev", "commit": {"sha": target}}
+        listings = {"workflow_runs": [row], "total_count": 1}
+        endpoints: dict[str, object] = {
+            "/repos/StrayForest/old_sparky/branches/dev": branch,
+            "/repos/StrayForest/old_sparky/actions/workflows/platform-security.yml": workflow,
+            "/repos/StrayForest/old_sparky/actions/workflows/71/runs?branch=dev&event=push&head_sha="
+            + target
+            + "&per_page=100": listings,
+            "/repos/StrayForest/old_sparky/actions/runs/1234/attempts/2": row,
+            f"/repos/StrayForest/old_sparky/commits/{target}/statuses?per_page=100": [{
+                "id": 456,
+                "context": "platform-security-build",
+                "state": "success",
+                "description": "Platform security and build passed",
+                "target_url": "https://github.com/StrayForest/old_sparky/actions/runs/1234/attempts/2",
+                "created_at": "2020-01-01T00:00:00Z",
+                "updated_at": "2020-01-01T00:00:00Z",
+                "creator": {"login": "github-actions[bot]", "type": "Bot", "id": 41898282},
+            }],
+        }
+
+        def api_json(_api_base: str, _token: str, endpoint: str) -> object:
+            return endpoints[endpoint]
+
+        with patch.object(platform_runtime_profile_workflow, "_api_json", side_effect=api_json):
+            self.assertEqual(
+                platform_runtime_profile_workflow.exact_successful_security_run(
+                    api_base="https://api.github.com",
+                    token="test-token",
+                    repository="StrayForest/old_sparky",
+                    target_sha=target,
+                ),
+                ("1234", "2"),
+            )
+
+        invalid_cases = (
+            ("branch", {"name": "dev", "commit": {"sha": "c" * 40}}),
+            ("listing", {"workflow_runs": [row, row], "total_count": 2}),
+            ("run", {**row, "conclusion": "failure"}),
+            ("attempt", {**row, "head_sha": "c" * 40}),
+            ("status", [{"state": "failure"}]),
+        )
+        for key, invalid in invalid_cases:
+            with self.subTest(key=key):
+                local_endpoints = dict(endpoints)
+                if key == "branch":
+                    local_endpoints["/repos/StrayForest/old_sparky/branches/dev"] = invalid
+                elif key == "listing":
+                    local_endpoints[next(endpoint for endpoint in endpoints if "/runs?" in endpoint)] = invalid
+                elif key == "run":
+                    local_endpoints[next(endpoint for endpoint in endpoints if "/runs?" in endpoint)] = {
+                        "workflow_runs": [invalid], "total_count": 1,
+                    }
+                elif key == "status":
+                    local_endpoints[next(endpoint for endpoint in endpoints if "/statuses?" in endpoint)] = invalid
+                else:
+                    local_endpoints["/repos/StrayForest/old_sparky/actions/runs/1234/attempts/2"] = invalid
+
+                def invalid_api(_api_base: str, _token: str, endpoint: str) -> object:
+                    return local_endpoints[endpoint]
+
+                with patch.object(platform_runtime_profile_workflow, "_api_json", side_effect=invalid_api):
+                    with self.assertRaises(platform_runtime_profile_workflow.ProfileWorkflowError):
+                        platform_runtime_profile_workflow.exact_successful_security_run(
+                            api_base="https://api.github.com",
+                            token="test-token",
+                            repository="StrayForest/old_sparky",
+                            target_sha=target,
+                        )
+
+    def test_profile_only_supervisor_branch_precedes_release_preflight_and_install(self) -> None:
+        supervisor = DEPLOY_SUPERVISOR.read_text(encoding="utf-8")
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-runtime-profile.yml"
+        ).read_text(encoding="utf-8")
+        branch = supervisor.index('if [[ "$deploy_mode" == "profile-switch" ]]; then', supervisor.index('platform_retained_load_lock_open'))
+        branch_end = supervisor.index("set_failure_context preflight preflight preflight_failed", branch)
+        profile_branch = supervisor[branch:branch_end]
+        self.assertIn("run_profile_switch", profile_branch)
+        self.assertNotIn("platform_release_preflight.sh", profile_branch)
+        self.assertLess(branch, supervisor.index('candidate_deploy="$bootstrap_dir/$artifact_slug/tools/platform_release_deploy.sh"'))
+
+        profile_function = supervisor[
+            supervisor.index("run_profile_switch() {"):supervisor.index("restart_api_and_wait() {")
+        ]
+        self.assertIn("platform_release_lock_supervisor_holds", profile_function)
+        self.assertIn("platform_retained_load_lock_supervisor_holds", profile_function)
+        self.assertIn("--only PLATFORM_WEB_SERVER_AUTH_TRANSPORT", profile_function)
+        self.assertIn("--profile \"$old_profile\"", profile_function)
+        self.assertNotIn("restart deadlock-api", profile_function)
+        self.assertNotIn("restart deadlock-worker", profile_function)
+        self.assertNotIn("platform_release_deploy.sh", profile_function)
+        self.assertIn("profile_switch_recoverable=1", supervisor)
+        self.assertIn('failure_reason="runtime_profile_restored"', profile_function)
+        self.assertIn("runtime_profile_restored", platform_workflow_remote_dispatch.RELEASE_FAILURE_REASONS[("deployment", "readiness")])
+
+        self.assertIn("group: platform-production-deploy", workflow)
+        self.assertIn("environment: production", workflow)
+        self.assertIn("statuses: read", workflow)
+        self.assertIn("platform_runtime_profile_workflow.py", workflow)
+        self.assertIn("Prior profile restoration after failure", workflow)
+        self.assertIn("runtime_profile_restored", workflow)
+        self.assertIn("runtime-profile-switch", workflow)
+        self.assertIn("expected_sha", workflow)
+        self.assertNotIn("platform-production-deploy.yml/dispatches", workflow)
+        self.assertNotIn("platform_build_release.sh", workflow)
+
+    def _run_profile_switch_fixture(self, scenario: str) -> tuple[subprocess.CompletedProcess[str], Path]:
+        supervisor = DEPLOY_SUPERVISOR.read_text(encoding="utf-8")
+        restart_match = re.search(
+            r"(?ms)^restart_web_and_wait\(\) \{.*?^\}", supervisor
+        )
+        switch_match = re.search(
+            r"(?ms)^run_profile_switch\(\) \{.*?^\}", supervisor
+        )
+        self.assertIsNotNone(restart_match)
+        self.assertIsNotNone(switch_match)
+        assert restart_match is not None and switch_match is not None
+
+        temporary = tempfile.TemporaryDirectory(prefix="profile-switch-")
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        runtime = root / "platform"
+        env_dir = runtime / "shared/env"
+        python = runtime / "shared/venv/bin/python"
+        env_dir.mkdir(parents=True)
+        python.parent.mkdir(parents=True)
+        web_env = env_dir / "web.env"
+        api_env = env_dir / "api.env"
+        worker_env = env_dir / "worker.env"
+        web_env.write_text("PLATFORM_WEB_SERVER_AUTH_TRANSPORT=fetch\n", encoding="ascii")
+        api_env.write_text("API_TEST=preserved\n", encoding="ascii")
+        worker_env.write_text("WORKER_TEST=preserved\n", encoding="ascii")
+        applied_profiles = root / "applied-profiles.txt"
+        restarts = root / "restarts.txt"
+
+        python.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "profile=''\napply=0\n"
+            "while (( $# )); do\n"
+            "  case \"$1\" in\n"
+            "    --profile) profile=\"$2\"; shift 2 ;;\n"
+            "    --apply) apply=1; shift ;;\n"
+            "    *) shift ;;\n"
+            "  esac\n"
+            "done\n"
+            "if (( apply )); then\n"
+            f"  printf '%s\\n' \"$profile\" >> {shlex.quote(str(applied_profiles))}\n"
+            "  transport=fetch\n"
+            "  [[ \"$profile\" == authenticated-read-admission-24x8-native ]] && transport=node\n"
+            f"  awk -F= -v value=\"$transport\" '$1 == \"PLATFORM_WEB_SERVER_AUTH_TRANSPORT\" {{ print $1 \"=\" value; seen=1; next }} {{ print }} END {{ if (!seen) print \"PLATFORM_WEB_SERVER_AUTH_TRANSPORT=\" value }}' {shlex.quote(str(web_env))} > {shlex.quote(str(root / 'web.env.next'))}\n"
+            f"  mv -- {shlex.quote(str(root / 'web.env.next'))} {shlex.quote(str(web_env))}\n"
+            "else\n"
+            "  printf '{\"ok\":true,\"mode\":\"dry-run\",\"profile\":\"%s\",\"changed_count\":0,\"changed_keys\":[]}\\n' \"$profile\"\n"
+            "fi\n",
+            encoding="utf-8",
+        )
+        python.chmod(0o700)
+
+        releases = runtime / "releases"
+        releases.mkdir(parents=True)
+        current_release = releases / "current-release"
+        previous_release = releases / "previous-release"
+        current_release.mkdir()
+        previous_release.mkdir()
+        current_link = runtime / "current"
+        previous_link = runtime / "previous"
+        current_link.symlink_to(current_release)
+        previous_link.symlink_to(previous_release)
+
+        shell = f"""
+set -euo pipefail
+runtime={shlex.quote(str(runtime))}
+host_tools_dir={shlex.quote(str(runtime / 'shared/host-tools' / ('b' * 40)))}
+target_sha={'a' * 40}
+host_tools_sha={'b' * 40}
+release_slug=gha-123-1-aaaaaaaaaaaa
+expected_runtime_profile=authenticated-read-admission-24x8
+runtime_profile=authenticated-read-admission-24x8-native
+scenario={shlex.quote(scenario)}
+failure_class=preflight failure_phase=preflight failure_reason=internal failure_lock_stage=''
+emit_failure_marker() {{ :; }}
+set_failure_context() {{ :; }}
+fail() {{ printf 'FAIL:%s\\n' "$1"; exit 1; }}
+verify_active_profile_switch_identity() {{ [[ "$scenario" != identity ]]; }}
+platform_release_lock_supervisor_holds() {{ return 0; }}
+platform_retained_load_lock_supervisor_holds() {{ [[ "$scenario" != lock ]]; }}
+check_runtime_profile_identity() {{ [[ "$scenario" != profile ]]; }}
+restart_count=0
+restart_web_and_wait() {{
+  run_systemctl restart deadlock-web || return 1
+  restart_count=$((restart_count + 1))
+  for _ in $(seq 1 30); do
+    if service_is_active deadlock-web && curl --fail --silent --show-error --max-time 2 http://127.0.0.1:3000/ >/dev/null; then return 0; fi
+    sleep 1
+  done
+  if [[ "${{profile_switch_recoverable:-0}}" == 1 ]]; then return 1; fi
+  fail "deadlock-web did not recover after runtime profile"
+}}
+run_systemctl() {{
+  if [[ "$1" == show ]]; then
+    case "$*" in
+      *deadlock-api.service*) printf '101\\n' ;;
+      *deadlock-worker.service*) printf '202\\n' ;;
+      *) return 1 ;;
+    esac
+  elif [[ "$1" == restart ]]; then
+    printf '%s\\n' "$2" >> {shlex.quote(str(restarts))}
+  else return 1
+  fi
+}}
+service_is_active() {{ return 0; }}
+curl_count=0
+curl() {{
+  curl_count=$((curl_count + 1))
+  if [[ "$scenario" == readiness && $curl_count -le 30 ]]; then return 1; fi
+  return 0
+}}
+sleep() {{ :; }}
+"""
+        result = subprocess.run(
+            ["/bin/bash", "-c", shell + restart_match.group(0) + "\n" + switch_match.group(0) + "\nrun_profile_switch\n"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(current_link.resolve(), current_release)
+        self.assertEqual(previous_link.resolve(), previous_release)
+        return result, root
+
+    def test_profile_switch_changes_only_web_and_preserves_release_and_other_services(self) -> None:
+        result, root = self._run_profile_switch_fixture("success")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "RELEASE_DEPLOY schema=1 status=passed class=deployment release_slug=gha-123-1-aaaaaaaaaaaa source_sha=" + "a" * 40 + "\n")
+        self.assertEqual((root / "applied-profiles.txt").read_text().splitlines(), ["authenticated-read-admission-24x8-native"])
+        self.assertEqual((root / "restarts.txt").read_text().splitlines(), ["deadlock-web"])
+        self.assertEqual((root / "platform/shared/env/web.env").read_text(), "PLATFORM_WEB_SERVER_AUTH_TRANSPORT=node\n")
+        self.assertEqual((root / "platform/shared/env/api.env").read_text(), "API_TEST=preserved\n")
+        self.assertEqual((root / "platform/shared/env/worker.env").read_text(), "WORKER_TEST=preserved\n")
+
+    def test_profile_switch_rolls_back_after_web_readiness_failure(self) -> None:
+        result, root = self._run_profile_switch_fixture("readiness")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "FAIL:runtime profile switch failed; prior profile restored\n")
+        self.assertEqual(
+            (root / "applied-profiles.txt").read_text().splitlines(),
+            ["authenticated-read-admission-24x8-native", "authenticated-read-admission-24x8"],
+        )
+        self.assertEqual((root / "restarts.txt").read_text().splitlines(), ["deadlock-web", "deadlock-web"])
+        self.assertEqual((root / "platform/shared/env/web.env").read_text(), "PLATFORM_WEB_SERVER_AUTH_TRANSPORT=fetch\n")
+        self.assertEqual((root / "platform/shared/env/api.env").read_text(), "API_TEST=preserved\n")
+        self.assertEqual((root / "platform/shared/env/worker.env").read_text(), "WORKER_TEST=preserved\n")
+
+    def test_profile_switch_refuses_identity_profile_or_lock_drift_before_write(self) -> None:
+        for scenario in ("identity", "profile", "lock"):
+            with self.subTest(scenario=scenario):
+                result, root = self._run_profile_switch_fixture(scenario)
+                self.assertEqual(result.returncode, 1)
+                self.assertTrue(result.stdout.startswith("FAIL:"), result.stdout)
+                self.assertFalse((root / "applied-profiles.txt").exists())
+                self.assertFalse((root / "restarts.txt").exists())
+                self.assertEqual((root / "platform/shared/env/web.env").read_text(), "PLATFORM_WEB_SERVER_AUTH_TRANSPORT=fetch\n")
 
     def test_ssr_diagnostics_restarts_api_after_applying_api_log_gate(self) -> None:
         workflow = DEPLOY_SUPERVISOR.read_text()

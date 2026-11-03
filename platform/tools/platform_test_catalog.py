@@ -652,6 +652,36 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {
         "RetainedLoadExportExecutorTests",
         "test_fixture_trap_collision_leaves_preexisting_export_unchanged",
     ): "backend-privileged",
+    (
+        "test_platform_release_build_contract",
+        "PlatformReleaseBuildContractTests",
+        "test_runtime_profile_switch_payload_is_closed_to_the_a_b_pair",
+    ): "backend-tool-contract",
+    (
+        "test_platform_release_build_contract",
+        "PlatformReleaseBuildContractTests",
+        "test_runtime_profile_switch_requires_exact_successful_security_attempt",
+    ): "backend-tool-contract",
+    (
+        "test_platform_release_build_contract",
+        "PlatformReleaseBuildContractTests",
+        "test_profile_only_supervisor_branch_precedes_release_preflight_and_install",
+    ): "backend-tool-contract",
+    (
+        "test_platform_release_build_contract",
+        "PlatformReleaseBuildContractTests",
+        "test_profile_switch_changes_only_web_and_preserves_release_and_other_services",
+    ): "backend-tool-contract",
+    (
+        "test_platform_release_build_contract",
+        "PlatformReleaseBuildContractTests",
+        "test_profile_switch_rolls_back_after_web_readiness_failure",
+    ): "backend-tool-contract",
+    (
+        "test_platform_release_build_contract",
+        "PlatformReleaseBuildContractTests",
+        "test_profile_switch_refuses_identity_profile_or_lock_drift_before_write",
+    ): "backend-tool-contract",
 }
 
 # Filled after the implementation snapshot is stable.  The contract compares
@@ -660,10 +690,10 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
     "module_count": 176,
     "module_digest": "5f5168273bae9359473f971b7c853b7c517f39f21ea91cf025a2ff24eca391c4",
-    "test_count": 2340,
-    "test_id_digest": "9ec501a72906076898b0e16eccedfb6061a3ea049de0a527e7852675634ba98f",
-    "backend_test_count": 2260,
-    "backend_test_id_digest": "d40a97abd827c451057ace9cb88c0386e2cdcef521f8fd30b28df5089c69be48",
+    "test_count": 2346,
+    "test_id_digest": "083d7fdcad0c7c2af203d46d6b6ff0c7fc927900781a4b53f3f6456669963c6a",
+    "backend_test_count": 2266,
+    "backend_test_id_digest": "ade09830986d69f515ebce9e0cf3cae0ddfffecbdfa988f1eb42e863a8fc24d4",
     "verification_test_count": 80,
     "verification_test_id_digest": "441f275842aceea8043797eade1732b5ae6236284f09555d21c8bb4791511d35",
     "verification_classifier_test_count": 43,
@@ -690,10 +720,10 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
         "test_id_digest": "e641b7fb36a11f1918e039e8bf6bf555b451ca54f8800322642ce38310d824a3",
     },
     "backend-tool-contract": {
-        "module_count": 54,
-        "module_digest": "636080917fb0aba2e9a3af886ef5063e9f19ea9f73e40d4053e137dc74441bb2",
-        "test_count": 657,
-        "test_id_digest": "ff0a6ce41b7251f961e3c58435d8d3228cc03387f6b36771df00cee9c195acdf",
+        "module_count": 55,
+        "module_digest": "66eabc37edf399774d49df08165a506daa128ba1a1fc1511e8bfd0df0705fd3b",
+        "test_count": 663,
+        "test_id_digest": "fa2cab2e7b648d00fe548cbfcdf574d6261f153f65a25ce568fdc7d6ed01d4b0",
     },
     "backend-integration": {
         "module_count": 41,
@@ -831,13 +861,13 @@ def _contour_for(module: str, class_node: ast.ClassDef, method: ast.AST) -> str:
     override = CLASS_CONTOUR_OVERRIDES.get((module, class_node.name))
     if override is not None:
         return override
-    if module in PRIVILEGED_MODULES:
-        return "backend-privileged"
     method_override = TEST_CONTOUR_OVERRIDES.get(
         (module, class_node.name, getattr(method, "name", ""))
     )
     if method_override is not None:
         return method_override
+    if module in PRIVILEGED_MODULES:
+        return "backend-privileged"
     if module in TOOL_MODULES:
         return "backend-tool-contract"
     if module in UNIT_MODULES:

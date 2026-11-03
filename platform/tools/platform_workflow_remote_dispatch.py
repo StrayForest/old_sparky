@@ -328,6 +328,7 @@ EXPORT_EXECUTOR_ENV = {
     "LC_CTYPE": "C.UTF-8",
 }
 DEPLOY_OPERATION_TIMEOUT_SECONDS = 1950.0
+RUNTIME_PROFILE_SWITCH_TIMEOUT_SECONDS = 300.0
 CLEANUP_OPERATION_TIMEOUT_SECONDS = 300.0
 ARTIFACT_PREP_OPERATION_TIMEOUT_SECONDS = 120.0
 LIVE_USER_QA_OPERATION_TIMEOUT_SECONDS = 2400.0
@@ -601,7 +602,7 @@ RELEASE_MARKER_RE = re.compile(
     rb"artifact_count_invalid|checksum_missing|provenance_missing|"
     rb"artifact_name_invalid|release_slug_mismatch|checksum_mismatch|"
     rb"validation_failed|provenance_invalid|candidate_missing|"
-    rb"activation_failed|lock_lost|runtime_profile_failed|baseline_changed)"
+    rb"activation_failed|lock_lost|runtime_profile_failed|runtime_profile_restored|baseline_changed)"
     rb"(?: lock_stage=(?P<lock_stage>helper_metadata|release_supervise|"
     rb"release_open|retained_supervise|retained_open))?"
     rb"(?: candidate_diag_state=(?P<candidate_diag_state>classified|unknown)"
@@ -647,7 +648,9 @@ RELEASE_FAILURE_REASONS = {
     ("deployment", "candidate"): frozenset(
         {"candidate_missing", "activation_failed", "lock_lost"}
     ),
-    ("deployment", "readiness"): frozenset({"runtime_profile_failed"}),
+    ("deployment", "readiness"): frozenset(
+        {"runtime_profile_failed", "runtime_profile_restored"}
+    ),
 }
 RUN_ID_RE = re.compile(r"^[1-9][0-9]{0,31}$")
 EXTERNAL_PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -3982,11 +3985,13 @@ def main(argv: list[str] | None = None) -> int:
         mode = "live"
     elif arguments in (["production-deploy"], ["production-prepare-artifact"]):
         mode = "deployment"
+    elif arguments == ["runtime-profile-switch"]:
+        mode = "runtime-profile-switch"
     else:
         return _fail()
 
     try:
-        if mode == "deployment" and not _trusted_generation():
+        if mode in {"deployment", "runtime-profile-switch"} and not _trusted_generation():
             return _fail()
         try:
             payload = load_stdin_payload(mode=mode)
@@ -4153,6 +4158,30 @@ def main(argv: list[str] | None = None) -> int:
                     payload["release_slug"],
                     payload["target_sha"],
                 ),
+            )
+        if arguments == ["runtime-profile-switch"]:
+            if (
+                not _host_baseline_generation_ready()
+                or payload["host_tools_sha"] != ACTIVE_TOOLS_DIR.name
+            ):
+                return _fail()
+            run_id = payload["run_id"]
+            run_attempt = payload["run_attempt"]
+            release_slug = f"gha-{run_id}-{run_attempt}-{payload['target_sha'][:12]}"
+            artifact_dir = f"/tmp/old-sparky-platform-artifact-{run_id}-{run_attempt}"
+            return _run_sudo(
+                DEPLOY_HELPER,
+                [
+                    payload["target_sha"],
+                    release_slug,
+                    "profile-switch",
+                    artifact_dir,
+                    payload["target_profile"],
+                    payload["expected_profile"],
+                    payload["host_tools_sha"],
+                ],
+                timeout_seconds=RUNTIME_PROFILE_SWITCH_TIMEOUT_SECONDS,
+                expected_release_marker=("deploy", release_slug, payload["target_sha"]),
             )
         if arguments == ["live-user-qa"]:
             if (

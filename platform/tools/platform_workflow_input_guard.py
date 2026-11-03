@@ -50,6 +50,11 @@ CONFIRMATION_PHRASES = frozenset(
     }
 )
 DEPLOY_MODES = frozenset({"preflight", "deploy"})
+RUNTIME_PROFILE_SWITCH_CONFIRMATION = "SWITCH-PRODUCTION-READ-ADMISSION"
+RUNTIME_PROFILE_SWITCH_PROFILES = frozenset({
+    "authenticated-read-admission-24x8",
+    "authenticated-read-admission-24x8-native",
+})
 DEPLOY_RUNTIME_PROFILES = frozenset(
     {
         "baseline",
@@ -919,6 +924,56 @@ def validate_deployment_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def validate_runtime_profile_switch_payload(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate one closed, profile-only production handoff."""
+
+    payload = _require_mapping(payload)
+    required = {
+        "schema",
+        "confirmation",
+        "target_sha",
+        "expected_profile",
+        "target_profile",
+        "host_tools_sha",
+        "security_run_id",
+        "security_run_attempt",
+        "run_id",
+        "run_attempt",
+    }
+    if set(payload) != required:
+        raise _invalid()
+    _validate_schema(payload.get("schema"))
+    confirmation = _require_string(payload, "confirmation")
+    if confirmation != RUNTIME_PROFILE_SWITCH_CONFIRMATION:
+        raise _invalid()
+    target_sha = _require_string(payload, "target_sha")
+    host_tools_sha = _require_string(payload, "host_tools_sha")
+    if SHA_RE.fullmatch(target_sha) is None or SHA_RE.fullmatch(host_tools_sha) is None:
+        raise _invalid()
+    expected_profile = _require_string(payload, "expected_profile")
+    target_profile = _require_string(payload, "target_profile")
+    if (
+        expected_profile not in RUNTIME_PROFILE_SWITCH_PROFILES
+        or target_profile not in RUNTIME_PROFILE_SWITCH_PROFILES
+        or expected_profile == target_profile
+    ):
+        raise _invalid()
+    return {
+        "schema": 1,
+        "confirmation": confirmation,
+        "target_sha": target_sha,
+        "expected_profile": expected_profile,
+        "target_profile": target_profile,
+        "host_tools_sha": host_tools_sha,
+        "security_run_id": _validate_run_id(payload.get("security_run_id")),
+        "security_run_attempt": _validate_run_id(payload.get("security_run_attempt")),
+        "run_id": _validate_run_id(payload.get("run_id")),
+        "run_attempt": _validate_run_id(payload.get("run_attempt")),
+    }
+
+
 def validate_release_baseline_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Validate the exact tuple that the immutable supervisor rechecks."""
 
@@ -1137,6 +1192,8 @@ def load_payload(path: Path, *, mode: str) -> dict[str, Any]:
         return validate_cleanup_payload(payload)
     if mode == "deployment":
         return validate_deployment_payload(payload)
+    if mode == "runtime-profile-switch":
+        return validate_runtime_profile_switch_payload(payload)
     if mode == "host-tools":
         return validate_host_tools_payload(payload)
     raise _invalid()
@@ -1190,6 +1247,8 @@ def load_stdin_payload(*, mode: str) -> dict[str, Any]:
         return validate_cleanup_payload(payload)
     if mode == "deployment":
         return validate_deployment_payload(payload)
+    if mode == "runtime-profile-switch":
+        return validate_runtime_profile_switch_payload(payload)
     if mode == "host-tools":
         return validate_host_tools_payload(payload)
     raise _invalid()
@@ -1297,6 +1356,23 @@ def _deployment_from_args(args: argparse.Namespace) -> dict[str, str]:
     return validate_deployment_payload(payload)
 
 
+def _runtime_profile_switch_from_args(args: argparse.Namespace) -> dict[str, str]:
+    return validate_runtime_profile_switch_payload(
+        {
+            "schema": 1,
+            "confirmation": args.confirmation,
+            "target_sha": args.target_sha,
+            "expected_profile": args.expected_profile,
+            "target_profile": args.target_profile,
+            "host_tools_sha": args.host_tools_sha,
+            "security_run_id": args.security_run_id,
+            "security_run_attempt": args.security_run_attempt,
+            "run_id": args.run_id,
+            "run_attempt": args.run_attempt,
+        }
+    )
+
+
 def _host_tools_from_args(args: argparse.Namespace) -> dict[str, str]:
     payload: dict[str, Any] = {
         "schema": 1,
@@ -1394,6 +1470,18 @@ def _parser() -> argparse.ArgumentParser:
     deployment.add_argument("--classifier-run-attempt", required=True)
     deployment.add_argument("--web-compression", required=True)
 
+    runtime_profile_switch = subparsers.add_parser("runtime-profile-switch")
+    runtime_profile_switch.add_argument("--output", type=Path, required=True)
+    runtime_profile_switch.add_argument("--confirmation", required=True)
+    runtime_profile_switch.add_argument("--target-sha", required=True)
+    runtime_profile_switch.add_argument("--expected-profile", required=True)
+    runtime_profile_switch.add_argument("--target-profile", required=True)
+    runtime_profile_switch.add_argument("--host-tools-sha", required=True)
+    runtime_profile_switch.add_argument("--security-run-id", required=True)
+    runtime_profile_switch.add_argument("--security-run-attempt", required=True)
+    runtime_profile_switch.add_argument("--run-id", required=True)
+    runtime_profile_switch.add_argument("--run-attempt", required=True)
+
     host_tools = subparsers.add_parser("host-tools")
     host_tools.add_argument("--input", type=Path)
     host_tools.add_argument("--output", type=Path)
@@ -1463,6 +1551,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "deployment":
             _write_private_json(args.output, _deployment_from_args(args))
+            return 0
+        if args.command == "runtime-profile-switch":
+            _write_private_json(args.output, _runtime_profile_switch_from_args(args))
             return 0
         if args.command == "host-tools":
             if args.input is not None:
