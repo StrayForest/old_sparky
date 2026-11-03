@@ -751,6 +751,7 @@ fi
 set_failure_context preflight preflight preflight_failed
 preflight_previous_flag=(--require-previous)
 active_revision_preflight_flag=()
+legacy_api_transport_preflight_flag=(--allow-legacy-api-web-transport)
 if [[ "$deploy_mode" == "deploy" ]]; then
   active_revision_preflight_flag=(--defer-active-alembic-revision-check)
 fi
@@ -762,6 +763,7 @@ fi
 "$host_tools_dir/platform_release_preflight.sh" \
   "${preflight_previous_flag[@]}" \
   "${active_revision_preflight_flag[@]}" \
+  "${legacy_api_transport_preflight_flag[@]}" \
   --require-verified-backup \
   --require-edge-parity \
   --backup-max-age-hours 24 >/dev/null 2>/dev/null \
@@ -942,6 +944,7 @@ set_failure_context preflight preflight preflight_failed
 "$host_tools_dir/platform_release_preflight.sh" \
   --app-dir "$runtime" \
   "${preflight_previous_flag[@]}" \
+  "${legacy_api_transport_preflight_flag[@]}" \
   --defer-active-alembic-revision-check \
   --require-verified-backup \
   --require-edge-parity \

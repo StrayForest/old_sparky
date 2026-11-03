@@ -42,7 +42,7 @@ PROFILE_REJECTION_CODES = frozenset({
     "systemd_identity", "preflight_exception", "identity_pid", "identity_start_ticks",
     "identity_invocation", "identity_unit", "identity_cgroup",
     "journal_timestamp", "journal_window", "profile_start_lag", "profile_elapsed",
-    "profile_end_lag", "profile_numeric", "profile_category",
+    "profile_end_lag", "profile_numeric", "profile_category", "profile_function_detail",
     "profile_aggregate", "profile_parser", "summary_exception", "summary_validation",
     "missing", "duplicate", "unexpected",
 })
@@ -77,6 +77,7 @@ CPU_PLAN_FAILURE_STAGES = frozenset({
     "helper_output_limit", "unrecognized_rc2", "inner_exit",
     "response_framing", "response_parse", "response_summary",
     "usage_rows", "usage_aggregate", "profile_rows", "profile_categories",
+    "profile_function_details",
     "profile_aggregate", "memory_rows", "memory_metrics", "memory_aggregate",
     "cgroup_aggregate", "summary_bound",
 })
@@ -95,9 +96,120 @@ PROFILE_ROW_FIELDS = frozenset({
     "service", "expected_targets", "observed_targets", "event_count", "timer",
     "observation_unit", "total_cpu_us", "sample_count", "start_lag_ms_min",
     "start_lag_ms_max", "elapsed_ms_min", "elapsed_ms_max", "end_lag_ms_min",
-    "end_lag_ms_max", "categories",
+    "end_lag_ms_max", "categories", "function_details",
 })
 PROFILE_CATEGORY_FIELDS = frozenset({"category", "cpu_us", "observations"})
+PROFILE_FUNCTION_IDS = frozenset({
+    "api.orm.session_execute", "api.orm.session_scalars", "api.orm.loading_instances",
+    "api.orm.loading_instance", "api.db.execute_context", "api.orm.result_all",
+    "api.orm.result_scalars", "api.db.asyncpg_fetch", "api.db.asyncpg_fetchrow",
+    "api.db.asyncpg_execute", "api.db.asyncpg_bind_execute",
+    "api.serialization.pydantic_init", "api.serialization.pydantic_validate",
+    "api.serialization.pydantic_dump", "api.serialization.fastapi_response",
+    "api.serialization.fastapi_encode", "api.serialization.json_encode",
+    "web.workspace.api_fetch", "web.workspace.page_load", "web.workspace.page_render",
+    "web.react.render_stream", "web.react.render_string", "web.react.serialize_model",
+    "web.react.serialize_row", "web.serialization.json_parse",
+    "web.serialization.json_stringify", "web.serialization.schema_parse",
+    "web.next.render_route", "web.next.render_response", "web.next.flight_payload",
+    "web.next.metadata", "web.http.fetch", "web.http.request", "web.react.render_work",
+})
+PROFILE_FUNCTION_DETAIL_FIELDS = frozenset({
+    "top_self", "top_cumulative", "top_samples", "mapped_self_cpu_us", "mapped_sample_count",
+})
+PROFILE_FUNCTION_MAX_ROWS = 20
+
+
+def _validate_profile_function_details(
+    value: Any, *, service: str, total_cpu_us: int | None, sample_count: int | None,
+) -> dict[str, Any] | None:
+    """Validate fixed function IDs and keep mapped coverage separate from totals."""
+
+    if (not isinstance(value, dict) or set(value) != PROFILE_FUNCTION_DETAIL_FIELDS
+            or any(not isinstance(value.get(name), list) for name in (
+                "top_self", "top_cumulative", "top_samples",
+            ))
+            or any(len(value[name]) > PROFILE_FUNCTION_MAX_ROWS for name in (
+                "top_self", "top_cumulative", "top_samples",
+            ))
+            or type(value.get("mapped_self_cpu_us")) is not int
+            or not 0 <= value["mapped_self_cpu_us"] <= 10**10
+            or type(value.get("mapped_sample_count")) is not int
+            or not 0 <= value["mapped_sample_count"] <= 2400):
+        return None
+    clean = {
+        "top_self": [], "top_cumulative": [], "top_samples": [],
+        "mapped_self_cpu_us": value["mapped_self_cpu_us"],
+        "mapped_sample_count": value["mapped_sample_count"],
+    }
+    for list_name in ("top_self", "top_cumulative", "top_samples"):
+        names: list[str] = []
+        for item in value[list_name]:
+            is_api_cpu = service == "api" and list_name != "top_samples"
+            expected = ({"function_id", "cpu_us", "calls", "primitive_calls"}
+                        if is_api_cpu else {"function_id", "samples"})
+            function_id = item.get("function_id") if isinstance(item, dict) else None
+            if (not isinstance(item, dict) or set(item) != expected
+                    or not isinstance(function_id, str)
+                    or function_id not in PROFILE_FUNCTION_IDS
+                    or (service == "api" and not function_id.startswith("api."))
+                    or (service == "web" and not function_id.startswith("web."))):
+                return None
+            names.append(function_id)
+            if is_api_cpu:
+                maximum_cpu = 60_000_000 if list_name == "top_self" else 240_000_000
+                if (type(item["cpu_us"]) is not int or not 0 <= item["cpu_us"] <= maximum_cpu
+                        or type(item["calls"]) is not int or not 0 <= item["calls"] <= 10_000_000
+                        or type(item["primitive_calls"]) is not int
+                        or not 0 <= item["primitive_calls"] <= item["calls"]):
+                    return None
+                clean[list_name].append({
+                    "function_id": function_id, "cpu_us": item["cpu_us"],
+                    "calls": item["calls"], "primitive_calls": item["primitive_calls"],
+                })
+            else:
+                if type(item["samples"]) is not int or not 1 <= item["samples"] <= 2400:
+                    return None
+                clean[list_name].append({"function_id": function_id, "samples": item["samples"]})
+        if len(set(names)) != len(names):
+            return None
+    if service == "api":
+        if (value["top_samples"] or value["mapped_sample_count"] != 0
+                or sum(item["cpu_us"] for item in clean["top_self"])
+                != value["mapped_self_cpu_us"]
+                or value["mapped_self_cpu_us"] > (total_cpu_us or 0)):
+            return None
+        if any(
+            current["cpu_us"] > previous["cpu_us"]
+            or (current["cpu_us"] == previous["cpu_us"]
+                and current["function_id"] < previous["function_id"])
+            for list_name in ("top_self", "top_cumulative")
+            for previous, current in zip(clean[list_name], clean[list_name][1:])
+        ):
+            return None
+        self_by_id = {item["function_id"]: item for item in clean["top_self"]}
+        cumulative_by_id = {item["function_id"]: item for item in clean["top_cumulative"]}
+        if any(
+            self_by_id[name]["calls"] != cumulative_by_id[name]["calls"]
+            or self_by_id[name]["primitive_calls"] != cumulative_by_id[name]["primitive_calls"]
+            for name in self_by_id.keys() & cumulative_by_id.keys()
+        ):
+            return None
+    else:
+        if (value["top_self"] or value["top_cumulative"]
+                or value["mapped_self_cpu_us"] != 0
+                or sum(item["samples"] for item in clean["top_samples"])
+                != value["mapped_sample_count"]
+                or value["mapped_sample_count"] > (sample_count or 0)):
+            return None
+        if any(
+            current["samples"] > previous["samples"]
+            or (current["samples"] == previous["samples"]
+                and current["function_id"] < previous["function_id"])
+            for previous, current in zip(clean["top_samples"], clean["top_samples"][1:])
+        ):
+            return None
+    return clean
 MEMORY_ROW_FIELDS = frozenset({
     "service", "run_id", "phase", "expected_targets", "observed_targets",
     "event_count", "duplicate_count", "status", "gc_status", "gc_overflow",
@@ -195,6 +307,8 @@ def _validate_profile_projection(
             item = clean[name]
             if item is not None and (type(item) is not int or not 0 <= item <= 10**10):
                 return None
+        if service == "web" and clean["sample_count"] is not None and clean["sample_count"] > 2400:
+            return None
         categories: list[dict[str, Any]] = []
         names: list[str] = []
         for category in clean["categories"]:
@@ -214,6 +328,13 @@ def _validate_profile_projection(
         if names != sorted(names) or len(set(names)) != len(names):
             return None
         clean["categories"] = categories
+        clean_detail = _validate_profile_function_details(
+            clean.get("function_details"), service=service,
+            total_cpu_us=clean["total_cpu_us"], sample_count=clean["sample_count"],
+        )
+        if clean_detail is None:
+            return None
+        clean["function_details"] = clean_detail
         clean_rows.append(clean)
     if value["profile_status"] == "complete" and (
         value["profile_reason"] != "none"
@@ -1714,6 +1835,14 @@ def _validate_usage_summary(
         if names != sorted(names) or len(set(names)) != len(names):
             return None
         profile_clean["categories"] = categories
+        clean_details = _validate_profile_function_details(
+            profile_clean["function_details"], service=service,
+            total_cpu_us=profile_clean["total_cpu_us"],
+            sample_count=profile_clean["sample_count"],
+        )
+        if clean_details is None:
+            return None
+        profile_clean["function_details"] = clean_details
         clean_profiles.append(profile_clean)
     if expected_workload not in PROFILE_WORKLOADS:
         zero_profile = (
@@ -1726,6 +1855,10 @@ def _validate_usage_summary(
                 and row["total_cpu_us"] == 0
                 and row["sample_count"] == (None if row["service"] == "api" else 0)
                 and row["categories"] == []
+                and row["function_details"] == {
+                    "top_self": [], "top_cumulative": [], "top_samples": [],
+                    "mapped_self_cpu_us": 0, "mapped_sample_count": 0,
+                }
                 and all(row[field] is None for field in (
                     "start_lag_ms_min", "start_lag_ms_max", "elapsed_ms_min",
                     "elapsed_ms_max", "end_lag_ms_min", "end_lag_ms_max",

@@ -790,6 +790,31 @@ API_FUNCTION_ALLOWLIST = frozenset({
     "get_server_request_correlation_headers",
     "run_with_ssr_trace",
 })
+# Function-level output is intentionally narrower than category attribution.
+# Match both the installed module suffix and exact function name, then emit
+# only this fixed identifier. Never serialize pstats filenames or raw symbols.
+API_PROFILE_FUNCTIONS = {
+    ("/sqlalchemy/orm/session.py", "_execute_internal"): "api.orm.session_execute",
+    ("/sqlalchemy/orm/session.py", "execute"): "api.orm.session_execute",
+    ("/sqlalchemy/orm/session.py", "scalars"): "api.orm.session_scalars",
+    ("/sqlalchemy/orm/loading.py", "instances"): "api.orm.loading_instances",
+    ("/sqlalchemy/orm/loading.py", "_instance"): "api.orm.loading_instance",
+    ("/sqlalchemy/engine/base.py", "_exec_single_context"): "api.db.execute_context",
+    ("/sqlalchemy/engine/base.py", "_execute_context"): "api.db.execute_context",
+    ("/sqlalchemy/engine/result.py", "all"): "api.orm.result_all",
+    ("/sqlalchemy/engine/result.py", "scalars"): "api.orm.result_scalars",
+    ("/asyncpg/connection.py", "fetch"): "api.db.asyncpg_fetch",
+    ("/asyncpg/connection.py", "fetchrow"): "api.db.asyncpg_fetchrow",
+    ("/asyncpg/connection.py", "_execute"): "api.db.asyncpg_execute",
+    ("/asyncpg/protocol/protocol.py", "bind_execute"): "api.db.asyncpg_bind_execute",
+    ("/pydantic/main.py", "__init__"): "api.serialization.pydantic_init",
+    ("/pydantic/main.py", "model_validate"): "api.serialization.pydantic_validate",
+    ("/pydantic/main.py", "model_dump"): "api.serialization.pydantic_dump",
+    ("/fastapi/routing.py", "serialize_response"): "api.serialization.fastapi_response",
+    ("/fastapi/encoders.py", "jsonable_encoder"): "api.serialization.fastapi_encode",
+    ("/json/encoder.py", "encode"): "api.serialization.json_encode",
+    ("/json/encoder.py", "iterencode"): "api.serialization.json_encode",
+}
 RUNTIME_PREFIX_CATEGORIES = (
     ("/sqlalchemy/", "orm_result"),
     ("/asyncpg/", "db_driver"),
@@ -830,11 +855,14 @@ def _bounded_profile_categories(
     return [(name, values[0], values[1]) for name, values in projected]
 
 
-def _profile_summary(profile: cProfile.Profile) -> tuple[list[tuple[str, int, int]], int]:
+def _profile_summary(
+    profile: cProfile.Profile,
+) -> tuple[list[tuple[str, int, int]], int, dict[str, list[dict[str, int | str]]]]:
     import pstats
 
     stats = pstats.Stats(profile).stats
     totals: dict[str, list[int]] = {}
+    function_totals: dict[str, list[int]] = {}
     all_self_us = 0
     platform_root = str(Path(__file__).resolve().parents[2])
     for (filename, _line, function), values in stats.items():
@@ -857,7 +885,32 @@ def _profile_summary(profile: cProfile.Profile) -> tuple[list[tuple[str, int, in
         entry = totals.setdefault(label, [0, 0])
         entry[0] += self_us
         entry[1] += int(values[1])
-    return _bounded_profile_categories(totals), all_self_us
+        for (module_suffix, function_name), function_id in API_PROFILE_FUNCTIONS.items():
+            if normalized.endswith(module_suffix) and function == function_name:
+                detail = function_totals.setdefault(function_id, [0, 0, 0, 0])
+                detail[0] += self_us
+                detail[1] += int(max(0.0, float(values[3])) * 1_000_000)
+                detail[2] += int(values[1])
+                detail[3] += int(values[0])
+                break
+    # Emit every recognized ID (the closed map is capped at 20), allowing the
+    # parent to merge API workers before selecting its top rows.
+    top_self = [
+        {"function_id": name, "cpu_us": values[0], "calls": values[2], "primitive_calls": values[3]}
+        for name, values in sorted(function_totals.items(), key=lambda item: (-item[1][0], item[0]))
+        if values[0] or values[2]
+    ]
+    top_cumulative = [
+        {"function_id": name, "cpu_us": values[1], "calls": values[2], "primitive_calls": values[3]}
+        for name, values in sorted(function_totals.items(), key=lambda item: (-item[1][1], item[0]))
+        if values[1] or values[2]
+    ]
+    return _bounded_profile_categories(totals), all_self_us, {
+        "top_self": top_self,
+        "top_cumulative": top_cumulative,
+        "top_samples": [],
+        "mapped_self_cpu_us": sum(int(row["cpu_us"]) for row in top_self),
+    }
 
 
 class ApiCpuDiagnostic:
@@ -1013,19 +1066,28 @@ class ApiCpuDiagnostic:
             current_plan = None
         if current_plan != self.plan:
             return
-        rows, total_self_us = _profile_summary(self.profile)
+        rows, total_self_us, details = _profile_summary(self.profile)
         elapsed_ms = 0
         if self.started_monotonic is not None:
             elapsed_ms = min(MAX_CAPTURE_MS, int((time.monotonic() - self.started_monotonic) * 1000))
         categories = ",".join(f"{name}:{cpu_us}:{calls}" for name, cpu_us, calls in rows)
         _emit_cpu_diagnostic_message(
             "cpu_diagnostic_complete service=api run_id=%s timer=thread_cpu "
-            "start_lag_ms=%s elapsed_ms=%s total_self_cpu_us=%s functions=%s" % (
+            "start_lag_ms=%s elapsed_ms=%s total_self_cpu_us=%s functions=%s "
+            "top_self=%s top_cumulative=%s" % (
                 self.plan.run_id,
                 self.start_lag_ms,
                 elapsed_ms,
                 total_self_us,
-                categories[:6000],
+                categories[:3000],
+                ",".join(
+                    f"{row['function_id']}:{row['cpu_us']}:{row['calls']}:{row['primitive_calls']}"
+                    for row in details["top_self"]
+                ),
+                ",".join(
+                    f"{row['function_id']}:{row['cpu_us']}:{row['calls']}:{row['primitive_calls']}"
+                    for row in details["top_cumulative"]
+                ),
             )
         )
 

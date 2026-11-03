@@ -335,7 +335,9 @@ identities, and all of these conditions hold:
   rechecks the exact process-bound plan and end time before emitting a complete
   profile record. A missing, late, replaced, or unreadable plan remains
   incomplete; the first ON request cannot start or shift this profile. Keep the
-  250 ms start and end bounds. The 120-second capacity workload never enables
+  250 ms start and end bounds. Web V8 sampling uses a bounded 10 ms interval
+  in this opt-in workload, with at most 2,400 samples and 10,000 profile
+  nodes. The 120-second capacity workload never enables
   API cProfile. Profile data is attribution only; do not merge it into
   capacity-window latency or CPU results.
 - When the API profiler emits more than ten categories, it retains the
@@ -369,11 +371,19 @@ Any missing phase, request identity, required metric, cleanup proof, binding,
 or deadline condition makes the composite incomplete; retain the partial
 observations as partial and assign no capacity, SLO, or matrix credit. The
 profiled phase is never capacity evidence. API function self-time is measured
-on the event-loop thread and excludes other threads. Web V8 category values
-sum sampled `timeDeltas` at a 100-millisecond interval; they are not process
-CPU time or exact function self-time, and `other` can combine many unclassified
-frames. Do not report function-level attribution from these aggregate-only
-summaries.
+on the event-loop thread and excludes other threads. API profile rows include
+at most 20 fixed function IDs with self CPU, cumulative CPU, total and
+primitive calls. The self-time coverage field counts only mapped functions;
+the category totals still conserve all API self CPU. Cumulative values overlap
+their callers and must not be summed into a total. Unknown functions remain in
+their existing category and never expose a raw symbol or file path.
+
+Web profile rows contain sampled counts for at most 20 reviewed function IDs
+and a mapped-sample count against the total sample count. These are V8 sample
+counts, not per-function CPU time. Category values continue to sum sampled
+`timeDeltas`; they are diagnostic weights, not process CPU or exact function
+self-time. Unknown frames remain in their existing category. Neither producer
+exports raw profile nodes, paths, symbols, request IDs or source text.
 
 For an incomplete diagnostic, use the one-day failure-fingerprint artifact to
 read only the bounded failure classifications. `capacity_phase.resource_abort_reason`

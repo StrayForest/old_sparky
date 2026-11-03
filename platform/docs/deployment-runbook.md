@@ -271,6 +271,13 @@ manually dispatch. Stop if it fails again or the stage is unclear.
 Do not run `platform_build_release.sh` or `platform_release_deploy.sh` directly for a normal release.
 They are workflow implementation details; direct server execution is limited to explicitly authorized recovery or rollback.
 
+### Legacy renderer transition
+
+Pre-install supervisor and candidate checks accept the verify-only
+`--allow-legacy-api-web-transport` flag only for the exact former API bytes
+with canonical `fetch|node`; ownership, mode, links, parser, web and worker
+checks stay strict. It never writes. Installer regenerates envs; post-smoke stays strict.
+
 ### Service preflight recovery
 
 Use the existing web-only recovery if `deadlock-web` is inactive/unhealthy, or

@@ -184,8 +184,8 @@ class ApiCpuProfileConservationTests(unittest.TestCase):
             add_record("api", pid, 1_044_000, message)
         web_message = (
             f"cpu_diagnostic_complete service=web run_id={run_id} timer=v8_cpu "
-            "start_lag_ms=0 elapsed_ms=20000 sample_interval_us=100000 sample_count=20 "
-            "categories=other:1000000:10,web_framework:1000000:10"
+            "start_lag_ms=0 elapsed_ms=20000 sample_interval_us=10000 sample_count=20 "
+            "categories=other:1000000:10,web_framework:1000000:10 top_samples="
         )
         add_record("web", 103, 1_044_000, web_message)
 
@@ -215,7 +215,7 @@ class ApiCpuProfileConservationTests(unittest.TestCase):
         self.assertGreater(raw_category_count, 10)
         self.assertLess(sum(row[1] for row in legacy_rows), legacy_total)
 
-        rows, total = api_diagnostic._profile_summary(profile)
+        rows, total, _details = api_diagnostic._profile_summary(profile)
         self.assertLessEqual(len(rows), 10)
         self._assert_cpu_ranked(rows)
         self.assertEqual(len({row[0] for row in rows}), len(rows))
@@ -228,7 +228,7 @@ class ApiCpuProfileConservationTests(unittest.TestCase):
     def test_small_profile_keeps_all_categories_without_fabricating_other(self) -> None:
         profile = self._profile(sorted(api_diagnostic.API_FUNCTION_ALLOWLIST)[:4])
         legacy_rows, legacy_total, raw_category_count = self._legacy_top_ten(profile)
-        rows, total = api_diagnostic._profile_summary(profile)
+        rows, total, _details = api_diagnostic._profile_summary(profile)
         self.assertGreater(total, 0)
         self.assertLessEqual(len(rows), 10)
         self.assertEqual(len(rows), raw_category_count)
@@ -252,7 +252,7 @@ class ApiCpuProfileConservationTests(unittest.TestCase):
 
     def test_existing_other_and_overflow_conserve_both_totals(self) -> None:
         profile = self._profile(sorted(api_diagnostic.API_FUNCTION_ALLOWLIST)[:12], unclassified=True)
-        rows, total = api_diagnostic._profile_summary(profile)
+        rows, total, _details = api_diagnostic._profile_summary(profile)
         self.assertLessEqual(len(rows), 10)
         self._assert_cpu_ranked(rows)
         self.assertIn("other", {row[0] for row in rows})
@@ -300,7 +300,8 @@ class ApiCpuProfileConservationTests(unittest.TestCase):
             encoded = ",".join(f"{name}:{cpu_us}:{calls}" for name, cpu_us, calls in legacy_rows)
             old_messages.append(
                 f"cpu_diagnostic_complete service=api run_id={'b' * 32} timer=thread_cpu "
-                f"start_lag_ms=0 elapsed_ms=20000 total_self_cpu_us={total} functions={encoded}"
+                f"start_lag_ms=0 elapsed_ms=20000 total_self_cpu_us={total} functions={encoded} "
+                "top_self= top_cumulative="
             )
         summary = self._journal_summary(old_messages)
         self.assertEqual(summary["profile_status"], "incomplete")

@@ -8,7 +8,7 @@ import inspector from "node:inspector";
 import { getHeapStatistics } from "node:v8";
 import { headers } from "next/headers";
 import { hasAuthorizedDiagnosticRunMarker } from "./performance-diagnostic-marker";
-import { categoryForFrame } from "./cpu-profile-categories.mjs";
+import { categoryForFrame, functionIdForFrame } from "./cpu-profile-categories.mjs";
 import { isHtmlSsrCaptureEligible } from "./ssr-capture-sampling.mjs";
 import { releaseMetadataPathFromStandaloneCwd } from "./release-identity-path.mjs";
 import {
@@ -36,7 +36,7 @@ const OFF_WINDOW_MS = 20_000;
 const IDLE_WINDOW_MS = 5_000;
 const ON_WINDOW_MS = 20_000;
 const HTML_CAPACITY_ON_WINDOW_MS = 120_000;
-const MAX_SAMPLES = 1200;
+const MAX_SAMPLES = 2400;
 const MAX_PROFILE_NODES = 10_000;
 const MAX_PROFILE_CPU_US = 60_000_000;
 const CPU_WINDOW_TOLERANCE_MS = 250;
@@ -826,7 +826,7 @@ async function startNodeCpuProfile(plan: DiagnosticPlan, startedAtMs: number): P
   try {
     session.connect();
     await post<InspectorResponse<unknown>>(session, "Profiler.enable");
-    await post<InspectorResponse<unknown>>(session, "Profiler.setSamplingInterval", { interval: 100_000 });
+    await post<InspectorResponse<unknown>>(session, "Profiler.setSamplingInterval", { interval: 10_000 });
     await post<InspectorResponse<unknown>>(session, "Profiler.start");
     activeCpuRunId = plan.run_id;
     const delay = Math.max(1, plan.on_end_ms - Date.now());
@@ -837,6 +837,27 @@ async function startNodeCpuProfile(plan: DiagnosticPlan, startedAtMs: number): P
   } catch {
     session.disconnect();
   }
+}
+
+function summarizeFunctionSamples(
+  nodes: Map<number, { url?: string; functionName?: string }>,
+  samples: number[],
+): { rows: Array<{ function_id: string; samples: number }>; mapped_sample_count: number } {
+  const counts = new Map<string, number>();
+  for (const nodeId of samples) {
+    const frame = nodes.get(nodeId);
+    if (!frame) continue;
+    const functionId = functionIdForFrame(frame.url ?? "", frame.functionName ?? "");
+    if (functionId !== null) counts.set(functionId, (counts.get(functionId) ?? 0) + 1);
+  }
+  const rows = [...counts.entries()]
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .slice(0, 20)
+    .map(([function_id, count]) => ({ function_id, samples: count }));
+  return {
+    rows,
+    mapped_sample_count: rows.reduce((total, row) => total + row.samples, 0),
+  };
 }
 
 async function stopNodeCpuProfile(
@@ -884,11 +905,16 @@ async function stopNodeCpuProfile(
       .map(([name, row]) => `${name}:${row.cpuUs}:${row.samples}`);
     summaryRows.push(`other:${otherTotals.cpuUs}:${otherTotals.samples}`);
     const summary = summaryRows.join(",");
+    const functionDetails = summarizeFunctionSamples(nodes, profile.samples);
+    const functionSummary = functionDetails.rows
+      .map(({ function_id, samples }) => `${function_id}:${samples}`)
+      .join(",");
     const elapsedMs = Math.max(0, Math.floor(performance.now() - startedMonotonicMs));
     console.info(
       `cpu_diagnostic_complete service=web run_id=${runId} timer=v8_cpu `
       + `start_lag_ms=${startLagMs} elapsed_ms=${elapsedMs} `
-      + `sample_interval_us=100000 sample_count=${acceptedSamples} categories=${summary.slice(0, 3000)}`
+      + `sample_interval_us=10000 sample_count=${acceptedSamples} categories=${summary.slice(0, 3000)} `
+      + `top_samples=${functionSummary}`
     );
   } catch {
     console.info(`cpu_diagnostic_complete service=web run_id=${runId} status=incomplete reason=profile_stop`);
@@ -901,4 +927,7 @@ export const __diagnosticPlanTestHooks = {
   canonicalJson,
   validatePayload,
   categoryForFrame,
+  functionIdForFrame,
+  summarizeFunctionSamples,
+  profileSampling: { intervalUs: 10_000, maxSamples: MAX_SAMPLES, maxNodes: MAX_PROFILE_NODES },
 };

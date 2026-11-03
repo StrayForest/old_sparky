@@ -1,5 +1,33 @@
 const JSON_FRAME_PATH = /(?:^|\/)(?:json|json_parse|json-parser)(?:[./-]|$)/u;
 
+// Function identities are a reviewed, source-free projection. Paths and raw
+// V8 symbols are never returned to logs or parent reports.
+const FUNCTION_IDENTITIES = new Map([
+  ["repo:getTournamentWorkspace", "web.workspace.api_fetch"],
+  ["repo:loadTournamentWorkspace", "web.workspace.page_load"],
+  ["repo:TournamentPage", "web.workspace.page_render"],
+  ["react:renderToReadableStream", "web.react.render_stream"],
+  ["react:renderToString", "web.react.render_string"],
+  ["react:resolveModelToJSON", "web.react.serialize_model"],
+  ["react:serializeRow", "web.react.serialize_row"],
+  ["json:parse", "web.serialization.json_parse"],
+  ["json:stringify", "web.serialization.json_stringify"],
+  ["zod:parse", "web.serialization.schema_parse"],
+  ["zod:safeParse", "web.serialization.schema_parse"],
+  ["next:renderToHTMLOrFlight", "web.next.render_route"],
+  ["next:renderToResponseWithComponentsImpl", "web.next.render_response"],
+  ["next:generateFlight", "web.next.flight_payload"],
+  ["next:generateMetadata", "web.next.metadata"],
+  ["undici:fetch", "web.http.fetch"],
+  ["undici:request", "web.http.request"],
+  ["node:parse", "web.serialization.json_parse"],
+  ["node:JSONParse", "web.serialization.json_parse"],
+  ["node:JSONStringify", "web.serialization.json_stringify"],
+  ["react:performWork", "web.react.render_work"],
+  ["react:renderWithHooks", "web.react.render_work"],
+  ["react:renderNodeDestructive", "web.react.render_work"],
+]);
+
 export function categoryForFrame(url, functionName = "") {
   const normalized = String(url).replaceAll("\\", "/");
   if (normalized.includes("/apps/platform_web/.next/server/app/(site)/tournaments/")) {
@@ -24,4 +52,27 @@ export function categoryForFrame(url, functionName = "") {
     return "compiled_server_chunk";
   }
   return "other";
+}
+
+export function functionIdForFrame(url, functionName = "") {
+  const normalized = String(url).replaceAll("\\", "/");
+  let family = "";
+  if (normalized.includes("/apps/platform_web/.next/server/app/(site)/tournaments/")) {
+    family = "repo";
+  } else if (normalized.includes("/node_modules/next/dist/compiled/react-server-dom-webpack/")
+      || normalized.includes("/node_modules/react-server-dom-webpack/")
+      || normalized.includes("/node_modules/react-dom/")) {
+    family = "react";
+  } else if (JSON_FRAME_PATH.test(normalized)) {
+    family = "json";
+  } else if (normalized.includes("/node_modules/next/")) {
+    family = "next";
+  } else if (normalized.includes("/node_modules/zod/")) {
+    family = "zod";
+  } else if (normalized.includes("/node_modules/undici/")) {
+    family = "undici";
+  } else if (normalized.startsWith("node:internal/")) {
+    family = "node";
+  }
+  return FUNCTION_IDENTITIES.get(`${family}:${String(functionName)}`) ?? null;
 }

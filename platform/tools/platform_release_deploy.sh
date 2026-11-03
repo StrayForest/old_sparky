@@ -438,12 +438,22 @@ wait_for_activation_readiness() {
 
 release_preflight() {
   local active_revision_flag=()
-  if [[ "${1:-}" == "--defer-active-alembic-revision-check" ]]; then
-    active_revision_flag=(--defer-active-alembic-revision-check)
-  elif [[ -n "${1:-}" ]]; then
-    public_status failed argument >&2
-    return 1
-  fi
+  local legacy_api_transport_flag=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --defer-active-alembic-revision-check)
+        active_revision_flag=(--defer-active-alembic-revision-check)
+        ;;
+      --allow-legacy-api-web-transport)
+        legacy_api_transport_flag=(--allow-legacy-api-web-transport)
+        ;;
+      *)
+        public_status failed argument >&2
+        return 1
+        ;;
+    esac
+    shift
+  done
   local previous_flag=(--require-previous)
   if [[ "$INITIAL_INSTALL" -eq 1 ]]; then
     previous_flag=(--allow-initial-install)
@@ -467,6 +477,7 @@ release_preflight() {
   "$TOOLS_DIR/platform_release_preflight.sh" \
     --app-dir "$APP_DIR" \
     "${active_revision_flag[@]}" \
+    "${legacy_api_transport_flag[@]}" \
     "${previous_flag[@]}" \
     --require-verified-backup \
     --require-edge-parity \
@@ -1599,6 +1610,7 @@ if [[ "$RESUME" -eq 0 ]]; then
     exit 3
   fi
   run_release_preflight_quiet --defer-active-alembic-revision-check \
+    --allow-legacy-api-web-transport \
     >/dev/null 2>/dev/null
   # The installed host validator has already authenticated and extracted this
   # private bootstrap tree. Check its browser source, active provider and copy
@@ -1713,6 +1725,7 @@ fi
 # quiesced. This closes the preflight -> stage TOCTOU window before migration.
 if [[ "$phase" == "staged" || "$phase" == "migration-pending" || "$phase" == "migration-failed" ]]; then
   release_preflight --defer-active-alembic-revision-check \
+    --allow-legacy-api-web-transport \
     >/dev/null 2>/dev/null
   # Validate the source-only browser runtime against the still-active typed
   # provider before migration or pointer promotion. In particular, a changed

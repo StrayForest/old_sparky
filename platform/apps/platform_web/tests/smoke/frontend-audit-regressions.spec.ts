@@ -8,7 +8,8 @@ import {
   PlatformApiError,
   setTournamentReadyCheckChoice,
 } from "../../lib/platform-api";
-import { categoryForFrame } from "../../lib/cpu-profile-categories.mjs";
+import { categoryForFrame, functionIdForFrame } from "../../lib/cpu-profile-categories.mjs";
+import { __diagnosticPlanTestHooks } from "../../lib/performance-diagnostic-plan";
 import {
   htmlSsrCaptureDigest,
   isHtmlSsrCaptureEligible,
@@ -696,6 +697,37 @@ test("web CPU profile categories classify route, React render, chunks, and JSON 
   expect(categoryForFrame("/srv/release/apps/platform_web/.next/server/chunks/143.js", "")).toBe("compiled_server_chunk");
   expect(categoryForFrame("node:internal/json_parse", "")).toBe("serialization_validation");
   expect(categoryForFrame("/srv/release/apps/platform_web/.next/server/app/layout.js", "")).toBe("compiled_server_chunk");
+});
+
+test("web CPU profile function details expose only bounded safe IDs and sample counts", () => {
+  expect(__diagnosticPlanTestHooks.profileSampling).toEqual({
+    intervalUs: 10_000, maxSamples: 2400, maxNodes: 10_000,
+  });
+  const nodes = new Map([
+    [1, {
+      url: "/srv/private/releases/secret/apps/platform_web/node_modules/react-dom/server.js",
+      functionName: "renderToString",
+    }],
+    [2, { url: "node:internal/json_parse", functionName: "parse" }],
+    [3, {
+      url: "/srv/private/releases/secret/apps/platform_web/.next/server/chunks/private.js",
+      functionName: "userSuppliedFunctionName",
+    }],
+  ]);
+  const summary = __diagnosticPlanTestHooks.summarizeFunctionSamples(
+    nodes,
+    [1, 1, 2, 3],
+  );
+  expect(summary).toEqual({
+    rows: [
+      { function_id: "web.react.render_string", samples: 2 },
+      { function_id: "web.serialization.json_parse", samples: 1 },
+    ],
+    mapped_sample_count: 3,
+  });
+  expect(JSON.stringify(summary)).not.toContain("secret");
+  expect(JSON.stringify(summary)).not.toContain("userSuppliedFunctionName");
+  expect(functionIdForFrame("/srv/private/chunks/private.js", "userSuppliedFunctionName")).toBeNull();
 });
 
 test("typed HTML capture sampling matches the fixed cross-service SHA-256 vectors", () => {

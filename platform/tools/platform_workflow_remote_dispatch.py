@@ -134,6 +134,7 @@ CPU_DIAGNOSTIC_FAILURE_STAGES = frozenset({
     "helper_output_limit", "unrecognized_rc2", "inner_exit",
     "response_framing", "response_parse", "response_summary",
     "usage_rows", "usage_aggregate", "profile_rows", "profile_categories",
+    "profile_function_details",
     "profile_aggregate", "memory_rows", "memory_metrics", "memory_aggregate",
     "cgroup_aggregate", "summary_bound",
 })
@@ -206,15 +207,34 @@ CPU_PROFILE_ROW_FIELDS = {
     "service", "expected_targets", "observed_targets", "event_count", "timer",
     "observation_unit", "total_cpu_us", "sample_count", "start_lag_ms_min",
     "start_lag_ms_max", "elapsed_ms_min", "elapsed_ms_max", "end_lag_ms_min",
-    "end_lag_ms_max", "categories",
+    "end_lag_ms_max", "categories", "function_details",
 }
 CPU_PROFILE_CATEGORY_FIELDS = {"category", "cpu_us", "observations"}
+CPU_PROFILE_FUNCTION_IDS = {
+    "api.orm.session_execute", "api.orm.session_scalars", "api.orm.loading_instances",
+    "api.orm.loading_instance", "api.db.execute_context", "api.orm.result_all",
+    "api.orm.result_scalars", "api.db.asyncpg_fetch", "api.db.asyncpg_fetchrow",
+    "api.db.asyncpg_execute", "api.db.asyncpg_bind_execute",
+    "api.serialization.pydantic_init", "api.serialization.pydantic_validate",
+    "api.serialization.pydantic_dump", "api.serialization.fastapi_response",
+    "api.serialization.fastapi_encode", "api.serialization.json_encode",
+    "web.workspace.api_fetch", "web.workspace.page_load", "web.workspace.page_render",
+    "web.react.render_stream", "web.react.render_string", "web.react.serialize_model",
+    "web.react.serialize_row", "web.serialization.json_parse",
+    "web.serialization.json_stringify", "web.serialization.schema_parse",
+    "web.next.render_route", "web.next.render_response", "web.next.flight_payload",
+    "web.next.metadata", "web.http.fetch", "web.http.request", "web.react.render_work",
+}
+CPU_PROFILE_FUNCTION_DETAIL_FIELDS = {
+    "top_self", "top_cumulative", "top_samples", "mapped_self_cpu_us", "mapped_sample_count",
+}
 CPU_PROFILE_REJECTION_CODES = frozenset({
     "malformed_record", "release_identity", "plan_identity", "plan_targets",
     "systemd_identity", "preflight_exception", "identity_pid", "identity_start_ticks",
     "identity_invocation", "identity_unit", "identity_cgroup",
     "journal_timestamp", "journal_window", "profile_start_lag", "profile_elapsed",
     "profile_end_lag", "profile_numeric", "profile_category",
+    "profile_function_detail",
     "profile_aggregate", "profile_parser", "summary_exception", "summary_validation",
     "missing", "duplicate", "unexpected",
 })
@@ -1391,6 +1411,8 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                     value = row.get(numeric)
                     if value is not None and (type(value) is not int or not 0 <= value <= 10**10):
                         return emit_failure("profile_rows", process=process, output=output)
+                if service == "web" and row["sample_count"] is not None and row["sample_count"] > 2400:
+                    return emit_failure("profile_rows", process=process, output=output)
                 categories: list[dict[str, Any]] = []
                 category_names: list[str] = []
                 failure_stage = "profile_categories"
@@ -1413,6 +1435,70 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                     })
                 if category_names != sorted(category_names) or len(set(category_names)) != len(category_names):
                     return emit_failure("profile_categories", process=process, output=output)
+                detail = row.get("function_details")
+                if (not isinstance(detail, dict) or set(detail) != CPU_PROFILE_FUNCTION_DETAIL_FIELDS
+                        or any(not isinstance(detail.get(name), list) for name in (
+                            "top_self", "top_cumulative", "top_samples",
+                        ))
+                        or any(len(detail[name]) > 20 for name in (
+                            "top_self", "top_cumulative", "top_samples",
+                        ))
+                        or type(detail.get("mapped_self_cpu_us")) is not int
+                        or not 0 <= detail["mapped_self_cpu_us"] <= 10**10
+                        or type(detail.get("mapped_sample_count")) is not int
+                        or not 0 <= detail["mapped_sample_count"] <= 2400):
+                    return emit_failure("profile_function_details", process=process, output=output)
+                clean_detail = {
+                    "top_self": [], "top_cumulative": [], "top_samples": [],
+                    "mapped_self_cpu_us": detail["mapped_self_cpu_us"],
+                    "mapped_sample_count": detail["mapped_sample_count"],
+                }
+                for list_name in ("top_self", "top_cumulative", "top_samples"):
+                    names_seen: list[str] = []
+                    for item in detail[list_name]:
+                        is_api_detail = service == "api" and list_name != "top_samples"
+                        expected_fields = ({"function_id", "cpu_us", "calls", "primitive_calls"}
+                                           if is_api_detail else {"function_id", "samples"})
+                        function_id = item.get("function_id") if isinstance(item, dict) else None
+                        if (not isinstance(item, dict) or set(item) != expected_fields
+                                or not isinstance(function_id, str)
+                                or function_id not in CPU_PROFILE_FUNCTION_IDS
+                                or (service == "api" and not function_id.startswith("api."))
+                                or (service == "web" and not function_id.startswith("web."))):
+                            return emit_failure("profile_function_details", process=process, output=output)
+                        names_seen.append(function_id)
+                        if is_api_detail:
+                            maximum_cpu = 240_000_000 if list_name == "top_cumulative" else 60_000_000
+                            if (type(item["cpu_us"]) is not int or not 0 <= item["cpu_us"] <= maximum_cpu
+                                    or type(item["calls"]) is not int
+                                    or not 0 <= item["calls"] <= 20_000_000
+                                    or type(item["primitive_calls"]) is not int
+                                    or not 0 <= item["primitive_calls"] <= item["calls"]):
+                                return emit_failure("profile_function_details", process=process, output=output)
+                            clean_detail[list_name].append({
+                                "function_id": function_id, "cpu_us": item["cpu_us"],
+                                "calls": item["calls"], "primitive_calls": item["primitive_calls"],
+                            })
+                        else:
+                            if (type(item["samples"]) is not int or not 1 <= item["samples"] <= 2400):
+                                return emit_failure("profile_function_details", process=process, output=output)
+                            clean_detail[list_name].append({
+                                "function_id": function_id, "samples": item["samples"],
+                            })
+                    if len(set(names_seen)) != len(names_seen):
+                        return emit_failure("profile_function_details", process=process, output=output)
+                if service == "api":
+                    if (detail["top_samples"] or detail["mapped_sample_count"] != 0
+                            or sum(item["cpu_us"] for item in clean_detail["top_self"])
+                            != detail["mapped_self_cpu_us"]
+                            or detail["mapped_self_cpu_us"] > (row["total_cpu_us"] or 0)):
+                        return emit_failure("profile_function_details", process=process, output=output)
+                elif (detail["top_self"] or detail["top_cumulative"]
+                      or detail["mapped_self_cpu_us"] != 0
+                      or sum(item["samples"] for item in clean_detail["top_samples"])
+                      != detail["mapped_sample_count"]
+                      or detail["mapped_sample_count"] > (row["sample_count"] or 0)):
+                    return emit_failure("profile_function_details", process=process, output=output)
                 failure_stage = "profile_rows"
                 projected_profiles.append({
                     "service": service,
@@ -1430,6 +1516,7 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                     "end_lag_ms_min": row["end_lag_ms_min"],
                     "end_lag_ms_max": row["end_lag_ms_max"],
                     "categories": categories,
+                    "function_details": clean_detail,
                 })
             if (result["profile_status"] == "complete"
                     and result.get("workload") in CPU_DIAGNOSTIC_NO_PROFILE_WORKLOADS):
@@ -1440,6 +1527,10 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                             or row["total_cpu_us"] != 0
                             or row["sample_count"] != (None if row["service"] == "api" else 0)
                             or row["categories"] != []
+                            or row["function_details"] != {
+                                "top_self": [], "top_cumulative": [], "top_samples": [],
+                                "mapped_self_cpu_us": 0, "mapped_sample_count": 0,
+                            }
                             or any(row[field] is not None for field in (
                                 "start_lag_ms_min", "start_lag_ms_max", "elapsed_ms_min",
                                 "elapsed_ms_max", "end_lag_ms_min", "end_lag_ms_max",

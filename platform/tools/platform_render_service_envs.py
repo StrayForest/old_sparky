@@ -166,6 +166,41 @@ def render_service_env(service: str, values: dict[str, str]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_legacy_api_service_env(values: dict[str, str]) -> str | None:
+    """Return the exact former API projection, when its legacy key is valid."""
+    transport = values.get("PLATFORM_WEB_SERVER_AUTH_TRANSPORT")
+    if transport not in {"fetch", "node"}:
+        return None
+    keys = sorted({*selected_keys("api", values), "PLATFORM_WEB_SERVER_AUTH_TRANSPORT"})
+    lines = [
+        "# Generated from shared/.env.platform; do not edit.",
+        "# Runtime scope: api",
+    ]
+    lines.extend(f"{key}={shlex.quote(values[key])}" for key in keys)
+    return "\n".join(lines) + "\n"
+
+
+def verify_rendered_contents(
+    output_dir: Path,
+    rendered: dict[str, str],
+    values: dict[str, str],
+    *,
+    allow_legacy_api_web_transport: bool = False,
+) -> None:
+    legacy_api = (
+        render_legacy_api_service_env(values)
+        if allow_legacy_api_web_transport
+        else None
+    )
+    for service, content in rendered.items():
+        actual = (output_dir / f"{service}.env").read_bytes()
+        if actual == content.encode("utf-8"):
+            continue
+        if service == "api" and legacy_api is not None and actual == legacy_api.encode("utf-8"):
+            continue
+        raise RuntimeError(f"Runtime env is stale for service: {service}")
+
+
 def validate_source_metadata(path: Path) -> None:
     metadata = path.stat()
     mode = stat.S_IMODE(metadata.st_mode)
@@ -232,7 +267,15 @@ def main() -> int:
         action="store_true",
         help="Verify rendered files match the canonical source without writing.",
     )
+    parser.add_argument(
+        "--allow-legacy-api-web-transport",
+        action="store_true",
+        help="During --verify only, accept the exact former API env projection.",
+    )
     args = parser.parse_args()
+
+    if args.allow_legacy_api_web_transport and not args.verify:
+        raise RuntimeError("--allow-legacy-api-web-transport requires --verify.")
 
     values = load_env_file(args.source)
     rendered = {
@@ -242,13 +285,14 @@ def main() -> int:
 
     if args.apply and args.verify:
         raise RuntimeError("--apply and --verify cannot be combined.")
-
     if args.verify:
         verify_runtime_files(args.output_dir)
-        for service, content in rendered.items():
-            path = args.output_dir / f"{service}.env"
-            if path.read_text(encoding="utf-8") != content:
-                raise RuntimeError(f"Runtime env is stale for service: {service}")
+        verify_rendered_contents(
+            args.output_dir,
+            rendered,
+            values,
+            allow_legacy_api_web_transport=args.allow_legacy_api_web_transport,
+        )
         print("Runtime service envs are current and metadata-safe.")
         return 0
 

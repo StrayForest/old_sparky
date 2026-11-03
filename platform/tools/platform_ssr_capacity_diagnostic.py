@@ -54,7 +54,7 @@ PROFILE_REJECTION_CODES = frozenset({
     "systemd_identity", "preflight_exception", "identity_pid", "identity_start_ticks",
     "identity_invocation", "identity_unit", "identity_cgroup",
     "journal_timestamp", "journal_window", "profile_start_lag", "profile_elapsed",
-    "profile_end_lag", "profile_numeric", "profile_category",
+    "profile_end_lag", "profile_numeric", "profile_category", "profile_function_detail",
     "profile_aggregate", "profile_parser", "summary_exception", "summary_validation",
     "missing", "duplicate", "unexpected",
 })

@@ -1,18 +1,98 @@
 from __future__ import annotations
 
 from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
 from tools.platform_render_service_envs import (
     WEB_FORBIDDEN_KEYS,
     WORKER_FORBIDDEN_KEYS,
+    render_legacy_api_service_env,
     render_service_env,
+    verify_rendered_contents,
 )
+from tools import platform_render_service_envs
 
 PLATFORM_ROOT = Path(__file__).resolve().parents[1]
 
 
 class RuntimeIsolationTests(unittest.TestCase):
+    def test_preflight_accepts_only_exact_legacy_api_transport_projection(self) -> None:
+        values = {
+            "PLATFORM_ENVIRONMENT": "production",
+            "PLATFORM_API_PORT": "8010",
+            "PLATFORM_WEB_SERVER_AUTH_TRANSPORT": "node",
+            "PLATFORM_DATABASE_URL": "postgresql://private",
+            "PLATFORM_WORKER_DB_POOL_SIZE": "2",
+        }
+        rendered = {
+            service: render_service_env(service, values)
+            for service in ("api", "web", "worker")
+        }
+        legacy_api = render_legacy_api_service_env(values)
+        self.assertIsNotNone(legacy_api)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary)
+            for service, content in rendered.items():
+                (output_dir / f"{service}.env").write_text(content, encoding="utf-8")
+            (output_dir / "api.env").write_text(legacy_api or "", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "Runtime env is stale for service: api"):
+                verify_rendered_contents(output_dir, rendered, values)
+            verify_rendered_contents(
+                output_dir,
+                rendered,
+                values,
+                allow_legacy_api_web_transport=True,
+            )
+
+            (output_dir / "api.env").write_text(
+                (legacy_api or "") + "PLATFORM_EXTRA=unexpected\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "Runtime env is stale for service: api"):
+                verify_rendered_contents(
+                    output_dir,
+                    rendered,
+                    values,
+                    allow_legacy_api_web_transport=True,
+                )
+            (output_dir / "api.env").write_text(legacy_api or "", encoding="utf-8")
+            for service in ("web", "worker"):
+                path = output_dir / f"{service}.env"
+                original = rendered[service]
+                path.write_text(original + "PLATFORM_EXTRA=unexpected\n", encoding="utf-8")
+                with self.assertRaisesRegex(
+                    RuntimeError, f"Runtime env is stale for service: {service}"
+                ):
+                    verify_rendered_contents(
+                        output_dir,
+                        rendered,
+                        values,
+                        allow_legacy_api_web_transport=True,
+                    )
+                path.write_text(original, encoding="utf-8")
+
+        self.assertIsNone(
+            render_legacy_api_service_env(
+                {**values, "PLATFORM_WEB_SERVER_AUTH_TRANSPORT": "unexpected"}
+            )
+        )
+
+    def test_legacy_api_renderer_opt_in_is_verify_only(self) -> None:
+        with (
+            patch(
+                "sys.argv",
+                ["platform_render_service_envs.py", "--allow-legacy-api-web-transport"],
+            ),
+            patch.object(platform_render_service_envs, "load_env_file") as load_env,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "requires --verify"):
+                platform_render_service_envs.main()
+        load_env.assert_not_called()
+
     def test_web_env_never_receives_backend_credentials(self) -> None:
         values = {
             "PLATFORM_ENVIRONMENT": "PLATFORM_ENVIRONMENT=production",

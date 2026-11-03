@@ -62,7 +62,7 @@ CAPACITY_JOURNAL_COLLECTION_REASONS = frozenset({
     "journal_failed", "trailing_partial_line", "journal_sync_failed",
 })
 NGINX_ACCESS_LOG = Path("/var/log/nginx/platform-access.log")
-MAX_SAMPLES_PROFILE = 1200
+MAX_SAMPLES_PROFILE = 2400
 MEMORY_SAMPLE_COUNT = 5
 SSR_CAPACITY_MEMORY_MAX_BYTES = 1_073_741_824
 SSR_CAPACITY_ABORT_FLOOR_BYTES = 768 * 1024 * 1024
@@ -1597,12 +1597,14 @@ USAGE_MESSAGE_RE = re.compile(
 PROFILE_API_MESSAGE_RE = re.compile(
     r"^cpu_diagnostic_complete service=api run_id=([0-9a-f]{32}) "
     r"timer=thread_cpu start_lag_ms=([0-9]{1,8}) elapsed_ms=([0-9]{1,8}) "
-    r"total_self_cpu_us=([0-9]{1,12}) functions=(.*)$"
+    r"total_self_cpu_us=([0-9]{1,12}) functions=([^ ]*) "
+    r"top_self=([^ ]*) top_cumulative=(.*)$"
 )
 PROFILE_WEB_MESSAGE_RE = re.compile(
     r"^cpu_diagnostic_complete service=web run_id=([0-9a-f]{32}) "
     r"timer=v8_cpu start_lag_ms=([0-9]{1,8}) elapsed_ms=([0-9]{1,8}) "
-    r"sample_interval_us=100000 sample_count=([0-9]{1,8}) categories=(.*)$"
+    r"sample_interval_us=10000 sample_count=([0-9]{1,8}) categories=([^ ]*) "
+    r"top_samples=(.*)$"
 )
 NODE_MEMORY_FIELDS = frozenset({
     "service", "run_id", "phase", "sample_count", "status",
@@ -1644,6 +1646,24 @@ WEB_PROFILE_CATEGORIES = frozenset({
     "http_client", "crypto", "repo.workspace_api_fetch", "repo.workspace_page",
     "react_server_render", "repo.ssr_route_module", "compiled_server_chunk",
 })
+API_PROFILE_FUNCTION_IDS = frozenset({
+    "api.orm.session_execute", "api.orm.session_scalars", "api.orm.loading_instances",
+    "api.orm.loading_instance", "api.db.execute_context", "api.orm.result_all",
+    "api.orm.result_scalars", "api.db.asyncpg_fetch", "api.db.asyncpg_fetchrow",
+    "api.db.asyncpg_execute", "api.db.asyncpg_bind_execute",
+    "api.serialization.pydantic_init", "api.serialization.pydantic_validate",
+    "api.serialization.pydantic_dump", "api.serialization.fastapi_response",
+    "api.serialization.fastapi_encode", "api.serialization.json_encode",
+})
+WEB_PROFILE_FUNCTION_IDS = frozenset({
+    "web.workspace.api_fetch", "web.workspace.page_load", "web.workspace.page_render",
+    "web.react.render_stream", "web.react.render_string", "web.react.serialize_model",
+    "web.react.serialize_row", "web.serialization.json_parse",
+    "web.serialization.json_stringify", "web.serialization.schema_parse",
+    "web.next.render_route", "web.next.render_response", "web.next.flight_payload",
+    "web.next.metadata", "web.http.fetch", "web.http.request", "web.react.render_work",
+})
+PROFILE_FUNCTION_MAX_ROWS = 20
 
 # These counters are the bounded, non-identifying explanation for profile
 # rejection.  The stable profile_reason remains the compatibility summary;
@@ -1668,6 +1688,7 @@ PROFILE_REJECTION_CODES = (
     "profile_end_lag",
     "profile_numeric",
     "profile_category",
+    "profile_function_detail",
     "profile_aggregate",
     "profile_parser",
     "summary_exception",
@@ -1724,6 +1745,66 @@ def _parse_profile_categories_diagnostic(
         seen.add(parts[0])
         parsed.append({"category": parts[0], "cpu_us": cpu_us, "observations": observations})
     return parsed, None
+
+
+def _parse_profile_function_details(
+    raw_self: str,
+    raw_cumulative: str,
+    raw_samples: str,
+    *,
+    service: str,
+    sample_count: int | None,
+) -> dict[str, list[dict[str, int | str]]] | None:
+    """Parse bounded safe IDs; function names and frame paths never enter reports."""
+
+    details: dict[str, list[dict[str, int | str]]] = {
+        "top_self": [], "top_cumulative": [], "top_samples": [],
+    }
+    if service == "api":
+        if raw_samples or len(raw_self) > 3000 or len(raw_cumulative) > 3000:
+            return None
+        for field, raw in (("top_self", raw_self), ("top_cumulative", raw_cumulative)):
+            seen: set[str] = set()
+            allowed = API_PROFILE_FUNCTION_IDS
+            for token in raw.split(",") if raw else ():
+                parts = token.split(":")
+                if (len(parts) != 4 or parts[0] not in allowed or parts[0] in seen
+                        or not parts[1].isdecimal() or len(parts[1]) > 9
+                        or any(not part.isdecimal() or len(part) > 8 for part in parts[2:])):
+                    return None
+                cpu_us, calls, primitive_calls = map(int, parts[1:])
+                cpu_limit = 60_000_000 if field == "top_self" else 120_000_000
+                if (cpu_us > cpu_limit or calls > 10_000_000
+                        or primitive_calls > calls):
+                    return None
+                seen.add(parts[0])
+                details[field].append({
+                    "function_id": parts[0], "cpu_us": cpu_us,
+                    "calls": calls, "primitive_calls": primitive_calls,
+                })
+                if len(seen) > PROFILE_FUNCTION_MAX_ROWS:
+                    return None
+        if sum(int(row["cpu_us"]) for row in details["top_self"]) > 60_000_000:
+            return None
+        return details
+    if raw_self or raw_cumulative or len(raw_samples) > 3000:
+        return None
+    seen = set()
+    for token in raw_samples.split(",") if raw_samples else ():
+        parts = token.split(":")
+        if (len(parts) != 2 or parts[0] not in WEB_PROFILE_FUNCTION_IDS
+                or parts[0] in seen or not parts[1].isdecimal() or len(parts[1]) > 8):
+            return None
+        samples = int(parts[1])
+        if samples <= 0 or samples > MAX_SAMPLES_PROFILE:
+            return None
+        seen.add(parts[0])
+        details["top_samples"].append({"function_id": parts[0], "samples": samples})
+        if len(seen) > PROFILE_FUNCTION_MAX_ROWS:
+            return None
+    if sample_count is None or sum(int(row["samples"]) for row in details["top_samples"]) > sample_count:
+        return None
+    return details
 
 
 def _parse_profile_categories(
@@ -1873,6 +1954,10 @@ def _usage_summary(
                 "total_cpu_us": None,
                 "sample_count": None,
                 "categories": [],
+                "function_details": {
+                    "top_self": [], "top_cumulative": [], "top_samples": [],
+                    "mapped_self_cpu_us": 0, "mapped_sample_count": 0,
+                },
             }
             for service, expected in (("api", 2), ("web", 1))
         ]
@@ -2191,6 +2276,9 @@ def _usage_summary(
                     elapsed_ms = int(profile_api_match.group(3))
                     total_cpu_us = int(profile_api_match.group(4))
                     raw_categories = profile_api_match.group(5)
+                    raw_top_self = profile_api_match.group(6)
+                    raw_top_cumulative = profile_api_match.group(7)
+                    raw_top_samples = ""
                     sample_count = None
                     timer = "thread_cpu"
                 else:
@@ -2199,6 +2287,9 @@ def _usage_summary(
                     elapsed_ms = int(profile_web_match.group(3))
                     sample_count = int(profile_web_match.group(4))
                     raw_categories = profile_web_match.group(5)
+                    raw_top_self = ""
+                    raw_top_cumulative = ""
+                    raw_top_samples = profile_web_match.group(6)
                     total_cpu_us = 0
                     timer = "v8_cpu"
                 profile_window_ms = _plan_on_window_ms(workload)
@@ -2206,6 +2297,10 @@ def _usage_summary(
                 categories, category_parse_reason = _parse_profile_categories_diagnostic(
                     raw_categories,
                     service=service,
+                )
+                function_details = _parse_profile_function_details(
+                    raw_top_self, raw_top_cumulative, raw_top_samples,
+                    service=service, sample_count=sample_count,
                 )
                 if timer == "v8_cpu" and categories is not None:
                     total_cpu_us = sum(int(item["cpu_us"]) for item in categories)
@@ -2216,6 +2311,8 @@ def _usage_summary(
                     rejection = "profile_category"
                 elif category_parse_reason == "numeric":
                     rejection = "profile_numeric"
+                elif function_details is None:
+                    rejection = "profile_function_detail"
                 elif not 0 <= start_lag_ms <= 250:
                     rejection = "profile_start_lag"
                 elif profile_window_ms is None or not profile_window_ms - 250 <= elapsed_ms <= profile_window_ms + 500:
@@ -2252,6 +2349,7 @@ def _usage_summary(
                     "sample_count": sample_count,
                     "timer": timer,
                     "categories": categories,
+                    "function_details": function_details,
                 })
         except Exception:
             if is_memory:
@@ -2390,6 +2488,52 @@ def _usage_summary(
             {"category": name, "cpu_us": values[0], "observations": values[1]}
             for name, values in sorted(category_totals.items())
         ]
+        self_totals: dict[str, list[int]] = {}
+        cumulative_totals: dict[str, list[int]] = {}
+        sample_totals: dict[str, int] = {}
+        for item in flat_profiles:
+            details = item["function_details"]
+            for row in details["top_self"]:
+                entry = self_totals.setdefault(str(row["function_id"]), [0, 0, 0])
+                entry[0] += int(row["cpu_us"])
+                entry[1] += int(row["calls"])
+                entry[2] += int(row["primitive_calls"])
+            for row in details["top_cumulative"]:
+                entry = cumulative_totals.setdefault(str(row["function_id"]), [0, 0, 0])
+                entry[0] += int(row["cpu_us"])
+                entry[1] += int(row["calls"])
+                entry[2] += int(row["primitive_calls"])
+            for row in details["top_samples"]:
+                name = str(row["function_id"])
+                sample_totals[name] = sample_totals.get(name, 0) + int(row["samples"])
+        ordered_self = sorted(self_totals.items(), key=lambda pair: (-pair[1][0], pair[0]))
+        ordered_cumulative = sorted(
+            cumulative_totals.items(), key=lambda pair: (-pair[1][0], pair[0])
+        )
+        ordered_samples = sorted(sample_totals.items(), key=lambda pair: (-pair[1], pair[0]))
+        function_details = {
+            "top_self": [
+                {"function_id": name, "cpu_us": values[0],
+                 "calls": values[1], "primitive_calls": values[2]}
+                for name, values in ordered_self[:PROFILE_FUNCTION_MAX_ROWS]
+            ],
+            "top_cumulative": [
+                {"function_id": name, "cpu_us": values[0],
+                 "calls": values[1], "primitive_calls": values[2]}
+                for name, values in ordered_cumulative[:PROFILE_FUNCTION_MAX_ROWS]
+            ],
+            "top_samples": [
+                {"function_id": name, "samples": count}
+                for name, count in ordered_samples[:PROFILE_FUNCTION_MAX_ROWS]
+            ],
+            "mapped_self_cpu_us": sum(values[0] for values in self_totals.values()),
+            "mapped_sample_count": sum(sample_totals.values()),
+        }
+        if not row_complete:
+            function_details = {
+                "top_self": [], "top_cumulative": [], "top_samples": [],
+                "mapped_self_cpu_us": 0, "mapped_sample_count": 0,
+            }
         sample_counts = [item["sample_count"] for item in flat_profiles]
         profile_rows.append({
             "service": service,
@@ -2413,6 +2557,7 @@ def _usage_summary(
                 if row_complete and service == "web" else None
             ),
             "categories": category_rows,
+            "function_details": function_details,
         })
     if not profile_complete and profile_reason == "none":
         profile_reason = "invalid_profile"
@@ -2639,6 +2784,10 @@ def cleanup(args: argparse.Namespace) -> dict[str, object]:
                             "total_cpu_us": None,
                             "sample_count": None,
                             "categories": [],
+                            "function_details": {
+                                "top_self": [], "top_cumulative": [], "top_samples": [],
+                                "mapped_self_cpu_us": 0, "mapped_sample_count": 0,
+                            },
                         }
                         for service, expected in (("api", 2), ("web", 1))
                     ],

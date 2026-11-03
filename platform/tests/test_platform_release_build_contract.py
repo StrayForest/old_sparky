@@ -6976,6 +6976,16 @@ fail 'private lock detail must not cross the public channel'
         supervisor = (TOOLS_DIR / "platform_production_deploy_supervisor.sh").read_text(
             encoding="utf-8"
         )
+        self.assertIn(
+            "--allow-legacy-api-web-transport)",
+            preflight,
+            "the preflight wrapper exposes the renderer's explicit verification mode",
+        )
+        self.assertIn(
+            '"${legacy_api_transport_flag[@]}"',
+            preflight,
+            "the preflight wrapper forwards the mode only to renderer --verify",
+        )
         mode_preflight_return = supervisor.index('if [[ "$deploy_mode" == "preflight" ]]')
         mode_deploy_check = supervisor.index('[[ "$deploy_mode" == "deploy" ]] || fail')
         first_host_preflight = supervisor.index('"$host_tools_dir/platform_release_preflight.sh"')
@@ -6996,6 +7006,51 @@ fail 'private lock detail must not cross the public channel'
             '"${active_revision_preflight_flag[@]}"',
             supervisor[ first_host_preflight : mode_preflight_return ],
         )
+        first_preflight_region = supervisor[first_host_preflight:second_host_preflight]
+        second_preflight_region = supervisor[second_host_preflight:]
+        self.assertIn(
+            'legacy_api_transport_preflight_flag=(--allow-legacy-api-web-transport)',
+            supervisor,
+        )
+        self.assertIn('"${legacy_api_transport_preflight_flag[@]}"', first_preflight_region)
+        self.assertIn(
+            '"${legacy_api_transport_preflight_flag[@]}"',
+            second_preflight_region,
+            "both supervisor preflights precede the candidate installer",
+        )
+        candidate_deploy = (TOOLS_DIR / "platform_release_deploy.sh").read_text()
+        candidate_preflight_start = candidate_deploy.index("release_preflight() {")
+        candidate_preflight_end = candidate_deploy.index("\n}\n", candidate_preflight_start)
+        candidate_preflight_function = candidate_deploy[
+            candidate_preflight_start:candidate_preflight_end
+        ]
+        self.assertIn(
+            '"${legacy_api_transport_flag[@]}"',
+            candidate_preflight_function,
+        )
+        pre_normalization_check = candidate_deploy.index(
+            "run_release_preflight_quiet --defer-active-alembic-revision-check"
+        )
+        migration_gate = candidate_deploy.index(
+            "release_preflight --defer-active-alembic-revision-check",
+            pre_normalization_check + 1,
+        )
+        strict_post_smoke = candidate_deploy.rfind("  release_preflight\n")
+        self.assertIn(
+            "--allow-legacy-api-web-transport",
+            candidate_deploy[pre_normalization_check:migration_gate],
+        )
+        self.assertIn(
+            "--allow-legacy-api-web-transport",
+            candidate_deploy[migration_gate:strict_post_smoke],
+        )
+        self.assertNotIn(
+            "--allow-legacy-api-web-transport",
+            candidate_deploy[strict_post_smoke:],
+        )
+        service_installer = (TOOLS_DIR / "platform_install_systemd_units.sh").read_text()
+        self.assertIn('"$ROOT_DIR/tools/platform_prepare_service_user.sh"', service_installer)
+        self.assertIn("  --apply", service_installer)
         self.assertIn(
             "--defer-active-alembic-revision-check",
             supervisor[second_host_preflight:],

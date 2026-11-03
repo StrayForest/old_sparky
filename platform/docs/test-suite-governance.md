@@ -339,7 +339,7 @@ bundle validation to `test_platform_recovery_bootstrap`. The
 [classifier](../tools/platform_ci_classifier.py) and release workflows own
 implementation.
 
-`test_platform_release_build_contract` owns profile-switch Security binding, A↔B handoff, lock/source checks, web-only mutation/readiness/rollback, installed release-root pin identity, and preflight/install bypass. The profile-switch handoff cases run in `backend-tool-contract`; `test_profile_switch_identity_uses_installed_release_root_host_pin` runs in `backend-privileged` because its exact source predicate requires root-owned release receipt and pin fixtures.
+`test_platform_release_build_contract` owns profile-switch Security binding, A↔B handoff, lock/source checks, web-only mutation/readiness/rollback, installed release-root pin identity, and preflight/install bypass. The profile-switch handoff cases and exact legacy service-env renderer transition regression belong to `backend-tool-contract`; `test_profile_switch_identity_uses_installed_release_root_host_pin` runs in `backend-privileged` because its exact source predicate requires root-owned release receipt and pin fixtures. The renderer regression proves its verify-only exception and rejects other API, web, or worker projections.
 
 The event and conditional-job behavior follows the primary GitHub Actions
 contracts for [workflow events](https://docs.github.com/en/actions/reference/events-that-trigger-workflows),
@@ -423,7 +423,7 @@ SPA flows check client URLs and hydrated DOM, preserving project/auth/fixture co
 Use the canonical registry for focused local feedback, then run each affected owner gate; impact planning is advisory.
 
 Replace example paths/selectors with current changes. Backend needs `backend`; web needs `web-quality` and `web-hermetic`.
-`backend-unit --focused` is DB-free; `backend` needs DB, Redis and privileged resources. Run `ci` for a full local pass; Actions remain the release authority.
+`backend-unit --focused` is DB-free; `backend` needs DB, Redis and privileged resources. Run `ci` for a full local pass; Actions remain the release authority. `test_platform_cpu_profile` owns API cProfile safe-ID projection/category conservation and parent parser cases in `performance-contract`; `frontend-audit-regressions.spec.ts` owns the V8 sample interval/cap and safe function-ID projection under web gates. Keep the `platform_cpu_diagnostic_plan.py`, `platform_cpu_diagnostic_pair.py` and `platform_workflow_remote_dispatch.py` projections synchronized; tests verify raw frame names and paths do not escape.
 
 When the local runner cannot create PID namespaces, run the other `performance-contract` IDs as a local subset. Keep the summary outside the repository; hosted CI still requires the full contour.
 

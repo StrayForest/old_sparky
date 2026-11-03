@@ -10,6 +10,7 @@ ALLOW_INITIAL_INSTALL=0
 REQUIRE_VERIFIED_BACKUP=0
 REQUIRE_EDGE_PARITY=0
 DEFER_ACTIVE_ALEMBIC_REVISION_CHECK=0
+ALLOW_LEGACY_API_WEB_TRANSPORT=0
 BACKUP_MAX_AGE_HOURS="24"
 EXPECTED_NODE_VERSION="26.3.1"
 DB_TIMEOUT_BIN="/usr/bin/timeout"
@@ -50,6 +51,10 @@ while [[ $# -gt 0 ]]; do
       DEFER_ACTIVE_ALEMBIC_REVISION_CHECK=1
       shift
       ;;
+    --allow-legacy-api-web-transport)
+      ALLOW_LEGACY_API_WEB_TRANSPORT=1
+      shift
+      ;;
     --backup-max-age-hours)
       if [[ $# -lt 2 ]]; then
         echo "--backup-max-age-hours requires a number." >&2
@@ -64,6 +69,7 @@ Usage: platform_release_preflight.sh [--app-dir <path>] [--require-previous]
        [--allow-no-previous] [--allow-initial-install]
        [--require-verified-backup] [--require-edge-parity]
        [--defer-active-alembic-revision-check]
+       [--allow-legacy-api-web-transport]
        [--backup-max-age-hours <hours>]
 
 Validates the live platform release layout before or after a deploy.
@@ -290,9 +296,14 @@ pass
 RENDER_SERVICE_ENVS_TOOL="$SCRIPT_DIR/platform_render_service_envs.py"
 [[ -f "$RENDER_SERVICE_ENVS_TOOL" && ! -L "$RENDER_SERVICE_ENVS_TOOL" ]] \
   || fail "Service env renderer is missing or unsafe."
+legacy_api_transport_flag=()
+if [[ "$ALLOW_LEGACY_API_WEB_TRANSPORT" -eq 1 ]]; then
+  legacy_api_transport_flag=(--allow-legacy-api-web-transport)
+fi
 "$PYTHON_BIN" -B "$RENDER_SERVICE_ENVS_TOOL" \
   --source "$ENV_FILE" \
   --output-dir "$SHARED_DIR/env" \
+  "${legacy_api_transport_flag[@]}" \
   --verify >/dev/null 2>/dev/null \
   || fail "Rendered service envs are stale or unsafe."
 pass

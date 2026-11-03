@@ -2692,6 +2692,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                         "elapsed_ms_min": None, "elapsed_ms_max": None,
                         "end_lag_ms_min": None, "end_lag_ms_max": None,
                         "total_cpu_us": 0, "sample_count": None, "categories": [],
+                        "function_details": {"top_self": [], "top_cumulative": [], "top_samples": [],
+                                             "mapped_self_cpu_us": 0, "mapped_sample_count": 0},
                     },
                     {
                         "service": "web", "expected_targets": 1,
@@ -2701,6 +2703,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                         "elapsed_ms_min": None, "elapsed_ms_max": None,
                         "end_lag_ms_min": None, "end_lag_ms_max": None,
                         "total_cpu_us": 0, "sample_count": 0, "categories": [],
+                        "function_details": {"top_self": [], "top_cumulative": [], "top_samples": [],
+                                             "mapped_self_cpu_us": 0, "mapped_sample_count": 0},
                     },
                 ],
                 "memory_status": "complete", "memory_reason": "none",
@@ -3779,12 +3783,16 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                         "event_count": 2, "total_cpu_us": 1_000_000, "sample_count": None,
                         "timer": "thread_cpu", "observation_unit": "calls",
                         "categories": [{"category": "other", "cpu_us": 1_000_000, "observations": 10}],
+                        "function_details": {"top_self": [], "top_cumulative": [], "top_samples": [],
+                                             "mapped_self_cpu_us": 0, "mapped_sample_count": 0},
                     },
                     {
                         "service": "web", "expected_targets": 1, "observed_targets": 1,
                         "event_count": 1, "total_cpu_us": 1_000_000, "sample_count": 100,
                         "timer": "v8_cpu", "observation_unit": "samples",
                         "categories": [{"category": "other", "cpu_us": 1_000_000, "observations": 100}],
+                        "function_details": {"top_self": [], "top_cumulative": [], "top_samples": [],
+                                             "mapped_self_cpu_us": 0, "mapped_sample_count": 0},
                     },
                 ],
             },
@@ -4052,6 +4060,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                         "category": "repo.get_current_user", "cpu_us": 50_000,
                         "observations": 100,
                     }],
+                    "function_details": {"top_self": [], "top_cumulative": [], "top_samples": [],
+                                         "mapped_self_cpu_us": 0, "mapped_sample_count": 0},
                 },
                 {
                     "service": "web", "expected_targets": 1, "observed_targets": 1,
@@ -4061,6 +4071,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     "elapsed_ms_min": 20_000, "elapsed_ms_max": 20_000,
                     "end_lag_ms_min": 0, "end_lag_ms_max": 0,
                     "categories": [{"category": "other", "cpu_us": 1_000_000, "observations": 100}],
+                    "function_details": {"top_self": [], "top_cumulative": [], "top_samples": [],
+                                         "mapped_self_cpu_us": 0, "mapped_sample_count": 0},
                 },
             ],
             "memory_status": "incomplete",
@@ -4771,11 +4783,11 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 message = (
                     "cpu_diagnostic_complete service=api run_id=" + "a" * 32
                     + " timer=thread_cpu start_lag_ms=0 elapsed_ms=20000 total_self_cpu_us=100 "
-                    + "functions=other:100:1"
+                    + "functions=other:100:1 top_self= top_cumulative="
                     if service == "api" else
                     "cpu_diagnostic_complete service=web run_id=" + "a" * 32
-                    + " timer=v8_cpu start_lag_ms=0 elapsed_ms=20000 sample_interval_us=100000 "
-                    + "sample_count=1 categories=other:100:1"
+                    + " timer=v8_cpu start_lag_ms=0 elapsed_ms=20000 sample_interval_us=10000 "
+                    + "sample_count=1 categories=other:100:1 top_samples="
                 )
                 base_rows.append({
                     "MESSAGE": message, "_PID": str(target["pid"]),
@@ -4851,6 +4863,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                            "start_lag_ms=250 elapsed_ms=20500"), "api", "profile_end_lag"),
             ("numeric", mutate(0, "total_self_cpu_us=100", "total_self_cpu_us=60000001"), "api", "profile_numeric"),
             ("category", mutate(0, "functions=other:100:1", "functions=raw_name:100:1"), "api", "profile_category"),
+            ("function-id", mutate(0, "top_self= top_cumulative=", "top_self=raw_frame:1:1:1 top_cumulative="), "api", "profile_function_detail"),
+            ("sample-cap", mutate(2, "sample_count=1", "sample_count=2401"), "web", "profile_numeric"),
             ("aggregate", mutate(0, "total_self_cpu_us=100", "total_self_cpu_us=101"), "api", "profile_aggregate"),
         )
         for label, rows, service, code in cases:
@@ -5111,7 +5125,9 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                         f"run_id={'a' * 32} timer=thread_cpu start_lag_ms=0 elapsed_ms=20000 "
                         "total_self_cpu_us=150 functions="
                         "orm_result:50:1,repo.get_auth_bootstrap:25:1,"
-                        "repo.build_auth_bootstrap:25:1,repo.get_current_user:50:1"
+                        "repo.build_auth_bootstrap:25:1,repo.get_current_user:50:1 "
+                        "top_self=api.orm.session_execute:20:5:2,api.serialization.pydantic_dump:10:4:1 "
+                        "top_cumulative=api.orm.session_execute:60:5:2,api.serialization.pydantic_dump:20:4:1"
                     )
                     journal_rows.append({
                         "MESSAGE": json.dumps(
@@ -5127,8 +5143,9 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     profile_message = (
                         "cpu_diagnostic_complete service=web "
                         f"run_id={'a' * 32} timer=v8_cpu start_lag_ms=0 elapsed_ms=20000 "
-                        "sample_interval_us=100000 "
-                        "sample_count=5 categories=repo.workspace_page:100:3,web_framework:200:2"
+                        "sample_interval_us=10000 "
+                        "sample_count=5 categories=repo.workspace_page:100:3,web_framework:200:2 "
+                        "top_samples=web.workspace.page_render:3,web.react.render_stream:1"
                     )
                     journal_rows.append({
                         "MESSAGE": profile_message,
@@ -5214,6 +5231,17 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(api_profile["observation_unit"], "calls")
         self.assertIsNone(api_profile["sample_count"])
         self.assertEqual(api_profile["total_cpu_us"], 300)
+        self.assertEqual(api_profile["function_details"]["mapped_self_cpu_us"], 60)
+        self.assertEqual(api_profile["function_details"]["top_self"][0], {
+            "function_id": "api.orm.session_execute", "cpu_us": 40,
+            "calls": 10, "primitive_calls": 4,
+        })
+        self.assertEqual(api_profile["function_details"]["top_cumulative"][0]["cpu_us"], 120)
+        self.assertNotIn("session.py", repr(api_profile["function_details"]))
+        self.assertEqual(web_profile["function_details"]["mapped_sample_count"], 4)
+        self.assertEqual(web_profile["function_details"]["top_samples"][0], {
+            "function_id": "web.workspace.page_render", "samples": 3,
+        })
         self.assertEqual(
             [row["category"] for row in api_profile["categories"]],
             [
@@ -5227,6 +5255,14 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         )
         self.assertTrue(producer_categories.issubset(remote_dispatch.CPU_PROFILE_CATEGORIES))
         self.assertTrue(producer_categories.issubset(cpu_pair.PROFILE_CATEGORIES))
+        self.assertEqual(
+            diagnostic_plan_tool.API_PROFILE_FUNCTION_IDS | diagnostic_plan_tool.WEB_PROFILE_FUNCTION_IDS,
+            cpu_pair.PROFILE_FUNCTION_IDS,
+        )
+        self.assertEqual(
+            diagnostic_plan_tool.API_PROFILE_FUNCTION_IDS | diagnostic_plan_tool.WEB_PROFILE_FUNCTION_IDS,
+            remote_dispatch.CPU_PROFILE_FUNCTION_IDS,
+        )
         self.assertNotIn("raw_function_name", remote_dispatch.CPU_PROFILE_CATEGORIES)
         self.assertEqual(web_profile["timer"], "v8_cpu")
         self.assertEqual(web_profile["sample_count"], 5)
@@ -5407,6 +5443,30 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             )
             self.assertIsNotNone(typed_validated)
             assert typed_validated is not None
+            invalid_dispatch_input = json.loads(json.dumps(typed_summary))
+            invalid_dispatch_input["profile_rows"][0]["function_details"].update({
+                "top_self": [{"function_id": "raw.private.frame", "cpu_us": 1,
+                              "calls": 1, "primitive_calls": 1}],
+                "mapped_self_cpu_us": 1,
+            })
+            summary_path.write_text(json.dumps({
+                "status": "expired_plans_removed", "service_count": 2,
+                **invalid_dispatch_input,
+            }, sort_keys=True), encoding="ascii")
+            invalid_dispatch_stdout = io.StringIO()
+            with (
+                patch.object(remote_dispatch, "_trusted_python_helper", return_value=True),
+                patch.object(remote_dispatch, "SUDO", str(fake_sudo)),
+                redirect_stdout(invalid_dispatch_stdout),
+            ):
+                self.assertEqual(remote_dispatch._run_cpu_diagnostic_plan({
+                    "operation": "cleanup", "schema": 1, "run_id": "a" * 32,
+                }), 2)
+            self.assertIn('"stage":"profile_function_details"', invalid_dispatch_stdout.getvalue())
+            self.assertNotIn("raw.private.frame", invalid_dispatch_stdout.getvalue())
+            summary_path.write_text(json.dumps({
+                "status": "expired_plans_removed", "service_count": 2, **typed_summary,
+            }, sort_keys=True), encoding="ascii")
             oversized_typed_summary = json.loads(json.dumps(typed_dispatched))
             oversized_typed_summary["memory_rows"][1]["sampled_window_end_elapsed_ms"] = 120_501
             oversized_typed_summary["memory_rows"][1]["sampled_window_duration_ms"] = 120_404
@@ -5458,6 +5518,28 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 ["unattributed"]["summary_validation"],
                 1,
             )
+            invalid_function_summary = json.loads(json.dumps(validated_cleanup))
+            invalid_function_summary["profile_rows"][0]["function_details"].update({
+                "top_self": [{"function_id": "raw.private.frame", "cpu_us": 1,
+                              "calls": 1, "primitive_calls": 1}],
+                "top_cumulative": [{"function_id": "raw.private.frame", "cpu_us": 1,
+                                    "calls": 1, "primitive_calls": 1}],
+                "mapped_self_cpu_us": 1,
+            })
+            self.assertIsNone(cpu_pair._validate_usage_summary(
+                invalid_function_summary, expected_workload=cpu_pair.WORKLOAD,
+                allow_projected_memory_rows=True, allow_noop_cleanup=True,
+            ))
+            invalid_function_telemetry = capacity_diagnostic._project_server_telemetry(
+                invalid_function_summary, include_cpu_profile=True,
+                expected_workload=cpu_pair.WORKLOAD,
+            )
+            self.assertEqual(invalid_function_telemetry["profile_status"], "incomplete")
+            self.assertEqual(
+                invalid_function_telemetry["profile_rejections"]["capture_reason"],
+                "summary_validation",
+            )
+            self.assertNotIn("raw.private.frame", json.dumps(invalid_function_telemetry))
 
             # No parsed Web memory samples must still produce the closed,
             # incomplete row shape accepted by the remote cleanup projection.
@@ -5645,7 +5727,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         message = (
             "cpu_diagnostic_complete service=api run_id=" + "a" * 32
             + " timer=thread_cpu start_lag_ms=0 elapsed_ms=20000 "
-            "total_self_cpu_us=1 functions=other:1:1"
+            "total_self_cpu_us=1 functions=other:1:1 top_self= top_cumulative="
         )
         self.assertIsNotNone(diagnostic_plan_tool.PROFILE_API_MESSAGE_RE.fullmatch(message))
 
@@ -6480,7 +6562,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "helper_spawn", "helper_io", "helper_timeout", "helper_output_limit",
             "unrecognized_rc2", "inner_exit", "response_framing", "response_parse",
             "response_summary", "usage_rows", "usage_aggregate", "profile_rows",
-            "profile_categories", "profile_aggregate", "memory_rows", "memory_metrics",
+            "profile_categories", "profile_function_details", "profile_aggregate",
+            "memory_rows", "memory_metrics",
             "memory_aggregate", "cgroup_aggregate", "summary_bound",
         }))
         self.assertIsNone(cpu_pair._decode_cpu_plan_failure(
@@ -7165,6 +7248,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 "categories": [{
                     "category": "other", "cpu_us": 100, "observations": 1,
                 }],
+                "function_details": {"top_self": [], "top_cumulative": [], "top_samples": [],
+                                     "mapped_self_cpu_us": 0, "mapped_sample_count": 0},
             })
         self.assertIsNotNone(cpu_pair._validate_usage_summary({
             "status": "expired_plans_removed",
@@ -7637,6 +7722,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                         "category": category, "cpu_us": 100,
                         "observations": targets if service == "api" else 1,
                     }] if profiled else []),
+                    "function_details": {
+                        "top_self": [], "top_cumulative": [], "top_samples": [],
+                        "mapped_self_cpu_us": 0, "mapped_sample_count": 0,
+                    },
                 })
             return {
                 "status": "expired_plans_removed", "service_count": 2,
@@ -7908,7 +7997,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         profile.enable()
         sum(range(1000))
         profile.disable()
-        rows, total_cpu_us = __import__(
+        rows, total_cpu_us, details = __import__(
             "python_packages.platform_infra.performance_diagnostic",
             fromlist=["_profile_summary"],
         )._profile_summary(profile)
@@ -7918,6 +8007,38 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "serialization_validation", "orm_result", "db_driver",
             "async_event_loop", "crypto",
         } or name.startswith("repo.") for name, _, _ in rows))
+        self.assertEqual(details["top_samples"], [])
+        self.assertEqual(details["mapped_self_cpu_us"], sum(
+            int(item["cpu_us"]) for item in details["top_self"]
+        ))
+
+    def test_profile_function_projection_preserves_cpu_and_hides_unmapped_frames(self) -> None:
+        from types import SimpleNamespace
+        import pstats
+        import python_packages.platform_infra.performance_diagnostic as diagnostic_module
+
+        stats = {
+            ("/venv/lib/python3.12/site-packages/sqlalchemy/orm/session.py", 10, "_execute_internal"):
+                (2, 3, 0.003, 0.009, {}),
+            ("/venv/lib/python3.12/site-packages/pydantic/main.py", 20, "model_validate"):
+                (1, 2, 0.002, 0.004, {}),
+            ("/private/customer-secret.py", 30, "customer_secret_function"):
+                (1, 1, 0.004, 0.004, {}),
+        }
+        with patch.object(pstats, "Stats", return_value=SimpleNamespace(stats=stats)):
+            categories, total_self_us, details = diagnostic_module._profile_summary(object())
+        self.assertEqual(total_self_us, 9000)
+        self.assertEqual(sum(cpu_us for _category, cpu_us, _calls in categories), total_self_us)
+        self.assertEqual(details["mapped_self_cpu_us"], 5000)
+        self.assertEqual(details["top_self"], [
+            {"function_id": "api.orm.session_execute", "cpu_us": 3000,
+             "calls": 3, "primitive_calls": 2},
+            {"function_id": "api.serialization.pydantic_validate", "cpu_us": 2000,
+             "calls": 2, "primitive_calls": 1},
+        ])
+        self.assertEqual(details["top_cumulative"][0]["cpu_us"], 9000)
+        self.assertNotIn("customer_secret_function", repr(details))
+        self.assertNotIn("customer-secret.py", repr(details))
 
     async def test_api_cpu_capture_is_one_use_and_stops_on_worker_loop(self) -> None:
         import python_packages.platform_infra.performance_diagnostic as diagnostic_module
@@ -7961,6 +8082,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertIsNone(diagnostic_module._active_profile)
         self.assertEqual(emit_event.call_count, 1)
         self.assertTrue(emit_event.call_args.args[0].startswith("cpu_diagnostic_complete service=api "))
+        self.assertIn("top_self= top_cumulative=", emit_event.call_args.args[0])
         self.assertEqual(revalidate.call_args.kwargs["phase_at_ms"], plan.on_end_ms - 1)
 
     def test_api_cpu_profile_completion_requires_live_plan_and_on_time_stop(self) -> None:
@@ -8016,7 +8138,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                             diagnostic_module, "_read_process_plan_uncached",
                             side_effect=read_current_plan,
                         ) as read_plan,
-                        patch.object(diagnostic_module, "_profile_summary", return_value=([], 0)),
+                        patch.object(diagnostic_module, "_profile_summary", return_value=(
+                            [], 0, {"top_self": [], "top_cumulative": [], "top_samples": [],
+                                    "mapped_self_cpu_us": 0},
+                        )),
                         patch.object(diagnostic_module, "_emit_cpu_diagnostic_message") as emit,
                     ):
                         diagnostic.stop()
@@ -8829,6 +8954,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                                 "category": "repo.get_current_user", "cpu_us": 50_000,
                                 "observations": 100,
                             }],
+                            "function_details": {"top_self": [], "top_cumulative": [], "top_samples": [],
+                                                 "mapped_self_cpu_us": 0, "mapped_sample_count": 0},
                         },
                         {
                             "service": "web", "expected_targets": 1,
@@ -8842,6 +8969,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                                 "category": "other", "cpu_us": 1_000_000,
                                 "observations": 100,
                             }],
+                            "function_details": {"top_self": [], "top_cumulative": [], "top_samples": [],
+                                                 "mapped_self_cpu_us": 0, "mapped_sample_count": 0},
                         },
                     ],
                 })
@@ -9164,6 +9293,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 "elapsed_ms_min": None, "elapsed_ms_max": None,
                 "end_lag_ms_min": None, "end_lag_ms_max": None,
                 "categories": [],
+                "function_details": {"top_self": [], "top_cumulative": [], "top_samples": [],
+                                     "mapped_self_cpu_us": 0, "mapped_sample_count": 0},
             })
             args.report = str(root / "producer-profile-rejection.json")
             rejection_state: dict[str, Any] = {}

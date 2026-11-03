@@ -4499,14 +4499,14 @@ class ExternalLoadTests(unittest.TestCase):
                                 "cpu_diagnostic_complete service=api "
                                 f"run_id={run_id} timer=thread_cpu start_lag_ms=0 "
                                 f"elapsed_ms={on_window} total_self_cpu_us=100 "
-                                "functions=repo.get_current_user:100:1"
+                                "functions=repo.get_current_user:100:1 top_self= top_cumulative="
                             )
                         else:
                             profile = (
                                 "cpu_diagnostic_complete service=web "
                                 f"run_id={run_id} timer=v8_cpu start_lag_ms=0 "
-                                f"elapsed_ms={on_window} sample_interval_us=100000 "
-                                "sample_count=5 categories=repo.workspace_page:100:5"
+                                f"elapsed_ms={on_window} sample_interval_us=10000 "
+                                "sample_count=5 categories=repo.workspace_page:100:5 top_samples="
                             )
                         journal_rows.append({
                             "MESSAGE": json.dumps({"message": profile}, separators=(",", ":"))
