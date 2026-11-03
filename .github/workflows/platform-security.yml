@@ -2406,7 +2406,7 @@ jobs:
               "deployable": os.environ.get("ROUTE_DEPLOYABLE", "") == "true",
               "fallback": os.environ.get("ROUTE_FALLBACK", "") == "true",
               "manifest_digest": os.environ.get("ROUTE_DIGEST", ""),
-              "expected_gates": expected,
+              "expected_gates": expected_by_class["full"] if baseline_mode else expected,
               "gate_results": results,
               "reused_source_security": {
                   "run_id": os.environ.get("SOURCE_SECURITY_RUN_ID", "") if baseline_mode else None,

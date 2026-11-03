@@ -1469,6 +1469,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     "service": "api", "expected_targets": 2, "observed_targets": 2,
                     "event_count": 2, "timer": "thread_cpu", "observation_unit": "calls",
                     "total_cpu_us": 2_000_000, "sample_count": None,
+                    "sample_class_counts": None,
                     "function_details": {
                         "top_self": [], "top_cumulative": [], "top_samples": [],
                         "mapped_self_cpu_us": 0, "mapped_sample_count": 0,
@@ -1485,6 +1486,10 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     "service": "web", "expected_targets": 1, "observed_targets": 1,
                     "event_count": 1, "timer": "v8_cpu", "observation_unit": "samples",
                     "total_cpu_us": 1_000_000, "sample_count": 100,
+                    "sample_class_counts": {
+                        "idle": 0, "garbage_collector": 0, "program": 0,
+                        "unmapped_busy": 100, "known_category": 0, "unclassified": 0,
+                    },
                     "function_details": {
                         "top_self": [], "top_cumulative": [], "top_samples": [],
                         "mapped_self_cpu_us": 0, "mapped_sample_count": 0,
@@ -1553,7 +1558,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertEqual(projected["profile_rows"], [])
 
         dispatch_status, dispatch_output = invoke_with_helper_result(complete_helper_result)
-        self.assertEqual(dispatch_status, 0)
+        self.assertEqual(dispatch_status, 0, dispatch_output)
         self.assertTrue(dispatch_output.startswith("CPU_DIAGNOSTIC_PLAN "))
         projected = json.loads(dispatch_output.removeprefix("CPU_DIAGNOSTIC_PLAN "))
         self.assertEqual(projected["usage_rows"], rows)

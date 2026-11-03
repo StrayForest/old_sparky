@@ -421,6 +421,8 @@ Use the canonical registry for focused local feedback, then run each affected ow
 Replace example paths/selectors with current changes. Backend needs `backend`; web needs `web-quality` and `web-hermetic`.
 `backend-unit --focused` is DB-free; `backend` needs DB, Redis and privileged resources. Run `ci` for a full local pass; Actions remain the release authority. `test_platform_cpu_profile` owns API cProfile safe-ID projection/category conservation and parent parser cases in `performance-contract`; `frontend-audit-regressions.spec.ts` owns the V8 sample interval/cap and safe function-ID projection under web gates. Keep the `platform_cpu_diagnostic_plan.py`, `platform_cpu_diagnostic_pair.py` and `platform_workflow_remote_dispatch.py` projections synchronized; tests verify raw frame names and paths do not escape.
 
+Changes to the CPU profile row schema must also run the downstream remote-dispatch contract before the full privileged contour. Its positive fixture is `tests.test_platform_live_qa_wrappers.LiveQaWrapperContractTests.test_cpu_diagnostic_dispatch_uses_closed_canonical_stdin`; keep its web `sample_class_counts` conserved with `sample_count` and preserve the API row's explicit `null`. Run that focused case from `platform/` with the canonical quiet wrapper; the full `backend-privileged` gate remains required in CI.
+
 When the local runner cannot create PID namespaces, run the other `performance-contract` IDs as a local subset. Keep the summary outside the repository; hosted CI still requires the full contour.
 
 ```bash
