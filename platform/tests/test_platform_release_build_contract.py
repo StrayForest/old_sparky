@@ -3533,6 +3533,9 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("profile_switch_recoverable=1", supervisor)
         self.assertIn('failure_reason="runtime_profile_restored"', profile_function)
         self.assertIn("runtime_profile_restored", platform_workflow_remote_dispatch.RELEASE_FAILURE_REASONS[("deployment", "readiness")])
+        self.assertIn('set_failure_context deployment readiness runtime_profile_identity', profile_function)
+        self.assertIn("runtime_profile_identity", platform_workflow_remote_dispatch.RELEASE_FAILURE_REASONS[("deployment", "readiness")])
+        self.assertIn("runtime_profile_identity", workflow)
 
         self.assertIn("group: platform-production-deploy", workflow)
         self.assertIn("environment: production", workflow)
@@ -3820,6 +3823,86 @@ sleep() {{ :; }}
                 self.assertFalse((root / "applied-profiles.txt").exists())
                 self.assertFalse((root / "restarts.txt").exists())
                 self.assertEqual((root / "platform/shared/env/web.env").read_text(), "PLATFORM_WEB_SERVER_AUTH_TRANSPORT=fetch\n")
+
+    def test_profile_switch_identity_uses_installed_release_root_host_pin(self) -> None:
+        supervisor = DEPLOY_SUPERVISOR.read_text(encoding="utf-8")
+        match = re.search(
+            r"(?ms)^verify_active_profile_switch_identity\(\) \{.*?^\}",
+            supervisor,
+        )
+        self.assertIsNotNone(match)
+        assert match is not None
+        function = match.group(0)
+
+        source_sha = "a" * 40
+        host_tools_sha = "b" * 40
+        release_slug = f"gha-123-1-{source_sha[:12]}"
+        with tempfile.TemporaryDirectory(prefix="profile-switch-release-identity-") as temporary:
+            root = Path(temporary)
+            runtime = root / "platform"
+            releases = runtime / "releases"
+            release = releases / release_slug
+            release.mkdir(parents=True)
+            tools = runtime / "shared/host-tools" / host_tools_sha
+            tools.mkdir(parents=True)
+            (release / "RELEASE.json").write_text(
+                json.dumps({"source_git_commit": source_sha, "release_slug": release_slug}),
+                encoding="utf-8",
+            )
+            contract_dir = release / "contracts"
+            contract_dir.mkdir()
+            pin = contract_dir / "host_tools_pin.json"
+            pin.write_text(
+                json.dumps({
+                    "schema": 1,
+                    "repository": "StrayForest/old_sparky",
+                    "host_tools_sha": host_tools_sha,
+                }),
+                encoding="utf-8",
+            )
+            (release / "RELEASE.json").chmod(0o444)
+            pin.chmod(0o444)
+            current = runtime / "current"
+            current.symlink_to(release)
+            shell = f"""
+set -euo pipefail
+runtime={shlex.quote(str(runtime))}
+current={shlex.quote(str(current))}
+target_sha={shlex.quote(source_sha)}
+host_tools_sha={shlex.quote(host_tools_sha)}
+host_tools_dir={shlex.quote(str(tools))}
+fail() {{ exit 1; }}
+{function}
+verify_active_profile_switch_identity
+"""
+            result = subprocess.run(
+                ["/bin/bash", "-c", shell],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((release / "platform/contracts/host_tools_pin.json").exists())
+
+            pin.chmod(0o644)
+            pin.write_text(
+                json.dumps({
+                    "schema": 1,
+                    "repository": "StrayForest/old_sparky",
+                    "host_tools_sha": "c" * 40,
+                }),
+                encoding="utf-8",
+            )
+            pin.chmod(0o444)
+            rejected = subprocess.run(
+                ["/bin/bash", "-c", shell],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
 
     def test_ssr_diagnostics_restarts_api_after_applying_api_log_gate(self) -> None:
         workflow = DEPLOY_SUPERVISOR.read_text()

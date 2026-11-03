@@ -129,9 +129,8 @@ the server request ID, and allows the same 15-second bounded drain as typed
 HTML plans. Its existing capped, sampled IDs feed the existing SSR projection.
 If B is active initially, switch B→A with the same route before A1; stop if
 the active profile is outside this A/B pair.
-Use the protected A/B profile-only route: it verifies exact source/Security and
-profile, locks release/load, changes only web transport, restarts web, checks
-readiness and rolls back; it does no build, migration, backup or pointer change.
+Use the protected A/B route: it binds exact source/Security, release-root `RELEASE.json` and `contracts/host_tools_pin.json`, expected profile and both locks before web-only mutation; it restarts web, checks readiness, and rolls back without build/migration/backup/pointer changes.
+`runtime_profile_identity` means a prewrite mismatch; `runtime_profile_failed` covers apply/readiness. Start no load until a passing switch or verified healthy A restore.
 For A/B/A, ensure A before A1, switch to B before B, then restore A before A2:
 
 ```bash

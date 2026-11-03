@@ -227,6 +227,19 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
         }
         native_web_env = render_service_env("web", native_values)
         self.assertIn("PLATFORM_WEB_SERVER_AUTH_TRANSPORT=node", native_web_env)
+        admission_api_env = render_service_env("api", admission_profile).encode("utf-8")
+        admission_worker_env = render_service_env("worker", admission_profile).encode("utf-8")
+        admission_web_env = render_service_env("web", admission_profile)
+        self.assertEqual(
+            render_service_env("api", native_profile).encode("utf-8"), admission_api_env,
+        )
+        self.assertEqual(
+            render_service_env("worker", native_profile).encode("utf-8"),
+            admission_worker_env,
+        )
+        self.assertNotEqual(native_web_env.encode("utf-8"), admission_web_env.encode("utf-8"))
+        self.assertNotIn(b"PLATFORM_WEB_SERVER_AUTH_TRANSPORT=", admission_api_env)
+        self.assertNotIn(b"PLATFORM_WEB_SERVER_AUTH_TRANSPORT=", admission_worker_env)
 
         restored_content, _changed = configure.merge_baseline(
             native_content.splitlines(), baseline=admission_profile,

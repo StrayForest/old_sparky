@@ -339,7 +339,7 @@ bundle validation to `test_platform_recovery_bootstrap`. The
 [classifier](../tools/platform_ci_classifier.py) and release workflows own
 implementation.
 
-`test_platform_release_build_contract` owns profile-switch Security binding, A↔B handoff, lock/source checks, web-only mutation/readiness/rollback, and preflight/install bypass; its isolated profile-switch cases run in `backend-tool-contract`.
+`test_platform_release_build_contract` owns profile-switch Security binding, A↔B handoff, lock/source checks, web-only mutation/readiness/rollback, installed release-root pin identity, and preflight/install bypass. The profile-switch handoff cases run in `backend-tool-contract`; `test_profile_switch_identity_uses_installed_release_root_host_pin` runs in `backend-privileged` because its exact source predicate requires root-owned release receipt and pin fixtures.
 
 The event and conditional-job behavior follows the primary GitHub Actions
 contracts for [workflow events](https://docs.github.com/en/actions/reference/events-that-trigger-workflows),

@@ -213,7 +213,7 @@ jobs:
           marker = Path(path).read_bytes()
           pattern = re.compile(
               rb"RELEASE_DEPLOY schema=1 status=(?:passed|failed) class=(?:preflight|artifact|deployment)"
-              rb"(?: phase=(?:preflight|artifact|provenance|candidate|readiness) reason=(?:internal|host_tools_invalid|lock|environment|service_state|nginx_config|preflight_failed|artifact_missing|artifact_count_invalid|checksum_missing|provenance_missing|artifact_name_invalid|release_slug_mismatch|checksum_mismatch|validation_failed|provenance_invalid|candidate_missing|activation_failed|lock_lost|runtime_profile_failed|runtime_profile_restored|baseline_changed)(?: lock_stage=(?:helper_metadata|release_supervise|release_open|retained_supervise|retained_open))?)? "
+              rb"(?: phase=(?:preflight|artifact|provenance|candidate|readiness) reason=(?:internal|host_tools_invalid|lock|environment|service_state|nginx_config|preflight_failed|artifact_missing|artifact_count_invalid|checksum_missing|provenance_missing|artifact_name_invalid|release_slug_mismatch|checksum_mismatch|validation_failed|provenance_invalid|candidate_missing|activation_failed|lock_lost|runtime_profile_identity|runtime_profile_failed|runtime_profile_restored|baseline_changed)(?: lock_stage=(?:helper_metadata|release_supervise|release_open|retained_supervise|retained_open))?)? "
               rb"release_slug=" + re.escape(slug.encode()) + rb" source_sha=" + re.escape(source.encode()) + rb"\n"
           )
           if pattern.fullmatch(marker) is None:
