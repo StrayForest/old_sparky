@@ -475,6 +475,17 @@ gh api \
 gh run watch <exact-cleanup-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
+Before accepting the cleanup input or reaching SSH, the workflow normalizes the
+downloaded `source-binding.json` into its private runner-temp directory. It
+accepts only the artifact extractor's owner-owned regular file with one link,
+rejects symlinks and unexpected entries, and secures the directory/file as
+`0700`/`0600`; the following validator still checks the exact artifact run,
+attempt, archive digest and downloaded bytes. A
+`CLEANUP_PREFLIGHT reason=source_binding_metadata` or
+`SOURCE_BINDING_HANDOFF reason=metadata_invalid` is a pre-SSH failure. Stop and
+retain that exact run's evidence; do not edit or substitute the artifact or
+bypass validation.
+
 Review the cleanup run's exact source-binding, summary, diagnostic and
 canonical-log artifacts. Require `ok=true`, control account preserved, the
 expected fixture rows deleted, zero scoped residuals as enforced by the
