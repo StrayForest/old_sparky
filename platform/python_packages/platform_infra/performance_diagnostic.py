@@ -372,13 +372,15 @@ def _start_cpu_usage_window(plan: DiagnosticPlan, phase: str, loop: Any) -> None
     expected_window_ms = end_ms_target - start_ms_target
     start_ms = time.time_ns() // 1_000_000
     start_lag_ms = start_ms - start_ms_target
-    start_cpu_ns = time.process_time_ns()
     start_monotonic_ns = time.monotonic_ns()
+    start_cpu_ns = time.process_time_ns()
     capacity = _effective_cpu_capacity()
 
     def finish() -> None:
         end_ms = time.time_ns() // 1_000_000
         end_lag_ms = end_ms - end_ms_target
+        end_monotonic_ns = time.monotonic_ns()
+        end_cpu_ns = time.process_time_ns()
         fresh_plan = _read_process_plan_uncached(
             "api",
             now_ms=end_ms,
@@ -393,8 +395,8 @@ def _start_cpu_usage_window(plan: DiagnosticPlan, phase: str, loop: Any) -> None
                 or end_ms > end_ms_target + CPU_WINDOW_TOLERANCE_MS
                 or end_ms > plan.expires_at_ms + CPU_WINDOW_TOLERANCE_MS):
             return
-        window_ms = max(0, (time.monotonic_ns() - start_monotonic_ns) // 1_000_000)
-        cpu_ns = max(0, time.process_time_ns() - start_cpu_ns)
+        window_ms = max(0, (end_monotonic_ns - start_monotonic_ns) // 1_000_000)
+        cpu_ns = max(0, end_cpu_ns - start_cpu_ns)
         timing_complete = bool(
             0 <= start_lag_ms <= CPU_WINDOW_TOLERANCE_MS
             and abs(end_lag_ms) <= CPU_WINDOW_TOLERANCE_MS
@@ -947,13 +949,13 @@ class ApiCpuDiagnostic:
             _consumed_run_ids.add(plan.run_id)
             return False
         diagnostic.loop = loop
-        diagnostic.started_monotonic = time.monotonic()
         diagnostic.start_lag_ms = prepared_lag_ms
         _consumed_run_ids.add(plan.run_id)
         _active_profile = diagnostic
         diagnostic.profile.enable()
-        # Record a conservative timestamp after enable: scheduler delays and
-        # profiler activation time count against the fixed 250 ms allowance.
+        # Pair the monotonic origin with the post-enable wall-clock boundary;
+        # do not count work before the profiler actually starts.
+        diagnostic.started_monotonic = time.monotonic()
         enabled_ms = time.time_ns() // 1_000_000
         enabled_lag_ms = enabled_ms - plan.on_start_ms
         remaining_seconds = (plan.on_end_ms - enabled_ms) / 1000
@@ -1055,6 +1057,13 @@ class ApiCpuDiagnostic:
         end_lag_ms = ended_ms - self.plan.on_end_ms
         if not 0 <= end_lag_ms <= CPU_WINDOW_TOLERANCE_MS:
             return
+        stopped_monotonic = time.monotonic()
+        elapsed_ms = 0
+        if self.started_monotonic is not None:
+            elapsed_ms = min(
+                MAX_CAPTURE_MS,
+                int((stopped_monotonic - self.started_monotonic) * 1000),
+            )
         try:
             current_plan = _read_process_plan_uncached(
                 "api", now_ms=ended_ms, pid=None, start_ticks=None,
@@ -1067,9 +1076,6 @@ class ApiCpuDiagnostic:
         if current_plan != self.plan:
             return
         rows, total_self_us, details = _profile_summary(self.profile)
-        elapsed_ms = 0
-        if self.started_monotonic is not None:
-            elapsed_ms = min(MAX_CAPTURE_MS, int((time.monotonic() - self.started_monotonic) * 1000))
         categories = ",".join(f"{name}:{cpu_us}:{calls}" for name, cpu_us, calls in rows)
         _emit_cpu_diagnostic_message(
             "cpu_diagnostic_complete service=api run_id=%s timer=thread_cpu "

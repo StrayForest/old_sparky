@@ -97,6 +97,11 @@ PROFILE_ROW_FIELDS = frozenset({
     "observation_unit", "total_cpu_us", "sample_count", "start_lag_ms_min",
     "start_lag_ms_max", "elapsed_ms_min", "elapsed_ms_max", "end_lag_ms_min",
     "end_lag_ms_max", "categories", "function_details",
+    "sample_class_counts",
+})
+PROFILE_SAMPLE_CLASS_KEYS = frozenset({
+    "idle", "garbage_collector", "program", "unmapped_busy", "known_category",
+    "unclassified",
 })
 PROFILE_CATEGORY_FIELDS = frozenset({"category", "cpu_us", "observations"})
 PROFILE_FUNCTION_IDS = frozenset({
@@ -308,6 +313,19 @@ def _validate_profile_projection(
             if item is not None and (type(item) is not int or not 0 <= item <= 10**10):
                 return None
         if service == "web" and clean["sample_count"] is not None and clean["sample_count"] > 2400:
+            return None
+        sample_classes = clean["sample_class_counts"]
+        if service == "api":
+            if sample_classes is not None:
+                return None
+        elif clean["sample_count"] is None or clean["sample_count"] == 0:
+            if sample_classes not in (None, {key: 0 for key in PROFILE_SAMPLE_CLASS_KEYS}):
+                return None
+        elif (not isinstance(sample_classes, dict)
+              or set(sample_classes) != PROFILE_SAMPLE_CLASS_KEYS
+              or any(type(count) is not int or not 0 <= count <= 2400
+                     for count in sample_classes.values())
+              or sum(sample_classes.values()) != clean["sample_count"]):
             return None
         categories: list[dict[str, Any]] = []
         names: list[str] = []

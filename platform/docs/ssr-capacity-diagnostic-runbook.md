@@ -309,7 +309,11 @@ identities, and all of these conditions hold:
   duplicate, malformed, overflowed or truncated coverage is partial evidence
   even when `report_complete` is true. The web selector releases its reservation
   on that response's `close` event and only when the map still contains that
-  exact selection. Verify this contract when changing the guard:
+  exact selection. The same marker reports bounded counts for typed selector
+  acceptance/rejection and response-ID header outcomes. Check that selected
+  plans equal the sum of header-set, already-sent, unavailable and error
+  outcomes. These diagnostic counts do not replace the full-cohort request-ID
+  counts or identify an individual request. Verify this contract when changing the guard:
 
   ```bash
   cd platform/apps/platform_web
@@ -331,9 +335,11 @@ identities, and all of these conditions hold:
   prearm API and web OFF/ON usage windows; API also arms a thread-CPU cProfile
   callback on each worker event loop. The callback rechecks the exact plan and
   starts at the planned ON edge; the API rechecks actual start time around
-  profiler construction and activation. At stop, it disables first, then
-  rechecks the exact process-bound plan and end time before emitting a complete
-  profile record. A missing, late, replaced, or unreadable plan remains
+  profiler construction and activation. The monotonic start is captured after
+  profiler enable; stop captures the end immediately after disable, before
+  plan revalidation or profile summarization. Usage-window CPU and monotonic
+  endpoints are likewise snapshotted before plan revalidation. A missing, late,
+  replaced, or unreadable plan remains
   incomplete; the first ON request cannot start or shift this profile. Keep the
   250 ms start and end bounds. Web V8 sampling uses a bounded 10 ms interval
   in this opt-in workload, with at most 2,400 samples and 10,000 profile
@@ -382,8 +388,12 @@ Web profile rows contain sampled counts for at most 20 reviewed function IDs
 and a mapped-sample count against the total sample count. These are V8 sample
 counts, not per-function CPU time. Category values continue to sum sampled
 `timeDeltas`; they are diagnostic weights, not process CPU or exact function
-self-time. Unknown frames remain in their existing category. Neither producer
-exports raw profile nodes, paths, symbols, request IDs or source text.
+self-time. The closed `sample_class_counts` separates idle, garbage-collector,
+program, known-category, unmapped-busy and unclassified sample counts; their sum
+must equal the total sample count. These counts do not assign CPU time to a
+function or category. Unknown frames remain in their existing category.
+Neither producer exports raw profile nodes, paths, symbols, request IDs or
+source text.
 
 For an incomplete diagnostic, use the one-day failure-fingerprint artifact to
 read only the bounded failure classifications. `capacity_phase.resource_abort_reason`

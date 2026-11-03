@@ -11,6 +11,7 @@ import { hasAuthorizedDiagnosticRunMarker } from "./performance-diagnostic-marke
 import {
   CPU_PROFILE_SAMPLING,
   categoryForFrame,
+  summarizeSampleClasses,
   summarizeFunctionSamples,
 } from "./cpu-profile-categories.mjs";
 import { isHtmlSsrCaptureEligible } from "./ssr-capture-sampling.mjs";
@@ -870,16 +871,15 @@ async function stopNodeCpuProfile(
     }
     const nodes = new Map(profile.nodes.map((node) => [node.id, node.callFrame ?? {}]));
     const totals = new Map<string, { samples: number; cpuUs: number }>();
-    let acceptedSamples = 0;
+    const sampleClassCounts = summarizeSampleClasses(nodes, profile.samples);
+    const acceptedSamples = profile.samples.length;
     for (let index = 0; index < profile.samples.length; index += 1) {
       const frame = nodes.get(profile.samples[index]);
-      if (!frame) continue;
-      const category = categoryForFrame(frame.url ?? "", frame.functionName ?? "");
+      const category = categoryForFrame(frame?.url ?? "", frame?.functionName ?? "");
       const row = totals.get(category) ?? { samples: 0, cpuUs: 0 };
       row.samples += 1;
       row.cpuUs += Math.max(0, profile.timeDeltas[index]);
       totals.set(category, row);
-      acceptedSamples += 1;
     }
     const otherTotals = totals.get("other") ?? { samples: 0, cpuUs: 0 };
     const summaryRows = [...totals.entries()]
@@ -897,7 +897,11 @@ async function stopNodeCpuProfile(
     console.info(
       `cpu_diagnostic_complete service=web run_id=${runId} timer=v8_cpu `
       + `start_lag_ms=${startLagMs} elapsed_ms=${elapsedMs} `
-      + `sample_interval_us=10000 sample_count=${acceptedSamples} categories=${summary.slice(0, 3000)} `
+      + `sample_interval_us=10000 sample_count=${acceptedSamples} `
+      + `sample_classes=idle:${sampleClassCounts.idle},gc:${sampleClassCounts.garbage_collector},`
+      + `program:${sampleClassCounts.program},unmapped_busy:${sampleClassCounts.unmapped_busy},`
+      + `known_category:${sampleClassCounts.known_category},unclassified:${sampleClassCounts.unclassified} `
+      + `categories=${summary.slice(0, 3000)} `
       + `top_samples=${functionSummary}`
     );
   } catch {

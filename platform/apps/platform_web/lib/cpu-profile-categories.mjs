@@ -100,3 +100,31 @@ export function summarizeFunctionSamples(nodes, samples) {
     mapped_sample_count: rows.reduce((total, row) => total + row.samples, 0),
   };
 }
+
+export function summarizeSampleClasses(nodes, samples) {
+  const counts = {
+    idle: 0,
+    garbage_collector: 0,
+    program: 0,
+    unmapped_busy: 0,
+    known_category: 0,
+    unclassified: 0,
+  };
+  for (const nodeId of samples) {
+    const frame = nodes.get(nodeId);
+    if (!frame) {
+      counts.unclassified += 1;
+    } else if (frame.functionName === "(idle)") {
+      counts.idle += 1;
+    } else if (frame.functionName === "(garbage collector)") {
+      counts.garbage_collector += 1;
+    } else if (frame.functionName === "(program)") {
+      counts.program += 1;
+    } else if (categoryForFrame(frame.url ?? "", frame.functionName ?? "") === "other") {
+      counts.unmapped_busy += 1;
+    } else {
+      counts.known_category += 1;
+    }
+  }
+  return counts;
+}

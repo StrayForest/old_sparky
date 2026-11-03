@@ -2691,7 +2691,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                         "start_lag_ms_min": None, "start_lag_ms_max": None,
                         "elapsed_ms_min": None, "elapsed_ms_max": None,
                         "end_lag_ms_min": None, "end_lag_ms_max": None,
-                        "total_cpu_us": 0, "sample_count": None, "categories": [],
+                        "total_cpu_us": 0, "sample_count": None,
+                        "sample_class_counts": None, "categories": [],
                         "function_details": {"top_self": [], "top_cumulative": [], "top_samples": [],
                                              "mapped_self_cpu_us": 0, "mapped_sample_count": 0},
                     },
@@ -2702,7 +2703,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                         "start_lag_ms_min": None, "start_lag_ms_max": None,
                         "elapsed_ms_min": None, "elapsed_ms_max": None,
                         "end_lag_ms_min": None, "end_lag_ms_max": None,
-                        "total_cpu_us": 0, "sample_count": 0, "categories": [],
+                        "total_cpu_us": 0, "sample_count": 0,
+                        "sample_class_counts": None, "categories": [],
                         "function_details": {"top_self": [], "top_cumulative": [], "top_samples": [],
                                              "mapped_self_cpu_us": 0, "mapped_sample_count": 0},
                     },
@@ -2993,6 +2995,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "capture_lost_requests": 0, "capture_rows": len(html_context_rows),
             "capture_lost_rows": 0, "capture_truncated_records": 0,
             "capture_malformed_records": 0, "capture_status": "complete",
+            "plan_selected": len(html_context_rows), "header_set": len(html_context_rows),
+            "header_already_sent": 0, "header_unavailable": 0, "header_error": 0,
+            "selector_invalid": 0, "selector_unmatched": 0, "selector_capacity": 0,
+            "outcome_truncated_records": 0,
             "status": "none",
         }
         html_report["server_telemetry"]["request_correlation"] = {
@@ -3026,6 +3032,24 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 run_id="12345", attempt="1", manifest_sha256=manifest_sha,
                 workload=capacity_diagnostic.HTML_WORKLOAD,
             ), "PASS")
+            incomplete_full_cohort_ids = json.loads(json.dumps(sanitized_legacy))
+            incomplete_evidence = incomplete_full_cohort_ids["worker"][
+                "request_window_evidence"
+            ]
+            incomplete_evidence["ssr_request_id_singleton_count"] -= 1
+            incomplete_evidence["ssr_request_id_missing_count"] += 1
+            self.assertEqual(
+                incomplete_full_cohort_ids["server_telemetry"][
+                    "request_correlation"
+                ]["status"],
+                "complete",
+            )
+            self.assertEqual(capacity_diagnostic.evaluate_capacity_report(
+                incomplete_full_cohort_ids,
+                source_sha="b" * 40, app_target_sha="c" * 40,
+                run_id="12345", attempt="1", manifest_sha256=manifest_sha,
+                workload=capacity_diagnostic.HTML_WORKLOAD,
+            ), "INVALID")
             incomplete_correlation = json.loads(json.dumps(sanitized_legacy))
             incomplete_correlation["server_telemetry"]["request_correlation"] = {
                 "status": "incomplete", "summary": None,
@@ -4787,7 +4811,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     if service == "api" else
                     "cpu_diagnostic_complete service=web run_id=" + "a" * 32
                     + " timer=v8_cpu start_lag_ms=0 elapsed_ms=20000 sample_interval_us=10000 "
-                    + "sample_count=1 categories=other:100:1 top_samples="
+                    + "sample_count=1 sample_classes=idle:0,gc:0,program:0,unmapped_busy:1,"
+                    + "known_category:0,unclassified:0 categories=other:100:1 top_samples="
                 )
                 base_rows.append({
                     "MESSAGE": message, "_PID": str(target["pid"]),
@@ -4865,6 +4890,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             ("category", mutate(0, "functions=other:100:1", "functions=raw_name:100:1"), "api", "profile_category"),
             ("function-id", mutate(0, "top_self= top_cumulative=", "top_self=raw_frame:1:1:1 top_cumulative="), "api", "profile_function_detail"),
             ("sample-cap", mutate(2, "sample_count=1", "sample_count=2401"), "web", "profile_numeric"),
+            ("sample-class-conservation", mutate(2, "unmapped_busy:1", "unmapped_busy:0"), "web", "profile_numeric"),
             ("aggregate", mutate(0, "total_self_cpu_us=100", "total_self_cpu_us=101"), "api", "profile_aggregate"),
         )
         for label, rows, service, code in cases:
@@ -5144,7 +5170,9 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                         "cpu_diagnostic_complete service=web "
                         f"run_id={'a' * 32} timer=v8_cpu start_lag_ms=0 elapsed_ms=20000 "
                         "sample_interval_us=10000 "
-                        "sample_count=5 categories=repo.workspace_page:100:3,web_framework:200:2 "
+                        "sample_count=5 sample_classes=idle:0,gc:0,program:0,unmapped_busy:0,"
+                        "known_category:5,unclassified:0 "
+                        "categories=repo.workspace_page:100:3,web_framework:200:2 "
                         "top_samples=web.workspace.page_render:3,web.react.render_stream:1"
                     )
                     journal_rows.append({
@@ -5239,6 +5267,14 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(api_profile["function_details"]["top_cumulative"][0]["cpu_us"], 120)
         self.assertNotIn("session.py", repr(api_profile["function_details"]))
         self.assertEqual(web_profile["function_details"]["mapped_sample_count"], 4)
+        self.assertEqual(web_profile["sample_class_counts"], {
+            "idle": 0, "garbage_collector": 0, "program": 0,
+            "unmapped_busy": 0, "known_category": 5, "unclassified": 0,
+        })
+        self.assertIsNone(diagnostic_plan_tool._parse_web_sample_classes(
+            "idle:0,gc:0,program:0,unmapped_busy:0,known_category:4,unclassified:0",
+            sample_count=5,
+        ))
         self.assertEqual(web_profile["function_details"]["top_samples"][0], {
             "function_id": "web.workspace.page_render", "samples": 3,
         })
@@ -5633,13 +5669,39 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 return SimpleNamespace(cancel=lambda: None)
 
         loop = CapturedLoop()
+        usage_clock = {
+            "wall_ns": 1_000_000_000,
+            "wall_calls": 0,
+            "monotonic_ns": 0,
+            "process_ns": 100,
+        }
+
+        def usage_wall_ns() -> int:
+            usage_clock["wall_calls"] += 1
+            if usage_clock["wall_calls"] == 2:
+                usage_clock["wall_ns"] = 21_000_000_000
+            return usage_clock["wall_ns"]
+
+        def slow_usage_plan_read(*_args: Any, **_kwargs: Any) -> Any:
+            usage_clock["wall_ns"] = 22_000_000_000
+            usage_clock["monotonic_ns"] = 21_000_000_000
+            usage_clock["process_ns"] = 4_000_000_100
+            return counter_plan
+
         with (
             patch.object(diagnostic_module, "_effective_cpu_capacity", return_value=2.0),
-            patch.object(diagnostic_module.time, "time_ns", side_effect=[1_000_000_000, 21_000_000_000]),
-            patch.object(diagnostic_module.time, "monotonic_ns", side_effect=[0, 20_000_000_000]),
-            patch.object(diagnostic_module.time, "process_time_ns", side_effect=[100, 3_000_000_100]),
+            patch.object(diagnostic_module.time, "time_ns", side_effect=usage_wall_ns),
             patch.object(
-                diagnostic_module, "_read_process_plan_uncached", return_value=counter_plan,
+                diagnostic_module.time, "monotonic_ns",
+                side_effect=lambda: usage_clock["monotonic_ns"],
+            ),
+            patch.object(
+                diagnostic_module.time, "process_time_ns",
+                side_effect=lambda: usage_clock["process_ns"],
+            ),
+            patch.object(
+                diagnostic_module, "_read_process_plan_uncached",
+                side_effect=slow_usage_plan_read,
             ),
             patch.object(diagnostic_module, "_emit_cpu_diagnostic_message") as usage_event,
         ):
@@ -5650,6 +5712,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         usage_message = usage_event.call_args.args[0]
         self.assertIn("cpu_diagnostic_usage service=api", usage_message)
         self.assertIn("cpu_ns=3000000000", usage_message)
+        self.assertIn("window_ms=20000", usage_message)
+        self.assertIn("end_lag_ms=0", usage_message)
         self.assertIn("timing_complete=true", usage_message)
         self.assertNotIn("pid", usage_message)
         usage_event.assert_called_once_with(usage_message)
@@ -7509,6 +7573,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "capture_retained_requests": 0, "capture_lost_requests": 0,
             "capture_rows": 0, "capture_lost_rows": 0,
             "capture_truncated_records": 0, "capture_malformed_records": 0,
+            "plan_selected": 0, "header_set": 0, "header_already_sent": 0,
+            "header_unavailable": 0, "header_error": 0, "selector_invalid": 0,
+            "selector_unmatched": 0, "selector_capacity": 0,
+            "outcome_truncated_records": 0,
         }
         run_id = "a" * 32
         record = diagnostic_plan_tool._record_ssr_stream_coverage
@@ -7537,30 +7605,51 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "capture_retained_requests": 0, "capture_lost_requests": 0,
             "capture_rows": 0, "capture_lost_rows": 0,
             "capture_truncated_records": 0, "capture_malformed_records": 0,
+            "plan_selected": 0, "header_set": 0, "header_already_sent": 0,
+            "header_unavailable": 0, "header_error": 0, "selector_invalid": 0,
+            "selector_unmatched": 0, "selector_capacity": 0,
+            "outcome_truncated_records": 0,
         })
         good_capture = (
             "ssr_stream_capture_coverage scheme=sha256-runid-requestid-1of8-v1 "
-            f"run_id={run_id} eligible=3 retained=3 lost=0 rows=18 lost_rows=0 status=complete"
+            f"run_id={run_id} eligible=3 retained=3 lost=0 rows=18 lost_rows=0 status=complete "
+            "plan_selected=40 header_set=39 header_already_sent=1 header_unavailable=0 "
+            "header_error=0 selector_invalid=1 selector_unmatched=2 selector_capacity=3 "
+            "outcome_status=complete"
         )
         self.assertTrue(record(good_capture, run_id=run_id, coverage=coverage))
         self.assertEqual(coverage["capture_marker_records"], 1)
         self.assertEqual(coverage["capture_rows"], 18)
+        self.assertEqual(coverage["plan_selected"], 40)
+        self.assertEqual(coverage["header_set"] + coverage["header_already_sent"], 40)
+        self.assertEqual(coverage["selector_capacity"], 3)
+        self.assertTrue(record(
+            good_capture.replace("plan_selected=40", "plan_selected=41"),
+            run_id=run_id, coverage=coverage,
+        ))
+        self.assertEqual(coverage["capture_malformed_records"], 1)
         self.assertTrue(record(
             "ssr_stream_capture_coverage scheme=sha256-runid-requestid-1of8-v1 "
-            f"run_id={run_id} eligible=3 retained=2 lost=1 rows=12 lost_rows=6 status=truncated",
+            f"run_id={run_id} eligible=3 retained=2 lost=1 rows=12 lost_rows=6 status=truncated "
+            "plan_selected=2 header_set=1 header_already_sent=0 header_unavailable=1 "
+            "header_error=0 selector_invalid=0 selector_unmatched=0 selector_capacity=0 "
+            "outcome_status=complete",
             run_id=run_id, coverage=coverage,
         ))
         self.assertEqual(coverage["capture_truncated_records"], 1)
         self.assertTrue(record(
             "ssr_stream_capture_coverage scheme=unknown "
-            f"run_id={run_id} eligible=3 retained=2 lost=1 rows=12 lost_rows=6 status=truncated",
+            f"run_id={run_id} eligible=3 retained=2 lost=1 rows=12 lost_rows=6 status=truncated "
+            "plan_selected=2 header_set=1 header_already_sent=0 header_unavailable=1 "
+            "header_error=0 selector_invalid=0 selector_unmatched=0 selector_capacity=0 "
+            "outcome_status=complete",
             run_id=run_id, coverage=coverage,
         ))
-        self.assertEqual(coverage["capture_malformed_records"], 1)
+        self.assertEqual(coverage["capture_malformed_records"], 2)
         self.assertTrue(record(
             "ssr_stream_capture_coverage", run_id=run_id, coverage=coverage,
         ))
-        self.assertEqual(coverage["capture_malformed_records"], 2)
+        self.assertEqual(coverage["capture_malformed_records"], 3)
         self.assertFalse(record("ssr_stream request_id=x", run_id=run_id, coverage=coverage))
 
     def test_ssr_request_correlation_projection_retains_only_closed_aggregates(self) -> None:
@@ -7603,6 +7692,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "capture_lost_requests": 0, "capture_rows": 1,
             "capture_lost_rows": 0, "capture_truncated_records": 0,
             "capture_malformed_records": 0, "capture_status": "complete",
+            "plan_selected": 1, "header_set": 1, "header_already_sent": 0,
+            "header_unavailable": 0, "header_error": 0, "selector_invalid": 0,
+            "selector_unmatched": 0, "selector_capacity": 0,
+            "outcome_truncated_records": 0,
             "status": "none",
         }
         projected = capacity_diagnostic._project_request_correlation({
@@ -8098,7 +8191,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         try:
             for scenario in (
                 "valid", "replaced", "expired", "unreadable", "late",
-                "slow_replacement",
+                "slow_replacement", "slow_summary",
             ):
                 with self.subTest(scenario=scenario):
                     diagnostic = ApiCpuDiagnostic(plan)
@@ -8116,6 +8209,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                         "unreadable": None,
                         "late": plan,
                         "slow_replacement": replacement,
+                        "slow_summary": plan,
                     }[scenario]
 
                     def read_current_plan(*_args, **_kwargs):
@@ -8124,6 +8218,14 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                         if scenario == "unreadable":
                             raise OSError("unavailable")
                         return current_plan
+
+                    def summarize_profile(*_args, **_kwargs):
+                        if scenario == "slow_summary":
+                            clock["monotonic"] += 0.5
+                        return [], 0, {
+                            "top_self": [], "top_cumulative": [], "top_samples": [],
+                            "mapped_self_cpu_us": 0,
+                        }
 
                     with (
                         patch.object(
@@ -8138,22 +8240,24 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                             diagnostic_module, "_read_process_plan_uncached",
                             side_effect=read_current_plan,
                         ) as read_plan,
-                        patch.object(diagnostic_module, "_profile_summary", return_value=(
-                            [], 0, {"top_self": [], "top_cumulative": [], "top_samples": [],
-                                    "mapped_self_cpu_us": 0},
-                        )),
+                        patch.object(
+                            diagnostic_module, "_profile_summary",
+                            side_effect=summarize_profile,
+                        ),
                         patch.object(diagnostic_module, "_emit_cpu_diagnostic_message") as emit,
                     ):
                         diagnostic.stop()
 
                     self.assertTrue(diagnostic.stopped)
                     self.assertIsNone(diagnostic_module._active_profile)
-                    self.assertEqual(emit.call_count, int(scenario == "valid"))
+                    self.assertEqual(emit.call_count, int(scenario in {"valid", "slow_summary"}))
                     self.assertEqual(read_plan.call_count, int(scenario != "late"))
                     if scenario == "slow_replacement":
                         self.assertEqual(
                             read_plan.call_args.kwargs["now_ms"], plan.on_end_ms,
                         )
+                    if scenario == "slow_summary":
+                        self.assertIn("elapsed_ms=20000", emit.call_args.args[0])
         finally:
             diagnostic_module._active_profile = old_active
 
@@ -8878,6 +8982,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 "capture_lost_requests": 0, "capture_rows": 1,
                 "capture_lost_rows": 0, "capture_truncated_records": 0,
                 "capture_malformed_records": 0, "capture_status": "complete",
+                "plan_selected": 1, "header_set": 1, "header_already_sent": 0,
+                "header_unavailable": 0, "header_error": 0, "selector_invalid": 0,
+                "selector_unmatched": 0, "selector_capacity": 0,
+                "outcome_truncated_records": 0,
                 "status": "none",
             }
             cpu_rows = []

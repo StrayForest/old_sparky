@@ -12,6 +12,7 @@ import {
   CPU_PROFILE_SAMPLING,
   categoryForFrame,
   functionIdForFrame,
+  summarizeSampleClasses,
   summarizeFunctionSamples,
 } from "../../lib/cpu-profile-categories.mjs";
 import {
@@ -729,6 +730,25 @@ test("web CPU profile function details expose only bounded safe IDs and sample c
   expect(JSON.stringify(summary)).not.toContain("secret");
   expect(JSON.stringify(summary)).not.toContain("userSuppliedFunctionName");
   expect(functionIdForFrame("/srv/private/chunks/private.js", "userSuppliedFunctionName")).toBeNull();
+  const classNodes = new Map([
+    [1, { url: "node:internal/process/task_queues", functionName: "runMicrotasks" }],
+    [2, { url: "/srv/private/chunks/unknown.js", functionName: "privateSymbol" }],
+    [3, { url: "", functionName: "(idle)" }],
+    [4, { url: "", functionName: "(garbage collector)" }],
+    [5, { url: "", functionName: "(program)" }],
+  ]);
+  const counts = summarizeSampleClasses(classNodes, [1, 2, 2, 3, 4, 5, 999]);
+  expect(counts).toEqual({
+    idle: 1,
+    garbage_collector: 1,
+    program: 1,
+    unmapped_busy: 2,
+    known_category: 1,
+    unclassified: 1,
+  });
+  expect(Object.values(counts).reduce((total, count) => total + count, 0)).toBe(7);
+  expect(JSON.stringify(counts)).not.toContain("privateSymbol");
+  expect(JSON.stringify(counts)).not.toContain("/srv/private");
 });
 
 test("typed HTML capture sampling matches the fixed cross-service SHA-256 vectors", () => {

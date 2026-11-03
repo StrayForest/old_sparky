@@ -51,11 +51,15 @@ async function sendSelection(port, tag, requestId) {
 }
 const server = http.createServer((request, response) => {
   const requestId = request.headers["x-request-id"];
+  const tag = request.headers["x-fixture-tag"];
+  const expectedCaptureEligible = captureEligible(requestId);
   const accepted = selectPlanRequest({
     requestId,
     runId,
-    expiresAtMs: Date.now() + 10_000,
-    captureEligible: captureEligible(requestId),
+    expiresAtMs: Date.now() + 1_000,
+    captureEligible: tag === "eligibility-mismatch"
+      ? !expectedCaptureEligible
+      : expectedCaptureEligible,
   });
   response.setHeader("x-fixture-selector-result", accepted ? "accepted" : "rejected");
   response.once("close", () => {
@@ -70,6 +74,10 @@ const server = http.createServer((request, response) => {
 server.listen(0, "127.0.0.1", async () => {
   const port = server.address().port;
   try {
+    const invalidResult = await sendSelection(port, "eligibility-mismatch", eligibleId);
+    if (invalidResult !== "rejected") {
+      throw new Error("capture eligibility mismatch was accepted");
+    }
     for (let index = 0; index < noneligibleIds.length; index += 1) {
       const result = await sendSelection(port, "closed-noneligible-" + index, noneligibleIds[index]);
       if (result !== "accepted") throw new Error("closed noneligible selection was refused at index " + index);
@@ -78,6 +86,7 @@ server.listen(0, "127.0.0.1", async () => {
     if (eligibleResult !== "accepted") throw new Error("eligible selection was starved after closed noneligible responses");
     const eligibleAgain = await sendSelection(port, "eligible-after-close", eligibleId);
     if (eligibleAgain !== "accepted") throw new Error("eligible selection was not removed on response close");
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
     console.log("closed_noneligible=128 eligible_after_close=accepted eligible_again=accepted");
   } catch (error) {
     console.error(error);
@@ -594,6 +603,18 @@ async function main() {
     "closed_noneligible=128 eligible_after_close=accepted eligible_again=accepted",
   )) {
     throw new Error("closed noneligible plan entries consumed selector capacity");
+  }
+  for (const fragment of [
+    "plan_selected=130",
+    "selector_invalid=1",
+    "header_set=130",
+    "header_already_sent=0",
+    "header_unavailable=0",
+    "outcome_status=complete",
+  ]) {
+    if (!closedNoneligibleOutput.includes(fragment)) {
+      throw new Error(`header outcome fixture omitted ${fragment}`);
+    }
   }
   const duplicateIdCloseOutput = await runFixture("duplicate-plan-id-close", {
     disabled: true,

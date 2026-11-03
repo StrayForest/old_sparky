@@ -185,6 +185,7 @@ class ApiCpuProfileConservationTests(unittest.TestCase):
         web_message = (
             f"cpu_diagnostic_complete service=web run_id={run_id} timer=v8_cpu "
             "start_lag_ms=0 elapsed_ms=20000 sample_interval_us=10000 sample_count=20 "
+            "sample_classes=idle:0,gc:0,program:0,unmapped_busy:10,known_category:10,unclassified:0 "
             "categories=other:1000000:10,web_framework:1000000:10 top_samples="
         )
         add_record("web", 103, 1_044_000, web_message)

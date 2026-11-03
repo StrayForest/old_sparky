@@ -60,7 +60,16 @@ function reportCaptureCoverage(runId) {
       + ` lost=${coverage.lostRequests}`
       + ` rows=${coverage.rows}`
       + ` lost_rows=${coverage.lostRows}`
-      + ` status=${coverage.truncated ? "truncated" : "complete"}`,
+      + ` status=${coverage.truncated ? "truncated" : "complete"}`
+      + ` plan_selected=${coverage.planSelected}`
+      + ` header_set=${coverage.headerSet}`
+      + ` header_already_sent=${coverage.headerAlreadySent}`
+      + ` header_unavailable=${coverage.headerUnavailable}`
+      + ` header_error=${coverage.headerError}`
+      + ` selector_invalid=${coverage.selectorInvalid}`
+      + ` selector_unmatched=${coverage.selectorUnmatched}`
+      + ` selector_capacity=${coverage.selectorCapacity}`
+      + ` outcome_status=${coverage.outcomeTruncated ? "truncated" : "complete"}`,
   );
   captureCoverageByRun.delete(runId);
 }
@@ -75,6 +84,15 @@ function captureCoverageFor(runId, expiresAtMs) {
     lostRequests: 0,
     rows: 0,
     lostRows: 0,
+    planSelected: 0,
+    headerSet: 0,
+    headerAlreadySent: 0,
+    headerUnavailable: 0,
+    headerError: 0,
+    selectorInvalid: 0,
+    selectorUnmatched: 0,
+    selectorCapacity: 0,
+    outcomeTruncated: false,
     truncated: false,
     reported: false,
     timer: null,
@@ -86,6 +104,15 @@ function captureCoverageFor(runId, expiresAtMs) {
   coverage.timer.unref?.();
   captureCoverageByRun.set(runId, coverage);
   return coverage;
+}
+
+function incrementPlanOutcome(coverage, field) {
+  if (!coverage) return;
+  if (coverage[field] >= 1_000_000) {
+    coverage.outcomeTruncated = true;
+    return;
+  }
+  coverage[field] += 1;
 }
 
 function sampleRate() {
@@ -179,6 +206,14 @@ function selectedPlanFor(request) {
 function registerValidatedPlanRequest(entry) {
   const now = Date.now();
   prunePlanState(now);
+  const candidateRunId = entry && typeof entry === "object" ? entry.runId : null;
+  const candidateExpiry = entry && typeof entry === "object" ? entry.expiresAtMs : null;
+  const candidateCoverage = /^[0-9a-f]{32}$/.test(candidateRunId || "")
+      && Number.isSafeInteger(candidateExpiry)
+      && candidateExpiry > now
+      && candidateExpiry - now <= maxPlanDurationMs
+    ? captureCoverageFor(candidateRunId, candidateExpiry)
+    : null;
   const pending = entry && pendingPlanRequests.get(entry.requestId);
   if (!entry || typeof entry !== "object"
       || !/^[0-9a-f]{32}$/.test(entry.requestId)
@@ -186,9 +221,15 @@ function registerValidatedPlanRequest(entry) {
       || typeof entry.captureEligible !== "boolean"
       || !Number.isSafeInteger(entry.expiresAtMs)
       || entry.expiresAtMs <= now
-      || entry.expiresAtMs - now > maxPlanDurationMs) return false;
+      || entry.expiresAtMs - now > maxPlanDurationMs) {
+    incrementPlanOutcome(candidateCoverage, "selectorInvalid");
+    return false;
+  }
   const expectedCaptureEligibility = isCaptureEligible(entry.runId, entry.requestId);
-  if (entry.captureEligible !== expectedCaptureEligibility) return false;
+  if (entry.captureEligible !== expectedCaptureEligibility) {
+    incrementPlanOutcome(candidateCoverage, "selectorInvalid");
+    return false;
+  }
   const coverage = captureCoverageFor(entry.runId, entry.expiresAtMs);
   if (coverage && entry.captureEligible) {
     coverage.eligibleRequests = Math.min(1_000_000, coverage.eligibleRequests + 1);
@@ -196,6 +237,7 @@ function registerValidatedPlanRequest(entry) {
   if (!pending
       || pending.request.headers["x-request-id"] !== entry.requestId
       || pending.request.headers[ssrTraceHeader] !== entry.runId) {
+    incrementPlanOutcome(coverage, "selectorUnmatched");
     if (coverage && entry.captureEligible) {
       coverage.lostRequests = Math.min(1_000_000, coverage.lostRequests + 1);
       coverage.truncated = true;
@@ -205,6 +247,7 @@ function registerValidatedPlanRequest(entry) {
   }
   if (!selectedPlanRequests.has(entry.requestId)
       && selectedPlanRequests.size >= maxSelectedRequests) {
+    incrementPlanOutcome(coverage, "selectorCapacity");
     if (coverage && entry.captureEligible) {
       coverage.lostRequests = Math.min(1_000_000, coverage.lostRequests + 1);
       coverage.truncated = true;
@@ -227,8 +270,19 @@ function registerValidatedPlanRequest(entry) {
   if (coverage && entry.captureEligible) {
     coverage.retainedRequests = Math.min(1_000_000, coverage.retainedRequests + 1);
   }
-  if (!pending.response.headersSent && typeof pending.response.setHeader === "function") {
-    pending.response.setHeader("x-platform-ssr-request-id", entry.requestId);
+  incrementPlanOutcome(coverage, "planSelected");
+  if (pending.response.headersSent) {
+    incrementPlanOutcome(coverage, "headerAlreadySent");
+  } else if (typeof pending.response.setHeader !== "function") {
+    incrementPlanOutcome(coverage, "headerUnavailable");
+  } else {
+    try {
+      pending.response.setHeader("x-platform-ssr-request-id", entry.requestId);
+      incrementPlanOutcome(coverage, "headerSet");
+    } catch (error) {
+      incrementPlanOutcome(coverage, "headerError");
+      throw error;
+    }
   }
   reportSelectorCoverage(entry.runId, entry.expiresAtMs);
   pendingPlanRequests.delete(entry.requestId);

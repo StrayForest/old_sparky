@@ -4506,7 +4506,9 @@ class ExternalLoadTests(unittest.TestCase):
                                 "cpu_diagnostic_complete service=web "
                                 f"run_id={run_id} timer=v8_cpu start_lag_ms=0 "
                                 f"elapsed_ms={on_window} sample_interval_us=10000 "
-                                "sample_count=5 categories=repo.workspace_page:100:5 top_samples="
+                                "sample_count=5 sample_classes=idle:0,gc:0,program:0,unmapped_busy:0,"
+                                "known_category:5,unclassified:0 "
+                                "categories=repo.workspace_page:100:5 top_samples="
                             )
                         journal_rows.append({
                             "MESSAGE": json.dumps({"message": profile}, separators=(",", ":"))
@@ -4717,6 +4719,10 @@ class ExternalLoadTests(unittest.TestCase):
             "capture_lost_requests": 0, "capture_rows": 1,
             "capture_lost_rows": 0, "capture_truncated_records": 0,
             "capture_malformed_records": 0, "capture_status": "complete",
+            "plan_selected": 1, "header_set": 1, "header_already_sent": 0,
+            "header_unavailable": 0, "header_error": 0, "selector_invalid": 0,
+            "selector_unmatched": 0, "selector_capacity": 0,
+            "outcome_truncated_records": 0,
             "status": "none",
         }
         complete_telemetry["request_correlation"] = {

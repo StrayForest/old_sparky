@@ -1311,6 +1311,24 @@ def _phase_request_window_evidence_is_closed(
     return value["status"] == expected_status
 
 
+def _phase_request_ids_are_complete(value: Any) -> bool:
+    """Require one valid SSR request ID for every request started in the ON window."""
+
+    return bool(
+        isinstance(value, dict)
+        and type(value.get("started_in_window_count")) is int
+        and type(value.get("ssr_request_id_singleton_count")) is int
+        and type(value.get("ssr_request_id_missing_count")) is int
+        and type(value.get("ssr_request_id_duplicate_count")) is int
+        and type(value.get("ssr_request_id_malformed_count")) is int
+        and value["started_in_window_count"] > 0
+        and value["ssr_request_id_singleton_count"] == value["started_in_window_count"]
+        and value["ssr_request_id_missing_count"] == 0
+        and value["ssr_request_id_duplicate_count"] == 0
+        and value["ssr_request_id_malformed_count"] == 0
+    )
+
+
 def _capacity_worker_status(*, aborted: bool, all_200: bool) -> str:
     return "incomplete" if aborted else "complete" if all_200 else "failed"
 
@@ -3579,7 +3597,10 @@ def _project_request_correlation(value: Any) -> dict[str, Any] | None:
         "row_cap_rows", "truncated_records", "malformed_records",
         "capture_marker_records", "capture_eligible_requests", "capture_retained_requests",
         "capture_lost_requests", "capture_rows", "capture_lost_rows",
-        "capture_truncated_records", "capture_malformed_records", "capture_status", "status",
+        "capture_truncated_records", "capture_malformed_records",
+        "plan_selected", "header_set", "header_already_sent", "header_unavailable",
+        "header_error", "selector_invalid", "selector_unmatched", "selector_capacity",
+        "outcome_truncated_records", "capture_status", "status",
     }
     stream = summary.get("ssr_stream_coverage")
     if (not isinstance(stream, dict) or set(stream) != stream_fields
@@ -3597,12 +3618,25 @@ def _project_request_correlation(value: Any) -> dict[str, Any] | None:
             or stream["capture_truncated_records"] > 0
         ) else "complete"
     )
+    outcome_counts = {
+        key: stream[key] for key in (
+            "plan_selected", "header_set", "header_already_sent", "header_unavailable",
+            "header_error", "selector_invalid", "selector_unmatched", "selector_capacity",
+        )
+    }
+    outcome_truncated = stream["outcome_truncated_records"] > 0
+    if (outcome_counts["plan_selected"] != sum(outcome_counts[key] for key in (
+            "header_set", "header_already_sent", "header_unavailable", "header_error",
+        ))
+            or stream["outcome_truncated_records"] > stream["capture_marker_records"]):
+        return None
     truncated_stream = (
         stream["truncated_records"] > 0 or stream["malformed_records"] > 0
         or stream["capture_marker_records"] != 1
         or stream["capture_truncated_records"] > 0
         or stream["capture_malformed_records"] > 0
         or stream["capture_status"] != "complete"
+        or outcome_truncated
         or stream["capture_eligible_requests"]
         != stream["capture_retained_requests"] + stream["capture_lost_requests"]
     )
@@ -5141,7 +5175,10 @@ def evaluate_capacity_report(
                     start_ms=capacity_worker.get("on_window_start_ms"),
                     end_ms=capacity_worker.get("on_window_end_ms"),
                 )
-                or capacity_worker["request_window_evidence"].get("status") != "complete"):
+                or capacity_worker["request_window_evidence"].get("status") != "complete"
+                or not _phase_request_ids_are_complete(
+                    capacity_worker.get("request_window_evidence"),
+                )):
             return "INVALID"
         profile_telemetry = profile.get("server_telemetry")
         if (not isinstance(profile_telemetry, dict)
@@ -5160,6 +5197,12 @@ def evaluate_capacity_report(
         )
         if (not isinstance(request_correlation, dict)
                 or request_correlation.get("status") != "complete"):
+            return "INVALID"
+        html_worker = report.get("worker")
+        if workload == HTML_WORKLOAD and not _phase_request_ids_are_complete(
+            html_worker.get("request_window_evidence")
+            if isinstance(html_worker, dict) else None,
+        ):
             return "INVALID"
     worker = report.get("worker")
     memory = report["memory_guard"]

@@ -104,6 +104,21 @@ BASELINE_RUNTIME_GATE_NAMES = frozenset(
         "status-final",
     }
 )
+BASELINE_RUNTIME_REUSED_SOURCE_GATE_NAMES = frozenset(
+    {
+        "Backend DB-free contours",
+        "Backend PostgreSQL and Redis integration",
+        "Backend privileged ephemeral contour",
+        "Backend aggregate",
+        "Python quality",
+        "Security gates",
+        "web-quality",
+        "Web hermetic",
+        "Documentation consistency",
+        "Migration scenarios",
+        "Verification contract",
+    }
+)
 BASELINE_RUNTIME_RECEIPT_KEYS = frozenset(
     {
         "schema",
@@ -827,13 +842,21 @@ def validate_baseline_runtime_proof(
         jobs_by_name.setdefault(str(job.get("name")), []).append(job)
     if not BASELINE_RUNTIME_GATE_NAMES.issubset(jobs_by_name):
         raise ProvenanceError("runtime proof workflow is missing required gate jobs")
-    if any(
-        len(rows) != 1
-        or rows[0].get("status") != "completed"
-        or rows[0].get("conclusion") != "success"
-        for rows in jobs_by_name.values()
-    ):
-        raise ProvenanceError("a required baseline runtime proof job did not succeed exactly once")
+    # The mandatory Authenticate internal baseline runtime proof job validates
+    # the exact source Security run and requires every canonical source gate to
+    # have succeeded. Those gate jobs may therefore be skipped in this proof
+    # attempt. The two runtime gates remain required in this attempt itself.
+    for name, rows in jobs_by_name.items():
+        if len(rows) != 1 or rows[0].get("status") != "completed":
+            raise ProvenanceError("a required baseline runtime proof job is missing or duplicated")
+        conclusion = rows[0].get("conclusion")
+        if name in BASELINE_RUNTIME_REUSED_SOURCE_GATE_NAMES:
+            if conclusion not in {"success", "skipped"}:
+                raise ProvenanceError(
+                    "a reused source gate failed instead of succeeding or being skipped"
+                )
+        elif conclusion != "success":
+            raise ProvenanceError("a required baseline runtime proof job did not succeed")
     return {
         "attempt_url": attempt_url,
         "target_sha": expected_target_sha,

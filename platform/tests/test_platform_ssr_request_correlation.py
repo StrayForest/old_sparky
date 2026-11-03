@@ -143,7 +143,10 @@ class SsrRequestCorrelationTests(unittest.TestCase):
         marker = (
             "ssr_stream_capture_coverage scheme=sha256-runid-requestid-1of8-v1 "
             f"run_id={run_id} eligible=1000 retained=1000 lost=0 rows=25000 "
-            "lost_rows=0 status=complete"
+            "lost_rows=0 status=complete plan_selected=1000 header_set=1000 "
+            "header_already_sent=0 header_unavailable=0 header_error=0 "
+            "selector_invalid=0 selector_unmatched=0 selector_capacity=0 "
+            "outcome_status=complete"
         )
         messages = []
         padding = "x" * 430
@@ -311,7 +314,9 @@ web_messages += [
 ]
 web_messages.append(
     "ssr_stream_capture_coverage scheme=sha256-runid-requestid-1of8-v1 "
-    "run_id=" + run_id + " eligible=1 retained=1 lost=0 rows=6 lost_rows=0 status=complete"
+    "run_id=" + run_id + " eligible=1 retained=1 lost=0 rows=6 lost_rows=0 status=complete "
+    "plan_selected=1 header_set=1 header_already_sent=0 header_unavailable=0 header_error=0 "
+    "selector_invalid=0 selector_unmatched=0 selector_capacity=0 outcome_status=complete"
 )
 late_marker = web_messages.pop()
 def records(messages):
@@ -670,6 +675,10 @@ print("ok")
             "capture_retained_requests": 1, "capture_lost_requests": 0,
             "capture_rows": 1, "capture_lost_rows": 0,
             "capture_truncated_records": 0, "capture_malformed_records": 0,
+            "plan_selected": 1, "header_set": 1, "header_already_sent": 0,
+            "header_unavailable": 0, "header_error": 0, "selector_invalid": 0,
+            "selector_unmatched": 0, "selector_capacity": 0,
+            "outcome_truncated_records": 0,
             "capture_status": "complete", "status": "none",
         }
         projected = capacity_diagnostic._project_request_correlation({

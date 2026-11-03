@@ -12,3 +12,14 @@ export function summarizeFunctionSamples(
   rows: Array<{ function_id: string; samples: number }>;
   mapped_sample_count: number;
 };
+export function summarizeSampleClasses(
+  nodes: ReadonlyMap<number, { url?: string; functionName?: string }>,
+  samples: readonly number[],
+): {
+  idle: number;
+  garbage_collector: number;
+  program: number;
+  unmapped_busy: number;
+  known_category: number;
+  unclassified: number;
+};

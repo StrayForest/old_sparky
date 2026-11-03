@@ -57,6 +57,7 @@ from tools.platform_workflow_provenance import (  # noqa: E402
 )
 from tools.platform_deploy_baseline import (  # noqa: E402
     BASELINE_RUNTIME_GATE_NAMES,
+    BASELINE_RUNTIME_REUSED_SOURCE_GATE_NAMES,
     REPORT_ONLY_RECOVERY_CONFIRMATION,
     active_deployment_status_identity,
     classify_cumulative_baseline,
@@ -1441,6 +1442,36 @@ class WorkflowProvenanceTests(unittest.TestCase):
         with self.assertRaises(ProvenanceError):
             self._validate_baseline_runtime_payload(candidate)
 
+        reused = copy.deepcopy(baseline)
+        for job in reused[2]:
+            if job["name"] in BASELINE_RUNTIME_REUSED_SOURCE_GATE_NAMES:
+                job["conclusion"] = "skipped"
+        self._validate_baseline_runtime_payload(reused)
+
+        missing_guard = list(copy.deepcopy(reused))
+        missing_guard[2] = [
+            job for job in missing_guard[2]
+            if job["name"] != "Authenticate internal baseline runtime proof"
+        ]
+        with self.assertRaises(ProvenanceError):
+            self._validate_baseline_runtime_payload(missing_guard)
+
+        failed_source_gate = copy.deepcopy(reused)
+        next(
+            job for job in failed_source_gate[2]
+            if job["name"] == "Backend privileged ephemeral contour"
+        )["conclusion"] = "failure"
+        with self.assertRaises(ProvenanceError):
+            self._validate_baseline_runtime_payload(failed_source_gate)
+
+        skipped_runtime_gate = copy.deepcopy(reused)
+        next(
+            job for job in skipped_runtime_gate[2]
+            if job["name"] == "Trusted dev immutable release runtime"
+        )["conclusion"] = "skipped"
+        with self.assertRaises(ProvenanceError):
+            self._validate_baseline_runtime_payload(skipped_runtime_gate)
+
         for complete_flag, jobs_complete, statuses_complete in (
             ("jobs", False, True),
             ("statuses", True, False),
@@ -1834,6 +1865,121 @@ class WorkflowProvenanceTests(unittest.TestCase):
         next(item for item in failed if item["name"] == "Trusted dev immutable release runtime")["conclusion"] = "failure"
         with self.assertRaises(SystemExit):
             validate(failed)
+
+        proof_workflow = yaml.safe_load(
+            (WORKFLOW_DIR / "platform-security.yml").read_text(encoding="utf-8")
+        )
+        for job_id in (
+            "backend-static",
+            "backend-integration",
+            "backend-privileged",
+            "backend",
+            "python-quality",
+            "security",
+            "web-quality",
+            "web-hermetic",
+            "docs",
+            "migration",
+            "verification-contract",
+        ):
+            condition = proof_workflow["jobs"][job_id]["if"]
+            with self.subTest(baseline_proof_skips=job_id):
+                self.assertIn("inputs.proof_mode != 'baseline-runtime'", condition)
+        self.assertIn(
+            "inputs.proof_mode == 'baseline-runtime'",
+            proof_workflow["jobs"]["release-runtime"]["if"],
+        )
+        self.assertIn(
+            "inputs.proof_mode == 'baseline-runtime'",
+            proof_workflow["jobs"]["release-runtime-real"]["if"],
+        )
+
+        finalizer = proof_workflow["jobs"]["status-final"]
+        finalizer_steps = [
+            step for step in finalizer["steps"]
+            if isinstance(step, dict)
+            and step.get("name") == "Report platform security build result"
+        ]
+        self.assertEqual(len(finalizer_steps), 1)
+        finalizer_blocks = re.findall(
+            r"<<['\"]PY['\"]\s*\n(.*?)^\s*PY\s*$",
+            finalizer_steps[0]["run"],
+            flags=re.MULTILINE | re.DOTALL,
+        )
+        self.assertTrue(finalizer_blocks)
+        expected_gates = [
+            "backend", "python-quality", "security", "migration", "docs",
+            "web-quality", "web-hermetic", "verification-contract",
+        ]
+
+        def finalizer_result(*, guard: str, runtime: str, real_runtime: str) -> tuple[str, dict[str, object]]:
+            with tempfile.TemporaryDirectory() as temporary:
+                summary_path = Path(temporary) / "summary.json"
+                environment = os.environ.copy()
+                environment.update(
+                    {
+                        "SUMMARY_PATH": str(summary_path),
+                        "EVENT_NAME": "workflow_dispatch",
+                        "ROUTE_CLASS": "full",
+                        "ROUTE_EVENT": "workflow_dispatch",
+                        "PROOF_MODE": "baseline-runtime",
+                        "BASELINE_GUARD_RESULT": guard,
+                        "CLASSIFIER_RESULT": "success",
+                        "HOST_TOOLS_PIN_PREFLIGHT_RESULT": "success",
+                        "TARGET_SHA_INPUT": self.SHA,
+                        "TESTED_SHA": self.SHA,
+                        "ROUTE_RUNTIME_SENSITIVE": "true",
+                        "ROUTE_TARGET_SHA": self.SHA,
+                        "ROUTE_DIGEST": "a" * 64,
+                        "ROUTE_REASON": "baseline runtime proof test",
+                        "ROUTE_DEPLOYABLE": "false",
+                        "ROUTE_FALLBACK": "true",
+                        "EXPECTED_GATES": json.dumps(expected_gates),
+                        "STATUS_START_RESULT": "success",
+                        "BACKEND_RESULT": "skipped",
+                        "PYTHON_QUALITY_RESULT": "skipped",
+                        "SECURITY_RESULT": "skipped",
+                        "WEB_QUALITY_RESULT": "skipped",
+                        "WEB_HERMETIC_RESULT": "skipped",
+                        "DOCS_RESULT": "skipped",
+                        "MIGRATION_RESULT": "skipped",
+                        "VERIFICATION_CONTRACT_RESULT": "skipped",
+                        "RELEASE_RUNTIME_RESULT": runtime,
+                        "RELEASE_RUNTIME_REAL_RESULT": real_runtime,
+                        "WORKFLOW_REF": "refs/heads/dev",
+                        "REPOSITORY": "StrayForest/old_sparky",
+                        "SOURCE_SECURITY_RUN_ID": "567",
+                        "SOURCE_SECURITY_RUN_ATTEMPT": "1",
+                    }
+                )
+                result = subprocess.run(
+                    [sys.executable, "-c", textwrap.dedent(finalizer_blocks[0])],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=environment,
+                    timeout=5,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return result.stdout.strip(), json.loads(summary_path.read_text(encoding="utf-8"))
+
+        passed, summary = finalizer_result(guard="success", runtime="success", real_runtime="success")
+        self.assertEqual(passed, "true")
+        self.assertEqual(summary["reused_source_security"]["run_id"], "567")
+        self.assertTrue(summary["reused_source_security"]["validated_by_baseline_guard"])
+        self.assertEqual(summary["reused_source_security"]["gates"], expected_gates)
+        self.assertEqual(summary["expected_gates"], expected_gates)
+        self.assertEqual(summary["gate_results"]["backend"], "skipped")
+        for guard, runtime, real_runtime in (
+            ("failure", "success", "success"),
+            ("success", "skipped", "success"),
+            ("success", "success", "skipped"),
+        ):
+            with self.subTest(guard=guard, runtime=runtime, real_runtime=real_runtime):
+                rejected, _ = finalizer_result(
+                    guard=guard, runtime=runtime, real_runtime=real_runtime
+                )
+                self.assertEqual(rejected, "false")
 
         # Exercise the exact nested baseline-proof job/step selection against
         # the producer's three-job AutoDeploy graph. The final POST belongs to

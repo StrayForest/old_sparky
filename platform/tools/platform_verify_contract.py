@@ -1482,10 +1482,10 @@ def _migration_contract_issues(security_text: str) -> list[str]:
     if "contains(fromJSON(needs.classifier.outputs.expected_gates), 'migration')" not in migration:
         issues.append("migration job must follow classifier expected_gates")
     if "baseline-runtime-guard" in migration_needs and (
-        "inputs.proof_mode == 'baseline-runtime'" not in migration
-        or "needs.baseline-runtime-guard.result == 'success'" not in migration
+        "inputs.proof_mode != 'baseline-runtime'" not in migration
+        or "inputs.proof_mode == 'baseline-runtime'" in migration
     ):
-        issues.append("migration job must gate the baseline proof lane")
+        issues.append("migration job must skip the baseline proof lane")
     if "continue-on-error" in migration or re.search(
         r"^\s{4,}retries?\s*:", migration, re.IGNORECASE | re.MULTILINE
     ):
@@ -1623,11 +1623,11 @@ def _backend_workflow_issues(security_text: str) -> list[str]:
         if job_id != "backend":
             if "contains(fromJSON(needs.classifier.outputs.expected_gates), 'backend')" not in block:
                 issues.append(f"backend job {job_id} must follow classifier expected_gates")
-            if "baseline-runtime-guard" in dependencies and (
-                "inputs.proof_mode == 'baseline-runtime'" not in block
-                or "needs.baseline-runtime-guard.result == 'success'" not in block
-            ):
-                issues.append(f"backend job {job_id} must gate the baseline proof lane")
+        if "baseline-runtime-guard" in dependencies and (
+            "inputs.proof_mode != 'baseline-runtime'" not in block
+            or "inputs.proof_mode == 'baseline-runtime'" in block
+        ):
+            issues.append(f"backend job {job_id} must skip the baseline proof lane")
 
     static = blocks["backend-static"]
     integration = blocks["backend-integration"]

@@ -334,16 +334,21 @@ cannot suppress runtime proof required by earlier undelivered changes.
 
 When that cumulative route is runtime-sensitive, it also requires a distinct
 successful `Platform security and build` `workflow_dispatch` proof run on the
-exact target. That run retains the full canonical gate set and must pass both
-`release-runtime` and `release-runtime-real`. Its `platform-baseline-runtime`
-status context and receipt bind the proof attempt to the exact source security
-run, automatic dispatcher run and parent production run. The parent waits for
-the finalizer to publish the terminal status for that exact attempt, then
-accepts the proof only with the current bot-authored success status, complete
-job/status inventories and matching receipt artifact. This separate context
-preserves the original push `platform-security-build`
-evidence; a proof run cannot replace or refresh the source CI marker. The
-bootstrap-only artifact never supplies deployment authority.
+exact target. The proof guard revalidates that the exact source Security
+run/attempt passed every canonical standard gate; the proof run reuses those
+results and must itself pass both `release-runtime` and
+`release-runtime-real`. A missing, failed, cancelled or mismatched source
+gate rejects the proof, as does either missing or unsuccessful runtime gate.
+The combined evidence therefore retains the full canonical gate set without
+rerunning the standard suite. Its `platform-baseline-runtime` status context
+and receipt bind the proof attempt to the exact source security run, automatic
+dispatcher run and parent production run. The parent waits for the finalizer
+to publish the terminal status for that exact attempt, then accepts the proof
+only with the current bot-authored success status, complete job/status
+inventories and matching receipt artifact. This separate context preserves
+the original push `platform-security-build` evidence; a proof run cannot
+replace or refresh the source CI marker. The bootstrap-only artifact never
+supplies deployment authority.
 
 The immutable host query is repeated inside the pinned production deployment
 supervisor after it acquires the canonical release and retained-load locks and
