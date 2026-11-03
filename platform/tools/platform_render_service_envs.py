@@ -39,7 +39,10 @@ WEB_KEYS = frozenset({
 # API owns the public/auth boundary and legitimately needs the complete PLATFORM_*
 # configuration. Non-platform process variables are never copied from the source.
 API_PREFIXES = ("PLATFORM_",)
-WEB_ONLY_KEYS = frozenset({"PLATFORM_SSR_HEAP_METRICS_ENABLED"})
+WEB_ONLY_KEYS = frozenset({
+    "PLATFORM_SSR_HEAP_METRICS_ENABLED",
+    "PLATFORM_WEB_SERVER_AUTH_TRANSPORT",
+})
 RUNTIME_CONTROL_KEYS = frozenset({
     "PLATFORM_ENV_FILE",
     "PLATFORM_RUNTIME_SERVICE",

@@ -602,7 +602,7 @@ RELEASE_MARKER_RE = re.compile(
     rb"artifact_count_invalid|checksum_missing|provenance_missing|"
     rb"artifact_name_invalid|release_slug_mismatch|checksum_mismatch|"
     rb"validation_failed|provenance_invalid|candidate_missing|"
-    rb"activation_failed|lock_lost|runtime_profile_failed|runtime_profile_restored|baseline_changed)"
+    rb"activation_failed|lock_lost|runtime_profile_identity|runtime_profile_failed|runtime_profile_restored|baseline_changed)"
     rb"(?: lock_stage=(?P<lock_stage>helper_metadata|release_supervise|"
     rb"release_open|retained_supervise|retained_open))?"
     rb"(?: candidate_diag_state=(?P<candidate_diag_state>classified|unknown)"
@@ -649,7 +649,7 @@ RELEASE_FAILURE_REASONS = {
         {"candidate_missing", "activation_failed", "lock_lost"}
     ),
     ("deployment", "readiness"): frozenset(
-        {"runtime_profile_failed", "runtime_profile_restored"}
+        {"runtime_profile_identity", "runtime_profile_failed", "runtime_profile_restored"}
     ),
 }
 RUN_ID_RE = re.compile(r"^[1-9][0-9]{0,31}$")

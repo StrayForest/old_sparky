@@ -398,7 +398,7 @@ try:
         or tools_dir != runtime_root / "shared/host-tools" / str(expected_tools)
     ):
         raise SystemExit(1)
-    pin_path = release / "platform/contracts/host_tools_pin.json"
+    pin_path = release / "contracts/host_tools_pin.json"
     pin_metadata = pin_path.lstat()
     if (
         not stat.S_ISREG(pin_metadata.st_mode)
@@ -433,11 +433,12 @@ run_profile_switch() {
 
   [[ ! -e "$runtime/shared/.release-operation.json" && ! -L "$runtime/shared/.release-operation.json" ]] \
     || fail "a release operation is pending"
-  verify_active_profile_switch_identity \
-    || fail "active app or host-tools identity differs"
   platform_release_lock_supervisor_holds \
     && platform_retained_load_lock_supervisor_holds \
     || fail "profile switch lost its exclusive operation locks"
+  set_failure_context deployment readiness runtime_profile_identity
+  verify_active_profile_switch_identity \
+    || fail "active app or host-tools identity differs"
   check_runtime_profile_identity "$old_profile" \
     || fail "the actual runtime profile differs from the expected profile"
   for env_path in \
@@ -462,6 +463,7 @@ run_profile_switch() {
   [[ "$api_env_digest" =~ ^[0-9a-f]{64}$ && "$worker_env_digest" =~ ^[0-9a-f]{64}$ ]] \
     || fail "the API or worker runtime environment is invalid"
 
+  set_failure_context deployment readiness runtime_profile_failed
   profile_switch_recoverable=1
   if "$runtime/shared/venv/bin/python" -B \
     "$host_tools_dir/platform_configure_shared_env.py" \
