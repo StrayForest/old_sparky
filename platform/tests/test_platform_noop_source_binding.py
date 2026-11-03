@@ -1755,6 +1755,20 @@ class NoopSourceBindingTests(unittest.TestCase):
             download["with"]["artifact-ids"],
             "${{ needs.resolve-host-tools-pin.outputs.source_binding_artifact_id }}",
         )
+        normalize = next(
+            step for step in cleanup_job["steps"]
+            if step.get("name") == "Normalize downloaded source-binding handoff permissions"
+        )
+        verify_artifact = next(
+            step for step in cleanup_job["steps"]
+            if step.get("name") == "Verify exact source-binding artifact metadata and archive"
+        )
+        download_index = cleanup_job["steps"].index(download)
+        normalize_index = cleanup_job["steps"].index(normalize)
+        verify_index = cleanup_job["steps"].index(verify_artifact)
+        self.assertLess(download_index, normalize_index)
+        self.assertLess(normalize_index, verify_index)
+        self.assertNotIn("GH_TOKEN", normalize.get("env", {}))
         validation = next(
             step for step in cleanup_job["steps"]
             if step.get("id") == "validate_cleanup_inputs"
@@ -1906,6 +1920,15 @@ class NoopSourceBindingTests(unittest.TestCase):
             item for item in workflow["jobs"]["cleanup"]["steps"]
             if item.get("name") == "Verify exact source-binding artifact metadata and archive"
         )
+        normalize_step = next(
+            item for item in workflow["jobs"]["cleanup"]["steps"]
+            if item.get("name") == "Normalize downloaded source-binding handoff permissions"
+        )
+        normalize_marker = '/usr/bin/python3 - "$SOURCE_BINDING_PATH"'
+        normalize_begin = normalize_step["run"].index(normalize_marker)
+        normalize_heredoc = normalize_step["run"].index("<<'PY'", normalize_begin) + len("<<'PY'")
+        normalize_end = normalize_step["run"].index("\nPY", normalize_heredoc)
+        normalize_script = normalize_step["run"][normalize_heredoc:normalize_end].lstrip("\n")
         marker = '/usr/bin/python3 - "$RUNNER_TEMP/retained-cleanup-source-binding/source-binding.json"'
         begin = step["run"].index(marker)
         heredoc = step["run"].index("<<'PY'", begin) + len("<<'PY'")
@@ -1962,6 +1985,14 @@ class NoopSourceBindingTests(unittest.TestCase):
             def read(self, limit: int = -1) -> bytes:
                 return self.body if limit < 0 else self.body[:limit]
 
+        def normalize(binding_path: Path) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [sys.executable, "-c", normalize_script, str(binding_path)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
         def invoke(
             *,
             body: bytes = archive_bytes,
@@ -1987,10 +2018,17 @@ class NoopSourceBindingTests(unittest.TestCase):
             with tempfile.TemporaryDirectory(prefix="cleanup-artifact-verify-") as directory:
                 root = Path(directory)
                 binding_dir = root / "retained-cleanup-source-binding"
-                binding_dir.mkdir(mode=0o700)
+                binding_dir.mkdir(mode=0o755)
+                binding_dir.chmod(0o755)
                 binding_path = binding_dir / "source-binding.json"
                 binding_path.write_bytes(downloaded_value)
-                binding_path.chmod(0o600)
+                binding_path.chmod(0o644)
+                self.assertEqual(binding_path.stat().st_mode & 0o777, 0o644)
+                normalized = normalize(binding_path)
+                self.assertEqual(normalized.returncode, 0, normalized.stderr)
+                self.assertEqual(normalized.stdout, "SOURCE_BINDING_HANDOFF status=secured\n")
+                self.assertEqual(binding_path.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(binding_dir.stat().st_mode & 0o777, 0o700)
                 old_argv = sys.argv
                 sys.argv = ["source-binding-artifact-check", str(binding_path)]
                 environment = {
@@ -2012,6 +2050,33 @@ class NoopSourceBindingTests(unittest.TestCase):
                 finally:
                     sys.argv = old_argv
                 return output.getvalue(), calls, namespace["SafeRedirect"]
+
+        for unsafe in ("symlink", "hardlink", "writable"):
+            with self.subTest(unsafe_download=unsafe), tempfile.TemporaryDirectory(
+                prefix="cleanup-artifact-unsafe-download-"
+            ) as directory:
+                root = Path(directory)
+                binding_dir = root / "retained-cleanup-source-binding"
+                binding_dir.mkdir(mode=0o755)
+                binding_dir.chmod(0o755)
+                binding_path = binding_dir / "source-binding.json"
+                outside = root / "outside-source-binding.json"
+                outside.write_bytes(handoff_bytes)
+                outside.chmod(0o644)
+                if unsafe == "symlink":
+                    binding_path.symlink_to(outside)
+                elif unsafe == "hardlink":
+                    os.link(outside, binding_path)
+                else:
+                    binding_path.write_bytes(handoff_bytes)
+                    binding_path.chmod(0o666)
+                rejected = normalize(binding_path)
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertEqual(
+                    rejected.stderr.strip(),
+                    "SOURCE_BINDING_HANDOFF reason=metadata_invalid",
+                )
+                self.assertEqual(outside.stat().st_mode & 0o777, 0o644)
 
         output, calls, safe_redirect_type = invoke()
         self.assertEqual(output, "SOURCE_BINDING_ARTIFACT status=verified\n")

@@ -280,7 +280,14 @@ class CodexArchiveRetentionTests(unittest.TestCase):
             fake_bin = root / "bin"
             fake_bin.mkdir()
             gh = fake_bin / "gh"
-            gh.write_text("#!/bin/sh\nprintf %s \"$GH_BODY\"\n", encoding="utf-8")
+            gh.write_text(
+                "#!/bin/sh\n"
+                "for arg do\n"
+                "  if [ \"$arg\" = --silent ]; then exit 0; fi\n"
+                "done\n"
+                "printf %s \"$GH_BODY\"\n",
+                encoding="utf-8",
+            )
             gh.chmod(0o700)
             env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "REPO": "owner/repo"}
 

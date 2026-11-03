@@ -115,7 +115,7 @@ fetch_bounded_zip() {
     return 1
   fi
   [[ ! -e "$output" && ! -L "$output" ]]
-  if ! (set -o noclobber; gh api --silent --header 'Accept: application/vnd.github+json' \
+  if ! (set -o noclobber; gh api --header 'Accept: application/vnd.github+json' \
       "/repos/$REPO/actions/artifacts/$artifact_id/zip" 2>/dev/null | head -c "$((expected + 1))" > "$output"); then
     rm -f -- "$output"
     return 1

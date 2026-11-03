@@ -363,6 +363,91 @@ jobs:
           artifact-ids: ${{ needs.resolve-host-tools-pin.outputs.source_binding_artifact_id }}
           path: ${{ runner.temp }}/retained-cleanup-source-binding
 
+      - name: Normalize downloaded source-binding handoff permissions
+        shell: bash
+        env:
+          SOURCE_BINDING_PATH: ${{ runner.temp }}/retained-cleanup-source-binding/source-binding.json
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 - "$SOURCE_BINDING_PATH" <<'PY'
+          import os
+          import stat
+          import sys
+
+          def fail():
+              raise SystemExit("SOURCE_BINDING_HANDOFF reason=metadata_invalid")
+
+          def valid_file(metadata, modes):
+              return (
+                  stat.S_ISREG(metadata.st_mode)
+                  and metadata.st_uid == os.geteuid()
+                  and metadata.st_nlink == 1
+                  and metadata.st_size <= 20 * 1024
+                  and stat.S_IMODE(metadata.st_mode) in modes
+              )
+
+          def same_file(left, right):
+              return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+          path = sys.argv[1]
+          directory = os.path.dirname(path)
+          name = os.path.basename(path)
+          if name != "source-binding.json":
+              fail()
+          directory_fd = binding_fd = -1
+          try:
+              directory_fd = os.open(
+                  directory,
+                  os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+              )
+              directory_meta = os.fstat(directory_fd)
+              if (
+                  not stat.S_ISDIR(directory_meta.st_mode)
+                  or directory_meta.st_uid != os.geteuid()
+                  or stat.S_IMODE(directory_meta.st_mode) not in {0o700, 0o755}
+                  or os.listdir(directory_fd) != [name]
+              ):
+                  fail()
+              path_meta = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+              if not valid_file(path_meta, {0o600, 0o644}):
+                  fail()
+              binding_fd = os.open(
+                  name,
+                  os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                  dir_fd=directory_fd,
+              )
+              opened_meta = os.fstat(binding_fd)
+              if not valid_file(opened_meta, {0o600, 0o644}) or not same_file(
+                  opened_meta, path_meta
+              ):
+                  fail()
+              os.fchmod(binding_fd, 0o600)
+              os.fchmod(directory_fd, 0o700)
+              secured_file = os.fstat(binding_fd)
+              secured_path = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+              secured_directory = os.fstat(directory_fd)
+              if (
+                  not valid_file(secured_file, {0o600})
+                  or not same_file(secured_file, opened_meta)
+                  or not valid_file(secured_path, {0o600})
+                  or not same_file(secured_path, secured_file)
+                  or not stat.S_ISDIR(secured_directory.st_mode)
+                  or secured_directory.st_uid != os.geteuid()
+                  or stat.S_IMODE(secured_directory.st_mode) != 0o700
+              ):
+                  fail()
+          except SystemExit:
+              raise
+          except OSError:
+              fail()
+          finally:
+              if binding_fd >= 0:
+                  os.close(binding_fd)
+              if directory_fd >= 0:
+                  os.close(directory_fd)
+          print("SOURCE_BINDING_HANDOFF status=secured")
+          PY
+
       - name: Verify exact source-binding artifact metadata and archive
         shell: bash
         env:
