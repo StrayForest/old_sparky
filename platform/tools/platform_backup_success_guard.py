@@ -600,13 +600,8 @@ def wait_for_backup_success(
         run_id, attempt, created_at, workflow_started = _validate_candidate_identity(
             candidate, workflow_id, expected
         )
-        if not (
-            security_started
-            <= created_at
-            <= workflow_started
-            < last_job_completed_at
-        ):
-            raise BackupProofError("backup did not reserve its production slot during the source security run")
+        if not security_started <= created_at <= workflow_started:
+            raise BackupProofError("backup run timestamps are not ordered after the exact Security start")
         status = candidate.get("status")
         if isinstance(status, str) and status in {
             "queued",
@@ -655,14 +650,8 @@ def wait_for_backup_success(
         backup_updated = _parse_time(candidate.get("updated_at"), "backup run update")
         if not workflow_started <= job_started <= job_completed <= backup_updated:
             raise BackupProofError("backup job timestamps are inconsistent with its exact run")
-        if not (
-            security_started
-            <= created_at
-            <= workflow_started
-            <= job_started
-            < last_job_completed_at
-        ):
-            raise BackupProofError("production backup job did not start while security was in progress")
+        if not security_started <= created_at <= workflow_started <= job_started:
+            raise BackupProofError("production backup job timestamps are not ordered after the exact Security start")
 
         artifacts = api.backup_artifacts(run_id)
         _check_deadline(deadline, clock)

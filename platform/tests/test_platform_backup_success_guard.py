@@ -666,7 +666,6 @@ class BackupSuccessGuardTests(unittest.TestCase):
             {"started_at": _gh_time("18:58:59")},
             {"completed_at": None},
             {"completed_at": _gh_time("18:59:59")},
-            {"completed_at": _gh_time("19:00:00")},
             {"completed_at": _gh_time("19:10:01")},
         )
         for mutation in job_mutations:
@@ -1230,66 +1229,57 @@ class BackupSuccessGuardTests(unittest.TestCase):
         self.assertTrue(listed_pages[-1].endswith("page=2"))
         self.assertNotIn("download_artifact", source_api.calls)
 
-    def test_backup_must_start_before_security_run_completes(self) -> None:
+    def test_backup_can_start_after_exact_security_completes(self) -> None:
         api = FakeBackupProofApi()
         api.runs[0].update(
             {
                 "created_at": _gh_time("19:11:00"),
                 "run_started_at": _gh_time("19:11:00"),
-                "updated_at": _gh_time("19:12:00"),
+                "updated_at": _gh_time("19:14:00"),
             }
         )
-        with self.assertRaisesRegex(
-            backup_guard.BackupProofError,
-            "backup did not reserve its production slot during the source security run",
-        ):
-            backup_guard.wait_for_backup_success(api, _binding())
-        self.assertNotIn("download_artifact", api.calls)
+        api.jobs[0].update(
+            {"started_at": _gh_time("19:12:00"), "completed_at": _gh_time("19:13:00")}
+        )
+        api.artifacts[0]["created_at"] = _gh_time("19:12:30")
+        proof = backup_guard.wait_for_backup_success(api, _binding())
+        self.assertEqual(proof["backup_run_id"], str(BACKUP_RUN_ID))
+        self.assertEqual(proof["source_security_run_attempt"], str(SECURITY_ATTEMPT))
+        self.assertIn("download_artifact", api.calls)
 
         api = FakeBackupProofApi()
         api.runs[0]["created_at"] = _gh_time("18:58:00")
         with self.assertRaisesRegex(
             backup_guard.BackupProofError,
-            "backup did not reserve its production slot during the source security run",
+            "backup run timestamps are not ordered after the exact Security start",
         ):
             backup_guard.wait_for_backup_success(api, _binding())
         self.assertNotIn("download_artifact", api.calls)
 
-        api = FakeBackupProofApi()
-        api.jobs[0]["started_at"] = _gh_time("19:11:00")
-        api.jobs[0]["completed_at"] = _gh_time("19:11:00")
-        api.runs[0]["updated_at"] = _gh_time("19:12:00")
-        with self.assertRaisesRegex(
-            backup_guard.BackupProofError,
-            "production backup job did not start while security was in progress",
-        ):
-            backup_guard.wait_for_backup_success(api, _binding())
-        self.assertNotIn("download_artifact", api.calls)
-
-        api = FakeBackupProofApi()
-        api.jobs[0]["started_at"] = _gh_time("19:10:00")
-        api.jobs[0]["completed_at"] = _gh_time("19:11:00")
-        api.runs[0]["updated_at"] = _gh_time("19:12:00")
-        with self.assertRaisesRegex(
-            backup_guard.BackupProofError,
-            "production backup job did not start while security was in progress",
-        ):
-            backup_guard.wait_for_backup_success(api, _binding())
-        self.assertNotIn("download_artifact", api.calls)
-
-        # Reservation equality with the conservative source-job completion
-        # bound is rejected, even though the run's later updated_at is not.
         api = FakeBackupProofApi()
         api.runs[0].update(
-            {"created_at": _gh_time("19:10:00"), "run_started_at": _gh_time("19:10:00")}
+            {"created_at": _gh_time("19:01:00"), "run_started_at": _gh_time("19:04:00")}
         )
         api.jobs[0].update(
-            {"started_at": _gh_time("19:10:00"), "completed_at": _gh_time("19:11:00")}
+            {"started_at": _gh_time("19:03:00"), "completed_at": _gh_time("19:05:00")}
         )
-        api.runs[0]["updated_at"] = _gh_time("19:12:00")
+        api.artifacts[0]["created_at"] = _gh_time("19:04:30")
         with self.assertRaisesRegex(
             backup_guard.BackupProofError,
-            "backup did not reserve its production slot during the source security run",
+            "backup job timestamps are inconsistent with its exact run",
+        ):
+            backup_guard.wait_for_backup_success(api, _binding())
+        self.assertNotIn("download_artifact", api.calls)
+
+        # The run itself must still be ordered: a workflow_dispatch created
+        # after its own workflow start cannot satisfy source binding.
+        api = FakeBackupProofApi()
+        api.runs[0].update(
+            {"created_at": _gh_time("19:03:00"), "run_started_at": _gh_time("19:02:00")}
+        )
+        with self.assertRaisesRegex(
+            backup_guard.BackupProofError,
+            "backup run timestamps are not ordered after the exact Security start",
         ):
             backup_guard.wait_for_backup_success(api, _binding())
         self.assertNotIn("download_artifact", api.calls)

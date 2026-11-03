@@ -233,31 +233,29 @@ does not dispatch it. Use this order:
    Require full, deployable and non-fallback classification for a normal app
    release. Global-guidance routes do not qualify; documented recovery,
    bootstrap, candidate and docs routes use their own procedures.
-2. While that Security attempt is active and the shared slot is unowned, dispatch
-   one `operation=create` with the same ID/attempt/SHA. Require
-   `security_started <= backup.created_at <= backup.run_started_at <= backup_job.started_at < security_last_job_completed`.
-   Confirm both workflow and production job actually start before the bound; a late queued run cannot qualify. Once started, the workflow waits for Security success before staging or SSH. The proof counts every matching backup run ID, including failed and cancelled runs, so use only one backup ID per exact Security run/attempt/SHA.
-3. Wait for exact Security success and the create-only source-bound backup
-   receipt. The receipt is published only when the archive identity, restore
-   and Alembic results, and bounded keep-one retention proof all agree.
-   Auto-deploy starts after Security completes; it only polls the dispatched backup
-   and dispatches production after both exact proofs pass.
+2. With the shared slot unowned, dispatch exactly one `operation=create` bound
+   to the Security ID/attempt/SHA. It may start while Security runs or after
+   success: the workflow waits for exact success and current `dev` before
+   staging or SSH. Keep `security_started <= created_at <= run_started_at <=
+   backup_job.started_at`; start it within Auto's proof wait. Never create a
+   second matching run; failed/cancelled runs also count.
+3. Wait for exact Security success and the create-only receipt, published only
+   when archive identity, restore/Alembic and keep-one retention proofs agree.
+   Auto polls for both exact proofs before dispatching production.
 
-Do not wait for Security completion or substitute another run, attempt, SHA or timestamp. If missed, confirm the original SHA is still current `dev`, rerun all jobs of its Security run (not failed jobs only), record the new attempt and reserve exactly one backup run ID while it runs. The verifier counts matching IDs regardless of conclusion; multiple IDs are permanently ambiguous even when all but one failed or were cancelled. Recover an ambiguous attempt only with a new all-jobs Security attempt and one fresh backup producer. Rerunning the same backup ID remains structurally unique, but still needs documented authority and the original timing; it cannot backfill a completed Security attempt. If `dev` moved, stop and replan from current `dev` and its own Security run. See the [deployment runbook](deployment-runbook.md#preconditions); never deploy manually.
+Do not substitute another run, attempt or SHA. If Auto is still waiting and no
+matching run exists, dispatch the single exact backup; its workflow still waits
+for exact Security success before staging or SSH. If Auto's proof wait ended,
+the attempt is ambiguous, or `dev` moved, follow the [deployment recovery](deployment-runbook.md#preconditions): rerun all Security jobs for an unchanged SHA, then dispatch one backup for its new attempt; if `dev` moved, replan. Failed/cancelled matching IDs also count; multiple IDs are permanently ambiguous. Never deploy manually.
 
-Run the workflow through GitHub Actions, not a production shell. It waits up to
-30 minutes for Security within its 120-minute deadline; attestation is capped at
-10 minutes and SSH needs 60 minutes for backup/restore and cleanup. Polling is
-bounded. Both guards re-fetch the exact run/attempt and stable job set; failures,
-malformed rows and identity drift fail closed. Attempt timestamps stay within
-the run; executed jobs start before completion, and the reservation bound is the
-maximum Security job completion. The backup verifies the exact restore job,
-artifact digest, attestation and helper manifest before staging source-bound
-helpers. Any timeout, SHA drift or bundle error stops before backup with no
-installed-helper fallback. On push, only the exact finalizer/auth baseline jobs
-may be skipped; each must be terminal skipped with `steps` null/empty, and auth
-also requires all four runner fields explicitly null. Their timestamps remain
-within run bounds and their completions stay in the reservation maximum.
+Run through GitHub Actions, not a production shell. Security polling is bounded
+to 30 minutes within the 120-minute job deadline; attestation is capped at
+10 minutes and SSH at 60. Guards re-fetch exact runs/attempts and stable job
+sets; malformed pages or identity drift fail closed. Job timestamps remain
+run-bounded and ordered. The backup verifies the exact restore job, artifact
+digest, attestation and helper manifest before staging. On push, only the exact
+finalizer/auth baseline jobs may be skipped; their closed skipped shapes and
+run-bounded timestamps remain mandatory.
 
 After staging, an `always()` finalizer removes any leftover run-specific helper
 bundle before deleting the SSH material. Transfer, the remote backup operation,
