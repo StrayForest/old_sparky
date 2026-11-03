@@ -1676,6 +1676,9 @@ def _validate_usage_summary(
                 "malformed_records", "capture_marker_records", "capture_eligible_requests",
                 "capture_retained_requests", "capture_lost_requests", "capture_rows",
                 "capture_lost_rows", "capture_truncated_records", "capture_malformed_records",
+                "plan_selected", "header_set", "header_already_sent", "header_unavailable",
+                "header_error", "selector_invalid", "selector_unmatched", "selector_capacity",
+                "outcome_truncated_records",
                 "capture_status", "status",
             }
             if (not isinstance(stream, dict) or set(stream) != stream_fields
@@ -1698,12 +1701,16 @@ def _validate_usage_summary(
                 or stream["capture_marker_records"] != 1
                 or stream["capture_truncated_records"] > 0
                 or stream["capture_malformed_records"] > 0
+                or stream["outcome_truncated_records"] > 0
                 or stream["capture_status"] != "complete"
                 or stream["capture_eligible_requests"]
                 != stream["capture_retained_requests"] + stream["capture_lost_requests"]
             )
             if (stream["capture_status"] != expected_capture_status
                     or stream["status"] != ("incomplete" if stream_incomplete else "none")
+                    or stream["plan_selected"] != sum(stream[key] for key in (
+                        "header_set", "header_already_sent", "header_unavailable", "header_error",
+                    ))
                     or (raw_telemetry["status"] == "complete"
                         and (not coverage["complete"] or stream_incomplete))
                     or (raw_telemetry["status"] == "incomplete"

@@ -4077,6 +4077,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     "service": "api", "expected_targets": 2, "observed_targets": 2,
                     "event_count": 2, "timer": "thread_cpu", "observation_unit": "calls",
                     "total_cpu_us": 2_000_000, "sample_count": None,
+                    "sample_class_counts": None,
                     "start_lag_ms_min": 0, "start_lag_ms_max": 0,
                     "elapsed_ms_min": 20_000, "elapsed_ms_max": 20_000,
                     "end_lag_ms_min": 0, "end_lag_ms_max": 0,
@@ -4091,6 +4092,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     "service": "web", "expected_targets": 1, "observed_targets": 1,
                     "event_count": 1, "timer": "v8_cpu", "observation_unit": "samples",
                     "total_cpu_us": 1_000_000, "sample_count": 100,
+                    "sample_class_counts": {
+                        "idle": 0, "garbage_collector": 0, "program": 0,
+                        "unmapped_busy": 100, "known_category": 0, "unclassified": 0,
+                    },
                     "start_lag_ms_min": 0, "start_lag_ms_max": 0,
                     "elapsed_ms_min": 20_000, "elapsed_ms_max": 20_000,
                     "end_lag_ms_min": 0, "end_lag_ms_max": 0,
@@ -5680,6 +5685,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             usage_clock["wall_calls"] += 1
             if usage_clock["wall_calls"] == 2:
                 usage_clock["wall_ns"] = 21_000_000_000
+                usage_clock["monotonic_ns"] = 20_000_000_000
+                usage_clock["process_ns"] = 3_000_000_100
             return usage_clock["wall_ns"]
 
         def slow_usage_plan_read(*_args: Any, **_kwargs: Any) -> Any:
@@ -7805,6 +7812,12 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     "timer": timer, "observation_unit": unit,
                     "total_cpu_us": 100 if profiled else 0,
                     "sample_count": sample_count if profiled else (None if service == "api" else 0),
+                    "sample_class_counts": (
+                        None if service == "api" or not profiled else {
+                            "idle": 0, "garbage_collector": 0, "program": 0,
+                            "unmapped_busy": 0, "known_category": 1, "unclassified": 0,
+                        }
+                    ),
                     "start_lag_ms_min": 0 if profiled else None,
                     "start_lag_ms_max": 0 if profiled else None,
                     "elapsed_ms_min": on_window_ms if profiled else None,
@@ -9055,6 +9068,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                             "observed_targets": 2, "event_count": 2,
                             "timer": "thread_cpu", "observation_unit": "calls",
                             "total_cpu_us": 2_000_000, "sample_count": None,
+                            "sample_class_counts": None,
                             "start_lag_ms_min": 0, "start_lag_ms_max": 0,
                             "elapsed_ms_min": 20_000, "elapsed_ms_max": 20_000,
                             "end_lag_ms_min": 0, "end_lag_ms_max": 0,
@@ -9070,6 +9084,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                             "observed_targets": 1, "event_count": 1,
                             "timer": "v8_cpu", "observation_unit": "samples",
                             "total_cpu_us": 1_000_000, "sample_count": 100,
+                            "sample_class_counts": {
+                                "idle": 0, "garbage_collector": 0, "program": 0,
+                                "unmapped_busy": 100, "known_category": 0, "unclassified": 0,
+                            },
                             "start_lag_ms_min": 0, "start_lag_ms_max": 0,
                             "elapsed_ms_min": 20_000, "elapsed_ms_max": 20_000,
                             "end_lag_ms_min": 0, "end_lag_ms_max": 0,
