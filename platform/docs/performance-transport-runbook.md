@@ -123,8 +123,23 @@ settings, and concurrency fixed and change only the runtime profile. Arm A is
 250 ms admission tuple and the same worker/pool settings. Before A1, verify
 and record one web worker, compression enabled, API worker/pool values, and
 the exact active profile; verify these values remain fixed after each switch.
-A
-completed response must be HTTP 200, `text/html`, and
+If B is active initially, switch B→A with the same route before A1; stop if
+the active profile is outside this A/B pair.
+Use the protected A/B profile-only route: it verifies exact source/Security and
+profile, locks release/load, changes only web transport, restarts web, checks
+readiness and rolls back; it does no build, migration, backup or pointer change.
+For A/B/A, ensure A before A1, switch to B before B, then restore A before A2:
+
+```bash
+APP_SOURCE_SHA="<exact deployed SHA with successful Security>"
+gh workflow run platform-production-runtime-profile.yml --repo StrayForest/old_sparky --ref dev -f confirmation=SWITCH-PRODUCTION-READ-ADMISSION -f "expected_sha=$APP_SOURCE_SHA" -f expected_profile=authenticated-read-admission-24x8 -f target_profile=authenticated-read-admission-24x8-native
+gh run watch <switch-run-id> --repo StrayForest/old_sparky --exit-status
+gh workflow run platform-production-runtime-profile.yml --repo StrayForest/old_sparky --ref dev -f confirmation=SWITCH-PRODUCTION-READ-ADMISSION -f "expected_sha=$APP_SOURCE_SHA" -f expected_profile=authenticated-read-admission-24x8-native -f target_profile=authenticated-read-admission-24x8
+gh run watch <restore-run-id> --repo StrayForest/old_sparky --exit-status
+```
+
+Start a load only after its switch passes; on failure, keep it stopped and verify the sanitized profile result.
+A completed response must be HTTP 200, `text/html`, and
 contain the existing `tournament-detail-lifecycle` marker, a server-rendered
 `data-ssr-workspace-ready="true"` attribute on that lifecycle marker, the
 server-rendered `h1.hero-title` with the tournament title, the generic
@@ -231,13 +246,9 @@ SSR/event-loop diagnostics and API request logging off; its required evidence
 is the bounded client-timeout to Nginx route/status/upstream-timing join.
 Applying the profile restarts both
 `deadlock-api` and `deadlock-web` with readiness checks because the API gate is read at process
-startup. Before applying it, record the exact prior runtime profile and verify
-that its web-worker and auth-transport values match the diagnostic profile's
-one-worker/fetch defaults. Restore the recorded profile through the supported
-runtime-profile workflow; do not assume `ready-vote-static-8` is the prior
-profile or edit the shared environment directly. When the prior profile is
-`authenticated-read-admission-24x8`, use the supported baseline-then-prior
-sequence, checking readiness after each transition. The 24x8 restore selector explicitly resets
+startup. The `web-ssr-diagnostics` transition is not exposed by the current
+profile-only workflow; keep the active profile unchanged while following the
+A/B procedure below. The 24x8 restore selector explicitly resets
 `PLATFORM_SSR_WORKSPACE_ERROR_DIAGNOSTIC=false` while preserving the 24/8/250ms
 admission tuple and existing API/database pool settings.
 The API only accepts internal SSR diagnostic headers from the loopback SSR
@@ -256,8 +267,10 @@ API failures. The observer joins these rows to Nginx only by a unique request
 ID and publishes stage, error family, status and response-code counts; request
 IDs, Cloudflare rays and diagnostic run IDs remain private and transient. This
 is a sampled error population: zero observed rows does not establish that no
-unsampled errors occurred. Restore the prior runtime profile after the window;
-the baseline sets `PLATFORM_SSR_WORKSPACE_ERROR_DIAGNOSTIC=false`.
+unsampled errors occurred. The `web-ssr-diagnostics` profile is outside the
+profile-only A/B workflow. Do not activate or restore it by dispatching the
+normal production deploy workflow; keep the current profile unchanged in this
+procedure.
 
 The aggregate Nginx HTML observer includes exact `GET /tournaments/<slug>`
 records with client statuses from 100 through 599, so failed responses remain
@@ -295,15 +308,13 @@ consumption and JSON parsing. Compare only like transport profiles. All spans
 remain disabled with the SSR diagnostic flag off; the bounded capacity plan
 may still explicitly enable its request-local trace.
 
-Run this only as one explicitly reviewed `web-ssr-diagnostics` window using the
-canonical external authenticated-page profile. It leaves compression,
-database pools, API admission and capacity limits unchanged; its selected web
-worker and auth-transport values are one and `fetch`, so verify those match the
-recorded prior profile before applying it. If the observer
-records a web restart or any unexpected status, treat the window as diagnostic
-evidence rather than a clean latency result and follow [Web restart evidence](#web-restart-evidence).
-Restore the exact recorded prior profile after the window so the diagnostic
-keys and API logging selectors return to their baseline values
+The diagnostic profile documentation describes its selected settings, but
+the profile-only route below supports only the fetch/native A/B pair. Keep the
+current profile unchanged for other diagnostic windows; do not switch profiles
+through the normal production deploy workflow. If an existing supported
+diagnostic procedure records a web restart or unexpected status, use
+[Web restart evidence](#web-restart-evidence). The 24x8 profile restores the
+diagnostic key and API logging selectors to their baseline values
 (`PLATFORM_SSR_PERF_LOG_ENABLED=false`,
 `PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED=false`, `PLATFORM_LOG_LEVEL=INFO` and
 `PLATFORM_PERF_LOG_ENABLED=true`).
@@ -395,8 +406,10 @@ Run sequencing is deliberately three-step:
    Do not enable `web-ssr-diagnostics` for this first pass: its marked-request
    trace adds per-request SSR/API/event-loop logging and can change the failure
    mode. If the minimal contour leaves an origin-localized timeout unresolved,
-   run the full profile as a separately identified diagnostic window, then
-   restore the pre-window profile.
+   stop and defer the full `web-ssr-diagnostics` profile until its own protected
+   profile-only operation is available. The A/B workflow above is closed to
+   that profile. Do not use `platform-production-deploy.yml` to change or
+   restore a runtime profile.
 2. Read the bounded `timeout-diagnostics.json` rows by observation index.
    Missing Nginx evidence means only “not observed at origin” (client vs
    Cloudflare is unresolved), not proof that an edge layer was healthy. API
@@ -407,26 +420,12 @@ Run sequencing is deliberately three-step:
    with the nearest aggregate system sample; event-loop evidence is available
    only when the full diagnostic profile was active. Do not infer CPU
    saturation from aggregate CPU alone.
-3. Restore the exact pre-window runtime profile through the production deploy
-   workflow (substitute the recorded profile in the assignment below), for
-   example:
-
-   ```bash
-   PRE_WINDOW_PROFILE="ready-vote-static-8"
-   gh workflow run platform-production-deploy.yml \
-     --repo StrayForest/old_sparky --ref dev \
-     -f mode=deploy -f "runtime_profile=$PRE_WINDOW_PROFILE" \
-     -f web_compression=enabled
-   gh run watch <restore-run-id> --repo StrayForest/old_sparky --exit-status
-   ```
-
-   Verify both services are ready, confirm diagnostics are off and confirm
-   `MemoryMax` is unchanged; this workflow must not be used to tune the
-   memory ceiling. The supervisor always performs exact
-   fixture cleanup; its temporary manifest and handoff are removed at the
-   barrier. Do not delete the retained diagnostic artifact until the evidence
-   review is complete, then apply the normal bounded storage-retention
-   procedure.
+3. The minimal timeout diagnostic does not change the runtime profile. Keep
+   the pre-window profile active, confirm `MemoryMax` is unchanged, and do not
+   dispatch the production deploy workflow as a profile switch. The supervisor
+   performs exact fixture cleanup; its temporary manifest and handoff are
+   removed at the barrier. Do not delete the retained diagnostic artifact
+   until evidence review is complete, then apply normal bounded retention.
 
 Only after the evidence identifies a reversible bottleneck may an operator
 propose a separate fix for approval. Do not rerun the full 20,000/20,000

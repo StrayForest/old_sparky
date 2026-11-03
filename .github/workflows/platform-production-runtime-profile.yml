@@ -1,0 +1,262 @@
+name: Platform production runtime profile switch
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type SWITCH-PRODUCTION-READ-ADMISSION to switch the read-admission profile"
+        required: true
+        type: string
+      expected_sha:
+        description: "Exact source currently deployed on production"
+        required: true
+        type: string
+      expected_profile:
+        description: "Profile that must be active before the switch"
+        required: true
+        type: choice
+        options:
+          - authenticated-read-admission-24x8
+          - authenticated-read-admission-24x8-native
+      target_profile:
+        description: "Profile to activate"
+        required: true
+        type: choice
+        options:
+          - authenticated-read-admission-24x8
+          - authenticated-read-admission-24x8-native
+
+permissions:
+  actions: read
+  contents: read
+  statuses: read
+
+concurrency:
+  group: platform-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  switch:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    permissions:
+      actions: read
+      contents: read
+      statuses: read
+    env:
+      CONFIRMATION: ${{ inputs.confirmation }}
+      EXPECTED_SHA: ${{ inputs.expected_sha }}
+      EXPECTED_PROFILE: ${{ inputs.expected_profile }}
+      TARGET_PROFILE: ${{ inputs.target_profile }}
+      TARGET_SHA: ${{ github.sha }}
+    steps:
+      - name: Checkout exact deployed source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Prove exact-source Security and build private handoff
+        id: handoff
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/dev \
+            || { echo "Profile switching is available only from reviewed dev." >&2; exit 1; }
+          test "$EXPECTED_SHA" = "$TARGET_SHA" \
+            || { echo "Expected deployed source must equal this exact workflow SHA." >&2; exit 1; }
+          /usr/bin/python3 platform/tools/platform_workflow_input_guard.py sha --value "$TARGET_SHA"
+          /usr/bin/python3 platform/tools/platform_runtime_profile_workflow.py
+          host_tools_sha="$(/usr/bin/python3 - "$TARGET_SHA" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          target_sha = sys.argv[1]
+          payload = json.loads(Path("platform/contracts/host_tools_pin.json").read_text(encoding="utf-8"))
+          if not isinstance(payload, dict):
+              raise SystemExit("host-tools pin is invalid")
+          value = payload.get("host_tools_sha")
+          if (
+              payload.get("schema") != 1
+              or payload.get("repository") != "StrayForest/old_sparky"
+              or re.fullmatch(r"[0-9a-f]{40}", str(value)) is None
+              or len(target_sha) != 40
+          ):
+              raise SystemExit("host-tools pin is invalid")
+          print(value)
+          PY
+          )"
+          input_path="$RUNNER_TEMP/runtime-profile-switch.json"
+          umask 077
+          /usr/bin/python3 platform/tools/platform_workflow_input_guard.py runtime-profile-switch \
+            --output "$input_path" \
+            --confirmation "$CONFIRMATION" \
+            --target-sha "$TARGET_SHA" \
+            --expected-profile "$EXPECTED_PROFILE" \
+            --target-profile "$TARGET_PROFILE" \
+            --host-tools-sha "$host_tools_sha" \
+            --security-run-id "$(sed -n 's/^security_run_id=//p' "$GITHUB_OUTPUT" | tail -n 1)" \
+            --security-run-attempt "$(sed -n 's/^security_run_attempt=//p' "$GITHUB_OUTPUT" | tail -n 1)" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT"
+          test "$(stat -c '%a' "$input_path")" = 600
+          printf 'host_tools_sha=%s\n' "$host_tools_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Validate production SSH inputs
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured." >&2; exit 1; }
+          test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured." >&2; exit 1; }
+          test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured." >&2; exit 1; }
+
+      - name: Configure pinned production SSH
+        id: configure-ssh
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          ssh_dir="$RUNNER_TEMP/production-runtime-profile-ssh"
+          install -d -m 700 "$ssh_dir"
+          printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
+          chmod 600 "$ssh_dir/id_ed25519"
+          ssh_scan="$ssh_dir/known_hosts.scan"; rm -f -- "$ssh_scan"; ssh_scan_ok=0
+          for ssh_attempt in 1 2; do
+            ssh_scan_attempt="$ssh_scan.$ssh_attempt"; rm -f -- "$ssh_scan_attempt"; install -m 600 /dev/null "$ssh_scan_attempt"
+            ssh_scan_rc=0
+            if timeout --foreground 4s ssh-keyscan -T 3 -t ed25519 "$PROD_SSH_HOST" >"$ssh_scan_attempt" 2>/dev/null; then
+              :
+            else
+              ssh_scan_rc=$?
+            fi
+            if (( ssh_scan_rc == 0 )) \
+              && awk -v host="$PROD_SSH_HOST" '/^[[:space:]]*($|#)/ { next } { records++; if (NF == 3 && $1 == host && $2 == "ssh-ed25519") { valid=1; next } { invalid=1 } } END { exit !(records == 1 && valid == 1 && !invalid) }' "$ssh_scan_attempt" \
+              && test "$(ssh-keygen -lf "$ssh_scan_attempt" -E sha256 2>/dev/null | awk 'NR == 1 {print $2}')" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y"; then
+              mv -- "$ssh_scan_attempt" "$ssh_scan"; ssh_scan_ok=1; printf 'Production SSH host-key acquisition attempt %s/2 succeeded\n' "$ssh_attempt"; break
+            fi
+            ssh_scan_line_count="$(awk 'END {print NR + 0}' "$ssh_scan_attempt")"
+            read -r ssh_scan_record_count ssh_scan_host_token_valid ssh_scan_key_type_valid < <(
+              awk -v host="$PROD_SSH_HOST" '
+                /^[[:space:]]*($|#)/ { next }
+                {
+                  records++
+                  if (NF != 3 || $1 != host) host_invalid=1
+                  if (NF != 3 || $2 != "ssh-ed25519") type_invalid=1
+                }
+                END { printf "%d %d %d\n", records + 0, (records == 1 && !host_invalid), (records == 1 && !type_invalid) }
+              ' "$ssh_scan_attempt"
+            )
+            ssh_scan_fingerprint_match=0
+            if (( ssh_scan_record_count == 1 )); then
+              ssh_scan_fingerprint="$(ssh-keygen -lf "$ssh_scan_attempt" -E sha256 2>/dev/null | awk 'NR == 1 {print $2}' || true)"
+              if [[ "$ssh_scan_fingerprint" == "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y" ]]; then
+                ssh_scan_fingerprint_match=1
+              fi
+            fi
+            printf 'SSH_KEYSCAN_DIAGNOSTIC rc=%s lines=%s records=%s host_token_valid=%s key_type_valid=%s fingerprint_match=%s\n' \
+              "$ssh_scan_rc" "$ssh_scan_line_count" "$ssh_scan_record_count" "$ssh_scan_host_token_valid" "$ssh_scan_key_type_valid" "$ssh_scan_fingerprint_match" >&2
+            rm -f -- "$ssh_scan_attempt"; printf 'Production SSH host-key acquisition attempt %s/2 failed\n' "$ssh_attempt" >&2; (( ssh_attempt == 2 )) || sleep 0.5
+          done
+          test "$ssh_scan_ok" = 1 || { echo "Production SSH host-key acquisition failed after 2 bounded attempts" >&2; exit 1; }
+          install -m 600 "$ssh_scan" "$ssh_dir/known_hosts"
+          printf 'ssh_dir=%s\n' "$ssh_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Apply profile-only switch with rollback and readiness
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          SSH_DIR: ${{ steps.configure-ssh.outputs.ssh_dir }}
+          HOST_TOOLS_SHA: ${{ steps.handoff.outputs.host_tools_sha }}
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 platform/tools/platform_workflow_input_guard.py sha --value "$HOST_TOOLS_SHA"
+          input_path="$RUNNER_TEMP/runtime-profile-switch.json"
+          remote_out="$RUNNER_TEMP/runtime-profile-switch.stdout"
+          remote_err="$RUNNER_TEMP/runtime-profile-switch.stderr"
+          trap 'rm -f -- "$input_path" "$remote_out" "$remote_err"' EXIT
+          remote_dispatcher="/opt/oldsparky/platform/shared/host-tools/$HOST_TOOLS_SHA/platform_workflow_remote_dispatch.py"
+          remote_host="$PROD_SSH_USER@$PROD_SSH_HOST"
+          set +e
+          ssh -i "$SSH_DIR/id_ed25519" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$SSH_DIR/known_hosts" \
+            -o ConnectTimeout=10 \
+            "$remote_host" \
+            "sudo -n -- /usr/bin/python3.12 -I -B '$remote_dispatcher' runtime-profile-switch" \
+            < "$input_path" > "$remote_out" 2> "$remote_err"
+          ssh_status=$?
+          set -e
+          release_slug="gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${TARGET_SHA:0:12}"
+          /usr/bin/python3 - "$remote_out" "$ssh_status" "$release_slug" "$TARGET_SHA" "$EXPECTED_PROFILE" "$TARGET_PROFILE" "$GITHUB_STEP_SUMMARY" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          path, raw_status, slug, source, expected_profile, target_profile, summary_path = sys.argv[1:]
+          marker = Path(path).read_bytes()
+          pattern = re.compile(
+              rb"RELEASE_DEPLOY schema=1 status=(?:passed|failed) class=(?:preflight|artifact|deployment)"
+              rb"(?: phase=(?:preflight|artifact|provenance|candidate|readiness) reason=(?:internal|host_tools_invalid|lock|environment|service_state|nginx_config|preflight_failed|artifact_missing|artifact_count_invalid|checksum_missing|provenance_missing|artifact_name_invalid|release_slug_mismatch|checksum_mismatch|validation_failed|provenance_invalid|candidate_missing|activation_failed|lock_lost|runtime_profile_failed|runtime_profile_restored|baseline_changed)(?: lock_stage=(?:helper_metadata|release_supervise|release_open|retained_supervise|retained_open))?)? "
+              rb"release_slug=" + re.escape(slug.encode()) + rb" source_sha=" + re.escape(source.encode()) + rb"\n"
+          )
+          if pattern.fullmatch(marker) is None:
+              raise SystemExit("profile switch returned no valid sanitized receipt")
+          marker_text = marker.decode("ascii").strip()
+          restored = b"reason=runtime_profile_restored " in marker
+          restore_state = "verified" if restored else (
+              "not needed" if marker.startswith(b"RELEASE_DEPLOY schema=1 status=passed ") else "unverified"
+          )
+          Path(summary_path).write_text(
+              "## Runtime profile switch result\n\n"
+              f"- Source SHA: {source}\n"
+              f"- Profile: {expected_profile} -> {target_profile}\n"
+              f"- Prior profile restoration after failure: {restore_state}\n"
+              f"- Sanitized supervisor result: {marker_text}\n",
+              encoding="utf-8",
+          )
+          print(marker_text)
+          if raw_status != "0" or not marker.startswith(b"RELEASE_DEPLOY schema=1 status=passed "):
+              raise SystemExit("profile switch failed; use the sanitized supervisor result above")
+          PY
+          printf '%s\n' "- Security run: \`${{ steps.handoff.outputs.security_run_id }}/${{ steps.handoff.outputs.security_run_attempt }}\`" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "- Host-tools generation: \`${HOST_TOOLS_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove production SSH and private handoff files
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          ssh_dir="$RUNNER_TEMP/production-runtime-profile-ssh"
+          test "$ssh_dir" = "$RUNNER_TEMP/production-runtime-profile-ssh"
+          if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+            test -d "$ssh_dir" && test ! -L "$ssh_dir"
+            rm -f -- "$ssh_dir/id_ed25519" "$ssh_dir/known_hosts" "$ssh_dir/known_hosts.scan" "$ssh_dir/known_hosts.scan.1" "$ssh_dir/known_hosts.scan.2" "$ssh_dir/control.sock" "$ssh_dir/control-master" "$ssh_dir/control-master.sock"
+            test ! -e "$ssh_dir/id_ed25519" && test ! -L "$ssh_dir/id_ed25519"
+            test ! -e "$ssh_dir/known_hosts" && test ! -L "$ssh_dir/known_hosts"
+            test ! -e "$ssh_dir/known_hosts.scan" && test ! -L "$ssh_dir/known_hosts.scan"
+            test ! -e "$ssh_dir/known_hosts.scan.1" && test ! -L "$ssh_dir/known_hosts.scan.1"
+            test ! -e "$ssh_dir/known_hosts.scan.2" && test ! -L "$ssh_dir/known_hosts.scan.2"
+            rmdir -- "$ssh_dir"
+          fi
+          test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
+          rm -f -- "$RUNNER_TEMP/runtime-profile-switch.json" "$RUNNER_TEMP/runtime-profile-switch.stdout" "$RUNNER_TEMP/runtime-profile-switch.stderr"
+          test ! -e "$RUNNER_TEMP/runtime-profile-switch.json" && test ! -L "$RUNNER_TEMP/runtime-profile-switch.json"
+          test ! -e "$RUNNER_TEMP/runtime-profile-switch.stdout" && test ! -L "$RUNNER_TEMP/runtime-profile-switch.stdout"
+          test ! -e "$RUNNER_TEMP/runtime-profile-switch.stderr" && test ! -L "$RUNNER_TEMP/runtime-profile-switch.stderr"
