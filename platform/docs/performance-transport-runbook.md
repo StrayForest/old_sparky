@@ -120,9 +120,13 @@ runtime-profile A/B must keep this HTML workload, source, fixture, observer
 settings, and concurrency fixed and change only the runtime profile. Arm A is
 `authenticated-read-admission-24x8` (`fetch`); arm B is
 `authenticated-read-admission-24x8-native` (`node`). Both preserve the 24/8/
-250 ms admission tuple and the same worker/pool settings. Before A1, verify
-and record one web worker, compression enabled, API worker/pool values, and
-the exact active profile; verify these values remain fixed after each switch.
+250 ms admission tuple and the same worker/pool settings. The omitted worker
+DB-pool key keeps the application default of 2 without writing that key; verify
+and record the one web worker, compression, API worker/pool values and active
+profile before A1, and keep them fixed after each switch.
+The standalone 20-second plan selects the existing run-bound SSR trace, returns
+the server request ID, and allows the same 15-second bounded drain as typed
+HTML plans. Its existing capped, sampled IDs feed the existing SSR projection.
 If B is active initially, switch B→A with the same route before A1; stop if
 the active profile is outside this A/B pair.
 Use the protected A/B profile-only route: it verifies exact source/Security and

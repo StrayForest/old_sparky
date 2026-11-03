@@ -18,7 +18,7 @@
     {
       "mode": 493,
       "path": "platform/tools/platform_production_deploy_supervisor.sh",
-      "sha256": "14fb4b82fe1add299db129dcf02f182997f9eb76fc8c381e9192af8a459370a3"
+      "sha256": "c0e392e529e721fddf634bde31b643a74cd4670b0d74a29043f73c85b8259780"
     },
     {
       "mode": 493,
@@ -73,10 +73,10 @@
     {
       "mode": 420,
       "path": "platform/tools/platform_cpu_diagnostic_plan.py",
-      "sha256": "914c50b144286c12a9fbf18692ae9fb5812ef1e19ccef4ab2020c2f4bb20b410"
+      "sha256": "f42898d3a4f3bd2a51aca8ef21e55ee457b91eb97277ea9eeb3dc0ca60706b7e"
     }
   ],
-  "host_tools_sha": "b3089b04842266c036512e883dc2c39de847eadd",
+  "host_tools_sha": "37786df35f425214cda76e005e798327a073fd40",
   "repository": "StrayForest/old_sparky",
   "schema": 1
 }

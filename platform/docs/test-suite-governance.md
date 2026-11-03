@@ -117,7 +117,7 @@ The existing `test_platform_live_qa_guard` and `test_platform_live_qa_wrappers` 
 The root-only isolated-restore signal test and disk-image fixture directory identity/mode test run once in the required `backend-privileged` contour. Their aggregate summary must include successful timing; missing or skipped execution fails. The directory test verifies the actual root-owned fixture preconditions and must not be moved to a non-root contour or mocked as root. This current-run evidence does not replace the separately source- and parent-bound `baseline-runtime` proof, and does not authorize reuse across runs.
 
 The synthetic PG16 restore diagnostic is hosted Security-only in `backend-privileged`. It creates a fixed 32 MiB custom dump (4,096 rows × 8,192-byte payloads) with a `pg_trgm` GIN index and Alembic marker, then runs the three fixed serial restore arms using the explicitly selected scratch backend. `tmpfs_v1` remains the default; the separate `disk_ext4_image_v1` diagnostic uses the verified bounded ext4 image, formatted with discard disabled and eager inode-table initialization. After formatting, the exact open image inode is reallocated before the unchanged full-allocation predicate is checked, covering formatter zero-range fallback that may punch holes in regular files. The full-allocation predicate is also checked during mount verification. Both backends retain the verified 640 MiB, zero-swap unit and the same restore, isolation and cleanup checks. Each arm checks exact row digests and payload bytes before/after both schema restores, plus schema, index plan/result and Alembic equivalence. The sanitized source-bound artifact records separate cluster-wide WAL counter deltas; each after-snapshot waits for all sessions in the exact restore database to exit, flushing backend-local WAL statistics before observation. It also records `pg_restore` command time, precheck-through-postcheck phase time, reset cgroup peak and the selected backend's sampled filesystem high-water for `restore_platform` and `restore_public`. This synthetic diagnostic does not prove production capacity or change production defaults.
-The SSR admission-shed parser remains in `test_platform_ssr_observability` (performance-contract), public projection privacy in `test_platform_evidence_privacy` (backend-tool-contract), and the bounded web scheduler in the existing `frontend-audit-regressions.spec.ts` smoke owner. The inline retry queue regression adds one ID to the existing performance-contract module; it adds no module or gate-ownership entry. The composite authenticated-HTML capacity/CPU diagnostic uses the existing `backend` aggregate and web gates; it adds no workflow route. `test_platform_cpu_profile` (performance-contract) owns Python plan authorization, middleware sampling bounds, and sanitized observer projection; the catalogued, DB-free `test_platform_ssr_request_correlation` module owns bounded deterministic selection and one-to-many joins. In the web package, `ssr-stream-diagnostics-contract.cjs` (web-quality) owns selector/capture behavior, and `frontend-audit-regressions.spec.ts` (web-hermetic) covers integration. Keep sampling inputs and IDs private; assert one-in-eight hash selection, parent caps, and ON-start requests through failures and drain. Update discovery only through the canonical registry; do not add test IDs to workflow YAML. The same module tests the composite SSR producer-to-sanitizer round trip and closed, value-free rejection artifact.
+The SSR admission-shed parser remains in `test_platform_ssr_observability` (performance-contract), public projection privacy in `test_platform_evidence_privacy` (backend-tool-contract), and the bounded web scheduler in the existing `frontend-audit-regressions.spec.ts` smoke owner. The inline retry queue regression adds one ID to the existing performance-contract module; it adds no module or gate-ownership entry. The composite authenticated-HTML capacity/CPU diagnostic uses the existing `backend` aggregate and web gates; it adds no workflow route. `test_platform_cpu_profile` (performance-contract) owns Python plan authorization, middleware sampling bounds, and sanitized observer projection; the standalone HTML capacity workload uses the same bounded request-ID correlation contract. The catalogued, DB-free `test_platform_ssr_request_correlation` module owns bounded deterministic selection and one-to-many joins. In the web package, `ssr-stream-diagnostics-contract.cjs` (web-quality) owns selector/capture behavior, `ssr-diagnostic-e2e/response-header.spec.ts` exercises the real Next plan parser and response-ID handoff, and `frontend-audit-regressions.spec.ts` (web-hermetic) covers integration. Keep sampling inputs and IDs private; assert one-in-eight hash selection, parent caps, and ON-start requests through failures and drain. Update discovery only through the canonical registry; do not add test IDs to workflow YAML. The same module tests the composite SSR producer-to-sanitizer round trip and closed, value-free rejection artifact.
 
 Every aggregate and backend sub-contour is guarded before test discovery by one pure, fail-closed resource validator. It requires
 the exact values `PLATFORM_ENVIRONMENT=test`, `PLATFORM_DB_SCHEMA=platform`, database `platformdb_test`, a literal IP loopback
@@ -420,24 +420,23 @@ SPA flows check client URLs and hydrated DOM, preserving project/auth/fixture co
 
 ## Local and GitHub verification
 
-Use the canonical registry for focused local feedback, then each affected owner gate; impact
-planning is advisory and does not replace either check.
+Use the canonical registry for focused local feedback, then run each affected owner gate; impact planning is advisory.
+
+Replace example paths/selectors with current changes. Backend needs `backend`; web needs `web-quality` and `web-hermetic`.
+`backend-unit --focused` is DB-free; `backend` needs DB, Redis and privileged resources. Run `ci` for a full local pass; Actions remain the release authority.
+
+When the local runner cannot create PID namespaces, run the other `performance-contract` IDs as a local subset. Keep the summary outside the repository; hosted CI still requires the full contour.
 
 ```bash
 cd platform
-.cache/platform-ci-venv/bin/python tools/platform_verify.py impact \
-  --changed-path platform/apps/platform_api/app/main.py
-.cache/platform-ci-venv/bin/python tools/platform_verify.py backend-unit \
-  --focused tests.test_platform_domain
+.cache/platform-ci-venv/bin/python -c 'from tools import platform_test_catalog as c; from tools.platform_verify import main;
+r = c.TEST_NONROOT_PID_NAMESPACE_REQUIREMENTS; ids = [x.test_id for x in c.cases_for_contour("performance-contract") if x.test_id not in r];
+raise SystemExit(main(["performance-contract", "--focused", *ids, "--summary", "/tmp/performance-contract-focused-summary.json", "--quiet"]))'
 ```
 
-Replace example paths/selectors with current changes. Backend needs `backend`; web needs `web-quality` and `web-hermetic`.
-`backend-unit --focused` is DB-free; `backend` needs DB, Redis and privileged resources. Run `ci` only for a full local pass;
-exact-SHA Actions gates remain the release authority.
+Report `LOCAL GATE BLOCKED` when local requirements are unavailable; never spoof runner markers or claim full-contour success.
 
 For full local Python gate dependencies, see [the development guide](development-guide.md#python-dependency-ownership).
-
-`LOCAL GATE BLOCKED` means required safe dependencies are unavailable; a smaller substitute is not a complete-gate pass.
 
 The privileged storage-maintenance host-contract test is catalogued with its
 GitHub-hosted Linux environment markers. The canonical verifier and runner

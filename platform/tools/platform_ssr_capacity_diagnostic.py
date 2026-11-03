@@ -92,8 +92,12 @@ ON_WINDOW_MS_BY_WORKLOAD = {
     HTML_CPU_PROFILE_20S_WORKLOAD: ON_WINDOW_MS,
 }
 NEW_TYPED_WORKLOADS = frozenset({HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD})
+SSR_CORRELATION_WORKLOADS = frozenset({
+    HTML_WORKLOAD, HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD,
+})
 PLAN_EXPIRY_GRACE_MS = 15_000
 PLAN_EXPIRY_GRACE_MS_BY_WORKLOAD = {
+    HTML_WORKLOAD: PLAN_EXPIRY_GRACE_MS,
     HTML_CAPACITY_120S_WORKLOAD: PLAN_EXPIRY_GRACE_MS,
     HTML_CPU_PROFILE_20S_WORKLOAD: PLAN_EXPIRY_GRACE_MS,
 }
@@ -2299,7 +2303,7 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
         "diagnostic_credit": False,
         "namespace_closed": False,
     }
-    if capacity["workload"] in {HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD}:
+    if capacity["workload"] in SSR_CORRELATION_WORKLOADS:
         report["client_join_request_ids"] = _selected_ssr_join_request_ids(results, binding["run_id"])
     return report
 
@@ -2376,7 +2380,7 @@ def _incomplete_report(
                 )):
             raise ValueError("capacity warmup failure projection rejected")
         report["warmup_failure"] = dict(warmup_failure)
-    if capacity["workload"] in {HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD}:
+    if capacity["workload"] in SSR_CORRELATION_WORKLOADS:
         report["client_join_request_ids"] = _selected_ssr_join_request_ids(
             _phase_request_window_evidence(
                 on_results or [],
@@ -2631,7 +2635,7 @@ def run_isolated_capacity_worker(
     valid_worker = _worker_report_matches(worker_payload, capacity_config)
     if (valid_worker and isinstance(worker_payload, Mapping)
             and capacity_config.get("workload")
-            in {HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD}):
+            in SSR_CORRELATION_WORKLOADS):
         stage_state["transient_ssr_join_ids"] = list(
             worker_payload["client_join_request_ids"]
         )
@@ -2840,12 +2844,12 @@ def _worker_report_matches(payload: Any, capacity_config: Mapping[str, Any]) -> 
         or len(set(join_ids)) != len(join_ids)
         or join_ids != sorted(join_ids)
         or (request_window is not None and len(join_ids) != request_window.get("retained_sample_count"))
-        or (workload in {HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD}
+        or (workload in SSR_CORRELATION_WORKLOADS
             and any(not _ssr_join_id_is_eligible(payload.get("run_id", ""), item)
                     for item in join_ids))
     ):
         return False
-    if (workload in {HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD}
+    if (workload in SSR_CORRELATION_WORKLOADS
             and (request_window is None or join_ids is None)):
         return False
     cpu_rows = payload.get("process_cpu_windows", _unknown_cpu_windows())
@@ -4134,7 +4138,7 @@ def _parent_run_once(
             state["stage"] = "worker_supervision"
     if isinstance(outcome, dict):
         correlation_required = workload in {
-            HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD,
+            *SSR_CORRELATION_WORKLOADS,
         }
         server_telemetry = _project_server_telemetry(
             telemetry_summary, include_request_correlation=correlation_required,
@@ -4205,7 +4209,7 @@ def _parent_run_once(
             },
             "server_telemetry": _project_server_telemetry(
                 None, include_request_correlation=workload in {
-                    HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD,
+                    *SSR_CORRELATION_WORKLOADS,
                 },
                 include_cpu_profile=workload == HTML_CPU_PROFILE_20S_WORKLOAD,
                 expected_workload=workload,
@@ -4623,8 +4627,7 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
                 or ("request_window_evidence" in worker
                     and worker["submitted"]
                     != worker["request_window_evidence"].get("started_in_window_count"))
-                or (_is_html_workload(value["workload"])
-                    and value["workload"] in {HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD}
+                or (value["workload"] in SSR_CORRELATION_WORKLOADS
                     and "request_window_evidence" not in worker)
                 or not (
                     (legacy_failure_evidence is True
@@ -4781,7 +4784,7 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
         "node_memory_reason", "cgroup_memory_status", "cgroup_memory_reason", "node_memory_rows",
     }
     correlation_required = value.get("workload") in {
-        HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD,
+        *SSR_CORRELATION_WORKLOADS,
     }
     if correlation_required:
         telemetry_fields.add("request_correlation")
@@ -5149,6 +5152,15 @@ def evaluate_capacity_report(
             or report.get("namespace_closed") is not True
             or report.get("remote_plan_cleanup") != "complete"):
         return "FAIL" if report.get("status") == "resource_abort" else "INVALID"
+    if workload in SSR_CORRELATION_WORKLOADS:
+        server_telemetry = report.get("server_telemetry")
+        request_correlation = (
+            server_telemetry.get("request_correlation")
+            if isinstance(server_telemetry, dict) else None
+        )
+        if (not isinstance(request_correlation, dict)
+                or request_correlation.get("status") != "complete"):
+            return "INVALID"
     worker = report.get("worker")
     memory = report["memory_guard"]
     runner = report["runner_headroom"]
@@ -5870,7 +5882,7 @@ def _composite_parent_failure_fingerprint(
         # attribution-only fields added by that projector.
         report = value if isinstance(value, Mapping) else None
         if report is not None and report.get("workload") in {
-            HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD,
+            *SSR_CORRELATION_WORKLOADS,
         }:
             worker = report.get("worker")
             worker_status = worker.get("status") if isinstance(worker, Mapping) else "missing"

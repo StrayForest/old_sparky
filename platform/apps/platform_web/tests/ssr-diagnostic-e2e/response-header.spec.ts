@@ -4,6 +4,7 @@ import { expect, test } from "@playwright/test";
 
 type SsrPlanFixture = {
   run_id: string;
+  workload: string;
   request_path: string;
   off_start_ms: number;
   off_end_ms: number;
@@ -27,6 +28,7 @@ test("actual Next plan and Node guard return the trusted SSR request ID", async 
     readFileSync(join(fixtureRoot!, "fixture.json"), "utf8"),
   ) as SsrPlanFixture;
   expect(fixture.run_id).toMatch(/^[0-9a-f]{32}$/u);
+  expect(fixture.workload).toBe("authenticated_html_ssr_capacity_v1");
   expect(fixture.request_path).toBe("/tournaments/night-veil-open-5");
 
   const requestId = process.env.PLATFORM_SSR_DIAGNOSTIC_REQUEST_ID ?? "";

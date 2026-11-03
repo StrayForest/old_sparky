@@ -1632,47 +1632,39 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertNotIn('/usr/bin/python3 "$artifacts_metadata"', workflow)
         self.assertIn("/usr/bin/python3 \"$trusted_tool\" metadata", workflow)
         self.assertIn("/usr/bin/python3 \"$trusted_tool\" manifest", workflow)
-        host_build = self._workflow_step_run(
-            workflow, "Verify exact host-tools artifact metadata"
-        )
+        host_build = workflow_job(workflow, "build-host-tools")
+        host_capability = workflow_job(workflow, "host-capability-preflight")
         host_preflight = self._workflow_step_run(
             workflow, "Validate host-tools artifact envelope and bundle"
         )
-        self.assertIn(
-            "actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}",
-            host_build,
+        outer_verification = self._workflow_step_run(
+            workflow,
+            "Rebind outer artifact and attest exact inner bundle before extraction",
         )
-        self.assertIn("platform/tools/platform_host_tools_bundle.py", host_build)
-        self.assertIn("verify-artifact-metadata", host_build)
-        self.assertIn("--max-filesize 524288", host_build)
-        self.assertIn("platform_fetch_artifact_metadata.py", host_build)
-        metadata_fetch_source = (
-            TOOLS_DIR / "platform_fetch_artifact_metadata.py"
-        ).read_text()
-        self.assertIn(
-            "TRANSIENT_HTTP_STATUSES = frozenset({404, 408, 425, 429, 500, 502, 503, 504})",
-            metadata_fetch_source,
+        final_handoff = self._workflow_step_run(
+            workflow, "Create closed host-tools handoff after final verification"
         )
-        self.assertIn("TOTAL_DEADLINE_SECONDS = 50.0", metadata_fetch_source)
-        self.assertIn("MAX_ATTEMPTS = 4", metadata_fetch_source)
-        self.assertIn(
-            "/usr/bin/timeout --signal=TERM --kill-after=5s 55s",
-            host_build,
+        self.assertNotIn("Verify exact host-tools artifact metadata", host_build)
+        self.assertNotIn(
+            "/actions/artifacts/${HOST_TOOLS_ARTIFACT_ID}/zip", host_build
         )
-        metadata_call = host_build[
-            host_build.index("platform_fetch_artifact_metadata.py") : host_build.index(
-                "api_zip=\"$RUNNER_TEMP/platform-host-tools-artifact.zip\""
-            )
-        ]
-        self.assertNotIn("GH_TOKEN", metadata_call)
-        self.assertIn('--archive "$api_zip"', host_build)
-        self.assertNotIn("--jq", host_build)
-        self.assertNotIn("@tsv", host_build)
-        self.assertIn("host-tools workflow attempt metadata request failed", host_build)
-        self.assertIn("verify-workflow-attempt", host_build)
-        self.assertNotIn(".workflow_run.run_attempt", host_build)
-        self.assertIn('"sha256:${HOST_TOOLS_ARTIFACT_DIGEST}"', host_build)
-        self.assertIn("sha256sum -c", host_build)
+        self.assertEqual(
+            1,
+            host_capability.count(
+                "/actions/artifacts/${HOST_TOOLS_ARTIFACT_ID}/zip"
+            ),
+        )
+        self.assertIn("gh attestation verify", outer_verification)
+        self.assertIn('payload.get("digest") != digest', outer_verification)
+        self.assertIn('workflow_run.get("id") != int(run_id)', outer_verification)
+        self.assertIn('workflow_run.get("head_sha") != source_sha', outer_verification)
+        self.assertIn("runInvocationURI", final_handoff)
+        self.assertIn(
+            "actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}/jobs",
+            final_handoff,
+        )
+        self.assertIn('row.get("run_attempt") == attempt', final_handoff)
+        self.assertIn('row.get("conclusion") == "success"', final_handoff)
         self.assertNotIn("actions/checkout@", host_preflight)
         self.assertNotIn("platform_host_tools_bundle.py", host_preflight)
         self.assertIn("HOST_TOOLS_TOOLSET_VERSION", host_preflight)
@@ -1685,7 +1677,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
 
         # Execute the actual embedded pre-SSH bundle validator against both
         # trusted source layouts and closed negative variants. This keeps the
-        # workflow's duplicate envelope check aligned with the bundle builder.
+        # pre-build capability-gate envelope check aligned with the builder.
         validator_command = '/usr/bin/python3 - "$inner_root/manifest.json"'
         validator_start = host_preflight.index(validator_command)
         script_start = host_preflight.index("<<'PY'\n", validator_start) + len("<<'PY'\n")
@@ -3552,6 +3544,124 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("expected_sha", workflow)
         self.assertNotIn("platform-production-deploy.yml/dispatches", workflow)
         self.assertNotIn("platform_build_release.sh", workflow)
+
+        # Exercise the exact inline identity predicate with the real profile
+        # configurator. Its only tolerated dry-run delta is the omitted worker
+        # pool setting whose application default remains 2.
+        validator_match = re.search(
+            r'check_runtime_profile_identity\(\) \{[\s\S]*?<<\'PY\'\n([\s\S]*?)\nPY\n\}',
+            supervisor,
+        )
+        self.assertIsNotNone(validator_match)
+        assert validator_match is not None
+        validator = validator_match.group(1)
+        from python_packages.platform_infra.config import PlatformSettings
+        self.assertEqual(PlatformSettings.model_fields["platform_worker_db_pool_size"].default, 2)
+        selected = [
+            "PLATFORM_AUTHENTICATED_READ_ADMISSION_ENABLED",
+            "PLATFORM_AUTHENTICATED_READ_ADMISSION_CONCURRENCY",
+            "PLATFORM_AUTHENTICATED_READ_ADMISSION_MAX_WAITERS",
+            "PLATFORM_AUTHENTICATED_READ_ADMISSION_WAIT_TIMEOUT_MS",
+            "PLATFORM_API_WORKERS", "PLATFORM_DB_POOL_SIZE",
+            "PLATFORM_DB_MAX_OVERFLOW", "PLATFORM_DB_CONNECTION_BUDGET",
+            "PLATFORM_WEB_WORKERS", "PLATFORM_WEB_SERVER_AUTH_TRANSPORT",
+            "PLATFORM_WORKER_CONCURRENCY", "PLATFORM_WORKER_DB_POOL_SIZE",
+            "PLATFORM_COOKIE_SECURE",
+        ]
+        profile_values = dict(platform_configure_shared_env.PUBLIC_BASELINE)
+        profile_values.update(platform_configure_shared_env.RUNTIME_PROFILES[
+            "authenticated-read-admission-24x8"
+        ])
+        profile_values.pop("PLATFORM_WORKER_DB_POOL_SIZE")
+        fixture_secrets = {
+            "PLATFORM_DATABASE_URL": "fixture-database-url",
+            "PLATFORM_SECRET_KEY": "fixture-secret-key",
+            "PLATFORM_R2_ACCESS_KEY_ID": "fixture-access-key",
+            "PLATFORM_R2_SECRET_ACCESS_KEY": "fixture-storage-secret",
+        }
+        with tempfile.TemporaryDirectory(prefix="runtime-profile-identity-") as temporary:
+            root = Path(temporary)
+            canonical = root / ".env.platform"
+            worker_env = root / "worker.env"
+            lines = [f"{key}={value}" for key, value in sorted(profile_values.items())]
+            lines.extend(f"{key}={value}" for key, value in fixture_secrets.items())
+            canonical.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            canonical.chmod(0o600)
+            worker_env.write_text("PLATFORM_WORKER_CONCURRENCY=2\n", encoding="utf-8")
+            worker_env.chmod(0o600)
+            original_canonical = canonical.read_bytes()
+            original_worker = worker_env.read_bytes()
+
+            def helper_report(profile: str, env_path: Path = canonical) -> dict[str, object]:
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        str(TOOLS_DIR / "platform_configure_shared_env.py"),
+                        "--env-file", str(env_path), "--profile", profile,
+                        *[item for key in selected for item in ("--only", key)],
+                        "--json",
+                    ],
+                    check=True, capture_output=True, text=True,
+                )
+                return json.loads(completed.stdout)
+
+            def run_identity(
+                report: dict[str, object], profile: str, env_path: Path = canonical,
+            ) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [sys.executable, "-I", "-B", "-", profile,
+                     json.dumps(report, sort_keys=True), str(env_path), str(worker_env)],
+                    input=validator, check=False, capture_output=True, text=True,
+                )
+
+            a_report = helper_report("authenticated-read-admission-24x8")
+            self.assertEqual(a_report["changed_keys"], ["PLATFORM_WORKER_DB_POOL_SIZE"])
+            self.assertEqual(run_identity(a_report, "authenticated-read-admission-24x8").returncode, 0)
+            self.assertEqual(canonical.read_bytes(), original_canonical)
+            self.assertEqual(worker_env.read_bytes(), original_worker)
+
+            b_values = dict(profile_values)
+            b_values["PLATFORM_WEB_SERVER_AUTH_TRANSPORT"] = "node"
+            canonical.write_text(
+                "\n".join([f"{key}={value}" for key, value in sorted(b_values.items())]
+                          + [f"{key}={value}" for key, value in fixture_secrets.items()]) + "\n",
+                encoding="utf-8",
+            )
+            b_report = helper_report("authenticated-read-admission-24x8-native")
+            self.assertEqual(b_report["changed_keys"], ["PLATFORM_WORKER_DB_POOL_SIZE"])
+            self.assertEqual(run_identity(b_report, "authenticated-read-admission-24x8-native").returncode, 0)
+            for invalid_value in ("3", ""):
+                invalid_env = root / f"invalid-{len(invalid_value)}.env"
+                invalid_env.write_text(
+                    canonical.read_text(encoding="utf-8").replace(
+                        "PLATFORM_WORKER_CONCURRENCY=2",
+                        f"PLATFORM_WORKER_DB_POOL_SIZE={invalid_value}\nPLATFORM_WORKER_CONCURRENCY=2",
+                    ),
+                    encoding="utf-8",
+                )
+                invalid_env.chmod(0o600)
+                self.assertNotEqual(
+                    run_identity(
+                        b_report, "authenticated-read-admission-24x8-native", invalid_env,
+                    ).returncode,
+                    0,
+                )
+            duplicate_env = root / "invalid-duplicate.env"
+            duplicate_env.write_text(
+                canonical.read_text(encoding="utf-8").replace(
+                    "PLATFORM_WORKER_CONCURRENCY=2",
+                    "PLATFORM_WORKER_DB_POOL_SIZE=2\nPLATFORM_WORKER_DB_POOL_SIZE=2\n"
+                    "PLATFORM_WORKER_CONCURRENCY=2",
+                ),
+                encoding="utf-8",
+            )
+            duplicate_env.chmod(0o600)
+            self.assertNotEqual(
+                run_identity(
+                    b_report, "authenticated-read-admission-24x8-native", duplicate_env,
+                ).returncode,
+                0,
+            )
 
     def _run_profile_switch_fixture(self, scenario: str) -> tuple[subprocess.CompletedProcess[str], Path]:
         supervisor = DEPLOY_SUPERVISOR.read_text(encoding="utf-8")

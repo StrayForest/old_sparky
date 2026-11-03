@@ -187,6 +187,7 @@ function validatePayload(value: unknown): DiagnosticPlan | null {
     ? HTML_CAPACITY_ON_WINDOW_MS
     : ON_WINDOW_MS;
   const typedHtmlWorkload = plan.workload === WORKLOAD_HTML_SSR_CAPACITY_120S
+    || plan.workload === WORKLOAD_HTML_SSR_CAPACITY
     || plan.workload === WORKLOAD_HTML_SSR_CPU_PROFILE_20S;
   const expectedExpiry = onEnd + (typedHtmlWorkload ? 15_000 : 0);
   if (!(offStart < offEnd && offEnd <= onStart && onStart < onEnd && onEnd <= expires)
@@ -302,7 +303,8 @@ export function current_diagnostic_run_id(): string | null {
 export function isCurrentTypedHtmlSsrDiagnosticPlan(): boolean {
   const current = diagnosticStorage.getStore();
   return current !== undefined && (
-    current.plan.workload === WORKLOAD_HTML_SSR_CAPACITY_120S
+    current.plan.workload === WORKLOAD_HTML_SSR_CAPACITY
+    || current.plan.workload === WORKLOAD_HTML_SSR_CAPACITY_120S
     || current.plan.workload === WORKLOAD_HTML_SSR_CPU_PROFILE_20S
   );
 }
@@ -310,7 +312,8 @@ export function isCurrentTypedHtmlSsrDiagnosticPlan(): boolean {
 export function currentTypedHtmlSsrDiagnosticExpiryMs(): number | null {
   const current = diagnosticStorage.getStore();
   return current && (
-    current.plan.workload === WORKLOAD_HTML_SSR_CAPACITY_120S
+    current.plan.workload === WORKLOAD_HTML_SSR_CAPACITY
+    || current.plan.workload === WORKLOAD_HTML_SSR_CAPACITY_120S
     || current.plan.workload === WORKLOAD_HTML_SSR_CPU_PROFILE_20S
   )
     ? current.plan.expires_at_ms
@@ -322,7 +325,8 @@ function validatedSsrDiagnostic(requestHeaders: Pick<Headers, "get">): ActiveDia
   if (!incomingTrace || !/^[0-9a-f]{32}$/u.test(incomingTrace)) return null;
   const plan = currentPlan();
   if (!plan
-      || (plan.workload !== WORKLOAD_HTML_SSR_CAPACITY_120S
+      || (plan.workload !== WORKLOAD_HTML_SSR_CAPACITY
+        && plan.workload !== WORKLOAD_HTML_SSR_CAPACITY_120S
         && plan.workload !== WORKLOAD_HTML_SSR_CPU_PROFILE_20S)
       || !hasAuthorizedDiagnosticRunMarker(incomingTrace, plan.run_id)) return null;
   const phase = activePhase(plan, Date.now());
