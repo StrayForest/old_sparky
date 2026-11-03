@@ -352,7 +352,7 @@ test("registered detail uses compact workspace state and ready vote avoids full 
 test("ready vote retries bounded overloads as one logical action", async ({ page }) => {
   forcedReadyVoteOverloads = 2;
   holdFirstReadyVoteResponse = true;
-  await page.clock.install({ time: new Date("2026-07-20T16:10:00Z") });
+  await page.clock.install({ time: new Date("2026-07-20T16:09:00Z") });
   await page.context().addCookies([{
     name: "deadlock_platform_session",
     value: "lean-detail-session",
@@ -364,6 +364,7 @@ test("ready vote retries bounded overloads as one logical action", async ({ page
   }]);
 
   await page.goto(`/tournaments/${readyTournamentSlug}`);
+  await page.clock.pauseAt(new Date("2026-07-20T16:10:00Z"));
   const readyButton = page.getByTestId("ready-check-step").getByRole("button");
   await readyButton.click();
   await expect(readyButton).toHaveAttribute("aria-busy", "true");
