@@ -1238,7 +1238,10 @@ def _record_ssr_stream_coverage(
             fields[key] = value
         expected = {
             "scheme", "run_id", "eligible", "retained", "lost", "rows",
-            "lost_rows", "status",
+            "lost_rows", "status", "plan_selected", "header_set",
+            "header_already_sent", "header_unavailable", "header_error",
+            "selector_invalid", "selector_unmatched", "selector_capacity",
+            "outcome_status",
         }
         if set(fields) != expected or fields.get("run_id") != run_id:
             coverage["capture_malformed_records"] += 1
@@ -1251,12 +1254,25 @@ def _record_ssr_stream_coverage(
                 key: int(fields[key])
                 for key in ("eligible", "retained", "lost", "rows", "lost_rows")
             }
+            outcome_values = {
+                key: int(fields[key])
+                for key in (
+                    "plan_selected", "header_set", "header_already_sent",
+                    "header_unavailable", "header_error", "selector_invalid",
+                    "selector_unmatched", "selector_capacity",
+                )
+            }
         except ValueError:
             coverage["capture_malformed_records"] += 1
             return True
         if (any(value < 0 or value > 1_000_000 for value in values.values())
+                or any(value < 0 or value > 1_000_000 for value in outcome_values.values())
                 or values["rows"] > 6_000
                 or values["eligible"] != values["retained"] + values["lost"]
+                or outcome_values["plan_selected"] != sum(outcome_values[key] for key in (
+                    "header_set", "header_already_sent", "header_unavailable", "header_error",
+                ))
+                or fields["outcome_status"] not in {"complete", "truncated"}
                 or fields["status"] not in {"complete", "truncated"}
                 or (fields["status"] == "complete" and (
                     values["lost"] != 0 or values["lost_rows"] != 0
@@ -1275,6 +1291,19 @@ def _record_ssr_stream_coverage(
             ("lost_rows", "capture_lost_rows"),
         ):
             coverage[target_key] += values[source_key]
+        for source_key, target_key in (
+            ("plan_selected", "plan_selected"),
+            ("header_set", "header_set"),
+            ("header_already_sent", "header_already_sent"),
+            ("header_unavailable", "header_unavailable"),
+            ("header_error", "header_error"),
+            ("selector_invalid", "selector_invalid"),
+            ("selector_unmatched", "selector_unmatched"),
+            ("selector_capacity", "selector_capacity"),
+        ):
+            coverage[target_key] += outcome_values[source_key]
+        if fields["outcome_status"] == "truncated":
+            coverage["outcome_truncated_records"] += 1
         if fields["status"] == "truncated":
             coverage["capture_truncated_records"] += 1
         return True
@@ -1476,6 +1505,10 @@ def _capacity_request_telemetry(
         "capture_lost_requests": 0, "capture_rows": 0,
         "capture_lost_rows": 0, "capture_truncated_records": 0,
         "capture_malformed_records": 0,
+        "plan_selected": 0, "header_set": 0, "header_already_sent": 0,
+        "header_unavailable": 0, "header_error": 0, "selector_invalid": 0,
+        "selector_unmatched": 0, "selector_capacity": 0,
+        "outcome_truncated_records": 0,
     }
     for raw in web_raw:
         message = _message_text(raw)
@@ -1603,8 +1636,12 @@ PROFILE_API_MESSAGE_RE = re.compile(
 PROFILE_WEB_MESSAGE_RE = re.compile(
     r"^cpu_diagnostic_complete service=web run_id=([0-9a-f]{32}) "
     r"timer=v8_cpu start_lag_ms=([0-9]{1,8}) elapsed_ms=([0-9]{1,8}) "
-    r"sample_interval_us=10000 sample_count=([0-9]{1,8}) categories=([^ ]*) "
-    r"top_samples=(.*)$"
+    r"sample_interval_us=10000 sample_count=([0-9]{1,8}) "
+    r"sample_classes=([^ ]*) categories=([^ ]*) top_samples=(.*)$"
+)
+WEB_SAMPLE_CLASS_KEYS = (
+    "idle", "garbage_collector", "program", "unmapped_busy", "known_category",
+    "unclassified",
 )
 NODE_MEMORY_FIELDS = frozenset({
     "service", "run_id", "phase", "sample_count", "status",
@@ -1807,6 +1844,32 @@ def _parse_profile_function_details(
     return details
 
 
+def _parse_web_sample_classes(raw: str, *, sample_count: int) -> dict[str, int] | None:
+    labels = ("idle", "gc", "program", "unmapped_busy", "known_category", "unclassified")
+    parts = raw.split(",")
+    if len(parts) != len(labels):
+        return None
+    values: dict[str, int] = {}
+    for label, token in zip(labels, parts, strict=True):
+        key, separator, value = token.partition(":")
+        if key != label or not separator or not value.isdecimal() or len(value) > 4:
+            return None
+        count = int(value)
+        if count > MAX_SAMPLES_PROFILE:
+            return None
+        values[label] = count
+    if sum(values.values()) != sample_count:
+        return None
+    return {
+        "idle": values["idle"],
+        "garbage_collector": values["gc"],
+        "program": values["program"],
+        "unmapped_busy": values["unmapped_busy"],
+        "known_category": values["known_category"],
+        "unclassified": values["unclassified"],
+    }
+
+
 def _parse_profile_categories(
     raw: str,
     *,
@@ -1953,6 +2016,7 @@ def _usage_summary(
                 "end_lag_ms_max": None,
                 "total_cpu_us": None,
                 "sample_count": None,
+                "sample_class_counts": None,
                 "categories": [],
                 "function_details": {
                     "top_self": [], "top_cumulative": [], "top_samples": [],
@@ -2280,16 +2344,20 @@ def _usage_summary(
                     raw_top_cumulative = profile_api_match.group(7)
                     raw_top_samples = ""
                     sample_count = None
+                    sample_class_counts = None
                     timer = "thread_cpu"
                 else:
                     assert profile_web_match is not None
                     start_lag_ms = int(profile_web_match.group(2))
                     elapsed_ms = int(profile_web_match.group(3))
                     sample_count = int(profile_web_match.group(4))
-                    raw_categories = profile_web_match.group(5)
+                    sample_class_counts = _parse_web_sample_classes(
+                        profile_web_match.group(5), sample_count=sample_count,
+                    )
+                    raw_categories = profile_web_match.group(6)
                     raw_top_self = ""
                     raw_top_cumulative = ""
-                    raw_top_samples = profile_web_match.group(6)
+                    raw_top_samples = profile_web_match.group(7)
                     total_cpu_us = 0
                     timer = "v8_cpu"
                 profile_window_ms = _plan_on_window_ms(workload)
@@ -2313,6 +2381,8 @@ def _usage_summary(
                     rejection = "profile_numeric"
                 elif function_details is None:
                     rejection = "profile_function_detail"
+                elif timer == "v8_cpu" and sample_class_counts is None:
+                    rejection = "profile_numeric"
                 elif not 0 <= start_lag_ms <= 250:
                     rejection = "profile_start_lag"
                 elif profile_window_ms is None or not profile_window_ms - 250 <= elapsed_ms <= profile_window_ms + 500:
@@ -2347,6 +2417,7 @@ def _usage_summary(
                     "end_lag_ms": end_lag_ms,
                     "total_cpu_us": total_cpu_us,
                     "sample_count": sample_count,
+                    "sample_class_counts": sample_class_counts,
                     "timer": timer,
                     "categories": categories,
                     "function_details": function_details,
@@ -2511,6 +2582,12 @@ def _usage_summary(
             cumulative_totals.items(), key=lambda pair: (-pair[1][0], pair[0])
         )
         ordered_samples = sorted(sample_totals.items(), key=lambda pair: (-pair[1], pair[0]))
+        sample_class_totals = None
+        if service == "web" and row_complete:
+            sample_class_totals = {
+                key: sum(int(item["sample_class_counts"][key]) for item in flat_profiles)
+                for key in WEB_SAMPLE_CLASS_KEYS
+            }
         function_details = {
             "top_self": [
                 {"function_id": name, "cpu_us": values[0],
@@ -2556,6 +2633,7 @@ def _usage_summary(
                 sum(int(value) for value in sample_counts if value is not None)
                 if row_complete and service == "web" else None
             ),
+            "sample_class_counts": sample_class_totals,
             "categories": category_rows,
             "function_details": function_details,
         })
@@ -2783,6 +2861,7 @@ def cleanup(args: argparse.Namespace) -> dict[str, object]:
                             "end_lag_ms_max": None,
                             "total_cpu_us": None,
                             "sample_count": None,
+                "sample_class_counts": None,
                             "categories": [],
                             "function_details": {
                                 "top_self": [], "top_cumulative": [], "top_samples": [],

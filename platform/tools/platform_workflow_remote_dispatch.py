@@ -208,6 +208,11 @@ CPU_PROFILE_ROW_FIELDS = {
     "observation_unit", "total_cpu_us", "sample_count", "start_lag_ms_min",
     "start_lag_ms_max", "elapsed_ms_min", "elapsed_ms_max", "end_lag_ms_min",
     "end_lag_ms_max", "categories", "function_details",
+    "sample_class_counts",
+}
+CPU_PROFILE_SAMPLE_CLASS_KEYS = {
+    "idle", "garbage_collector", "program", "unmapped_busy", "known_category",
+    "unclassified",
 }
 CPU_PROFILE_CATEGORY_FIELDS = {"category", "cpu_us", "observations"}
 CPU_PROFILE_FUNCTION_IDS = {
@@ -1413,6 +1418,19 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                         return emit_failure("profile_rows", process=process, output=output)
                 if service == "web" and row["sample_count"] is not None and row["sample_count"] > 2400:
                     return emit_failure("profile_rows", process=process, output=output)
+                sample_classes = row.get("sample_class_counts")
+                if service == "api":
+                    if sample_classes is not None:
+                        return emit_failure("profile_rows", process=process, output=output)
+                elif row["sample_count"] is None or row["sample_count"] == 0:
+                    if sample_classes not in (None, {key: 0 for key in CPU_PROFILE_SAMPLE_CLASS_KEYS}):
+                        return emit_failure("profile_rows", process=process, output=output)
+                elif (not isinstance(sample_classes, dict)
+                      or set(sample_classes) != CPU_PROFILE_SAMPLE_CLASS_KEYS
+                      or any(type(count) is not int or not 0 <= count <= 2400
+                             for count in sample_classes.values())
+                      or sum(sample_classes.values()) != row["sample_count"]):
+                    return emit_failure("profile_rows", process=process, output=output)
                 categories: list[dict[str, Any]] = []
                 category_names: list[str] = []
                 failure_stage = "profile_categories"
@@ -1509,6 +1527,7 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                     "observation_unit": observation_unit,
                     "total_cpu_us": row["total_cpu_us"],
                     "sample_count": row["sample_count"],
+                    "sample_class_counts": sample_classes,
                     "start_lag_ms_min": row["start_lag_ms_min"],
                     "start_lag_ms_max": row["start_lag_ms_max"],
                     "elapsed_ms_min": row["elapsed_ms_min"],
