@@ -4368,6 +4368,7 @@ class ExternalLoadTests(unittest.TestCase):
             json_payload: dict[str, object] | None = None,
             expected_statuses: frozenset[int] = frozenset({200}),
             extra_headers: dict[str, str] | None = None,
+            capture_timestamps: bool = False,
         ) -> RequestResult:
             calls.append(
                 {
@@ -4375,6 +4376,7 @@ class ExternalLoadTests(unittest.TestCase):
                     "path": path,
                     "expected_statuses": expected_statuses,
                     "extra_headers": extra_headers,
+                    "capture_timestamps": capture_timestamps,
                 }
             )
             is_refresh = extra_headers is not None
@@ -4429,6 +4431,7 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertEqual(report["phases"]["read_mix"]["requests"], 2)
         self.assertEqual(report["phases"]["manual_refresh"]["requests"], 1)
         self.assertEqual(report["phases"]["manual_refresh"]["status_counts"], {"304": 1})
+        self.assertTrue(all(not call["capture_timestamps"] for call in calls))
         refresh_call = next(call for call in calls if call["phase"] == "manual_workspace_refresh")
         self.assertEqual(refresh_call["expected_statuses"], frozenset({200, 304}))
         self.assertEqual(refresh_call["extra_headers"], {"If-None-Match": '"workspace-etag"'})
@@ -4648,6 +4651,7 @@ class ExternalLoadTests(unittest.TestCase):
         payload = manifest_payload()
         _, users = load_manifest_from_payload(payload)
         calls: list[str] = []
+        timestamp_captures: list[bool] = []
 
         def fake_trace(origin: str, timeout: float) -> dict[str, str]:
             return {"status": "200", "ip": "192.0.2.10", "colo": "TEST"}
@@ -4665,8 +4669,10 @@ class ExternalLoadTests(unittest.TestCase):
             json_payload: dict[str, object] | None = None,
             expected_statuses: frozenset[int] = frozenset({200}),
             extra_headers: dict[str, str] | None = None,
+            capture_timestamps: bool = False,
         ) -> RequestResult:
             calls.append(phase)
+            timestamp_captures.append(capture_timestamps)
             return RequestResult(
                 phase=phase,
                 method=method,
@@ -4704,6 +4710,8 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertFalse(report["authoritative"])
         self.assertFalse(report["dispatchable"])
         self.assertEqual(report["phases"]["read_mix"]["requests"], 4)
+        self.assertTrue(timestamp_captures)
+        self.assertFalse(any(timestamp_captures))
         self.assertEqual(
             report["phases"]["capacity_ramp"]["concurrency_stages"],
             [1, 2],
