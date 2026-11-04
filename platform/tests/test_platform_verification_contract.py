@@ -3455,6 +3455,11 @@ except lock.VerificationLockError as exc:
                 1,
             ),
             autodeploy.replace(
+                "      no_backup_noop_only: ${{ steps.gate.outputs.no_backup_noop_only }}\n",
+                "",
+                1,
+            ),
+            autodeploy.replace(
                 "        if: ${{ needs.dispatch.outputs.backup_required != 'false' }}\n",
                 "        if: ${{ always() }}\n",
                 1,

@@ -2103,7 +2103,7 @@ class WorkflowProvenanceTests(unittest.TestCase):
         )
         self.assertEqual(len(auto_payload_blocks), 1)
         auto_payload_result = subprocess.run(
-            [sys.executable, "-c", textwrap.dedent(auto_payload_blocks[0]), "567", "1", "baseline-reconcile", "678", "1"],
+            [sys.executable, "-c", textwrap.dedent(auto_payload_blocks[0]), "567", "1", "baseline-reconcile", "678", "1", "false"],
             check=False,
             capture_output=True,
             text=True,
@@ -2122,6 +2122,7 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 "classifier_run_attempt": "1",
                 "autodeploy_run_id": "678",
                 "autodeploy_run_attempt": "1",
+                "no_backup_noop_only": "false",
             },
         )
 

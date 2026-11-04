@@ -339,8 +339,12 @@ def source_bound_backup_dispatch_issues(workflow_text: str) -> list[str]:
     if guard.get("if") != expected_guard_if:
         issues.append("initial backup proof must run for every route except the exact validated backup exemption")
     dispatch_outputs = dispatch_job_config.get("outputs", {})
-    if not isinstance(dispatch_outputs, dict) or dispatch_outputs.get("backup_required") != "${{ steps.gate.outputs.backup_required }}":
-        issues.append("dispatch job must expose the validated closed backup requirement")
+    if (
+        not isinstance(dispatch_outputs, dict)
+        or dispatch_outputs.get("backup_required") != "${{ steps.gate.outputs.backup_required }}"
+        or dispatch_outputs.get("no_backup_noop_only") != "${{ steps.gate.outputs.no_backup_noop_only }}"
+    ):
+        issues.append("dispatch job must expose both validated backup policy outputs")
     expected_env = {
         "GH_TOKEN": "${{ github.token }}",
         "GITHUB_REPOSITORY": "${{ github.repository }}",
@@ -374,16 +378,25 @@ def source_bound_backup_dispatch_issues(workflow_text: str) -> list[str]:
     if (
         not isinstance(dispatch_env, dict)
         or dispatch_env.get("BACKUP_REQUIRED") != "${{ needs.dispatch.outputs.backup_required }}"
+        or dispatch_env.get("NO_BACKUP_NOOP_ONLY") != "${{ needs.dispatch.outputs.no_backup_noop_only }}"
         or not isinstance(dispatch_run, str)
         or '"$BACKUP_REQUIRED" == "true"' not in dispatch_run
         or '"$BACKUP_REQUIRED" == "false"' not in dispatch_run
         or '[[ "$BACKUP_REQUIRED" == "true" || "$BACKUP_REQUIRED" == "false" ]]' not in dispatch_run
+        or '"$NO_BACKUP_NOOP_ONLY" == "true"' not in dispatch_run
+        or '"$NO_BACKUP_NOOP_ONLY" == "false"' not in dispatch_run
         or "baseline-reconcile)" not in dispatch_run
-        or "Exact docs-only baseline reconciliation must not require an application backup" not in dispatch_run
-        or "Non-docs baseline reconciliation requires an exact source-bound backup" not in dispatch_run
+        or "No-backup baseline reconciliation requires an exact closed no-op-only route." not in dispatch_run
+        or "No-op-only mode cannot be combined with a required backup." not in dispatch_run
+        or '"$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "true"' not in dispatch_run
+        or '"$ROUTE_DOCS_ONLY" == "true"' not in dispatch_run
+        or '"$ROUTE_FALLBACK" == "false"' not in dispatch_run
+        or '"$ROUTE_STORAGE_OPERATIONS_ONLY" == "false"' not in dispatch_run
+        or '"$ROUTE_OUT_OF_SCOPE_ONLY" == "false"' not in dispatch_run
+        or '"no_backup_noop_only": sys.argv[6]' not in dispatch_run
         or "backup requirement is missing or malformed" not in dispatch_run
     ):
-        issues.append("child dispatch must fail closed on backup requirement and exempt only exact docs-only baseline reconciliation")
+        issues.append("child dispatch must fail closed on backup requirement and allow only closed no-op-only baseline routes")
     final_steps = final_job_config.get("steps")
     if not isinstance(final_steps, list):
         issues.append("final production dispatch job must define its ordered steps")

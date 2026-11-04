@@ -1196,20 +1196,24 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         self.assertIn("BACKUP_GUARD_TOOL: ${{ github.workspace }}/platform/tools/platform_backup_success_guard.py", autodeploy)
         gate_script = _workflow_run_scalar(autodeploy, "Verify tested SHA is current dev head")
         policy_start = gate_script.index("backup_required=true\n")
-        policy_end = gate_script.index('echo "backup_required=$backup_required" >> "$GITHUB_OUTPUT"', policy_start) + len(
-            'echo "backup_required=$backup_required" >> "$GITHUB_OUTPUT"'
+        policy_end = gate_script.index('echo "no_backup_noop_only=$no_backup_noop_only" >> "$GITHUB_OUTPUT"', policy_start) + len(
+            'echo "no_backup_noop_only=$no_backup_noop_only" >> "$GITHUB_OUTPUT"'
         )
         backup_policy = 'dispatch_mode="$DISPATCH_MODE"\n' + gate_script[policy_start:policy_end]
         route_cases = (
-            ("deploy", "full", "true", "false", "false", "false", "true"),
-            ("baseline-reconcile", "full", "false", "false", "true", "false", "true"),
-            ("baseline-reconcile", "full", "false", "false", "false", "true", "true"),
-            ("baseline-reconcile", "docs-only", "false", "true", "false", "false", "false"),
+            ("deploy", "full", "true", "false", "false", "false", "false", "false", "false", "true", "false"),
+            ("baseline-reconcile", "full", "false", "false", "true", "false", "false", "false", "false", "false", "true"),
+            ("baseline-reconcile", "full", "false", "false", "false", "true", "false", "false", "false", "true", "false"),
+            ("baseline-reconcile", "docs-only", "false", "true", "false", "false", "false", "false", "false", "false", "true"),
             # Inconsistent docs/recovery flags cannot produce the exemption.
-            ("baseline-reconcile", "docs-only", "false", "true", "true", "false", "true"),
+            ("baseline-reconcile", "docs-only", "false", "true", "true", "false", "false", "false", "false", "true", "false"),
+            ("baseline-reconcile", "full", "false", "false", "true", "false", "true", "false", "false", "true", "false"),
+            ("baseline-reconcile", "full", "false", "false", "true", "false", "false", "true", "false", "true", "false"),
+            ("baseline-reconcile", "out-of-scope", "false", "false", "false", "false", "false", "true", "false", "true", "false"),
+            ("baseline-reconcile", "full", "false", "false", "true", "false", "false", "false", "true", "true", "false"),
         )
-        for mode, route_class, deployable, docs_only, recovery_only, candidate_only, expected in route_cases:
-            with self.subTest(backup_policy_route=route_class, mode=mode, expected=expected):
+        for mode, route_class, deployable, docs_only, recovery_only, candidate_only, storage_only, out_of_scope, fallback, expected_backup, expected_noop in route_cases:
+            with self.subTest(backup_policy_route=route_class, mode=mode, expected=expected_backup):
                 with tempfile.TemporaryDirectory() as temporary:
                     output_path = Path(temporary) / "github-output"
                     environment = os.environ.copy()
@@ -1221,6 +1225,9 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
                             "ROUTE_DOCS_ONLY": docs_only,
                             "ROUTE_RECOVERY_BOOTSTRAP_ONLY": recovery_only,
                             "ROUTE_CANDIDATE_PACKAGING_ONLY": candidate_only,
+                            "ROUTE_STORAGE_OPERATIONS_ONLY": storage_only,
+                            "ROUTE_OUT_OF_SCOPE_ONLY": out_of_scope,
+                            "ROUTE_FALLBACK": fallback,
                             "GITHUB_OUTPUT": str(output_path),
                         }
                     )
@@ -1235,7 +1242,7 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(
                         output_path.read_text(encoding="utf-8"),
-                        f"backup_required={expected}\n",
+                        f"backup_required={expected_backup}\nno_backup_noop_only={expected_noop}\n",
                     )
         self.assertIn("github.event.workflow_run.status == 'completed'", autodeploy)
         self.assertIn("github.event.workflow_run.conclusion == 'success'", autodeploy)
@@ -1257,8 +1264,8 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         self.assertIn('"$BACKUP_REQUIRED" == "true"', final_dispatch)
         self.assertIn('"$BACKUP_REQUIRED" == "false"', final_dispatch)
         self.assertIn('"$DISPATCH_MODE" == "baseline-reconcile"', final_dispatch)
-        self.assertIn("Exact docs-only baseline reconciliation must not require an application backup", final_dispatch)
-        self.assertIn("Non-docs baseline reconciliation requires an exact source-bound backup", final_dispatch)
+        self.assertIn("No-backup baseline reconciliation requires an exact closed no-op-only route.", final_dispatch)
+        self.assertIn("No-op-only mode cannot be combined with a required backup.", final_dispatch)
         self.assertIn("backup requirement is unresolved", final_dispatch)
         self.assertIn("platform-production-deploy.yml/dispatches", final_dispatch)
         self.assertNotIn("workflow_run:\n    workflows:\n      - Platform production auto-deploy", autodeploy)
@@ -1271,20 +1278,21 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         )[0]
         self.assertNotIn("curl", validation_script)
         dispatch_cases = (
-            ("ordinary deploy", "deploy", "full", "true", "false", "false", "false", "true", True),
-            ("recovery reconcile", "baseline-reconcile", "full", "false", "false", "true", "false", "true", True),
-            ("candidate reconcile", "baseline-reconcile", "full", "false", "false", "false", "true", "true", True),
-            ("exact docs no-op", "baseline-reconcile", "docs-only", "false", "true", "false", "false", "false", True),
-            ("docs needs backup rejected", "baseline-reconcile", "docs-only", "false", "true", "false", "false", "true", False),
-            ("mixed docs recovery rejected", "baseline-reconcile", "docs-only", "false", "true", "true", "false", "false", False),
-            ("ordinary without backup rejected", "deploy", "full", "true", "false", "false", "false", "false", False),
-            ("ordinary missing backup rejected", "deploy", "full", "true", "false", "false", "false", "missing", False),
-            ("recovery missing backup rejected", "baseline-reconcile", "full", "false", "false", "true", "false", "missing", False),
-            ("candidate missing backup rejected", "baseline-reconcile", "full", "false", "false", "false", "true", "missing", False),
-            ("malformed backup requirement rejected", "baseline-reconcile", "docs-only", "false", "true", "false", "false", "unknown", False),
-            ("storage route cannot dispatch", "baseline-reconcile", "full", "false", "false", "false", "false", "true", False),
+            ("ordinary deploy", "deploy", "full", "true", "false", "false", "false", "false", "false", "true", "false", True),
+            ("recovery no-op", "baseline-reconcile", "full", "false", "false", "true", "false", "false", "false", "false", "true", True),
+            ("recovery no-op flag missing", "baseline-reconcile", "full", "false", "false", "true", "false", "false", "false", "false", "false", False),
+            ("recovery requires backup", "baseline-reconcile", "full", "false", "false", "true", "false", "false", "false", "true", "false", True),
+            ("candidate reconcile", "baseline-reconcile", "full", "false", "false", "false", "true", "false", "false", "true", "false", True),
+            ("exact docs no-op", "baseline-reconcile", "docs-only", "false", "true", "false", "false", "false", "false", "false", "true", True),
+            ("docs exemption flags missing", "baseline-reconcile", "docs-only", "false", "true", "false", "false", "false", "false", "false", "false", False),
+            ("docs required backup conflicts with no-op flag", "baseline-reconcile", "docs-only", "false", "true", "false", "false", "false", "false", "true", "true", False),
+            ("mixed docs recovery rejected", "baseline-reconcile", "docs-only", "false", "true", "true", "false", "false", "false", "false", "true", False),
+            ("ordinary missing backup rejected", "deploy", "full", "true", "false", "false", "false", "false", "false", "missing", "false", False),
+            ("recovery missing backup rejected", "baseline-reconcile", "full", "false", "false", "true", "false", "false", "false", "missing", "false", False),
+            ("malformed backup requirement rejected", "baseline-reconcile", "docs-only", "false", "true", "false", "false", "false", "false", "unknown", "false", False),
+            ("storage route cannot dispatch", "baseline-reconcile", "full", "false", "false", "false", "false", "true", "false", "true", "false", False),
         )
-        for label, mode, route_class, deployable, docs_only, recovery_only, candidate_only, backup_required, accepted in dispatch_cases:
+        for label, mode, route_class, deployable, docs_only, recovery_only, candidate_only, storage_only, out_of_scope, backup_required, no_op_only, accepted in dispatch_cases:
             with self.subTest(dispatch_policy=label):
                 environment = os.environ.copy()
                 environment.update(
@@ -1296,6 +1304,9 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
                         "ROUTE_DOCS_ONLY": docs_only,
                         "ROUTE_RECOVERY_BOOTSTRAP_ONLY": recovery_only,
                         "ROUTE_CANDIDATE_PACKAGING_ONLY": candidate_only,
+                        "ROUTE_STORAGE_OPERATIONS_ONLY": storage_only,
+                        "ROUTE_OUT_OF_SCOPE_ONLY": out_of_scope,
+                        "ROUTE_FALLBACK": "false",
                         "AUTODEPLOY_RUN_ID": "12345",
                         "AUTODEPLOY_RUN_ATTEMPT": "1",
                     }
@@ -1303,6 +1314,7 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
                 environment.pop("BACKUP_REQUIRED", None)
                 if backup_required != "missing":
                     environment["BACKUP_REQUIRED"] = backup_required
+                environment["NO_BACKUP_NOOP_ONLY"] = no_op_only
                 result = subprocess.run(
                     ["/bin/bash", "-c", validation_script],
                     env=environment,
@@ -1312,6 +1324,35 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
                     timeout=5,
                 )
                 self.assertEqual(result.returncode == 0, accepted, result.stderr)
+
+        fallback_environment = os.environ.copy()
+        fallback_environment.update(
+            {
+                "HOST_TOOLS_SHA": "a" * 40,
+                "DISPATCH_MODE": "baseline-reconcile",
+                "ROUTE_CLASS": "full",
+                "ROUTE_DEPLOYABLE": "false",
+                "ROUTE_DOCS_ONLY": "false",
+                "ROUTE_RECOVERY_BOOTSTRAP_ONLY": "true",
+                "ROUTE_CANDIDATE_PACKAGING_ONLY": "false",
+                "ROUTE_STORAGE_OPERATIONS_ONLY": "false",
+                "ROUTE_OUT_OF_SCOPE_ONLY": "false",
+                "ROUTE_FALLBACK": "true",
+                "BACKUP_REQUIRED": "false",
+                "NO_BACKUP_NOOP_ONLY": "true",
+                "AUTODEPLOY_RUN_ID": "12345",
+                "AUTODEPLOY_RUN_ATTEMPT": "1",
+            }
+        )
+        fallback_recovery = subprocess.run(
+            ["/bin/bash", "-c", validation_script],
+            env=fallback_environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        self.assertNotEqual(fallback_recovery.returncode, 0)
 
         missing_backup_environment = os.environ.copy()
         missing_backup_environment.update(
@@ -1323,6 +1364,9 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
                 "ROUTE_DOCS_ONLY": "true",
                 "ROUTE_RECOVERY_BOOTSTRAP_ONLY": "false",
                 "ROUTE_CANDIDATE_PACKAGING_ONLY": "false",
+                "ROUTE_STORAGE_OPERATIONS_ONLY": "false",
+                "ROUTE_OUT_OF_SCOPE_ONLY": "false",
+                "ROUTE_FALLBACK": "false",
                 "AUTODEPLOY_RUN_ID": "12345",
                 "AUTODEPLOY_RUN_ATTEMPT": "1",
             }
