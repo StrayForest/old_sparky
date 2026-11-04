@@ -2144,11 +2144,24 @@ class EvidencePrivacyTests(unittest.TestCase):
                     "email": "operator@example.test",
                     "values": ["/home/operator/private-report.json"],
                 },
+                "failure_diagnostics": {
+                    "failure_stage_counts": {"body_receive": 1},
+                    "observed_status_counts": {"200": 1},
+                    "connection_state_counts": {"reused": 1},
+                },
                 "error_samples": [{
                     "diagnostic_id": "tdiag-123-00001",
                     "path": "https://old-sparky.example/invite/INVITE-CODE?token=secret-token",
                     "message": "password=secret-password",
-                    "status": 500,
+                    "phase": "read_mix_c16",
+                    "method": "GET",
+                    "route_class": "tournament_workspace",
+                    "status": 0,
+                    "error_class": "timeout",
+                    "failure_stage": "body_receive",
+                    "observed_status": 200,
+                    "connection_state": "reused",
+                    "private_failure_detail": "secret-token",
                 }],
                 "timeout_diagnostics": [{
                     "diagnostic_id": "tdiag-123-00002",
@@ -2186,7 +2199,31 @@ class EvidencePrivacyTests(unittest.TestCase):
                 },
                 "capacity_ramp": {
                     "concurrency_stages": [16, 32],
-                    "stages": {"16": {"raw_http": {"requests": 2}}},
+                    "stages": {
+                        "16": {
+                            "raw_http": {"requests": 2},
+                            "ready_check_state": {
+                                "expected_cohort_count": 40,
+                                "observed_cohort_count": 40,
+                                "active_cohort_count": 40,
+                                "missing_cohort_count": 0,
+                                "minimum_remaining_seconds": 4200.0,
+                                "minimum_headroom_seconds": 300.0,
+                                "required_remaining_seconds": 3900.0,
+                                "passed": True,
+                                "tournament_slug": "private-slug",
+                            },
+                        },
+                        "32": {
+                            "ready_check_state": {
+                                "expected_cohort_count": 40,
+                                "observed_cohort_count": 40,
+                                "active_cohort_count": 0,
+                                "missing_cohort_count": 0,
+                                "passed": False,
+                            },
+                        },
+                    },
                     "analysis": {
                         "recommended_max_concurrency": 16,
                         "rollout_required": True,
@@ -2228,6 +2265,29 @@ class EvidencePrivacyTests(unittest.TestCase):
             18.0,
         )
         self.assertEqual(
+            public_report["raw_http"]["failure_diagnostics"],
+            {
+                "failure_stage_counts": {"body_receive": 1},
+                "observed_status_counts": {"200": 1},
+                "connection_state_counts": {"reused": 1},
+            },
+        )
+        self.assertEqual(
+            public_report["raw_http"]["error_samples"][0],
+            {
+                "phase": "read_mix_c16",
+                "method": "GET",
+                "route_class": "tournament_workspace",
+                "error_class": "timeout",
+                "cf_error_class": "none",
+                "cf_error_origin_class": "none",
+                "status": 0,
+                "failure_stage": "body_receive",
+                "observed_status": 200,
+                "connection_state": "reused",
+            },
+        )
+        self.assertEqual(
             public_report["phases"]["write_external_vote_close_a"]["transport"],
             "http1-close",
         )
@@ -2250,6 +2310,48 @@ class EvidencePrivacyTests(unittest.TestCase):
             public_report["phases"]["capacity_ramp"]["analysis"]["recommended_max_concurrency"],
             16,
         )
+        self.assertEqual(
+            public_report["phases"]["capacity_ramp"]["stages"]["16"][
+                "ready_check_state"
+            ],
+            {
+                "expected_cohort_count": 40,
+                "observed_cohort_count": 40,
+                "active_cohort_count": 40,
+                "missing_cohort_count": 0,
+                "minimum_remaining_seconds": 4200.0,
+                "minimum_headroom_seconds": 300.0,
+                "required_remaining_seconds": 3900.0,
+                "passed": True,
+            },
+        )
+        self.assertEqual(
+            public_report["phases"]["capacity_ramp"]["stages"]["32"][
+                "ready_check_state"
+            ],
+            {
+                "expected_cohort_count": 40,
+                "observed_cohort_count": 40,
+                "active_cohort_count": 0,
+                "missing_cohort_count": 0,
+                "passed": False,
+            },
+        )
+        self.assertNotIn("private-slug", public_output)
+        self.assertNotIn("secret-token", public_output)
+        unknown_failure_field = {
+            **external_source,
+            "raw_http": {
+                **external_source["raw_http"],
+                "failure_diagnostics": {
+                    **external_source["raw_http"]["failure_diagnostics"],
+                    "unsafe": "private-failure-data",
+                },
+            },
+        }
+        unknown_projection = project_public_artifact("external_load", unknown_failure_field)
+        self.assertNotIn("failure_diagnostics", unknown_projection["raw_http"])
+        self.assertNotIn("private-failure-data", serialized(unknown_projection))
         self.assertTrue(public_report["report_binding"]["checks"]["run_identity"])
         self.assertNotIn("actual", public_report["report_binding"])
         self.assertNotIn("unknown", public_report)

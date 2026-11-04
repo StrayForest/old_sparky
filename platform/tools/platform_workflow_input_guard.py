@@ -446,6 +446,8 @@ def validate_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         keys.update({"ssr_capacity_concurrency", "ssr_capacity_workload"})
     if schema == 2:
         keys.add("source_binding")
+    if "fixture_schedule" in payload:
+        keys.add("fixture_schedule")
     if set(payload) != keys and set(payload) != keys - {"fixture_kind"}:
         _require_exact_keys(payload, keys)
     confirmation = _require_string(payload, "confirmation")
@@ -473,6 +475,16 @@ def validate_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         "external_load", "cpu_diagnostic_only_v1", "ssr_capacity_diagnostic_v1",
         "ssr_html_capacity_diagnostic_v1", "ssr_html_capacity_composite_diagnostic_v1",
     }:
+        raise _invalid()
+    fixture_schedule = payload.get("fixture_schedule")
+    if "fixture_schedule" in payload and (
+        fixture_schedule != "read-mix-concurrency-ramp-v1"
+        or fixture_kind != "external_load"
+        or timeout_diagnostics != "false"
+        or tournament_count != "40"
+        or users_per_tournament != "500"
+        or confirmation != EXTERNAL_CONFIRMATION
+    ):
         raise _invalid()
     if fixture_kind in {
         "cpu_diagnostic_only_v1", "ssr_capacity_diagnostic_v1",
@@ -536,6 +548,8 @@ def validate_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
     if "fixture_kind" in payload:
         result["fixture_kind"] = fixture_kind
+    if "fixture_schedule" in payload:
+        result["fixture_schedule"] = fixture_schedule
     if fixture_kind in {
         "ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1",
         "ssr_html_capacity_composite_diagnostic_v1",

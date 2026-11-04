@@ -1,12 +1,13 @@
 import asyncio
 from contextlib import nullcontext
+from datetime import UTC, datetime, timedelta
 import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 from tools.platform_prepare_external_vote_fixture import (
@@ -14,9 +15,11 @@ from tools.platform_prepare_external_vote_fixture import (
     FixtureStageTimings,
     prepare,
     project_fixture_timing_summary,
+    summarize_fixture_setup_http,
     write_fixture_timing_receipt,
 )
 from tools.platform_production_qa import (
+    HttpMetricsRecorder,
     ProductionQa,
     is_local_origin,
     normalize_path_for_slugs,
@@ -25,6 +28,83 @@ from tools.platform_production_qa import (
 
 
 class ProductionQaContractTests(unittest.TestCase):
+    def test_external_fixture_setup_http_summary_is_route_and_status_aggregated(self) -> None:
+        recorder = HttpMetricsRecorder()
+        for method, path, status, ok, elapsed, response_bytes in (
+            ("POST", "/tournaments", 201, True, 0.2, 240),
+            ("POST", "/tournaments/private-slug/join", 201, True, 0.1, 120),
+            ("PATCH", "/tournaments/private-slug/status", 500, False, 0.4, 80),
+            ("POST", "/unrecognized/private-id", 400, False, 0.3, 40),
+        ):
+            recorder.record(
+                phase="external_vote_fixture_setup",
+                method=method,
+                path=path,
+                status_code=status,
+                elapsed_seconds=elapsed,
+                ok=ok,
+                started_at=1.0,
+                finished_at=1.0 + elapsed,
+                response_bytes=response_bytes,
+            )
+        summary = summarize_fixture_setup_http(SimpleNamespace(http_metrics=recorder))
+        self.assertEqual(summary["requests"], 4)
+        self.assertEqual(summary["errors"], 2)
+        self.assertEqual(
+            summary["by_route"]["POST tournaments_collection"]["status_counts"],
+            {"201": 1},
+        )
+        self.assertEqual(
+            summary["by_route"]["PATCH tournament_detail"]["response_bytes_total"],
+            80,
+        )
+        self.assertEqual(summary["by_route"]["other"]["errors"], 1)
+        self.assertNotIn("private-slug", json.dumps(summary))
+        self.assertNotIn("private-id", json.dumps(summary))
+
+    def test_read_mix_fixture_schedule_uses_supported_future_ready_window(self) -> None:
+        qa = ProductionQa(
+            origin="http://127.0.0.1",
+            report_path=Path("/tmp/platform-production-qa-schedule-test.json"),
+            http_timeout=1.0,
+            keep_data=True,
+            mode="write-burst",
+            scale_users=500,
+            write_burst_users_per_tournament=500,
+        )
+        create_response = {"id": "tournament-id", "slug": "scheduled-fixture"}
+        request_as = AsyncMock(side_effect=(create_response, {}))
+        qa.request_as = request_as
+
+        result = asyncio.run(
+            qa.create_write_burst_tournament(
+                object(),
+                organizer={"id": "organizer-id"},
+                label="external_ready",
+                index=1,
+                scheduled_ready_window=True,
+            )
+        )
+
+        create_payload = request_as.await_args_list[0].kwargs["json_payload"]
+        registration_close = datetime.fromisoformat(
+            create_payload["registration_closes_at"].replace("Z", "+00:00")
+        )
+        ready_start = datetime.fromisoformat(
+            create_payload["ready_check_starts_at"].replace("Z", "+00:00")
+        )
+        ready_end = datetime.fromisoformat(
+            create_payload["ready_check_ends_at"].replace("Z", "+00:00")
+        )
+        captain_start = datetime.fromisoformat(
+            create_payload["captain_selection_starts_at"].replace("Z", "+00:00")
+        )
+        self.assertGreater(ready_start, datetime.now(UTC))
+        self.assertEqual(ready_start - registration_close, timedelta(minutes=1))
+        self.assertEqual(ready_end - ready_start, timedelta(minutes=120))
+        self.assertEqual(captain_start, ready_end)
+        self.assertEqual(result["slug"], "scheduled-fixture")
+
     def test_rostered_participant_requires_retained_scale_mode(self) -> None:
         kwargs = {
             "origin": "http://127.0.0.1",
@@ -280,20 +360,27 @@ class ProductionQaContractTests(unittest.TestCase):
             self.assertEqual(events, expected_events)
             self.assertTrue(report["passed"])
             self.assertEqual(os.stat(receipt_path).st_mode & 0o777, 0o600)
+            timing_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
             self.assertEqual(
-                json.loads(receipt_path.read_text(encoding="utf-8")),
-                {
-                    "schema": 1,
-                    "clock": "time.perf_counter",
-                    "stages": {
-                        "bulk_user_creation": {"duration_ms": 1250.0, "completed": True},
-                        "permission_grants": {"duration_ms": 2000.0, "completed": True},
-                        "tournament_api_setup": {"duration_ms": 3000.0, "completed": True},
-                        "ready_check_starts": {"duration_ms": 4000.0, "completed": True},
-                        "fixture_finalization": {"duration_ms": 6000.0, "completed": True},
-                    },
-                },
+                set(timing_receipt), {"schema", "clock", "stages", "setup_http"}
             )
+            self.assertEqual(timing_receipt["schema"], 1)
+            self.assertEqual(timing_receipt["clock"], "time.perf_counter")
+            self.assertEqual(timing_receipt["setup_http"], {"requests": 0, "errors": 0, "by_route": {}})
+            for name, duration in (
+                ("bulk_user_creation", 1250.0),
+                ("permission_grants", 2000.0),
+                ("tournament_api_setup", 3000.0),
+                ("ready_check_starts", 4000.0),
+                ("fixture_finalization", 6000.0),
+            ):
+                stage = timing_receipt["stages"][name]
+                self.assertEqual(stage["duration_ms"], duration)
+                self.assertTrue(stage["completed"])
+                self.assertLessEqual(
+                    datetime.fromisoformat(stage["started_at_utc"]),
+                    datetime.fromisoformat(stage["finished_at_utc"]),
+                )
 
             source_summary = {
                 "mode": "write-burst",
@@ -350,6 +437,10 @@ class ProductionQaContractTests(unittest.TestCase):
             self.assertEqual(
                 timing_projection,
                 json.loads(receipt_path.read_text(encoding="utf-8")),
+            )
+            self.assertEqual(
+                projected["external_vote_fixture"]["fixture_setup_http"],
+                timing_receipt["setup_http"],
             )
             self.assertNotIn("private-marker", summary_path.read_text(encoding="utf-8"))
             self.assertNotIn("/private/path", summary_path.read_text(encoding="utf-8"))
@@ -477,9 +568,14 @@ class ProductionQaContractTests(unittest.TestCase):
                 qa_succeeded=False,
             )
             partial = json.loads(summary_path.read_text(encoding="utf-8"))
-            self.assertEqual(
-                partial["external_vote_fixture"]["fixture_setup_timings"]["stages"],
-                {"tournament_api_setup": {"duration_ms": 500.0, "completed": False}},
+            partial_stage = partial["external_vote_fixture"]["fixture_setup_timings"][
+                "stages"
+            ]["tournament_api_setup"]
+            self.assertEqual(partial_stage["duration_ms"], 500.0)
+            self.assertFalse(partial_stage["completed"])
+            self.assertLessEqual(
+                datetime.fromisoformat(partial_stage["started_at_utc"]),
+                datetime.fromisoformat(partial_stage["finished_at_utc"]),
             )
 
     def test_tournament_lifecycle_uses_the_current_workspace_and_profile_flow(self) -> None:

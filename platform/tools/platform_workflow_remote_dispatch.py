@@ -3533,6 +3533,11 @@ def _external_fixture(
         "ssr_html_capacity_composite_diagnostic_v1",
     }:
         arguments.extend(("--fixture-kind", fixture_kind))
+    fixture_schedule = payload.get("fixture_schedule")
+    if fixture_schedule is not None:
+        if fixture_schedule != "read-mix-concurrency-ramp-v1":
+            return 2
+        arguments.extend(("--fixture-schedule", fixture_schedule))
     if (
         EXTERNAL_HELPER.parent != ACTIVE_TOOLS_DIR
         or not EXTERNAL_HELPER.is_file()

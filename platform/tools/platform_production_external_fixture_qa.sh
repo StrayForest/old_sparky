@@ -67,6 +67,7 @@ source_binding_b64=""
 run_attempt=""
 input_handoff_sha256=""
 fixture_kind=""
+fixture_schedule=""
 if (( $# < 7 || $# > 16 )); then
   echo "Usage: $0 $EXTERNAL_CONFIRMATION <target-sha> <concurrency> <run-id> external-vote <tournament-count> <users-per-tournament> [timeout-path] [typed options]" >&2
   exit 2
@@ -116,6 +117,13 @@ while (( $# >= next_extra_arg )); do
       }
       fixture_kind="$value"
       ;;
+    --fixture-schedule)
+      [[ -z "$fixture_schedule" && "$value" == "read-mix-concurrency-ramp-v1" ]] || {
+        echo "External-load fixture schedule is invalid." >&2
+        exit 2
+      }
+      fixture_schedule="$value"
+      ;;
     *)
       echo "Unexpected external-load fixture option." >&2
       exit 2
@@ -134,6 +142,13 @@ fi
   echo "External-load fixture supports only the external-vote profile." >&2
   exit 1
 }
+if [[ -n "$fixture_schedule" ]] && [[ "$fixture_kind" != "external_load" \
+  || "$external_vote_tournament_count" != "40" \
+  || "$external_vote_users_per_tournament" != "500" \
+  || "$timeout_diagnostics" != "false" ]]; then
+  echo "Scheduled Ready Check fixture does not match the exact read-mix profile." >&2
+  exit 1
+fi
 [[ "$target_sha" =~ ^[0-9a-f]{40}$ ]] || {
   echo "Target SHA must be a lowercase 40-character commit SHA." >&2
   exit 1
@@ -445,6 +460,9 @@ record_progress() {
 fixture_source_binding_args=(--runner-sha "$target_sha")
 if [[ -n "$source_binding_b64" ]]; then
   fixture_source_binding_args+=(--source-binding-base64 "$source_binding_b64")
+fi
+if [[ -n "$fixture_schedule" ]]; then
+  fixture_source_binding_args+=(--fixture-schedule "$fixture_schedule")
 fi
 
 set +e

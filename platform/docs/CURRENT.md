@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-11-02
+- Last reviewed: 2026-11-04
 
 Read this page for live pins, pending release work, open QA gates and hard
 operational limits. Product contracts, procedures and detailed run evidence
@@ -10,42 +10,52 @@ belong in the linked owner documents below.
 
 ## Live and pending state
 
-- Production app source S12 is `009062a7812552897e92490818bd699858a0f4f9`
-  (`gha-41400373353-1-009062a78125`); previous app source S11 is
-  `d74adf9df950665affa523029801d5ecc49f611c`. Installed host-tools generation
-  C is `5a8d4c69e208d096af418f67dfba1ef1cf630aa0`, toolset v4; generation
-  `92fd34fd81e85ac71a14b2ea8ecf68d0731849a7` remains preserved. Keep runner,
-  app and host-tools source identities distinct in every receipt.
-- Exact-source Security `41398260324/1`, backup `41398501956/1`, AUTO
-  `41399761466/1` and deployment `41400373353/1` succeeded. The source-bound
-  backup was restore-verified with 36 tables and preserved existing archives.
-  That records the then-deployed S12 policy; the reviewed keep-one retention
-  change is not active until its exact source is merged and deployed.
-  The merged read-only readiness collector did not produce a ready record: it
-  failed closed with `HostToolsPinError` before collecting the effective
-  profile, health and lock fields. S12 therefore has no fresh readiness pass
-  and no S12 effective-profile claim.
-- The last verified profile remains the S11 snapshot, not a current S12
-  readiness result. The prior run `41393226256/1` was a prefixture no-op and
-  earns no measurement or capacity credit. Do not dispatch a new diagnostic
-  until the release-layout pin validation fix passes exact-source CI, its
-  read-only verification path is independently reviewed, and readiness passes
-  for the installed app source and C generation. A separately staged verifier
-  can establish readiness only; it does not authorize runtime or fixture
-  mutations. Use the
+- Production app release P4 (`72bafc12` prefix) is active with host-tools
+  generation C `da8e1275` prefix. Main-load workflow source S is
+  `01b6c0991ed33218e5abae9bcabe7f5c1322ee4d`; it is a separate runner identity,
+  not the deployed application source. Exact-source Security
+  `41795419693/1`, AUTO `41797244771/1`, and the verified no-op child
+  `41797485924/1` bind runner S to the unchanged active app P4. One verified
+  source-bound backup is retained; storage review `41800306654/1` completed.
+  Keep S, app P4 and host-tools C distinct in every row and artifact.
+- The corrected 120-second SSR plus 20-second CPU-profile diagnostic
+  `41798744468/1` completed successfully and its exact fixture cleanup passed.
+  It is an SSR capacity/diagnostic result, not a cell in the 11-profile
+  external-load matrix. Use the
   [SSR capacity diagnostic runbook](ssr-capacity-diagnostic-runbook.md) for
-  dispatch, acceptance, abort and cleanup.
-- Source-bound backup admission requires one successful producer bound to the
-  exact merged source SHA and Security run/attempt. Follow the
+  its separate acceptance and cleanup contract.
+- The 11-profile external-load matrix remains in progress against P4/C with
+  runner source S above. Cell 10, `ready-vote-stress-15k-v2` run
+  `41823168149/1`, completed exact cleanup (30 tournaments and 15,000 users
+  deleted; control preserved) but failed its stress-behavior contract under
+  503 overload; idempotency checks found no state violation. Cell 11,
+  `ready-vote-stress-20k-v2` run `41825666178/1`, completed exact cleanup
+  (40 tournaments and 20,000 users deleted; control preserved) but failed the
+  stress-behavior contract: 16,520/21,000 logical actions succeeded and
+  24,224/40,744 HTTP requests returned 503. Cell 9,
+  `read-mix-concurrency-ramp-v1`, was
+  deferred before dispatch because the original fixture's 10-minute Ready
+  Check TTL could expire during its ~27-minute ramp. It remains pending until
+  the corrected runner and installed origin-helper release; record actual app
+  and host-tools pins from that receipt. Cell outcomes and scope are in the
+  [performance evidence](../performance/README.md#current-11-profile-production-matrix).
+  Do not switch app or host-tools profiles during an active cell.
+- Production backup, deployment and source-binding rules remain owned by the
+  [deployment runbook](deployment-runbook.md) and
   [backup and restore runbook](backup-restore-runbook.md).
 
 ## Open QA and cleanup gates
 
-- The SSR composite has no accepted result. The next run must use the corrected
-  credential transport after its normal release and readiness gates pass. The
-  current readiness blocker is the release-layout host-tools pin validator;
-  the prior prefixture run remains zero-credit. See the
-  [SSR capacity diagnostic runbook](ssr-capacity-diagnostic-runbook.md).
+- The 11-profile matrix is not complete while any cell is running, omitted or
+  missing authoritative cleanup. Record each profile's own contract outcome;
+  a complete execution can still fail its SLO/behavior target. Do not describe
+  this external HTTP matrix as whole-site functional coverage. See the
+  [matrix procedure and scope](../performance/README.md#current-11-profile-production-matrix).
+- Original cell 7 `authenticated-page-load-v2` had 53 timeouts out of 20,000
+  requests (0.265%) whose transport stage and observed response status were
+  absent from its public summary. After the corrected runner and origin helper
+  are released, run one targeted `authenticated-page-load-v2` diagnostic
+  repeat; do not repeat the full matrix for this question.
 
 ## Hard operational limits
 

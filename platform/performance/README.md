@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform performance
-- Last reviewed: 2026-10-30
+- Last reviewed: 2026-11-04
 
 The top-level JSON files in `profiles/` are the only authored canonical load
 contracts (schema 2). `tools/platform_load.py` validates, fingerprints and
@@ -117,6 +117,155 @@ preproduction harness concern. Derive this portfolio from the executable
 [profile registry](../tools/platform_load.py)
 and the reviewed [production workflow choices](../../.github/workflows/platform-production-external-load.yml),
 not from retained report counts.
+
+## Current 11-profile production matrix
+
+The production matrix is running serially against a fixed runtime: active
+application P4 (`72bafc12` prefix), host-tools generation C (`da8e1275`
+prefix), and workflow runner source S
+`01b6c0991ed33218e5abae9bcabe7f5c1322ee4d`. S is bound to the still-active P4
+through the successful exact-source Security/AUTO verified no-op chain
+`41795419693/1` → `41797244771/1` → `41797485924/1`; this does not deploy S or
+change P4/C. The retained backup and storage review are recorded in
+[`CURRENT.md`](../docs/CURRENT.md). The successful 120s+20s SSR diagnostic
+`41798744468/1` and its cleanup are separate evidence and are not a matrix
+cell. No profiling or runtime-profile switch is part of this matrix.
+
+Run one profile at a time in this order, using the canonical external-load
+workflow dispatch and hidden control-account prompt in the
+[operations runbook](../docs/operations-runbook.md#live-production-external-load):
+change only `profile_id` for each cell; never batch-dispatch the matrix.
+
+1. `ready-vote-slo-v2`
+2. `read-mix-human-v2`
+3. `ready-vote-spike-v1`
+4. `ready-vote-capacity-ramp-v2`
+5. `read-mix-stress-v2`
+6. `authenticated-page-load-v1`
+7. `authenticated-page-load-v2`
+8. `ready-vote-saturation-ramp-v4`
+9. `read-mix-concurrency-ramp-v1`
+10. `ready-vote-stress-15k-v2`
+11. `ready-vote-stress-20k-v2` — run only if all prior cells have closed
+    cleanly and the operator's current safety/preflight checks still pass;
+    otherwise mark it not run and leave the matrix incomplete.
+
+Current disposition (2026-11-04): the original runs used runner source S
+`01b6c0991ed33218e5abae9bcabe7f5c1322ee4d` on app P4 (`72bafc12` prefix) and
+host-tools C (`da8e1275` prefix). Cell 9 was deferred before dispatch because
+the fixture's 10-minute Ready Check TTL could expire during its approximately
+27-minute ramp. It remains pending until the corrected runner and installed
+origin-helper release are both proven by the normal release receipt. Record
+the actual app and host-tools pins from that receipt; the runner commit alone
+does not establish them.
+
+| Cell | Profile | Contract result | Exact cleanup |
+| ---: | --- | --- | --- |
+| 1 | `ready-vote-slo-v2` | SLO PASS | PASS |
+| 2 | `read-mix-human-v2` | SLO PASS | PASS |
+| 3 | `ready-vote-spike-v1` | SPIKE BEHAVIOR PASS | PASS |
+| 4 | `ready-vote-capacity-ramp-v2` | CAPACITY TARGET PASS through tested 80 actions/s | PASS |
+| 5 | `read-mix-stress-v2` | STRESS BEHAVIOR FAIL on whole-cohort logical delay under saturated c128; 30,000/30,000 HTTP requests succeeded, including 10,000 conditional 304s | PASS |
+| 6 | `authenticated-page-load-v1` | STRESS BEHAVIOR FAIL on whole-cohort schedule delay; 20,000 HTTP 200 responses | PASS |
+| 7 | `authenticated-page-load-v2` | STRESS BEHAVIOR FAIL; 53/20,000 `GET tournament_detail` requests timed out; retained samples show status 0 and about 30 seconds; time clustering and Nginx reconciliation unresolved | PASS |
+| 8 | `ready-vote-saturation-ramp-v4` | STRESS BEHAVIOR PASS under contract despite bounded 503 responses and shedding | PASS |
+| 9 | `read-mix-concurrency-ramp-v1` | Deferred before dispatch; strict knee comparison invalid under the original 10-minute Ready Check TTL | No fixture created |
+| 10 | `ready-vote-stress-15k-v2` | STRESS BEHAVIOR FAIL: 2,804/15,000 primary actions and 101/750 same-state duplicates failed; all HTTP errors were 503, with no idempotency state violation | PASS |
+| 11 | `ready-vote-stress-20k-v2` | STRESS BEHAVIOR FAIL: 16,520/21,000 logical actions succeeded; 24,224/40,744 HTTP requests returned 503 | PASS |
+
+For cell 11, exact cleanup removed 40 tournaments and 20,000 fixture users and
+preserved the control account. Nginx totals matched the client report. Origin
+samples showed CPU pressure and no database lock queue; the relation between
+controller `pressure` states and individual 503s, and the protective-shed
+trigger, remain unproven. Cells 10 and 11 failed their authored action
+thresholds; a 503 response alone does not determine the contract outcome.
+The 11-profile matrix remains incomplete until cell 9 runs on the corrected
+runner and installed origin helper and its exact cleanup passes.
+
+Before the first cell, confirm `dev` and the exact Security result match S,
+the successful AUTO/no-op receipt binds S to active app P4, the active host
+pin is C, readiness is green, no load/maintenance/release/cleanup lock or
+marker is held, and the existing backup, disk-space and maintenance gates
+pass. Do not change S, P4, C, or the selected runtime profile during the
+sequence. These are workload-profile dispatches, not permission to apply a
+runtime configuration.
+
+For every cell, dispatch one run with that exact `profile_id`; record run ID,
+attempt, runner `SOURCE_GIT_SHA`, active `APP_TARGET_SHA`, host-tools C,
+profile version/digest and the sanitized artifact identities. Keep fixture
+setup evidence separate from measurement: setup's API registrations,
+fixture-created user/tournament counts and `setup_status` are preparation
+activity, not measured client HTTP requests, logical actions, rate or
+throughput. Origin observer traffic is also not part of the client request
+denominator. The profile's canonical JSON owns its fixture size, traffic,
+expected statuses and pass/fail limits; do not override them or compare a
+complete stress behavior result to an ordinary-traffic SLO.
+Fixture size is profile-specific and can reach 40 tournaments × 500 users
+(20,000 users); do not assume every cell uses that maximum.
+For `read-mix-concurrency-ramp-v1`, the fixture uses the public scheduled
+tournament workflow: registration closes at +4 minutes, Ready Check starts at
++5 minutes, and its 120-minute window is profile-bound. The normal automation
+worker creates each round; the fixture waits at most 360 seconds for all 40 to
+become active and fails if the minimum deadline remaining is at most 65
+minutes. The external runner then validates every concurrency stage against
+the workspace responses already in that stage's read mix: each stage must
+observe an active round for all 40 tournaments, and every response must leave
+more time than the load runtime's remaining budget plus a five-minute startup
+margin. Missing, closed, stale-clock, or near-expiry state invalidates that
+stage. Public evidence contains only cohort counts, minimum remaining time,
+and minimum headroom over the per-response requirement; identifiers and
+response bodies are not retained. Other profiles keep their existing manual
+Ready Check setup.
+The private fixture timing receipt keeps monotonic stage durations and UTC
+start/end bounds. Its safe matrix projection also includes aggregate status,
+error, latency and response-byte metrics for tournament create, join and
+registration-close API requests; these setup requests remain outside the
+external runner's measured HTTP population.
+
+After the corrected runner and origin helper are published, run one targeted
+`authenticated-page-load-v2` diagnostic repeat to expose the original 53
+timeouts' failure-stage, observed-status and connection-state breakdown. Do
+not repeat the full 11-profile matrix for this diagnosis. The external-load
+matrix remains distinct from whole-site functional QA and does not establish
+registration, profile, tournament administration or complete lifecycle
+coverage.
+
+Accept a cell only after the exact-source workflow and external client finish,
+the client report validates against that profile's schema and acceptance
+contract, and the run-bound finalizer passes exact cleanup, namespace/origin
+boundary and control-account preservation checks. Use the canonical public
+client projection `external-client/external-load.json` from the exact
+`platform-production-external-load-<run_id>-<attempt>` artifact directly; it
+is marked `public_projection=true` and `authoritative=false`. When present,
+preserve its numeric `phases.ramp.phases` rows for per-step counts, offered
+rates, latency and window evidence. Select needed numeric fields
+programmatically without dumping per-request IDs or private inputs; no second
+sanitizer/projection is required. The origin `server-observability.json` and
+exact cleanup receipt are required alongside it. The
+`external-evidence/matrix-summary.json` artifact is fixture-provisioning/setup
+evidence only; it is not the HTTP workload result.
+`request_perf` rows are a selected server-side diagnostic sample, not the
+client request population. Align host/CPU observations to measured phase
+bounds and use the public client report as the request denominator. The exact
+workflow evaluator and cleanup receipt own acceptance; the public projection
+does not. Record the result as PASS, FAIL, INVALID or NOT RUN; a complete run
+may still fail its target.
+Do not dispatch the next cell until cleanup is terminal and verified. On a
+cancelled, incomplete or ambiguous run, keep the sequence stopped and follow
+the same-run abort and cleanup procedure in the
+[retained-load runbook](../docs/retained-load-and-web-verification.md). Never
+reuse a fixture, infer cleanup from an envelope marker, or publish the
+temporary fixture manifest.
+
+This matrix measures Ready Vote request behavior, authenticated read routes,
+and authenticated HTML HTTP responses under the versioned profiles. It does
+not perform real account signup, email verification, interactive browser UI
+testing, or the full tournament lifecycle. The 10,000-user tournament
+lifecycle QA contour described in the operations runbook is QA/preproduction
+only and must never be pointed at production; no configured QA target is part
+of this production matrix. Therefore these load results are not a claim of
+whole-site functional coverage. Keep browser/live-user QA and the separate
+QA-only lifecycle acceptance as separate gates.
 
 Each profile owns its versioned fixture shape, setup concurrency, offered
 logical actions, HTTP concurrency, spread, timeout, retry policy, expected
@@ -753,9 +902,10 @@ This explains only run
 and the original confinement/restore failure `38261983678` also remains
 UNKNOWN; do not relabel either as this callsite bug.
 
-The external 11-profile matrix remains 5/11 complete; this workflow repair
-adds no load-profile result or server-capacity evidence. Human browser and
-Turnstile QA, the remaining six profiles, separate CPU validation, final QA,
+At this 2026-10-14 checkpoint, the external 11-profile matrix stood at 5/11
+complete; this workflow repair added no load-profile result or server-capacity
+evidence. Human browser and Turnstile QA, the remaining six profiles, separate
+CPU validation, final QA,
 and healthy maintenance-timer completion remain outstanding.
 
 A read-only snapshot of the current live `platformdb` (2026-10-15 14:52:18

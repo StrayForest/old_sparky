@@ -65,6 +65,9 @@ SAFE_ERROR_CLASSES = frozenset(
 SAFE_CF_ERROR_CLASSES = frozenset(
     {"none", "cf_520", "cf_521", "cf_522", "cf_523", "cf_524", "origin", "other"}
 )
+PUBLIC_FAILURE_STAGE_CLASSES = frozenset(
+    {"connect_or_request_write", "response_headers", "body_receive", "unknown", "other"}
+)
 SAFE_BACKENDS = frozenset({"api", "web", "worker", "qa", "observer", "postgres", "other"})
 SAFE_PROFILE_SIGNAL_REASONS = frozenset(
     {
@@ -1551,7 +1554,69 @@ def _project_error_row(value: Any) -> dict[str, Any]:
         number = _copy_number(source, key)
         if number is not None:
             output[key] = number
+    if "failure_stage" in source:
+        failure_stage = source.get("failure_stage")
+        output["failure_stage"] = (
+            failure_stage
+            if isinstance(failure_stage, str)
+            and failure_stage in PUBLIC_FAILURE_STAGE_CLASSES
+            else "other"
+        )
+    if "observed_status" in source:
+        output["observed_status"] = _copy_status(source, "observed_status")
+    if "connection_state" in source:
+        connection_state = source.get("connection_state")
+        output["connection_state"] = (
+            connection_state
+            if isinstance(connection_state, str)
+            and connection_state in {"reused", "new", "unknown"}
+            else "unknown"
+        )
     return output
+
+
+def _project_failure_diagnostics(
+    value: Any,
+    *,
+    expected_errors: int,
+) -> dict[str, Any] | None:
+    source = _mapping(value)
+    required = {
+        "failure_stage_counts",
+        "observed_status_counts",
+        "connection_state_counts",
+    }
+    if set(source) != required:
+        return None
+
+    def counter(raw: Any, allowed: frozenset[str]) -> dict[str, int] | None:
+        values = _mapping(raw)
+        if set(values) - allowed:
+            return None
+        output: dict[str, int] = {}
+        for key, number in values.items():
+            if type(number) is not int or not 0 <= number <= 1_000_000_000:
+                return None
+            output[key] = number
+        if sum(output.values()) != expected_errors:
+            return None
+        return dict(sorted(output.items()))
+
+    stages = counter(source.get("failure_stage_counts"), PUBLIC_FAILURE_STAGE_CLASSES)
+    statuses_allowed = frozenset(
+        {"unknown", *(str(status) for status in range(100, 600))}
+    )
+    statuses = counter(source.get("observed_status_counts"), statuses_allowed)
+    connections = counter(
+        source.get("connection_state_counts"), frozenset({"reused", "new", "unknown"})
+    )
+    if stages is None or statuses is None or connections is None:
+        return None
+    return {
+        "failure_stage_counts": stages,
+        "observed_status_counts": statuses,
+        "connection_state_counts": connections,
+    }
 
 
 def _project_error_rows(value: Any, *, limit: int = 64) -> list[dict[str, Any]]:
@@ -1665,6 +1730,14 @@ def _project_summary(value: Any) -> dict[str, Any]:
         counters = _project_counter(source.get(key), SAFE_ERROR_CLASSES | SAFE_CF_ERROR_CLASSES)
         if counters:
             output[key] = counters
+    expected_errors = _copy_int(source, "errors")
+    if expected_errors is not None:
+        failure_diagnostics = _project_failure_diagnostics(
+            source.get("failure_diagnostics"),
+            expected_errors=expected_errors,
+        )
+        if failure_diagnostics is not None:
+            output["failure_diagnostics"] = failure_diagnostics
     changed = _project_counter(source.get("changed_counts"), frozenset({"False", "True"}))
     if changed:
         output["changed_counts"] = changed
@@ -1838,11 +1911,55 @@ def _project_phase(value: Any) -> dict[str, Any]:
         if concurrency is None:
             continue
         projected = _project_summary(raw_value)
+        if isinstance(raw_value, Mapping):
+            ready_state = _project_ready_check_state(raw_value.get("ready_check_state"))
+            if ready_state is not None:
+                projected["ready_check_state"] = ready_state
         if projected:
             stage_output[str(concurrency)] = projected
     if stage_output:
         output["stages"] = dict(sorted(stage_output.items(), key=lambda item: int(item[0])))
     return output
+
+
+def _project_ready_check_state(value: Any) -> dict[str, Any] | None:
+    """Project only aggregate, identifier-free read-ramp state evidence."""
+
+    source = _mapping(value)
+    output: dict[str, Any] = {}
+    for key in (
+        "expected_cohort_count",
+        "observed_cohort_count",
+        "active_cohort_count",
+        "missing_cohort_count",
+    ):
+        number = safe_int(source.get(key), maximum=64)
+        if number is not None:
+            output[key] = number
+    for key in (
+        "minimum_remaining_seconds",
+        "minimum_headroom_seconds",
+        "required_remaining_seconds",
+    ):
+        number = _copy_number(source, key)
+        if number is not None:
+            output[key] = number
+    passed = _copy_bool(source, "passed")
+    if passed is not None:
+        output["passed"] = passed
+    required = {
+        "expected_cohort_count",
+        "observed_cohort_count",
+        "active_cohort_count",
+        "missing_cohort_count",
+        "passed",
+    }
+    optional = {
+        "minimum_remaining_seconds",
+        "minimum_headroom_seconds",
+        "required_remaining_seconds",
+    }
+    return output if required <= set(output) and set(output) <= required | optional else None
 
 
 def _project_acceptance(value: Any) -> dict[str, Any]:

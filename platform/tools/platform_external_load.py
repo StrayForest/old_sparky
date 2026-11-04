@@ -17,7 +17,7 @@ import codecs
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from functools import wraps
 from html.parser import HTMLParser
 import http.client
@@ -90,6 +90,9 @@ MAX_CONCURRENCY = 512
 RESPONSE_BODY_LIMIT = 2 * 1024 * 1024
 ERROR_SAMPLE_LIMIT = 25
 TIMEOUT_DIAGNOSTIC_LIMIT = 25
+FAILURE_STAGE_CLASSES = frozenset(
+    {"connect_or_request_write", "response_headers", "body_receive", "unknown", "other"}
+)
 DIAGNOSTIC_HEADER_LIMIT = 128
 RESPONSE_JSON_CAPTURE_LIMIT = 64 * 1024
 MAX_MEASUREMENT = 1_000_000_000_000.0
@@ -107,6 +110,8 @@ READY_VOTE_TRANSPORT_PAIR_PHASES = (
 READY_VOTE_TRANSPORT_PAIR_PHASE_ACTIONS = 2_100
 READY_VOTE_TRANSPORT_PAIR_TOURNAMENTS_PER_PHASE = 5
 READY_VOTE_TRANSPORT_PAIR_USERS_PER_TOURNAMENT = 420
+READ_MIX_READY_STATE_PROFILE_ID = "read-mix-concurrency-ramp-v1"
+READ_MIX_READY_STATE_STARTUP_MARGIN_SECONDS = 300.0
 SUPPORTED_PAGE_TRANSPORTS = frozenset(
     {DEFAULT_CLIENT_TRANSPORT, HTTP11_KEEPALIVE_TRANSPORT}
 )
@@ -2371,6 +2376,9 @@ class _ResultAccumulator:
         "error_kinds",
         "cf_error_types",
         "cf_error_origins",
+        "failure_stage_counts",
+        "observed_status_counts",
+        "error_connection_state_counts",
         "error_sample_entries",
         "timeout_diagnostic_entries",
         "error_sample_total",
@@ -2400,6 +2408,9 @@ class _ResultAccumulator:
         self.error_kinds: Counter[str] = Counter()
         self.cf_error_types: Counter[str] = Counter()
         self.cf_error_origins: Counter[str] = Counter()
+        self.failure_stage_counts: Counter[str] = Counter()
+        self.observed_status_counts: Counter[str] = Counter()
+        self.error_connection_state_counts: Counter[str] = Counter()
         self.error_sample_entries: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
         self.timeout_diagnostic_entries: list[
             tuple[tuple[Any, ...], dict[str, Any]]
@@ -2491,6 +2502,39 @@ class _ResultAccumulator:
             self.errors += 1
             kind = safe_error_class(result.error_kind or "unexpected", status=result.status)
             self.error_kinds[kind] += 1
+            raw_failure_stage = result.failure_stage
+            if raw_failure_stage is None:
+                failure_stage = "unknown"
+            elif (
+                isinstance(raw_failure_stage, str)
+                and raw_failure_stage in FAILURE_STAGE_CLASSES
+                and raw_failure_stage not in {"unknown", "other"}
+            ):
+                failure_stage = raw_failure_stage
+            else:
+                failure_stage = "other"
+            observed_status = (
+                result.observed_status
+                if isinstance(result.observed_status, int)
+                and not isinstance(result.observed_status, bool)
+                and 100 <= result.observed_status <= 599
+                else None
+            )
+            connection_reused = (
+                result.transport_timing.get("connection_reused")
+                if isinstance(result.transport_timing, Mapping)
+                else None
+            )
+            connection_state = (
+                "reused" if connection_reused is True
+                else "new" if connection_reused is False
+                else "unknown"
+            )
+            self.failure_stage_counts[failure_stage] += 1
+            self.observed_status_counts[
+                str(observed_status) if observed_status is not None else "unknown"
+            ] += 1
+            self.error_connection_state_counts[connection_state] += 1
             self.error_sample_total += 1
             error_sample = {
                 "phase": safe_phase(result.phase),
@@ -2498,6 +2542,9 @@ class _ResultAccumulator:
                 "route_class": safe_route_class(result.path),
                 "status": safe_status(result.status),
                 "error_class": kind,
+                "failure_stage": failure_stage,
+                "observed_status": observed_status,
+                "connection_state": connection_state,
                 "cf_error_class": safe_cf_error_class(result.cf_error_type),
                 "cf_error_origin_class": safe_cf_error_class(result.cf_error_origin),
                 "ttfb_ms": finite_number(result.time_to_first_byte_ms),
@@ -2525,6 +2572,9 @@ class _ResultAccumulator:
                     "route_class": safe_route_class(result.path),
                     "status": safe_status(result.status),
                     "error_class": "timeout",
+                    "failure_stage": failure_stage,
+                    "observed_status": observed_status,
+                    "connection_state": connection_state,
                     "cf_error_class": safe_cf_error_class(result.cf_error_type),
                     "cf_error_origin_class": safe_cf_error_class(result.cf_error_origin),
                     "ttfb_ms": finite_number(result.time_to_first_byte_ms),
@@ -2595,6 +2645,13 @@ class _ResultAccumulator:
             "error_kinds": dict(sorted(self.error_kinds.items())),
             "cf_error_type_counts": dict(sorted(self.cf_error_types.items())),
             "cf_error_origin_counts": dict(sorted(self.cf_error_origins.items())),
+            "failure_diagnostics": {
+                "failure_stage_counts": dict(sorted(self.failure_stage_counts.items())),
+                "observed_status_counts": dict(sorted(self.observed_status_counts.items())),
+                "connection_state_counts": dict(
+                    sorted(self.error_connection_state_counts.items())
+                ),
+            },
             "changed_counts": dict(sorted(self.changed.items())),
             "latency": metric_stats(self.latencies),
             "timing": self.timing.summary(
@@ -2910,8 +2967,14 @@ def load_manifest_bytes(raw: bytes) -> tuple[dict[str, Any], list[VirtualUser]]:
         "tournaments",
         "users",
     }
+    scheduled_keys = legacy_keys | {"fixture_schedule"}
     if schema == MANIFEST_SCHEMA:
-        if set(payload) not in (legacy_keys, legacy_keys | {"created_at"}):
+        if set(payload) not in (
+            legacy_keys,
+            legacy_keys | {"created_at"},
+            scheduled_keys,
+            scheduled_keys | {"created_at"},
+        ):
             raise ExternalLoadError("legacy external load manifest schema is not closed")
     else:
         source_keys = {
@@ -2920,9 +2983,15 @@ def load_manifest_bytes(raw: bytes) -> tuple[dict[str, Any], list[VirtualUser]]:
             "source_binding",
             "source_binding_sha256",
         }
-        if set(payload) != legacy_keys | source_keys | {"created_at"}:
+        if set(payload) not in (
+            legacy_keys | source_keys | {"created_at"},
+            legacy_keys | source_keys | {"created_at", "fixture_schedule"},
+        ):
             raise ExternalLoadError("source-bound external load manifest schema is not closed")
         _manifest_source_binding(payload)
+    fixture_schedule = payload.get("fixture_schedule")
+    if "fixture_schedule" in payload and fixture_schedule != READ_MIX_READY_STATE_PROFILE_ID:
+        raise ExternalLoadError("external load fixture schedule is unsupported")
     if payload.get("purpose") != "external_ready_vote":
         raise ExternalLoadError("external load manifest purpose is invalid")
     if str(payload.get("origin") or "").rstrip("/") != EXPECTED_ORIGIN:
@@ -2953,6 +3022,15 @@ def load_manifest_bytes(raw: bytes) -> tuple[dict[str, Any], list[VirtualUser]]:
             or expected_count <= 0
         ):
             raise ExternalLoadError("manifest tournament user_count must be positive")
+        if fixture_schedule is not None:
+            for field in ("ready_check_starts_at", "ready_check_ends_at"):
+                if _safe_load_timestamp(raw_tournament.get(field)) is None:
+                    raise ExternalLoadError("scheduled Ready Check manifest deadline is invalid")
+            ready_start = _safe_load_timestamp(raw_tournament["ready_check_starts_at"])
+            ready_end = _safe_load_timestamp(raw_tournament["ready_check_ends_at"])
+            assert ready_start is not None and ready_end is not None
+            if not 0 < (ready_end - ready_start).total_seconds() <= 24 * 60 * 60:
+                raise ExternalLoadError("scheduled Ready Check manifest window is invalid")
         tournament_slugs.add(slug)
         tournament_expected_counts[slug] = expected_count
 
@@ -3036,8 +3114,13 @@ def _response_json_projection(
 
     is_vote = method == "POST" and path.endswith("/deadlock/ready-check/vote")
     is_state = method == "GET" and path.endswith("/deadlock/ready-check")
+    is_workspace = (
+        method == "GET"
+        and path.startswith("/tournaments/")
+        and path.split("?", 1)[0].endswith("/workspace")
+    )
     is_authenticated_read = _is_authenticated_read_route(method, path)
-    if not body or not (is_vote or is_state or is_authenticated_read):
+    if not body or not (is_vote or is_state or is_workspace or is_authenticated_read):
         return None
     try:
         payload = json.loads(body.decode("utf-8"))
@@ -3067,6 +3150,32 @@ def _response_json_projection(
         if type(changed) is bool:
             projection["changed"] = changed
         return projection or None
+    if is_workspace:
+        tournament = payload.get("tournament")
+        ready_check = payload.get("ready_check")
+        active_round = (
+            ready_check.get("active_round") or ready_check.get("latest_round")
+            if isinstance(ready_check, dict)
+            else None
+        )
+        ready_status = active_round.get("status") if isinstance(active_round, dict) else None
+        ready_ends_at = (
+            tournament.get("ready_check_ends_at")
+            if isinstance(tournament, dict)
+            else None
+        )
+        server_time = payload.get("server_time")
+        if (
+            isinstance(ready_status, str)
+            and isinstance(ready_ends_at, str)
+            and isinstance(server_time, str)
+        ):
+            return {
+                "ready_check_status": ready_status[:32],
+                "ready_check_ends_at": ready_ends_at[:64],
+                "server_time": server_time[:64],
+            }
+        return None
     if is_authenticated_read:
         if payload.get("code") == "AUTHENTICATED_READ_OVERLOADED":
             return {"code": "AUTHENTICATED_READ_OVERLOADED"}
@@ -3755,6 +3864,153 @@ def _route_for_read(index: int, slug: str) -> str:
     if bucket == 8:
         return "/users/me"
     return "/tournaments"
+
+
+def _read_mix_ready_deadlines(
+    manifest: Mapping[str, Any],
+    *,
+    expected_profile_id: str | None,
+    mode: str,
+    users: list[VirtualUser],
+    runtime_budget: LoadRuntimeBudget | None,
+) -> dict[str, datetime] | None:
+    scheduled = manifest.get("fixture_schedule")
+    if expected_profile_id != READ_MIX_READY_STATE_PROFILE_ID:
+        if scheduled is not None:
+            raise ExternalLoadError("scheduled Ready Check manifest does not match the selected profile")
+        return None
+    if (
+        scheduled != READ_MIX_READY_STATE_PROFILE_ID
+        or mode != "read-mix"
+        or len(users) != 20_000
+        or runtime_budget is None
+        or not math.isfinite(runtime_budget.max_duration_seconds)
+        or runtime_budget.max_duration_seconds <= 0
+    ):
+        raise ExternalLoadError("read-mix Ready Check fixture binding is invalid")
+    tournaments = manifest.get("tournaments")
+    if not isinstance(tournaments, list) or len(tournaments) != 40:
+        raise ExternalLoadError("read-mix Ready Check tournament fixture is invalid")
+    deadlines: dict[str, datetime] = {}
+    for entry in tournaments:
+        if not isinstance(entry, Mapping) or entry.get("user_count") != 500:
+            raise ExternalLoadError("read-mix Ready Check tournament cohort is invalid")
+        slug = entry.get("slug")
+        starts_at = _safe_load_timestamp(entry.get("ready_check_starts_at"))
+        ends_at = _safe_load_timestamp(entry.get("ready_check_ends_at"))
+        if (
+            not isinstance(slug, str)
+            or SLUG_RE.fullmatch(slug) is None
+            or slug in deadlines
+            or starts_at is None
+            or ends_at is None
+            or (ends_at - starts_at).total_seconds() != 7_200
+        ):
+            raise ExternalLoadError("read-mix Ready Check schedule is invalid")
+        deadlines[slug] = ends_at
+    if len(deadlines) != 40 or {
+        user.tournament_slug for user in users
+    } != set(deadlines):
+        raise ExternalLoadError("read-mix Ready Check manifest cohorts do not match users")
+    return deadlines
+
+
+def _read_mix_ready_state_for_result(
+    result: RequestResult,
+    *,
+    deadlines: Mapping[str, datetime],
+) -> tuple[str, bool, float | None] | None:
+    path = result.path.split("?", 1)[0]
+    parts = path.split("/")
+    if len(parts) != 4 or parts[1] != "tournaments" or parts[3] != "workspace":
+        return None
+    slug = parts[2]
+    if slug not in deadlines:
+        return None
+    payload = result.response_json
+    status = payload.get("ready_check_status") if isinstance(payload, Mapping) else None
+    end_at = _safe_load_timestamp(
+        payload.get("ready_check_ends_at") if isinstance(payload, Mapping) else None
+    )
+    server_time = _safe_load_timestamp(
+        payload.get("server_time") if isinstance(payload, Mapping) else None
+    )
+    request_started = _safe_load_timestamp(result.started_at_utc)
+    request_finished = _safe_load_timestamp(result.finished_at_utc)
+    if (
+        result.status != 200
+        or not isinstance(status, str)
+        or end_at != deadlines[slug]
+        or server_time is None
+        or request_started is None
+        or request_finished is None
+        or not request_started - timedelta(seconds=120)
+        <= server_time
+        <= request_finished + timedelta(seconds=120)
+    ):
+        return slug, False, None
+    remaining = (end_at - server_time).total_seconds()
+    return slug, status == "active" and remaining > 0, remaining
+
+
+def _summarize_read_mix_ready_state(
+    observations: Mapping[str, list[tuple[bool, float | None, float]]],
+    *,
+    expected_slugs: set[str],
+) -> dict[str, Any]:
+    observed_slugs = {slug for slug, rows in observations.items() if rows}
+    active_slugs = {
+        slug
+        for slug, rows in observations.items()
+        if rows
+        and all(
+            active and remaining is not None
+            for active, remaining, _required in rows
+        )
+    }
+    valid_remaining = [
+        remaining
+        for rows in observations.values()
+        for _active, remaining, _required in rows
+        if remaining is not None
+    ]
+    minimum_remaining = min(valid_remaining) if valid_remaining else None
+    required_remaining_seconds = max(
+        (required for rows in observations.values() for _a, _r, required in rows),
+        default=0.0,
+    )
+    minimum_headroom = min(
+        (
+            remaining - required
+            for rows in observations.values()
+            for _active, remaining, required in rows
+            if remaining is not None
+        ),
+        default=None,
+    )
+    passed = (
+        observed_slugs == expected_slugs
+        and active_slugs == expected_slugs
+        and all(
+            remaining is not None and remaining > required
+            for rows in observations.values()
+            for _active, remaining, required in rows
+        )
+    )
+    return {
+        "expected_cohort_count": len(expected_slugs),
+        "observed_cohort_count": len(observed_slugs),
+        "active_cohort_count": len(active_slugs),
+        "missing_cohort_count": len(expected_slugs - observed_slugs),
+        "minimum_remaining_seconds": (
+            round(minimum_remaining, 3) if minimum_remaining is not None else None
+        ),
+        "minimum_headroom_seconds": (
+            round(minimum_headroom, 3) if minimum_headroom is not None else None
+        ),
+        "required_remaining_seconds": round(required_remaining_seconds, 3),
+        "passed": passed,
+    }
 
 
 def run_phase(
@@ -4753,6 +5009,13 @@ def _run_load_impl(
             f"max_http_attempts {max_http_attempts}"
         )
     read_concurrency_stages = tuple(concurrency_stages or (concurrency,))
+    read_mix_ready_deadlines = _read_mix_ready_deadlines(
+        manifest,
+        expected_profile_id=expected_profile_id,
+        mode=mode,
+        users=users,
+        runtime_budget=runtime_budget,
+    )
     planned_primary_action_count = (
         sum(int(phase.get("logical_actions") or 0) for phase in (phase_plan or []))
         if mode == "ready-vote" and phase_plan
@@ -5453,11 +5716,30 @@ def _run_load_impl(
         for stage_concurrency in read_concurrency_stages:
             stage_started_at = time.monotonic()
             stage_acc = _ResultAccumulator()
+            ready_state_observations: dict[
+                str, list[tuple[bool, float | None, float]]
+            ] = {}
 
             def consume_read(result: RequestResult) -> None:
                 stage_acc.add(result)
                 read_acc.add(result)
                 overall_raw_acc.add(result)
+                if read_mix_ready_deadlines is not None:
+                    observation = _read_mix_ready_state_for_result(
+                        result,
+                        deadlines=read_mix_ready_deadlines,
+                    )
+                    if observation is not None:
+                        slug, active, remaining = observation
+                        required_remaining = max(
+                            0.0,
+                            runtime_budget.remaining_seconds()
+                            if runtime_budget is not None
+                            else 0.0,
+                        ) + READ_MIX_READY_STATE_STARTUP_MARGIN_SECONDS
+                        ready_state_observations.setdefault(slug, []).append(
+                            (active, remaining, required_remaining)
+                        )
 
             run_progress_phase(
                 origin,
@@ -5485,6 +5767,12 @@ def _run_load_impl(
                 / stage_wall_seconds,
                 3,
             )
+            if read_mix_ready_deadlines is not None:
+                ready_state_summary = _summarize_read_mix_ready_state(
+                    ready_state_observations,
+                    expected_slugs=set(read_mix_ready_deadlines),
+                )
+                stage_summary["ready_check_state"] = ready_state_summary
             ramp_stages[str(stage_concurrency)] = stage_summary
         read_summary = read_acc.summary(
             expected_count=len(users) * len(read_concurrency_stages),
@@ -5589,6 +5877,14 @@ def _run_load_impl(
                         {"200", "304"}
                     )
                 )
+            and (
+                read_mix_ready_deadlines is None
+                or all(
+                    isinstance(stage.get("ready_check_state"), Mapping)
+                    and stage["ready_check_state"].get("passed") is True
+                    for stage in ramp_stages.values()
+                )
+            )
             )
         )
 

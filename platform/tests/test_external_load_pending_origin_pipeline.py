@@ -23,6 +23,7 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from urllib.error import HTTPError, URLError
 import unittest
@@ -318,14 +319,28 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                     all(type(value) is bool for value in evidence["checks"].values())
                 )
                 scenario, manifest, users = _small_profile(profile)
+                synthetic_ready_check_end = datetime.now(UTC) + timedelta(days=2)
 
                 def request(origin: str, user: VirtualUser, phase: str | None = None, *_args: object, **kwargs: object) -> RequestResult:
                     del origin, user
                     effective_phase = kwargs.get("phase") or phase
                     started = time.monotonic()
+                    path = str(kwargs.get("path") or "/")
+                    ready_state = (
+                        {
+                            "ready_check_status": "active",
+                            "ready_check_ends_at": synthetic_ready_check_end.isoformat(),
+                            "server_time": datetime.now(UTC).isoformat(),
+                        }
+                        if profile_id == "read-mix-concurrency-ramp-v1"
+                        and path.split("?", 1)[0].endswith("/workspace")
+                        else None
+                    )
                     response_json = (
                         {"active_round": {"ready_count": len(users)}}
                         if effective_phase == "read_external_vote_state"
+                        else ready_state
+                        if ready_state is not None
                         else {"changed": True}
                         if kwargs.get("method") == "POST"
                         else None
@@ -333,7 +348,7 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                     return RequestResult(
                         phase=str(kwargs.get("phase") or phase or "primary"),
                         method=str(kwargs.get("method") or "GET"),
-                        path=str(kwargs.get("path") or "/"),
+                        path=path,
                         status=200,
                         elapsed_ms=10_000,
                         ok=True,
@@ -342,6 +357,8 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                         response_json=response_json,
                         started_at_monotonic=started,
                         finished_at_monotonic=started + 10,
+                        started_at_utc=datetime.now(UTC).isoformat(),
+                        finished_at_utc=(datetime.now(UTC) + timedelta(seconds=10)).isoformat(),
                     )
 
                 with tempfile.TemporaryDirectory(prefix="pending-profile-builder-") as temporary:
@@ -351,6 +368,14 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                         patch("tools.platform_external_load._trace", return_value={"status": "200", "ip": "192.0.2.10", "colo": "TEST"}),
                         patch("tools.platform_external_load._request", side_effect=request),
                         patch("tools.platform_external_load._page_request_http11_keepalive", side_effect=request),
+                        patch(
+                            "tools.platform_external_load._read_mix_ready_deadlines",
+                            return_value={
+                                "qa-tournament": synthetic_ready_check_end
+                            },
+                        )
+                        if profile_id == "read-mix-concurrency-ramp-v1"
+                        else nullcontext(),
                         patch("socket.socket.connect", side_effect=AssertionError("network access is forbidden in this test")),
                         patch.dict(os.environ, {"SOURCE_GIT_SHA": SOURCE_SHA, "GITHUB_RUN_ID": RUN_ID}, clear=False),
                     ):
@@ -501,6 +526,87 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                     scenario["acceptance"]["kind"], profile["acceptance"]["kind"]
                 )
 
+        # The real scheduled-state guard must reject a scaled fixture before
+        # HTTP work and leave a closed, non-authoritative failure report. This
+        # keeps invalid schedule input from being mistaken for pending-origin
+        # evidence by the tests that exercise valid state above.
+        scheduled_profile = platform_load.get_profile(
+            "read-mix-concurrency-ramp-v1"
+        )
+        invalid_scenario, invalid_manifest, invalid_users = _small_profile(
+            scheduled_profile
+        )
+        with tempfile.TemporaryDirectory(prefix="invalid-read-mix-schedule-") as temporary:
+            report_path = Path(temporary) / "report.json"
+            with (
+                patch(
+                    "tools.platform_external_load.load_manifest",
+                    return_value=(invalid_manifest, invalid_users),
+                ),
+                patch(
+                    "tools.platform_external_load._trace",
+                    return_value={"status": "200", "ip": "192.0.2.10", "colo": "TEST"},
+                ),
+                patch(
+                    "tools.platform_external_load._request",
+                    side_effect=AssertionError("invalid schedule must fail before HTTP"),
+                ) as request_mock,
+                patch.dict(
+                    os.environ,
+                    {"SOURCE_GIT_SHA": SOURCE_SHA, "GITHUB_RUN_ID": RUN_ID},
+                    clear=False,
+                ),
+            ):
+                with redirect_stdout(io.StringIO()):
+                    worker_exit = platform_load.run_profile_worker(
+                        invalid_scenario,
+                        Path(temporary) / "manifest.json",
+                        report_path,
+                    )
+            failed_report = json.loads(report_path.read_text(encoding="utf-8"))
+        self.assertEqual(worker_exit, 1)
+        request_mock.assert_not_called()
+        self.assertEqual(
+            set(failed_report),
+            {
+                "schema",
+                "measurement_schema",
+                "timing_schema",
+                "profile_id",
+                "profile_version",
+                "profile_digest",
+                "mode",
+                "environment",
+                "passed",
+                "authoritative",
+                "dispatchable",
+                "error_class",
+                "load_contract",
+                "acceptance",
+                "partial_work",
+                "inflight_unknown",
+            },
+        )
+        self.assertEqual(
+            set(failed_report["acceptance"]),
+            {
+                "passed",
+                "decision",
+                "authoritative",
+                "dispatchable",
+                "contract_ok",
+                "error_class",
+            },
+        )
+        self.assertFalse(failed_report["authoritative"])
+        self.assertFalse(failed_report["dispatchable"])
+        self.assertFalse(failed_report["acceptance"]["passed"])
+        self.assertEqual(failed_report["acceptance"]["decision"], "LOAD RUN FAILED")
+        self.assertEqual(
+            failed_report["error_class"], failed_report["acceptance"]["error_class"]
+        )
+        self.assertNotIn("pending_origin_evidence", failed_report["acceptance"])
+
     def test_all_authored_builders_close_transport_and_server_failures(self) -> None:
         profiles = platform_load.load_profiles()
         self.assertEqual(len(profiles), 12)
@@ -640,6 +746,23 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
             ]
         else:
             profile, manifest, users = _small_profile(profile)
+        if profile_id == "read-mix-concurrency-ramp-v1" and not preserve_profile:
+            # Keep one synthetic cohort but include a non-workspace route so
+            # the terminal failure case still exercises an HTTP failure while
+            # separate successful workspace responses prove the active state.
+            target_users = 6
+            users = [
+                VirtualUser(
+                    user_id=f"user-{index + 1:08d}",
+                    tournament_slug="qa-tournament",
+                    session_token=f"{index + 1:064x}",
+                    csrf_token=f"{index + 1:064x}",
+                )
+                for index in range(target_users)
+            ]
+            profile["fixture"]["users_per_tournament"] = target_users
+            profile["fixture"]["max_total_users"] = target_users
+            manifest["tournaments"][0]["user_count"] = target_users
         if (
             profile.get("mode") == "read-mix"
             and profile.get("traffic", {}).get("concurrency_stages") is not None
@@ -683,13 +806,23 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
             for index, user in enumerate(users)
         ]
         failure_lock = threading.Lock()
-        failing_session_token = users[0].session_token
+        failing_user_index = 0
+        if profile_id == "read-mix-concurrency-ramp-v1":
+            failing_user_index = next(
+                index
+                for index in range(len(users))
+                if not platform_external_load._route_for_read(
+                    index, users[index].tournament_slug
+                ).split("?", 1)[0].endswith("/workspace")
+            )
+        failing_session_token = users[failing_user_index].session_token
         failing_attempts = 0
         failed_once = False
         pair_ready_counts = {
             str(tournament["slug"]): 420
             for tournament in manifest["tournaments"]
         } if exact_transport_pair else {}
+        synthetic_ready_check_end = datetime.now(UTC) + timedelta(days=2)
         if exact_transport_pair:
             pair_ready_counts[users[0].tournament_slug] -= 1
 
@@ -786,6 +919,18 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                     }
                 ).encode("ascii")
                 if method == "GET" and "/deadlock/ready-check" in path
+                else json.dumps(
+                    {
+                        "tournament": {
+                            "ready_check_ends_at": synthetic_ready_check_end.isoformat()
+                        },
+                        "ready_check": {
+                            "active_round": {"status": "active"}
+                        },
+                        "server_time": datetime.now(UTC).isoformat(),
+                    }
+                ).encode("ascii")
+                if method == "GET" and path.split("?", 1)[0].endswith("/workspace")
                 else b'{"changed":true}'
                 if method == "POST"
                 else b"<!doctype html><html><body>ok</body></html>"
@@ -847,6 +992,13 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                 stack.enter_context(
                     patch("tools.platform_external_load._trace", return_value={"status": "200", "ip": "192.0.2.10", "colo": "TEST"})
                 )
+                if profile_id == "read-mix-concurrency-ramp-v1" and not preserve_profile:
+                    stack.enter_context(
+                        patch(
+                            "tools.platform_external_load._read_mix_ready_deadlines",
+                            return_value={"qa-tournament": synthetic_ready_check_end},
+                        )
+                    )
                 if profile.get("client_transport") == "http1-keepalive":
                     stack.enter_context(
                         patch("tools.platform_http_transport._TimedHTTPConnection.request", autospec=True, side_effect=http11_request)

@@ -3697,6 +3697,7 @@ class ProductionQa:
         concurrency: int = 80,
         http_max_connections: int | None = None,
         collect_performance: bool = False,
+        collect_http_metrics: bool | None = None,
         system_sample_interval: float = 1.0,
         scale_site_mix_users: int | None = None,
         scale_bracket_view_users: int | None = None,
@@ -3809,6 +3810,11 @@ class ProductionQa:
         )
         self.http_max_connections = max(1, min(10_000, requested_http_connections))
         self.collect_performance = collect_performance or mode == "tournament-lifecycle"
+        self.collect_http_metrics = (
+            self.collect_performance
+            if collect_http_metrics is None
+            else collect_http_metrics
+        )
         self.scale_site_mix_users = (
             self.scale_users
             if scale_site_mix_users is None
@@ -4201,7 +4207,7 @@ class ProductionQa:
                     raise
                 retry_busy = True
             finally:
-                if self.collect_performance:
+                if self.collect_http_metrics:
                     finished_at = time.monotonic()
                     self.http_metrics.record(
                         phase=self.current_phase,
@@ -5346,24 +5352,39 @@ class ProductionQa:
         organizer: dict[str, Any],
         label: str,
         index: int,
+        scheduled_ready_window: bool = False,
     ) -> dict[str, Any]:
+        json_payload: dict[str, Any] = {
+            "name": write_burst_tournament_name(self.marker, index, label),
+            "description": f"Write burst profile {self.marker} {label}.",
+            "visibility": "public",
+            "format_slug": "solo",
+            "allowed_ranks": VALID_RANKS,
+            "max_participants": self.write_burst_users_per_tournament,
+            "match_format": "bo3",
+            "final_format": "bo5",
+            "teams_count": READY_TEST_TEAMS,
+        }
+        if scheduled_ready_window:
+            created_at = datetime.now(UTC).replace(microsecond=0)
+            registration_close = created_at + timedelta(minutes=4)
+            ready_start = created_at + timedelta(minutes=5)
+            ready_end = ready_start + timedelta(minutes=120)
+            json_payload.update(
+                {
+                    "registration_closes_at": registration_close.isoformat(),
+                    "ready_check_starts_at": ready_start.isoformat(),
+                    "ready_check_ends_at": ready_end.isoformat(),
+                    "captain_selection_starts_at": ready_end.isoformat(),
+                }
+            )
         created = await self.request_as(
             api_client,
             organizer,
             "POST",
             "/tournaments",
             expected=201,
-            json_payload={
-                "name": write_burst_tournament_name(self.marker, index, label),
-                "description": f"Write burst profile {self.marker} {label}.",
-                "visibility": "public",
-                "format_slug": "solo",
-                "allowed_ranks": VALID_RANKS,
-                "max_participants": self.write_burst_users_per_tournament,
-                "match_format": "bo3",
-                "final_format": "bo5",
-                "teams_count": READY_TEST_TEAMS,
-            },
+            json_payload=json_payload,
         )
         tournament_id = str(created["id"])
         tournament_slug = str(created["slug"])
@@ -5526,12 +5547,14 @@ class ProductionQa:
         label: str,
         index: int,
         start_ready_check: bool = True,
+        scheduled_ready_window: bool = False,
     ) -> dict[str, Any]:
         tournament = await self.create_write_burst_tournament(
             api_client,
             organizer=organizer,
             label=label,
             index=index,
+            scheduled_ready_window=scheduled_ready_window,
         )
         await self.join_tournament_participants(
             api_client,

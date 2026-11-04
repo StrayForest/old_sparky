@@ -311,6 +311,29 @@ class SourceBindingDispatchTests(unittest.TestCase):
         with self.assertRaises(WorkflowInputError):
             validate_external_payload(oversized)
 
+    def test_scheduled_ready_fixture_is_bound_to_exact_read_ramp_shape(self) -> None:
+        payload = _external_payload()
+        payload.update(
+            tournament_count="40",
+            users_per_tournament="500",
+            fixture_schedule="read-mix-concurrency-ramp-v1",
+        )
+        validated = validate_external_payload(payload)
+        self.assertEqual(
+            validated["fixture_schedule"], "read-mix-concurrency-ramp-v1"
+        )
+        for mutation in (
+            {**payload, "tournament_count": "39"},
+            {**payload, "users_per_tournament": "499"},
+            {**payload, "timeout_diagnostics": "true"},
+            {**payload, "fixture_kind": "cpu_diagnostic_only_v1"},
+            {**payload, "fixture_schedule": None},
+            {**payload, "fixture_schedule": "other-profile"},
+        ):
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(WorkflowInputError):
+                    validate_external_payload(mutation)
+
     def test_never_started_cleanup_proof_is_exact_and_keeps_old_load_sha_separate(self) -> None:
         proof = _never_started_cleanup_proof()
         payload = validate_cleanup_payload(
@@ -583,6 +606,38 @@ class SourceBindingDispatchTests(unittest.TestCase):
         self.assertEqual(command[18:], [])
         self.assertNotIn("shell", popen.call_args.kwargs)
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
+
+        scheduled_payload = _external_payload()
+        scheduled_payload.update(
+            tournament_count="40",
+            users_per_tournament="500",
+            fixture_schedule="read-mix-concurrency-ramp-v1",
+        )
+        scheduled_payload = validate_external_payload(scheduled_payload)
+        with tempfile.TemporaryDirectory() as scheduled_temporary:
+            scheduled_root = Path(scheduled_temporary)
+            scheduled_helper = scheduled_root / "platform_production_external_fixture_qa.sh"
+            scheduled_helper.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+            scheduled_helper.chmod(0o700)
+            scheduled_process = FakeProcess()
+            with (
+                patch.object(dispatcher, "ACTIVE_TOOLS_DIR", scheduled_root),
+                patch.object(dispatcher, "EXTERNAL_HELPER", scheduled_helper),
+                patch.object(dispatcher, "SUDO", "/usr/bin/sudo"),
+                patch.object(
+                    dispatcher.subprocess, "Popen", return_value=scheduled_process
+                ) as scheduled_popen,
+            ):
+                self.assertEqual(
+                    dispatcher._external_fixture(
+                        scheduled_payload, run_id="567890", run_attempt="3"
+                    ),
+                    0,
+                )
+            self.assertEqual(
+                scheduled_popen.call_args.args[0][-2:],
+                ["--fixture-schedule", "read-mix-concurrency-ramp-v1"],
+            )
 
     def test_cleanup_dispatch_keeps_runner_sha_and_forwards_closed_binding(self) -> None:
         payload = validate_cleanup_payload(

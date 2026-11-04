@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform maintainers
-- Last reviewed: 2026-11-02
+- Last reviewed: 2026-11-04
 
 The executable registry at `platform/tools/platform_verify.py` is the single source of truth for verification ownership, commands, environment
 requirements and CI membership. Use `list --json` when tooling needs the
@@ -19,7 +19,7 @@ python3 tools/platform_verify.py impact --changed-path platform/tools/platform_v
 
 The planner maps changed sources to complete owners; unknown or malformed paths select the full canonical gate set. It is a test-selection aid only: it cannot skip owner gates or replace exact-SHA CI. Changes to test modules select their complete owner contour.
 
-Run focused tests, then each affected full owner gate. Same-repository `dev` PRs confined to `platform/apps/platform_web/`
+Run focused local tests and obtain independent review. Omit duplicate local full owner runs only when mandatory exact-target hosted CI proves coverage and deployment fails closed; never change CI routes, gates or selection. Same-repository `dev` PRs confined to `platform/apps/platform_web/`
 run `python-quality`, `security`, `docs`, `web-quality`, `web-hermetic` and `verification-contract`; backend/migration skip.
 Fork, mixed, unknown, sensitive, `merge_group` and `dev` push routes retain full CI on the exact merged source.
 
@@ -40,6 +40,7 @@ Fork, mixed, unknown, sensitive, `merge_group` and `dev` push routes retain full
 | `live-public` | production operators | canonical public origin and dedicated QA identity | explicit/release workflow |
 | `live-user-destructive` | production operators | marked production fixtures and mandatory cleanup | explicit operator workflow |
 | `external-load` | performance operators | external generator to production origin | explicit operator workflow |
+
 
 The `web-quality` gate runs shutdown, SSR stream/heap and Next root-directory
 contracts from `shutdown-guard-contract.cjs`, `ssr-stream-diagnostics-contract.cjs`,

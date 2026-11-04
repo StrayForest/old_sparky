@@ -189,6 +189,113 @@ def load_manifest_from_payload(
 
 
 class ExternalLoadTests(unittest.TestCase):
+    def test_read_mix_workspace_projection_retains_only_ready_state_and_clock(self) -> None:
+        body = json.dumps(
+            {
+                "tournament": {
+                    "id": "private-tournament-id",
+                    "ready_check_ends_at": "2026-11-04T12:00:00Z",
+                },
+                "server_time": "2026-11-04T11:00:00Z",
+                "ready_check": {
+                    "active_round": {
+                        "id": 123,
+                        "status": "active",
+                        "eligible_participant_count": 500,
+                    }
+                },
+            }
+        ).encode()
+        projection = external_load._response_json_projection(
+            method="GET",
+            path="/tournaments/private-slug/workspace?participants_limit=0",
+            body=body,
+        )
+        self.assertEqual(
+            projection,
+            {
+                "ready_check_status": "active",
+                "ready_check_ends_at": "2026-11-04T12:00:00Z",
+                "server_time": "2026-11-04T11:00:00Z",
+            },
+        )
+        self.assertNotIn("id", projection)
+
+    def test_read_mix_state_summary_requires_all_cohorts_active_and_in_window(self) -> None:
+        ready = {
+            "cohort-a": [(True, 900.0, 700.0)],
+            "cohort-b": [(True, 800.0, 700.0)],
+        }
+        passed = external_load._summarize_read_mix_ready_state(
+            ready,
+            expected_slugs={"cohort-a", "cohort-b"},
+        )
+        self.assertTrue(passed["passed"])
+        self.assertEqual(passed["observed_cohort_count"], 2)
+        self.assertEqual(passed["minimum_remaining_seconds"], 800.0)
+        self.assertEqual(passed["minimum_headroom_seconds"], 100.0)
+
+        missing = external_load._summarize_read_mix_ready_state(
+            {"cohort-a": [(True, 900.0, 700.0)]},
+            expected_slugs={"cohort-a", "cohort-b"},
+        )
+        self.assertFalse(missing["passed"])
+        self.assertEqual(missing["missing_cohort_count"], 1)
+
+        expired = external_load._summarize_read_mix_ready_state(
+            {
+                "cohort-a": [(False, None, 700.0)],
+                "cohort-b": [(True, 600.0, 700.0)],
+            },
+            expected_slugs={"cohort-a", "cohort-b"},
+        )
+        self.assertFalse(expired["passed"])
+        self.assertEqual(expired["active_cohort_count"], 1)
+
+        early_observation = external_load._summarize_read_mix_ready_state(
+            {
+                "cohort-a": [(True, 710.0, 720.0)],
+                "cohort-b": [(True, 900.0, 700.0)],
+            },
+            expected_slugs={"cohort-a", "cohort-b"},
+        )
+        self.assertFalse(early_observation["passed"])
+        self.assertEqual(early_observation["minimum_headroom_seconds"], -10.0)
+
+    def test_read_mix_state_observation_rejects_stale_server_clock(self) -> None:
+        now = external_load.datetime.now(external_load.UTC)
+        ends_at = now + external_load.timedelta(minutes=90)
+        result = RequestResult(
+            phase="scale_external_read_mix_c16",
+            method="GET",
+            path="/tournaments/cohort-a/workspace?participants_limit=0",
+            status=200,
+            elapsed_ms=10.0,
+            ok=True,
+            response_bytes=100,
+            response_json={
+                "ready_check_status": "active",
+                "ready_check_ends_at": ends_at.isoformat(),
+                "server_time": now.isoformat(),
+            },
+            started_at_utc=(now - external_load.timedelta(seconds=1)).isoformat(),
+            finished_at_utc=(now + external_load.timedelta(seconds=1)).isoformat(),
+        )
+        observation = external_load._read_mix_ready_state_for_result(
+            result, deadlines={"cohort-a": ends_at}
+        )
+        self.assertIsNotNone(observation)
+        self.assertTrue(observation[1])
+        self.assertAlmostEqual(observation[2], 5_400, delta=1)
+
+        result.response_json["server_time"] = (
+            now - external_load.timedelta(minutes=5)
+        ).isoformat()
+        stale = external_load._read_mix_ready_state_for_result(
+            result, deadlines={"cohort-a": ends_at}
+        )
+        self.assertEqual(stale, ("cohort-a", False, None))
+
     def test_dispatcher_projects_typed_120s_memory_rows_and_rejects_wrong_window(self) -> None:
         for workload, on_window_ms in (
             (capacity_diagnostic.HTML_CAPACITY_120S_WORKLOAD, 120_000),
@@ -3425,6 +3532,48 @@ class ExternalLoadTests(unittest.TestCase):
             summary["transport"]["phase_timings"]["ttfb_ms"]["p95_ms"],
             18.0,
         )
+
+    def test_summary_preserves_bounded_error_stage_status_and_connection_state(self) -> None:
+        body_timeout = RequestResult(
+            phase="scale_external_read_mix_c16",
+            method="GET",
+            path="/tournaments/private-slug/workspace",
+            status=0,
+            elapsed_ms=30_000.0,
+            ok=False,
+            response_bytes=0,
+            error_kind="TimeoutError",
+            observed_status=200,
+            failure_stage="body_receive",
+            transport_timing={"connection_reused": True, "unsafe": "private-data"},
+        )
+        pre_headers_timeout = RequestResult(
+            phase="scale_external_read_mix_c16",
+            method="GET",
+            path="/tournaments/private-slug/workspace",
+            status=0,
+            elapsed_ms=30_000.0,
+            ok=False,
+            response_bytes=0,
+            error_kind="TimeoutError",
+            failure_stage="response_headers",
+            transport_timing={"connection_reused": False},
+        )
+        summary = summarize_results([body_timeout, pre_headers_timeout])
+        self.assertEqual(
+            summary["failure_diagnostics"],
+            {
+                "failure_stage_counts": {"body_receive": 1, "response_headers": 1},
+                "observed_status_counts": {"200": 1, "unknown": 1},
+                "connection_state_counts": {"new": 1, "reused": 1},
+            },
+        )
+        self.assertEqual(summary["error_samples"][0]["status"], 0)
+        self.assertEqual(summary["error_samples"][0]["observed_status"], 200)
+        self.assertEqual(summary["error_samples"][0]["failure_stage"], "body_receive")
+        self.assertEqual(summary["error_samples"][0]["connection_state"], "reused")
+        self.assertNotIn("private-slug", json.dumps(summary))
+        self.assertNotIn("private-data", json.dumps(summary))
 
     def test_summary_keeps_only_bounded_cloudflare_failure_diagnostics(self) -> None:
         result = RequestResult(

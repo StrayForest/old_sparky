@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import Counter, defaultdict
 from contextlib import contextmanager
 from datetime import UTC, datetime
 import hashlib
@@ -25,11 +26,25 @@ import time
 from typing import Any, Iterator
 
 try:
-    from platform_production_qa import ProductionQa, QaFailure, dispose_engine, load_env_file
+    from platform_production_qa import (
+        ProductionQa,
+        QaFailure,
+        dispose_engine,
+        load_env_file,
+        metric_stats,
+    )
+    from platform_evidence_sanitizer import safe_route_key
 except ModuleNotFoundError as exc:  # Imported as ``tools.*`` by focused tests.
     if exc.name != "platform_production_qa":
         raise
-    from tools.platform_production_qa import ProductionQa, QaFailure, dispose_engine, load_env_file
+    from tools.platform_production_qa import (
+        ProductionQa,
+        QaFailure,
+        dispose_engine,
+        load_env_file,
+        metric_stats,
+    )
+    from tools.platform_evidence_sanitizer import safe_route_key
 
 
 PUBLIC_ORIGIN = "https://old-sparky.com"
@@ -39,6 +54,9 @@ MAX_USERS_PER_TOURNAMENT = 500
 MAX_TOURNAMENTS = 40
 MAX_USERS = MAX_USERS_PER_TOURNAMENT * MAX_TOURNAMENTS
 SOURCE_SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
+READ_MIX_SCHEDULE_PROFILE = "read-mix-concurrency-ramp-v1"
+READY_WORKER_POLL_SECONDS = 5
+READY_WORKER_WAIT_SECONDS = 360
 FIXTURE_TIMING_STAGES = (
     "bulk_user_creation",
     "permission_grants",
@@ -47,19 +65,28 @@ FIXTURE_TIMING_STAGES = (
     "fixture_finalization",
 )
 MAX_FIXTURE_STAGE_DURATION_MS = 180 * 60 * 1000
+FIXTURE_SETUP_ROUTE_KEYS = frozenset(
+    {
+        "POST tournaments_collection",
+        "POST tournament_participants",
+        "PATCH tournament_detail",
+        "other",
+    }
+)
 
 
 class FixtureStageTimings:
     """Keep one monotonic duration for each bounded fixture-setup stage."""
 
     def __init__(self) -> None:
-        self._stages: dict[str, dict[str, float | bool]] = {}
+        self._stages: dict[str, dict[str, Any]] = {}
 
     @contextmanager
     def measure(self, name: str) -> Iterator[None]:
         if name not in FIXTURE_TIMING_STAGES or name in self._stages:
             raise ValueError("external fixture timing stage is invalid")
         started = time.perf_counter()
+        started_at_utc = datetime.now(UTC).isoformat()
         completed = False
         try:
             yield
@@ -69,9 +96,11 @@ class FixtureStageTimings:
             self._stages[name] = {
                 "duration_ms": round(elapsed_seconds * 1000, 3),
                 "completed": completed,
+                "started_at_utc": started_at_utc,
+                "finished_at_utc": datetime.now(UTC).isoformat(),
             }
 
-    def snapshot(self) -> dict[str, dict[str, float | bool]]:
+    def snapshot(self) -> dict[str, dict[str, Any]]:
         return {name: dict(stage) for name, stage in self._stages.items()}
 
 
@@ -102,7 +131,12 @@ def atomic_write_json(path: Path, payload: dict[str, Any], *, mode: int) -> None
             pass
 
 
-def write_fixture_timing_receipt(path: Path, timings: FixtureStageTimings) -> None:
+def write_fixture_timing_receipt(
+    path: Path,
+    timings: FixtureStageTimings,
+    *,
+    setup_http: dict[str, Any] | None = None,
+) -> None:
     """Persist only bounded phase durations, separate from credential reports."""
 
     atomic_write_json(
@@ -111,9 +145,116 @@ def write_fixture_timing_receipt(path: Path, timings: FixtureStageTimings) -> No
             "schema": 1,
             "clock": "time.perf_counter",
             "stages": timings.snapshot(),
+            **({"setup_http": setup_http} if setup_http is not None else {}),
         },
         mode=0o600,
     )
+
+
+def summarize_fixture_setup_http(qa: ProductionQa) -> dict[str, Any]:
+    """Keep bounded route aggregates for tournament API fixture setup only."""
+
+    rows: dict[str, list[Any]] = defaultdict(list)
+    recorder = getattr(qa, "http_metrics", None)
+    for sample in getattr(recorder, "samples", ()):
+        if sample.phase != "external_vote_fixture_setup":
+            continue
+        route_key = safe_route_key(sample.method, sample.path)
+        route = route_key if route_key in FIXTURE_SETUP_ROUTE_KEYS else "other"
+        rows[route].append(sample)
+    by_route: dict[str, Any] = {}
+    for route, samples in sorted(rows.items()):
+        statuses = Counter(str(sample.status_code) for sample in samples)
+        by_route[route] = {
+            "requests": len(samples),
+            "errors": sum(not sample.ok for sample in samples),
+            "status_counts": dict(sorted(statuses.items())),
+            "latency_ms": metric_stats([sample.elapsed_ms for sample in samples]),
+            "response_bytes_total": sum(sample.response_bytes for sample in samples),
+        }
+    return {
+        "requests": sum(len(samples) for samples in rows.values()),
+        "errors": sum(
+            not sample.ok for samples in rows.values() for sample in samples
+        ),
+        "by_route": by_route,
+    }
+
+
+def project_fixture_setup_http(value: Any) -> dict[str, Any]:
+    """Validate the fixed numeric route/status summary; discard all other keys."""
+
+    if not isinstance(value, dict) or set(value) != {"requests", "errors", "by_route"}:
+        raise ValueError("fixture setup HTTP summary schema is invalid")
+
+    def bounded_int(raw: Any, maximum: int) -> int:
+        if isinstance(raw, bool) or not isinstance(raw, int) or not 0 <= raw <= maximum:
+            raise ValueError("fixture setup HTTP count is invalid")
+        return raw
+
+    requests = bounded_int(value["requests"], 50_000)
+    errors = bounded_int(value["errors"], requests)
+    raw_routes = value["by_route"]
+    if not isinstance(raw_routes, dict) or set(raw_routes) - FIXTURE_SETUP_ROUTE_KEYS:
+        raise ValueError("fixture setup HTTP route summary is invalid")
+    by_route: dict[str, Any] = {}
+    route_requests = 0
+    route_errors = 0
+    for route, raw in sorted(raw_routes.items()):
+        if not isinstance(raw, dict) or set(raw) != {
+            "requests",
+            "errors",
+            "status_counts",
+            "latency_ms",
+            "response_bytes_total",
+        }:
+            raise ValueError("fixture setup HTTP route row is invalid")
+        count = bounded_int(raw["requests"], 50_000)
+        route_error_count = bounded_int(raw["errors"], count)
+        raw_statuses = raw["status_counts"]
+        if not isinstance(raw_statuses, dict):
+            raise ValueError("fixture setup HTTP status summary is invalid")
+        statuses: dict[str, int] = {}
+        for status, status_count in raw_statuses.items():
+            if (
+                not isinstance(status, str)
+                or not re.fullmatch(r"[0-9]{1,3}", status)
+                or int(status) > 599
+            ):
+                raise ValueError("fixture setup HTTP status summary is invalid")
+            statuses[status] = bounded_int(status_count, count)
+        if sum(statuses.values()) != count:
+            raise ValueError("fixture setup HTTP status counts do not match requests")
+        latency = raw["latency_ms"]
+        latency_keys = {"count", "avg_ms", "p50_ms", "p95_ms", "p99_ms", "max_ms"}
+        if not isinstance(latency, dict) or set(latency) != latency_keys:
+            raise ValueError("fixture setup HTTP latency summary is invalid")
+        if bounded_int(latency["count"], 50_000) != count:
+            raise ValueError("fixture setup HTTP latency count does not match requests")
+        safe_latency: dict[str, Any] = {"count": count}
+        for key in latency_keys - {"count"}:
+            number = latency[key]
+            if (
+                isinstance(number, bool)
+                or not isinstance(number, (int, float))
+                or not math.isfinite(number)
+                or not 0 <= number <= 3_600_000
+            ):
+                raise ValueError("fixture setup HTTP latency value is invalid")
+            safe_latency[key] = number
+        response_bytes = bounded_int(raw["response_bytes_total"], 10_000_000_000)
+        by_route[route] = {
+            "requests": count,
+            "errors": route_error_count,
+            "status_counts": dict(sorted(statuses.items())),
+            "latency_ms": safe_latency,
+            "response_bytes_total": response_bytes,
+        }
+        route_requests += count
+        route_errors += route_error_count
+    if route_requests != requests or route_errors != errors:
+        raise ValueError("fixture setup HTTP route totals do not match summary")
+    return {"requests": requests, "errors": errors, "by_route": by_route}
 
 
 def read_fixture_timing_projection(
@@ -167,7 +308,10 @@ def read_fixture_timing_projection(
         raise ValueError("fixture timing receipt is invalid") from exc
     if (
         not isinstance(payload, dict)
-        or set(payload) != {"schema", "clock", "stages"}
+        or set(payload) not in (
+            {"schema", "clock", "stages"},
+            {"schema", "clock", "stages", "setup_http"},
+        )
         or type(payload.get("schema")) is not int
         or payload["schema"] != 1
         or payload.get("clock") != "time.perf_counter"
@@ -178,15 +322,34 @@ def read_fixture_timing_projection(
     stages = payload["stages"]
     if set(stages) - set(FIXTURE_TIMING_STAGES):
         raise ValueError("fixture timing receipt has an unknown stage")
-    safe_stages: dict[str, dict[str, float | bool]] = {}
+    safe_stages: dict[str, dict[str, Any]] = {}
     for stage_name in FIXTURE_TIMING_STAGES:
         if stage_name not in stages:
             continue
         stage = stages[stage_name]
-        if not isinstance(stage, dict) or set(stage) != {"duration_ms", "completed"}:
+        if not isinstance(stage, dict) or set(stage) != {
+            "duration_ms",
+            "completed",
+            "started_at_utc",
+            "finished_at_utc",
+        }:
             raise ValueError("fixture timing stage schema is invalid")
         duration_ms = stage["duration_ms"]
         completed = stage["completed"]
+        timestamps: dict[str, str] = {}
+        parsed_timestamps: dict[str, datetime] = {}
+        for key in ("started_at_utc", "finished_at_utc"):
+            value = stage[key]
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except (AttributeError, TypeError, ValueError):
+                raise ValueError("fixture timing timestamp is invalid") from None
+            if parsed.tzinfo is None:
+                raise ValueError("fixture timing timestamp is invalid")
+            parsed_timestamps[key] = parsed.astimezone(UTC)
+            timestamps[key] = parsed.astimezone(UTC).isoformat()
+        if parsed_timestamps["finished_at_utc"] < parsed_timestamps["started_at_utc"]:
+            raise ValueError("fixture timing timestamp order is invalid")
         if (
             isinstance(duration_ms, bool)
             or not isinstance(duration_ms, (int, float))
@@ -199,6 +362,7 @@ def read_fixture_timing_projection(
         safe_stages[stage_name] = {
             "duration_ms": duration_ms,
             "completed": completed,
+            **timestamps,
         }
 
     if qa_succeeded and (
@@ -206,7 +370,16 @@ def read_fixture_timing_projection(
         or any(stage["completed"] is not True for stage in safe_stages.values())
     ):
         raise ValueError("successful fixture timing is incomplete")
-    return {"schema": 1, "clock": "time.perf_counter", "stages": safe_stages}
+    safe_receipt: dict[str, Any] = {
+        "schema": 1,
+        "clock": "time.perf_counter",
+        "stages": safe_stages,
+    }
+    if "setup_http" in payload:
+        safe_receipt["setup_http"] = project_fixture_setup_http(payload["setup_http"])
+    elif qa_succeeded:
+        raise ValueError("successful fixture timing has no setup HTTP metrics")
+    return safe_receipt
 
 
 def project_fixture_timing_summary(
@@ -308,7 +481,14 @@ def project_fixture_timing_summary(
         "completed_users": safe_count("completed_users"),
         "passed": payload.get("passed") is True,
         "rows": safe_rows,
-        "external_vote_fixture": {"fixture_setup_timings": timing},
+        "external_vote_fixture": {
+            "fixture_setup_timings": timing,
+            **(
+                {"fixture_setup_http": timing["setup_http"]}
+                if "setup_http" in timing
+                else {}
+            ),
+        },
     }
     try:
         parent_stat = os.lstat(destination_path.parent)
@@ -339,6 +519,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--http-timeout", type=float, default=30.0)
     parser.add_argument("--runner-sha")
     parser.add_argument("--source-binding-base64")
+    parser.add_argument("--fixture-schedule", choices=(READ_MIX_SCHEDULE_PROFILE,))
     return parser.parse_args()
 
 
@@ -411,6 +592,13 @@ async def prepare(args: argparse.Namespace) -> dict[str, Any]:
     total_users = args.tournament_count * args.users_per_tournament
     if total_users > MAX_USERS:
         raise QaFailure("external fixture exceeds the supported user bound")
+    fixture_schedule = getattr(args, "fixture_schedule", None)
+    if fixture_schedule is not None and (
+        fixture_schedule != READ_MIX_SCHEDULE_PROFILE
+        or args.tournament_count != MAX_TOURNAMENTS
+        or args.users_per_tournament != MAX_USERS_PER_TOURNAMENT
+    ):
+        raise QaFailure("scheduled Ready Check fixture dimensions are invalid")
 
     load_env_file(args.env_file)
     os.environ["PLATFORM_RUNTIME_SERVICE"] = "qa"
@@ -425,6 +613,7 @@ async def prepare(args: argparse.Namespace) -> dict[str, Any]:
         concurrency=args.concurrency,
         http_max_connections=max(100, args.concurrency),
         collect_performance=False,
+        collect_http_metrics=True,
         write_burst_profile="single-ready",
         write_burst_users_per_tournament=args.users_per_tournament,
     )
@@ -440,6 +629,7 @@ async def prepare(args: argparse.Namespace) -> dict[str, Any]:
     }
     fixture_timings = FixtureStageTimings()
     fixture_timing_path = args.report_path.with_name("fixture-timing.json")
+    fixture_setup_http: dict[str, Any] | None = None
 
     api_client = await qa.new_client(args.local_origin)
     try:
@@ -477,6 +667,7 @@ async def prepare(args: argparse.Namespace) -> dict[str, Any]:
                         label="external_ready",
                         index=index,
                         start_ready_check=False,
+                        scheduled_ready_window=(fixture_schedule is not None),
                     )
                 prepared_tournaments.append(tournament)
                 slug = str(tournament["slug"])
@@ -485,6 +676,18 @@ async def prepare(args: argparse.Namespace) -> dict[str, Any]:
                         "id": str(tournament["id"]),
                         "slug": slug,
                         "user_count": len(chunk),
+                        **(
+                            {
+                                "ready_check_starts_at": tournament[
+                                    "ready_check_starts_at"
+                                ],
+                                "ready_check_ends_at": tournament[
+                                    "ready_check_ends_at"
+                                ],
+                            }
+                            if fixture_schedule is not None
+                            else {}
+                        ),
                     }
                 )
                 for user in chunk:
@@ -497,22 +700,76 @@ async def prepare(args: argparse.Namespace) -> dict[str, Any]:
                             "csrf_token": qa.csrf_tokens_by_user_id[user_id],
                         }
                     )
+        fixture_setup_http = summarize_fixture_setup_http(qa)
 
-        # Start every Ready Check only after the complete fixture exists. A
-        # sequential setup of a 20k cohort can otherwise age the first
-        # tournament past its ten-minute manual window before measurement
-        # begins, making the duplicate phase test the timer instead of
-        # idempotency.
+        # Manual windows are started only after the complete fixture exists.
+        # The read-mix capacity profile instead uses the public scheduled
+        # workflow and waits for the normal automation worker to materialize
+        # every active round.
         with fixture_timings.measure("ready_check_starts"):
-            for tournament in prepared_tournaments:
-                with qa.phase("external_vote_fixture_start"):
-                    await qa.request_as(
-                        api_client,
-                        tournament["organizer"],
-                        "POST",
-                        f"/tournaments/{tournament['slug']}/deadlock/ready-check/start",
-                        expected=201,
+            if fixture_schedule is None:
+                for tournament in prepared_tournaments:
+                    with qa.phase("external_vote_fixture_start"):
+                        await qa.request_as(
+                            api_client,
+                            tournament["organizer"],
+                            "POST",
+                            f"/tournaments/{tournament['slug']}/deadlock/ready-check/start",
+                            expected=201,
+                        )
+            else:
+                deadline = time.monotonic() + READY_WORKER_WAIT_SECONDS
+                active_count = 0
+                while True:
+                    active_count = 0
+
+                    async def check_active_round(tournament: dict[str, Any]) -> None:
+                        nonlocal active_count
+                        with qa.phase("external_vote_fixture_scheduled_ready_check_poll"):
+                            state = await qa.request_as(
+                                api_client,
+                                tournament["organizer"],
+                                "GET",
+                                f"/tournaments/{tournament['slug']}/deadlock/ready-check",
+                                expected=200,
+                            )
+                        active_round = (
+                            state.get("active_round") if isinstance(state, dict) else None
+                        )
+                        if isinstance(active_round, dict) and active_round.get("status") == "active":
+                            active_count += 1
+
+                    await qa.bounded_each(prepared_tournaments, check_active_round)
+                    if active_count == len(prepared_tournaments):
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise QaFailure(
+                            "scheduled Ready Checks did not become active within the bounded worker wait"
+                        )
+                    await asyncio.sleep(min(READY_WORKER_POLL_SECONDS, remaining))
+                now = datetime.now(UTC)
+                scheduled_deadlines = [
+                    datetime.fromisoformat(
+                        str(tournament["ready_check_ends_at"]).replace("Z", "+00:00")
+                    ).astimezone(UTC)
+                    for tournament in tournament_entries
+                ]
+                minimum_remaining_seconds = min(
+                    (deadline_at - now).total_seconds()
+                    for deadline_at in scheduled_deadlines
+                )
+                if minimum_remaining_seconds <= 3_900:
+                    raise QaFailure(
+                        "scheduled Ready Checks do not leave the read-ramp runtime and startup margin"
                     )
+                qa.report["external_vote"]["scheduled_ready_state"] = {
+                    "expected_active_rounds": len(prepared_tournaments),
+                    "active_rounds": active_count,
+                    "minimum_remaining_seconds": round(minimum_remaining_seconds, 3),
+                    "required_remaining_seconds": 3_900,
+                    "passed": True,
+                }
 
         with fixture_timings.measure("fixture_finalization"):
             qa.report["tournament_ids"] = list(qa.tournament_ids)
@@ -538,6 +795,8 @@ async def prepare(args: argparse.Namespace) -> dict[str, Any]:
                 "tournaments": tournament_entries,
                 "users": manifest_users,
             }
+            if fixture_schedule is not None:
+                manifest_payload["fixture_schedule"] = fixture_schedule
             if runner_sha is not None:
                 manifest_payload.update(
                     {
@@ -570,7 +829,11 @@ async def prepare(args: argparse.Namespace) -> dict[str, Any]:
                 tournaments_created=len(tournament_entries),
                 finished_at=datetime.now(UTC),
             )
-        write_fixture_timing_receipt(fixture_timing_path, fixture_timings)
+        write_fixture_timing_receipt(
+            fixture_timing_path,
+            fixture_timings,
+            setup_http=fixture_setup_http,
+        )
         return qa.report
     except Exception:
         qa.report["finished_at"] = datetime.now(UTC).isoformat()
@@ -585,7 +848,11 @@ async def prepare(args: argparse.Namespace) -> dict[str, Any]:
             await qa.record_preprod_run(status="failed", finished_at=datetime.now(UTC))
         except Exception:
             pass
-        write_fixture_timing_receipt(fixture_timing_path, fixture_timings)
+        write_fixture_timing_receipt(
+            fixture_timing_path,
+            fixture_timings,
+            setup_http=fixture_setup_http,
+        )
         raise
     finally:
         await api_client.aclose()
