@@ -3128,6 +3128,11 @@ def _response_json_projection(
         return None
     if not isinstance(payload, dict):
         return None
+    if (
+        is_authenticated_read
+        and payload.get("code") == "AUTHENTICATED_READ_OVERLOADED"
+    ):
+        return {"code": "AUTHENTICATED_READ_OVERLOADED"}
     if is_vote:
         projection: dict[str, Any] = {}
         code = payload.get("code")
@@ -3177,8 +3182,6 @@ def _response_json_projection(
             }
         return None
     if is_authenticated_read:
-        if payload.get("code") == "AUTHENTICATED_READ_OVERLOADED":
-            return {"code": "AUTHENTICATED_READ_OVERLOADED"}
         return None
     active_round = payload.get("active_round")
     if not isinstance(active_round, dict):

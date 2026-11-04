@@ -14,6 +14,7 @@ import stat
 import tempfile
 import time
 import unittest
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 from tools.platform_external_load import (
@@ -905,6 +906,7 @@ class PerformanceProfileContractTests(unittest.TestCase):
                 scenario["traffic"]["manual_refresh_count"] = 0
             marker = manifest["marker"]
             external_run_id = "26082900000000"
+            ready_check_ends_at = datetime.now(UTC) + timedelta(days=2)
 
             def bound_request(
                 origin: str,
@@ -913,9 +915,23 @@ class PerformanceProfileContractTests(unittest.TestCase):
             ) -> RequestResult:
                 del origin, user
                 phase = str(kwargs.get("phase") or "")
+                path = str(kwargs.get("path") or "/")
+                server_time = datetime.now(UTC)
+                ready_state = (
+                    {
+                        "ready_check_status": "active",
+                        "ready_check_ends_at": ready_check_ends_at.isoformat(),
+                        "server_time": server_time.isoformat(),
+                    }
+                    if profile_id == "read-mix-concurrency-ramp-v1"
+                    and path.split("?", 1)[0].endswith("/workspace")
+                    else None
+                )
                 response_json = (
                     {"active_round": {"ready_count": 1}}
                     if phase == "read_external_vote_state"
+                    else ready_state
+                    if ready_state is not None
                     else {"changed": True}
                     if scenario["mode"] == "ready-vote"
                     else None
@@ -923,13 +939,15 @@ class PerformanceProfileContractTests(unittest.TestCase):
                 return RequestResult(
                     phase=phase,
                     method=str(kwargs.get("method") or "GET"),
-                    path=str(kwargs.get("path") or "/"),
+                    path=path,
                     status=200,
                     elapsed_ms=10.0,
                     ok=True,
                     response_bytes=128,
                     response_etag='"workspace-etag"',
                     response_json=response_json,
+                    started_at_utc=(server_time - timedelta(seconds=1)).isoformat(),
+                    finished_at_utc=(server_time + timedelta(seconds=1)).isoformat(),
                 )
 
             observer = {
@@ -973,6 +991,14 @@ class PerformanceProfileContractTests(unittest.TestCase):
                     patch(
                         "tools.platform_external_load._request",
                         side_effect=bound_request,
+                    ),
+                    patch(
+                        "tools.platform_external_load._read_mix_ready_deadlines",
+                        return_value=(
+                            {"qa-tournament": ready_check_ends_at}
+                            if profile_id == "read-mix-concurrency-ramp-v1"
+                            else None
+                        ),
                     ),
                     patch.dict(
                         os.environ,

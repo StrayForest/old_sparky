@@ -3604,11 +3604,31 @@ class ExternalLoadTests(unittest.TestCase):
                 "route_class": "ready_vote",
                 "status": 522,
                 "error_class": "server_error",
+                "failure_stage": "unknown",
+                "observed_status": None,
+                "connection_state": "unknown",
                 "cf_error_class": "cf_522",
                 "cf_error_origin_class": "origin",
                 "ttfb_ms": None,
                 "elapsed_ms": 30_000.0,
             },
+        )
+        public_summary = project_public_artifact(
+            "external_load", {"raw_http": summary}
+        )
+        self.assertEqual(
+            public_summary["raw_http"]["error_samples"][0]["cf_error_class"],
+            "cf_522",
+        )
+        self.assertEqual(
+            public_summary["raw_http"]["error_samples"][0][
+                "cf_error_origin_class"
+            ],
+            "origin",
+        )
+        self.assertEqual(
+            public_summary["raw_http"]["error_samples"][0]["failure_stage"],
+            "unknown",
         )
 
     def test_request_extracts_only_allowlisted_failure_headers(self) -> None:
