@@ -9325,6 +9325,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             ):
                 control_produced = capacity_diagnostic._parent_composite_run(args, control_state)
             self.assertEqual(control_produced["status"], "incomplete")
+            self.assertIsNone(control_produced["cpu_profile_phase"])
             self.assertIsNotNone(
                 capacity_diagnostic._project_composite_capacity_report(control_produced),
             )
@@ -9515,6 +9516,85 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertFalse(sanitized_incomplete["matrix_credit"])
             self.assertFalse(sanitized_incomplete["slo_credit"])
             self.assertFalse(sanitized_incomplete["diagnostic_credit"])
+
+            correlation_gap_capacity = json.loads(json.dumps(capacity))
+            correlation_request_id = next(
+                f"{index:032x}"
+                for index in range(1, 10_000)
+                if diagnostic_plan_tool.is_ssr_response_id_eligible(
+                    correlation_gap_capacity["run_id"], f"{index:032x}",
+                )
+            )
+            correlation_gap = diagnostic_plan_tool.summarize_ssr_request_correlation(
+                selected_request_ids=[correlation_request_id],
+                submitted_html_count=1, valid_response_id_count=1,
+                eligible_response_id_count=1,
+                selection_scheme="sha256-runid-requestid-1of8-v1",
+                missing_response_id_count=0, duplicate_response_id_count=0,
+                malformed_response_id_count=0, run_id=correlation_gap_capacity["run_id"],
+                phase="on", window_start_utc="2026-10-29T12:00:00+00:00",
+                window_end_utc="2026-10-29T12:00:15+00:00", nginx_rows=[], ssr_rows=[],
+                stream_rows=[], api_rows=[],
+                source_collection_reason={"api": "complete", "web": "complete"},
+            )
+            correlation_gap["ssr_stream_coverage"] = {
+                **capacity["server_telemetry"]["request_correlation"]["summary"]
+                ["ssr_stream_coverage"],
+            }
+            correlation_gap_capacity["server_telemetry"]["request_correlation"] = {
+                "status": "incomplete", "summary": correlation_gap,
+            }
+            correlation_gap_capacity["status"] = "incomplete"
+            correlation_gap_capacity["passed"] = False
+            self.assertIsNotNone(
+                capacity_diagnostic._project_capacity_report(correlation_gap_capacity),
+            )
+            args.report = str(root / "producer-correlation-gap.json")
+            profile_calls: list[str] = []
+
+            def run_phase(phase_args: Namespace, _state: dict[str, Any]) -> dict[str, Any]:
+                profile_calls.append(phase_args.workload)
+                return (correlation_gap_capacity
+                        if phase_args.workload == capacity_diagnostic.HTML_CAPACITY_120S_WORKLOAD
+                        else profile)
+
+            with (
+                patch.object(capacity_diagnostic, "_read_manifest", return_value=(manifest_raw, manifest, actors)),
+                patch.object(capacity_diagnostic, "_parent_run_once", side_effect=run_phase),
+                patch.object(capacity_diagnostic, "_composite_wait_for_profile_gap", return_value=True),
+            ):
+                correlation_gap_report = capacity_diagnostic._parent_composite_run(args, {})
+            self.assertEqual(profile_calls, [
+                capacity_diagnostic.HTML_CAPACITY_120S_WORKLOAD,
+                capacity_diagnostic.HTML_CPU_PROFILE_20S_WORKLOAD,
+            ])
+            self.assertEqual(correlation_gap_report["status"], "incomplete")
+            self.assertFalse(correlation_gap_report["passed"])
+            self.assertTrue(correlation_gap_report["namespace_closed"])
+            self.assertEqual(correlation_gap_report["remote_plan_cleanup"], "complete")
+            self.assertIsNotNone(
+                capacity_diagnostic._project_composite_capacity_report(correlation_gap_report),
+            )
+            capacity_diagnostic._write_report(Path(args.report), correlation_gap_report)
+            correlation_gap_output = root / "sanitized-correlation-gap.json"
+            with patch.object(
+                capacity_diagnostic, "_read_manifest",
+                return_value=(manifest_raw, manifest, actors),
+            ):
+                self.assertEqual(capacity_diagnostic.sanitize_capacity_report(
+                    input_path=Path(args.report), output_path=correlation_gap_output,
+                    manifest_path=root / "manifest.json", source_sha=source_sha,
+                    app_target_sha=app_sha, run_id=external_run_id, attempt=attempt,
+                    workload=capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+                ), "FAIL")
+            sanitized_correlation_gap = json.loads(
+                correlation_gap_output.read_text(encoding="ascii"),
+            )
+            self.assertEqual(sanitized_correlation_gap["status"], "incomplete")
+            self.assertFalse(sanitized_correlation_gap["passed"])
+            self.assertFalse(sanitized_correlation_gap["matrix_credit"])
+            self.assertFalse(sanitized_correlation_gap["slo_credit"])
+            self.assertFalse(sanitized_correlation_gap["diagnostic_credit"])
 
             # A bounded rejection counter survives the full composite report,
             # sanitizer, and failure-fingerprint path without granting credit.

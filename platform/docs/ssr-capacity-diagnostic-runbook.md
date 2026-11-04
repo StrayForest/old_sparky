@@ -20,30 +20,42 @@ exact-head CI route. For a runtime-sensitive source change:
 
 1. Merge the reviewed change through the normal `dev` route. Record the exact
    merged source SHA `S` and its successful Security run and attempt.
-2. Start exactly one source-bound TMPFS backup for that same `S` and Security
-   run/attempt. It may start while Security runs or after exact Security
-   success; confirm the backup workflow starts within AUTO's bounded proof
-   wait. The backup still waits for exact Security success and current `dev`
-   before staging or SSH. Require the receipt to bind `S`, the Security identity
-   and backup run, with create, restore, Alembic and scratch-cleanup success.
+2. Follow the exact-source AUTO route selected by the validated classifier.
+   For a deployable production change, start exactly one source-bound TMPFS
+   backup for `S` and its Security run/attempt; it may start during Security or
+   after success, and must start within AUTO's bounded proof wait. Require the
+   receipt to bind `S` and prove create, restore, Alembic and scratch cleanup.
+   A non-deployable recovery-bootstrap change uses automatic baseline
+   reconciliation and its verified no-op receipt; it does not require a
+   backup. Do not infer that route from the file list or manually dispatch a
+   different workflow.
 3. Let the normal auto-deploy parent verify its signed host-tools bundle and
-   attestation. Install a new host-tools generation only from that normal,
-   source-bound parent artifact. A pull-request candidate artifact is never
-   production authority. Keep runner source `S`, active app source `A`, and
-   host-tools generation `C` distinct in every receipt.
+   attestation. Install a new host-tools generation only when that exact
+   source-bound route requires one, and only from its trusted parent artifact.
+   A pull-request candidate artifact is never production authority. Keep
+   runner source `S`, active app source `A`, and host-tools generation `C`
+   distinct in every receipt; confirm the active `C` pin even when the
+   recovery-bootstrap route reuses the installed generation.
    Verify host-tool modes against the installed generation's normalized
    manifest (`0555` executable members, `0444` data), not checkout source
    modes. Runner-only checks requiring `RUNNER_TEMP` or an SSH handoff stay in
    their owning workflow job, not the host shell. See the
    [host-tools provisioning ADR](adr/production-host-tools-provisioning.md).
-4. Let the normal deployment child install the app. Require strict shared-venv
-   reuse, the exact `S` release marker, the expected previous-release pointer,
-   healthy `deadlock-api`, `deadlock-web`, and `deadlock-worker`, and no pending
+4. If classifier evidence marks `S` deployable, let the normal deployment
+   child install the app. Require strict shared-venv reuse, the exact `S`
+   release marker, the expected previous-release pointer, healthy
+   `deadlock-api`, `deadlock-web`, and `deadlock-worker`, and no pending
    operation or diagnostic lock. Do not manually install or dispatch a normal
-   production deployment.
-5. Confirm the diagnostic profile is active and the exact app source is
-   deployed. Run these read-only checks from the authorized host session; pass
-   the expected deployed app SHA as a public value. They print only selected
+   production deployment. For a non-deployable recovery-bootstrap change, keep
+   app source `A` active and require the automatic baseline-reconcile child to
+   publish its exact verified no-op source-binding receipt for runner `S` and
+   app `A`; do not substitute a manually dispatched deploy or an unverified
+   no-op.
+5. Confirm the active app is healthy and the source binding is exact. For a
+   deployed run, `S` must equal active app source `A`; for the verified no-op
+   route, preserve distinct `S` and `A` and require the exact source-bound
+   receipt. Run these read-only checks from the authorized host session; pass
+   the expected active app SHA `A` as a public value. They print only selected
    systemd fields, release identity and allowlisted runtime settings. The
    preflight filters the process environment to the listed keys, emits only
    those allowlisted values, and never opens or prints the shared environment
@@ -392,8 +404,15 @@ identities, and all of these conditions hold:
 The capacity phase is descriptive and has no latency or throughput threshold.
 Any missing phase, request identity, required metric, cleanup proof, binding,
 or deadline condition makes the composite incomplete; retain the partial
-observations as partial and assign no capacity, SLO, or matrix credit. The
-profiled phase is never capacity evidence. API function self-time is measured
+observations as partial and assign no capacity, SLO, or matrix credit. If
+request correlation is the only incomplete capacity evidence and both phase
+namespaces and plan cleanups are proven closed, the separate 20-second profile
+still runs for diagnosis. Its presence does not complete the composite: full
+cohort correlation remains required for `PASS`, and incomplete correlation
+receives no credit. Worker failure, resource abort, incomplete non-correlation
+telemetry, unclosed namespace, failed plan cleanup, fixture/source mismatch,
+quiescence failure, or insufficient wall budget still prevents the profile.
+The profiled phase is never capacity evidence. API function self-time is measured
 on the event-loop thread and excludes other threads. API profile rows include
 at most 20 fixed function IDs with self CPU, cumulative CPU, total and
 primitive calls. The self-time coverage field counts only mapped functions;
@@ -485,19 +504,26 @@ source-bound backup for `S` and its successful Security run/attempt using the
 [backup procedure](backup-restore-runbook.md#local-verified-backup); it may
 start after Security succeeds and must start within AUTO's bounded proof
 wait. Let the existing AUTO chain complete normal deployment and readiness;
-never manually dispatch deployment. Before cleanup, verify `dev`, the
-successful Security source, active `RELEASE.json` source, and cleanup
-workflow checkout all equal the exact 40-character SHA `S`. Confirm the
-installed host-tools pin and normal service readiness checks from
+never manually dispatch deployment. A non-deployable recovery-bootstrap `S`
+uses the automatic baseline-reconcile route instead: wait for its exact
+verified no-op receipt binding runner `S` to the still-active app `A`. This
+route needs no app deployment or backup. Do not dispatch a deploy/reconcile
+workflow manually or treat an unverified no-op as a source binding.
+
+Before cleanup, verify the successful Security source and cleanup workflow
+checkout are the exact 40-character SHA `S`. For a same-source or deployed
+binding, verify active `RELEASE.json` also equals `S`; for the verified no-op
+route, verify the receipt binds `S` to active `A` and the host helper confirms
+`A` against current `RELEASE.json`. In either route, confirm the installed
+host-tools pin and normal service readiness checks from
 [Release and host readiness](#release-and-host-readiness). The cleanup
-source-binding resolver binds its checked-out SHA by same-source identity
-or an exact verified no-op receipt; the host helper independently checks
-the bound app SHA against current `RELEASE.json`. Once `S` is active, the
-normal same-source binding is used by the cleanup command below. If `dev`
-moves, AUTO fails, a source differs, or readiness cannot be proved, stop
-and use the [deployment recovery procedure](deployment-runbook.md#preconditions).
-Do not override the app target, create a no-op alias, or dispatch a new
-workload before exact cleanup succeeds.
+source-binding resolver binds its checked-out SHA by same-source identity or
+an exact verified no-op receipt; the host helper independently checks the
+bound app SHA against current `RELEASE.json`. If `dev` moves, AUTO fails, a
+source or receipt binding differs, or readiness cannot be proved, stop and use
+the [deployment recovery procedure](deployment-runbook.md#preconditions). Do
+not override the app target, create a no-op alias, or dispatch a new workload
+before exact cleanup succeeds.
 
 The origin supervisor keeps the observer timeout tree in its own process
 session. On `SIGINT` or `SIGTERM`, it stops and reaps that session before it

@@ -4360,11 +4360,12 @@ def _parent_composite_run(
                 break
             if phase_name == "cpu_profile":
                 capacity_phase = phases["capacity"]
+                projected_capacity = _project_capacity_report(capacity_phase)
                 if (
-                    capacity_phase is None
-                    or capacity_phase.get("status") != "complete"
-                    or capacity_phase.get("namespace_closed") is not True
-                    or capacity_phase.get("remote_plan_cleanup") != "complete"
+                    projected_capacity is None
+                    or not _capacity_phase_allows_profile_attribution(projected_capacity)
+                    or projected_capacity.get("namespace_closed") is not True
+                    or projected_capacity.get("remote_plan_cleanup") != "complete"
                 ):
                     break
                 try:
@@ -4436,6 +4437,14 @@ def _parent_composite_run(
         and phase.get("namespace_closed") is True
         for phase in phases.values()
     )
+    both_phase_namespaces_closed = all(
+        phase is not None and phase.get("namespace_closed") is True
+        for phase in phases.values()
+    )
+    both_phase_plans_cleaned = all(
+        phase is not None and phase.get("remote_plan_cleanup") == "complete"
+        for phase in phases.values()
+    )
     profile_report = phases["cpu_profile"]
     if profile_report is not None:
         profile_report = {
@@ -4486,8 +4495,8 @@ def _parent_composite_run(
         "cpu_profile_phase": profile_report,
         "capacity_quantiles_scope": "capacity_phase_on_window_only",
         "profile_latency_scope": "excluded",
-        "remote_plan_cleanup": "complete" if both_complete else "incomplete",
-        "namespace_closed": both_complete,
+        "remote_plan_cleanup": "complete" if both_phase_plans_cleaned else "incomplete",
+        "namespace_closed": both_phase_namespaces_closed,
         "maximum_wall_seconds": 600,
         "wall_elapsed_seconds": round(min(600, wall_elapsed_seconds), 3),
         "wall_budget_exceeded": wall_budget_exceeded,
@@ -4941,6 +4950,104 @@ def _project_capacity_report(value: Any) -> dict[str, Any] | None:
     return value
 
 
+def _capacity_phase_allows_profile_attribution(value: Any) -> bool:
+    """Allow the separate profile after a closed 120s phase with ID loss alone.
+
+    Full request correlation remains mandatory for a PASS. This narrow path
+    only lets the attribution capture run when the capacity worker and all
+    non-correlation telemetry are complete, and the selected SSR/API sample
+    itself is complete; missing cohort IDs still make the composite fail.
+    """
+
+    phase = value if isinstance(value, dict) else None
+    if (phase is None
+            or phase.get("namespace_closed") is not True
+            or phase.get("remote_plan_cleanup") != "complete"):
+        return False
+    if phase.get("status") == "complete":
+        return True
+    if (phase.get("status") != "incomplete"
+            or phase.get("passed") is not False
+            or phase.get("generator_cpu_evidence") != "measured"):
+        return False
+    worker = phase.get("worker")
+    if (not isinstance(worker, dict) or worker.get("status") != "complete"
+            or worker.get("resource_abort_reason") is not None
+            or worker.get("completed") != worker.get("submitted")
+            or worker.get("http_status_counts") != {"200": worker.get("submitted")}
+            or worker.get("error_counts") != {}):
+        return False
+    request_window = worker.get("request_window_evidence")
+    if (not isinstance(request_window, dict)
+            or request_window.get("status") != "complete"
+            or not _phase_request_window_evidence_is_closed(
+                request_window,
+                start_ms=worker.get("on_window_start_ms"),
+                end_ms=worker.get("on_window_end_ms"),
+            )):
+        return False
+
+    telemetry = phase.get("server_telemetry")
+    memory = phase.get("memory_guard")
+    runner = phase.get("runner_headroom")
+    correlation = telemetry.get("request_correlation") if isinstance(telemetry, dict) else None
+    summary = correlation.get("summary") if isinstance(correlation, dict) else None
+    if (not isinstance(telemetry, dict)
+            or telemetry.get("cpu_status") != "complete"
+            or len(telemetry.get("cpu_rows", [])) != 4
+            or telemetry.get("node_memory_status") != "complete"
+            or telemetry.get("cgroup_memory_status") != "complete"
+            or telemetry.get("cgroup_memory_reason") != "none"
+            or len(telemetry.get("node_memory_rows", [])) != 2
+            or any(row.get("status") != "complete" or row.get("sample_count") != 5
+                   for row in telemetry["node_memory_rows"])
+            or not isinstance(memory, dict) or memory.get("status") != "complete"
+            or memory.get("ssh_material_restored") is not True
+            or not isinstance(runner, dict) or runner.get("status") != "complete"
+            or not isinstance(correlation, dict) or correlation.get("status") != "incomplete"
+            or not isinstance(summary, dict)):
+        return False
+
+    cohort = summary.get("cohort")
+    coverage = summary.get("coverage")
+    join = summary.get("join")
+    stream = summary.get("ssr_stream_coverage")
+    if (not isinstance(cohort, dict) or not isinstance(coverage, dict)
+            or not isinstance(join, dict) or not isinstance(stream, dict)
+            or cohort.get("submitted_html_requests") != request_window.get("started_in_window_count")
+            or cohort.get("valid_response_ids") != request_window.get("ssr_request_id_singleton_count")
+            or cohort.get("missing_response_ids") != request_window.get("ssr_request_id_missing_count")
+            or cohort.get("duplicate_response_ids") != request_window.get("ssr_request_id_duplicate_count")
+            or cohort.get("malformed_response_ids") != request_window.get("ssr_request_id_malformed_count")
+            or coverage.get("complete") is not False or coverage.get("full_cohort") is not False
+            or coverage.get("source_collection_reason") != {"api": "complete", "web": "complete"}
+            or coverage.get("source_rows_truncated") != {
+                "nginx": False, "ssr": False, "stream": False, "api": False,
+            }
+            or any(any(count != 0 for count in counts.values())
+                   for counts in coverage.get("source_rejections", {}).values())
+            or cohort.get("selected_sample_complete") is not True
+            or cohort.get("selected_sample_expected") != cohort.get("selected_sample_received")
+            or cohort.get("selected_sample_received") != cohort.get("selected_sample_valid")
+            or any(cohort.get(key) != 0 for key in (
+                "selected_sample_malformed_ids", "selected_sample_ineligible_ids",
+                "selected_sample_duplicate_ids",
+            ))
+            or stream.get("status") != "none"
+            or stream.get("capture_status") != "complete"
+            or stream.get("capture_lost_requests") != 0
+            or stream.get("capture_lost_rows") != 0):
+        return False
+    cohort_gap = sum(cohort.get(key, -1) for key in (
+        "missing_response_ids", "duplicate_response_ids", "malformed_response_ids",
+    )) > 0
+    selected_join_gap = any(join.get(key, 0) > 0 for key in (
+        "unmatched_selected_to_nginx", "unmatched_selected_to_ssr",
+        "unmatched_selected_to_stream", "unmatched_selected_to_api",
+    ))
+    return cohort_gap or selected_join_gap
+
+
 def _project_composite_capacity_report(value: dict[str, Any]) -> dict[str, Any] | None:
     fields = {
         "schema", "report_complete", "workload", "fixture_kind", "status", "passed",
@@ -5019,7 +5126,7 @@ def _project_composite_capacity_report(value: dict[str, Any]) -> dict[str, Any] 
         return None
     if profile is not None and (
         capacity is None
-        or capacity.get("status") != "complete"
+        or not _capacity_phase_allows_profile_attribution(capacity)
         or capacity.get("namespace_closed") is not True
         or capacity.get("remote_plan_cleanup") != "complete"
     ):
@@ -5067,20 +5174,30 @@ def _project_composite_capacity_report(value: dict[str, Any]) -> dict[str, Any] 
         })
     phase_pair_closed = bool(
         capacity is not None and profile is not None
-        and capacity.get("status") == "complete" and profile.get("status") == "complete"
-        and capacity.get("remote_plan_cleanup") == "complete"
-        and profile.get("remote_plan_cleanup") == "complete"
         and capacity.get("namespace_closed") is True
         and profile.get("namespace_closed") is True
     )
+    phase_pair_cleanup_complete = bool(
+        capacity is not None and profile is not None
+        and capacity.get("remote_plan_cleanup") == "complete"
+        and profile.get("remote_plan_cleanup") == "complete"
+    )
+    phase_pair_complete = bool(
+        phase_pair_closed and phase_pair_cleanup_complete
+        and capacity is not None and profile is not None
+        and capacity.get("status") == "complete" and profile.get("status") == "complete"
+    )
     complete = bool(
-        phase_pair_closed
+        phase_pair_complete
         and value["same_fixture_manifest"] is True
         and len(run_ids) == 2 and len(set(run_ids)) == 2
         and value["wall_budget_exceeded"] is False
     )
     if ((value["status"] == "complete") != complete
-            or value["namespace_closed"] != phase_pair_closed):
+            or value["namespace_closed"] != phase_pair_closed
+            or value["remote_plan_cleanup"] != (
+                "complete" if phase_pair_cleanup_complete else "incomplete"
+            )):
         return None
     if value["passed"] != bool(complete and capacity and capacity.get("passed") is True):
         return None
@@ -5472,7 +5589,7 @@ def _composite_projection_failure_detail(value: Any) -> dict[str, Any]:
                     or profile_raw.get("capacity_quantile_member") is not False):
                 return failure("cpu_profile_phase", "profile_annotation_mismatch", profile_raw)
         return failure("cpu_profile_phase", "phase_projection_rejected", profile_raw)
-    if profile is not None and (capacity is None or capacity.get("status") != "complete"
+    if profile is not None and (capacity is None or not _capacity_phase_allows_profile_attribution(capacity)
             or capacity.get("namespace_closed") is not True
             or capacity.get("remote_plan_cleanup") != "complete"):
         return failure("cpu_profile_phase", "capacity_prerequisite_incomplete", profile_raw)
@@ -5507,14 +5624,22 @@ def _composite_projection_failure_detail(value: Any) -> dict[str, Any]:
     if digests != expected_digests:
         return failure("phase_profile_digests", "phase_identity_summary_mismatch", digests)
     phase_pair_closed = bool(capacity is not None and profile is not None
-        and capacity.get("status") == "complete" and profile.get("status") == "complete"
+        and capacity.get("namespace_closed") is True
+        and profile.get("namespace_closed") is True)
+    phase_pair_cleanup_complete = bool(capacity is not None and profile is not None
         and capacity.get("remote_plan_cleanup") == "complete"
         and profile.get("remote_plan_cleanup") == "complete"
-        and capacity.get("namespace_closed") is True and profile.get("namespace_closed") is True)
-    complete = bool(phase_pair_closed and same_fixture is True and len(run_ids) == 2
+    )
+    phase_pair_complete = bool(phase_pair_closed and phase_pair_cleanup_complete
+        and capacity is not None and profile is not None
+        and capacity.get("status") == "complete" and profile.get("status") == "complete")
+    complete = bool(phase_pair_complete and same_fixture is True and len(run_ids) == 2
         and len(set(run_ids)) == 2 and exceeded is False)
     if ((value["status"] == "complete") != complete
-            or value["namespace_closed"] != phase_pair_closed):
+            or value["namespace_closed"] != phase_pair_closed
+            or value["remote_plan_cleanup"] != (
+                "complete" if phase_pair_cleanup_complete else "incomplete"
+            )):
         return failure("phase_completion", "composite_completion_mismatch", value.get("status"))
     if value["passed"] != bool(complete and capacity and capacity.get("passed") is True):
         return failure("passed", "composite_passed_mismatch", value.get("passed"))
