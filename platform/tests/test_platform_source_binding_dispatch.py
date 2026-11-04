@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import base64
 import copy
+from contextlib import redirect_stdout
 import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -123,91 +125,147 @@ def _external_payload(schema: int = 2) -> dict[str, object]:
 
 
 class SourceBindingDispatchTests(unittest.TestCase):
-    def test_cleanup_helper_resolves_only_from_stable_source_bound_app_release(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            runtime_root = Path(temp_dir) / "platform"
-            release = runtime_root / "releases" / str(_baseline()["release_slug"])
-            tools = release / "tools"
-            tools.mkdir(parents=True)
-            helper = tools / "platform_production_retained_load_cleanup_qa.sh"
-            helper.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
-            helper.chmod(0o755)
-            original_lstat = Path.lstat
-
-            def root_owned_lstat(path: Path):
-                metadata = original_lstat(path)
-                if path in {release, tools, helper}:
-                    fields = list(metadata)
-                    fields[4] = 0
-                    fields[5] = 0
-                    return os.stat_result(fields)
-                return metadata
-
-            with (
-                patch.object(dispatcher, "RUNTIME_ROOT", runtime_root),
-                patch.object(dispatcher.os, "geteuid", return_value=0),
-                patch.object(Path, "lstat", root_owned_lstat),
-                patch.object(
-                    dispatcher,
-                    "_release_baseline",
-                    side_effect=(_baseline(), _baseline()),
-                ),
-            ):
-                self.assertEqual(
-                    dispatcher._active_app_retained_cleanup_helper(
-                        APP_SHA,
-                        expected_baseline=_baseline(),
-                    ),
-                    helper,
-                )
-
-            changed_baseline = {**_baseline(), "current_link_ino": 999}
-            for baseline_rows, target_sha, expected_baseline, mode in (
-                ((_baseline(),), "c" * 40, _baseline(), 0o755),
-                ((_baseline(),), APP_SHA, {**_baseline(), "release_ino": 999}, 0o755),
-                ((_baseline(), changed_baseline), APP_SHA, None, 0o755),
-            ):
-                helper.chmod(mode)
-                with (
-                    patch.object(dispatcher, "RUNTIME_ROOT", runtime_root),
-                    patch.object(dispatcher.os, "geteuid", return_value=0),
-                    patch.object(Path, "lstat", root_owned_lstat),
-                    patch.object(dispatcher, "_release_baseline", side_effect=baseline_rows),
-                ):
-                    self.assertIsNone(
+    def test_cleanup_helper_selection_defers_root_baseline_checks_to_sudo_child(self) -> None:
+        fixed_helper = (
+            dispatcher.RUNTIME_ROOT
+            / "current"
+            / "tools"
+            / dispatcher.RETAINED_LOAD_CLEANUP_HELPER_NAME
+        )
+        with (
+            patch.object(dispatcher.os, "geteuid", return_value=1000),
+            patch.object(
+                dispatcher,
+                "_release_baseline",
+                side_effect=AssertionError("root-only baseline read ran before sudo"),
+            ),
+        ):
+            for app_sha, baseline in ((APP_SHA, _baseline()), (RUNNER_SHA, None)):
+                with self.subTest(app_sha=app_sha, has_baseline=baseline is not None):
+                    self.assertEqual(
                         dispatcher._active_app_retained_cleanup_helper(
-                            target_sha,
-                            expected_baseline=expected_baseline,
+                            app_sha,
+                            expected_baseline=baseline,
+                        ),
+                        fixed_helper,
+                    )
+            self.assertIsNone(
+                dispatcher._active_app_retained_cleanup_helper(
+                    "not-a-source-sha",
+                    expected_baseline=_baseline(),
+                )
+            )
+            self.assertIsNone(
+                dispatcher._active_app_retained_cleanup_helper(
+                    APP_SHA,
+                    expected_baseline={**_baseline(), "source_sha": "c" * 40},
+                )
+            )
+            self.assertIsNone(
+                dispatcher._active_app_retained_cleanup_helper(
+                    APP_SHA,
+                    expected_baseline={"schema": 1},
+                )
+            )
+
+        with (
+            patch.object(dispatcher.os, "geteuid", return_value=1000),
+            patch.object(dispatcher, "_release_baseline", side_effect=AssertionError),
+            patch.object(dispatcher.subprocess, "Popen") as spawn,
+            redirect_stdout(io.StringIO()),
+        ):
+            result = dispatcher._run_retained_cleanup_sudo(
+                None,
+                ["DELETE-PRODUCTION-RETAINED-LOAD", RUNNER_SHA, "567890", "567890"],
+                control_email="qa.control@example.test",
+                expected_app_sha=APP_SHA,
+                expected_baseline={**_baseline(), "source_sha": "c" * 40},
+            )
+        self.assertEqual(result, 2)
+        spawn.assert_not_called()
+
+    def test_nonroot_cleanup_dispatch_uses_fixed_sudo_app_entrypoint_and_stdin(self) -> None:
+        real_popen = subprocess.Popen
+        observed: list[str] = []
+
+        def spawn(command: list[str], **options: object) -> subprocess.Popen[bytes]:
+            observed.extend(command)
+            child = (
+                "import json,sys; "
+                "assert json.load(sys.stdin) == "
+                "{'schema': 1, 'control_email': 'qa.control@example.test'}; "
+                "print('RETAINED_CLEANUP_STAGE schema=1 stage=complete exit_code=0')"
+            )
+            return real_popen([sys.executable, "-c", child], **options)
+
+        fixed_helper = (
+            dispatcher.RUNTIME_ROOT
+            / "current"
+            / "tools"
+            / dispatcher.RETAINED_LOAD_CLEANUP_HELPER_NAME
+        )
+        cases = (
+            (
+                APP_SHA,
+                _baseline(),
+                [
+                    "DELETE-PRODUCTION-RETAINED-LOAD",
+                    RUNNER_SHA,
+                    "567890",
+                    "567890",
+                    "--source-binding-base64",
+                    "c2FmZS1maXh0dXJl",
+                ],
+            ),
+            (
+                RUNNER_SHA,
+                None,
+                ["DELETE-PRODUCTION-RETAINED-LOAD", RUNNER_SHA, "567890", "567890"],
+            ),
+        )
+        with (
+            patch.object(dispatcher.os, "geteuid", return_value=1000),
+            patch.object(
+                dispatcher,
+                "_release_baseline",
+                side_effect=AssertionError("root-only baseline read ran before sudo"),
+            ),
+            patch.object(dispatcher.subprocess, "Popen", side_effect=spawn),
+        ):
+            for app_sha, baseline, arguments in cases:
+                with self.subTest(app_sha=app_sha, has_binding=baseline is not None):
+                    observed.clear()
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        result = dispatcher._run_retained_cleanup_sudo(
+                            None,
+                            arguments,
+                            control_email="qa.control@example.test",
+                            expected_app_sha=app_sha,
+                            expected_baseline=baseline,
                         )
+
+                    self.assertEqual(result, 0)
+                    self.assertEqual(
+                        observed,
+                        [dispatcher.SUDO, "-n", "--", str(fixed_helper), *arguments],
+                    )
+                    self.assertNotIn("qa.control@example.test", observed)
+                    self.assertEqual(
+                        output.getvalue(),
+                        "RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=complete child_exit=0\n",
                     )
 
-            helper.chmod(0o775)
-            with (
-                patch.object(dispatcher, "RUNTIME_ROOT", runtime_root),
-                patch.object(dispatcher.os, "geteuid", return_value=0),
-                patch.object(Path, "lstat", root_owned_lstat),
-                patch.object(dispatcher, "_release_baseline", return_value=_baseline()),
-            ):
-                self.assertIsNone(
-                    dispatcher._active_app_retained_cleanup_helper(
-                        APP_SHA,
-                        expected_baseline=None,
-                    )
-                )
-
-            helper.unlink()
-            with (
-                patch.object(dispatcher, "RUNTIME_ROOT", runtime_root),
-                patch.object(dispatcher.os, "geteuid", return_value=0),
-                patch.object(Path, "lstat", root_owned_lstat),
-                patch.object(dispatcher, "_release_baseline", return_value=_baseline()),
-            ):
-                self.assertIsNone(
-                    dispatcher._active_app_retained_cleanup_helper(
-                        APP_SHA,
-                        expected_baseline=None,
-                    )
-                )
+    def test_root_cleanup_script_revalidates_active_source_path_and_lock_before_work(self) -> None:
+        script = (
+            PLATFORM_ROOT / "tools" / dispatcher.RETAINED_LOAD_CLEANUP_HELPER_NAME
+        ).read_text(encoding="utf-8")
+        self.assertIn('[[ "$EUID" -ne 0 ]]', script)
+        self.assertIn('"${BASH_SOURCE[0]}"', script)
+        self.assertIn("validate-active-runtime-binding", script)
+        self.assertIn('test "$release_sha" = "$app_target_sha"', script)
+        self.assertIn("platform_retained_load_lock_supervise", script)
+        self.assertIn("platform_retained_load_lock_open", script)
 
     def test_cpu_plan_cleanup_accepts_only_bounded_sorted_request_ids(self) -> None:
         payload = {

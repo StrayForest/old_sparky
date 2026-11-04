@@ -988,6 +988,31 @@ class FixtureCredentialTransportTests(unittest.TestCase):
             {**valid, "surprise": "value"},
             {**valid, "input": {**valid["input"], "control_email": "fixture-control@example.invalid"}},
             {**valid, "manifest": {**valid["manifest"], "source_binding_sha256": "0" * 64}},
+            {**valid, "input": {**valid["input"], "fixture_schedule": "unknown-schedule"}},
+            {
+                **valid,
+                "input": {
+                    **valid["input"],
+                    "fixture_kind": "cpu_diagnostic_only_v1",
+                    "fixture_schedule": "read-mix-concurrency-ramp-v1",
+                },
+            },
+            {**valid, "manifest": {**valid["manifest"], "fixture_schedule": "read-mix-concurrency-ramp-v1"}},
+            {
+                **valid,
+                "input": {
+                    **valid["input"],
+                    "tournament_count": "40",
+                    "users_per_tournament": "500",
+                    "fixture_schedule": "read-mix-concurrency-ramp-v1",
+                },
+                "manifest": {
+                    **valid["manifest"],
+                    "tournament_count": 40,
+                    "user_count": 20_000,
+                    "users_per_tournament": [500] * 40,
+                },
+            },
         )
         for payload in invalid_cases:
             with self.subTest(keys=sorted(payload)):
@@ -1358,25 +1383,36 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
             "confirmation": "RUN-PRODUCTION-EXTERNAL-LOAD",
             "target_sha": runner_sha,
             "control_email": "fixture-control@example.invalid",
-            "setup_concurrency": "8",
+            "setup_concurrency": "20",
             "run_id": run_id,
             "profile": "external-vote",
-            "tournament_count": "1",
-            "users_per_tournament": "14",
+            "tournament_count": "40",
+            "users_per_tournament": "500",
             "timeout_diagnostics": "false",
             "fixture_kind": "external_load",
+            "fixture_schedule": "read-mix-concurrency-ramp-v1",
         }
         input_bytes = (
             json.dumps(input_value, ensure_ascii=True, separators=(",", ":")) + "\n"
         ).encode("ascii")
+        tournaments = [
+            {
+                "id": f"synthetic-tournament-{index:02d}",
+                "slug": f"synthetic-fixture-{index:02d}",
+                "user_count": 500,
+                "ready_check_starts_at": "2030-01-01T12:00:00Z",
+                "ready_check_ends_at": "2030-01-01T14:00:00Z",
+            }
+            for index in range(40)
+        ]
         users = [
             {
-                "user_id": f"synthetic-user-{index:02d}",
-                "tournament_slug": "synthetic-fixture-slug",
-                "session_token": f"SYNTHETIC_SESSION_{index:02d}_not_a_credential",
-                "csrf_token": f"SYNTHETIC_CSRF_{index:02d}_not_a_credential",
+                "user_id": f"synthetic-user-{index:05d}",
+                "tournament_slug": tournaments[index // 500]["slug"],
+                "session_token": f"SYNTHETIC_SESSION_{index:05d}_not_a_credential_long_enough",
+                "csrf_token": f"SYNTHETIC_CSRF_{index:05d}_not_a_credential_long_enough",
             }
-            for index in range(14)
+            for index in range(20_000)
         ]
         manifest_value = {
             "schema": 2,
@@ -1386,9 +1422,8 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
             "csrf_cookie_name": "__Host-session_csrf",
             "marker": "preprod202611020000abcd",
             "created_at": "2026-11-02T00:00:00Z",
-            "tournaments": [
-                {"id": "synthetic-tournament-id", "slug": "synthetic-fixture-slug", "user_count": 14}
-            ],
+            "fixture_schedule": "read-mix-concurrency-ramp-v1",
+            "tournaments": tournaments,
             "users": users,
             "runner_sha": runner_sha,
             "app_target_sha": runner_sha,
@@ -1400,10 +1435,11 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
         ).encode("ascii")
         synthetic_credentials = {
             input_value["control_email"],
-            *(row["user_id"] for row in users),
-            *(row["tournament_slug"] for row in users),
-            *(row["session_token"] for row in users),
-            *(row["csrf_token"] for row in users),
+            "synthetic-user-",
+            "synthetic-fixture-",
+            "synthetic-tournament-",
+            "SYNTHETIC_SESSION_",
+            "SYNTHETIC_CSRF_",
         }
 
         def run_yaml_step(
@@ -1489,7 +1525,11 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
         run_yaml_step(
             validate_manifest_step,
             setup_temp,
-            extra_env={"TARGET_SHA": runner_sha, "APP_TARGET_SHA": runner_sha},
+            extra_env={
+                "TARGET_SHA": runner_sha,
+                "APP_TARGET_SHA": runner_sha,
+                "EXPECTED_PROFILE_ID": "read-mix-concurrency-ramp-v1",
+            },
         )
         encrypted_manifest_step = {
             **encrypt_manifest_step,
@@ -1516,6 +1556,14 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
         self.assertNotIn("control_email", public_descriptor["input"])
         self.assertNotIn("session_token", json.dumps(public_descriptor, sort_keys=True))
         self.assertNotIn("csrf_token", json.dumps(public_descriptor, sort_keys=True))
+        self.assertEqual(
+            public_descriptor["input"]["fixture_schedule"],
+            "read-mix-concurrency-ramp-v1",
+        )
+        self.assertEqual(
+            public_descriptor["manifest"]["fixture_schedule"],
+            "read-mix-concurrency-ramp-v1",
+        )
         manifest_cipher_bytes = manifest_cipher.read_bytes()
         descriptor_bytes = descriptor.read_bytes()
         for public_payload in (manifest_cipher_bytes, descriptor_bytes):
@@ -1599,9 +1647,19 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
                 "GITHUB_RUN_ATTEMPT": attempt,
                 "TARGET_SHA": runner_sha,
                 "APP_TARGET_SHA": runner_sha,
+                "EXPECTED_PROFILE_ID": "read-mix-concurrency-ramp-v1",
                 "PYTHONPATH": str(REPO_ROOT / "platform"),
             },
         )
+
+        from tools.platform_load import source_binding_environment_from_handoff
+        with mock.patch.dict(
+            os.environ,
+            {"GITHUB_RUN_ID": run_id, "GITHUB_RUN_ATTEMPT": attempt},
+        ):
+            source_binding_environment_from_handoff(
+                descriptor, load_manifest, runner_sha=runner_sha, app_target_sha=runner_sha,
+            )
 
         setup_github_env = setup_temp / "github-env"
         setup_github_output = setup_temp / "github-output"

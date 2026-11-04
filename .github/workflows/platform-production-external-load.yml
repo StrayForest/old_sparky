@@ -1322,54 +1322,12 @@ jobs:
             --output "$RUNNER_TEMP/external-fixture/manifest.json.age" \
             "$RUNNER_TEMP/external-fixture/manifest.json"
           chmod 600 "$RUNNER_TEMP/external-fixture/manifest.json.age"
-          /usr/bin/python3 - "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" "$RUNNER_TEMP/external-fixture/manifest.json" "$RUNNER_TEMP/external-fixture/fixture-descriptor.json" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$TARGET_SHA" "$APP_TARGET_SHA" <<'PY'
-          import hashlib
-          import json
-          import os
-          from pathlib import Path
-          import stat
-          import sys
-          input_path, manifest_path, output_path, run_id, attempt, runner_sha, app_sha = sys.argv[1:]
-          raw_input = Path(input_path).read_bytes()
-          raw_manifest = Path(manifest_path).read_bytes()
-          private_input = json.loads(raw_input.decode("ascii"))
-          manifest = json.loads(raw_manifest.decode("utf-8"))
-          public_keys = {"schema", "target_sha", "setup_concurrency", "run_id", "profile", "tournament_count", "users_per_tournament", "timeout_diagnostics", "fixture_kind", "source_binding", "ssr_capacity_concurrency", "ssr_capacity_workload"}
-          public_keys.add("fixture_schedule")
-          descriptor = {
-              "schema": 1,
-              "run_id": run_id,
-              "run_attempt": attempt,
-              "runner_sha": runner_sha,
-              "app_target_sha": app_sha,
-              "input": {key: value for key, value in private_input.items() if key in public_keys},
-              "manifest": {
-                  "sha256": hashlib.sha256(raw_manifest).hexdigest(),
-                  "size_bytes": len(raw_manifest),
-                  "schema": manifest["schema"],
-                  "purpose": manifest["purpose"],
-                  "origin": manifest["origin"],
-                  "runner_sha": manifest["runner_sha"],
-                  "app_target_sha": manifest["app_target_sha"],
-                  "source_binding": manifest["source_binding"],
-                  "source_binding_sha256": manifest["source_binding_sha256"],
-                  "tournament_count": len(manifest["tournaments"]),
-                  "user_count": len(manifest["users"]),
-                  "users_per_tournament": sorted(row["user_count"] for row in manifest["tournaments"]),
-              },
-          }
-          if (private_input.get("run_id") != run_id or private_input.get("target_sha") != runner_sha
-                  or manifest.get("runner_sha") != runner_sha or manifest.get("app_target_sha") != app_sha
-                  or manifest.get("source_binding") != private_input.get("source_binding")):
-              raise SystemExit("fixture descriptor source binding is invalid")
-          encoded = (json.dumps(descriptor, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
-          fd = os.open(output_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-          try:
-              os.write(fd, encoded)
-              os.fsync(fd)
-          finally:
-              os.close(fd)
-          PY
+          /usr/bin/python3 -I -B platform/tools/platform_fixture_credential_transport.py descriptor \
+            --input "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" \
+            --manifest "$RUNNER_TEMP/external-fixture/manifest.json" \
+            --output "$RUNNER_TEMP/external-fixture/fixture-descriptor.json" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --runner-sha "$TARGET_SHA" --app-sha "$APP_TARGET_SHA"
           rm -f -- "$age_archive"
 
       - name: Publish encrypted fixture manifest

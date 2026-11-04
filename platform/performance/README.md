@@ -194,13 +194,82 @@ The 11-profile matrix remains incomplete until cell 9's corrected runner, app
 helper and host-tools dispatcher are released and installed before a
 successful rerun.
 
-Before the first cell, confirm `dev` and the exact Security result match S,
-the successful AUTO/no-op receipt binds S to active app P4, the active host
-pin is C, readiness is green, no load/maintenance/release/cleanup lock or
-marker is held, and the existing backup, disk-space and maintenance gates
-pass. Do not change S, P4, C, or the selected runtime profile during the
-sequence. These are workload-profile dispatches, not permission to apply a
-runtime configuration.
+Before every cell dispatch, obtain a fresh canonical FULL readiness receipt
+after the automatic production chain has completed and before fixture setup
+starts. Use release receipts for A and its previous release, and the active
+host-tools pin for C; the verifier SHA must equal A. Run this in the authorized
+root shell on the VPS, before any fixture workflow is dispatched. The collector
+uses the canonical locks and must not be run while a load, setup, maintenance,
+release or cleanup process holds one.
+
+```bash
+set -euo pipefail
+umask 077
+EXPECTED_APP_SHA='<active-app-source-sha-from-release-receipt>'
+EXPECTED_PREVIOUS_APP_SHA='<previous-app-source-sha-from-release-receipt>'
+EXPECTED_RELEASE_MANIFEST_SHA='<active-release-manifest-sha-from-release-receipt>'
+EXPECTED_PREVIOUS_RELEASE_MANIFEST_SHA='<previous-release-manifest-sha-from-release-receipt>'
+EXPECTED_HOST_TOOLS_SHA='<active-host-tools-source-sha-from-pin>'
+EXPECTED_PREVIOUS_HOST_TOOLS_SHA='<previous-host-tools-source-sha-from-pin>'
+VERIFIER_SOURCE_SHA="$EXPECTED_APP_SHA"
+EVIDENCE_DIR="$(mktemp -d /root/platform-full-readiness.XXXXXX)"
+test "$(/usr/bin/stat -c '%a' "$EVIDENCE_DIR")" = 700
+/usr/bin/python3.12 -I -B \
+  /opt/oldsparky/platform/current/tools/platform_readonly_live_readiness.py \
+  --verifier-source-sha "$VERIFIER_SOURCE_SHA" \
+  --expected-app-sha "$EXPECTED_APP_SHA" \
+  --expected-previous-app-sha "$EXPECTED_PREVIOUS_APP_SHA" \
+  --expected-release-manifest-sha "$EXPECTED_RELEASE_MANIFEST_SHA" \
+  --expected-previous-release-manifest-sha "$EXPECTED_PREVIOUS_RELEASE_MANIFEST_SHA" \
+  --expected-host-tools-sha "$EXPECTED_HOST_TOOLS_SHA" \
+  --expected-previous-host-tools-sha "$EXPECTED_PREVIOUS_HOST_TOOLS_SHA" \
+  --expected-toolset-version production-host-tools-v4 \
+  > "$EVIDENCE_DIR/readiness.json" 2> "$EVIDENCE_DIR/readiness.stderr"
+test ! -s "$EVIDENCE_DIR/readiness.stderr"
+test "$(/usr/bin/stat -c '%a' "$EVIDENCE_DIR/readiness.json")" = 600
+/usr/bin/python3.12 -I -B - \
+  "$EVIDENCE_DIR/readiness.json" "$VERIFIER_SOURCE_SHA" "$EXPECTED_APP_SHA" \
+  "$EXPECTED_PREVIOUS_APP_SHA" "$EXPECTED_RELEASE_MANIFEST_SHA" \
+  "$EXPECTED_PREVIOUS_RELEASE_MANIFEST_SHA" "$EXPECTED_HOST_TOOLS_SHA" \
+  "$EXPECTED_PREVIOUS_HOST_TOOLS_SHA" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+raw = path.read_bytes()
+data = json.loads(raw)
+assert len(data) == 23 and data.get("schema") == 1
+assert data.get("status") == "ready"
+assert data.get("purpose") == "read_only_readiness"
+assert data.get("runtime_or_fixture_mutations_authorized") is False
+assert data.get("verifier_source_sha") == sys.argv[2] == data.get("app_target_sha") == sys.argv[3]
+assert data.get("current", {}).get("source_sha") == sys.argv[3]
+assert data.get("current", {}).get("release_json_sha256") == sys.argv[5]
+assert data.get("previous", {}).get("source_sha") == sys.argv[4]
+assert data.get("previous", {}).get("release_json_sha256") == sys.argv[6]
+host = data.get("host_tools", {})
+assert host.get("source_sha") == sys.argv[7]
+assert host.get("expected_previous_generation_sha") == sys.argv[8]
+print("status=ready fields=23")
+print("readiness_sha256=" + hashlib.sha256(raw).hexdigest())
+print("evidence_path=" + str(path))
+PY
+```
+
+Keep the receipt and its printed SHA in the private operator checkpoint. Only
+after this command exits successfully, dispatch the selected profile from the
+authenticated operator shell using the existing hidden-input procedure in the
+[operations runbook](../docs/operations-runbook.md#live-production-external-load).
+The installed collector owns the pinned closure, service health, lock,
+marker/plan/job, maintenance, release-origin and final-consistency checks; its
+`status=ready` is required in addition to the exact-source receipt assertion.
+The checkpoint must bind the receipt to the same A, previous A, release
+manifest digests, C and previous C used for the dispatch. A child smoke,
+fixture-preparation check, or readiness check started after setup has acquired
+the canonical lock is not a FULL readiness pass. Stop if the collector or any
+receipt assertion fails. Do not change the runner source, active A, host-tools
+C or selected runtime profile during the sequence. These are workload-profile
+dispatches, not permission to apply a runtime configuration.
 
 For every cell, dispatch one run with that exact `profile_id`; record run ID,
 attempt, runner `SOURCE_GIT_SHA`, active `APP_TARGET_SHA`, host-tools C,

@@ -30,13 +30,12 @@ revalidates the marker and requires two clean zero-process scans at least
 Inspect the exact-run finalizer receipt first; dispatch cleanup only if it is
 missing or incomplete, not when it passed with zero residuals.
 
-For setup failure with one recognized profile directory but no manifest, use
-the same run-bound cleanup workflow after source/process/namespace barriers.
-The installed supervisor checks runner/app binding, resolves its helper from
-the active immutable app release, then reconstructs inventory from exactly one
-durable `PreprodTestRun` row at the exact report path (origin, mode, marker,
-scoped user count and tournament IDs). Standard cleanup validates the report
-and summary before deletion. Never synthesize manifests, invoke helpers directly or use the empty-root no-op with fixture evidence; ambiguity fails. Read only the exact `control_email` field from retained private operator inputs, validate without printing, and enter it through the workflow's hidden prompt for private stdin forwarding. Use bounded `RETAINED_CLEANUP_STAGE` or cleanup diagnostics to classify child failure; generic outer lock messages are not diagnostic.
+For setup failure with one recognized profile directory but no manifest, use the same run-bound workflow after source/process/namespace barriers.
+The non-root dispatcher validates runner/app binding and invokes `/opt/oldsparky/platform/current/tools/platform_production_retained_load_cleanup_qa.sh` via `sudo`; root rechecks release/source and locks before inventory reconstruction.
+Require exactly one durable `PreprodTestRun` row at the exact report path (origin, mode, marker, scoped user count, tournament IDs); cleanup validates report and summary.
+Never synthesize manifests or use the empty-root no-op with fixture evidence.
+Read only the exact `control_email` field from private inputs, validate silently and use the hidden prompt/private stdin.
+Use bounded stage diagnostics for child failures; generic lock errors are not diagnostic.
 
 If the reviewed abort helper is on recovery-only runner SHA `R` while the active app is at freshly verified SHA `A`, use this order. Runner binding permits the same app SHA or an exact verified no-op receipt; the host helper checks the bound app SHA against current `RELEASE.json`.
 For a deployable source not active, follow the [deploy-before-cleanup sequence in the SSR diagnostic runbook](ssr-capacity-diagnostic-runbook.md#abort-and-close-the-exact-fixture): abort → one source-bound backup → AUTO normal deployment/readiness → verify source and pin active → exact old-run cleanup. Keep load closed; do not override target, alias no-op, or start another workload.

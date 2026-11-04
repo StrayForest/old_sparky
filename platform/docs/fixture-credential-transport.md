@@ -11,6 +11,14 @@ the low-entropy control email. The descriptor contains exact run/attempt and
 runner/app binding, nonsecret dimensions and the random-token manifest digest;
 it contains no email, token, user ID, slug or marker.
 
+The fixture-setup workflow writes this descriptor through the shared
+`platform_fixture_credential_transport.py descriptor` command. Its public
+projection is a closed allowlist. The scheduled read-mix profile may expose
+only `fixture_schedule=read-mix-concurrency-ramp-v1`; the builder copies that
+value into the manifest summary, and the validator rejects any mismatch there.
+The load consumer also compares the summary with the decrypted manifest. Other
+fixture kinds reject the schedule field; ordinary descriptors omit it.
+
 The workflow pins age v1.3.2 and the release archive SHA-256 in
 `tools/platform_fixture_credential_transport.py`. The recipient is public and
 checked in. A private identity is a fixture-only key, never an SSH or

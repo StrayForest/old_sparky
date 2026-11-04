@@ -38,7 +38,10 @@ INPUT_KEYS = {
     "run_id", "profile", "tournament_count", "users_per_tournament",
     "timeout_diagnostics",
 }
-OPTIONAL_INPUT_KEYS = {"fixture_kind", "ssr_capacity_concurrency", "ssr_capacity_workload", "source_binding"}
+OPTIONAL_INPUT_KEYS = {
+    "fixture_kind", "fixture_schedule", "ssr_capacity_concurrency",
+    "ssr_capacity_workload", "source_binding",
+}
 MANIFEST_KEYS = {
     "schema", "purpose", "origin", "session_cookie_name", "csrf_cookie_name",
     "marker", "created_at", "tournaments", "users", "runner_sha",
@@ -47,9 +50,10 @@ MANIFEST_KEYS = {
 PUBLIC_INPUT_KEYS = {
     "schema", "target_sha", "setup_concurrency", "run_id", "profile",
     "tournament_count", "users_per_tournament", "timeout_diagnostics",
-    "fixture_kind", "ssr_capacity_concurrency", "ssr_capacity_workload",
-    "source_binding",
+    "fixture_kind", "fixture_schedule", "ssr_capacity_concurrency",
+    "ssr_capacity_workload", "source_binding",
 }
+READ_MIX_SCHEDULE_PROFILE = "read-mix-concurrency-ramp-v1"
 
 
 def _safe_error(message: str) -> "NoReturn":
@@ -277,7 +281,17 @@ def build_descriptor(
         _safe_error("fixture descriptor input identity is invalid")
     if not re.fullmatch(r"[0-9a-f]{40}", runner_sha) or not re.fullmatch(r"[0-9a-f]{40}", app_sha):
         _safe_error("fixture descriptor source SHA is invalid")
-    if set(manifest) != MANIFEST_KEYS or manifest.get("schema") != 2 or manifest.get("runner_sha") != runner_sha or manifest.get("app_target_sha") != app_sha:
+    fixture_schedule = payload.get("fixture_schedule")
+    expected_manifest_keys = MANIFEST_KEYS
+    if fixture_schedule is not None:
+        expected_manifest_keys = MANIFEST_KEYS | {"fixture_schedule"}
+    if (
+        set(manifest) != expected_manifest_keys
+        or manifest.get("schema") != 2
+        or manifest.get("runner_sha") != runner_sha
+        or manifest.get("app_target_sha") != app_sha
+        or manifest.get("fixture_schedule") != fixture_schedule
+    ):
         _safe_error("fixture descriptor manifest identity is invalid")
     if manifest.get("source_binding") != payload.get("source_binding"):
         _safe_error("fixture descriptor source binding differs")
@@ -305,12 +319,29 @@ def build_descriptor(
     tournaments, users = manifest.get("tournaments"), manifest.get("users")
     if not isinstance(tournaments, list) or not 1 <= len(tournaments) <= 40 or not isinstance(users, list) or not 14 <= len(users) <= 20_000:
         _safe_error("fixture descriptor counts are invalid")
+    if fixture_schedule is not None and (
+        payload.get("fixture_kind") != "external_load"
+        or payload.get("timeout_diagnostics") != "false"
+        or payload.get("tournament_count") != "40"
+        or payload.get("users_per_tournament") != "500"
+        or len(tournaments) != 40
+        or len(users) != 20_000
+    ):
+        _safe_error("fixture descriptor scheduled dimensions are invalid")
+    tournament_row_keys = {"id", "slug", "user_count"}
+    if fixture_schedule is not None:
+        tournament_row_keys |= {"ready_check_starts_at", "ready_check_ends_at"}
     for row in tournaments:
-        if (not isinstance(row, dict) or set(row) != {"id", "slug", "user_count"}
+        if (not isinstance(row, dict) or set(row) != tournament_row_keys
                 or not isinstance(row.get("id"), str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", row["id"]) is None
                 or not isinstance(row.get("slug"), str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", row["slug"]) is None
                 or type(row.get("user_count")) is not int or row["user_count"] < 14):
             _safe_error("fixture descriptor tournament row is invalid")
+        if fixture_schedule is not None and any(
+            not isinstance(row.get(field), str) or not row[field]
+            for field in ("ready_check_starts_at", "ready_check_ends_at")
+        ):
+            _safe_error("fixture descriptor schedule deadlines are invalid")
     for row in users:
         if not isinstance(row, dict) or set(row) != {"user_id", "tournament_slug", "session_token", "csrf_token"}:
             _safe_error("fixture descriptor user row is invalid")
@@ -343,6 +374,8 @@ def build_descriptor(
             ),
         },
     }
+    if fixture_schedule is not None:
+        descriptor["manifest"]["fixture_schedule"] = fixture_schedule
     if len(descriptor["manifest"]["users_per_tournament"]) != len(tournaments):
         _safe_error("fixture descriptor tournament counts are invalid")
     output = (json.dumps(descriptor, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
@@ -374,10 +407,18 @@ def validate_descriptor(
     if "control_email" in input_value or "confirmation" in input_value:
         _safe_error("fixture descriptor contains a private input field")
     fixture_kind = input_value.get("fixture_kind")
+    fixture_schedule = input_value.get("fixture_schedule")
     expected_input_keys = {
         "schema", "target_sha", "setup_concurrency", "run_id", "profile",
         "tournament_count", "users_per_tournament", "timeout_diagnostics", "fixture_kind",
     }
+    if "fixture_schedule" in input_value:
+        expected_input_keys.add("fixture_schedule")
+        if (
+            fixture_kind != "external_load"
+            or fixture_schedule != READ_MIX_SCHEDULE_PROFILE
+        ):
+            _safe_error("fixture descriptor schedule is invalid")
     if input_value.get("schema") in (2, "2"):
         expected_input_keys.add("source_binding")
     if fixture_kind in {"ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1", "ssr_html_capacity_composite_diagnostic_v1"}:
@@ -397,6 +438,12 @@ def validate_descriptor(
             or not isinstance(input_value.get("users_per_tournament"), str) or re.fullmatch(r"[1-9][0-9]{0,3}", input_value["users_per_tournament"]) is None
             or input_value.get("timeout_diagnostics") not in {"true", "false"}):
         _safe_error("fixture descriptor input identity is invalid")
+    if fixture_schedule is not None and (
+        input_value.get("timeout_diagnostics") != "false"
+        or input_value.get("tournament_count") != "40"
+        or input_value.get("users_per_tournament") != "500"
+    ):
+        _safe_error("fixture descriptor scheduled dimensions are invalid")
     if fixture_kind in {"cpu_diagnostic_only_v1", "ssr_capacity_diagnostic_v1", "ssr_html_capacity_diagnostic_v1", "ssr_html_capacity_composite_diagnostic_v1"}:
         if input_value.get("timeout_diagnostics") != "false" or input_value.get("tournament_count") != "1" or input_value.get("users_per_tournament") != "14":
             _safe_error("fixture descriptor diagnostic dimensions are invalid")
@@ -425,6 +472,8 @@ def validate_descriptor(
         "app_target_sha", "source_binding", "source_binding_sha256",
         "tournament_count", "user_count", "users_per_tournament",
     }
+    if fixture_schedule is not None:
+        expected_manifest.add("fixture_schedule")
     if set(manifest) != expected_manifest:
         _safe_error("fixture descriptor manifest schema is invalid")
     if (not isinstance(manifest.get("sha256"), str) or re.fullmatch(r"[0-9a-f]{64}", manifest["sha256"]) is None
@@ -432,12 +481,19 @@ def validate_descriptor(
             or manifest.get("schema") != 2 or manifest.get("purpose") != "external_ready_vote"
             or manifest.get("origin") != "https://old-sparky.com"
             or manifest.get("runner_sha") != runner_sha or manifest.get("app_target_sha") != app_sha
+            or manifest.get("fixture_schedule") != fixture_schedule
             or type(manifest.get("tournament_count")) is not int or not 1 <= manifest["tournament_count"] <= 40
             or type(manifest.get("user_count")) is not int or not 14 <= manifest["user_count"] <= 20_000
             or not isinstance(manifest.get("users_per_tournament"), list)
             or len(manifest["users_per_tournament"]) != manifest["tournament_count"]
             or any(type(count) is not int or count < 14 for count in manifest["users_per_tournament"])):
         _safe_error("fixture descriptor manifest identity or counts are invalid")
+    if fixture_schedule is not None and (
+        manifest.get("tournament_count") != 40
+        or manifest.get("user_count") != 20_000
+        or manifest.get("users_per_tournament") != [500] * 40
+    ):
+        _safe_error("fixture descriptor scheduled manifest dimensions are invalid")
     binding = manifest.get("source_binding")
     if (binding != input_value.get("source_binding")
             or (binding is None and (runner_sha != app_sha or manifest.get("source_binding_sha256") is not None))):

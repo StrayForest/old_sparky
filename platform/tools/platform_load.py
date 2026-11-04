@@ -1829,6 +1829,7 @@ def source_binding_environment_from_handoff(
                     or manifest.get("app_target_sha") != public_manifest.get("app_target_sha")
                     or manifest.get("source_binding") != public_manifest.get("source_binding")
                     or manifest.get("source_binding_sha256") != public_manifest.get("source_binding_sha256")
+                    or manifest.get("fixture_schedule") != public_manifest.get("fixture_schedule")
                     or len(manifest.get("tournaments", [])) != public_manifest.get("tournament_count")
                     or len(manifest.get("users", [])) != public_manifest.get("user_count")
                     or sorted(row.get("user_count") for row in manifest.get("tournaments", []))

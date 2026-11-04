@@ -3141,73 +3141,28 @@ def _active_app_retained_cleanup_helper(
     *,
     expected_baseline: object | None,
 ) -> Path | None:
-    """Resolve the fixed cleanup entrypoint from the source-bound app release."""
+    """Return the fixed root-side active-app cleanup entrypoint.
+
+    This dispatcher runs as the SSH account, so it must not call the
+    root-only release-baseline reader. The fixed cleanup script is invoked
+    through the existing sudo boundary; that root-owned script validates its
+    active immutable release, source binding, file ownership and locks before
+    any cleanup work.
+    """
 
     if (
-        os.geteuid() != 0
-        or not isinstance(app_target_sha, str)
+        not isinstance(app_target_sha, str)
         or SOURCE_SHA_RE.fullmatch(app_target_sha) is None
     ):
         return None
-    try:
-        baseline = _release_baseline()
-        if (
-            baseline.get("source_sha") != app_target_sha
-            or (
-                expected_baseline is not None
-                and not _baseline_identity_matches(expected_baseline, baseline)
-            )
-        ):
-            return None
-        release_slug = baseline.get("release_slug")
-        if not isinstance(release_slug, str) or RELEASE_SLUG_RE.fullmatch(release_slug) is None:
-            return None
-        release = RUNTIME_ROOT / "releases" / release_slug
-        tools = release / "tools"
-        if release.resolve(strict=True) != release or tools.resolve(strict=True) != tools:
-            return None
-        release_metadata = release.lstat()
-        tools_metadata = tools.lstat()
-        if any(
-            not stat.S_ISDIR(metadata.st_mode)
-            or metadata.st_uid != 0
-            or metadata.st_gid != 0
-            or metadata.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
-            or stat.S_IMODE(metadata.st_mode) & 0o022
-            for metadata in (release_metadata, tools_metadata)
-        ):
-            return None
-        helper = tools / RETAINED_LOAD_CLEANUP_HELPER_NAME
-        before = helper.lstat()
-        if (
-            helper.parent != tools
-            or helper.resolve(strict=True) != helper
-            or not stat.S_ISREG(before.st_mode)
-            or before.st_uid != 0
-            or before.st_gid != 0
-            or before.st_nlink != 1
-            or stat.S_IMODE(before.st_mode) != 0o755
-        ):
-            return None
-        after = helper.lstat()
-        if (
-            (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
-            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
-        ):
-            return None
-        after_baseline = _release_baseline()
-        if (
-            not _baseline_identity_matches(baseline, after_baseline)
-            or after_baseline.get("source_sha") != app_target_sha
-            or (
-                expected_baseline is not None
-                and not _baseline_identity_matches(expected_baseline, after_baseline)
-            )
-        ):
-            return None
-        return helper
-    except (OSError, RuntimeError, TypeError, ValueError):
+
+    if expected_baseline is not None and (
+        not isinstance(expected_baseline, dict)
+        or not _baseline_identity_matches(expected_baseline, expected_baseline)
+        or expected_baseline.get("source_sha") != app_target_sha
+    ):
         return None
+    return RUNTIME_ROOT / "current" / "tools" / RETAINED_LOAD_CLEANUP_HELPER_NAME
 
 
 def _trusted_python_helper(helper: Path) -> bool:
