@@ -134,6 +134,8 @@ RECOVERY_BOOTSTRAP_ALLOWLIST_ONLY_FILES = frozenset(
         "platform/tests/test_platform_noop_source_binding.py",
         "platform/tools/platform_release_lock.sh",
         "platform/tests/test_platform_workflow_provenance.py",
+        "platform/tests/test_platform_backup_probe_workflow_contract.py",
+        "platform/tests/test_platform_verification_contract.py",
         "platform/tools/platform_deploy_baseline.py",
         "platform/tools/platform_baseline_runtime_proof.py",
         "platform/tools/platform_host_tools_bundle.py",
@@ -5798,6 +5800,66 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                     for line in output_path.read_text(encoding="utf-8").splitlines()
                 )
 
+        contract_owner_paths = [
+            "platform/tests/test_platform_backup_probe_workflow_contract.py",
+            "platform/tests/test_platform_verification_contract.py",
+        ]
+        contract_owner_manifest = classifier.classify(
+            contract_owner_paths,
+            event="push",
+            target_sha="a" * 40,
+            branch="dev",
+        )
+        self.assertEqual(contract_owner_manifest["class"], "full")
+        self.assertFalse(contract_owner_manifest["deployable"])
+        self.assertTrue(
+            classifier._is_recovery_bootstrap_only(contract_owner_manifest["files"])
+        )
+        contract_owner_auto = run_auto_backup_gate(
+            contract_owner_manifest, dispatch_mode="baseline-reconcile"
+        )
+        self.assertEqual(contract_owner_auto["backup_required"], "false")
+        self.assertEqual(contract_owner_auto["no_backup_noop_only"], "true")
+
+        # This is the exact P4-to-candidate cumulative path set. Both test-only
+        # contract owners are now in the closed recovery family; an app path
+        # still makes the cumulative source deployable and backup-required.
+        p4_to_candidate_paths = {
+            ".github/workflows/platform-production-autodeploy.yml",
+            ".github/workflows/platform-production-deploy.yml",
+            "platform/docs/deployment-runbook.md",
+            "platform/docs/ssr-capacity-diagnostic-runbook.md",
+            "platform/docs/test-suite-governance.md",
+            "platform/tests/test_platform_backup_probe_workflow_contract.py",
+            "platform/tests/test_platform_cpu_profile.py",
+            "platform/tests/test_platform_recovery_bootstrap.py",
+            "platform/tests/test_platform_release_build_contract.py",
+            "platform/tests/test_platform_verification_contract.py",
+            "platform/tests/test_platform_workflow_provenance.py",
+            "platform/tools/platform_ci_classifier.py",
+            "platform/tools/platform_production_classifier_artifact.py",
+            "platform/tools/platform_ssr_capacity_diagnostic.py",
+            "platform/tools/platform_verify_contract.py",
+        }
+        cumulative_noop = baseline.classify_cumulative_baseline(
+            contract_owner_manifest,
+            sorted(p4_to_candidate_paths),
+            expected_target_sha="a" * 40,
+        )
+        self.assertEqual(
+            baseline.validate_cumulative_reconcile_route(cumulative_noop),
+            {"no_op": True, "runtime_required": False},
+        )
+        mixed_app_cumulative = baseline.classify_cumulative_baseline(
+            contract_owner_manifest,
+            sorted(p4_to_candidate_paths | {"platform/apps/platform_api/app/main.py"}),
+            expected_target_sha="a" * 40,
+        )
+        self.assertEqual(
+            baseline.validate_cumulative_reconcile_route(mixed_app_cumulative),
+            {"no_op": False, "runtime_required": True},
+        )
+
         auto_noop_decision = run_auto_backup_gate(
             incremental_recovery, dispatch_mode="baseline-reconcile"
         )
@@ -5853,13 +5915,13 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             '"no_backup_noop_only": sys.argv[6]', auto_deploy_source
         )
         for closed_recovery_requirement in (
-            '"ROUTE_CLASS" == "full"',
-            '"ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "true"',
-            '"ROUTE_CANDIDATE_PACKAGING_ONLY" == "false"',
-            '"ROUTE_DOCS_ONLY" == "false"',
-            '"ROUTE_STORAGE_OPERATIONS_ONLY" == "false"',
-            '"ROUTE_OUT_OF_SCOPE_ONLY" == "false"',
-            '"ROUTE_FALLBACK" == "false"',
+            '"$ROUTE_CLASS" == "full"',
+            '"$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "true"',
+            '"$ROUTE_CANDIDATE_PACKAGING_ONLY" == "false"',
+            '"$ROUTE_DOCS_ONLY" == "false"',
+            '"$ROUTE_STORAGE_OPERATIONS_ONLY" == "false"',
+            '"$ROUTE_OUT_OF_SCOPE_ONLY" == "false"',
+            '"$ROUTE_FALLBACK" == "false"',
         ):
             self.assertIn(closed_recovery_requirement, auto_deploy_source)
         self.assertIn('inputs.no_backup_noop_only != true', deploy_workflow_source)

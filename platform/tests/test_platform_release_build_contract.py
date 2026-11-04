@@ -375,6 +375,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
                 mode,
                 "12345678902",
                 "3",
+                "false",
             ],
             text=True,
             capture_output=True,

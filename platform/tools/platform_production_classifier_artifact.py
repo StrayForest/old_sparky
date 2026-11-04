@@ -125,6 +125,8 @@ RECOVERY_BOOTSTRAP_FILES = frozenset(
         "platform/tools/platform_run_alembic.sh",
         "platform/tests/test_platform_recovery_bootstrap.py",
         "platform/tests/test_platform_cpu_profile.py",
+        "platform/tests/test_platform_backup_probe_workflow_contract.py",
+        "platform/tests/test_platform_verification_contract.py",
         "platform/tests/test_platform_noop_source_binding.py",
         "platform/tests/test_platform_db.py",
         "platform/tests/test_platform_release_audit_hardening.py",
