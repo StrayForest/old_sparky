@@ -74,6 +74,11 @@ on:
         required: false
         default: ""
         type: string
+      no_backup_noop_only:
+        description: "Require an authenticated cumulative no-op because the automatic caller skipped backup"
+        required: false
+        default: false
+        type: boolean
       failed_deploy_run_id:
         description: "Exact failed production deployment run to reconcile (recovery-deploy only)"
         required: false
@@ -119,6 +124,7 @@ jobs:
       CLASSIFIER_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt || github.run_attempt }}
       AUTODEPLOY_RUN_ID: ${{ inputs.autodeploy_run_id }}
       AUTODEPLOY_RUN_ATTEMPT: ${{ inputs.autodeploy_run_attempt }}
+      NO_BACKUP_NOOP_ONLY: ${{ inputs.no_backup_noop_only }}
       FAILED_DEPLOY_RUN_ID: ${{ inputs.failed_deploy_run_id }}
       FAILED_DEPLOY_RUN_ATTEMPT: ${{ inputs.failed_deploy_run_attempt }}
       REPORT_ONLY_CONFIRMATION: ${{ inputs.report_only_confirmation }}
@@ -133,6 +139,13 @@ jobs:
             preflight|deploy|baseline-reconcile|recovery-deploy) ;;
             *) echo "Unsupported deployment mode; refusing a green no-op." >&2; exit 1 ;;
           esac
+          [[ "$NO_BACKUP_NOOP_ONLY" == "true" || "$NO_BACKUP_NOOP_ONLY" == "false" ]] || {
+            echo "No-backup no-op-only input is malformed." >&2; exit 1;
+          }
+          if [[ "$NO_BACKUP_NOOP_ONLY" == "true" && "$DEPLOY_MODE" != "baseline-reconcile" ]]; then
+            echo "No-backup no-op-only input is only valid for baseline reconciliation." >&2
+            exit 1
+          fi
           if [[ "$DEPLOY_MODE" == "baseline-reconcile" ]]; then
             [[ "$DISPATCH_ACTOR" == "github-actions[bot]" ]] || {
               echo "Baseline reconciliation is restricted to the automatic deployment chain." >&2
@@ -263,6 +276,7 @@ jobs:
       CLASSIFIER_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt || github.run_attempt }}
       AUTODEPLOY_RUN_ID: ${{ inputs.autodeploy_run_id }}
       AUTODEPLOY_RUN_ATTEMPT: ${{ inputs.autodeploy_run_attempt }}
+      NO_BACKUP_NOOP_ONLY: ${{ inputs.no_backup_noop_only }}
     steps:
       - name: Resolve immutable default-branch classifier source
         id: trusted_classifier_default
@@ -1531,6 +1545,7 @@ jobs:
       SOURCE_SECURITY_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt }}
       AUTODEPLOY_RUN_ID: ${{ inputs.autodeploy_run_id }}
       AUTODEPLOY_RUN_ATTEMPT: ${{ inputs.autodeploy_run_attempt }}
+      NO_BACKUP_NOOP_ONLY: ${{ inputs.no_backup_noop_only }}
     steps:
       - name: Checkout exact reviewed target for bounded first-parent diff
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -1573,6 +1588,7 @@ jobs:
           api_opener = build_opener(RejectRedirect())
 
           sys.path.insert(0, str(Path.cwd() / "platform"))
+          from tools import platform_deploy_baseline as baseline  # noqa: E402
           from tools.platform_deploy_baseline import (  # noqa: E402
               DEPLOY_STATUS_CONTEXT,
               active_deployment_status_identity,
@@ -1804,6 +1820,54 @@ jobs:
               reconcile_route = validate_cumulative_reconcile_route(cumulative_result)
           except ProvenanceError as exc:
               raise SystemExit(f"cumulative baseline route is not authorized: {exc}") from exc
+          no_backup_noop_only = os.environ.get("NO_BACKUP_NOOP_ONLY")
+          if no_backup_noop_only not in {"true", "false"}:
+              raise SystemExit("no-backup no-op-only input is malformed")
+          if no_backup_noop_only == "true":
+              incremental_files = incremental.get("files")
+              docs_only_incremental = bool(
+                  incremental.get("class") == "docs-only"
+                  and incremental.get("expected_gates") == list(baseline.DOCS_ONLY_GATE_IDS)
+                  and incremental.get("fallback") is False
+                  and incremental.get("runtime_sensitive") is False
+                  and incremental.get("deployable") is False
+                  and incremental.get("reason") == baseline.DOCS_ONLY_REASON
+                  and isinstance(incremental_files, list)
+                  and bool(incremental_files)
+                  and all(
+                      isinstance(path, str) and path.startswith(baseline.DOCS_PREFIX)
+                      for path in incremental_files
+                  )
+              )
+              recovery_bootstrap_incremental = bool(
+                  incremental.get("class") == "full"
+                  and incremental.get("expected_gates") == list(baseline.FULL_GATE_IDS)
+                  and incremental.get("fallback") is False
+                  and incremental.get("deployable") is False
+                  and incremental.get("reason") == baseline.RECOVERY_BOOTSTRAP_REASON
+                  and isinstance(incremental_files, list)
+                  and any(
+                      isinstance(path, str) and path in baseline.RECOVERY_BOOTSTRAP_FILES
+                      for path in incremental_files
+                  )
+                  and all(
+                      isinstance(path, str)
+                      and (
+                          path in baseline.RECOVERY_BOOTSTRAP_FILES
+                          or path.startswith(baseline.DOCS_PREFIX)
+                      )
+                      for path in incremental_files
+                  )
+              )
+              if not (docs_only_incremental or recovery_bootstrap_incremental):
+                  raise SystemExit("no-backup input is outside the exact docs or recovery-bootstrap route")
+              if not (
+                  cumulative_no_op is True
+                  and reconcile_route == {"no_op": True, "runtime_required": False}
+              ):
+                  raise SystemExit(
+                      "no-backup baseline reconciliation did not prove a cumulative no-op"
+                  )
           manifest_bytes = json.dumps(
               cumulative, sort_keys=True, separators=(",", ":")
           ).encode("utf-8")
@@ -2674,6 +2738,7 @@ jobs:
         ) ||
         (
           inputs.mode == 'baseline-reconcile' &&
+          inputs.no_backup_noop_only != true &&
           needs.validate-active-baseline.result == 'success' &&
           needs.validate-active-baseline.outputs.cumulative_no_op == 'false' &&
           (

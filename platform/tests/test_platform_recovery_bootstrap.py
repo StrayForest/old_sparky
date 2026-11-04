@@ -5541,6 +5541,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
     def test_recovery_bootstrap_route_is_non_deployable_and_mixed_runtime_is_deployable(self) -> None:
         sys.path.insert(0, str(TOOLS))
         from tools import platform_ci_classifier as classifier
+        from tools import platform_deploy_baseline as baseline
 
         patch_file_digest = hashlib.sha256(
             "\n".join(sorted(RECOVERY_BOOTSTRAP_PATCH_FILES)).encode()
@@ -5697,6 +5698,294 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         self.assertIn("--allow-docs-only", auto_deploy_source)
         self.assertIn("--allow-candidate-packaging", auto_deploy_source)
         self.assertIn("--emit-manifest-base64", auto_deploy_source)
+        deploy_workflow_source = (
+            REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
+        ).read_text(encoding="utf-8")
+
+        # The incremental recovery-bootstrap manifest alone cannot prove that
+        # the active-app-to-target range is a no-op. Exercise the real
+        # cumulative validator for both outcomes, then bind the AUTO opt-out
+        # flag to the child's pre-build no-op guard.
+        incremental_recovery = classifier.classify(
+            pure_bootstrap_paths,
+            event="push",
+            target_sha="a" * 40,
+            branch="dev",
+        )
+        self.assertTrue(incremental_recovery["runtime_sensitive"])
+        cumulative_noop = baseline.classify_cumulative_baseline(
+            incremental_recovery,
+            pure_bootstrap_paths,
+            expected_target_sha="a" * 40,
+        )
+        self.assertTrue(cumulative_noop["no_op"])
+        self.assertEqual(
+            baseline.validate_cumulative_reconcile_route(cumulative_noop),
+            {"no_op": True, "runtime_required": False},
+        )
+        cumulative_deploy = baseline.classify_cumulative_baseline(
+            incremental_recovery,
+            pure_bootstrap_paths + ["platform/apps/platform_api/app/main.py"],
+            expected_target_sha="a" * 40,
+        )
+        self.assertFalse(cumulative_deploy["no_op"])
+        self.assertFalse(
+            baseline.validate_cumulative_reconcile_route(cumulative_deploy)["no_op"]
+        )
+        backup_gate_start = auto_deploy_source.index(
+            "          backup_required=true\n          no_backup_noop_only=false"
+        )
+        backup_gate_end = auto_deploy_source.index(
+            '          echo "no_backup_noop_only=$no_backup_noop_only" >> "$GITHUB_OUTPUT"',
+            backup_gate_start,
+        ) + len(
+            '          echo "no_backup_noop_only=$no_backup_noop_only" >> "$GITHUB_OUTPUT"'
+        )
+        backup_gate = textwrap.dedent(
+            auto_deploy_source[backup_gate_start:backup_gate_end]
+        )
+
+        def run_auto_backup_gate(
+            route: dict[str, object],
+            *,
+            dispatch_mode: str,
+            overrides: dict[str, str] | None = None,
+        ) -> dict[str, str]:
+            route_files = route.get("files", [])
+            route_reason = route.get("reason")
+            values = {
+                "ROUTE_CLASS": str(route.get("class")),
+                "ROUTE_DEPLOYABLE": str(route.get("deployable")).lower(),
+                "ROUTE_RECOVERY_BOOTSTRAP_ONLY": str(
+                    route_reason == classifier.RECOVERY_BOOTSTRAP_REASON
+                    and classifier._is_recovery_bootstrap_only(route_files)
+                ).lower(),
+                "ROUTE_CANDIDATE_PACKAGING_ONLY": str(
+                    route_reason == classifier.CANDIDATE_PACKAGING_REASON
+                    and classifier._is_candidate_packaging_only(route_files)
+                ).lower(),
+                "ROUTE_DOCS_ONLY": str(route.get("class") == "docs-only").lower(),
+                "ROUTE_STORAGE_OPERATIONS_ONLY": str(
+                    route_reason == classifier.STORAGE_OPERATIONS_REASON
+                    and classifier._is_storage_operations_only(route_files)
+                ).lower(),
+                "ROUTE_OUT_OF_SCOPE_ONLY": str(
+                    route.get("class") == "out-of-scope"
+                ).lower(),
+                "ROUTE_FALLBACK": str(route.get("fallback")).lower(),
+                "DISPATCH_MODE": dispatch_mode,
+            }
+            if overrides:
+                values.update(overrides)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                output_path = Path(temp_dir) / "github-output"
+                output_path.touch()
+                values["GITHUB_OUTPUT"] = str(output_path)
+                subprocess.run(
+                    [
+                        "/bin/bash",
+                        "-c",
+                        'set -euo pipefail\ndispatch_mode="$DISPATCH_MODE"\n'
+                        + backup_gate,
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    env={**os.environ, **values},
+                )
+                return dict(
+                    line.split("=", 1)
+                    for line in output_path.read_text(encoding="utf-8").splitlines()
+                )
+
+        auto_noop_decision = run_auto_backup_gate(
+            incremental_recovery, dispatch_mode="baseline-reconcile"
+        )
+        self.assertEqual(auto_noop_decision["backup_required"], "false")
+        self.assertEqual(auto_noop_decision["no_backup_noop_only"], "true")
+        docs_only_route = classifier.classify(
+            ["platform/docs/README.md"],
+            event="push",
+            target_sha="a" * 40,
+            branch="dev",
+        )
+        docs_auto_decision = run_auto_backup_gate(
+            docs_only_route, dispatch_mode="baseline-reconcile"
+        )
+        self.assertEqual(docs_auto_decision["backup_required"], "false")
+        self.assertEqual(docs_auto_decision["no_backup_noop_only"], "true")
+        candidate_only_route = classifier.classify(
+            sorted(classifier.CANDIDATE_PACKAGING_FILES),
+            event="push",
+            target_sha="a" * 40,
+            branch="dev",
+        )
+        candidate_auto_decision = run_auto_backup_gate(
+            candidate_only_route, dispatch_mode="baseline-reconcile"
+        )
+        self.assertEqual(candidate_auto_decision["backup_required"], "true")
+        self.assertEqual(candidate_auto_decision["no_backup_noop_only"], "false")
+        for disqualifying_route in (
+            "ROUTE_STORAGE_OPERATIONS_ONLY",
+            "ROUTE_FALLBACK",
+            "ROUTE_OUT_OF_SCOPE_ONLY",
+        ):
+            with self.subTest(disqualifying_route=disqualifying_route):
+                rejected_skip = run_auto_backup_gate(
+                    incremental_recovery,
+                    dispatch_mode="baseline-reconcile",
+                    overrides={disqualifying_route: "true"},
+                )
+                self.assertEqual(rejected_skip["backup_required"], "true")
+                self.assertEqual(rejected_skip["no_backup_noop_only"], "false")
+        deployable_route = classifier.classify(
+            ["platform/apps/platform_api/app/main.py"],
+            event="push",
+            target_sha="a" * 40,
+            branch="dev",
+        )
+        deploy_auto_decision = run_auto_backup_gate(
+            deployable_route, dispatch_mode="deploy"
+        )
+        self.assertEqual(deploy_auto_decision["backup_required"], "true")
+        self.assertEqual(deploy_auto_decision["no_backup_noop_only"], "false")
+        self.assertIn(
+            '"no_backup_noop_only": sys.argv[6]', auto_deploy_source
+        )
+        for closed_recovery_requirement in (
+            '"ROUTE_CLASS" == "full"',
+            '"ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "true"',
+            '"ROUTE_CANDIDATE_PACKAGING_ONLY" == "false"',
+            '"ROUTE_DOCS_ONLY" == "false"',
+            '"ROUTE_STORAGE_OPERATIONS_ONLY" == "false"',
+            '"ROUTE_OUT_OF_SCOPE_ONLY" == "false"',
+            '"ROUTE_FALLBACK" == "false"',
+        ):
+            self.assertIn(closed_recovery_requirement, auto_deploy_source)
+        self.assertIn('inputs.no_backup_noop_only != true', deploy_workflow_source)
+        self.assertIn('no_backup_noop_only == "true"', deploy_workflow_source)
+        self.assertIn(
+            'incremental.get("reason") == baseline.RECOVERY_BOOTSTRAP_REASON',
+            deploy_workflow_source,
+        )
+        self.assertIn(
+            "no_backup_noop_only:\n"
+            '        description: "Require an authenticated cumulative no-op because the automatic caller skipped backup"\n'
+            "        required: false\n"
+            "        default: false\n"
+            "        type: boolean",
+            deploy_workflow_source,
+        )
+        self.assertIn('cumulative_no_op is True', deploy_workflow_source)
+        self.assertIn(
+            'reconcile_route == {"no_op": True, "runtime_required": False}',
+            deploy_workflow_source,
+        )
+        self.assertIn(
+            "no-backup baseline reconciliation did not prove a cumulative no-op",
+            deploy_workflow_source,
+        )
+        self.assertIn(
+            "needs.validate-active-baseline.result == 'success'",
+            deploy_workflow_source,
+        )
+        self.assertIn(
+            "needs.validate-active-baseline.outputs.cumulative_no_op == 'false'",
+            deploy_workflow_source,
+        )
+
+        guard_start = deploy_workflow_source.index(
+            "          no_backup_noop_only = os.environ.get(\"NO_BACKUP_NOOP_ONLY\")"
+        )
+        guard_end = deploy_workflow_source.index(
+            "          manifest_bytes = json.dumps(", guard_start
+        )
+        no_backup_guard = textwrap.dedent(
+            deploy_workflow_source[guard_start:guard_end]
+        )
+
+        def execute_no_backup_guard(
+            incremental_manifest: dict[str, object],
+            *,
+            no_op: bool,
+            runtime_required: bool,
+            flag: str,
+        ) -> None:
+            namespace = {
+                "baseline": baseline,
+                "incremental": incremental_manifest,
+                "cumulative_no_op": no_op,
+                "reconcile_route": {
+                    "no_op": no_op,
+                    "runtime_required": runtime_required,
+                },
+                "os": os,
+            }
+            with mock.patch.dict(os.environ, {"NO_BACKUP_NOOP_ONLY": flag}):
+                exec(compile(no_backup_guard, "deploy-workflow-noop-guard", "exec"), namespace)
+
+        execute_no_backup_guard(
+            incremental_recovery,
+            no_op=True,
+            runtime_required=False,
+            flag="true",
+        )
+        docs_incremental = classifier.classify(
+            ["platform/docs/README.md"],
+            event="push",
+            target_sha="a" * 40,
+            branch="dev",
+        )
+        docs_noop = baseline.classify_cumulative_baseline(
+            docs_incremental,
+            ["platform/docs/README.md"],
+            expected_target_sha="a" * 40,
+        )
+        self.assertTrue(docs_noop["no_op"])
+        self.assertEqual(
+            baseline.validate_cumulative_reconcile_route(docs_noop),
+            {"no_op": True, "runtime_required": False},
+        )
+        execute_no_backup_guard(
+            docs_incremental,
+            no_op=True,
+            runtime_required=False,
+            flag="true",
+        )
+        with self.assertRaises(SystemExit):
+            execute_no_backup_guard(
+                incremental_recovery,
+                no_op=False,
+                runtime_required=True,
+                flag="true",
+            )
+        candidate_only_paths = sorted(classifier.CANDIDATE_PACKAGING_FILES)
+        candidate_only_manifest = classifier.classify(
+            candidate_only_paths,
+            event="push",
+            target_sha="a" * 40,
+            branch="dev",
+        )
+        with self.assertRaises(SystemExit):
+            execute_no_backup_guard(
+                candidate_only_manifest,
+                no_op=True,
+                runtime_required=False,
+                flag="true",
+            )
+        execute_no_backup_guard(
+            incremental_recovery,
+            no_op=False,
+            runtime_required=True,
+            flag="false",
+        )
+        with self.assertRaises(SystemExit):
+            execute_no_backup_guard(
+                incremental_recovery,
+                no_op=True,
+                runtime_required=False,
+                flag="unknown",
+            )
         for representation in (
             canonical,
             classifier_files,

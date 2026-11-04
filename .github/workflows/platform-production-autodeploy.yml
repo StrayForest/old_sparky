@@ -25,11 +25,15 @@ jobs:
       deploy: ${{ steps.gate.outputs.deploy }}
       mode: ${{ steps.gate.outputs.mode }}
       backup_required: ${{ steps.gate.outputs.backup_required }}
+      no_backup_noop_only: ${{ steps.gate.outputs.no_backup_noop_only }}
       route_class: ${{ steps.route.outputs.route_class }}
       route_deployable: ${{ steps.route.outputs.route_deployable }}
       route_recovery_bootstrap_only: ${{ steps.route.outputs.route_recovery_bootstrap_only }}
       route_candidate_packaging_only: ${{ steps.route.outputs.route_candidate_packaging_only }}
       route_docs_only: ${{ steps.route.outputs.route_docs_only }}
+      route_storage_operations_only: ${{ steps.route.outputs.route_storage_operations_only }}
+      route_out_of_scope_only: ${{ steps.route.outputs.route_out_of_scope_only }}
+      route_fallback: ${{ steps.route.outputs.route_fallback }}
       host_tools_sha: ${{ steps.host-tools-pin.outputs.host_tools_sha }}
       host_tools_toolset_version: ${{ steps.host-tools-build.outputs.toolset_version }}
       host_tools_artifact_id: ${{ steps.publish-host-tools.outputs.artifact-id }}
@@ -363,6 +367,7 @@ jobs:
           ROUTE_DOCS_ONLY: ${{ steps.route.outputs.route_docs_only }}
           ROUTE_STORAGE_OPERATIONS_ONLY: ${{ steps.route.outputs.route_storage_operations_only }}
           ROUTE_OUT_OF_SCOPE_ONLY: ${{ steps.route.outputs.route_out_of_scope_only }}
+          ROUTE_FALLBACK: ${{ steps.route.outputs.route_fallback }}
         run: |
           set -euo pipefail
 
@@ -758,18 +763,39 @@ jobs:
           echo "mode=$dispatch_mode" >> "$GITHUB_OUTPUT"
           echo "deploy=true" >> "$GITHUB_OUTPUT"
           backup_required=true
+          no_backup_noop_only=false
           if [[ "$dispatch_mode" == "baseline-reconcile" \
             && "$ROUTE_CLASS" == "docs-only" \
             && "$ROUTE_DEPLOYABLE" == "false" \
             && "$ROUTE_DOCS_ONLY" == "true" \
             && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "false" \
-            && "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "false" ]]; then
+            && "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "false" \
+            && "$ROUTE_STORAGE_OPERATIONS_ONLY" == "false" \
+            && "$ROUTE_OUT_OF_SCOPE_ONLY" == "false" \
+            && "$ROUTE_FALLBACK" == "false" ]]; then
             # The child independently proves the complete active-release-to-
-            # target range is exactly docs-only and emits a no-op receipt;
-            # this incremental docs-only source cannot activate an app build.
+            # target range is exactly docs-only. It is explicitly constrained
+            # to stop unless that proof yields a no-op receipt.
             backup_required=false
+            no_backup_noop_only=true
+          elif [[ "$dispatch_mode" == "baseline-reconcile" \
+            && "$ROUTE_CLASS" == "full" \
+            && "$ROUTE_DEPLOYABLE" == "false" \
+            && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "true" \
+            && "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "false" \
+            && "$ROUTE_DOCS_ONLY" == "false" \
+            && "$ROUTE_STORAGE_OPERATIONS_ONLY" == "false" \
+            && "$ROUTE_OUT_OF_SCOPE_ONLY" == "false" \
+            && "$ROUTE_FALLBACK" == "false" ]]; then
+            # This incremental route is recovery-only, but its cumulative
+            # range may include app changes. The child is told to require an
+            # authenticated cumulative no-op before any release build; if
+            # that fails, it stops and a later deployable source needs backup.
+            backup_required=false
+            no_backup_noop_only=true
           fi
           echo "backup_required=$backup_required" >> "$GITHUB_OUTPUT"
+          echo "no_backup_noop_only=$no_backup_noop_only" >> "$GITHUB_OUTPUT"
 
       - name: Verify exact source-bound restore-verified backup
         if: ${{ steps.gate.outputs.deploy == 'true' && steps.gate.outputs.backup_required != 'false' }}
@@ -887,6 +913,7 @@ jobs:
           SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
           ROUTE_CLASS: ${{ steps.route.outputs.route_class }}
           ROUTE_REASON: ${{ steps.route.outputs.route_reason }}
+          NO_BACKUP_NOOP_ONLY: ${{ steps.gate.outputs.no_backup_noop_only }}
         run: |
           {
             echo "### Platform production auto-deploy preflight"
@@ -897,8 +924,8 @@ jobs:
             if [[ "$SHOULD_DEPLOY" == "true" ]]; then
               if [[ "$BACKUP_REQUIRED" == "true" ]]; then
                 echo "- Result: exact host-tools artifact built; source-bound backup proof passed; waiting for host readiness."
-              elif [[ "$BACKUP_REQUIRED" == "false" && "$ROUTE_CLASS" == "docs-only" ]]; then
-                echo "- Result: exact docs-only baseline route selected; the child must authenticate cumulative no-op before issuing its source receipt."
+              elif [[ "$BACKUP_REQUIRED" == "false" && "$NO_BACKUP_NOOP_ONLY" == "true" ]]; then
+                echo "- Result: bounded no-backup reconcile selected; the child must authenticate cumulative no-op before any release build or source receipt."
               else
                 echo "- Result: source-bound backup requirement is unresolved." >&2
                 exit 1
@@ -1109,7 +1136,11 @@ jobs:
           ROUTE_RECOVERY_BOOTSTRAP_ONLY: ${{ needs.dispatch.outputs.route_recovery_bootstrap_only }}
           ROUTE_CANDIDATE_PACKAGING_ONLY: ${{ needs.dispatch.outputs.route_candidate_packaging_only }}
           ROUTE_DOCS_ONLY: ${{ needs.dispatch.outputs.route_docs_only }}
+          ROUTE_STORAGE_OPERATIONS_ONLY: ${{ needs.dispatch.outputs.route_storage_operations_only }}
+          ROUTE_OUT_OF_SCOPE_ONLY: ${{ needs.dispatch.outputs.route_out_of_scope_only }}
+          ROUTE_FALLBACK: ${{ needs.dispatch.outputs.route_fallback }}
           BACKUP_REQUIRED: ${{ needs.dispatch.outputs.backup_required }}
+          NO_BACKUP_NOOP_ONLY: ${{ needs.dispatch.outputs.no_backup_noop_only }}
           AUTODEPLOY_RUN_ID: ${{ github.run_id }}
           AUTODEPLOY_RUN_ATTEMPT: ${{ github.run_attempt }}
           HOST_TOOLS_SHA: ${{ needs.dispatch.outputs.host_tools_sha }}
@@ -1135,15 +1166,23 @@ jobs:
                     && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "false" \
                     && "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "false" ) ) ]] \
                 || { echo "Refusing an invalid baseline-reconcile route." >&2; exit 1; }
-              if [[ "$ROUTE_CLASS" == "docs-only" && "$ROUTE_DOCS_ONLY" == "true" \
-                && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "false" \
-                && "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "false" ]]; then
-                [[ "$BACKUP_REQUIRED" == "false" ]] || {
-                  echo "Exact docs-only baseline reconciliation must not require an application backup." >&2; exit 1;
+              if [[ "$BACKUP_REQUIRED" == "false" ]]; then
+                [[ "$NO_BACKUP_NOOP_ONLY" == "true" \
+                  && "$ROUTE_FALLBACK" == "false" \
+                  && "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "false" \
+                  && "$ROUTE_STORAGE_OPERATIONS_ONLY" == "false" \
+                  && "$ROUTE_OUT_OF_SCOPE_ONLY" == "false" \
+                  && ( ( "$ROUTE_CLASS" == "docs-only" \
+                      && "$ROUTE_DOCS_ONLY" == "true" \
+                      && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "false" ) \
+                    || ( "$ROUTE_CLASS" == "full" \
+                      && "$ROUTE_DOCS_ONLY" == "false" \
+                      && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "true" ) ) ]] || {
+                  echo "No-backup baseline reconciliation requires an exact closed no-op-only route." >&2; exit 1;
                 }
               else
-                [[ "$BACKUP_REQUIRED" == "true" ]] || {
-                  echo "Non-docs baseline reconciliation requires an exact source-bound backup." >&2; exit 1;
+                [[ "$NO_BACKUP_NOOP_ONLY" == "false" ]] || {
+                  echo "No-op-only mode cannot be combined with a required backup." >&2; exit 1;
                 }
               fi
               ;;
@@ -1162,7 +1201,7 @@ jobs:
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-deploy.yml/dispatches" \
-            --data "$(/usr/bin/python3 - "$SOURCE_RUN_ID" "$SOURCE_RUN_ATTEMPT" "$DISPATCH_MODE" "$AUTODEPLOY_RUN_ID" "$AUTODEPLOY_RUN_ATTEMPT" <<'PY'
+            --data "$(/usr/bin/python3 - "$SOURCE_RUN_ID" "$SOURCE_RUN_ATTEMPT" "$DISPATCH_MODE" "$AUTODEPLOY_RUN_ID" "$AUTODEPLOY_RUN_ATTEMPT" "$NO_BACKUP_NOOP_ONLY" <<'PY'
           import json
           import sys
           print(json.dumps({
@@ -1175,6 +1214,7 @@ jobs:
                   "classifier_run_attempt": sys.argv[2],
                   "autodeploy_run_id": sys.argv[4],
                   "autodeploy_run_attempt": sys.argv[5],
+                  "no_backup_noop_only": sys.argv[6],
               },
           }))
           PY
@@ -1187,6 +1227,7 @@ jobs:
           SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
           DISPATCH_MODE: ${{ needs.dispatch.outputs.mode }}
           BACKUP_REQUIRED: ${{ needs.dispatch.outputs.backup_required }}
+          NO_BACKUP_NOOP_ONLY: ${{ needs.dispatch.outputs.no_backup_noop_only }}
           ROUTE_CLASS: ${{ needs.dispatch.outputs.route_class }}
         run: |
           {
@@ -1197,8 +1238,8 @@ jobs:
             if [[ "${{ job.status }}" == "success" ]]; then
               if [[ "$BACKUP_REQUIRED" == "true" ]]; then
                 echo "- Result: normal production child dispatched after source, backup, and host readiness proofs."
-              elif [[ "$BACKUP_REQUIRED" == "false" && "$DISPATCH_MODE" == "baseline-reconcile" && "$ROUTE_CLASS" == "docs-only" ]]; then
-                echo "- Result: exact docs-only baseline reconciliation child dispatched after source and host readiness proofs; it must prove cumulative no-op before receipt publication."
+              elif [[ "$BACKUP_REQUIRED" == "false" && "$NO_BACKUP_NOOP_ONLY" == "true" && "$DISPATCH_MODE" == "baseline-reconcile" ]]; then
+                echo "- Result: no-backup no-op-only baseline child dispatched after source and host readiness proofs; it must prove cumulative no-op before any release build or receipt."
               else
                 echo "- Result: backup requirement is unresolved." >&2
                 exit 1

@@ -12,7 +12,7 @@ Use this document for the normal immutable release path. CSP mode changes and pr
 2. Push it to `dev`; record the exact Security run ID/attempt/SHA and verify its classifier is full, deployable and
    non-fallback for this normal app release. Global-guidance routes do not qualify; documented recovery, bootstrap,
    candidate and docs routes use their own procedures.
-3. Dispatch exactly one `create` backup bound to that Security run ID/attempt and SHA, with the shared production slot unowned. It may start while Security runs or after it succeeds; the backup workflow independently waits for exact Security success and current `dev` before staging or SSH. Confirm the backup run actually starts within Auto's bounded proof wait. A duplicate matching backup run is ambiguous. See the [backup procedure](backup-restore-runbook.md#local-verified-backup).
+3. For a deployable normal app release, dispatch exactly one `create` backup bound to that Security run ID/attempt and SHA, with the shared production slot unowned. It may start while Security runs or after it succeeds; the backup workflow independently waits for exact Security success and current `dev` before staging or SSH. Confirm the backup run actually starts within Auto's bounded proof wait. A duplicate matching backup run is ambiguous. Closed no-op-only reconciliation is the exception in step 4. See the [backup procedure](backup-restore-runbook.md#local-verified-backup).
 4. Wait for exact Security success and the restore-verified receipt. Auto-deploy starts after Security completes; it never dispatches the backup, only polls for the exact receipt and dispatches the child after both proofs pass.
 5. Confirm migration compatibility, healthy services and at least `max(5 GiB, 10% of total)` free / at most 90% used; protect `current`/`previous`. Never manually deploy. Other routes use their own procedures; local tests do not replace release gates.
 
@@ -57,16 +57,14 @@ to `dev`. The chain is:
    Before child dispatch, the guard revalidates the exact Security run/attempt/source and requires complete, terminal, source-bound pages from that attempt's [workflow-jobs endpoint](https://docs.github.com/en/rest/actions/workflow-jobs), with valid start/completion times. The backup run must have the exact Security ID/attempt/SHA title, start after that Security run began, and preserve its own creation→workflow→job timestamp order. The backup workflow independently waits for Security success and rechecks current `dev` before staging or SSH; it then proves the successful restore-verified receipt. Missing, malformed or incomplete Security or backup jobs abort. `updated_at` remains only a consistency upper bound; event `workflow_run.completed_at` is never a fallback.
 4. The automatic chain dispatches `mode=deploy` for deployable full routes and
    `mode=baseline-reconcile` for validated recovery-bootstrap-only or docs-only
-   routes; never dispatch either mode manually. The production workflow
+   routes; never dispatch either mode manually. Auto may skip backup only for closed, non-fallback docs-only or recovery-bootstrap routes and marks the child `no_backup_noop_only`; the child proves cumulative no-op before build.
+   The production workflow
    authenticates source/caller, validates the cumulative range and active
    baseline's latest bot-authored deploy marker, attempt URL and successful exact
    `Deploy production` job. Legacy slugs require root validation, GitHub attempt 1
    and passing exact checks; unknown formats, reruns and ambiguity fail closed.
-   An allowed docs-only no-op publishes an authenticated source receipt binding
-   workflow SHA to active app baseline without deployment. Wait for it before
-   live QA, which targets the unchanged app. Recovery-bootstrap build/publisher
-   separately emits its own authenticated skip receipt, not the QA receipt.
-5. After Security, backup and classifier proofs pass, a secret-free prerequisite validates the exact classifier artifact before the production child builds `TARGET_SHA` once.
+   A no-backup child requires `cumulative_no_op=true` and `runtime_required=false` or fails before build or receipt. Candidate-packaging, storage and ordinary deploy routes retain the exact source-bound backup gate. The authenticated no-op receipt binds workflow SHA to active app baseline and may authorize live QA against that unchanged app; the recovery-bootstrap publisher's skip receipt is separate.
+5. After Security, classifier and any required backup proofs pass, a secret-free prerequisite validates the exact classifier artifact before the production child builds `TARGET_SHA` once.
    The production environment then repeats that exact-SHA validation immediately
    before its first production write, followed by the security/build check and
    immutable artifact consumption. The classifier artifact is treated as
