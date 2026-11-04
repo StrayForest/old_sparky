@@ -425,20 +425,54 @@ print("ok")
         self.assertEqual(completed.stdout.strip(), "ok")
 
     def test_one_html_parent_joins_all_api_calls_and_ssr_stages(self) -> None:
-        report = summarize()
+        unselected_id = "00000000000000000000000000000004"
+        trace_start = "2026-10-29T11:59:32+00:00"
+
+        def trace_event(request_id: str, **fields: object) -> dict[str, object]:
+            row = event(request_id, **fields)
+            row["window_start_utc"] = trace_start
+            return row
+
+        report = summarize(
+            window_start_utc=trace_start,
+            nginx_rows=[
+                trace_event(ID_ONE, request_time_ms=100.0, cf_ray="ray-one"),
+                trace_event(ID_TWO, request_time_ms=200.0, cf_ray="ray-two"),
+                trace_event(unselected_id, request_time_ms=300.0, cf_ray="unselected-ray"),
+            ],
+            ssr_rows=[
+                trace_event(ID_ONE, stage="auth_bootstrap_fetch", duration_ms=40.0),
+                trace_event(ID_ONE, stage="tournament_workspace", duration_ms=60.0),
+                trace_event(ID_ONE, stage="page_component", duration_ms=90.0),
+                trace_event(ID_TWO, stage="auth_bootstrap_fetch", duration_ms=80.0),
+                trace_event(unselected_id, stage="page_component", duration_ms=500.0),
+            ],
+            api_rows=[
+                trace_event(ID_ONE, source_time="2026-10-29T11:59:53Z",
+                           route_class="auth_bootstrap", total_ms=25.0),
+                trace_event(ID_ONE, route_class="auth_bootstrap", total_ms=30.0, sql_ms=5.0,
+                            max_sql_ms=3.0, pool_checkout_wait_ms=1.0,
+                            pool_connection_hold_ms=4.0, compute_ms=10.0, sql_count=2),
+                trace_event(ID_ONE, route_class="tournament_workspace", total_ms=50.0, sql_ms=20.0,
+                            max_sql_ms=15.0, pool_checkout_wait_ms=5.0,
+                            pool_connection_hold_ms=10.0, compute_ms=20.0, sql_count=3),
+                trace_event(ID_TWO, route_class="auth_bootstrap", total_ms=70.0),
+                trace_event(unselected_id, route_class="auth_bootstrap", total_ms=999.0),
+            ],
+        )
 
         self.assertEqual(report["join"]["matched_nginx_parents"], 2)  # type: ignore[index]
         self.assertEqual(report["join"]["matched_ssr_parents"], 2)  # type: ignore[index]
-        self.assertEqual(report["join"]["matched_api_rows"], 3)  # type: ignore[index]
-        self.assertEqual(report["join"]["matched_api_by_request_id"], 3)  # type: ignore[index]
+        self.assertEqual(report["join"]["matched_api_rows"], 4)  # type: ignore[index]
+        self.assertEqual(report["join"]["matched_api_by_request_id"], 4)  # type: ignore[index]
         api_metrics = report["timing_ms"]["api_request_by_route"]  # type: ignore[index]
-        self.assertEqual(api_metrics["auth_bootstrap"]["total_ms"]["count"], 2)  # type: ignore[index]
+        self.assertEqual(api_metrics["auth_bootstrap"]["total_ms"]["count"], 3)  # type: ignore[index]
         self.assertEqual(api_metrics["auth_bootstrap"]["sql_ms"]["count"], 1)  # type: ignore[index]
         self.assertEqual(api_metrics["auth_bootstrap"]["sql_count"]["count"], 1)  # type: ignore[index]
         self.assertEqual(api_metrics["tournament_workspace"]["total_ms"]["count"], 1)  # type: ignore[index]
         self.assertEqual(
             report["timing_ms"]["api_metric_missing_or_invalid_by_route"]["auth_bootstrap"]["sql_ms"],
-            1,  # type: ignore[index]
+            2,  # type: ignore[index]
         )
         self.assertEqual(
             report["timing_ms"]["ssr_stage"]["auth_bootstrap_fetch"]["count"],

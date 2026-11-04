@@ -66,6 +66,7 @@ PLAN_EXPIRY_GRACE_MS = {workload: 0 for workload in SUPPORTED_WORKLOADS}
 PLAN_EXPIRY_GRACE_MS[WORKLOAD_HTML_SSR_CAPACITY] = 15_000
 PLAN_EXPIRY_GRACE_MS[WORKLOAD_HTML_SSR_CAPACITY_120S] = 15_000
 PLAN_EXPIRY_GRACE_MS[WORKLOAD_HTML_SSR_CPU_PROFILE_20S] = 15_000
+HTML_TRACE_START_SKEW_MS = 28_000
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RUN_RE = re.compile(r"^[0-9a-f]{32}$")
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,79}$")
@@ -543,9 +544,10 @@ def authorize_html_request_perf_capture(
 ) -> tuple[DiagnosticPlan | None, str | None, bool]:
     """Authorize bounded request_perf capture for one validated HTML call.
 
-    The request headers only select a correlation candidate. Capture is enabled
-    only when the root-owned, service-bound plan independently authorizes the
-    matching run and exact ON phase.
+    The request headers only select a correlation candidate. Bounded request
+    telemetry is enabled only when the root-owned, service-bound plan
+    independently authorizes the matching run and bounded HTML trace interval.
+    This does not start or extend CPU-usage/profile windows.
     """
 
     if scope.get("type") != "http" or scope.get("method") != "GET":
@@ -591,14 +593,14 @@ def authorize_html_request_perf_capture(
     if (authorized_plan is None
             or authorized_plan.run_id != trace_run_id
             or authorized_plan.workload not in HTML_REQUEST_PERF_WORKLOADS
-            or not authorized_plan.on_start_ms <= parent_start_ms < authorized_plan.on_end_ms
-            or not (
-                authorized_plan.phase_at(current_ms) == "on"
-                or authorized_plan.on_end_ms <= current_ms <= authorized_plan.expires_at_ms
-            )
+            or not authorized_plan.on_start_ms - HTML_TRACE_START_SKEW_MS
+            <= parent_start_ms <= current_ms
             or current_ms > authorized_plan.expires_at_ms):
         return None, None, False
-    return authorized_plan, "on", True
+    # Keep the physical OFF/ON label when the API receives the request during
+    # an active phase. Requests in the bounded trace-only margins are correlated
+    # to the ON client cohort without changing any CPU/usage phase window.
+    return authorized_plan, authorized_plan.phase_at(current_ms) or "on", True
 
 
 def _read_process_plan_uncached(

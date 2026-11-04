@@ -2,7 +2,7 @@
 
 - Status: Active operator procedure
 - Owner: Production operator
-- Last reviewed: 2026-11-01
+- Last reviewed: 2026-11-04
 
 Use this runbook for the zero-credit authenticated SSR composite diagnostic.
 It runs one unprofiled 120-second capacity window, then a separate profiled
@@ -21,10 +21,11 @@ exact-head CI route. For a runtime-sensitive source change:
 1. Merge the reviewed change through the normal `dev` route. Record the exact
    merged source SHA `S` and its successful Security run and attempt.
 2. Start exactly one source-bound TMPFS backup for that same `S` and Security
-   run/attempt while the Security run is active. Confirm the backup production
-   job started before the latest required Security job completed. Require the
-   backup receipt to bind `S`, the Security identity and the backup run; require
-   create, restore, Alembic and scratch-cleanup success.
+   run/attempt. It may start while Security runs or after exact Security
+   success; confirm the backup workflow starts within AUTO's bounded proof
+   wait. The backup still waits for exact Security success and current `dev`
+   before staging or SSH. Require the receipt to bind `S`, the Security identity
+   and backup run, with create, restore, Alembic and scratch-cleanup success.
 3. Let the normal auto-deploy parent verify its signed host-tools bundle and
    attestation. Install a new host-tools generation only from that normal,
    source-bound parent artifact. A pull-request candidate artifact is never
@@ -319,16 +320,22 @@ identities, and all of these conditions hold:
   cd platform/apps/platform_web
   npm run test:ssr-stream-diagnostics
   ```
-  Typed HTML requests may finish trace registration during the plan's existing
-  15-second expiry only when the trusted parent-start stamped by the web proxy
-  is before the ON end. This is trace/correlation drain only: CPU, usage and
-  memory capture still stop at their original phase boundaries. The proxy
-  overwrites any caller-supplied parent-start value when the request reaches
-  the server. A browser request launched before ON end but received by the
-  proxy at or after that boundary has no trusted in-window start and remains
-  outside the cohort; the diagnostic does not infer client-side start time.
-  The load cohort is still measured by client start, so such transit-delayed
-  requests remain missing IDs and make the measurement incomplete.
+  Typed HTML trace correlation accepts a proxy-stamped receipt from 28 seconds
+  before ON start through the plan's fixed 15-second expiry, never later than
+  the current server time. The 28-second floor is the enforced 20-second
+  end-to-end plan preparation limit plus the 8-second remote clock-lag bound.
+  If a typed HTML plan takes longer than 20 seconds to prepare, the runner
+  stops before starting its workload and keeps the prepared plan in the existing
+  expiry/cleanup path. The proxy
+  strips caller-supplied parent-start values before stamping receipt time; no
+  client timestamp is trusted. An active OFF or ON request keeps its existing
+  physical phase, CPU/usage/memory/V8 starters and window edges. A request in
+  the bounded idle margin is trace-only. The collector reads only that bounded
+  interval and joins only exact request IDs selected from the client-started ON
+  cohort, so OFF probes, idle requests and other IDs cannot add ON capacity
+  credit. Receipt before the floor or after expiry remains uncorrelated. The
+  full-cohort ID and completion requirements reject any remaining boundary
+  arrival that cannot be joined; do not credit partial evidence.
 - The `authenticated_html_ssr_capacity_120s_v1` plan binds the Node memory
   event window to its exact phase duration: OFF remains capped at 20 seconds,
   while ON may span 120 seconds. The final sample endpoint may extend up to
@@ -470,6 +477,27 @@ the schema-2 receipt keeps the absent exit explicit and sets
 create a missing exit record, or hand-write a receipt. Proceed to cleanup only
 when the canonical abort normalizer produces
 `status=safe_for_exact_fixture_cleanup` for the selected run and attempt.
+
+If the checked-out `dev` source `S` is deployable, differs from the active app
+source `A`, and has no exact verified no-op source binding, keep the fixture
+closed after abort and do not dispatch cleanup yet. Dispatch exactly one
+source-bound backup for `S` and its successful Security run/attempt using the
+[backup procedure](backup-restore-runbook.md#local-verified-backup); it may
+start after Security succeeds and must start within AUTO's bounded proof
+wait. Let the existing AUTO chain complete normal deployment and readiness;
+never manually dispatch deployment. Before cleanup, verify `dev`, the
+successful Security source, active `RELEASE.json` source, and cleanup
+workflow checkout all equal the exact 40-character SHA `S`. Confirm the
+installed host-tools pin and normal service readiness checks from
+[Release and host readiness](#release-and-host-readiness). The cleanup
+source-binding resolver binds its checked-out SHA by same-source identity
+or an exact verified no-op receipt; the host helper independently checks
+the bound app SHA against current `RELEASE.json`. Once `S` is active, the
+normal same-source binding is used by the cleanup command below. If `dev`
+moves, AUTO fails, a source differs, or readiness cannot be proved, stop
+and use the [deployment recovery procedure](deployment-runbook.md#preconditions).
+Do not override the app target, create a no-op alias, or dispatch a new
+workload before exact cleanup succeeds.
 
 The origin supervisor keeps the observer timeout tree in its own process
 session. On `SIGINT` or `SIGTERM`, it stops and reaps that session before it

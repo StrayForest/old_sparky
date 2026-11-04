@@ -995,6 +995,7 @@ MAX_PLAN_PREPARE_ROUNDTRIP_MS = (
     - _plan_expiry_horizon_ms(HTML_CAPACITY_120S_WORKLOAD)
     - PLAN_EXPIRY_SKEW_MARGIN_MS
 )
+MAX_HTML_TRACE_PREPARE_ROUNDTRIP_MS = 20_000
 MAX_REMOTE_CLOCK_LAG_BOUND_MS = (
     MAX_REMOTE_CLOCK_LAG_WITHOUT_ROUNDTRIP_MS + MAX_PLAN_PREPARE_ROUNDTRIP_MS
 )
@@ -3124,6 +3125,20 @@ def _prepare_remote_capacity_plan(
             plan_created_monotonic=plan_created_monotonic,
             remote_clock_lag_bound_ms=remote_clock_lag_bound_ms,
         ) from None
+    if (workload in {
+        HTML_WORKLOAD, HTML_CAPACITY_120S_WORKLOAD, HTML_CPU_PROFILE_20S_WORKLOAD,
+    }
+            and prepare_roundtrip_ms > MAX_HTML_TRACE_PREPARE_ROUNDTRIP_MS):
+        # The trace-correlation start floor is 20s preparation + 8s remote
+        # clock lag. Refuse before workload start if the measured full call
+        # exceeded the preparation budget; the prepared plan remains owned by
+        # the existing expiry/cleanup path below the caller.
+        raise _RemoteCapacityPlanError(
+            lifecycle, "ValueError", expires_at_ms=expires_at_ms,
+            plan_created_at_ms=now_ms,
+            plan_created_monotonic=plan_created_monotonic,
+            remote_clock_lag_bound_ms=remote_clock_lag_bound_ms,
+        )
     expiry_wait_ms = _plan_expiry_horizon_ms(workload) + max(
         PLAN_EXPIRY_SKEW_MARGIN_MS, remote_clock_lag_bound_ms + 1_000,
     )

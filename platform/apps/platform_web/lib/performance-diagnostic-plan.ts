@@ -306,21 +306,18 @@ function currentPlan(): DiagnosticPlan | null {
 export function current_diagnostic_run_id(): string | null {
   const current = diagnosticStorage.getStore();
   if (!current) return null;
-  if (current.traceOnly === true) {
-    const parentStartMs = current.parentStartMs;
-    return typeof parentStartMs === "number"
-      && isHtmlSsrTraceDrainEligible(
-        current.plan.workload,
-        parentStartMs,
-        Date.now(),
-        current.plan.on_start_ms,
-        current.plan.on_end_ms,
-        current.plan.expires_at_ms,
-      )
-      ? current.plan.run_id
-      : null;
-  }
-  return activePhase(current.plan, Date.now()) === current.phase
+  const now = Date.now();
+  if (activePhase(current.plan, now) === current.phase) return current.plan.run_id;
+  const parentStartMs = current.parentStartMs;
+  return typeof parentStartMs === "number"
+    && isHtmlSsrTraceDrainEligible(
+      current.plan.workload,
+      parentStartMs,
+      now,
+      current.plan.on_start_ms,
+      current.plan.on_end_ms,
+      current.plan.expires_at_ms,
+    )
     ? current.plan.run_id
     : null;
 }
@@ -356,19 +353,25 @@ function validatedSsrDiagnostic(requestHeaders: Pick<Headers, "get">): ActiveDia
       || !hasAuthorizedDiagnosticRunMarker(incomingTrace, plan.run_id)) return null;
   const now = Date.now();
   const phase = activePhase(plan, now);
-  if (phase !== null) return { plan, phase };
   const parentStartText = requestHeaders.get(SSR_REQUEST_START_HEADER) ?? "";
-  if (!/^(?:0|[1-9][0-9]{0,15})$/u.test(parentStartText)) return null;
-  const parentStartMs = Number(parentStartText);
-  if (!isHtmlSsrTraceDrainEligible(
+  const parentStartMs = /^(?:0|[1-9][0-9]{0,15})$/u.test(parentStartText)
+    ? Number(parentStartText)
+    : null;
+  const traceEligible = parentStartMs !== null && isHtmlSsrTraceDrainEligible(
     plan.workload,
     parentStartMs,
     now,
     plan.on_start_ms,
     plan.on_end_ms,
     plan.expires_at_ms,
-  )) return null;
-  return { plan, phase: "on", traceOnly: true, parentStartMs };
+  );
+  // Preserve ordinary OFF/ON telemetry and its capture starters. The broader
+  // trace interval only supplies correlation context across phase edges.
+  if (phase !== null) {
+    return { plan, phase, ...(traceEligible ? { parentStartMs: parentStartMs! } : {}) };
+  }
+  if (!traceEligible) return null;
+  return { plan, phase: "on", traceOnly: true, parentStartMs: parentStartMs! };
 }
 
 function registerSsrStreamRequest(

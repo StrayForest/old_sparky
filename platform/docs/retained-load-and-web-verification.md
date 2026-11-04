@@ -2,7 +2,7 @@
 
 - Status: Active reference and operator how-to
 - Owner: Performance and web verification owners
-- Last reviewed: 2026-10-19
+- Last reviewed: 2026-11-04
 
 This document owns the detailed retained-load cleanup, hermetic web verification,
 external-load workflow barrier and evidence-projection contracts. The
@@ -38,8 +38,8 @@ after the canonical normalizer publishes the receipt for that same run and
 attempt; if a check fails, stop and follow the operator escalation path. Never
 create the missing exit record or hand-write the receipt.
 
-If the reviewed abort helper is on a recovery-only runner SHA `R` while the
-active app remains at its freshly verified SHA `A`, use this order:
+If the reviewed abort helper is on recovery-only runner SHA `R` while the active app is at freshly verified SHA `A`, use this order. Runner binding permits the same app SHA or an exact verified no-op receipt; the host helper checks the bound app SHA against current `RELEASE.json`.
+For a deployable source not active, follow the [deploy-before-cleanup sequence in the SSR diagnostic runbook](ssr-capacity-diagnostic-runbook.md#abort-and-close-the-exact-fixture): abort → one source-bound backup → AUTO normal deployment/readiness → verify source and pin active → exact old-run cleanup. Keep load closed; do not override target, alias no-op, or start another workload.
 
 Before starting Security or reserving its backup, inventory task-owned
 temporary paths, sizes and open users. Remove only exact task artifacts whose

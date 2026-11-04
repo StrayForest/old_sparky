@@ -56,6 +56,7 @@ CAPACITY_NGINX_FILES = 8
 CAPACITY_REQUEST_SAMPLE_LIMIT = 1_000
 CAPACITY_CAPTURE_DRAIN_MS = 15_000
 CAPACITY_CAPTURE_MARKER_GRACE_MS = 1_000
+CAPACITY_TRACE_START_SKEW_MS = 28_000
 CAPACITY_JOURNAL_COLLECTION_REASONS = frozenset({
     "complete", "invalid_request", "spawn_failed", "timeout", "byte_cap",
     "line_cap", "row_cap", "invalid_event", "invalid_identity",
@@ -1421,23 +1422,24 @@ def _capacity_request_telemetry(
         raise PlanError("capacity correlation cohort is invalid")
     start_ms = web_plan["on_start_ms"]
     end_ms = web_plan["on_end_ms"]
+    trace_start_ms = max(0, start_ms - CAPACITY_TRACE_START_SKEW_MS)
     capture_end_ms = min(
         web_plan["expires_at_ms"],
         end_ms + CAPACITY_CAPTURE_DRAIN_MS,
     )
     web_query_until_ms = capture_end_ms + CAPACITY_CAPTURE_MARKER_GRACE_MS
-    start_utc = datetime.fromtimestamp(start_ms / 1000, tz=UTC).isoformat()
+    trace_start_utc = datetime.fromtimestamp(trace_start_ms / 1000, tz=UTC).isoformat()
     end_utc = datetime.fromtimestamp(capture_end_ms / 1000, tz=UTC).isoformat()
     selected_set = set(selected_request_ids)
     api_raw, api_collection_reason = _bounded_capacity_journal_rows(
-        "api", api_plan, since_ms=max(0, start_ms - 1_000),
+        "api", api_plan, since_ms=trace_start_ms,
         until_ms=capture_end_ms,
         markers=("request_perf", "ssr_api_request_perf_coverage"),
         run_id=run_id, request_ids=selected_set,
     )
     def context(event_at_utc: str, request_id: str) -> dict[str, str]:
         return {
-            "run_id": run_id, "phase": "on", "window_start_utc": start_utc,
+            "run_id": run_id, "phase": "on", "window_start_utc": trace_start_utc,
             "window_end_utc": end_utc, "event_at_utc": event_at_utc,
             "request_id": request_id,
         }
@@ -1479,7 +1481,7 @@ def _capacity_request_telemetry(
 
     marker_sync_ok = _wait_and_sync_capacity_capture_marker(web_plan["expires_at_ms"])
     web_raw, web_collection_reason = _bounded_capacity_journal_rows(
-        "web", web_plan, since_ms=max(0, start_ms - 1_000),
+        "web", web_plan, since_ms=trace_start_ms,
         until_ms=web_query_until_ms, markers=(
             "ssr_perf", "ssr_stream", "ssr_stream_coverage",
             "ssr_stream_capture_coverage",
@@ -1491,7 +1493,7 @@ def _capacity_request_telemetry(
         # cause even if the following query also encounters a failure.
         web_collection_reason = "journal_sync_failed"
     nginx_raw, nginx_truncated = _bounded_nginx_rows(
-        selected_set, since_ms=max(0, start_ms - 1_000), until_ms=capture_end_ms,
+        selected_set, since_ms=trace_start_ms, until_ms=capture_end_ms,
     )
 
     ssr_rows: list[dict[str, Any]] = []
@@ -1578,7 +1580,7 @@ def _capacity_request_telemetry(
         selection_scheme=cohort_counts["sample_scheme"],
         eligible_response_id_count=cohort_counts["eligible_response_id_count"],
         run_id=run_id, phase="on",
-        window_start_utc=start_utc, window_end_utc=end_utc,
+        window_start_utc=trace_start_utc, window_end_utc=end_utc,
         nginx_rows=nginx_rows, ssr_rows=ssr_rows, stream_rows=stream_rows,
         api_rows=api_rows,
         rows_truncated=rows_truncated,

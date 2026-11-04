@@ -7485,10 +7485,112 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             ),
             (plan, "on", True),
         )
+        late_parent_headers = [
+            (name, b"146001" if name == b"x-platform-ssr-request-start-ms" else value)
+            for name, value in headers
+        ]
+        late_parent_scope = {
+            "type": "http", "method": "GET", "path": "/api/v1/auth/bootstrap",
+            "headers": late_parent_headers,
+        }
+        self.assertEqual(
+            authorize_html_request_perf_capture(late_parent_scope, plan=plan, now_ms=146_002),
+            (plan, "on", True),
+        )
+        expiry_parent_headers = [
+            (name, b"161000" if name == b"x-platform-ssr-request-start-ms" else value)
+            for name, value in headers
+        ]
+        self.assertEqual(
+            authorize_html_request_perf_capture(
+                {**late_parent_scope, "headers": expiry_parent_headers}, plan=plan, now_ms=161_000,
+            ),
+            (plan, "on", True),
+        )
         self.assertEqual(
             authorize_html_request_perf_capture(
                 {"type": "http", "method": "GET", "path": "/api/v1/auth/bootstrap", "headers": headers},
                 plan=plan, now_ms=161_001,
+            ),
+            (None, None, False),
+        )
+        for parent_start, now_ms in ((146_003, 146_002), (161_001, 161_001)):
+            invalid_parent_headers = [
+                (name, str(parent_start).encode("ascii")
+                 if name == b"x-platform-ssr-request-start-ms" else value)
+                for name, value in headers
+            ]
+            with self.subTest(parent_start=parent_start, now_ms=now_ms):
+                self.assertEqual(
+                    authorize_html_request_perf_capture(
+                        {**late_parent_scope, "headers": invalid_parent_headers},
+                        plan=plan, now_ms=now_ms,
+                    ),
+                    (None, None, False),
+                )
+        skew_payload = {
+            **payload,
+            "off_start_ms": 201_000,
+            "off_end_ms": 221_000,
+            "on_start_ms": 226_000,
+            "on_end_ms": 346_000,
+            "expires_at_ms": 361_000,
+        }
+        skew_plan = parse_plan_payload(
+            _canonical_payload(skew_payload), expected_service="api",
+        )
+        skew_headers = [
+            (name, b"200000" if name == b"x-platform-ssr-request-start-ms" else value)
+            for name, value in headers
+        ]
+        skew_scope = {
+            "type": "http", "method": "GET", "path": "/api/v1/auth/bootstrap",
+            "headers": skew_headers,
+        }
+        # A request whose trusted proxy receipt precedes ON may still arrive
+        # during the real OFF phase. It remains OFF for all ordinary telemetry.
+        self.assertEqual(
+            authorize_html_request_perf_capture(skew_scope, plan=skew_plan, now_ms=210_000),
+            (skew_plan, "off", True),
+        )
+        before_floor_headers = [
+            (name, b"197999" if name == b"x-platform-ssr-request-start-ms" else value)
+            for name, value in headers
+        ]
+        self.assertEqual(
+            authorize_html_request_perf_capture(
+                {**skew_scope, "headers": before_floor_headers},
+                plan=skew_plan, now_ms=226_000,
+            ),
+            (None, None, False),
+        )
+        idle_headers = [
+            (name, b"222000" if name == b"x-platform-ssr-request-start-ms" else value)
+            for name, value in headers
+        ]
+        self.assertEqual(
+            authorize_html_request_perf_capture(
+                {**skew_scope, "headers": idle_headers}, plan=skew_plan, now_ms=223_000,
+            ),
+            (skew_plan, "on", True),
+        )
+        wrong_run_id = "f" * 32
+        wrong_run_request_id = next(
+            f"{index:032x}"
+            for index in range(1, 10_000)
+            if int(hashlib.sha256(
+                f"{wrong_run_id}:{index:032x}".encode("ascii")
+            ).hexdigest()[:2], 16) & 7 == 0
+        )
+        wrong_run_headers = [
+            (name, wrong_run_id.encode("ascii") if name == b"x-platform-ssr-trace"
+             else wrong_run_request_id.encode("ascii")
+             if name in {b"x-platform-ssr-request-id", b"x-request-id"} else value)
+            for name, value in late_parent_headers
+        ]
+        self.assertEqual(
+            authorize_html_request_perf_capture(
+                {**late_parent_scope, "headers": wrong_run_headers}, plan=plan, now_ms=146_002,
             ),
             (None, None, False),
         )
@@ -7506,17 +7608,6 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             read_plan.assert_called_once_with(
                 "api", now_ms=146_001, allow_html_request_drain=True,
             )
-        outside_parent = [
-            (name, b"146000" if name == b"x-platform-ssr-request-start-ms" else value)
-            for name, value in headers
-        ]
-        self.assertEqual(
-            authorize_html_request_perf_capture(
-                {"type": "http", "method": "GET", "path": "/api/v1/auth/bootstrap", "headers": outside_parent},
-                plan=plan, now_ms=146_000,
-            ),
-            (None, None, False),
-        )
         ineligible_headers = [
             (name, b"11111111111111111111111111111111"
              if name == b"x-platform-ssr-request-id" or name == b"x-request-id" else value)
@@ -7536,6 +7627,14 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         scope = {"type": "http", "method": "GET", "path": "/api/v1/auth/bootstrap", "headers": headers}
         self.assertEqual(
             authorize_html_request_perf_capture(scope, plan=old_plan, now_ms=26_001),
+            (None, None, False),
+        )
+        self.assertEqual(
+            authorize_html_request_perf_capture(
+                {**late_parent_scope, "headers": late_parent_headers},
+                plan=old_plan,
+                now_ms=146_002,
+            ),
             (None, None, False),
         )
         profile = {
@@ -7740,6 +7839,11 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         # Exercise the exact host producer coverage envelope through the
         # remote dispatcher and the runner's closed cleanup-summary parser.
         run_id = "a" * 32
+        collector_calls: list[tuple[str, dict[str, object]]] = []
+
+        def empty_selected_rows(service: str, plan: dict[str, object], **kwargs: object):
+            collector_calls.append((service, kwargs))
+            return [], "complete"
 
         def producer_request_telemetry(
             workload: str,
@@ -7750,16 +7854,16 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 service: {
                     "run_id": run_id,
                     "workload": workload,
-                    "on_start_ms": 26_000,
-                    "on_end_ms": on_end_ms,
-                    "expires_at_ms": on_end_ms + 15_000,
+                    "on_start_ms": 126_000,
+                    "on_end_ms": on_end_ms + 100_000,
+                    "expires_at_ms": on_end_ms + 100_000 + 15_000,
                 }
                 for service in ("api", "web")
             }
             with (
                 patch.object(
                     diagnostic_plan_tool, "_bounded_capacity_journal_rows",
-                    return_value=([], "complete"),
+                    side_effect=empty_selected_rows,
                 ),
                 patch.object(
                     diagnostic_plan_tool, "_wait_and_sync_capacity_capture_marker",
@@ -7775,6 +7879,15 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     selected_request_ids=selected_ids,
                     cohort_counts=cohort_counts,
                 )
+            self.assertEqual(
+                [(service, call["since_ms"]) for service, call in collector_calls],
+                [("api", 98_000), ("web", 98_000)],
+            )
+            self.assertEqual(
+                [call["request_ids"] for _, call in collector_calls],
+                [set(selected_ids), set(selected_ids)],
+            )
+            collector_calls.clear()
             return {
                 "status": "complete" if result["coverage"]["complete"] else "incomplete",
                 "summary": result,

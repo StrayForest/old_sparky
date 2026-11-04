@@ -22,11 +22,12 @@ const HTML_SSR_TRACE_WORKLOADS = new Set([
   "authenticated_html_ssr_capacity_120s_v1",
   "authenticated_html_ssr_cpu_profile_20s_v1",
 ]);
+const HTML_SSR_TRACE_START_SKEW_MS = 28_000;
 
 /**
- * Permit trace correlation during the fixed post-ON drain only for a trusted
- * request whose server-proxy start was inside ON. This does not extend any
- * sampling or CPU-usage window.
+ * Permit trace correlation for a trusted server-proxy receipt in the bounded
+ * clock/prepare-skew interval around ON, through the plan's fixed expiry.
+ * This does not extend any sampling or CPU-usage window.
  *
  * @param {string} workload
  * @param {number} parentStartMs
@@ -52,8 +53,7 @@ export function isHtmlSsrTraceDrainEligible(
     && onStartMs < onEndMs
     && expiresAtMs > onEndMs
     && expiresAtMs - onEndMs <= 15_000
-    && parentStartMs >= onStartMs
-    && parentStartMs < onEndMs
-    && nowMs >= onEndMs
+    && parentStartMs >= onStartMs - HTML_SSR_TRACE_START_SKEW_MS
+    && parentStartMs <= nowMs
     && nowMs <= expiresAtMs;
 }

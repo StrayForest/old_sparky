@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-11-02
+- Last reviewed: 2026-11-04
 
 ## Ephemeral synthetic restore diagnostic
 
@@ -234,11 +234,11 @@ does not dispatch it. Use this order:
    release. Global-guidance routes do not qualify; documented recovery,
    bootstrap, candidate and docs routes use their own procedures.
 2. With the shared slot unowned, dispatch exactly one `operation=create` bound
-   to the Security ID/attempt/SHA. It may start while Security runs or after
-   success: the workflow waits for exact success and current `dev` before
-   staging or SSH. Keep `security_started <= created_at <= run_started_at <=
-   backup_job.started_at`; start it within Auto's proof wait. Never create a
-   second matching run; failed/cancelled runs also count.
+   to the Security ID/attempt/SHA. It may start during or after exact success;
+   it waits for Security success and current `dev` before staging or SSH. Start
+   within AUTO's proof wait; require `security_started <= created_at <=
+   run_started_at <= backup_job.started_at`. Never duplicate a matching run;
+   failed/cancelled runs also count.
 3. Wait for exact Security success and the create-only receipt, published only
    when archive identity, restore/Alembic and keep-one retention proofs agree.
    Auto polls for both exact proofs before dispatching production.
@@ -381,7 +381,7 @@ gh workflow run platform-production-backup.yml \
 ```
 
 For a probe-gated backup, dispatch one canonical `create` run while that exact
-Security run is still in progress and set
+Security run is in progress or after it succeeds, within AUTO's proof wait, and set
 `authorization_probe_before_create=true`. The create run reserves the existing
 `platform-production-deploy` concurrency group while it waits for the exact
 Security attempt to complete successfully and validates its artifact,
@@ -412,9 +412,10 @@ The automatic deployment workflow waits for this exact create run before it
 dispatches a deployment child. It accepts one completed-success backup run
 whose workflow, source Security run ID and attempt, source SHA, `dev` ref,
 backup run attempt, production-job start time, artifact API digest and closed
-receipt all agree. The backup workflow and production job must have started
-while that source Security run was still in progress, proving that the backup
-reserved the shared production slot before the automatic child. The receipt
+receipt all agree. Require `security_started <= created_at <= run_started_at
+<= backup_job.started_at`. The create may start during or after Security
+success, within AUTO's bounded proof wait; it still waits for exact Security
+success and current `dev` before staging or SSH. The receipt
 upload step additionally requires the named SSH cleanup step to finish
 successfully; job-level success alone is not sufficient. The receipt is
 uploaded only after the remote operation, cleanup and final acceptance
@@ -482,7 +483,7 @@ receipt excludes database names, raw command output, exception text and credenti
 A failed create can stop at the disk guard during base admission, fixed scratch-image reservation/allocation, or `pg_dump`; its private receipt records only a closed phase/reason and available/required bytes, never raw output. Scratch-image phases are `scratch_image_admission` and `scratch_image_postallocation`.
 It does not change the guard or preservation policy. Compare receipt bytes; retry only after headroom and health checks pass.
 Use the storage-retention preview and exact-candidate cleanup; preserve `current`, `previous` and protected releases. Keep exactly the newest backup pair only after its dump checksum, isolated restore and Alembic revision verify successfully. The lock-aware rotation removes former pairs, including entries from the retired protected-backup manifest, after the new verified pair is safely published. Never unlink backup files by hand, use broad globs, or lower the storage guard.
-Start one source-bound create during exact-SHA Security; it may wait. If either fails, fix the cause, start fresh Security, then bind one new create; never duplicate/rebind a completed attempt.
+Start one source-bound create for the exact-SHA Security run while it is in progress or after it succeeds; the create workflow waits for that exact success. If either run fails, fix the cause, start fresh Security, then bind one new create; never duplicate or rebind a completed attempt.
 
 For a failed create, run the read-only storage diagnostics workflow with that backup's exact run ID, attempt and
 source SHA plus the SHA currently deployed. It reads only the fixed `backup-failure-<run-id>-<attempt>.json` after

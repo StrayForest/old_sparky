@@ -277,6 +277,7 @@ class ExternalLoadTests(unittest.TestCase):
 
     def test_typed_ssr_plan_producer_payloads_match_host_input_guard(self) -> None:
         workloads = (
+            (capacity_diagnostic.HTML_WORKLOAD, 20_000),
             (capacity_diagnostic.HTML_CAPACITY_120S_WORKLOAD, 120_000),
             (capacity_diagnostic.HTML_CPU_PROFILE_20S_WORKLOAD, 20_000),
         )
@@ -290,7 +291,7 @@ class ExternalLoadTests(unittest.TestCase):
 
                 with (
                     patch.object(cpu_diagnostic_pair, "_ssh_plan", side_effect=accept_plan),
-                    patch.object(capacity_diagnostic.time, "monotonic", return_value=26.0),
+                    patch.object(capacity_diagnostic.time, "monotonic", return_value=21.0),
                 ):
                     prepared_plan, lifecycle = capacity_diagnostic._prepare_remote_capacity_plan(
                         host="example.invalid", user="tester", config=Path("/tmp/ssh/config"),
@@ -300,7 +301,7 @@ class ExternalLoadTests(unittest.TestCase):
                     )
                 self.assertEqual(
                     prepared_plan["remote_clock_lag_bound_ms"],
-                    capacity_diagnostic.MAX_REMOTE_CLOCK_LAG_WITHOUT_ROUNDTRIP_MS + 25_000,
+                    capacity_diagnostic.MAX_REMOTE_CLOCK_LAG_WITHOUT_ROUNDTRIP_MS + 20_000,
                 )
                 self.assertEqual(capacity_diagnostic.MAX_PLAN_PREPARE_ROUNDTRIP_MS, 79_000)
                 self.assertEqual(capacity_diagnostic.MAX_REMOTE_CLOCK_LAG_BOUND_MS, 87_000)
@@ -329,6 +330,38 @@ class ExternalLoadTests(unittest.TestCase):
                 ):
                     self.assertFalse(capacity_diagnostic._composite_wait_for_profile_gap(600.0))
                 sleep_overshoot.assert_called_once_with(gap_sleep)
+
+                def prepared_plan_reply(_args, _host, _user, _config, _key, _plan, lifecycle):
+                    lifecycle.update({
+                        "plan_prepare_status": "prepared",
+                        "plan_prepare_refusal_class": "none",
+                        "prepare_transport": {"child_state": "reaped"},
+                    })
+                    return True, "release-" + "a" * 12, None
+
+                over_bound_lifecycle: dict[str, object] = {}
+                with (
+                    patch.object(cpu_diagnostic_pair, "_ssh_plan", side_effect=prepared_plan_reply),
+                    patch.object(capacity_diagnostic.time, "monotonic", return_value=22.0),
+                    self.assertRaises(capacity_diagnostic._RemoteCapacityPlanError) as over_bound,
+                ):
+                    capacity_diagnostic._prepare_remote_capacity_plan(
+                        host="example.invalid", user="tester", config=Path("/tmp/ssh/config"),
+                        key=Path("/tmp/ssh/id_ed25519"), run_id="a" * 32,
+                        source_sha="b" * 40, now_ms=1_000_000,
+                        plan_created_monotonic=1.0, workload=workload,
+                        lifecycle=over_bound_lifecycle,
+                    )
+                self.assertEqual(
+                    over_bound.exception.remote_clock_lag_bound_ms,
+                    capacity_diagnostic.MAX_REMOTE_CLOCK_LAG_WITHOUT_ROUNDTRIP_MS + 21_000,
+                )
+                self.assertEqual(over_bound.exception.expires_at_ms, 1_000_000 +
+                                 capacity_diagnostic._plan_expiry_horizon_ms(workload))
+                self.assertEqual(over_bound.exception.lifecycle["plan_prepare_status"], "prepared")
+                self.assertTrue(capacity_diagnostic._prepare_transport_is_closed(
+                    over_bound.exception.lifecycle,
+                ))
 
                 late_lifecycle: dict[str, object] = {}
                 with (
@@ -537,7 +570,7 @@ class ExternalLoadTests(unittest.TestCase):
                                 "remote_clock_lag_bound_ms"
                             ],
                         )
-                    self.assertAlmostEqual(sum(wait_calls), 246.0, delta=0.01)
+                    self.assertAlmostEqual(sum(wait_calls), 241.0, delta=0.01)
                     with (
                         patch.object(capacity_diagnostic.time, "monotonic", return_value=10.0),
                         patch.object(capacity_diagnostic.time, "sleep") as no_sleep,
