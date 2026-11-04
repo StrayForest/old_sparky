@@ -663,6 +663,9 @@ class HostToolsBundleTests(unittest.TestCase):
         load_run_id = "37556438370"
         cleanup_run_id = "37560000001"
         control_email = "synthetic-control@example.test"
+        cleanup_helper = Path(
+            "/fixed/app-release/tools/platform_production_retained_load_cleanup_qa.sh"
+        )
 
         class FakeChild:
             def __init__(self, returncode: int, marker: bytes | None) -> None:
@@ -718,7 +721,11 @@ class HostToolsBundleTests(unittest.TestCase):
             output = StringIO()
             with (
                 patch.object(dispatcher.sys, "stdin", SimpleNamespace(buffer=BytesIO(raw))),
-                patch.object(dispatcher, "_trusted_helper", return_value=True),
+                patch.object(
+                    dispatcher,
+                    "_active_app_retained_cleanup_helper",
+                    return_value=cleanup_helper,
+                ),
                 patch.object(dispatcher.subprocess, "Popen", side_effect=spawn),
                 redirect_stdout(output),
             ):
@@ -782,7 +789,7 @@ class HostToolsBundleTests(unittest.TestCase):
                         dispatcher.SUDO,
                         "-n",
                         "--",
-                        str(dispatcher.CLEANUP_HELPER),
+                        str(cleanup_helper),
                         dispatcher.DELETE_CONFIRMATION,
                         target_sha,
                         load_run_id,
@@ -3638,6 +3645,8 @@ raise SystemExit(module.main(["host-capabilities"]))
             "platform_live_user_qa_dispatch.py",
             "platform_live_launch_trusted.sh",
         }
+        self.assertNotIn(dispatcher.RETAINED_LOAD_CLEANUP_HELPER_NAME, names)
+        self.assertIn(dispatcher.RETAINED_LOAD_CLEANUP_HELPER_NAME, boundary_allowlist)
 
         def build_graph(contents: dict[str, str]) -> dict[str, set[str]]:
             return {

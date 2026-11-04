@@ -72,8 +72,12 @@ class ProductionQaContractTests(unittest.TestCase):
             scale_users=500,
             write_burst_users_per_tournament=500,
         )
-        create_response = {"id": "tournament-id", "slug": "scheduled-fixture"}
-        request_as = AsyncMock(side_effect=(create_response, {}))
+        create_response = {
+            "id": "tournament-id",
+            "slug": "scheduled-fixture",
+            "status": "registration_open",
+        }
+        request_as = AsyncMock(return_value=create_response)
         qa.request_as = request_as
 
         result = asyncio.run(
@@ -104,6 +108,45 @@ class ProductionQaContractTests(unittest.TestCase):
         self.assertEqual(ready_end - ready_start, timedelta(minutes=120))
         self.assertEqual(captain_start, ready_end)
         self.assertEqual(result["slug"], "scheduled-fixture")
+        request_as.assert_awaited_once()
+        self.assertEqual(request_as.await_args.args[2:4], ("POST", "/tournaments"))
+
+    def test_unscheduled_fixture_opens_registration_after_create(self) -> None:
+        qa = ProductionQa(
+            origin="http://127.0.0.1",
+            report_path=Path("/tmp/platform-production-qa-unscheduled-test.json"),
+            http_timeout=1.0,
+            keep_data=True,
+            mode="write-burst",
+            scale_users=500,
+            write_burst_users_per_tournament=500,
+        )
+        create_response = {
+            "id": "tournament-id",
+            "slug": "unscheduled-fixture",
+            "status": "registration_closed",
+        }
+        request_as = AsyncMock(side_effect=(create_response, {}))
+        qa.request_as = request_as
+
+        asyncio.run(
+            qa.create_write_burst_tournament(
+                object(),
+                organizer={"id": "organizer-id"},
+                label="external_ready",
+                index=1,
+            )
+        )
+
+        self.assertEqual(request_as.await_count, 2)
+        self.assertEqual(
+            request_as.await_args_list[1].args[2:4],
+            ("PATCH", "/tournaments/unscheduled-fixture/status"),
+        )
+        self.assertEqual(
+            request_as.await_args_list[1].kwargs["json_payload"],
+            {"status": "registration_open"},
+        )
 
     def test_rostered_participant_requires_retained_scale_mode(self) -> None:
         kwargs = {

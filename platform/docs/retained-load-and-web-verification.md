@@ -20,23 +20,23 @@ sessions and audit rows while preserving the control account. The [cleanup
 tool](../tools/platform_cleanup_retained_matrix.py) calls `dispose_engine()` and
 `dispose_redis_clients()`; close warnings are failures, not harmless noise.
 
-Use the [canonical retained-load abort workflow](../../.github/workflows/platform-production-retained-load-abort.yml)
-for the exact load run and attempt; its dispatch command and required Security
-identity are in the [SSR diagnostic runbook](ssr-capacity-diagnostic-runbook.md).
-When the run-bound `supervisor.exit` record is absent, the recovery path is
-limited to the exact latest external-load attempt in completed failure state,
-with the reviewed workflow/source, matching actor, and a complete set of
-terminal jobs that includes a failure. The workflow rechecks that attempt
-immediately before remote abort, immediately after remote abort, and after
-proof normalization. Under the release lock then the retained-load lock, the
-helper revalidates the durable run marker and requires two fresh, error-free
-zero-process scans at least 100 ms apart. The schema-2 receipt explicitly
-records that no supervisor exit record exists, its exit code is null, and
-`namespace_closed` is false. It cannot be substituted for a recorded
-supervisor exit or prove namespace closure. Continue to exact cleanup only
-after the canonical normalizer publishes the receipt for that same run and
-attempt; if a check fails, stop and follow the operator escalation path. Never
-create the missing exit record or hand-write the receipt.
+Use the [canonical retained-load abort workflow](../../.github/workflows/platform-production-retained-load-abort.yml) for the exact run/attempt; see the [SSR diagnostic runbook](ssr-capacity-diagnostic-runbook.md) for dispatch inputs and Security identity. If
+`supervisor.exit` is absent, abort accepts only the latest exact failed run
+with reviewed source/workflow, matching actor and complete jobs; it rechecks
+the attempt around abort/normalization. Under release/retained locks, the helper
+revalidates the marker and requires two clean zero-process scans at least
+100 ms apart. Its schema-2 receipt records missing exit, null code and
+`namespace_closed=false` but does not prove namespace closure; continue only after normalization and never create receipts by hand.
+Inspect the exact-run finalizer receipt first; dispatch cleanup only if it is
+missing or incomplete, not when it passed with zero residuals.
+
+For setup failure with one recognized profile directory but no manifest, use
+the same run-bound cleanup workflow after source/process/namespace barriers.
+The installed supervisor checks runner/app binding, resolves its helper from
+the active immutable app release, then reconstructs inventory from exactly one
+durable `PreprodTestRun` row at the exact report path (origin, mode, marker,
+scoped user count and tournament IDs). Standard cleanup validates the report
+and summary before deletion. Never synthesize manifests, invoke helpers directly or use the empty-root no-op with fixture evidence; ambiguity fails. Read only the exact `control_email` field from retained private operator inputs, validate without printing, and enter it through the workflow's hidden prompt for private stdin forwarding. Use bounded `RETAINED_CLEANUP_STAGE` or cleanup diagnostics to classify child failure; generic outer lock messages are not diagnostic.
 
 If the reviewed abort helper is on recovery-only runner SHA `R` while the active app is at freshly verified SHA `A`, use this order. Runner binding permits the same app SHA or an exact verified no-op receipt; the host helper checks the bound app SHA against current `RELEASE.json`.
 For a deployable source not active, follow the [deploy-before-cleanup sequence in the SSR diagnostic runbook](ssr-capacity-diagnostic-runbook.md#abort-and-close-the-exact-fixture): abort → one source-bound backup → AUTO normal deployment/readiness → verify source and pin active → exact old-run cleanup. Keep load closed; do not override target, alias no-op, or start another workload.

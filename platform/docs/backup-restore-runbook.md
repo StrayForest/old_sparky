@@ -226,27 +226,26 @@ where applicable. It does not hash dump payloads. Drift fails closed, but
 pruning that already began is not transactional. Public
 summaries omit manifest names, paths and proof digests.
 
-For a normal reviewed `dev` release, the operator reserves the backup; auto-deploy
-does not dispatch it. Use this order:
+For a normal reviewed `dev` release, the operator owns backup dispatch;
+auto-deploy only checks its exact proof. Use this order:
 
 1. Push the reviewed commit; record the exact Security run ID, attempt and SHA.
    Require full, deployable and non-fallback classification for a normal app
    release. Global-guidance routes do not qualify; documented recovery,
    bootstrap, candidate and docs routes use their own procedures.
-2. With the shared slot unowned, dispatch exactly one `operation=create` bound
-   to the Security ID/attempt/SHA. It may start during or after exact success;
-   it waits for Security success and current `dev` before staging or SSH. Start
-   within AUTO's proof wait; require `security_started <= created_at <=
-   run_started_at <= backup_job.started_at`. Never duplicate a matching run;
-   failed/cancelled runs also count.
-3. Wait for exact Security success and the create-only receipt, published only
-   when archive identity, restore/Alembic and keep-one retention proofs agree.
-   Auto polls for both exact proofs before dispatching production.
+2. After exact Security PASS, inspect for a successful restore-verified receipt
+   or active create producer bound to that exact ID/attempt/SHA. Reuse or wait
+   if found; AUTO never dispatches a backup. If none exists and no failed,
+   cancelled or duplicate match exists, operator dispatches one create with
+   the shared slot unowned, using the command below within AUTO's proof wait.
+   Require `security_started <= created_at <= run_started_at <= backup_job.started_at`.
+3. Wait for exact Security success and the create-only receipt; archive identity,
+   restore/Alembic and keep-one retention proofs must agree. Watch AUTO consume it.
+   Parent-bound C provisioning follows backup in AUTO's 1,800-second window;
+   no separate preflight or second backup is needed.
 
-Do not substitute another run, attempt or SHA. If Auto is still waiting and no
-matching run exists, dispatch the single exact backup; its workflow still waits
-for exact Security success before staging or SSH. If Auto's proof wait ended,
-the attempt is ambiguous, or `dev` moved, follow the [deployment recovery](deployment-runbook.md#preconditions): rerun all Security jobs for an unchanged SHA, then dispatch one backup for its new attempt; if `dev` moved, replan. Failed/cancelled matching IDs also count; multiple IDs are permanently ambiguous. Never deploy manually.
+Do not substitute a run ID, attempt or SHA. If a run failed/cancelled, multiple matches exist,
+AUTO's wait ended or `dev` moved, follow [deployment recovery](deployment-runbook.md#preconditions); never duplicate, rebind or manually deploy.
 
 Run through GitHub Actions, not a production shell. Security polling is bounded
 to 30 minutes within the 120-minute job deadline; attestation is capped at

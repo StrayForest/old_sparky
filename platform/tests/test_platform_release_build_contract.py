@@ -7665,8 +7665,12 @@ cleanup
             'EXTERNAL_HELPER = ACTIVE_TOOLS_DIR / "platform_production_external_fixture_qa.sh"',
             remote_dispatch,
         )
-        self.assertIn(
+        self.assertNotIn(
             'CLEANUP_HELPER = ACTIVE_TOOLS_DIR / "platform_production_retained_load_cleanup_qa.sh"',
+            remote_dispatch,
+        )
+        self.assertIn(
+            'RETAINED_LOAD_CLEANUP_HELPER_NAME = "platform_production_retained_load_cleanup_qa.sh"',
             remote_dispatch,
         )
         self.assertIn(

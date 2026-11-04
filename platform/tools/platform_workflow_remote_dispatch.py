@@ -122,7 +122,7 @@ RUNTIME_ROOT = Path("/opt/oldsparky/platform")
 ACTIVE_TOOLS_DIR = Path(__file__).parent
 HOST_TOOLS_ROOT = RUNTIME_ROOT / "shared" / "host-tools"
 EXTERNAL_HELPER = ACTIVE_TOOLS_DIR / "platform_production_external_fixture_qa.sh"
-CLEANUP_HELPER = ACTIVE_TOOLS_DIR / "platform_production_retained_load_cleanup_qa.sh"
+RETAINED_LOAD_CLEANUP_HELPER_NAME = "platform_production_retained_load_cleanup_qa.sh"
 LIVE_HELPER = ACTIVE_TOOLS_DIR / "platform_live_launch_supervisor.sh"
 LIVE_USER_QA_HELPER = ACTIVE_TOOLS_DIR / "platform_live_user_qa_dispatch.py"
 CPU_DIAGNOSTIC_PLAN_HELPER = ACTIVE_TOOLS_DIR / "platform_cpu_diagnostic_plan.py"
@@ -2168,11 +2168,13 @@ def _control_email_stdin(control_email: str) -> bytes:
 
 
 def _run_retained_cleanup_sudo(
-    helper: Path,
+    helper: Path | None,
     arguments: list[str],
     *,
     control_email: str,
     diagnostic_binding: dict[str, str] | None = None,
+    expected_app_sha: str | None = None,
+    expected_baseline: object | None = None,
 ) -> int:
     """Run exact cleanup while retaining only its fixed stage marker."""
 
@@ -2233,7 +2235,16 @@ def _run_retained_cleanup_sudo(
     def return_code(value: int) -> int:
         return min(255, 128 + abs(value)) if value < 0 else min(255, value)
 
-    if not _trusted_helper(helper):
+    app_release_helper = helper is None and expected_app_sha is not None
+    if app_release_helper:
+        helper = _active_app_retained_cleanup_helper(
+            expected_app_sha,
+            expected_baseline=expected_baseline,
+        )
+    helper_trusted = helper is not None and (
+        app_release_helper or (expected_app_sha is None and _trusted_helper(helper))
+    )
+    if not helper_trusted:
         emit_diagnostic(
             stage="dispatcher",
             dispatcher_exit=2,
@@ -3123,6 +3134,80 @@ def _trusted_helper(helper: Path) -> bool:
         and not stat.S_IMODE(metadata.st_mode) & 0o022
         and stat.S_IMODE(metadata.st_mode) & 0o111
     )
+
+
+def _active_app_retained_cleanup_helper(
+    app_target_sha: str,
+    *,
+    expected_baseline: object | None,
+) -> Path | None:
+    """Resolve the fixed cleanup entrypoint from the source-bound app release."""
+
+    if (
+        os.geteuid() != 0
+        or not isinstance(app_target_sha, str)
+        or SOURCE_SHA_RE.fullmatch(app_target_sha) is None
+    ):
+        return None
+    try:
+        baseline = _release_baseline()
+        if (
+            baseline.get("source_sha") != app_target_sha
+            or (
+                expected_baseline is not None
+                and not _baseline_identity_matches(expected_baseline, baseline)
+            )
+        ):
+            return None
+        release_slug = baseline.get("release_slug")
+        if not isinstance(release_slug, str) or RELEASE_SLUG_RE.fullmatch(release_slug) is None:
+            return None
+        release = RUNTIME_ROOT / "releases" / release_slug
+        tools = release / "tools"
+        if release.resolve(strict=True) != release or tools.resolve(strict=True) != tools:
+            return None
+        release_metadata = release.lstat()
+        tools_metadata = tools.lstat()
+        if any(
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or metadata.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+            for metadata in (release_metadata, tools_metadata)
+        ):
+            return None
+        helper = tools / RETAINED_LOAD_CLEANUP_HELPER_NAME
+        before = helper.lstat()
+        if (
+            helper.parent != tools
+            or helper.resolve(strict=True) != helper
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_uid != 0
+            or before.st_gid != 0
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o755
+        ):
+            return None
+        after = helper.lstat()
+        if (
+            (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+        ):
+            return None
+        after_baseline = _release_baseline()
+        if (
+            not _baseline_identity_matches(baseline, after_baseline)
+            or after_baseline.get("source_sha") != app_target_sha
+            or (
+                expected_baseline is not None
+                and not _baseline_identity_matches(expected_baseline, after_baseline)
+            )
+        ):
+            return None
+        return helper
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
 
 
 def _trusted_python_helper(helper: Path) -> bool:
@@ -4144,7 +4229,7 @@ def main(argv: list[str] | None = None) -> int:
             if payload["load_run_id"] != payload["cleanup_run_id"]:
                 return _fail()
             return _run_retained_cleanup_sudo(
-                CLEANUP_HELPER,
+                None,
                 [
                     DELETE_CONFIRMATION,
                     payload["target_sha"],
@@ -4153,6 +4238,8 @@ def main(argv: list[str] | None = None) -> int:
                     *source_arguments,
                 ],
                 control_email=payload["control_email"],
+                expected_app_sha=app_target_sha,
+                expected_baseline=_expected_baseline,
                 diagnostic_binding={
                     "source_sha": payload["target_sha"],
                     "app_sha": app_target_sha,
@@ -4189,9 +4276,11 @@ def main(argv: list[str] | None = None) -> int:
                     ]
                 )
             return _run_retained_cleanup_sudo(
-                CLEANUP_HELPER,
+                None,
                 cleanup_arguments,
                 control_email=payload["control_email"],
+                expected_app_sha=app_target_sha,
+                expected_baseline=_expected_baseline,
                 diagnostic_binding={
                     "source_sha": payload["target_sha"],
                     "app_sha": app_target_sha,
@@ -4214,9 +4303,9 @@ def main(argv: list[str] | None = None) -> int:
                 return _fail()
             return _prepare_deployment(payload)
         if arguments == ["retained-cleanup"]:
-            _app_target_sha, _expected_baseline, source_arguments = _source_binding_context(payload)
+            app_target_sha, expected_baseline, source_arguments = _source_binding_context(payload)
             return _run_retained_cleanup_sudo(
-                CLEANUP_HELPER,
+                None,
                 [
                     DELETE_CONFIRMATION,
                     payload["target_sha"],
@@ -4225,6 +4314,8 @@ def main(argv: list[str] | None = None) -> int:
                     *source_arguments,
                 ],
                 control_email=payload["control_email"],
+                expected_app_sha=app_target_sha,
+                expected_baseline=expected_baseline,
             )
         if arguments == ["retained-cleanup-exports"]:
             app_target_sha, expected_baseline, _source_arguments = _source_binding_context(payload)

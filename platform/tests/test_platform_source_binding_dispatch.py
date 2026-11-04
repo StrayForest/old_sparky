@@ -6,6 +6,7 @@ import base64
 import copy
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -122,6 +123,92 @@ def _external_payload(schema: int = 2) -> dict[str, object]:
 
 
 class SourceBindingDispatchTests(unittest.TestCase):
+    def test_cleanup_helper_resolves_only_from_stable_source_bound_app_release(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime_root = Path(temp_dir) / "platform"
+            release = runtime_root / "releases" / str(_baseline()["release_slug"])
+            tools = release / "tools"
+            tools.mkdir(parents=True)
+            helper = tools / "platform_production_retained_load_cleanup_qa.sh"
+            helper.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+            helper.chmod(0o755)
+            original_lstat = Path.lstat
+
+            def root_owned_lstat(path: Path):
+                metadata = original_lstat(path)
+                if path in {release, tools, helper}:
+                    fields = list(metadata)
+                    fields[4] = 0
+                    fields[5] = 0
+                    return os.stat_result(fields)
+                return metadata
+
+            with (
+                patch.object(dispatcher, "RUNTIME_ROOT", runtime_root),
+                patch.object(dispatcher.os, "geteuid", return_value=0),
+                patch.object(Path, "lstat", root_owned_lstat),
+                patch.object(
+                    dispatcher,
+                    "_release_baseline",
+                    side_effect=(_baseline(), _baseline()),
+                ),
+            ):
+                self.assertEqual(
+                    dispatcher._active_app_retained_cleanup_helper(
+                        APP_SHA,
+                        expected_baseline=_baseline(),
+                    ),
+                    helper,
+                )
+
+            changed_baseline = {**_baseline(), "current_link_ino": 999}
+            for baseline_rows, target_sha, expected_baseline, mode in (
+                ((_baseline(),), "c" * 40, _baseline(), 0o755),
+                ((_baseline(),), APP_SHA, {**_baseline(), "release_ino": 999}, 0o755),
+                ((_baseline(), changed_baseline), APP_SHA, None, 0o755),
+            ):
+                helper.chmod(mode)
+                with (
+                    patch.object(dispatcher, "RUNTIME_ROOT", runtime_root),
+                    patch.object(dispatcher.os, "geteuid", return_value=0),
+                    patch.object(Path, "lstat", root_owned_lstat),
+                    patch.object(dispatcher, "_release_baseline", side_effect=baseline_rows),
+                ):
+                    self.assertIsNone(
+                        dispatcher._active_app_retained_cleanup_helper(
+                            target_sha,
+                            expected_baseline=expected_baseline,
+                        )
+                    )
+
+            helper.chmod(0o775)
+            with (
+                patch.object(dispatcher, "RUNTIME_ROOT", runtime_root),
+                patch.object(dispatcher.os, "geteuid", return_value=0),
+                patch.object(Path, "lstat", root_owned_lstat),
+                patch.object(dispatcher, "_release_baseline", return_value=_baseline()),
+            ):
+                self.assertIsNone(
+                    dispatcher._active_app_retained_cleanup_helper(
+                        APP_SHA,
+                        expected_baseline=None,
+                    )
+                )
+
+            helper.unlink()
+            with (
+                patch.object(dispatcher, "RUNTIME_ROOT", runtime_root),
+                patch.object(dispatcher.os, "geteuid", return_value=0),
+                patch.object(Path, "lstat", root_owned_lstat),
+                patch.object(dispatcher, "_release_baseline", return_value=_baseline()),
+            ):
+                self.assertIsNone(
+                    dispatcher._active_app_retained_cleanup_helper(
+                        APP_SHA,
+                        expected_baseline=None,
+                    )
+                )
+
     def test_cpu_plan_cleanup_accepts_only_bounded_sorted_request_ids(self) -> None:
         payload = {
             "schema": 1, "operation": "cleanup",
@@ -660,6 +747,12 @@ class SourceBindingDispatchTests(unittest.TestCase):
                 ),
                 0,
             )
+        self.assertIsNone(cleanup.call_args.args[0])
+        self.assertEqual(cleanup.call_args.kwargs["expected_app_sha"], APP_SHA)
+        self.assertEqual(
+            cleanup.call_args.kwargs["expected_baseline"],
+            _binding()["baseline_identity"],
+        )
         arguments = cleanup.call_args.args[1]
         self.assertEqual(
             arguments[:4],

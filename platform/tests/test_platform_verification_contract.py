@@ -1190,7 +1190,8 @@ class PlatformVerificationContractTests(unittest.TestCase):
                     f"pathlib.Path({str(parent_pid_path)!r}).write_text(str(os.getpid()))",
                     "child=subprocess.Popen([sys.executable, '-c', "
                     f"{child_code!r}, {marker!r}])",
-                    f"pathlib.Path({str(child_pid_path)!r}).write_text(str(child.pid))",
+                    f"pathlib.Path({str(child_pid_path)!r}).with_suffix('.tmp').write_text(str(child.pid)); "
+                    f"pathlib.Path({str(child_pid_path)!r}).with_suffix('.tmp').replace({str(child_pid_path)!r})",
                     "time.sleep(60)",
                 )
             )

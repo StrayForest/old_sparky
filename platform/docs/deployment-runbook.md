@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-11-02
+- Last reviewed: 2026-11-04
 
 Use this document for the normal immutable release path. CSP mode changes and production browser/live-user evidence are intentionally isolated in [`csp-live-qa-runbook.md`](csp-live-qa-runbook.md); do not load that document for routine releases.
 
@@ -12,11 +12,11 @@ Use this document for the normal immutable release path. CSP mode changes and pr
 2. Push it to `dev`; record the exact Security run ID/attempt/SHA and verify its classifier is full, deployable and
    non-fallback for this normal app release. Global-guidance routes do not qualify; documented recovery, bootstrap,
    candidate and docs routes use their own procedures.
-3. For a deployable normal app release, dispatch exactly one `create` backup bound to that Security run ID/attempt and SHA, with the shared production slot unowned. It may start while Security runs or after it succeeds; the backup workflow independently waits for exact Security success and current `dev` before staging or SSH. Confirm the backup run actually starts within Auto's bounded proof wait. A duplicate matching backup run is ambiguous. Closed no-op-only reconciliation is the exception in step 4. See the [backup procedure](backup-restore-runbook.md#local-verified-backup).
-4. Wait for exact Security success and the restore-verified receipt. Auto-deploy starts after Security completes; it never dispatches the backup, only polls for the exact receipt and dispatches the child after both proofs pass.
+3. For a deployable app release, the operator owns exactly one `operation=create` dispatch; AUTO never creates the backup. After exact Security PASS, inspect for a successful receipt or active producer bound to the same Security run/attempt/SHA: reuse the receipt or wait for that producer. If neither exists and there is no failed/cancelled or duplicate match, confirm `dev` is unchanged and the shared slot unowned, then dispatch once using the [backup procedure](backup-restore-runbook.md#local-verified-backup).
+4. The create waits for exact Security success/current `dev`; AUTO only polls for its source-bound restore-verified receipt. The same parent then builds and attests host-tools C, provisions/self-tests it in the 1,800-second pre-child window, verifies readiness and dispatches the app child. This parent-bound route needs no separate preflight or second backup. Closed no-op-only reconciliation uses its separate no-backup proof path.
 5. Confirm migration compatibility, healthy services and at least `max(5 GiB, 10% of total)` free / at most 90% used; protect `current`/`previous`. Never manually deploy. Other routes use their own procedures; local tests do not replace release gates.
 
-If the Auto proof wait is still active and no exact backup run exists, confirm the SHA is still current `dev` and dispatch the one matching backup; Auto will continue polling. If its bounded wait has ended or more than one matching backup run exists, follow the recovery procedure in the [backup runbook](backup-restore-runbook.md#local-verified-backup); never manually deploy. If `dev` moved, stop and replan from current `dev` and its own Security run.
+If Auto's proof wait ends, a matching run failed/cancelled, multiple matches exist, or `dev` moved, stop and follow the [backup recovery procedure](backup-restore-runbook.md#local-verified-backup); never duplicate or manually deploy.
 
 GitHub's active `Protect dev` ruleset requires no PR approval, but prevents branch deletion/force-push; exact-SHA
 security/build and the automatic production chain remain mandatory release gates.

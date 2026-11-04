@@ -150,14 +150,25 @@ change only `profile_id` for each cell; never batch-dispatch the matrix.
     cleanly and the operator's current safety/preflight checks still pass;
     otherwise mark it not run and leave the matrix incomplete.
 
-Current disposition (2026-11-04): the original runs used runner source S
+Current disposition (2026-11-04): cells 1–8 and 10–11 used runner source S
 `01b6c0991ed33218e5abae9bcabe7f5c1322ee4d` on app P4 (`72bafc12` prefix) and
-host-tools C (`da8e1275` prefix). Cell 9 was deferred before dispatch because
-the fixture's 10-minute Ready Check TTL could expire during its approximately
-27-minute ramp. It remains pending until the corrected runner and installed
-origin-helper release are both proven by the normal release receipt. Record
-the actual app and host-tools pins from that receipt; the runner commit alone
-does not establish them.
+host-tools C (`da8e1275` prefix). Cell 9 run `41857301086/1` used runner and
+app source T `0b6ddb5cd4356b754344ed3a511365ce2ed10a67` with host-tools C
+`276da572bf978448b7c582090564099aac6b8be2`. Cell 9 preparation failed before
+the client (see row); exact cleanup passed through the canonical T app helper
+and C export cleanup. The canonical finalizer for the later cell-7 diagnostic
+also passed cleanup, deleting 20,000 users and 40 tournaments while preserving
+the control account; the subsequent guarded supervisor confirmed it was
+already clean with zero residual rows and read-model keys. Source review confirmed the app helper must skip the
+same-status PATCH and the C dispatcher must resolve that app-owned helper from
+the source-bound immutable app release. The dispatcher change requires a
+normal C and pin-only P release. Cell 7's targeted diagnostic was run against
+frozen T as run `41866051379/1`: 19,971/20,000 requests succeeded, with 28
+status-0 failures, one status-502 failure, and no retries or drops. The
+truncated failure sample and disabled timeout diagnostics leave the cause
+unknown; Nginx recorded 19,990 HTML requests, all 200/upstream 200, without a
+client-request join. No transport bug is proven. Rerun cell 9 only after the
+corrected runner/app helper and dispatcher are installed.
 
 | Cell | Profile | Contract result | Exact cleanup |
 | ---: | --- | --- | --- |
@@ -169,7 +180,7 @@ does not establish them.
 | 6 | `authenticated-page-load-v1` | STRESS BEHAVIOR FAIL on whole-cohort schedule delay; 20,000 HTTP 200 responses | PASS |
 | 7 | `authenticated-page-load-v2` | STRESS BEHAVIOR FAIL; 53/20,000 `GET tournament_detail` requests timed out; retained samples show status 0 and about 30 seconds; time clustering and Nginx reconciliation unresolved | PASS |
 | 8 | `ready-vote-saturation-ramp-v4` | STRESS BEHAVIOR PASS under contract despite bounded 503 responses and shedding | PASS |
-| 9 | `read-mix-concurrency-ramp-v1` | Deferred before dispatch; strict knee comparison invalid under the original 10-minute Ready Check TTL | No fixture created |
+| 9 | `read-mix-concurrency-ramp-v1` | Fixture preparation failed before client dispatch: one `PATCH tournament_detail` returned 422 after 20,000 users and one tournament were created; no HTTP workload credit | PASS; 20,000 users and 1 tournament deleted, control preserved, zero residuals |
 | 10 | `ready-vote-stress-15k-v2` | STRESS BEHAVIOR FAIL: 2,804/15,000 primary actions and 101/750 same-state duplicates failed; all HTTP errors were 503, with no idempotency state violation | PASS |
 | 11 | `ready-vote-stress-20k-v2` | STRESS BEHAVIOR FAIL: 16,520/21,000 logical actions succeeded; 24,224/40,744 HTTP requests returned 503 | PASS |
 
@@ -179,8 +190,9 @@ samples showed CPU pressure and no database lock queue; the relation between
 controller `pressure` states and individual 503s, and the protective-shed
 trigger, remain unproven. Cells 10 and 11 failed their authored action
 thresholds; a 503 response alone does not determine the contract outcome.
-The 11-profile matrix remains incomplete until cell 9 runs on the corrected
-runner and installed origin helper and its exact cleanup passes.
+The 11-profile matrix remains incomplete until cell 9's corrected runner, app
+helper and host-tools dispatcher are released and installed before a
+successful rerun.
 
 Before the first cell, confirm `dev` and the exact Security result match S,
 the successful AUTO/no-op receipt binds S to active app P4, the active host
@@ -214,18 +226,20 @@ more time than the load runtime's remaining budget plus a five-minute startup
 margin. Missing, closed, stale-clock, or near-expiry state invalidates that
 stage. Public evidence contains only cohort counts, minimum remaining time,
 and minimum headroom over the per-response requirement; identifiers and
-response bodies are not retained. Other profiles keep their existing manual
-Ready Check setup.
+response bodies are not retained. Scheduled tournament creation opens
+registration when its start time is due or omitted, so the fixture uses that
+created state and skips the otherwise-required open-status PATCH. Other
+profiles keep their existing manual Ready Check setup.
 The private fixture timing receipt keeps monotonic stage durations and UTC
 start/end bounds. Its safe matrix projection also includes aggregate status,
 error, latency and response-byte metrics for tournament create, join and
 registration-close API requests; these setup requests remain outside the
 external runner's measured HTTP population.
 
-After the corrected runner and origin helper are published, run one targeted
-`authenticated-page-load-v2` diagnostic repeat to expose the original 53
-timeouts' failure-stage, observed-status and connection-state breakdown. Do
-not repeat the full 11-profile matrix for this diagnosis. The external-load
+The targeted `authenticated-page-load-v2` diagnostic repeat is complete for
+the original 53-timeout question; its truncated sample and unavailable
+client-to-Nginx join do not identify a cause. Do not repeat the full
+11-profile matrix for this diagnosis. The external-load
 matrix remains distinct from whole-site functional QA and does not establish
 registration, profile, tournament administration or complete lifecycle
 coverage.

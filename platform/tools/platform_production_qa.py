@@ -5393,14 +5393,15 @@ class ProductionQa:
         self.tournament_ids.append(tournament_id)
         self.tournament_slugs.append(tournament_slug)
         self.report["tournament_ids"] = list(self.tournament_ids)
-        await self.request_as(
-            api_client,
-            organizer,
-            "PATCH",
-            f"/tournaments/{tournament_slug}/status",
-            expected=200,
-            json_payload={"status": "registration_open"},
-        )
+        if created.get("status") != "registration_open":
+            await self.request_as(
+                api_client,
+                organizer,
+                "PATCH",
+                f"/tournaments/{tournament_slug}/status",
+                expected=200,
+                json_payload={"status": "registration_open"},
+            )
         return {**created, "category": label, "organizer": organizer}
 
     async def run_spread_requests(

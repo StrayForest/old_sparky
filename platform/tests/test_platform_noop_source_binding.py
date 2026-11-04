@@ -925,7 +925,7 @@ class NoopSourceBindingTests(unittest.TestCase):
             )
 
         helper, arguments = cleanup.call_args.args
-        self.assertEqual(helper, platform_workflow_remote_dispatch.CLEANUP_HELPER)
+        self.assertIsNone(helper)
         self.assertEqual(
             arguments[:4],
             [
@@ -945,6 +945,10 @@ class NoopSourceBindingTests(unittest.TestCase):
                 "run_attempt": "1",
                 "profile": "ready-vote-slo-v2",
             },
+        )
+        self.assertEqual(cleanup.call_args.kwargs["expected_app_sha"], APP_SHA)
+        self.assertEqual(
+            cleanup.call_args.kwargs["expected_baseline"], _baseline_identity()
         )
         self.assertEqual(arguments[-2], "--source-binding-base64")
         self.assertEqual(
