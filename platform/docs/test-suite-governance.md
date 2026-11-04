@@ -99,7 +99,8 @@ The executable [backend test catalog](../tools/platform_test_catalog.py) and
 [catalog runner](../tools/platform_test_runner.py) own test discovery,
 one-contour ownership, exact IDs and the expected snapshot. Refresh the
 snapshot from `registry_payload()` whenever discovery changes any ID, including
-a new method in an existing module. CI loads only catalog-owned IDs; the
+a new method in an existing module. Before publishing, run the canonical
+catalog tests with `tools/platform_verify.py backend-tool-contract --focused tests.test_platform_backend_test_catalog`, then run the changed test's owner contour through `platform_verify.py`. CI loads only catalog-owned IDs; the
 `backend` gate aggregates these five contours:
 
 | Catalog contour | Timeout | Shared-resource execution | Ownership boundary |
