@@ -1749,7 +1749,19 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
             self.assertLess(stage_index, decrypt_index)
             checkout_indexes = [i for i, step in enumerate(steps) if step.get("uses", "").startswith("actions/checkout@")]
             if checkout_indexes:
-                self.assertLess(decrypt_index, min(checkout_indexes))
+                checkout_index = min(checkout_indexes)
+                checkout = steps[checkout_index]
+                if job_name == "fixture-setup":
+                    self.assertLess(checkout_index, stage_index)
+                    self.assertLess(checkout_index, decrypt_index)
+                    self.assertEqual(
+                        checkout.get("uses"),
+                        "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+                    )
+                    self.assertEqual(checkout.get("with", {}).get("ref"), "${{ github.sha }}")
+                    self.assertFalse(checkout.get("with", {}).get("persist-credentials", True))
+                else:
+                    self.assertLess(decrypt_index, checkout_index)
         for job_name in ("derive-diagnostic-source-binding", "evaluate-load"):
             self.assertNotIn("FIXTURE_MANIFEST_AGE_IDENTITY", str(jobs[job_name]))
             self.assertIn("fixture-descriptor", str(jobs[job_name]))

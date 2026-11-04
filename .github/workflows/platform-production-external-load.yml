@@ -711,8 +711,8 @@ jobs:
           [[ "$host_tools_sha" =~ ^[0-9a-f]{40}$ ]]
           printf 'host_tools_sha=%s\n' "$host_tools_sha" >> "$GITHUB_OUTPUT"
 
-  # This job owns SSH only for trusted fixture setup.  It does not checkout or
-  # execute candidate code and publishes the manifest as data for a fresh
+  # This job checks out the exact workflow SHA after event scrubbing and before
+  # fixture secrets are staged, then publishes only manifest data for a fresh
   # external load runner.
   fixture-setup:
     name: Prepare external fixture with ephemeral SSH
@@ -789,6 +789,12 @@ jobs:
               if not isinstance(checked_inputs,dict) or "control_email" in checked_inputs or any(contains_private_value(checked,secret) for secret in {email,email.lower(),email.casefold()} if secret): raise ValueError
           except (KeyError,TypeError,UnicodeError,ValueError,json.JSONDecodeError): raise SystemExit("EVENT_SCRUB reason=event_payload_invalid")
           PY
+      - name: Checkout exact fixture source after event scrub
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
       - name: Download closed external-load handoff
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
