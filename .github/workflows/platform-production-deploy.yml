@@ -1588,7 +1588,7 @@ jobs:
           api_opener = build_opener(RejectRedirect())
 
           sys.path.insert(0, str(Path.cwd() / "platform"))
-          from tools import platform_deploy_baseline as baseline  # noqa: E402
+          from tools import platform_deploy_baseline as baseline_contract  # noqa: E402
           from tools.platform_deploy_baseline import (  # noqa: E402
               DEPLOY_STATUS_CONTEXT,
               active_deployment_status_identity,
@@ -1827,34 +1827,34 @@ jobs:
               incremental_files = incremental.get("files")
               docs_only_incremental = bool(
                   incremental.get("class") == "docs-only"
-                  and incremental.get("expected_gates") == list(baseline.DOCS_ONLY_GATE_IDS)
+                  and incremental.get("expected_gates") == list(baseline_contract.DOCS_ONLY_GATE_IDS)
                   and incremental.get("fallback") is False
                   and incremental.get("runtime_sensitive") is False
                   and incremental.get("deployable") is False
-                  and incremental.get("reason") == baseline.DOCS_ONLY_REASON
+                  and incremental.get("reason") == baseline_contract.DOCS_ONLY_REASON
                   and isinstance(incremental_files, list)
                   and bool(incremental_files)
                   and all(
-                      isinstance(path, str) and path.startswith(baseline.DOCS_PREFIX)
+                      isinstance(path, str) and path.startswith(baseline_contract.DOCS_PREFIX)
                       for path in incremental_files
                   )
               )
               recovery_bootstrap_incremental = bool(
                   incremental.get("class") == "full"
-                  and incremental.get("expected_gates") == list(baseline.FULL_GATE_IDS)
+                  and incremental.get("expected_gates") == list(baseline_contract.FULL_GATE_IDS)
                   and incremental.get("fallback") is False
                   and incremental.get("deployable") is False
-                  and incremental.get("reason") == baseline.RECOVERY_BOOTSTRAP_REASON
+                  and incremental.get("reason") == baseline_contract.RECOVERY_BOOTSTRAP_REASON
                   and isinstance(incremental_files, list)
                   and any(
-                      isinstance(path, str) and path in baseline.RECOVERY_BOOTSTRAP_FILES
+                      isinstance(path, str) and path in baseline_contract.RECOVERY_BOOTSTRAP_FILES
                       for path in incremental_files
                   )
                   and all(
                       isinstance(path, str)
                       and (
-                          path in baseline.RECOVERY_BOOTSTRAP_FILES
-                          or path.startswith(baseline.DOCS_PREFIX)
+                          path in baseline_contract.RECOVERY_BOOTSTRAP_FILES
+                          or path.startswith(baseline_contract.DOCS_PREFIX)
                       )
                       for path in incremental_files
                   )

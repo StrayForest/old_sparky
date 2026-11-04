@@ -5927,7 +5927,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         self.assertIn('inputs.no_backup_noop_only != true', deploy_workflow_source)
         self.assertIn('no_backup_noop_only == "true"', deploy_workflow_source)
         self.assertIn(
-            'incremental.get("reason") == baseline.RECOVERY_BOOTSTRAP_REASON',
+            'incremental.get("reason") == baseline_contract.RECOVERY_BOOTSTRAP_REASON',
             deploy_workflow_source,
         )
         self.assertIn(
@@ -5974,7 +5974,10 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             flag: str,
         ) -> None:
             namespace = {
-                "baseline": baseline,
+                # The enclosing workflow has already decoded ACTIVE_BASELINE_JSON
+                # into `baseline`; the contract module must have a distinct name.
+                "baseline": {"source_sha": "c" * 40, "release_slug": "active"},
+                "baseline_contract": baseline,
                 "incremental": incremental_manifest,
                 "cumulative_no_op": no_op,
                 "reconcile_route": {
