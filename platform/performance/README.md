@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform performance
-- Last reviewed: 2026-11-04
+- Last reviewed: 2026-11-05
 
 The top-level JSON files in `profiles/` are the only authored canonical load
 contracts (schema 2). `tools/platform_load.py` validates, fingerprints and
@@ -120,16 +120,21 @@ not from retained report counts.
 
 ## Current 11-profile production matrix
 
-The production matrix is running serially against a fixed runtime: active
-application P4 (`72bafc12` prefix), host-tools generation C (`da8e1275`
-prefix), and workflow runner source S
-`01b6c0991ed33218e5abae9bcabe7f5c1322ee4d`. S is bound to the still-active P4
-through the successful exact-source Security/AUTO verified no-op chain
-`41795419693/1` → `41797244771/1` → `41797485924/1`; this does not deploy S or
-change P4/C. The retained backup and storage review are recorded in
-[`CURRENT.md`](../docs/CURRENT.md). The successful 120s+20s SSR diagnostic
-`41798744468/1` and its cleanup are separate evidence and are not a matrix
-cell. No profiling or runtime-profile switch is part of this matrix.
+The matrix is run serially. Cells 1–8 and 10–11 completed on the previous
+P4/C baseline. Cell 9 is `read-mix-concurrency-ramp-v1` run `41916053065/1`
+on the corrected application A
+`77d1d1bdffe0c07005982e9f696f108366333f7b`, with host-tools C
+`0de51aca4b4d04a80a2f0d392003cc258d8f1400`; exact cleanup passed. The client
+completed the full 170,000-action population, but the Ready Check state guard
+failed in all eight stages because the workspace request UTC bounds were
+omitted when timeout diagnostics were disabled. This cell does not validate a
+Ready Check concurrency knee; rerun cell 9 after the runner correction passes
+exact-SHA CI and the normal automatic app deployment chain, including its
+single source-bound backup. For each run, record
+runner S, application A and host-tools C from its exact workflow/deployment
+receipts; do not infer one identity from another. The separate corrected SSR
+capacity diagnostic is not a matrix cell. Do not switch app or host-tools
+profiles while a cell is active.
 
 Run one profile at a time in this order, using the canonical external-load
 workflow dispatch and hidden control-account prompt in the
@@ -150,25 +155,16 @@ change only `profile_id` for each cell; never batch-dispatch the matrix.
     cleanly and the operator's current safety/preflight checks still pass;
     otherwise mark it not run and leave the matrix incomplete.
 
-Current disposition (2026-11-04): cells 1–8 and 10–11 used runner source S
-`01b6c0991ed33218e5abae9bcabe7f5c1322ee4d` on app P4 (`72bafc12` prefix) and
-host-tools C (`da8e1275` prefix). Cell 9 run `41857301086/1` used runner and
-app source T `0b6ddb5cd4356b754344ed3a511365ce2ed10a67` with host-tools C
-`276da572bf978448b7c582090564099aac6b8be2`. Cell 9 preparation failed before
-the client (see row); exact cleanup passed through the canonical T app helper
-and C export cleanup. The canonical finalizer for the later cell-7 diagnostic
-also passed cleanup, deleting 20,000 users and 40 tournaments while preserving
-the control account; the subsequent guarded supervisor confirmed it was
-already clean with zero residual rows and read-model keys. Source review confirmed the app helper must skip the
-same-status PATCH and the C dispatcher must resolve that app-owned helper from
-the source-bound immutable app release. The dispatcher change requires a
-normal C and pin-only P release. Cell 7's targeted diagnostic was run against
-frozen T as run `41866051379/1`: 19,971/20,000 requests succeeded, with 28
-status-0 failures, one status-502 failure, and no retries or drops. The
-truncated failure sample and disabled timeout diagnostics leave the cause
-unknown; Nginx recorded 19,990 HTML requests, all 200/upstream 200, without a
-client-request join. No transport bug is proven. Rerun cell 9 only after the
-corrected runner/app helper and dispatcher are installed.
+For the current matrix, rerun only cell 9 after the runner fix is source-bound
+and a fresh canonical FULL readiness receipt passes. Do not replay completed
+cells 1–8 or 10–11.
+
+Current disposition (2026-11-05): all 11 cells have run with authoritative
+cleanup. Cell 9's HTTP population and cleanup completed, but its state guard
+failed, so the profile's purpose—measuring an active Ready Check concurrency
+knee—remains unmet. Record the replacement run's runner S, app A and host-tools
+C from exact receipts. Keep cell 9 open until a corrected run passes the state
+guard and its exact cleanup is recorded.
 
 | Cell | Profile | Contract result | Exact cleanup |
 | ---: | --- | --- | --- |
@@ -180,19 +176,23 @@ corrected runner/app helper and dispatcher are installed.
 | 6 | `authenticated-page-load-v1` | STRESS BEHAVIOR FAIL on whole-cohort schedule delay; 20,000 HTTP 200 responses | PASS |
 | 7 | `authenticated-page-load-v2` | STRESS BEHAVIOR FAIL; 53/20,000 `GET tournament_detail` requests timed out; retained samples show status 0 and about 30 seconds; time clustering and Nginx reconciliation unresolved | PASS |
 | 8 | `ready-vote-saturation-ramp-v4` | STRESS BEHAVIOR PASS under contract despite bounded 503 responses and shedding | PASS |
-| 9 | `read-mix-concurrency-ramp-v1` | Fixture preparation failed before client dispatch: one `PATCH tournament_detail` returned 422 after 20,000 users and one tournament were created; no HTTP workload credit | PASS; 20,000 users and 1 tournament deleted, control preserved, zero residuals |
+| 9 | `read-mix-concurrency-ramp-v1` | FAIL: all 170,000 actions completed (160,000 HTTP 200 and 10,000 conditional 304; zero errors, retries or drops), but all eight stage state guards failed: 40/40 cohorts observed, 0 active, remaining/headroom unavailable. Logical p95/p99 were 192.7/305.6 s against 12/20 s limits; HTTP p95/p99 were 939/1,209 ms. No Ready Check knee is validly established; corrected rerun required. | PASS |
 | 10 | `ready-vote-stress-15k-v2` | STRESS BEHAVIOR FAIL: 2,804/15,000 primary actions and 101/750 same-state duplicates failed; all HTTP errors were 503, with no idempotency state violation | PASS |
 | 11 | `ready-vote-stress-20k-v2` | STRESS BEHAVIOR FAIL: 16,520/21,000 logical actions succeeded; 24,224/40,744 HTTP requests returned 503 | PASS |
 
-For cell 11, exact cleanup removed 40 tournaments and 20,000 fixture users and
-preserved the control account. Nginx totals matched the client report. Origin
-samples showed CPU pressure and no database lock queue; the relation between
-controller `pressure` states and individual 503s, and the protective-shed
-trigger, remain unproven. Cells 10 and 11 failed their authored action
-thresholds; a 503 response alone does not determine the contract outcome.
-The 11-profile matrix remains incomplete until cell 9's corrected runner, app
-helper and host-tools dispatcher are released and installed before a
-successful rerun.
+Cells 9–11 failed their authored acceptance contracts; a completed HTTP
+population does not override a failed state or latency guard. Cell 11 showed
+CPU pressure and no database lock queue, but the protective-shed trigger
+remains unproven. Only cell 9 requires a corrected rerun; its original run had
+authoritative cleanup.
+
+Cell 9's state failure came from the runner requiring request UTC bounds that
+`_request` retained only when a timeout-diagnostic ID was present. The ramp
+does not enable those diagnostics. The runner fix captures these bounds only
+for scheduled workspace state checks, without adding diagnostic headers or
+retaining timestamps in public artifacts. It must pass exact-SHA CI and the
+normal automatic app deployment chain, including its single source-bound
+backup, before the cell is rerun.
 
 Before every cell dispatch, obtain a fresh canonical FULL readiness receipt
 after the automatic production chain has completed and before fixture setup
@@ -295,10 +295,13 @@ more time than the load runtime's remaining budget plus a five-minute startup
 margin. Missing, closed, stale-clock, or near-expiry state invalidates that
 stage. Public evidence contains only cohort counts, minimum remaining time,
 and minimum headroom over the per-response requirement; identifiers and
-response bodies are not retained. Scheduled tournament creation opens
-registration when its start time is due or omitted, so the fixture uses that
-created state and skips the otherwise-required open-status PATCH. Other
-profiles keep their existing manual Ready Check setup.
+response bodies are not retained. The runner captures request start/end clock
+bounds for these workspace reads independently of timeout-diagnostic IDs; it
+does not enable timeout diagnostics or add diagnostic headers. Scheduled
+tournament creation opens registration when its start time is due or omitted,
+so the fixture uses that created state and skips the otherwise-required
+open-status PATCH. Other profiles keep their existing manual Ready Check
+setup.
 The private fixture timing receipt keeps monotonic stage durations and UTC
 start/end bounds. Its safe matrix projection also includes aggregate status,
 error, latency and response-byte metrics for tournament create, join and

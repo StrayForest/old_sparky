@@ -235,7 +235,12 @@ first large p95 increase with a flat throughput gain as an admission candidate;
 it is evidence for an operator-selected runtime profile, not an automatic
 configuration change. This is a stress diagnostic, so bounded typed
 authenticated-read shedding is counted separately from unexpected errors. Run
-it only in the approved window and complete exact cleanup.
+it only in the approved window and complete exact cleanup. Accept a Ready
+Check knee only when all eight state guards pass with 40/40 active cohorts and
+positive per-response deadline headroom; HTTP success alone is insufficient.
+Rerun only cell 9 after exact-SHA CI, automatic app deployment and its single
+source-bound backup; then obtain FULL readiness as described in the
+[performance matrix](../performance/README.md#current-11-profile-production-matrix).
 
 The SSR dependency graph has a hermetic browser contract in the platform web
 smoke suite: an authenticated tournament page must call `/auth/bootstrap` and

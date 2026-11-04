@@ -3327,6 +3327,7 @@ def _request(
     attempt_number: int = 1,
     url_prefix: str = "/api/v1",
     diagnostic_id: str | None = None,
+    capture_timestamps: bool = False,
     transport_client: HTTP11KeepAliveClient | None = None,
     budget: LoadRuntimeBudget | None = None,
 ) -> RequestResult:
@@ -3501,9 +3502,13 @@ def _request(
         time_to_first_byte_ms=time_to_first_byte_ms,
         attempt_number=attempt_number,
         diagnostic_id=diagnostic_id,
-        started_at_utc=started_at_utc if diagnostic_id else None,
+        started_at_utc=(
+            started_at_utc if capture_timestamps or diagnostic_id else None
+        ),
         exception_at_utc=exception_at_utc if diagnostic_id else None,
-        finished_at_utc=finished_at_utc if diagnostic_id else None,
+        finished_at_utc=(
+            finished_at_utc if capture_timestamps or diagnostic_id else None
+        ),
         transport_timing=transport_timing,
         started_at_monotonic=started_at,
         finished_at_monotonic=finished_at,
@@ -3867,6 +3872,37 @@ def _route_for_read(index: int, slug: str) -> str:
     if bucket == 8:
         return "/users/me"
     return "/tournaments"
+
+
+def _read_mix_request(
+    origin: str,
+    user: VirtualUser,
+    *,
+    user_index: int,
+    phase: str,
+    timeout: float,
+    session_cookie_name: str,
+    csrf_cookie_name: str,
+    require_ready_state_timestamps: bool,
+    budget: LoadRuntimeBudget | None = None,
+) -> RequestResult:
+    path = _route_for_read(user_index, user.tournament_slug)
+    capture_timestamps = (
+        require_ready_state_timestamps
+        and path.split("?", 1)[0].endswith("/workspace")
+    )
+    return _request(
+        origin,
+        user,
+        method="GET",
+        path=path,
+        phase=phase,
+        timeout=timeout,
+        session_cookie_name=session_cookie_name,
+        csrf_cookie_name=csrf_cookie_name,
+        capture_timestamps=capture_timestamps,
+        **({"budget": budget} if budget is not None else {}),
+    )
 
 
 def _read_mix_ready_deadlines(
@@ -5699,16 +5735,18 @@ def _run_load_impl(
 
         def read_builder(origin_value: str, user: VirtualUser, phase: str, request_timeout: float) -> RequestResult:
             index = user_indexes[user.user_id]
-            result = _request(
+            result = _read_mix_request(
                 origin_value,
                 user,
-                method="GET",
-                path=_route_for_read(index, user.tournament_slug),
+                user_index=index,
                 phase=phase,
                 timeout=request_timeout,
                 session_cookie_name=session_cookie_name,
                 csrf_cookie_name=csrf_cookie_name,
-                **({"budget": runtime_budget} if runtime_budget is not None else {}),
+                require_ready_state_timestamps=(
+                    read_mix_ready_deadlines is not None
+                ),
+                budget=runtime_budget,
             )
             if user.user_id in refresh_user_ids and result.response_etag:
                 initial_workspace_etags[user.user_id] = result.response_etag

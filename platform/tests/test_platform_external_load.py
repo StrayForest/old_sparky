@@ -22,6 +22,12 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from urllib.error import HTTPError
 from unittest.mock import Mock, patch
 
+from apps.platform_api.app.api.schemas import (
+    TournamentDeadlockReadyCheckStateResponse,
+    TournamentDeadlockReadyRoundResponse,
+    TournamentResponse,
+    TournamentWorkspaceResponse,
+)
 import tools.platform_external_load as external_load
 import tools.platform_cpu_diagnostic_pair as cpu_diagnostic_pair
 import tools.platform_ssr_capacity_diagnostic as capacity_diagnostic
@@ -295,6 +301,186 @@ class ExternalLoadTests(unittest.TestCase):
             result, deadlines={"cohort-a": ends_at}
         )
         self.assertEqual(stale, ("cohort-a", False, None))
+
+    def test_read_mix_request_state_uses_captured_times_without_diagnostic_id(self) -> None:
+        user = VirtualUser("user-00000001", "cohort-a", "s" * 64, "c" * 64)
+        now = external_load.datetime.now(external_load.UTC)
+        ends_at = now + external_load.timedelta(minutes=90)
+        round_response = TournamentDeadlockReadyRoundResponse(
+            id=123,
+            tournament_id="tournament-00000001",
+            status="active",
+            eligible_participant_count=500,
+            ready_count=0,
+            declined_count=0,
+            initiated_by_user_id=None,
+            created_at=now - external_load.timedelta(seconds=1),
+            closed_at=None,
+        )
+        workspace_body = TournamentWorkspaceResponse(
+            tournament=TournamentResponse(
+                id="tournament-00000001",
+                slug="cohort-a",
+                name="Read Mix Fixture",
+                description=None,
+                visibility="public",
+                status="registration_closed",
+                format_slug="solo",
+                organizer_user_id="user-00000001",
+                ready_check_starts_at=now - external_load.timedelta(minutes=1),
+                ready_check_ends_at=ends_at,
+                created_at=now - external_load.timedelta(minutes=2),
+            ),
+            server_time=now,
+            ready_check=TournamentDeadlockReadyCheckStateResponse(
+                active_round=round_response,
+                latest_round=round_response,
+                state_version=123,
+            ),
+        ).model_dump_json().encode("utf-8")
+
+        class UrlopenResponse:
+            status = 200
+            headers: dict[str, str] = {}
+
+            def __init__(self) -> None:
+                self.body = BytesIO(workspace_body)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self, size: int = -1) -> bytes:
+                return self.body.read(size)
+
+        class KeepAliveResponse:
+            status = 200
+            headers: dict[str, str] = {}
+            body = workspace_body
+            timing = {"ttfb_ms": 2.0, "total_ms": 4.0}
+
+        class KeepAliveClient:
+            def __init__(self) -> None:
+                self.request_headers: dict[str, str] | None = None
+                self.request_path: str | None = None
+
+            def request(self, _method, _path, *, headers, **_kwargs):
+                self.request_headers = headers
+                self.request_path = _path
+                return KeepAliveResponse()
+
+        workspace_path = (
+            "/tournaments/cohort-a/workspace?participants_limit=0"
+            "&participants_offset=0&workspace_view=detail&include_current_user=false"
+        )
+        for transport_kind in ("urlopen", "keepalive"):
+            with self.subTest(transport=transport_kind):
+                keepalive = KeepAliveClient()
+                with patch(
+                    "tools.platform_external_load.urlopen",
+                    return_value=UrlopenResponse(),
+                ) as urlopen:
+                    if transport_kind == "urlopen":
+                        result = external_load._read_mix_request(
+                            "https://old-sparky.com",
+                            user,
+                            user_index=0,
+                            phase="scale_external_read_mix_c16",
+                            timeout=2.0,
+                            session_cookie_name="session",
+                            csrf_cookie_name="csrf",
+                            require_ready_state_timestamps=True,
+                        )
+                    else:
+                        result = _request(
+                            "https://old-sparky.com",
+                            user,
+                            method="GET",
+                            path=workspace_path,
+                            phase="scale_external_read_mix_c16",
+                            timeout=2.0,
+                            session_cookie_name="session",
+                            csrf_cookie_name="csrf",
+                            capture_timestamps=True,
+                            transport_client=keepalive,
+                        )
+
+                self.assertTrue(result.ok)
+                self.assertIsNone(result.diagnostic_id)
+                self.assertIsNotNone(result.started_at_utc)
+                self.assertIsNotNone(result.finished_at_utc)
+                self.assertIsNone(result.exception_at_utc)
+                if transport_kind == "urlopen":
+                    self.assertEqual(urlopen.call_count, 1)
+                    request = urlopen.call_args.args[0]
+                    self.assertTrue(request.full_url.endswith(
+                        "/tournaments/cohort-a/workspace?participants_limit=0"
+                        "&participants_offset=0&workspace_view=detail"
+                        "&include_current_user=false"
+                    ))
+                    self.assertIsNone(
+                        request.get_header("X-platform-timeout-diagnostic-id")
+                    )
+                else:
+                    self.assertEqual(
+                        keepalive.request_path,
+                        "/api/v1/tournaments/cohort-a/workspace?participants_limit=0"
+                        "&participants_offset=0&workspace_view=detail"
+                        "&include_current_user=false",
+                    )
+                    self.assertIsNone(
+                        keepalive.request_headers.get(
+                            "X-Platform-Timeout-Diagnostic-ID"
+                        )
+                    )
+
+                observation = external_load._read_mix_ready_state_for_result(
+                    result, deadlines={"cohort-a": ends_at}
+                )
+                self.assertEqual(observation[0], "cohort-a")
+                self.assertTrue(observation[1])
+                self.assertAlmostEqual(observation[2], 90 * 60, delta=2)
+
+        with patch(
+            "tools.platform_external_load.urlopen",
+            return_value=UrlopenResponse(),
+        ):
+            ordinary_read = external_load._read_mix_request(
+                "https://old-sparky.com",
+                user,
+                user_index=0,
+                phase="scale_external_read_mix_c16",
+                timeout=2.0,
+                session_cookie_name="session",
+                csrf_cookie_name="csrf",
+                require_ready_state_timestamps=False,
+            )
+        self.assertIsNone(ordinary_read.started_at_utc)
+        self.assertIsNone(ordinary_read.finished_at_utc)
+        self.assertEqual(
+            external_load._read_mix_ready_state_for_result(
+                ordinary_read, deadlines={"cohort-a": ends_at}
+            ),
+            ("cohort-a", False, None),
+        )
+        with patch(
+            "tools.platform_external_load._request",
+            return_value=ordinary_read,
+        ) as request:
+            external_load._read_mix_request(
+                "https://old-sparky.com",
+                user,
+                user_index=8,
+                phase="scale_external_read_mix_c16",
+                timeout=2.0,
+                session_cookie_name="session",
+                csrf_cookie_name="csrf",
+                require_ready_state_timestamps=True,
+            )
+        self.assertEqual(request.call_args.kwargs["path"], "/users/me")
+        self.assertFalse(request.call_args.kwargs["capture_timestamps"])
 
     def test_dispatcher_projects_typed_120s_memory_rows_and_rejects_wrong_window(self) -> None:
         for workload, on_window_ms in (
