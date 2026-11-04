@@ -14,7 +14,10 @@ import {
   summarizeSampleClasses,
   summarizeFunctionSamples,
 } from "./cpu-profile-categories.mjs";
-import { isHtmlSsrCaptureEligible } from "./ssr-capture-sampling.mjs";
+import {
+  isHtmlSsrCaptureEligible,
+  isHtmlSsrTraceDrainEligible,
+} from "./ssr-capture-sampling.mjs";
 import { releaseMetadataPathFromStandaloneCwd } from "./release-identity-path.mjs";
 import {
   claimWorkspaceCpuWindowStart,
@@ -55,6 +58,7 @@ const WORKLOAD_HTML_SSR_CAPACITY = "authenticated_html_ssr_capacity_v1";
 const WORKLOAD_HTML_SSR_CAPACITY_120S = "authenticated_html_ssr_capacity_120s_v1";
 const WORKLOAD_HTML_SSR_CPU_PROFILE_20S = "authenticated_html_ssr_cpu_profile_20s_v1";
 const DIAGNOSTIC_TRACE_HEADER = "x-platform-ssr-trace";
+const SSR_REQUEST_START_HEADER = "x-platform-ssr-request-start-ms";
 const SSR_STREAM_SELECTOR = Symbol.for("old-sparky.ssr-stream-selector");
 
 type PlanTarget = {
@@ -90,6 +94,8 @@ export type WorkspaceCpuDiagnostic = {
 type ActiveDiagnostic = {
   readonly plan: DiagnosticPlan;
   readonly phase: DiagnosticPhase;
+  readonly traceOnly?: true;
+  readonly parentStartMs?: number;
 };
 
 const diagnosticStorage = new AsyncLocalStorage<ActiveDiagnostic>();
@@ -299,7 +305,22 @@ function currentPlan(): DiagnosticPlan | null {
 
 export function current_diagnostic_run_id(): string | null {
   const current = diagnosticStorage.getStore();
-  return current && activePhase(current.plan, Date.now()) === current.phase
+  if (!current) return null;
+  if (current.traceOnly === true) {
+    const parentStartMs = current.parentStartMs;
+    return typeof parentStartMs === "number"
+      && isHtmlSsrTraceDrainEligible(
+        current.plan.workload,
+        parentStartMs,
+        Date.now(),
+        current.plan.on_start_ms,
+        current.plan.on_end_ms,
+        current.plan.expires_at_ms,
+      )
+      ? current.plan.run_id
+      : null;
+  }
+  return activePhase(current.plan, Date.now()) === current.phase
     ? current.plan.run_id
     : null;
 }
@@ -333,8 +354,21 @@ function validatedSsrDiagnostic(requestHeaders: Pick<Headers, "get">): ActiveDia
         && plan.workload !== WORKLOAD_HTML_SSR_CAPACITY_120S
         && plan.workload !== WORKLOAD_HTML_SSR_CPU_PROFILE_20S)
       || !hasAuthorizedDiagnosticRunMarker(incomingTrace, plan.run_id)) return null;
-  const phase = activePhase(plan, Date.now());
-  return phase === null ? null : { plan, phase };
+  const now = Date.now();
+  const phase = activePhase(plan, now);
+  if (phase !== null) return { plan, phase };
+  const parentStartText = requestHeaders.get(SSR_REQUEST_START_HEADER) ?? "";
+  if (!/^(?:0|[1-9][0-9]{0,15})$/u.test(parentStartText)) return null;
+  const parentStartMs = Number(parentStartText);
+  if (!isHtmlSsrTraceDrainEligible(
+    plan.workload,
+    parentStartMs,
+    now,
+    plan.on_start_ms,
+    plan.on_end_ms,
+    plan.expires_at_ms,
+  )) return null;
+  return { plan, phase: "on", traceOnly: true, parentStartMs };
 }
 
 function registerSsrStreamRequest(
@@ -370,6 +404,9 @@ export async function runWithSsrDiagnosticPlan<T>(
   if (!diagnostic) return operation();
   registerSsrStreamRequest(requestHeaders, diagnostic);
   if (diagnosticStorage.getStore()) return operation();
+  if (diagnostic.traceOnly === true) {
+    return diagnosticStorage.run(diagnostic, operation);
+  }
   startCpuUsageWindow(diagnostic.plan, diagnostic.phase);
   startNodeMemoryWindow(diagnostic.plan, diagnostic.phase);
   if (diagnostic.plan.workload === WORKLOAD_HTML_SSR_CPU_PROFILE_20S

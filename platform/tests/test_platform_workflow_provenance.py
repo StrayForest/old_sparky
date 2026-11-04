@@ -3261,6 +3261,127 @@ class WorkflowProvenanceTests(unittest.TestCase):
                     expected_target_sha=self.SHA,
                     route_manifest=bad_route,
                 )
+
+        deployable_nonruntime_route = classify(
+            ["platform/tools/platform_verify.py"],
+            event="push",
+            target_sha=self.SHA,
+            branch="dev",
+        )
+        self.assertTrue(deployable_nonruntime_route["deployable"])
+        self.assertFalse(deployable_nonruntime_route["runtime_sensitive"])
+        runtime_skipped = [
+            {
+                **job,
+                "status": "completed",
+                "conclusion": (
+                    "skipped"
+                    if job["name"] == "Trusted dev immutable release runtime"
+                    else "success"
+                ),
+            }
+            for job in jobs
+        ]
+        self.assertEqual(
+            validate_recovery_source_security_gates(
+                workflow,
+                run,
+                runtime_skipped,
+                statuses,
+                expected_run_id=run_id,
+                expected_attempt=attempt,
+                expected_target_sha=self.SHA,
+                route_manifest=deployable_nonruntime_route,
+                now=datetime(2026, 10, 5, 12, tzinfo=timezone.utc),
+            ),
+            f"{base}/attempts/{attempt}",
+        )
+        invalid_skip_routes = []
+        for changes in (
+            {"target_sha": "b" * 40},
+            {"event": "workflow_dispatch"},
+            {"class": "docs-only"},
+            {"runtime_sensitive": True},
+            {"deployable": False},
+            {"fallback": True},
+        ):
+            invalid_route = {**deployable_nonruntime_route, **changes}
+            invalid_route["digest"] = manifest_digest(invalid_route)
+            invalid_skip_routes.append(invalid_route)
+        for invalid_route in invalid_skip_routes:
+            with self.subTest(route=invalid_route), self.assertRaises(ProvenanceError):
+                validate_recovery_source_security_gates(
+                    workflow,
+                    run,
+                    runtime_skipped,
+                    statuses,
+                    expected_run_id=run_id,
+                    expected_attempt=attempt,
+                    expected_target_sha=self.SHA,
+                    route_manifest=invalid_route,
+                    now=datetime(2026, 10, 5, 12, tzinfo=timezone.utc),
+                )
+        invalid_skipped_jobs = []
+        for name, changes in (
+            ("Trusted dev immutable release runtime", {"run_id": run_id + 1}),
+            ("Trusted dev immutable release runtime", {"run_attempt": attempt + 1}),
+            ("Trusted dev immutable release runtime", {"head_sha": "b" * 40}),
+            ("Trusted dev immutable release runtime", {"status": "in_progress"}),
+            ("Trusted dev immutable release runtime", {"conclusion": "failure"}),
+            ("Trusted dev immutable release runtime", {"conclusion": "cancelled"}),
+            ("Conditional release runtime fixture", {"conclusion": "skipped"}),
+        ):
+            invalid_jobs = [
+                {**job, **changes} if job["name"] == name else job
+                for job in runtime_skipped
+            ]
+            invalid_skipped_jobs.append((name, changes, invalid_jobs))
+        missing_runtime = [
+            job for job in runtime_skipped
+            if job["name"] != "Trusted dev immutable release runtime"
+        ]
+        duplicate_runtime = [
+            *runtime_skipped,
+            next(job for job in runtime_skipped if job["name"] == "Trusted dev immutable release runtime"),
+        ]
+        conditional_runtime_skipped = [
+            {
+                **job,
+                "conclusion": (
+                    "skipped"
+                    if job["name"] == "Conditional release runtime fixture"
+                    else "success"
+                ),
+            }
+            for job in jobs
+        ]
+        malformed_runtime = [
+            {**job, "run_attempt": "3"}
+            if job["name"] == "Trusted dev immutable release runtime"
+            else job
+            for job in runtime_skipped
+        ]
+        invalid_skipped_jobs.extend(
+            (
+                ("missing-runtime", {}, missing_runtime),
+                ("duplicate-runtime", {}, duplicate_runtime),
+                ("conditional-runtime-skipped", {}, conditional_runtime_skipped),
+                ("malformed-runtime", {}, malformed_runtime),
+            )
+        )
+        for name, changes, invalid_jobs in invalid_skipped_jobs:
+            with self.subTest(job=name, changes=changes), self.assertRaises(ProvenanceError):
+                validate_recovery_source_security_gates(
+                    workflow,
+                    run,
+                    invalid_jobs,
+                    statuses,
+                    expected_run_id=run_id,
+                    expected_attempt=attempt,
+                    expected_target_sha=self.SHA,
+                    route_manifest=deployable_nonruntime_route,
+                    now=datetime(2026, 10, 5, 12, tzinfo=timezone.utc),
+                )
         conditional_names = (
             "Conditional release runtime fixture",
             "Trusted dev immutable release runtime",

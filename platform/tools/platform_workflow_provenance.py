@@ -1028,6 +1028,10 @@ def validate_recovery_source_security_gates(
         route_manifest,
         expected_target_sha=expected_target_sha,
     )
+    deployable_nonruntime_push_route = _is_verified_deployable_nonruntime_push_route(
+        route_manifest,
+        expected_target_sha=expected_target_sha,
+    )
     conditional_runtime_jobs = {
         "Conditional release runtime fixture",
         "Trusted dev immutable release runtime",
@@ -1048,9 +1052,16 @@ def validate_recovery_source_security_gates(
             or job.get("head_sha") != expected_target_sha
         )
         allowed_conditional_skip = (
-            recovery_bootstrap_route
-            and name in conditional_runtime_jobs
-            and job.get("status") == "completed"
+            (
+                recovery_bootstrap_route
+                and name in conditional_runtime_jobs
+            )
+            or (
+                deployable_nonruntime_push_route
+                and name == "Trusted dev immutable release runtime"
+            )
+        ) and (
+            job.get("status") == "completed"
             and job.get("conclusion") == "skipped"
             and job.get("run_id") == expected_run_id
             and ("run_attempt" not in job or (
@@ -1062,6 +1073,36 @@ def validate_recovery_source_security_gates(
         if job_contract_failed and not allowed_conditional_skip:
             raise _fail("recovery source security gate did not pass for the exact attempt")
     return attempt_url
+
+
+def _is_verified_deployable_nonruntime_push_route(
+    route_manifest: Mapping[str, Any] | None,
+    *,
+    expected_target_sha: str,
+) -> bool:
+    """Recognize only a canonical deployable, non-runtime-sensitive dev push."""
+
+    if not isinstance(route_manifest, Mapping):
+        return False
+    try:
+        if __package__:
+            from . import platform_ci_classifier as classifier
+        else:
+            import platform_ci_classifier as classifier
+        classifier.validate_manifest(
+            route_manifest,
+            expected_target_sha=expected_target_sha,
+            require_deployable=True,
+        )
+    except (ImportError, TypeError, ValueError):
+        return False
+    return (
+        route_manifest.get("event") == "push"
+        and route_manifest.get("class") == "full"
+        and route_manifest.get("runtime_sensitive") is False
+        and route_manifest.get("deployable") is True
+        and route_manifest.get("fallback") is False
+    )
 
 
 def _is_verified_nondeployable_recovery_route(

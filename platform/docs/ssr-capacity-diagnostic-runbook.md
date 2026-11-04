@@ -319,6 +319,16 @@ identities, and all of these conditions hold:
   cd platform/apps/platform_web
   npm run test:ssr-stream-diagnostics
   ```
+  Typed HTML requests may finish trace registration during the plan's existing
+  15-second expiry only when the trusted parent-start stamped by the web proxy
+  is before the ON end. This is trace/correlation drain only: CPU, usage and
+  memory capture still stop at their original phase boundaries. The proxy
+  overwrites any caller-supplied parent-start value when the request reaches
+  the server. A browser request launched before ON end but received by the
+  proxy at or after that boundary has no trusted in-window start and remains
+  outside the cohort; the diagnostic does not infer client-side start time.
+  The load cohort is still measured by client start, so such transit-delayed
+  requests remain missing IDs and make the measurement incomplete.
 - The `authenticated_html_ssr_capacity_120s_v1` plan binds the Node memory
   event window to its exact phase duration: OFF remains capped at 20 seconds,
   while ON may span 120 seconds. The final sample endpoint may extend up to

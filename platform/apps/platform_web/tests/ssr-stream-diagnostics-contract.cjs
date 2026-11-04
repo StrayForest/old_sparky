@@ -413,8 +413,60 @@ async function main() {
     __dirname, "..", "app", "(site)", "tournaments", "[slug]", "page.tsx",
   );
   const planPath = path.resolve(__dirname, "..", "lib", "performance-diagnostic-plan.ts");
+  const proxyPath = path.resolve(__dirname, "..", "proxy.ts");
   const pageSource = fs.readFileSync(pagePath, "utf8");
   const planSource = fs.readFileSync(planPath, "utf8");
+  const proxySource = fs.readFileSync(proxyPath, "utf8");
+  const { isHtmlSsrTraceDrainEligible } = await import(path.resolve(
+    __dirname, "..", "lib", "ssr-capture-sampling.mjs",
+  ));
+  const onStartMs = 126_000;
+  const onEndMs = 146_000;
+  const expiresAtMs = 161_000;
+  for (const workload of [
+    "authenticated_html_ssr_capacity_v1",
+    "authenticated_html_ssr_capacity_120s_v1",
+    "authenticated_html_ssr_cpu_profile_20s_v1",
+  ]) {
+    if (!isHtmlSsrTraceDrainEligible(workload, onEndMs - 1, onEndMs + 1, onStartMs, onEndMs, expiresAtMs)) {
+      throw new Error(`${workload}: pre-end trusted parent was not admitted during trace drain`);
+    }
+  }
+  for (const [label, workload, parentStartMs, nowMs] of [
+    ["post-end parent", "authenticated_html_ssr_capacity_120s_v1", onEndMs, onEndMs + 1],
+    ["post-end request", "authenticated_html_ssr_capacity_120s_v1", onEndMs + 1, onEndMs + 1],
+    ["expired plan", "authenticated_html_ssr_capacity_120s_v1", onEndMs - 1, expiresAtMs + 1],
+    ["oversized drain", "authenticated_html_ssr_capacity_120s_v1", onEndMs - 1, onEndMs + 15_001],
+    ["wrong workload", "authenticated_workspace_read_capacity_v1", onEndMs - 1, onEndMs + 1],
+    ["invalid parent time", "authenticated_html_ssr_capacity_120s_v1", Number.NaN, onEndMs + 1],
+  ]) {
+    if (isHtmlSsrTraceDrainEligible(workload, parentStartMs, nowMs, onStartMs, onEndMs, expiresAtMs)) {
+      throw new Error(`trace drain accepted ${label}`);
+    }
+  }
+  const proxyHeaderClear = proxySource.indexOf("requestHeaders.delete(SSR_REQUEST_START_HEADER);");
+  const proxyHeaderStamp = proxySource.indexOf("requestHeaders.set(SSR_REQUEST_START_HEADER, String(proxyStartMs));");
+  if (proxyHeaderClear < 0 || proxyHeaderStamp <= proxyHeaderClear
+      || !proxySource.includes("const proxyStartMs = Date.now();")
+      || !planSource.includes("const parentStartText = requestHeaders.get(SSR_REQUEST_START_HEADER) ?? \"\";")) {
+    throw new Error("trace drain must use the server proxy's caller-overwritten parent-start");
+  }
+  const validatedStart = planSource.indexOf("function validatedSsrDiagnostic(");
+  const drainCheck = planSource.indexOf("isHtmlSsrTraceDrainEligible(", validatedStart);
+  const runStart = planSource.indexOf("export async function runWithSsrDiagnosticPlan(");
+  const traceOnlyReturn = planSource.indexOf("if (diagnostic.traceOnly === true)", runStart);
+  const usageStart = planSource.indexOf("startCpuUsageWindow(diagnostic.plan, diagnostic.phase);", runStart);
+  const memoryStart = planSource.indexOf("startNodeMemoryWindow(diagnostic.plan, diagnostic.phase);", runStart);
+  const profileStart = planSource.indexOf("await startNodeCpuProfile(diagnostic.plan, Date.now());", runStart);
+  const runIdReader = planSource.indexOf("export function current_diagnostic_run_id(): string | null {");
+  const traceOnlyRunId = planSource.indexOf("if (current.traceOnly === true)", runIdReader);
+  if (validatedStart < 0 || drainCheck <= validatedStart
+      || traceOnlyReturn <= runStart || usageStart <= traceOnlyReturn
+      || memoryStart <= traceOnlyReturn || profileStart <= traceOnlyReturn
+      || runIdReader < 0 || traceOnlyRunId <= runIdReader
+      || !planSource.includes("return diagnosticStorage.run(diagnostic, operation);")) {
+    throw new Error("trace-only drain is not separated from capture-window startup");
+  }
   const baseHeaders = { cookie: "session=fixture" };
   const runId = "a".repeat(32);
   const prearmPlan = {
