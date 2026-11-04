@@ -1553,6 +1553,15 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
         self.assertEqual(manifest_cipher.stat().st_mode & 0o777, 0o600)
         self.assertEqual(descriptor.stat().st_mode & 0o777, 0o600)
         public_descriptor = json.loads(descriptor.read_text(encoding="ascii"))
+        scheduled_reference = external_fixture / "scheduled-reference-descriptor.json"
+        transport.build_descriptor(
+            staged_input, manifest_path, scheduled_reference,
+            run_id, attempt, runner_sha, runner_sha,
+        )
+        self.assertEqual(
+            public_descriptor,
+            json.loads(scheduled_reference.read_text(encoding="ascii")),
+        )
         self.assertNotIn("control_email", public_descriptor["input"])
         self.assertNotIn("session_token", json.dumps(public_descriptor, sort_keys=True))
         self.assertNotIn("csrf_token", json.dumps(public_descriptor, sort_keys=True))
@@ -1691,6 +1700,96 @@ class FixtureCredentialWorkflowBoundaryTests(unittest.TestCase):
         self.assertFalse((load_temp / "fixture-age-tools").exists())
         self.assertFalse((load_temp / "age-v1.3.2.tar.gz").exists())
         self.assertTrue(load_descriptor.is_file())
+
+        ordinary_temp = root / "ordinary-fixture-producer-temp"
+        ordinary_input_dir = ordinary_temp / "external-input"
+        ordinary_fixture_dir = ordinary_temp / "external-fixture"
+        ordinary_input_dir.mkdir(mode=0o700, parents=True)
+        ordinary_fixture_dir.mkdir(mode=0o700)
+        ordinary_input = {
+            "schema": "1",
+            "confirmation": "RUN-PRODUCTION-EXTERNAL-LOAD",
+            "target_sha": runner_sha,
+            "control_email": "ordinary-control@example.invalid",
+            "setup_concurrency": "8",
+            "run_id": run_id,
+            "profile": "external-vote",
+            "tournament_count": "1",
+            "users_per_tournament": "14",
+            "timeout_diagnostics": "false",
+            "fixture_kind": "external_load",
+        }
+        ordinary_users = [
+            {
+                "user_id": f"ordinary-user-{index:02d}",
+                "tournament_slug": "ordinary-fixture-slug",
+                "session_token": f"ORDINARY_SESSION_{index:02d}_not_a_credential_value",
+                "csrf_token": f"ORDINARY_CSRF_{index:02d}_not_a_credential_value",
+            }
+            for index in range(14)
+        ]
+        ordinary_manifest = {
+            "schema": 2,
+            "purpose": "external_ready_vote",
+            "origin": "https://old-sparky.com",
+            "session_cookie_name": "__Host-session",
+            "csrf_cookie_name": "__Host-session_csrf",
+            "marker": "preprod202611020000abce",
+            "created_at": "2026-11-02T00:00:00Z",
+            "tournaments": [
+                {"id": "ordinary-tournament-id", "slug": "ordinary-fixture-slug", "user_count": 14}
+            ],
+            "users": ordinary_users,
+            "runner_sha": runner_sha,
+            "app_target_sha": runner_sha,
+            "source_binding": None,
+            "source_binding_sha256": None,
+        }
+        ordinary_input_path = ordinary_input_dir / "platform-production-external-load-input.json"
+        ordinary_manifest_path = ordinary_fixture_dir / "manifest.json"
+        ordinary_input_path.write_text(
+            json.dumps(ordinary_input, ensure_ascii=True, separators=(",", ":")) + "\n",
+            encoding="ascii",
+        )
+        ordinary_manifest_path.write_text(
+            json.dumps(ordinary_manifest, ensure_ascii=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        ordinary_input_path.chmod(0o600)
+        ordinary_manifest_path.chmod(0o600)
+        run_yaml_step(
+            encrypted_manifest_step,
+            ordinary_temp,
+            extra_env={
+                "GITHUB_RUN_ID": run_id,
+                "GITHUB_RUN_ATTEMPT": attempt,
+                "TARGET_SHA": runner_sha,
+                "APP_TARGET_SHA": runner_sha,
+            },
+        )
+        ordinary_descriptor = ordinary_fixture_dir / "fixture-descriptor.json"
+        ordinary_reference = ordinary_fixture_dir / "ordinary-reference-descriptor.json"
+        transport.build_descriptor(
+            ordinary_input_path, ordinary_manifest_path, ordinary_reference,
+            run_id, attempt, runner_sha, runner_sha,
+        )
+        ordinary_public = json.loads(ordinary_descriptor.read_text(encoding="ascii"))
+        self.assertEqual(
+            ordinary_public,
+            json.loads(ordinary_reference.read_text(encoding="ascii")),
+        )
+        self.assertNotIn("fixture_schedule", ordinary_public["input"])
+        self.assertNotIn("fixture_schedule", ordinary_public["manifest"])
+        self.assertNotIn("control_email", ordinary_public["input"])
+        self.assertNotIn("session_token", json.dumps(ordinary_public, sort_keys=True))
+        self.assertNotIn("csrf_token", json.dumps(ordinary_public, sort_keys=True))
+        for value in (
+            ordinary_input["control_email"],
+            *(row[field] for row in ordinary_users for field in (
+                "user_id", "tournament_slug", "session_token", "csrf_token",
+            )),
+        ):
+            self.assertNotIn(value.encode("ascii"), ordinary_descriptor.read_bytes())
 
     def test_public_artifacts_are_ciphertext_and_fixture_key_is_scoped(self) -> None:
         document = yaml.safe_load((WORKFLOW_ROOT / "platform-production-external-load.yml").read_text(encoding="utf-8"))
