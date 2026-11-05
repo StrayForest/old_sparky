@@ -40,6 +40,8 @@ async def get_me(
         await lookup.write_after_db_release(user_id=auth_session.user.id)
         return response
     finally:
-        await release_db_connection(db_session)
-        if lookup is not None:
-            lookup.finish_without_write()
+        try:
+            await release_db_connection(db_session)
+        finally:
+            if lookup is not None:
+                lookup.finish_without_write()

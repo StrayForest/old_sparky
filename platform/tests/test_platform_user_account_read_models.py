@@ -328,6 +328,98 @@ class UserAccountReadModelTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(release_mock.await_count, 2)
         self.assertEqual(record_event.call_args.kwargs["outcome"], "miss")
 
+    async def test_route_records_failed_set_duration_once_when_final_release_raises(self) -> None:
+        account = _account()
+        lookup = UserAccountReadModelLookup(
+            account=account,
+            get_ms=1.0,
+            build_ms=2.0,
+            outcome="miss",
+            pending_generation="generation-one",
+            pending_revision=10,
+            pending_payload=account,
+        )
+        release_count = 0
+
+        async def release(_session: object) -> None:
+            nonlocal release_count
+            release_count += 1
+            if release_count == 2:
+                raise RuntimeError("session close failed")
+
+        with patch(
+            "apps.platform_api.app.api.routes.users.get_or_build_user_account_read_model",
+            new=AsyncMock(return_value=lookup),
+        ), patch(
+            "apps.platform_api.app.api.routes.users.release_db_connection",
+            new=AsyncMock(side_effect=release),
+        ), patch(
+            "apps.platform_api.app.services.user_account_read_models._write",
+            new=AsyncMock(side_effect=RuntimeError("unexpected cache write failure")),
+        ) as write, patch(
+            "apps.platform_api.app.services.user_account_read_models.perf_counter",
+            side_effect=(10.0, 10.25),
+        ), patch(
+            "apps.platform_api.app.services.user_account_read_models.record_redis_read_model_event",
+        ) as record_event:
+            with self.assertRaisesRegex(RuntimeError, "session close failed"):
+                await get_me(
+                    SimpleNamespace(
+                        user=_user(),
+                        role_slugs=frozenset({"player"}),
+                        now=datetime(2026, 1, 2, tzinfo=UTC),
+                    ),
+                    SimpleNamespace(),
+                )
+
+        write.assert_awaited_once()
+        self.assertEqual(release_count, 2)
+        record_event.assert_called_once()
+        self.assertEqual(record_event.call_args.kwargs["outcome"], "write_error")
+        self.assertEqual(record_event.call_args.kwargs["set_ms"], 250.0)
+
+    async def test_route_records_cancelled_set_timing_once_and_propagates_cancel(self) -> None:
+        account = _account()
+        lookup = UserAccountReadModelLookup(
+            account=account,
+            get_ms=1.0,
+            build_ms=2.0,
+            outcome="miss",
+            pending_generation="generation-one",
+            pending_revision=10,
+            pending_payload=account,
+        )
+        with patch(
+            "apps.platform_api.app.api.routes.users.get_or_build_user_account_read_model",
+            new=AsyncMock(return_value=lookup),
+        ), patch(
+            "apps.platform_api.app.api.routes.users.release_db_connection",
+            new=AsyncMock(),
+        ) as release, patch(
+            "apps.platform_api.app.services.user_account_read_models._write",
+            new=AsyncMock(side_effect=asyncio.CancelledError()),
+        ) as write, patch(
+            "apps.platform_api.app.services.user_account_read_models.perf_counter",
+            side_effect=(20.0, 20.5),
+        ), patch(
+            "apps.platform_api.app.services.user_account_read_models.record_redis_read_model_event",
+        ) as record_event:
+            with self.assertRaises(asyncio.CancelledError):
+                await get_me(
+                    SimpleNamespace(
+                        user=_user(),
+                        role_slugs=frozenset({"player"}),
+                        now=datetime(2026, 1, 2, tzinfo=UTC),
+                    ),
+                    SimpleNamespace(),
+                )
+
+        write.assert_awaited_once()
+        self.assertEqual(release.await_count, 2)
+        record_event.assert_called_once()
+        self.assertEqual(record_event.call_args.kwargs["outcome"], "write_error")
+        self.assertEqual(record_event.call_args.kwargs["set_ms"], 500.0)
+
 
 class UserAccountReadModelRedisIntegrationTests(PlatformIsolatedAsyncioTestCase):
     async def test_real_lua_generation_guard_rejects_stale_and_expired_writers(self) -> None:

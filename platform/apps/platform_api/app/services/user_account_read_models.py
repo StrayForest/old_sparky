@@ -141,16 +141,16 @@ class UserAccountReadModelLookup:
     pending_revision: int | None = None
     pending_payload: dict[str, Any] | None = None
     finalized: bool = False
+    set_ms: float = 0.0
 
     def finish_without_write(self) -> None:
         if self.finalized:
             return
-        self._record(set_ms=0.0)
+        self._record(set_ms=self.set_ms)
 
     async def write_after_db_release(self, *, user_id: str) -> None:
         if self.finalized:
             return
-        set_ms = 0.0
         if self.pending_generation is not None:
             started = perf_counter()
             try:
@@ -165,10 +165,10 @@ class UserAccountReadModelLookup:
                 raise
             finally:
                 # This is wall time across Redis I/O, not CPU time.
-                set_ms = (perf_counter() - started) * 1000
+                self.set_ms = (perf_counter() - started) * 1000
             if write_ok is None:
                 self.outcome = "write_error"
-        self._record(set_ms=set_ms)
+        self._record(set_ms=self.set_ms)
 
     def _record(self, *, set_ms: float) -> None:
         if self.finalized:

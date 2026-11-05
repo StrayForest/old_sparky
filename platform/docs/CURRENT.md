@@ -10,14 +10,18 @@ belong in the linked owner documents below.
 
 ## Live and pending state
 
-- Production app source A is
-  `82956d85cdc7cec034c74ac22e8cd7091c229fcc` (deployment run
-  `42022174887/1`; previous app source `f72d3c969a4d89a435be25fd8ec0f2ebc11f02e0`);
-  active host-tools generation C is
-  `0de51aca4b4d04a80a2f0d392003cc258d8f1400`. Resolve A from the successful
-  deployment receipt and C from the checked-in active pin for each operation.
-  Keep workflow runner S, application A and host-tools C distinct; a matching
-  runner SHA does not prove deployment or installation.
+- Last verified production baseline is app A
+  `c116de3f78f85833646aa23d117c6a0a313db6cb` (deployment run
+  `42059556545/1`; previous app source
+  `82956d85cdc7cec034c74ac22e8cd7091c229fcc`), with active host-tools
+  generation C `0de51aca4b4d04a80a2f0d392003cc258d8f1400`. The exact read-only
+  baseline observation is bound in deployment run `42071875137`; that run did
+  not deploy the current runner source. Before future production work, use the
+  canonical full-readiness receipt to confirm the live baseline and locks.
+  Resolve A from a successful deployment receipt and C from the checked-in
+  active pin for each operation. Keep workflow runner S, application A and
+  host-tools C distinct; a matching runner SHA does not prove deployment or
+  installation.
 - The targeted API read-mix run `42034147480/1` has closed with authoritative
   fixture cleanup; no load or fixture is active. One restore-verified backup
   pair is retained. Post-run FULL readiness is not yet evidenced: two canonical

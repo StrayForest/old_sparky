@@ -137,7 +137,10 @@ failed reservation skips warming because there is no generation to guard.
 The diagnostic outcome `miss` means the request built its response from
 PostgreSQL; it does not certify that the cache write was accepted, since an
 invalidation or newer generation can reject that write without affecting the
-response.
+response. The per-request timing event retains the attempted Redis SET wall
+time when the write raises or is cancelled, and route cleanup records it even
+if final connection release raises. This diagnostic timing does not change the
+response or exception behavior.
 
 Authentication routes use a shared human-verification trust grant for the
 browser after a successful Cloudflare Turnstile Siteverify call. The grant is
