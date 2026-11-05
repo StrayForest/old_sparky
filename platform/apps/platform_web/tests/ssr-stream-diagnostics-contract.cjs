@@ -3,6 +3,8 @@
 const childProcess = process.getBuiltinModule("node:child_process");
 const fs = process.getBuiltinModule("node:fs");
 const path = process.getBuiltinModule("node:path");
+const os = process.getBuiltinModule("node:os");
+const assert = process.getBuiltinModule("node:assert/strict");
 
 const guardPath = path.resolve(__dirname, "..", "server-shutdown-guard.cjs");
 const fixtureWatchdogMs = 3_000;
@@ -388,7 +390,158 @@ function assertCount(output, fragment, expected, name) {
   }
 }
 
+async function verifyCpuProfileSourceMapContract() {
+  const { categoryForFrame, functionIdForFrame, summarizeFunctionSamples } = await import(
+    path.resolve(__dirname, "../lib/cpu-profile-categories.mjs")
+  );
+  const { CPU_PROFILE_SOURCE_MAP_LIMITS, mapSampledFrames } = await import(
+    path.resolve(__dirname, "../lib/cpu-profile-source-maps.mjs")
+  );
+  const { mapAfterCpuWindowSnapshot, runCpuWindowSetup } = await import(
+    path.resolve(__dirname, "../lib/cpu-profile-window.mjs")
+  );
+
+  let releaseSnapshot;
+  const snapshot = new Promise((resolve) => { releaseSnapshot = resolve; });
+  let mapCalls = 0;
+  const result = mapAfterCpuWindowSnapshot(1234, snapshot, () => {
+    mapCalls += 1;
+    return "mapped";
+  });
+  assert.equal(mapCalls, 0);
+  releaseSnapshot();
+  assert.deepEqual(await result, { elapsedMs: 1234, mapped: "mapped" });
+  assert.equal(mapCalls, 1);
+
+  let releaseFailedSetup;
+  const failedSetupSnapshot = new Promise((resolve) => { releaseFailedSetup = resolve; });
+  let settled = false;
+  void failedSetupSnapshot.then(() => { settled = true; });
+  const setupError = new Error("timer setup failed");
+  assert.throws(() => runCpuWindowSetup(releaseFailedSetup, () => { throw setupError; }), /timer setup failed/);
+  await Promise.resolve();
+  assert.equal(settled, true);
+
+  const planPath = path.resolve(__dirname, "../lib/performance-diagnostic-plan.ts");
+  const planSource = fs.readFileSync(planPath, "utf8");
+  const stopped = planSource.indexOf('"Profiler.stop"');
+  const elapsed = planSource.indexOf("const elapsedAtStopMs = Math.max", stopped);
+  const snapshotWait = planSource.indexOf('waitForCpuUsageWindowSnapshot(runId, "on")', elapsed);
+  const mapping = planSource.indexOf("mapSampledFrames(", snapshotWait);
+  if (stopped < 0 || elapsed <= stopped || snapshotWait <= elapsed || mapping <= snapshotWait) {
+    throw new Error("Web profile maps before the process-CPU snapshot or changes stop-time elapsed accounting");
+  }
+  if (!planSource.includes("Math.max(0, endTarget - startMs)")
+      || !planSource.includes("const usage = process.cpuUsage(startCpu);")) {
+    throw new Error("Web process-CPU window timing inputs changed");
+  }
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "web-cpu-map-"));
+  const appRoot = path.join(root, "app");
+  const runtimeCwd = path.join(appRoot, ".next", "standalone");
+  const runtimeChunks = path.join(runtimeCwd, ".next", "server", "chunks");
+  const siblingChunks = path.join(appRoot, ".next", "server", "chunks");
+  fs.mkdirSync(runtimeChunks, { recursive: true });
+  fs.mkdirSync(siblingChunks, { recursive: true });
+  const addChunk = (name, sourceUrl) => {
+    const runtimePath = path.join(runtimeChunks, name);
+    const siblingPath = path.join(siblingChunks, name);
+    const code = "function compiled() { return 1; }\n";
+    fs.writeFileSync(runtimePath, code);
+    fs.writeFileSync(siblingPath, code);
+    fs.writeFileSync(`${siblingPath}.map`, JSON.stringify({
+      version: 3, sources: [sourceUrl], names: [], mappings: "AAAA",
+    }));
+    return runtimePath;
+  };
+  try {
+    const nextPath = addChunk("next.js", path.join(root, "node_modules/next/dist/server/render.js"));
+    const reactPath = addChunk("react.js", path.join(root, "node_modules/react-dom/server.js"));
+    const oddPath = addChunk("odd.js", path.join(root, "vendor/unknown.js"));
+    const indexedPath = addChunk("indexed.js", path.join(root, "node_modules/next/dist/server/response.js"));
+    fs.writeFileSync(`${path.join(siblingChunks, "indexed.js")}.map`, JSON.stringify({
+      version: 3,
+      sections: [{
+        offset: { line: 0, column: 0 },
+        map: { version: 3, sources: [path.join(root, "node_modules/next/dist/server/response.js")], names: [], mappings: "AAAA" },
+      }],
+    }));
+    const linkedPath = path.join(runtimeChunks, "linked.js");
+    fs.symlinkSync(nextPath, linkedPath);
+    fs.writeFileSync(path.join(siblingChunks, "linked.js"), fs.readFileSync(nextPath));
+    fs.writeFileSync(`${path.join(siblingChunks, "linked.js")}.map`, fs.readFileSync(`${path.join(siblingChunks, "next.js")}.map`));
+    const pathToFileURL = process.getBuiltinModule("node:url").pathToFileURL;
+    const raw = new Map([
+      [1, { url: nextPath, functionName: "renderToResponseWithComponentsImpl", lineNumber: 0, columnNumber: 0 }],
+      [2, { url: reactPath, functionName: "renderToString", lineNumber: 0, columnNumber: 0 }],
+      [3, { url: nextPath, functionName: "renderToResponseWithComponentsImpl" }],
+      [4, { url: "webpack:///node_modules/next/dist/server/render.js", functionName: "renderToResponseWithComponentsImpl", lineNumber: 0, columnNumber: 0 }],
+      [5, { url: oddPath, functionName: "privateSymbol", lineNumber: 0, columnNumber: 0 }],
+      [6, { url: path.join(root, "outside.js"), functionName: "renderToResponseWithComponentsImpl", lineNumber: 0, columnNumber: 0 }],
+      [7, { url: nextPath, functionName: "unknownFrameworkName", lineNumber: 0, columnNumber: 0 }],
+      [8, { url: pathToFileURL(nextPath).href, functionName: "renderToResponseWithComponentsImpl", lineNumber: 0, columnNumber: 0 }],
+      [9, { url: linkedPath, functionName: "renderToResponseWithComponentsImpl", lineNumber: 0, columnNumber: 0 }],
+      [10, { url: indexedPath, functionName: "renderToResponseWithComponentsImpl", lineNumber: 0, columnNumber: 0 }],
+    ]);
+    const mapped = mapSampledFrames(raw, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], runtimeCwd);
+    assert.equal(categoryForFrame(mapped.get(1)?.url ?? "", mapped.get(1)?.functionName), "web_framework");
+    assert.equal(functionIdForFrame(mapped.get(1)?.url ?? "", mapped.get(1)?.functionName), "web.next.render_response");
+    assert.equal(functionIdForFrame(mapped.get(2)?.url ?? "", mapped.get(2)?.functionName), "web.react.render_string");
+    assert.deepEqual(mapped.get(3), raw.get(3));
+    assert.deepEqual(mapped.get(4), raw.get(4));
+    assert.equal(categoryForFrame(mapped.get(5)?.url ?? "", mapped.get(5)?.functionName), "other");
+    assert.equal(functionIdForFrame(mapped.get(5)?.url ?? "", mapped.get(5)?.functionName), null);
+    assert.deepEqual(mapped.get(6), raw.get(6));
+    assert.equal(categoryForFrame(mapped.get(7)?.url ?? "", mapped.get(7)?.functionName), "web_framework");
+    assert.equal(functionIdForFrame(mapped.get(7)?.url ?? "", mapped.get(7)?.functionName), null);
+    assert.equal(functionIdForFrame(mapped.get(8)?.url ?? "", mapped.get(8)?.functionName), "web.next.render_response");
+    assert.deepEqual(mapped.get(9), raw.get(9));
+    assert.equal(functionIdForFrame(mapped.get(10)?.url ?? "", mapped.get(10)?.functionName), "web.next.render_response");
+    const summary = summarizeFunctionSamples(mapped, [1, 2, 1]);
+    assert.deepEqual(summary.rows, [
+      { function_id: "web.next.render_response", samples: 2 },
+      { function_id: "web.react.render_string", samples: 1 },
+    ]);
+    assert.doesNotMatch(JSON.stringify(summary), /web-cpu-map|render\.js|renderToResponse/);
+    assert.deepEqual(CPU_PROFILE_SOURCE_MAP_LIMITS, {
+      files: 192, mapBytes: 2 * 1024 * 1024, totalBytes: 12 * 1024 * 1024, generatedBytes: 16 * 1024 * 1024,
+    });
+
+    const mapPath = `${path.join(siblingChunks, "next.js")}.map`;
+    fs.writeFileSync(mapPath, "not json");
+    assert.deepEqual(mapSampledFrames(raw, [1], runtimeCwd).get(1), raw.get(1));
+    fs.writeFileSync(path.join(siblingChunks, "next.js"), "mismatched generated code");
+    assert.deepEqual(mapSampledFrames(raw, [1], runtimeCwd).get(1), raw.get(1));
+    fs.writeFileSync(path.join(siblingChunks, "next.js"), fs.readFileSync(nextPath));
+    fs.rmSync(mapPath);
+    assert.deepEqual(mapSampledFrames(raw, [1], runtimeCwd).get(1), raw.get(1));
+    fs.symlinkSync(path.join(root, "elsewhere.map"), mapPath);
+    fs.writeFileSync(path.join(root, "elsewhere.map"), JSON.stringify({ version: 3, sources: ["node:internal/x"], names: [], mappings: "AAAA" }));
+    assert.equal(fs.lstatSync(mapPath).isSymbolicLink(), true);
+    assert.deepEqual(mapSampledFrames(raw, [1], runtimeCwd).get(1), raw.get(1));
+    fs.rmSync(mapPath);
+    for (const limits of [
+      { ...CPU_PROFILE_SOURCE_MAP_LIMITS, files: 0 },
+      { ...CPU_PROFILE_SOURCE_MAP_LIMITS, mapBytes: 1 },
+      { ...CPU_PROFILE_SOURCE_MAP_LIMITS, totalBytes: 1 },
+      { ...CPU_PROFILE_SOURCE_MAP_LIMITS, generatedBytes: 1 },
+    ]) {
+      assert.deepEqual(mapSampledFrames(raw, [1], runtimeCwd, limits).get(1), raw.get(1));
+    }
+    fs.mkdirSync(mapPath);
+    assert.deepEqual(mapSampledFrames(raw, [1], runtimeCwd).get(1), raw.get(1));
+    fs.rmSync(mapPath, { recursive: true });
+    fs.writeFileSync(mapPath, JSON.stringify({
+      version: 3, sources: [path.join(root, "node_modules/next/dist/server/render.js")], names: [], mappings: "",
+    }));
+    assert.deepEqual(mapSampledFrames(raw, [1], runtimeCwd).get(1), raw.get(1));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
 async function main() {
+  await verifyCpuProfileSourceMapContract();
   const guardSource = fs.readFileSync(guardPath, "utf8");
   for (const fragment of [
     "maxSelectedRequests = 128",

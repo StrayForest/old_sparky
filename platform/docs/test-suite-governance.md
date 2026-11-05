@@ -49,7 +49,7 @@ contracts from `shutdown-guard-contract.cjs`, `ssr-stream-diagnostics-contract.c
 contract self-signals only after the guard preload, has a bounded in-child
 watchdog, and cleans up its detached process group on failure. The SSR
 contract bounds both enabled and disabled fixtures and cleans up their
-detached process groups on failure. The backend tool contour keeps
+detached process groups on failure. It also owns pure-Node V8 source-map allowlist/bounds/fallback and process-CPU snapshot ordering without a browser. The backend tool contour keeps
 source/ownership assertions for these contracts but does not execute their
 Node processes; this prevents an unpinned backend runner from duplicating the
 web runtime checks. The heap contract injects a fake clock, process memory and
