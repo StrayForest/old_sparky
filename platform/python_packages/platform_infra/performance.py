@@ -338,6 +338,7 @@ def record_redis_read_model_event(
     set_ms: float = 0.0,
     payload_bytes: int = 0,
     revision: int | None = None,
+    include_payload_metadata: bool = True,
 ) -> None:
     """Attach shared Redis read-model evidence to the current request.
 
@@ -348,17 +349,17 @@ def record_redis_read_model_event(
     metrics = _current_metrics.get()
     if metrics is None:
         return
-    metrics.redis_read_model_events.append(
-        {
-            "model": str(model),
-            "outcome": str(outcome),
-            "get_ms": round(max(0.0, float(get_ms)), 3),
-            "build_ms": round(max(0.0, float(build_ms)), 3),
-            "set_ms": round(max(0.0, float(set_ms)), 3),
-            "payload_bytes": max(0, int(payload_bytes)),
-            "revision": int(revision) if revision is not None else None,
-        }
-    )
+    event = {
+        "model": str(model),
+        "outcome": str(outcome),
+        "get_ms": round(max(0.0, float(get_ms)), 3),
+        "build_ms": round(max(0.0, float(build_ms)), 3),
+        "set_ms": round(max(0.0, float(set_ms)), 3),
+    }
+    if include_payload_metadata:
+        event["payload_bytes"] = max(0, int(payload_bytes))
+        event["revision"] = int(revision) if revision is not None else None
+    metrics.redis_read_model_events.append(event)
 
 
 def record_profile_read_model_event(
@@ -640,7 +641,14 @@ class RequestPerformanceMiddleware:
             or is_sampled_ssr_auth_bootstrap
             or metrics.authenticated_read_admission_shed
             or any(
-                event["outcome"] in {"error", "fallback_db"}
+                event["outcome"] in {
+                    "error",
+                    "fallback_db",
+                    "read_error",
+                    "write_error",
+                    "read_write_error",
+                    "build_error",
+                }
                 for event in metrics.redis_read_model_events
             )
             or any(

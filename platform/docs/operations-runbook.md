@@ -280,7 +280,7 @@ authorization remain authoritative in PostgreSQL. Its monthly quota count is
 refreshed on every cache hit because it is derived from tournament rows;
 profile, identity, password, credit, role and tournament-creation commits
 invalidate the representation. A Redis hit removes supplemental joins but not
-the authoritative auth lookup or quota count.
+the authoritative auth lookup or quota count. With `request_perf` diagnostics enabled, the account read-model emits low-cardinality Redis GET, async build-wall and Redis write-wall timings with bounded hit/miss/error outcomes. `build_ms` is wall time, not CPU time, and these spans do not cover the full route, SQL work or DB connection hold. Errors use the existing retention trigger; hit/miss events follow sampling. Events omit account IDs, Redis keys, payloads, revisions and timestamps.
 
 The current candidate deliberately does not make public HTML static or bypass
 the nonce CSP. Any future public/static route split requires a separate

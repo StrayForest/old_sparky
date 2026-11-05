@@ -76,7 +76,9 @@ class UserAccountReadModelTests(PlatformIsolatedAsyncioTestCase):
         ), patch(
             "apps.platform_api.app.services.user_account_read_models.private_tournament_monthly_remaining",
             new=AsyncMock(return_value=0),
-        ):
+        ), patch(
+            "apps.platform_api.app.services.user_account_read_models.record_redis_read_model_event",
+        ) as record_event:
             result = await get_or_build_user_account_read_model(
                 db_session,
                 user=user,
@@ -87,6 +89,106 @@ class UserAccountReadModelTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(result["private_tournament_monthly_limit"], 1)
         client.get.assert_awaited_once_with(user_account_read_model_key("user-1"))
         db_session.execute.assert_not_awaited()
+        event = record_event.call_args.kwargs
+        self.assertEqual(event["model"], "user_account")
+        self.assertEqual(event["outcome"], "hit")
+        self.assertGreaterEqual(event["get_ms"], 0)
+        self.assertEqual(event["build_ms"], 0)
+        self.assertEqual(event["set_ms"], 0)
+        self.assertEqual(
+            set(event), {
+                "model", "outcome", "get_ms", "build_ms", "set_ms",
+                "include_payload_metadata",
+            }
+        )
+
+    async def test_cache_miss_records_build_and_swallowed_write_failure(self) -> None:
+        user = SimpleNamespace(id="private-user-id")
+        payload = {
+            "avatar_url": None,
+            "avatar_media": None,
+            "steam_id": None,
+            "steam_linked": False,
+            "has_password": False,
+            "can_unlink_steam": False,
+            "private_tournament_monthly_remaining": 1,
+            "private_tournament_monthly_limit": 1,
+        }
+        client = SimpleNamespace(get=AsyncMock(return_value=None), aclose=AsyncMock())
+        with patch(
+            "apps.platform_api.app.services.user_account_read_models.redis_client",
+            return_value=client,
+        ), patch(
+            "apps.platform_api.app.services.user_account_read_models.build_user_account_read_model",
+            new=AsyncMock(return_value=(10, payload)),
+        ), patch(
+            "apps.platform_api.app.services.user_account_read_models._write",
+            new=AsyncMock(return_value=False),
+        ), patch(
+            "apps.platform_api.app.services.user_account_read_models.record_redis_read_model_event",
+        ) as record_event:
+            result = await get_or_build_user_account_read_model(
+                SimpleNamespace(),
+                user=user,
+                now=datetime(2026, 1, 2, tzinfo=UTC),
+            )
+
+        self.assertEqual(result, payload)
+        client.get.assert_awaited_once_with(user_account_read_model_key("private-user-id"))
+        client.aclose.assert_awaited_once()
+        event = record_event.call_args.kwargs
+        self.assertEqual(event["outcome"], "write_error")
+        self.assertGreaterEqual(event["get_ms"], 0)
+        self.assertGreaterEqual(event["build_ms"], 0)
+        self.assertGreaterEqual(event["set_ms"], 0)
+        self.assertEqual(
+            set(event), {
+                "model", "outcome", "get_ms", "build_ms", "set_ms",
+                "include_payload_metadata",
+            }
+        )
+        self.assertNotIn("private-user-id", repr(event))
+        self.assertNotIn("private_tournament_monthly_remaining", repr(event))
+
+    async def test_cache_read_and_write_errors_have_distinct_outcome(self) -> None:
+        user = SimpleNamespace(id="user-1")
+        payload = {
+            "avatar_url": None,
+            "avatar_media": None,
+            "steam_id": None,
+            "steam_linked": False,
+            "has_password": False,
+            "can_unlink_steam": False,
+            "private_tournament_monthly_remaining": 1,
+            "private_tournament_monthly_limit": 1,
+        }
+        client = SimpleNamespace(
+            get=AsyncMock(side_effect=OSError("private cache detail")),
+            aclose=AsyncMock(),
+        )
+        with patch(
+            "apps.platform_api.app.services.user_account_read_models.redis_client",
+            return_value=client,
+        ), patch(
+            "apps.platform_api.app.services.user_account_read_models.build_user_account_read_model",
+            new=AsyncMock(return_value=(10, payload)),
+        ), patch(
+            "apps.platform_api.app.services.user_account_read_models._write",
+            new=AsyncMock(return_value=False),
+        ), patch(
+            "apps.platform_api.app.services.user_account_read_models.record_redis_read_model_event",
+        ) as record_event:
+            await get_or_build_user_account_read_model(
+                SimpleNamespace(),
+                user=user,
+                now=datetime(2026, 1, 2, tzinfo=UTC),
+            )
+
+        self.assertEqual(record_event.call_args.kwargs["outcome"], "read_write_error")
+        self.assertEqual(set(record_event.call_args.kwargs), {
+            "model", "outcome", "get_ms", "build_ms", "set_ms",
+            "include_payload_metadata",
+        })
 
 
 if __name__ == "__main__":

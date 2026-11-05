@@ -1656,7 +1656,14 @@ class ExternalLoadTests(unittest.TestCase):
             b'<section class="hero-wrap">' + raw_heading("Fixture title") + b"</section>",
             b'<section class="route-loading-shell"></section>',
         ))
-        valid_id = "0123456789abcdef0123456789abcdef"
+        join_run_id = "a" * 32
+        valid_id = next(
+            f"{candidate:032x}"
+            for candidate in range(1, 100)
+            if capacity_diagnostic._ssr_join_id_is_eligible(
+                join_run_id, f"{candidate:032x}"
+            )
+        )
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -1666,11 +1673,13 @@ class ExternalLoadTests(unittest.TestCase):
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("X-Private-Unapproved", "must-not-leak")
-                if self.path.endswith("fixture-valid"):
+                if self.path.endswith(("fixture-valid", "fixture-body-timeout")):
                     self.send_header("X-Platform-SSR-Request-Id", valid_id)
                 elif self.path.endswith("fixture-malformed"):
                     self.send_header("X-Platform-SSR-Request-Id", "not-an-id")
                 self.end_headers()
+                if self.path.endswith("fixture-body-timeout"):
+                    time.sleep(0.15)
                 self.wfile.write(body)
 
             def log_message(self, _format: str, *_args: object) -> None:
@@ -1702,6 +1711,17 @@ class ExternalLoadTests(unittest.TestCase):
                 filtered = client.get(
                     "/untrusted-header-check", headers={"Accept": "text/plain"},
                 )
+                results["body-timeout"] = external_load._page_request_http11_keepalive(
+                    origin,
+                    VirtualUser("actor", "fixture-body-timeout", "s" * 32, "c" * 32),
+                    "html-capacity",
+                    0.03,
+                    session_cookie_name="session",
+                    csrf_cookie_name="csrf",
+                    capture_timestamps=True,
+                    diagnostic_trace_run_id=join_run_id,
+                    require_authenticated_html=True,
+                )
         finally:
             client = getattr(local_transport, "client", None)
             if isinstance(client, HTTP11KeepAliveClient):
@@ -1710,7 +1730,9 @@ class ExternalLoadTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=2)
 
-        self.assertTrue(all(result.ok for result in results.values()))
+        self.assertTrue(
+            all(results[name].ok for name in ("valid", "missing", "malformed"))
+        )
         self.assertEqual(results["valid"].ssr_request_id, valid_id)
         self.assertFalse(results["valid"].ssr_request_id_malformed)
         self.assertIsNone(results["missing"].ssr_request_id)
@@ -1718,6 +1740,24 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertIsNone(results["malformed"].ssr_request_id)
         self.assertTrue(results["malformed"].ssr_request_id_malformed)
         self.assertNotIn("x-private-unapproved", filtered.headers)
+        failed_body = results["body-timeout"]
+        self.assertFalse(failed_body.ok)
+        self.assertEqual(failed_body.status, 0)
+        self.assertEqual(failed_body.observed_status, 200)
+        self.assertEqual(failed_body.failure_stage, "body_receive")
+        self.assertEqual(failed_body.transport_error_code, "timeout")
+        self.assertEqual(failed_body.ssr_request_id, valid_id)
+        self.assertEqual(
+            capacity_diagnostic._selected_ssr_join_request_ids(
+                [failed_body], join_run_id
+            ),
+            [valid_id],
+        )
+        self.assertIsNone(client._connection)
+        public_failure = project_public_artifact(
+            "external_load", {"raw_http": summarize_results([failed_body])}
+        )
+        self.assertNotIn(valid_id, json.dumps(public_failure))
 
     def test_html_capacity_response_failure_stops_refill_and_keeps_partial_counts(self) -> None:
         actors = [VirtualUser(f"actor-{index}", "fixture", "s" * 32, "c" * 32) for index in range(14)]
@@ -3100,6 +3140,10 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertEqual(summary["status_counts"], {"200": len(users)})
         self.assertEqual(summary["retry_attempts"], 0)
         self.assertEqual(summary["error_kinds"], {"transport": 1})
+        self.assertEqual(
+            summary["failure_diagnostics"]["transport_error_code_counts"],
+            {"incomplete_response": 1},
+        )
         self.assertNotIn("private-body", repr(summary))
 
         class BrokenResponse:
@@ -3752,6 +3796,7 @@ class ExternalLoadTests(unittest.TestCase):
                 "failure_stage_counts": {"body_receive": 1, "response_headers": 1},
                 "observed_status_counts": {"200": 1, "unknown": 1},
                 "connection_state_counts": {"new": 1, "reused": 1},
+                "transport_error_code_counts": {},
             },
         )
         self.assertEqual(summary["error_samples"][0]["status"], 0)
@@ -3782,6 +3827,9 @@ class ExternalLoadTests(unittest.TestCase):
 
         self.assertEqual(summary["cf_error_type_counts"], {"cf_522": 1})
         self.assertEqual(summary["cf_error_origin_counts"], {"origin": 1})
+        self.assertEqual(
+            summary["failure_diagnostics"]["transport_error_code_counts"], {}
+        )
         self.assertEqual(
             summary["error_samples"][0],
             {
@@ -3965,6 +4013,7 @@ class ExternalLoadTests(unittest.TestCase):
                 ok=False,
                 response_bytes=0,
                 error_kind="TimeoutError",
+                transport_error_code="timeout",
                 diagnostic_id=f"tdiag-123-{index:05d}",
             )
             for index in range(26)
@@ -3976,6 +4025,11 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertEqual(len(summary["timeout_diagnostics"]), 25)
         self.assertEqual(summary["timeout_diagnostic_total"], 26)
         self.assertEqual(summary["timeout_diagnostic_truncated"], 1)
+        self.assertEqual(
+            summary["failure_diagnostics"]["transport_error_code_counts"],
+            {"timeout": 26},
+        )
+        self.assertEqual(summary["error_samples"][0]["transport_error_code"], "timeout")
         self.assertEqual(
             summary["timeout_diagnostics"][0]["diagnostic_id"],
             "tdiag-123-00000",

@@ -6,8 +6,9 @@ from dataclasses import dataclass
 import json
 import logging
 from time import perf_counter
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
+from pydantic import BaseModel
 from redis.exceptions import RedisError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,6 +26,7 @@ ReadModelKind = Literal[
     "bracket_summary",
     "bracket_full",
 ]
+ReadModelT = TypeVar("ReadModelT", bound=BaseModel)
 
 READ_MODEL_KEY_PREFIX = "platform:tournament:read-model:v1"
 # This is a safety bound only. Consistency is controlled by the revision in
@@ -206,13 +208,15 @@ async def read_model_read_or_build(
     tournament_id: str,
     model: ReadModelKind,
     revision: int,
-    builder: Callable[[], Awaitable[Any]],
-) -> bytes:
-    """Read one serialized representation, falling back to PostgreSQL.
+    response_model: type[ReadModelT],
+    builder: Callable[[], Awaitable[ReadModelT]],
+) -> ReadModelT:
+    """Read one validated representation, falling back to PostgreSQL.
 
     Authentication and authorization are intentionally performed by callers
     before invoking this function. A revision-matching Redis hit never calls
-    the DB builder.
+    the DB builder. Cache hits are validated from JSON; a cache miss returns
+    the model already built for the cache write.
     """
 
     envelope, _get_ms, hit = await _redis_get(
@@ -221,7 +225,7 @@ async def read_model_read_or_build(
         revision=revision,
     )
     if hit and envelope is not None:
-        return envelope.payload
+        return response_model.model_validate_json(envelope.payload)
 
     build_started_at = perf_counter()
     value = await builder()
@@ -249,7 +253,7 @@ async def read_model_read_or_build(
             payload_bytes=len(payload),
             revision=revision,
         )
-    return payload
+    return value
 
 
 async def delete_tournament_read_models(

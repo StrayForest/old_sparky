@@ -233,6 +233,71 @@ class RequestPerformanceMiddlewareTests(unittest.TestCase):
         finally:
             performance.reset_request_metrics(token)
 
+    def test_redis_read_model_event_has_low_cardinality_timing_only(self) -> None:
+        token = performance.start_request_metrics("GET", "/api/v1/users/me")
+        try:
+            performance.record_redis_read_model_event(
+                model="user_account",
+                outcome="write_error",
+                get_ms=1.25,
+                build_ms=8.5,
+                set_ms=2.75,
+                include_payload_metadata=False,
+            )
+            performance.record_redis_read_model_event(
+                model="teams",
+                outcome="miss",
+                get_ms=0.5,
+                build_ms=4.0,
+                set_ms=1.0,
+                payload_bytes=32,
+                revision=9,
+            )
+            metrics = performance.current_request_metrics()
+            self.assertIsNotNone(metrics)
+            assert metrics is not None
+            self.assertEqual(
+                metrics.redis_read_model_events,
+                [
+                    {
+                        "model": "user_account",
+                        "outcome": "write_error",
+                        "get_ms": 1.25,
+                        "build_ms": 8.5,
+                        "set_ms": 2.75,
+                    },
+                    {
+                        "model": "teams",
+                        "outcome": "miss",
+                        "get_ms": 0.5,
+                        "build_ms": 4.0,
+                        "set_ms": 1.0,
+                        "payload_bytes": 32,
+                        "revision": 9,
+                    },
+                ],
+            )
+            middleware = performance.RequestPerformanceMiddleware(app=None)
+            with (
+                patch.object(performance, "get_settings", return_value=self.settings()),
+                patch.object(performance.logger, "info") as log_info,
+            ):
+                middleware._log_if_slow(
+                    {"route": SimpleNamespace(path="/users/me")}, metrics, 200
+                )
+
+            log_info.assert_called_once()
+            rendered = log_info.call_args.args[0] % log_info.call_args.args[1:]
+            self.assertIn("redis_read_model_models=user_account", rendered)
+            self.assertIn("redis_read_model_outcomes=write_error", rendered)
+            self.assertIn("redis_read_model_get_ms=1.75", rendered)
+            self.assertIn("redis_read_model_build_ms=12.50", rendered)
+            self.assertIn("redis_read_model_set_ms=3.75", rendered)
+            self.assertNotIn("user_id", rendered)
+            self.assertNotIn("read-model:v1:", rendered)
+        finally:
+            performance.reset_request_metrics(token)
+
     def test_auth_bootstrap_stages_record_bounded_components(self) -> None:
         token = performance.start_request_metrics(
             "GET",

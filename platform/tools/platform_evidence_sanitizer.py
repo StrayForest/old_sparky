@@ -68,6 +68,26 @@ SAFE_CF_ERROR_CLASSES = frozenset(
 PUBLIC_FAILURE_STAGE_CLASSES = frozenset(
     {"connect_or_request_write", "response_headers", "body_receive", "unknown", "other"}
 )
+PUBLIC_TRANSPORT_ERROR_CODES = frozenset(
+    {
+        "timeout",
+        "dns_resolution",
+        "tls",
+        "remote_disconnect",
+        "incomplete_response",
+        "http_protocol",
+        "connection_reset",
+        "connection_refused",
+        "connection_aborted",
+        "broken_pipe",
+        "network_unreachable",
+        "host_unreachable",
+        "not_connected",
+        "url_error",
+        "os_error",
+        "other",
+    }
+)
 SAFE_BACKENDS = frozenset({"api", "web", "worker", "qa", "observer", "postgres", "other"})
 SAFE_PROFILE_SIGNAL_REASONS = frozenset(
     {
@@ -175,7 +195,21 @@ SAFE_STAGE_NAMES = frozenset(
     }
 )
 
-SAFE_OUTCOMES = frozenset({"ok", "error", "timeout", "shed", "other"})
+SAFE_OUTCOMES = frozenset(
+    {
+        "ok",
+        "error",
+        "timeout",
+        "shed",
+        "hit",
+        "miss",
+        "read_error",
+        "write_error",
+        "read_write_error",
+        "build_error",
+        "other",
+    }
+)
 
 _DYNAMIC_SEGMENT = r"[^/]+"
 _ROUTE_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
@@ -1572,6 +1606,13 @@ def _project_error_row(value: Any) -> dict[str, Any]:
             and connection_state in {"reused", "new", "unknown"}
             else "unknown"
         )
+    if "transport_error_code" in source:
+        code = source.get("transport_error_code")
+        output["transport_error_code"] = (
+            code
+            if isinstance(code, str) and code in PUBLIC_TRANSPORT_ERROR_CODES
+            else "other"
+        )
     return output
 
 
@@ -1586,10 +1627,19 @@ def _project_failure_diagnostics(
         "observed_status_counts",
         "connection_state_counts",
     }
-    if set(source) != required:
+    optional_transport_codes = {"transport_error_code_counts"}
+    if frozenset(source) not in {
+        frozenset(required),
+        frozenset(required | optional_transport_codes),
+    }:
         return None
 
-    def counter(raw: Any, allowed: frozenset[str]) -> dict[str, int] | None:
+    def counter(
+        raw: Any,
+        allowed: frozenset[str],
+        *,
+        exact_total: bool = True,
+    ) -> dict[str, int] | None:
         values = _mapping(raw)
         if set(values) - allowed:
             return None
@@ -1598,7 +1648,9 @@ def _project_failure_diagnostics(
             if type(number) is not int or not 0 <= number <= 1_000_000_000:
                 return None
             output[key] = number
-        if sum(output.values()) != expected_errors:
+        if exact_total and sum(output.values()) != expected_errors:
+            return None
+        if not exact_total and sum(output.values()) > expected_errors:
             return None
         return dict(sorted(output.items()))
 
@@ -1612,11 +1664,21 @@ def _project_failure_diagnostics(
     )
     if stages is None or statuses is None or connections is None:
         return None
-    return {
+    result = {
         "failure_stage_counts": stages,
         "observed_status_counts": statuses,
         "connection_state_counts": connections,
     }
+    if "transport_error_code_counts" in source:
+        transport_codes = counter(
+            source.get("transport_error_code_counts"),
+            PUBLIC_TRANSPORT_ERROR_CODES,
+            exact_total=False,
+        )
+        if transport_codes is None:
+            return None
+        result["transport_error_code_counts"] = transport_codes
+    return result
 
 
 def _project_error_rows(value: Any, *, limit: int = 64) -> list[dict[str, Any]]:
@@ -1752,7 +1814,7 @@ def _project_summary(value: Any) -> dict[str, Any]:
         if events is not None:
             read_output["events"] = events
         for key, allowed in (
-            ("by_model", frozenset({"teams", "workspace_detail", "bracket_summary", "bracket_full", "other"})),
+            ("by_model", frozenset({"teams", "workspace_detail", "bracket_summary", "bracket_full", "user_account", "other"})),
             ("by_outcome", SAFE_OUTCOMES),
         ):
             counters = _project_counter(read_models.get(key), allowed)

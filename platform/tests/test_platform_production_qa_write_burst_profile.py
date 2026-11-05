@@ -520,6 +520,30 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
             },
         )
 
+    def test_request_perf_summary_projects_user_account_read_model_timings(self) -> None:
+        summary = summarize_request_perf_logs(
+            [
+                "request_perf method=GET path=/api/v1/users/me status=200 "
+                "request_ms=25.00 sql_count=2 pool_connection_hold_ms=18.00 "
+                "redis_read_model_models=user_account "
+                "redis_read_model_outcomes=write_error "
+                "redis_read_model_get_ms=1.25 "
+                "redis_read_model_build_ms=8.50 "
+                "redis_read_model_set_ms=2.75 "
+                "redis_read_model_payload_bytes=0 "
+                "redis_read_model_revisions=-"
+            ],
+            tournament_slug=None,
+        )
+
+        model = summary["redis_read_models"]
+        self.assertEqual(model["events"], 1)
+        self.assertEqual(model["by_model"], {"user_account": 1})
+        self.assertEqual(model["by_outcome"], {"write_error": 1})
+        self.assertEqual(model["get_ms"]["max_ms"], 1.25)
+        self.assertEqual(model["build_ms"]["max_ms"], 8.5)
+        self.assertEqual(model["set_ms"]["max_ms"], 2.75)
+
     def test_request_perf_summary_exposes_ready_vote_spans(self) -> None:
         summary = summarize_request_perf_logs(
             [

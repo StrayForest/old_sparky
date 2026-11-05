@@ -2618,6 +2618,9 @@ class PlatformVerificationContractTests(unittest.TestCase):
             fake_python.chmod(0o755)
             log_path = temp_root / "python-invocations.txt"
             env = os.environ.copy()
+            # This contract deliberately tests the explicit CI-venv path;
+            # isolate it from an outer aggregate-only gate invocation.
+            env.pop("PLATFORM_TEST_AGGREGATE_ONLY", None)
             env.update(
                 {
                     "PLATFORM_ENVIRONMENT": "test",

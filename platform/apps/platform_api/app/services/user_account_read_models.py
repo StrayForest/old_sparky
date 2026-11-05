@@ -29,6 +29,7 @@ from python_packages.platform_infra.models import (
     PlayerProfile,
     User,
 )
+from python_packages.platform_infra.performance import record_redis_read_model_event
 from python_packages.platform_infra.redis import redis_client
 
 logger = logging.getLogger(__name__)
@@ -187,7 +188,7 @@ async def build_user_account_read_model(
     return revision, payload
 
 
-async def _write(user_id: str, *, revision: int, payload: dict[str, Any]) -> None:
+async def _write(user_id: str, *, revision: int, payload: dict[str, Any]) -> bool:
     client = redis_client(decode_responses=False)
     try:
         await client.eval(
@@ -198,12 +199,14 @@ async def _write(user_id: str, *, revision: int, payload: dict[str, Any]) -> Non
             _encode(revision=revision, payload=payload),
             str(USER_ACCOUNT_READ_MODEL_SAFETY_TTL_SECONDS),
         )
+        return True
     except _REDIS_UNAVAILABLE as exc:
         logger.warning(
             "Redis user account read-model write failed user_id=%s error=%s",
             user_id,
             type(exc).__name__,
         )
+        return False
     finally:
         await client.aclose()
 
@@ -217,9 +220,27 @@ async def get_or_build_user_account_read_model(
     """Read cached supplemental fields or build them from the current session."""
 
     client = redis_client(decode_responses=False)
-    started_at = perf_counter()
+    get_ms = 0.0
+    build_ms = 0.0
+    set_ms = 0.0
+    outcome = "other"
+    read_failed = False
     try:
-        cached = _decode(await client.get(user_account_read_model_key(user.id)))
+        get_started = perf_counter()
+        try:
+            cached_raw = await client.get(user_account_read_model_key(user.id))
+        except _REDIS_UNAVAILABLE as exc:
+            read_failed = True
+            logger.warning(
+                "Redis user account read-model read failed user_id=%s error=%s",
+                user.id,
+                type(exc).__name__,
+            )
+            cached_raw = None
+        finally:
+            get_ms = (perf_counter() - get_started) * 1000
+            await client.aclose()
+        cached = _decode(cached_raw)
         if cached is not None:
             # The allowance is derived from tournament rows, not the user
             # record. Keep that one small authoritative count fresh even when
@@ -234,28 +255,47 @@ async def get_or_build_user_account_read_model(
                 now=now,
             )
             cached["private_tournament_monthly_limit"] = PRIVATE_TOURNAMENT_MONTHLY_LIMIT
+            outcome = "hit"
             return cached
-    except _REDIS_UNAVAILABLE as exc:
-        logger.warning(
-            "Redis user account read-model read failed user_id=%s error=%s",
-            user.id,
-            type(exc).__name__,
-        )
-    finally:
-        await client.aclose()
 
-    revision, payload = await build_user_account_read_model(
-        db_session,
-        user=user,
-        now=now,
-    )
-    await _write(user.id, revision=revision, payload=payload)
-    logger.debug(
-        "user_account_read_model_built user_id=%s build_ms=%.2f",
-        user.id,
-        (perf_counter() - started_at) * 1000,
-    )
-    return payload
+        build_started = perf_counter()
+        try:
+            revision, payload = await build_user_account_read_model(
+                db_session,
+                user=user,
+                now=now,
+            )
+        except BaseException:
+            outcome = "build_error"
+            raise
+        finally:
+            # This is wall time across the async builder, not CPU time.
+            build_ms = (perf_counter() - build_started) * 1000
+
+        set_started = perf_counter()
+        try:
+            write_ok = await _write(user.id, revision=revision, payload=payload)
+        finally:
+            set_ms = (perf_counter() - set_started) * 1000
+        if not write_ok:
+            outcome = "read_write_error" if read_failed else "write_error"
+        else:
+            outcome = "read_error" if read_failed else "miss"
+        logger.debug(
+            "user_account_read_model_built user_id=%s build_ms=%.2f",
+            user.id,
+            build_ms,
+        )
+        return payload
+    finally:
+        record_redis_read_model_event(
+            model="user_account",
+            outcome=outcome,
+            get_ms=get_ms,
+            build_ms=build_ms,
+            set_ms=set_ms,
+            include_payload_metadata=False,
+        )
 
 
 async def delete_user_account_read_model(user_id: str) -> None:

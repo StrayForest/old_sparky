@@ -1959,6 +1959,12 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                 self.assertEqual(
                     candidate["raw_http"]["error_kinds"], {"transport": 1}
                 )
+                self.assertEqual(
+                    candidate["raw_http"]["failure_diagnostics"][
+                        "transport_error_code_counts"
+                    ],
+                    {"url_error": 1},
+                )
             if retry_failure and candidate_mutation is None:
                 raw_timing = candidate["raw_http"]["timing"]
                 self.assertEqual(candidate["raw_http"]["retry_attempts"], 1)

@@ -2148,6 +2148,7 @@ class EvidencePrivacyTests(unittest.TestCase):
                     "failure_stage_counts": {"body_receive": 1},
                     "observed_status_counts": {"200": 1},
                     "connection_state_counts": {"reused": 1},
+                    "transport_error_code_counts": {"timeout": 1},
                 },
                 "error_samples": [{
                     "diagnostic_id": "tdiag-123-00001",
@@ -2158,9 +2159,11 @@ class EvidencePrivacyTests(unittest.TestCase):
                     "route_class": "tournament_workspace",
                     "status": 0,
                     "error_class": "timeout",
+                    "transport_error_code": "timeout",
                     "failure_stage": "body_receive",
                     "observed_status": 200,
                     "connection_state": "reused",
+                    "ssr_request_id": "0123456789abcdef0123456789abcdef",
                     "private_failure_detail": "secret-token",
                 }],
                 "timeout_diagnostics": [{
@@ -2270,6 +2273,7 @@ class EvidencePrivacyTests(unittest.TestCase):
                 "failure_stage_counts": {"body_receive": 1},
                 "observed_status_counts": {"200": 1},
                 "connection_state_counts": {"reused": 1},
+                "transport_error_code_counts": {"timeout": 1},
             },
         )
         self.assertEqual(
@@ -2285,6 +2289,7 @@ class EvidencePrivacyTests(unittest.TestCase):
                 "failure_stage": "body_receive",
                 "observed_status": 200,
                 "connection_state": "reused",
+                "transport_error_code": "timeout",
             },
         )
         self.assertEqual(
@@ -2339,6 +2344,7 @@ class EvidencePrivacyTests(unittest.TestCase):
         )
         self.assertNotIn("private-slug", public_output)
         self.assertNotIn("secret-token", public_output)
+        self.assertNotIn("0123456789abcdef0123456789abcdef", public_output)
         unknown_failure_field = {
             **external_source,
             "raw_http": {
@@ -2352,6 +2358,46 @@ class EvidencePrivacyTests(unittest.TestCase):
         unknown_projection = project_public_artifact("external_load", unknown_failure_field)
         self.assertNotIn("failure_diagnostics", unknown_projection["raw_http"])
         self.assertNotIn("private-failure-data", serialized(unknown_projection))
+        unknown_transport_code = {
+            **external_source,
+            "raw_http": {
+                **external_source["raw_http"],
+                "failure_diagnostics": {
+                    **external_source["raw_http"]["failure_diagnostics"],
+                    "transport_error_code_counts": {"private-system-error": 1},
+                },
+            },
+        }
+        unknown_code_projection = project_public_artifact(
+            "external_load", unknown_transport_code
+        )
+        self.assertNotIn(
+            "failure_diagnostics", unknown_code_projection["raw_http"]
+        )
+        legacy_transport_diagnostics = {
+            **external_source,
+            "raw_http": {
+                **external_source["raw_http"],
+                "failure_diagnostics": {
+                    key: value
+                    for key, value in external_source["raw_http"][
+                        "failure_diagnostics"
+                    ].items()
+                    if key != "transport_error_code_counts"
+                },
+            },
+        }
+        legacy_projection = project_public_artifact(
+            "external_load", legacy_transport_diagnostics
+        )
+        self.assertEqual(
+            set(legacy_projection["raw_http"]["failure_diagnostics"]),
+            {
+                "failure_stage_counts",
+                "observed_status_counts",
+                "connection_state_counts",
+            },
+        )
         self.assertTrue(public_report["report_binding"]["checks"]["run_identity"])
         self.assertNotIn("actual", public_report["report_binding"])
         self.assertNotIn("unknown", public_report)

@@ -10,11 +10,14 @@ and never serializes request headers or response bodies.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import errno
 import http.client
+import re
 import socket
 import ssl
 import time
 from typing import Any
+from urllib.error import URLError
 from urllib.parse import urlsplit
 
 
@@ -41,6 +44,68 @@ PHASE_TIMING_KEYS = (
     "body_receive_ms",
     "total_ms",
 )
+TRANSPORT_ERROR_CODES = frozenset(
+    {
+        "timeout",
+        "dns_resolution",
+        "tls",
+        "remote_disconnect",
+        "incomplete_response",
+        "http_protocol",
+        "connection_reset",
+        "connection_refused",
+        "connection_aborted",
+        "broken_pipe",
+        "network_unreachable",
+        "host_unreachable",
+        "not_connected",
+        "url_error",
+        "os_error",
+    }
+)
+_SSR_REQUEST_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
+def classify_transport_error(error: BaseException) -> str | None:
+    """Return a closed transport class without retaining exception details."""
+
+    if isinstance(error, http.client.RemoteDisconnected):
+        return "remote_disconnect"
+    if isinstance(error, TimeoutError):
+        return "timeout"
+    if isinstance(error, ssl.SSLError):
+        return "tls"
+    if isinstance(error, socket.gaierror):
+        return "dns_resolution"
+    if isinstance(error, http.client.IncompleteRead):
+        return "incomplete_response"
+    if isinstance(error, http.client.HTTPException):
+        return "http_protocol"
+    if isinstance(error, URLError):
+        reason = error.reason
+        if isinstance(reason, BaseException):
+            return classify_transport_error(reason) or "url_error"
+        return "url_error"
+    if isinstance(error, ConnectionResetError):
+        return "connection_reset"
+    if isinstance(error, ConnectionRefusedError):
+        return "connection_refused"
+    if isinstance(error, ConnectionAbortedError):
+        return "connection_aborted"
+    if isinstance(error, BrokenPipeError):
+        return "broken_pipe"
+    if isinstance(error, OSError):
+        errno_code = error.errno
+        by_errno = {
+            errno.ETIMEDOUT: "timeout",
+            errno.ECONNRESET: "connection_reset",
+            errno.ECONNREFUSED: "connection_refused",
+            errno.ECONNABORTED: "connection_aborted",
+            errno.EPIPE: "broken_pipe",
+            errno.ENETUNREACH: "network_unreachable",
+            errno.EHOSTUNREACH: "host_unreachable",
+            errno.ENOTCONN: "not_connected",
+        }
+        return by_errno.get(errno_code, "os_error")
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,6 +261,10 @@ class HTTP11KeepAliveClient:
         self.last_timing: dict[str, Any] = {}
         self.last_failure_stage: str | None = None
         self.last_observed_status: int | None = None
+        # Keep only a validated server-issued ID for the existing opt-in SSR
+        # correlation path when reading the response body fails.
+        self.last_ssr_request_id: str | None = None
+        self.last_ssr_request_id_malformed = False
 
     def set_timeout(self, timeout: float) -> None:
         """Apply the current request timeout to a reused socket as well."""
@@ -270,6 +339,8 @@ class HTTP11KeepAliveClient:
         self.last_timing = {}
         self.last_failure_stage = None
         self.last_observed_status = None
+        self.last_ssr_request_id = None
+        self.last_ssr_request_id_malformed = False
         if method not in {"GET", "POST"}:
             raise ValueError("HTTP transport method is unsupported")
         if not path.startswith("/") or "\r" in path or "\n" in path:
@@ -325,6 +396,14 @@ class HTTP11KeepAliveClient:
             failure_stage = "response_headers"
             response = connection.getresponse()
             self.last_observed_status = int(response.status)
+            response_ssr_request_id = response.headers.get(
+                "x-platform-ssr-request-id", ""
+            )
+            if response_ssr_request_id:
+                if _SSR_REQUEST_ID_RE.fullmatch(response_ssr_request_id):
+                    self.last_ssr_request_id = response_ssr_request_id
+                else:
+                    self.last_ssr_request_id_malformed = True
             failure_stage = "body_receive"
             headers_finished = time.perf_counter()
             timing["edge_wait_ms"] = (headers_finished - write_finished) * 1_000

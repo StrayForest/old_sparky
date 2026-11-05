@@ -39,7 +39,11 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 try:
-    from tools.platform_http_transport import HTTP11KeepAliveClient
+    from tools.platform_http_transport import (
+        HTTP11KeepAliveClient,
+        TRANSPORT_ERROR_CODES,
+        classify_transport_error,
+    )
     from tools.platform_load_runtime import (
         LoadRuntimeBudget,
     )
@@ -49,7 +53,11 @@ try:
         timing_summary_is_complete,
     )
 except ModuleNotFoundError:  # Direct execution from platform/tools.
-    from platform_http_transport import HTTP11KeepAliveClient
+    from platform_http_transport import (
+        HTTP11KeepAliveClient,
+        TRANSPORT_ERROR_CODES,
+        classify_transport_error,
+    )
     from platform_load_runtime import LoadRuntimeBudget
     from platform_load_acceptance import (
         derive_expected_phase_plan,
@@ -1925,6 +1933,8 @@ class RequestResult:
     # these fields. The coding value is normalized before assignment.
     html_content_encoding: str | None = None
     html_marker_flags: dict[str, bool] | None = None
+    # Closed, low-cardinality transport classification; never raw exception data.
+    transport_error_code: str | None = None
 
 
 @dataclass(slots=True)
@@ -2378,6 +2388,7 @@ class _ResultAccumulator:
         "cf_error_origins",
         "failure_stage_counts",
         "observed_status_counts",
+        "transport_error_code_counts",
         "error_connection_state_counts",
         "error_sample_entries",
         "timeout_diagnostic_entries",
@@ -2410,6 +2421,7 @@ class _ResultAccumulator:
         self.cf_error_origins: Counter[str] = Counter()
         self.failure_stage_counts: Counter[str] = Counter()
         self.observed_status_counts: Counter[str] = Counter()
+        self.transport_error_code_counts: Counter[str] = Counter()
         self.error_connection_state_counts: Counter[str] = Counter()
         self.error_sample_entries: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
         self.timeout_diagnostic_entries: list[
@@ -2535,6 +2547,9 @@ class _ResultAccumulator:
                 str(observed_status) if observed_status is not None else "unknown"
             ] += 1
             self.error_connection_state_counts[connection_state] += 1
+            transport_error_code = result.transport_error_code
+            if transport_error_code in TRANSPORT_ERROR_CODES:
+                self.transport_error_code_counts[transport_error_code] += 1
             self.error_sample_total += 1
             error_sample = {
                 "phase": safe_phase(result.phase),
@@ -2550,6 +2565,8 @@ class _ResultAccumulator:
                 "ttfb_ms": finite_number(result.time_to_first_byte_ms),
                 "elapsed_ms": finite_number(result.elapsed_ms),
             }
+            if transport_error_code in TRANSPORT_ERROR_CODES:
+                error_sample["transport_error_code"] = transport_error_code
             order = (
                 safe_phase(result.phase),
                 result.submission_index
@@ -2650,6 +2667,9 @@ class _ResultAccumulator:
                 "observed_status_counts": dict(sorted(self.observed_status_counts.items())),
                 "connection_state_counts": dict(
                     sorted(self.error_connection_state_counts.items())
+                ),
+                "transport_error_code_counts": dict(
+                    sorted(self.transport_error_code_counts.items())
                 ),
             },
             "changed_counts": dict(sorted(self.changed.items())),
@@ -3229,9 +3249,15 @@ _RESPONSE_READ_EXCEPTIONS = (
 class _BoundedResponseReadFailure(Exception):
     """Carry only a capped byte count and fixed transport classification."""
 
-    def __init__(self, response_bytes: int, error_kind: str) -> None:
+    def __init__(
+        self,
+        response_bytes: int,
+        error_kind: str,
+        transport_error_code: str | None,
+    ) -> None:
         self.response_bytes = response_bytes
         self.error_kind = error_kind
+        self.transport_error_code = transport_error_code
 
 
 def _response_read_error_kind(exc: BaseException) -> str:
@@ -3271,6 +3297,7 @@ def _read_bounded_response(
             raise _BoundedResponseReadFailure(
                 _bounded_partial_response_bytes(exc, response_bytes),
                 _response_read_error_kind(exc),
+                classify_transport_error(exc),
             ) from None
         if not chunk:
             break
@@ -3289,7 +3316,7 @@ def _read_response_body(
     response: Any,
     *,
     capture_json: bool,
-) -> tuple[int, bytes, str | None]:
+) -> tuple[int, bytes, str | None, str | None]:
     """Read one bounded body, returning no partial content after transport failure."""
 
     try:
@@ -3299,6 +3326,7 @@ def _read_response_body(
             _bounded_partial_response_bytes(exc),
             b"",
             _response_read_error_kind(exc),
+            classify_transport_error(exc),
         )
     try:
         response_bytes, captured_body = _read_bounded_response(
@@ -3307,8 +3335,13 @@ def _read_response_body(
             capture_json=capture_json,
         )
     except _BoundedResponseReadFailure as exc:
-        return exc.response_bytes, b"", exc.error_kind
-    return response_bytes, captured_body, None
+        return (
+            exc.response_bytes,
+            b"",
+            exc.error_kind,
+            exc.transport_error_code,
+        )
+    return response_bytes, captured_body, None, None
 
 
 def _request(
@@ -3365,6 +3398,7 @@ def _request(
     cf_ray: str | None = None
     response_etag: str | None = None
     error_kind: str | None = None
+    transport_error_code: str | None = None
     response_body_error: str | None = None
     response_json: Any = None
     time_to_first_byte_ms: float | None = None
@@ -3430,7 +3464,12 @@ def _request(
                 cf_error_type, cf_error_origin, retry_after = diagnostic_headers(response.headers)
                 response_etag = response.headers.get("etag", "")[:512] or None
                 time_to_first_byte_ms = (time.monotonic() - started_at) * 1000
-                response_bytes, captured_body, response_body_error = _read_response_body(
+                (
+                    response_bytes,
+                    captured_body,
+                    response_body_error,
+                    transport_error_code,
+                ) = _read_response_body(
                     response,
                     capture_json=_response_requires_json_projection(method, path),
                 )
@@ -3451,7 +3490,12 @@ def _request(
         cf_ray = exc.headers.get("cf-ray", "")[:128] or None
         cf_error_type, cf_error_origin, retry_after = diagnostic_headers(exc.headers)
         time_to_first_byte_ms = (time.monotonic() - started_at) * 1000
-        response_bytes, captured_body, response_body_error = _read_response_body(
+        (
+            response_bytes,
+            captured_body,
+            response_body_error,
+            transport_error_code,
+        ) = _read_response_body(
             exc,
             capture_json=_response_requires_json_projection(method, path),
         )
@@ -3469,13 +3513,15 @@ def _request(
                 path=path,
                 body=captured_body,
             )
-    except http.client.HTTPException:
+    except http.client.HTTPException as exc:
         error_kind = "transport_http_protocol"
+        transport_error_code = classify_transport_error(exc)
         if transport_client is not None:
             transport_timing = dict(transport_client.last_timing)
     except (URLError, TimeoutError, OSError, ValueError) as exc:
         exception_at_utc = datetime.now(UTC).isoformat()
         error_kind = type(exc).__name__
+        transport_error_code = classify_transport_error(exc)
         if transport_client is not None:
             transport_timing = dict(transport_client.last_timing)
     finished_at = time.monotonic()
@@ -3498,6 +3544,7 @@ def _request(
         retry_after=retry_after,
         response_etag=response_etag,
         error_kind=error_kind,
+        transport_error_code=transport_error_code,
         response_json=response_json,
         time_to_first_byte_ms=time_to_first_byte_ms,
         attempt_number=attempt_number,
@@ -3754,6 +3801,15 @@ def _page_request_http11_keepalive(
             exception_at_utc=finished_at_utc if capture_timestamps or diagnostic_id else None,
             finished_at_utc=finished_at_utc if capture_timestamps or diagnostic_id else None,
             transport_timing=timing or None,
+            transport_error_code=classify_transport_error(error),
+            ssr_request_id=(
+                getattr(client, "last_ssr_request_id", None)
+                if capture_timestamps else None
+            ),
+            ssr_request_id_malformed=(
+                capture_timestamps
+                and getattr(client, "last_ssr_request_id_malformed", False) is True
+            ),
             observed_status=getattr(client, "last_observed_status", None),
             failure_stage=getattr(client, "last_failure_stage", None),
             started_at_monotonic=started_at,

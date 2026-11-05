@@ -741,6 +741,31 @@ selection reason, process-local completion count and interval. These rows form
 a trigger-selected diagnostic sample: their pool quantiles describe logged
 rows only and never replace or claim the full-population HTTP client metrics.
 
+The `/users/me` supplemental account read-model contributes low-cardinality
+Redis GET, awaited builder wall-time, and Redis write wall-time events to the
+same existing request-performance stream. Builder time is elapsed wall time,
+not CPU time; those spans do not cover route SQL, the full request, or DB
+connection hold. Bounded outcomes distinguish hit, miss, read/write errors,
+and build errors. Error outcomes use the existing error-retention trigger;
+normal hit/miss records follow the process sampling policy. No account IDs,
+cache keys, payloads, revisions, or timestamps enter these events.
+
+Transport failures expose fixed `transport_error_code` counts over the full
+failed-request population; capped example rows may carry the same enum. This
+count is independent of the example cap. A completed HTTP error response (for
+example, 502) remains a status failure and is not classified as a transport
+exception. Older reports may omit the optional transport-code map. The
+sanitizer retains only the fixed enum and never publishes exception text,
+headers, or the internal SSR response ID. The existing SSR capacity diagnostic
+opts workloads `authenticated_html_ssr_capacity_v1` (20-second HTML),
+`authenticated_html_ssr_capacity_120s_v1` (120-second HTML), and
+`authenticated_html_ssr_cpu_profile_20s_v1` (20-second CPU) into timestamp
+capture; on those paths a validated response ID survives a body-read failure
+for the existing source-bound origin join. The ordinary
+`authenticated-page-load-v2` profile provides the transport-error census but
+does not promise response-ID joins. Failures before response headers have no
+response ID and remain uncorrelated.
+
 The v2 SLO profile applies the supported-load contract: accepted request
 p50/p90/p95/p99 of 250/400/600/1000 ms, logical p95/p99 of 600/1000 ms,
 final logical failure below 0.5%, and effectively zero overload shedding. A

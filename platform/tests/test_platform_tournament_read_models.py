@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
+from typing import ClassVar
 from unittest.mock import ANY, AsyncMock, patch
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from redis.exceptions import ConnectionError as RedisConnectionError
 
 from apps.platform_api.app.services import tournament_read_models as read_models
@@ -47,6 +48,16 @@ class _FakeRedis:
         self.closed = True
 
 
+class _Projection(BaseModel):
+    value: str
+    validations: ClassVar[int] = 0
+
+    @classmethod
+    def model_validate_json(cls, json_data, *args, **kwargs):
+        cls.validations += 1
+        return super().model_validate_json(json_data, *args, **kwargs)
+
+
 class TournamentReadModelTests(PlatformIsolatedAsyncioTestCase):
     def test_serializes_pydantic_lists_as_json_objects(self) -> None:
         class Team(BaseModel):
@@ -68,24 +79,62 @@ class TournamentReadModelTests(PlatformIsolatedAsyncioTestCase):
             clients.append(client)
             return client
 
-        builder = AsyncMock(return_value=b'{"teams":[]}')
+        _Projection.validations = 0
+        built = _Projection(value="teams")
+        builder = AsyncMock(return_value=built)
         with patch.object(read_models, "redis_client", side_effect=client_factory):
             first = await read_models.read_model_read_or_build(
                 tournament_id="tournament-1",
                 model="teams",
                 revision=7,
+                response_model=_Projection,
                 builder=builder,
             )
+            self.assertIs(first, built)
+            self.assertEqual(_Projection.validations, 0)
             second = await read_models.read_model_read_or_build(
                 tournament_id="tournament-1",
                 model="teams",
                 revision=7,
+                response_model=_Projection,
                 builder=builder,
             )
 
-        self.assertEqual(first, second)
+        self.assertEqual(first.model_dump_json(), second.model_dump_json())
+        self.assertEqual(_Projection.validations, 1)
+        cached = read_models._decode_envelope(
+            store[read_models.read_model_key("tournament-1", "teams")]
+        )
+        assert cached is not None
+        self.assertEqual(cached.payload, first.model_dump_json().encode("utf-8"))
         builder.assert_awaited_once()
         self.assertFalse(any(client.closed for client in clients))
+
+    async def test_corrupt_matching_cache_payload_still_fails_validation(self) -> None:
+        store = {
+            read_models.read_model_key("tournament-1", "teams"):
+                read_models._encode_envelope(
+                    revision=7,
+                    payload=b'{"other":"bad"}',
+                )
+        }
+        builder = AsyncMock(return_value=_Projection(value="unused"))
+
+        with patch.object(
+            read_models,
+            "redis_client",
+            side_effect=lambda **_: _FakeRedis(store),
+        ):
+            with self.assertRaises(ValidationError):
+                await read_models.read_model_read_or_build(
+                    tournament_id="tournament-1",
+                    model="teams",
+                    revision=7,
+                    response_model=_Projection,
+                    builder=builder,
+                )
+
+        builder.assert_not_awaited()
 
     async def test_stale_revision_cannot_overwrite_newer_projection(self) -> None:
         store: dict[str, bytes] = {}
@@ -134,17 +183,19 @@ class TournamentReadModelTests(PlatformIsolatedAsyncioTestCase):
 
     async def test_redis_outage_returns_authoritative_builder_payload(self) -> None:
         client = _FakeRedis({}, failure=RedisConnectionError("redis unavailable"))
-        builder = AsyncMock(return_value=b'{"status":"ready"}')
+        built = _Projection(value="ready")
+        builder = AsyncMock(return_value=built)
 
         with patch.object(read_models, "redis_client", return_value=client):
             payload = await read_models.read_model_read_or_build(
                 tournament_id="tournament-1",
                 model="workspace_detail",
                 revision=3,
+                response_model=_Projection,
                 builder=builder,
             )
 
-        self.assertEqual(payload, b'{"status":"ready"}')
+        self.assertIs(payload, built)
         builder.assert_awaited_once()
         self.assertFalse(client.closed)
 

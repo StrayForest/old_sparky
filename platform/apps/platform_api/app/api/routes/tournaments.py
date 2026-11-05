@@ -2917,13 +2917,13 @@ async def build_tournament_bracket_response(
     # capabilities remain request-specific and therefore bypass this cache.
     if not can_manage:
         read_model = "bracket_full" if include_team_members else "bracket_summary"
-        payload = await read_model_read_or_build(
+        return await read_model_read_or_build(
             tournament_id=tournament.id,
             model=read_model,
             revision=tournament_state_version(tournament),
+            response_model=TournamentBracketResponse,
             builder=build_uncached,
         )
-        return TournamentBracketResponse.model_validate_json(payload)
     return await build_uncached()
 
 
@@ -2985,13 +2985,13 @@ async def build_tournament_workspace_detail_bracket_response(
         )
 
     if not can_manage and use_read_model_cache:
-        payload = await read_model_read_or_build(
+        return await read_model_read_or_build(
             tournament_id=tournament.id,
             model="workspace_detail",
             revision=tournament_state_version(tournament),
+            response_model=TournamentBracketResponse,
             builder=build_uncached,
         )
-        return TournamentBracketResponse.model_validate_json(payload)
     return await build_uncached()
 
 

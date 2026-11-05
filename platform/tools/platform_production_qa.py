@@ -2063,7 +2063,14 @@ def summarize_request_perf_logs(
     def read_model_summary(row_values: list[dict[str, Any]]) -> dict[str, Any]:
         models: Counter[str] = Counter()
         outcomes: Counter[str] = Counter()
-        allowed_models = {"teams", "workspace_detail", "bracket_summary", "bracket_full", "other"}
+        allowed_models = {
+            "teams",
+            "workspace_detail",
+            "bracket_summary",
+            "bracket_full",
+            "user_account",
+            "other",
+        }
         for row in row_values:
             for model in str(row.get("redis_read_model_models") or "").split("|"):
                 if model and model != "-":

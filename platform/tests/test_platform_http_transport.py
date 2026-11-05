@@ -7,7 +7,11 @@ import json
 import ssl
 import time
 
-from tools.platform_http_transport import HTTP11KeepAliveClient, PHASE_TIMING_KEYS
+from tools.platform_http_transport import (
+    HTTP11KeepAliveClient,
+    PHASE_TIMING_KEYS,
+    classify_transport_error,
+)
 
 
 class _KeepAliveHandler(BaseHTTPRequestHandler):
@@ -20,6 +24,8 @@ class _KeepAliveHandler(BaseHTTPRequestHandler):
             body = b"delayed-body"
             self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
+            if self.path == "/body-timeout":
+                self.send_header("X-Platform-SSR-Request-Id", "0123456789abcdef0123456789abcdef")
             self.end_headers()
             if self.path == "/body-timeout":
                 time.sleep(0.15)
@@ -139,6 +145,11 @@ class PlatformHttpTransportTests(unittest.TestCase):
                 client.get("/body-timeout", headers={"Accept": "text/plain"}, timeout=0.03)
             self.assertEqual(client.last_observed_status, 200)
             self.assertEqual(client.last_failure_stage, "body_receive")
+            self.assertEqual(
+                client.last_ssr_request_id,
+                "0123456789abcdef0123456789abcdef",
+            )
+            self.assertIsNone(client._connection)
             with self.assertRaises(TimeoutError):
                 client.get("/header-timeout", headers={"Accept": "text/plain"}, timeout=0.03)
             self.assertIsNone(client.last_observed_status)
@@ -161,6 +172,28 @@ class PlatformHttpTransportTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             client.get("not-absolute", headers={})
         client.close()
+
+    def test_transport_error_classifier_orders_specific_stdlib_errors_first(self) -> None:
+        import errno
+        import http.client
+        import socket
+
+        self.assertEqual(
+            classify_transport_error(http.client.RemoteDisconnected("closed")),
+            "remote_disconnect",
+        )
+        self.assertEqual(classify_transport_error(TimeoutError()), "timeout")
+        self.assertEqual(classify_transport_error(ssl.SSLError()), "tls")
+        self.assertEqual(classify_transport_error(socket.gaierror()), "dns_resolution")
+        self.assertEqual(
+            classify_transport_error(OSError(errno.ECONNRESET, "private detail")),
+            "connection_reset",
+        )
+        self.assertEqual(
+            classify_transport_error(http.client.IncompleteRead(b"private", 4)),
+            "incomplete_response",
+        )
+        self.assertIsNone(classify_transport_error(ValueError("not a transport error")))
 
     def test_post_close_and_keepalive_share_request_contract_and_report_reuse(self) -> None:
         headers = {
