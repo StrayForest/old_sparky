@@ -14,6 +14,8 @@ import {
   summarizeSampleClasses,
   summarizeFunctionSamples,
 } from "./cpu-profile-categories.mjs";
+import { mapSampledFrames } from "./cpu-profile-source-maps.mjs";
+import { mapAfterCpuWindowSnapshot, runCpuWindowSetup } from "./cpu-profile-window.mjs";
 import {
   isHtmlSsrCaptureEligible,
   isHtmlSsrTraceDrainEligible,
@@ -85,6 +87,7 @@ type DiagnosticPlan = {
 };
 
 export type DiagnosticPhase = "off" | "on";
+type CpuUsageWindowSnapshot = { readonly promise: Promise<void>; readonly resolve: () => void };
 export type WorkspaceCpuDiagnostic = {
   readonly runId: string;
   readonly phase: DiagnosticPhase;
@@ -106,6 +109,7 @@ const consumedCpuRunIds = new Set<string>();
 const usageWindowsStarted = new Set<string>();
 const usageWindowsScheduled = new Set<string>();
 const usageWindowsFailed = new Set<string>();
+const cpuUsageWindowSnapshots = new Map<string, CpuUsageWindowSnapshot>();
 const memoryWindowsStarted = new Set<string>();
 let activeCpuRunId: string | null = null;
 let planCache: { checkedAt: number; plan: DiagnosticPlan | null } | null = null;
@@ -552,35 +556,81 @@ function startCpuUsageWindow(plan: DiagnosticPlan, phase: DiagnosticPhase): void
     scheduled: usageWindowsScheduled,
     failed: usageWindowsFailed,
   })) return;
-  const startTarget = phase === "off" ? plan.off_start_ms : plan.on_start_ms;
-  const endTarget = phase === "off" ? plan.off_end_ms : plan.on_end_ms;
-  const expectedWindowMs = endTarget - startTarget;
-  const startMs = Date.now();
-  const startLagMs = startMs - startTarget;
-  const startCpu = process.cpuUsage();
-  const startMonotonic = performance.now();
-  const capacity = effectiveCpuCapacity();
-  const timer = setTimeout(() => {
-    const endMs = Date.now();
-    const endLagMs = endMs - endTarget;
-    const windowMs = Math.max(0, Math.round(performance.now() - startMonotonic));
-    const usage = process.cpuUsage(startCpu);
-    const cpuNs = Math.max(0, usage.user + usage.system) * 1000;
-    const timingComplete = Boolean(
-      startLagMs >= 0 && startLagMs <= CPU_WINDOW_TOLERANCE_MS
-      && Math.abs(endLagMs) <= CPU_WINDOW_TOLERANCE_MS
-      && windowMs >= expectedWindowMs - CPU_WINDOW_TOLERANCE_MS
-      && windowMs <= expectedWindowMs + 2 * CPU_WINDOW_TOLERANCE_MS
-    );
-    console.info(
-      `cpu_diagnostic_usage service=web run_id=${plan.run_id} phase=${phase}`
-      + ` window_ms=${windowMs} cpu_ns=${cpuNs}`
-      + ` cpu_capacity_cpus=${capacity === null ? "unknown" : capacity.toFixed(6)}`
-      + ` start_lag_ms=${startLagMs} end_lag_ms=${endLagMs}`
-      + ` timing_complete=${String(timingComplete)}`
-    );
-  }, Math.max(0, endTarget - startMs));
-  timer.unref();
+  const snapshot = ensureCpuUsageWindowSnapshot(plan.run_id, phase);
+  const key = cpuUsageWindowKey(plan.run_id, phase);
+  runCpuWindowSetup(() => {
+    if (cpuUsageWindowSnapshots.get(key) === snapshot) {
+      cpuUsageWindowSnapshots.delete(key);
+    }
+    snapshot.resolve();
+  }, () => {
+    const startTarget = phase === "off" ? plan.off_start_ms : plan.on_start_ms;
+    const endTarget = phase === "off" ? plan.off_end_ms : plan.on_end_ms;
+    const expectedWindowMs = endTarget - startTarget;
+    const startMs = Date.now();
+    const startLagMs = startMs - startTarget;
+    const startCpu = process.cpuUsage();
+    const startMonotonic = performance.now();
+    const capacity = effectiveCpuCapacity();
+    const timer = setTimeout(() => {
+      try {
+        const endMs = Date.now();
+        const endLagMs = endMs - endTarget;
+        const windowMs = Math.max(0, Math.round(performance.now() - startMonotonic));
+        const usage = process.cpuUsage(startCpu);
+        const cpuNs = Math.max(0, usage.user + usage.system) * 1000;
+        const timingComplete = Boolean(
+          startLagMs >= 0 && startLagMs <= CPU_WINDOW_TOLERANCE_MS
+          && Math.abs(endLagMs) <= CPU_WINDOW_TOLERANCE_MS
+          && windowMs >= expectedWindowMs - CPU_WINDOW_TOLERANCE_MS
+          && windowMs <= expectedWindowMs + 2 * CPU_WINDOW_TOLERANCE_MS
+        );
+        console.info(
+          `cpu_diagnostic_usage service=web run_id=${plan.run_id} phase=${phase}`
+          + ` window_ms=${windowMs} cpu_ns=${cpuNs}`
+          + ` cpu_capacity_cpus=${capacity === null ? "unknown" : capacity.toFixed(6)}`
+          + ` start_lag_ms=${startLagMs} end_lag_ms=${endLagMs}`
+          + ` timing_complete=${String(timingComplete)}`
+        );
+      } finally {
+        if (cpuUsageWindowSnapshots.get(key) === snapshot) {
+          cpuUsageWindowSnapshots.delete(key);
+        }
+        snapshot.resolve();
+      }
+    }, Math.max(0, endTarget - startMs));
+    timer.unref();
+  });
+}
+
+function cpuUsageWindowKey(runId: string, phase: DiagnosticPhase): string {
+  return `${runId}:${phase}`;
+}
+
+function ensureCpuUsageWindowSnapshot(
+  runId: string,
+  phase: DiagnosticPhase,
+): CpuUsageWindowSnapshot {
+  const key = cpuUsageWindowKey(runId, phase);
+  const existing = cpuUsageWindowSnapshots.get(key);
+  if (existing) return existing;
+  let resolve!: () => void;
+  const promise = new Promise<void>((complete) => { resolve = complete; });
+  const snapshot = { promise, resolve };
+  cpuUsageWindowSnapshots.set(key, snapshot);
+  return snapshot;
+}
+
+async function waitForCpuUsageWindowSnapshot(
+  runId: string,
+  phase: DiagnosticPhase,
+): Promise<void> {
+  const key = cpuUsageWindowKey(runId, phase);
+  if (usageWindowsFailed.has(key) && !usageWindowsStarted.has(key)) {
+    cpuUsageWindowSnapshots.delete(key);
+    return;
+  }
+  await cpuUsageWindowSnapshots.get(key)?.promise;
 }
 
 type CgroupMemorySnapshot = {
@@ -895,10 +945,14 @@ async function stopNodeCpuProfile(
   activeCpuRunId = null;
   try {
     const response = await post<{ profile?: {
-      nodes?: Array<{ id: number; callFrame?: { url?: string; functionName?: string } }>;
+      nodes?: Array<{ id: number; callFrame?: {
+        url?: string; functionName?: string; lineNumber?: number; columnNumber?: number;
+      } }>;
       samples?: number[];
       timeDeltas?: number[];
     } }>(session, "Profiler.stop");
+    const elapsedAtStopMs = Math.max(0, Math.floor(performance.now() - startedMonotonicMs));
+    const elapsedMs = elapsedAtStopMs;
     const profile = response.profile;
     if (!profile || !Array.isArray(profile.nodes) || !Array.isArray(profile.samples)
         || !Array.isArray(profile.timeDeltas) || profile.samples.length > MAX_SAMPLES
@@ -909,7 +963,16 @@ async function stopNodeCpuProfile(
       console.info(`cpu_diagnostic_complete service=web run_id=${runId} status=incomplete reason=profile_bounds`);
       return;
     }
-    const nodes = new Map(profile.nodes.map((node) => [node.id, node.callFrame ?? {}]));
+    const profileWindow = await mapAfterCpuWindowSnapshot(
+      elapsedMs,
+      waitForCpuUsageWindowSnapshot(runId, "on"),
+      () => mapSampledFrames(
+        new Map(profile.nodes.map((node) => [node.id, node.callFrame ?? {}])),
+        profile.samples,
+        process.cwd(),
+      ),
+    );
+    const nodes = profileWindow.mapped;
     const totals = new Map<string, { samples: number; cpuUs: number }>();
     const sampleClassCounts = summarizeSampleClasses(nodes, profile.samples);
     const acceptedSamples = profile.samples.length;
@@ -933,7 +996,6 @@ async function stopNodeCpuProfile(
     const functionSummary = functionDetails.rows
       .map(({ function_id, samples }) => `${function_id}:${samples}`)
       .join(",");
-    const elapsedMs = Math.max(0, Math.floor(performance.now() - startedMonotonicMs));
     console.info(
       `cpu_diagnostic_complete service=web run_id=${runId} timer=v8_cpu `
       + `start_lag_ms=${startLagMs} elapsed_ms=${elapsedMs} `

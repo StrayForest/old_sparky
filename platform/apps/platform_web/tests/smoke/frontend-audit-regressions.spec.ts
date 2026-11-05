@@ -1,6 +1,10 @@
-import { existsSync, readFileSync } from "node:fs";
+import {
+  existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync,
+} from "node:fs";
 import { createServer, get as httpGet } from "node:http";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { pathToFileURL } from "node:url";
 import { expect, test } from "@playwright/test";
 import { NextRequest } from "next/server";
 import {
@@ -15,6 +19,11 @@ import {
   summarizeSampleClasses,
   summarizeFunctionSamples,
 } from "../../lib/cpu-profile-categories.mjs";
+import {
+  CPU_PROFILE_SOURCE_MAP_LIMITS,
+  mapSampledFrames,
+} from "../../lib/cpu-profile-source-maps.mjs";
+import { mapAfterCpuWindowSnapshot, runCpuWindowSetup } from "../../lib/cpu-profile-window.mjs";
 import {
   htmlSsrCaptureDigest,
   isHtmlSsrCaptureEligible,
@@ -656,6 +665,17 @@ test("workspace CPU diagnostics require an exact private run marker", () => {
   expect(planModule).toContain("scheduleAuthorizedWorkspaceCpuWindowEdges(");
   expect(planModule.indexOf("scheduleAuthorizedWorkspaceCpuWindowEdges("))
     .toBeLessThan(planModule.indexOf("diagnosticPrearmStorage.run(freshPlan, operation)"));
+  expect(planModule).toContain("const expectedWindowMs = endTarget - startTarget;");
+  expect(planModule).toContain("Math.max(0, endTarget - startMs)");
+  expect(planModule).toContain("const usage = process.cpuUsage(startCpu);");
+  const profileStop = planModule.indexOf('"Profiler.stop"');
+  const elapsedSnapshot = planModule.indexOf("const elapsedAtStopMs = Math.max", profileStop);
+  const cpuUsageSnapshotWait = planModule.indexOf('waitForCpuUsageWindowSnapshot(runId, "on")', elapsedSnapshot);
+  const sourceMapPass = planModule.indexOf("mapSampledFrames(", cpuUsageSnapshotWait);
+  expect(profileStop).toBeGreaterThanOrEqual(0);
+  expect(elapsedSnapshot).toBeGreaterThan(profileStop);
+  expect(cpuUsageSnapshotWait).toBeGreaterThan(elapsedSnapshot);
+  expect(sourceMapPass).toBeGreaterThan(cpuUsageSnapshotWait);
   const rootLayout = source("app/layout.tsx");
   const observability = source("lib/server-ssr-observability.ts");
   const streamGuard = source("server-shutdown-guard.cjs");
@@ -749,6 +769,128 @@ test("web CPU profile function details expose only bounded safe IDs and sample c
   expect(Object.values(counts).reduce((total, count) => total + count, 0)).toBe(7);
   expect(JSON.stringify(counts)).not.toContain("privateSymbol");
   expect(JSON.stringify(counts)).not.toContain("/srv/private");
+});
+
+test("web CPU profile maps only sampled verified standalone chunks within bounds", async () => {
+  let releaseSnapshot!: () => void;
+  const snapshot = new Promise<void>((resolveSnapshot) => { releaseSnapshot = resolveSnapshot; });
+  const elapsedAtStopMs = 1234;
+  let mapCalls = 0;
+  const resultPromise = mapAfterCpuWindowSnapshot(elapsedAtStopMs, snapshot, () => {
+    mapCalls += 1;
+    return "mapped";
+  });
+  expect(mapCalls).toBe(0);
+  releaseSnapshot();
+  await expect(resultPromise).resolves.toEqual({ elapsedMs: elapsedAtStopMs, mapped: "mapped" });
+  expect(mapCalls).toBe(1);
+
+  let releaseFailedSetup!: () => void;
+  const failedSetupSnapshot = new Promise<void>((resolveSnapshot) => { releaseFailedSetup = resolveSnapshot; });
+  let settled = false;
+  void failedSetupSnapshot.then(() => { settled = true; });
+  const setupError = new Error("timer setup failed");
+  expect(() => runCpuWindowSetup(releaseFailedSetup, () => { throw setupError; })).toThrow(setupError);
+  await Promise.resolve();
+  expect(settled).toBe(true);
+
+  const root = mkdtempSync(join(tmpdir(), "web-cpu-map-"));
+  const appRoot = join(root, "app");
+  const runtimeCwd = join(appRoot, ".next", "standalone");
+  const runtimeChunks = join(runtimeCwd, ".next", "server", "chunks");
+  const siblingChunks = join(appRoot, ".next", "server", "chunks");
+  mkdirSync(runtimeChunks, { recursive: true });
+  mkdirSync(siblingChunks, { recursive: true });
+  const addChunk = (name: string, sourceUrl: string) => {
+    const runtimePath = join(runtimeChunks, name);
+    const siblingPath = join(siblingChunks, name);
+    const code = `function compiled() { return 1; }\n`;
+    writeFileSync(runtimePath, code);
+    writeFileSync(siblingPath, code);
+    writeFileSync(`${siblingPath}.map`, JSON.stringify({
+      version: 3, sources: [sourceUrl], names: [], mappings: "AAAA",
+    }));
+    return runtimePath;
+  };
+  try {
+    const nextPath = addChunk("next.js", join(root, "node_modules/next/dist/server/render.js"));
+    const reactPath = addChunk("react.js", join(root, "node_modules/react-dom/server.js"));
+    const oddPath = addChunk("odd.js", join(root, "vendor/unknown.js"));
+    const indexedPath = addChunk("indexed.js", join(root, "node_modules/next/dist/server/response.js"));
+    writeFileSync(`${join(siblingChunks, "indexed.js")}.map`, JSON.stringify({
+      version: 3,
+      sections: [{
+        offset: { line: 0, column: 0 },
+        map: { version: 3, sources: [join(root, "node_modules/next/dist/server/response.js")], names: [], mappings: "AAAA" },
+      }],
+    }));
+    const linkedPath = join(runtimeChunks, "linked.js");
+    symlinkSync(nextPath, linkedPath);
+    writeFileSync(join(siblingChunks, "linked.js"), readFileSync(nextPath));
+    writeFileSync(`${join(siblingChunks, "linked.js")}.map`, readFileSync(`${join(siblingChunks, "next.js")}.map`));
+    const raw = new Map([
+      [1, { url: nextPath, functionName: "renderToResponseWithComponentsImpl", lineNumber: 0, columnNumber: 0 }],
+      [2, { url: reactPath, functionName: "renderToString", lineNumber: 0, columnNumber: 0 }],
+      [3, { url: nextPath, functionName: "renderToResponseWithComponentsImpl" }],
+      [4, { url: "webpack:///node_modules/next/dist/server/render.js", functionName: "renderToResponseWithComponentsImpl", lineNumber: 0, columnNumber: 0 }],
+      [5, { url: oddPath, functionName: "privateSymbol", lineNumber: 0, columnNumber: 0 }],
+      [6, { url: join(root, "outside.js"), functionName: "renderToResponseWithComponentsImpl", lineNumber: 0, columnNumber: 0 }],
+      [7, { url: nextPath, functionName: "unknownFrameworkName", lineNumber: 0, columnNumber: 0 }],
+      [8, { url: pathToFileURL(nextPath).href, functionName: "renderToResponseWithComponentsImpl", lineNumber: 0, columnNumber: 0 }],
+      [9, { url: linkedPath, functionName: "renderToResponseWithComponentsImpl", lineNumber: 0, columnNumber: 0 }],
+      [10, { url: indexedPath, functionName: "renderToResponseWithComponentsImpl", lineNumber: 0, columnNumber: 0 }],
+    ]);
+    const mapped = mapSampledFrames(raw, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], runtimeCwd);
+    expect(categoryForFrame(mapped.get(1)?.url, mapped.get(1)?.functionName)).toBe("web_framework");
+    expect(functionIdForFrame(mapped.get(1)?.url, mapped.get(1)?.functionName)).toBe("web.next.render_response");
+    expect(functionIdForFrame(mapped.get(2)?.url, mapped.get(2)?.functionName)).toBe("web.react.render_string");
+    expect(mapped.get(3)).toEqual(raw.get(3));
+    expect(mapped.get(4)).toEqual(raw.get(4));
+    expect(categoryForFrame(mapped.get(5)?.url, mapped.get(5)?.functionName)).toBe("other");
+    expect(functionIdForFrame(mapped.get(5)?.url, mapped.get(5)?.functionName)).toBeNull();
+    expect(mapped.get(6)).toEqual(raw.get(6));
+    expect(categoryForFrame(mapped.get(7)?.url, mapped.get(7)?.functionName)).toBe("web_framework");
+    expect(functionIdForFrame(mapped.get(7)?.url, mapped.get(7)?.functionName)).toBeNull();
+    expect(functionIdForFrame(mapped.get(8)?.url, mapped.get(8)?.functionName)).toBe("web.next.render_response");
+    expect(mapped.get(9)).toEqual(raw.get(9));
+    expect(functionIdForFrame(mapped.get(10)?.url, mapped.get(10)?.functionName)).toBe("web.next.render_response");
+    const summary = summarizeFunctionSamples(mapped, [1, 2, 1]);
+    expect(summary.rows).toEqual([
+      { function_id: "web.next.render_response", samples: 2 },
+      { function_id: "web.react.render_string", samples: 1 },
+    ]);
+    expect(JSON.stringify(summary)).not.toMatch(/web-cpu-map|render\.js|renderToResponse/);
+    expect(CPU_PROFILE_SOURCE_MAP_LIMITS).toEqual({
+      files: 192, mapBytes: 2 * 1024 * 1024, totalBytes: 12 * 1024 * 1024, generatedBytes: 16 * 1024 * 1024,
+    });
+
+    writeFileSync(`${join(siblingChunks, "next.js")}.map`, "not json");
+    expect(mapSampledFrames(raw, [1], runtimeCwd).get(1)).toEqual(raw.get(1));
+    writeFileSync(join(siblingChunks, "next.js"), "mismatched generated code");
+    expect(mapSampledFrames(raw, [1], runtimeCwd).get(1)).toEqual(raw.get(1));
+    writeFileSync(join(siblingChunks, "next.js"), readFileSync(nextPath));
+    rmSync(`${join(siblingChunks, "next.js")}.map`);
+    expect(mapSampledFrames(raw, [1], runtimeCwd).get(1)).toEqual(raw.get(1));
+    symlinkSync(join(root, "elsewhere.map"), `${join(siblingChunks, "next.js")}.map`);
+    writeFileSync(join(root, "elsewhere.map"), JSON.stringify({ version: 3, sources: ["node:internal/x"], names: [], mappings: "AAAA" }));
+    expect(lstatSync(`${join(siblingChunks, "next.js")}.map`).isSymbolicLink()).toBe(true);
+    expect(mapSampledFrames(raw, [1], runtimeCwd).get(1)).toEqual(raw.get(1));
+    expect(mapSampledFrames(raw, [1], runtimeCwd, { ...CPU_PROFILE_SOURCE_MAP_LIMITS, files: 0 }).get(1))
+      .toEqual(raw.get(1));
+    expect(mapSampledFrames(raw, [1], runtimeCwd, { ...CPU_PROFILE_SOURCE_MAP_LIMITS, mapBytes: 1 }).get(1))
+      .toEqual(raw.get(1));
+    expect(mapSampledFrames(raw, [1], runtimeCwd, { ...CPU_PROFILE_SOURCE_MAP_LIMITS, totalBytes: 1 }).get(1))
+      .toEqual(raw.get(1));
+    mkdirSync(`${join(siblingChunks, "next.js")}.map`);
+    expect(mapSampledFrames(raw, [1], runtimeCwd).get(1)).toEqual(raw.get(1));
+    rmSync(`${join(siblingChunks, "next.js")}.map`, { recursive: true });
+    writeFileSync(`${join(siblingChunks, "next.js")}.map`, JSON.stringify({
+      version: 3, sources: [join(root, "node_modules/next/dist/server/render.js")], names: [], mappings: "",
+    }));
+    expect(mapSampledFrames(raw, [1], runtimeCwd).get(1)).toEqual(raw.get(1));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("typed HTML capture sampling matches the fixed cross-service SHA-256 vectors", () => {

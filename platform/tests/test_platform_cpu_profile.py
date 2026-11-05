@@ -321,7 +321,129 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 self.assertTrue(replaced)
                 self.assertEqual(observed["sequence"], 2)
 
-        for unsafe_replacement in ("mode", "hardlink"):
+        def zero_link_snapshot(metadata):
+            return SimpleNamespace(
+                st_dev=metadata.st_dev, st_ino=metadata.st_ino,
+                st_mode=metadata.st_mode, st_uid=metadata.st_uid, st_nlink=0,
+                st_size=metadata.st_size, st_mtime_ns=metadata.st_mtime_ns,
+            )
+
+        for boundary in ("initial_path", "replacement_target", "after_read_path"):
+            with self.subTest(zero_link_boundary=boundary), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "capacity-control.json"
+                capacity_control.write_control(
+                    path, record(1), expected=expected,
+                    now_monotonic_ns=10_000_000_001,
+                )
+                replacement = path.with_name("capacity-control.next")
+                replaced = False
+
+                def replace_control() -> None:
+                    nonlocal replaced
+                    replacement.write_bytes(capacity_control.canonical_json(record(2)))
+                    os.chmod(replacement, 0o600)
+                    os.replace(replacement, path)
+                    replaced = True
+
+                original_lstat = Path.lstat
+                original_fstat = capacity_control.os.fstat
+                original_read = capacity_control.os.read
+                stale_open_metadata = None
+                stale_lstat_returned = False
+
+                def return_zero_link_snapshot(candidate):
+                    nonlocal stale_lstat_returned
+                    if candidate == path:
+                        if boundary == "initial_path" and not stale_lstat_returned:
+                            stale_lstat_returned = True
+                            stale = original_lstat(candidate)
+                            replace_control()
+                            return zero_link_snapshot(stale)
+                        if (boundary == "replacement_target" and replaced
+                                and not stale_lstat_returned):
+                            stale_lstat_returned = True
+                            return zero_link_snapshot(stale_open_metadata)
+                        if (boundary == "after_read_path" and replaced
+                                and not stale_lstat_returned):
+                            stale_lstat_returned = True
+                            return zero_link_snapshot(stale_open_metadata)
+                    return original_lstat(candidate)
+
+                def replace_after_open(fd):
+                    nonlocal stale_open_metadata
+                    if boundary == "replacement_target" and not replaced:
+                        replace_control()
+                        stale_open_metadata = original_fstat(fd)
+                        return stale_open_metadata
+                    return original_fstat(fd)
+
+                def replace_during_read(fd, size):
+                    if boundary == "after_read_path" and not replaced:
+                        nonlocal stale_open_metadata
+                        replace_control()
+                        stale_open_metadata = original_fstat(fd)
+                    return original_read(fd, size)
+
+                with patch.object(Path, "lstat", new=return_zero_link_snapshot), \
+                        patch.object(capacity_control.os, "fstat", side_effect=replace_after_open), \
+                        patch.object(capacity_control.os, "read", side_effect=replace_during_read):
+                    observed = capacity_control.read_control(
+                        path, expected=expected, now_monotonic_ns=now,
+                    )
+                self.assertTrue(replaced)
+                self.assertTrue(stale_lstat_returned)
+                self.assertEqual(observed["sequence"], 2)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "capacity-control.json"
+            capacity_control.write_control(
+                path, record(1), expected=expected,
+                now_monotonic_ns=10_000_000_001,
+            )
+            original_lstat = Path.lstat
+            stale_lstat_returned = False
+
+            def same_inode_zero_link(candidate):
+                nonlocal stale_lstat_returned
+                metadata = original_lstat(candidate)
+                if candidate == path and not stale_lstat_returned:
+                    stale_lstat_returned = True
+                    return zero_link_snapshot(metadata)
+                return metadata
+
+            with patch.object(Path, "lstat", new=same_inode_zero_link):
+                with self.assertRaises(capacity_control.CapacityControlError) as context:
+                    capacity_control.read_control(
+                        path, expected=expected, now_monotonic_ns=now,
+                    )
+            self.assertEqual(context.exception.reason, "replacement_target_metadata")
+            self.assertTrue(stale_lstat_returned)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "capacity-control.json"
+            capacity_control.write_control(
+                path, record(1), expected=expected,
+                now_monotonic_ns=10_000_000_001,
+            )
+            original_fstat = capacity_control.os.fstat
+            mode_changed = False
+
+            def change_opened_metadata(fd):
+                nonlocal mode_changed
+                if not mode_changed:
+                    mode_changed = True
+                    os.chmod(path, 0o640)
+                return original_fstat(fd)
+
+            with patch.object(capacity_control.os, "fstat", side_effect=change_opened_metadata):
+                with self.assertRaises(capacity_control.CapacityControlError) as context:
+                    capacity_control.read_control(
+                        path, expected=expected, now_monotonic_ns=now,
+                    )
+            self.assertTrue(mode_changed)
+            self.assertEqual(context.exception.reason, "opened_metadata")
+
+        for unsafe_replacement in ("mode", "hardlink", "symlink", "owner", "size"):
             with self.subTest(unsafe_replacement=unsafe_replacement), \
                     tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "capacity-control.json"
@@ -336,30 +458,52 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     os.chmod(replacement, 0o600)
                     if unsafe_replacement == "mode":
                         os.chmod(replacement, 0o640)
-                    else:
+                    elif unsafe_replacement == "hardlink":
                         os.link(replacement, path.with_name("capacity-control.link"))
+                    elif unsafe_replacement == "symlink":
+                        replacement.unlink()
+                        replacement.symlink_to(path.with_name("missing-target"))
+                    elif unsafe_replacement == "size":
+                        replacement.write_bytes(
+                            capacity_control.canonical_json(record(2))
+                            + b" " * capacity_control.MAX_CONTROL_BYTES,
+                        )
                     os.replace(replacement, path)
 
                 original_fstat = capacity_control.os.fstat
+                original_lstat = Path.lstat
                 replaced = False
 
                 def replace_with_unsafe_control_after_open(fd):
                     nonlocal replaced
                     if not replaced:
-                        replaced = True
                         replace_with_unsafe_control()
+                        replaced = True
                     return original_fstat(fd)
+
+                def unsafe_owner_snapshot(candidate):
+                    metadata = original_lstat(candidate)
+                    if (unsafe_replacement == "owner" and candidate == path and replaced):
+                        return SimpleNamespace(
+                            st_dev=metadata.st_dev, st_ino=metadata.st_ino,
+                            st_mode=metadata.st_mode, st_uid=os.geteuid() + 1,
+                            st_nlink=metadata.st_nlink, st_size=metadata.st_size,
+                            st_mtime_ns=metadata.st_mtime_ns,
+                        )
+                    return metadata
 
                 with patch.object(
                     capacity_control.os, "fstat",
                     side_effect=replace_with_unsafe_control_after_open,
-                ):
+                ), patch.object(Path, "lstat", new=unsafe_owner_snapshot):
                     with self.assertRaises(capacity_control.CapacityControlError) as context:
                         capacity_control.read_control(
                             path, expected=expected, now_monotonic_ns=now,
                         )
                 self.assertTrue(replaced)
-                self.assertEqual(context.exception.reason, "metadata")
+                self.assertEqual(
+                    context.exception.reason, "replacement_target_metadata",
+                )
 
     def test_ssr_capacity_control_exhaustion_and_invalid_records_fail_closed(self) -> None:
         expected = {
@@ -452,7 +596,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     path, expected=expected, previous_sequence=3,
                     now_monotonic_ns=base_ns + 200,
                 ),
-                ("control_file_invalid", 3, "metadata"),
+                ("control_file_invalid", 3, "path_metadata"),
             )
             os.chmod(path, 0o600)
             path.write_bytes(b"{}\n")
@@ -2800,29 +2944,34 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             source_sha="b" * 40, app_target_sha="c" * 40,
             run_id="12345", attempt="1", manifest_sha256="e" * 64,
         ), "PASS")
-        control_diagnostic = json.loads(json.dumps(report))
-        control_diagnostic["status"] = "incomplete"
-        control_diagnostic["passed"] = False
-        control_diagnostic["worker"]["status"] = "incomplete"
-        control_diagnostic["worker"]["resource_abort_reason"] = "control_file_invalid"
-        control_diagnostic["worker"]["control_failure_reason"] = "snapshot_replaced"
-        projected_control = capacity_diagnostic._project_capacity_report(control_diagnostic)
-        self.assertIsNotNone(projected_control)
-        self.assertEqual(
-            projected_control["worker"]["control_failure_reason"], "snapshot_replaced",
-        )
-        fingerprint = capacity_diagnostic._parent_failure_fingerprint(
-            projected_control,
-            args=Namespace(
-                concurrency=8, source_sha="b" * 40, app_target_sha="c" * 40,
-                external_run_id="12345", external_run_attempt="1",
-                workload=capacity_diagnostic.WORKLOAD,
-            ),
-            stage_state={},
-        )
-        self.assertEqual(
-            fingerprint["worker"]["control_failure_reason"], "snapshot_replaced",
-        )
+        for reason in (
+            "metadata", "snapshot_replaced", "path_metadata", "opened_metadata",
+            "replacement_target_metadata",
+        ):
+            with self.subTest(control_failure_reason=reason):
+                control_diagnostic = json.loads(json.dumps(report))
+                control_diagnostic["status"] = "incomplete"
+                control_diagnostic["passed"] = False
+                control_diagnostic["worker"]["status"] = "incomplete"
+                control_diagnostic["worker"]["resource_abort_reason"] = "control_file_invalid"
+                control_diagnostic["worker"]["control_failure_reason"] = reason
+                projected_control = capacity_diagnostic._project_capacity_report(
+                    control_diagnostic,
+                )
+                self.assertIsNotNone(projected_control)
+                self.assertEqual(
+                    projected_control["worker"]["control_failure_reason"], reason,
+                )
+                fingerprint = capacity_diagnostic._parent_failure_fingerprint(
+                    projected_control,
+                    args=Namespace(
+                        concurrency=8, source_sha="b" * 40, app_target_sha="c" * 40,
+                        external_run_id="12345", external_run_attempt="1",
+                        workload=capacity_diagnostic.WORKLOAD,
+                    ),
+                    stage_state={},
+                )
+                self.assertEqual(fingerprint["worker"]["control_failure_reason"], reason)
         off_probe_diagnostic_report = json.loads(json.dumps(report))
         off_probe_diagnostic_report["status"] = "incomplete"
         off_probe_diagnostic_report["passed"] = False
@@ -8211,15 +8360,15 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
 
     def test_profile_summary_exports_only_allowlisted_names_and_fixed_categories(self) -> None:
         import cProfile
+        import pstats
+        from pydantic import BaseModel
+        import python_packages.platform_infra.performance_diagnostic as diagnostic_module
 
         profile = cProfile.Profile(timer=time.thread_time_ns, timeunit=1e-9)
         profile.enable()
         sum(range(1000))
         profile.disable()
-        rows, total_cpu_us, details = __import__(
-            "python_packages.platform_infra.performance_diagnostic",
-            fromlist=["_profile_summary"],
-        )._profile_summary(profile)
+        rows, total_cpu_us, details = diagnostic_module._profile_summary(profile)
         self.assertGreater(total_cpu_us, 0)
         self.assertLessEqual(len(rows), 10)
         self.assertTrue(all(name == "other" or name in {
@@ -8231,6 +8380,35 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             int(item["cpu_us"]) for item in details["top_self"]
         ))
 
+        class ProfileModel(BaseModel):
+            value: int
+
+        pydantic_profile = cProfile.Profile(timer=time.thread_time_ns, timeunit=1e-9)
+        pydantic_profile.enable()
+        for _ in range(3):
+            model = ProfileModel.model_validate({"value": 4})
+            model.model_dump()
+            ProfileModel.model_validate_json('{"value":4}')
+            model.model_dump_json()
+        pydantic_profile.disable()
+        pydantic_stats = pstats.Stats(pydantic_profile).stats
+        expected_descriptors = set(diagnostic_module.API_PROFILE_BUILTIN_FUNCTIONS)
+        observed_descriptors = {
+            function for (filename, _line, function) in pydantic_stats
+            if filename == "~"
+        }
+        self.assertTrue(expected_descriptors <= observed_descriptors)
+        self.assertTrue(all(
+            int(pydantic_stats[("~", 0, descriptor)][1]) >= 3
+            for descriptor in expected_descriptors
+        ))
+        _categories, _pydantic_cpu_us, pydantic_details = diagnostic_module._profile_summary(
+            pydantic_profile,
+        )
+        mapped_ids = {row["function_id"] for row in pydantic_details["top_self"]}
+        self.assertIn("api.serialization.pydantic_validate", mapped_ids)
+        self.assertIn("api.serialization.pydantic_dump", mapped_ids)
+
     def test_profile_function_projection_preserves_cpu_and_hides_unmapped_frames(self) -> None:
         from types import SimpleNamespace
         import pstats
@@ -8241,23 +8419,48 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 (2, 3, 0.003, 0.009, {}),
             ("/venv/lib/python3.12/site-packages/pydantic/main.py", 20, "model_validate"):
                 (1, 2, 0.002, 0.004, {}),
+            ("/venv/lib/python3.12/site-packages/pydantic/main.py", 21, "model_dump"):
+                (1, 2, 0.002, 0.004, {}),
+            ("~", 0, "<method 'validate_python' of 'pydantic_core._pydantic_core.SchemaValidator' objects>"):
+                (1, 2, 0.001, 0.003, {}),
+            ("~", 0, "<method 'validate_json' of 'pydantic_core._pydantic_core.SchemaValidator' objects>"):
+                (2, 3, 0.0015, 0.0045, {}),
+            ("~", 0, "<method 'to_python' of 'pydantic_core._pydantic_core.SchemaSerializer' objects>"):
+                (3, 4, 0.002, 0.005, {}),
+            ("~", 0, "<method 'to_json' of 'pydantic_core._pydantic_core.SchemaSerializer' objects>"):
+                (1, 1, 0.0005, 0.0008, {}),
+            ("~", 0, "<method 'private' of 'pydantic_core._pydantic_core.SchemaValidator' objects>"):
+                (1, 1, 0.0007, 0.001, {}),
             ("/private/customer-secret.py", 30, "customer_secret_function"):
                 (1, 1, 0.004, 0.004, {}),
         }
         with patch.object(pstats, "Stats", return_value=SimpleNamespace(stats=stats)):
             categories, total_self_us, details = diagnostic_module._profile_summary(object())
-        self.assertEqual(total_self_us, 9000)
+        self.assertEqual(total_self_us, 16_700)
         self.assertEqual(sum(cpu_us for _category, cpu_us, _calls in categories), total_self_us)
-        self.assertEqual(details["mapped_self_cpu_us"], 5000)
+        self.assertEqual(details["mapped_self_cpu_us"], 12_000)
+        category_cpu = {name: cpu_us for name, cpu_us, _calls in categories}
+        self.assertEqual(category_cpu["serialization_validation"], 9_000)
+        self.assertEqual(category_cpu["other"], 4_700)
         self.assertEqual(details["top_self"], [
+            {"function_id": "api.serialization.pydantic_dump", "cpu_us": 4500,
+             "calls": 7, "primitive_calls": 5},
+            {"function_id": "api.serialization.pydantic_validate", "cpu_us": 4500,
+             "calls": 7, "primitive_calls": 4},
             {"function_id": "api.orm.session_execute", "cpu_us": 3000,
              "calls": 3, "primitive_calls": 2},
-            {"function_id": "api.serialization.pydantic_validate", "cpu_us": 2000,
-             "calls": 2, "primitive_calls": 1},
         ])
-        self.assertEqual(details["top_cumulative"][0]["cpu_us"], 9000)
+        self.assertEqual(details["top_cumulative"][0], {
+            "function_id": "api.serialization.pydantic_validate", "cpu_us": 11_500,
+            "calls": 7, "primitive_calls": 4,
+        })
+        self.assertEqual(details["top_cumulative"][1], {
+            "function_id": "api.serialization.pydantic_dump", "cpu_us": 9_800,
+            "calls": 7, "primitive_calls": 5,
+        })
         self.assertNotIn("customer_secret_function", repr(details))
         self.assertNotIn("customer-secret.py", repr(details))
+        self.assertNotIn("pydantic_core._pydantic_core", repr(details))
 
     async def test_api_cpu_capture_is_one_use_and_stops_on_worker_loop(self) -> None:
         import python_packages.platform_infra.performance_diagnostic as diagnostic_module

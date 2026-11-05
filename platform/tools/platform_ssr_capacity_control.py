@@ -30,7 +30,8 @@ MAX_CONTROL_AGE_SECONDS = 1.5
 CONTROL_READ_ATTEMPTS = 2
 CONTROL_FAILURE_REASONS = frozenset({
     "snapshot_replaced", "snapshot_changed", "stale", "future",
-    "metadata", "schema", "binding", "sequence", "unavailable", "unexpected",
+    "metadata", "path_metadata", "opened_metadata", "replacement_target_metadata",
+    "schema", "binding", "sequence", "unavailable", "unexpected",
 })
 
 
@@ -47,6 +48,52 @@ class _ControlPathReplaced(CapacityControlError):
 
     def __init__(self, message: str) -> None:
         super().__init__(message, reason="snapshot_replaced")
+
+
+def _control_path_metadata_is_valid(metadata: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and metadata.st_uid == os.geteuid()
+        and metadata.st_nlink == 1
+        and stat.S_IMODE(metadata.st_mode) == 0o600
+        and 0 < metadata.st_size <= MAX_CONTROL_BYTES
+    )
+
+
+def _control_path_metadata_is_zero_link_snapshot(metadata: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and metadata.st_uid == os.geteuid()
+        and metadata.st_nlink == 0
+        and stat.S_IMODE(metadata.st_mode) == 0o600
+        and 0 < metadata.st_size <= MAX_CONTROL_BYTES
+    )
+
+
+def _require_replacement_target(path: Path, previous: os.stat_result) -> None:
+    """Accept only a distinct, fully validated current path as replacement evidence."""
+    try:
+        current = path.lstat()
+    except OSError as exc:
+        raise CapacityControlError(
+            "control replacement target unavailable", reason="unavailable",
+        ) from exc
+    if _control_path_metadata_is_zero_link_snapshot(current):
+        try:
+            current = path.lstat()
+        except OSError as exc:
+            raise CapacityControlError(
+                "control replacement target unavailable", reason="unavailable",
+            ) from exc
+    if ((current.st_dev, current.st_ino) == (previous.st_dev, previous.st_ino)
+            or not _control_path_metadata_is_valid(current)):
+        raise CapacityControlError(
+            "control replacement target metadata invalid",
+            reason="replacement_target_metadata",
+        )
+    raise _ControlPathReplaced("control path replaced during snapshot")
 
 
 def write_control(
@@ -161,36 +208,36 @@ def _read_control_once(
 ) -> dict[str, Any]:
     try:
         before = path.lstat()
-        if (not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode)
-                or before.st_uid != os.geteuid() or before.st_nlink != 1
-                or stat.S_IMODE(before.st_mode) != 0o600
-                or before.st_size <= 0 or before.st_size > MAX_CONTROL_BYTES):
-            raise CapacityControlError("control file metadata invalid", reason="metadata")
+        if not _control_path_metadata_is_valid(before):
+            if _control_path_metadata_is_zero_link_snapshot(before):
+                _require_replacement_target(path, before)
+            raise CapacityControlError(
+                "control file path metadata invalid", reason="path_metadata",
+            )
         fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     except OSError as exc:
         raise CapacityControlError("control file unavailable", reason="unavailable") from exc
     try:
         opened = os.fstat(fd)
         if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
-            raise _ControlPathReplaced("control path replaced during open")
+            if _control_path_metadata_is_zero_link_snapshot(opened):
+                _require_replacement_target(path, opened)
+            if _control_path_metadata_is_valid(opened):
+                raise _ControlPathReplaced("control path replaced during open")
+            raise CapacityControlError(
+                "opened control file metadata invalid", reason="opened_metadata",
+            )
         if ((opened.st_mode, opened.st_uid, opened.st_nlink, opened.st_size)
                 != (before.st_mode, before.st_uid, before.st_nlink, before.st_size)):
-            if ((opened.st_mode, opened.st_uid, opened.st_size)
-                    == (before.st_mode, before.st_uid, before.st_size)
-                    and opened.st_nlink == 0):
-                try:
-                    current = path.lstat()
-                except OSError:
-                    current = None
-                if (current is not None
-                        and (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
-                        and stat.S_ISREG(current.st_mode)
-                        and current.st_uid == os.geteuid()
-                        and current.st_nlink == 1
-                        and stat.S_IMODE(current.st_mode) == 0o600
-                        and 0 < current.st_size <= MAX_CONTROL_BYTES):
-                    raise _ControlPathReplaced("control path replaced during open")
-            raise CapacityControlError("control file metadata changed", reason="metadata")
+            if _control_path_metadata_is_zero_link_snapshot(opened):
+                _require_replacement_target(path, opened)
+            raise CapacityControlError(
+                "opened control file metadata changed", reason="opened_metadata",
+            )
+        if not _control_path_metadata_is_valid(opened):
+            raise CapacityControlError(
+                "opened control file metadata invalid", reason="opened_metadata",
+            )
         raw = bytearray()
         while len(raw) <= MAX_CONTROL_BYTES:
             chunk = os.read(fd, min(1024, MAX_CONTROL_BYTES + 1 - len(raw)))
@@ -198,9 +245,21 @@ def _read_control_once(
                 break
             raw.extend(chunk)
         finished = os.fstat(fd)
-        after = path.lstat()
+        try:
+            after = path.lstat()
+        except OSError as exc:
+            raise CapacityControlError(
+                "control path unavailable after read", reason="unavailable",
+            ) from exc
     finally:
         os.close(fd)
+    if not _control_path_metadata_is_valid(after):
+        if _control_path_metadata_is_zero_link_snapshot(after):
+            _require_replacement_target(path, after)
+        raise CapacityControlError(
+            "control replacement target metadata invalid",
+            reason="replacement_target_metadata",
+        )
     if (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino):
         raise _ControlPathReplaced("control path replaced during read")
     if (len(raw) > MAX_CONTROL_BYTES or not raw.endswith(b"\n")

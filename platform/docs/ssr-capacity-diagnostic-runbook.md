@@ -419,6 +419,8 @@ primitive calls. The self-time coverage field counts only mapped functions;
 the category totals still conserve all API self CPU. Cumulative values overlap
 their callers and must not be summed into a total. Unknown functions remain in
 their existing category and never expose a raw symbol or file path.
+These IDs aggregate exact families: validate=`BaseModel.model_validate` plus Core `SchemaValidator.validate_python`/`validate_json`; dump=`BaseModel.model_dump` plus Core `SchemaSerializer.to_python`/`to_json`.
+Dump-ID CPU is not all `model_dump`. Call/primitive-call counts sum frames, not unique operations; self CPU sums frames and cumulative overlaps callers. Aliases remain `serialization_validation`, unknown built-ins `other`; mapping does not prove earlier CPU causation.
 
 Web profile rows contain sampled counts for at most 20 reviewed function IDs
 and a mapped-sample count against the total sample count. These are V8 sample
@@ -430,6 +432,11 @@ must equal the total sample count. These counts do not assign CPU time to a
 function or category. Unknown frames remain in their existing category.
 Neither producer exports raw profile nodes, paths, symbols, request IDs or
 source text.
+After `Profiler.stop`, Web V8 maps sampled chunks through pinned Node maps only for matching
+standalone/sibling bytes and bounded regular maps; otherwise classification is unchanged. Elapsed
+time is captured at stop and mapping waits for the process-CPU snapshot. Paths/positions/raw symbols
+stay private; only existing IDs/categories are emitted. Workloads: `authenticated_html_ssr_capacity_v1`,
+`authenticated_html_ssr_capacity_120s_v1`, `authenticated_html_ssr_cpu_profile_20s_v1`.
 
 For an incomplete diagnostic, use the one-day failure-fingerprint artifact to
 read only the bounded failure classifications. `capacity_phase.resource_abort_reason`
@@ -438,6 +445,7 @@ identifies the worker abort class; when it is `control_file_invalid`, use
 `memory_observer_failure` fields classify observer handling and remote-watch
 failures. A missing or `unknown` value leaves the cause unresolved. These
 classifications do not establish why an underlying file or process failed.
+Control reason labels are value-free: `path_metadata` (initial path), `opened_metadata` (opened file), `replacement_target_metadata` (distinct target), and `snapshot_replaced` (retry exhausted); legacy `metadata` remains valid. No path, stat value or control payload is exposed.
 Do not inspect or export raw control files, worker/supervisor reports, or
 observer stderr. Any incomplete result remains zero-credit and follows the
 exact-run abort and cleanup procedure below.

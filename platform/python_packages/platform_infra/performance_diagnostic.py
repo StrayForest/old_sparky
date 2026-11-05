@@ -795,8 +795,9 @@ API_FUNCTION_ALLOWLIST = frozenset({
     "run_with_ssr_trace",
 })
 # Function-level output is intentionally narrower than category attribution.
-# Match both the installed module suffix and exact function name, then emit
-# only this fixed identifier. Never serialize pstats filenames or raw symbols.
+# Match installed module suffixes or exact built-in descriptor names, then emit
+# only these fixed identifiers. Pydantic wrapper/core entries share one ID per
+# operation family; never serialize pstats filenames or raw symbols.
 API_PROFILE_FUNCTIONS = {
     ("/sqlalchemy/orm/session.py", "_execute_internal"): "api.orm.session_execute",
     ("/sqlalchemy/orm/session.py", "execute"): "api.orm.session_execute",
@@ -818,6 +819,19 @@ API_PROFILE_FUNCTIONS = {
     ("/fastapi/encoders.py", "jsonable_encoder"): "api.serialization.fastapi_encode",
     ("/json/encoder.py", "encode"): "api.serialization.json_encode",
     ("/json/encoder.py", "iterencode"): "api.serialization.json_encode",
+}
+# cProfile reports these CPython extension methods with filename "~". The
+# entire descriptor string is the lookup key: unknown or version-drifted names
+# stay in `other` rather than matching by substring.
+API_PROFILE_BUILTIN_FUNCTIONS = {
+    "<method 'validate_python' of 'pydantic_core._pydantic_core.SchemaValidator' objects>":
+        "api.serialization.pydantic_validate",
+    "<method 'validate_json' of 'pydantic_core._pydantic_core.SchemaValidator' objects>":
+        "api.serialization.pydantic_validate",
+    "<method 'to_python' of 'pydantic_core._pydantic_core.SchemaSerializer' objects>":
+        "api.serialization.pydantic_dump",
+    "<method 'to_json' of 'pydantic_core._pydantic_core.SchemaSerializer' objects>":
+        "api.serialization.pydantic_dump",
 }
 RUNTIME_PREFIX_CATEGORIES = (
     ("/sqlalchemy/", "orm_result"),
@@ -875,6 +889,7 @@ def _profile_summary(
         all_self_us += self_us
         normalized = filename.replace("\\", "/")
         label = "other"
+        function_id = None
         if normalized.startswith(platform_root + "/"):
             relative = normalized[len(platform_root) + 1 :]
             if function in API_FUNCTION_ALLOWLIST and relative.startswith((
@@ -886,17 +901,24 @@ def _profile_summary(
                 if prefix in normalized:
                     label = category
                     break
+        if normalized == "~":
+            function_id = API_PROFILE_BUILTIN_FUNCTIONS.get(function)
+            if function_id is not None:
+                label = "serialization_validation"
         entry = totals.setdefault(label, [0, 0])
         entry[0] += self_us
         entry[1] += int(values[1])
-        for (module_suffix, function_name), function_id in API_PROFILE_FUNCTIONS.items():
-            if normalized.endswith(module_suffix) and function == function_name:
-                detail = function_totals.setdefault(function_id, [0, 0, 0, 0])
-                detail[0] += self_us
-                detail[1] += int(max(0.0, float(values[3])) * 1_000_000)
-                detail[2] += int(values[1])
-                detail[3] += int(values[0])
-                break
+        if function_id is None:
+            for (module_suffix, function_name), candidate_id in API_PROFILE_FUNCTIONS.items():
+                if normalized.endswith(module_suffix) and function == function_name:
+                    function_id = candidate_id
+                    break
+        if function_id is not None:
+            detail = function_totals.setdefault(function_id, [0, 0, 0, 0])
+            detail[0] += self_us
+            detail[1] += int(max(0.0, float(values[3])) * 1_000_000)
+            detail[2] += int(values[1])
+            detail[3] += int(values[0])
     # Emit every recognized ID (the closed map is capped at 20), allowing the
     # parent to merge API workers before selecting its top rows.
     top_self = [
