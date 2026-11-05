@@ -21,16 +21,25 @@ async def get_me(
     auth_session=Depends(get_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> UserResponse:
+    lookup = None
     try:
-        account = await get_or_build_user_account_read_model(
+        lookup = await get_or_build_user_account_read_model(
             db_session,
             user=auth_session.user,
             now=auth_session.now,
         )
-        return serialize_current_user_from_account_read_model(
+        response = serialize_current_user_from_account_read_model(
             auth_session.user,
             role_slugs=auth_session.role_slugs,
-            account=account,
+            account=lookup.account,
         )
+        # The response is now detached from ORM state and the authoritative
+        # monthly allowance query has completed. Return the pooled connection
+        # before the best-effort cache write can await Redis.
+        await release_db_connection(db_session)
+        await lookup.write_after_db_release(user_id=auth_session.user.id)
+        return response
     finally:
         await release_db_connection(db_session)
+        if lookup is not None:
+            lookup.finish_without_write()

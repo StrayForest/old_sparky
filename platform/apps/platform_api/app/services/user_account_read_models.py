@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime
 import json
 import logging
+import secrets
 from time import perf_counter
 from typing import Any
 
@@ -38,24 +40,67 @@ USER_ACCOUNT_READ_MODEL_KEY_PREFIX = "platform:user-account:read-model:v1"
 USER_ACCOUNT_READ_MODEL_SAFETY_TTL_SECONDS = 60
 _REDIS_UNAVAILABLE = (RedisError, OSError, asyncio.TimeoutError)
 
-_SET_IF_NEWER_SCRIPT = """
+_RESERVE_GENERATION_SCRIPT = """
+local current = redis.call('GET', KEYS[1])
+if current then
+    local separator = string.find(current, '\\n', 1, true)
+    if separator then
+        local revision = tonumber(string.sub(current, 1, separator - 1))
+        local body = string.sub(current, separator + 1)
+        local ok, envelope = pcall(cjson.decode, body)
+        if ok and revision and type(envelope) == 'table' then
+            if envelope[1] == 'ready'
+                and type(envelope[2]) == 'string'
+                and string.len(envelope[2]) > 0
+                and type(envelope[3]) == 'table' then
+                return current
+            end
+            if revision == 0 and envelope[1] == 'pending'
+                and type(envelope[2]) == 'string'
+                and string.len(envelope[2]) > 0 then
+                return current
+            end
+        end
+    end
+end
+redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+return ARGV[1]
+"""
+
+_SET_IF_CURRENT_GENERATION_SCRIPT = """
 local current = redis.call('GET', KEYS[1])
 if not current then
-    redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
-    return 1
+    return 0
 end
 local separator = string.find(current, '\\n', 1, true)
 if not separator then
-    redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
-    return 1
+    return 0
 end
 local current_revision = tonumber(string.sub(current, 1, separator - 1))
-local next_revision = tonumber(ARGV[1])
-if not current_revision or current_revision <= next_revision then
-    redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
-    return 1
+local body = string.sub(current, separator + 1)
+local ok, envelope = pcall(cjson.decode, body)
+if not ok or type(envelope) ~= 'table' or not current_revision then
+    return 0
 end
-return 0
+local current_generation = nil
+if envelope[1] == 'pending' and current_revision == 0
+    and type(envelope[2]) == 'string' and string.len(envelope[2]) > 0 then
+    current_generation = envelope[2]
+elseif envelope[1] == 'ready' and type(envelope[2]) == 'string'
+    and string.len(envelope[2]) > 0 and type(envelope[3]) == 'table' then
+    current_generation = envelope[2]
+else
+    return 0
+end
+if type(current_generation) ~= 'string' or current_generation ~= ARGV[1] then
+    return 0
+end
+local next_revision = tonumber(ARGV[2])
+if not next_revision or current_revision > next_revision then
+    return 0
+end
+redis.call('SET', KEYS[1], ARGV[3], 'EX', ARGV[4])
+return 1
 """
 
 
@@ -69,27 +114,110 @@ def _revision_timestamp(value: datetime | None) -> int:
     return int(value.timestamp() * 1_000_000)
 
 
-def _encode(*, revision: int, payload: dict[str, Any]) -> bytes:
+def _encode_pending(*, generation: str) -> bytes:
+    return b"0\n" + json.dumps(
+        ["pending", generation],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def _encode(*, revision: int, generation: str, payload: dict[str, Any]) -> bytes:
     return f"{int(revision)}\n".encode("ascii") + json.dumps(
-        payload,
+        ["ready", generation, payload],
         separators=(",", ":"),
         ensure_ascii=False,
         sort_keys=True,
     ).encode("utf-8")
 
 
-def _decode(raw: bytes | str | None) -> dict[str, Any] | None:
+@dataclass(slots=True)
+class UserAccountReadModelLookup:
+    account: dict[str, Any]
+    get_ms: float
+    build_ms: float
+    outcome: str
+    pending_generation: str | None = None
+    pending_revision: int | None = None
+    pending_payload: dict[str, Any] | None = None
+    finalized: bool = False
+
+    def finish_without_write(self) -> None:
+        if self.finalized:
+            return
+        self._record(set_ms=0.0)
+
+    async def write_after_db_release(self, *, user_id: str) -> None:
+        if self.finalized:
+            return
+        set_ms = 0.0
+        if self.pending_generation is not None:
+            started = perf_counter()
+            try:
+                write_ok = await _write(
+                    user_id,
+                    generation=self.pending_generation,
+                    revision=self.pending_revision or 0,
+                    payload=self.pending_payload or {},
+                )
+            except BaseException:
+                self.outcome = "write_error"
+                raise
+            finally:
+                # This is wall time across Redis I/O, not CPU time.
+                set_ms = (perf_counter() - started) * 1000
+            if write_ok is None:
+                self.outcome = "write_error"
+        self._record(set_ms=set_ms)
+
+    def _record(self, *, set_ms: float) -> None:
+        if self.finalized:
+            return
+        self.finalized = True
+        record_redis_read_model_event(
+            model="user_account",
+            outcome=self.outcome,
+            get_ms=self.get_ms,
+            build_ms=self.build_ms,
+            set_ms=set_ms,
+            include_payload_metadata=False,
+        )
+
+
+def _decode(
+    raw: bytes | str | None,
+) -> tuple[str, str, int, dict[str, Any]] | tuple[str, str] | None:
     if raw is None:
         return None
     raw_bytes = raw.encode("utf-8") if isinstance(raw, str) else bytes(raw)
-    _revision, separator, payload = raw_bytes.partition(b"\n")
+    raw_revision, separator, payload = raw_bytes.partition(b"\n")
     if not separator:
         return None
     try:
+        revision = int(raw_revision)
         decoded = json.loads(payload)
     except (TypeError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
         return None
-    return decoded if isinstance(decoded, dict) else None
+    if not isinstance(decoded, list) or not decoded:
+        # v1 object payloads and malformed values are never served by the v2 reader.
+        return None
+    if (
+        decoded[0] == "pending"
+        and len(decoded) == 2
+        and isinstance(decoded[1], str)
+        and bool(decoded[1])
+        and revision == 0
+    ):
+        return "pending", decoded[1]
+    if (
+        decoded[0] == "ready"
+        and len(decoded) == 3
+        and isinstance(decoded[1], str)
+        and bool(decoded[1])
+        and isinstance(decoded[2], dict)
+    ):
+        return "ready", decoded[1], revision, decoded[2]
+    return None
 
 
 async def build_user_account_read_model(
@@ -188,25 +316,32 @@ async def build_user_account_read_model(
     return revision, payload
 
 
-async def _write(user_id: str, *, revision: int, payload: dict[str, Any]) -> bool:
+async def _write(
+    user_id: str,
+    *,
+    generation: str,
+    revision: int,
+    payload: dict[str, Any],
+) -> bool | None:
     client = redis_client(decode_responses=False)
     try:
-        await client.eval(
-            _SET_IF_NEWER_SCRIPT,
+        result = await client.eval(
+            _SET_IF_CURRENT_GENERATION_SCRIPT,
             1,
             user_account_read_model_key(user_id),
+            generation,
             str(int(revision)),
-            _encode(revision=revision, payload=payload),
+            _encode(revision=revision, generation=generation, payload=payload),
             str(USER_ACCOUNT_READ_MODEL_SAFETY_TTL_SECONDS),
         )
-        return True
+        return int(result) == 1
     except _REDIS_UNAVAILABLE as exc:
         logger.warning(
             "Redis user account read-model write failed user_id=%s error=%s",
             user_id,
             type(exc).__name__,
         )
-        return False
+        return None
     finally:
         await client.aclose()
 
@@ -216,32 +351,39 @@ async def get_or_build_user_account_read_model(
     *,
     user: User,
     now: datetime,
-) -> dict[str, Any]:
+) -> UserAccountReadModelLookup:
     """Read cached supplemental fields or build them from the current session."""
 
     client = redis_client(decode_responses=False)
     get_ms = 0.0
     build_ms = 0.0
-    set_ms = 0.0
     outcome = "other"
-    read_failed = False
+    generation: str | None = None
+    lookup_returned = False
     try:
         get_started = perf_counter()
         try:
-            cached_raw = await client.get(user_account_read_model_key(user.id))
+            generated_token = secrets.token_urlsafe(18)
+            reservation = await client.eval(
+                _RESERVE_GENERATION_SCRIPT,
+                1,
+                user_account_read_model_key(user.id),
+                _encode_pending(generation=generated_token),
+                str(USER_ACCOUNT_READ_MODEL_SAFETY_TTL_SECONDS),
+            )
         except _REDIS_UNAVAILABLE as exc:
-            read_failed = True
             logger.warning(
                 "Redis user account read-model read failed user_id=%s error=%s",
                 user.id,
                 type(exc).__name__,
             )
-            cached_raw = None
+            reservation = None
         finally:
             get_ms = (perf_counter() - get_started) * 1000
             await client.aclose()
-        cached = _decode(cached_raw)
-        if cached is not None:
+        decoded = _decode(reservation)
+        if decoded is not None and decoded[0] == "ready":
+            _, generation, _revision, cached = decoded
             # The allowance is derived from tournament rows, not the user
             # record. Keep that one small authoritative count fresh even when
             # the profile/security joins are served from Redis. Normal
@@ -256,7 +398,16 @@ async def get_or_build_user_account_read_model(
             )
             cached["private_tournament_monthly_limit"] = PRIVATE_TOURNAMENT_MONTHLY_LIMIT
             outcome = "hit"
-            return cached
+            lookup = UserAccountReadModelLookup(
+                account=cached,
+                get_ms=get_ms,
+                build_ms=0.0,
+                outcome=outcome,
+            )
+            lookup_returned = True
+            return lookup
+        if decoded is not None and decoded[0] == "pending":
+            _, generation = decoded
 
         build_started = perf_counter()
         try:
@@ -272,30 +423,36 @@ async def get_or_build_user_account_read_model(
             # This is wall time across the async builder, not CPU time.
             build_ms = (perf_counter() - build_started) * 1000
 
-        set_started = perf_counter()
-        try:
-            write_ok = await _write(user.id, revision=revision, payload=payload)
-        finally:
-            set_ms = (perf_counter() - set_started) * 1000
-        if not write_ok:
-            outcome = "read_write_error" if read_failed else "write_error"
+        if generation is None:
+            outcome = "read_error"
         else:
-            outcome = "read_error" if read_failed else "miss"
+            outcome = "miss"
         logger.debug(
             "user_account_read_model_built user_id=%s build_ms=%.2f",
             user.id,
             build_ms,
         )
-        return payload
-    finally:
-        record_redis_read_model_event(
-            model="user_account",
-            outcome=outcome,
+        lookup = UserAccountReadModelLookup(
+            account=payload,
             get_ms=get_ms,
             build_ms=build_ms,
-            set_ms=set_ms,
-            include_payload_metadata=False,
+            outcome=outcome,
+            pending_generation=generation,
+            pending_revision=revision if generation is not None else None,
+            pending_payload=payload if generation is not None else None,
         )
+        lookup_returned = True
+        return lookup
+    finally:
+        if not lookup_returned:
+            record_redis_read_model_event(
+                model="user_account",
+                outcome=outcome,
+                get_ms=get_ms,
+                build_ms=build_ms,
+                set_ms=0.0,
+                include_payload_metadata=False,
+            )
 
 
 async def delete_user_account_read_model(user_id: str) -> None:

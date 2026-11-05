@@ -11,11 +11,21 @@ belong in the linked owner documents below.
 ## Live and pending state
 
 - Production app source A is
-  `7c6034efe3878c3413090ca1bcdb5be6e93154e8`; active host-tools generation C is
+  `82956d85cdc7cec034c74ac22e8cd7091c229fcc` (deployment run
+  `42022174887/1`; previous app source `f72d3c969a4d89a435be25fd8ec0f2ebc11f02e0`);
+  active host-tools generation C is
   `0de51aca4b4d04a80a2f0d392003cc258d8f1400`. Resolve A from the successful
   deployment receipt and C from the checked-in active pin for each operation.
   Keep workflow runner S, application A and host-tools C distinct; a matching
   runner SHA does not prove deployment or installation.
+- The targeted API read-mix run `42034147480/1` has closed with authoritative
+  fixture cleanup; no load or fixture is active. One restore-verified backup
+  pair is retained. Post-run FULL readiness is not yet evidenced: two canonical
+  collector attempts returned generic failures without JSON, and a separate
+  traced invocation returned `ready` but retained only its trace projection,
+  not the canonical receipt. Preserve the failures as unexplained and obtain
+  and validate a complete canonical FULL receipt before the next consequential
+  production operation.
 - Cell 9, `read-mix-concurrency-ramp-v1`, completed as run `41937909055/1` on
   runner S and app A, both `7c6034efe3878c3413090ca1bcdb5be6e93154e8`, with
   host-tools C `0de51aca4b4d04a80a2f0d392003cc258d8f1400`; exact cleanup

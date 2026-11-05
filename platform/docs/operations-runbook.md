@@ -191,7 +191,7 @@ CPU/RAM/load, connections, locks, cache state, Celery queue backlog/retries and
 worker lifecycle. Use
 `tools/platform_production_qa.py --collect-performance` and
 `tools/platform_performance_audit.py`; detailed JSON stays under shared storage.
-For read-path diagnosis, distinguish checkout wait, connection hold, SQL and complete request time; see the [performance transport runbook](performance-transport-runbook.md) for attribution. Workspace and `/users/me` release the session after materialization; exceptions still follow normal dependency teardown.
+For read-path diagnosis, distinguish checkout wait, connection hold, SQL and complete request time; see the [performance transport runbook](performance-transport-runbook.md) for attribution. The `connection_after_sql_time` diagnostic is `max(0, pool_connection_hold_ms - sum(db_sql_ms))`: held-connection time outside recorded SQL spans, not time after the last SQL statement. Workspace and `/users/me` release the session after materialization; exceptions still follow normal dependency teardown.
 Reviewed production load profiles are JSON contracts under
 `platform/performance/profiles/`, selected by ID in
 `platform-production-external-load.yml`; this runbook covers procedure and

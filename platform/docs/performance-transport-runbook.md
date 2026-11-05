@@ -5,19 +5,20 @@
 
 ## CPU and memory diagnostic interpretation
 
-The opt-in paired diagnostic uses eight authenticated actors and at most five
-Node/V8 samples per phase. Standard 20-second phases sample nominally every
-four seconds; the typed `authenticated_html_ssr_capacity_120s_v1` plan spreads
-five samples across its longer phase (about 30 seconds). Its ON sample duration
-may reach 120 seconds, while OFF remains at 20 seconds. The endpoint may lag
-the phase boundary by 500 ms, but `sampled_window_duration_ms` must fit the
-planned duration. Only the exact workload/phase gets the wider parser bound;
-all other windows stay capped at 20 seconds. Fewer than five accepted samples
-remain incomplete. `sampled_window_duration_ms` spans the first-to-last sample
-(normally 16 seconds on standard plans), not the full request phase; sampled
-memory-event deltas cover only that interval. RSS, heap, external memory and
-array buffers are bytes; Node `arrayBuffers` is part of `external`. GC entries
-are assigned by monotonic start time and clipped to the phase end.
+The opt-in paired diagnostic uses eight authenticated actors and at most five Node/V8 samples per phase.
+Standard 20-second phases sample nominally every four seconds; the typed `authenticated_html_ssr_capacity_120s_v1`
+plan spreads five samples across its longer phase (about 30 seconds). Its ON sample duration may reach 120 seconds,
+while OFF remains at 20 seconds. The endpoint may lag the phase boundary by 500 ms, but
+`sampled_window_duration_ms` must fit the planned duration. Only the exact workload/phase gets the wider parser bound;
+all other windows stay capped at 20 seconds. Fewer than five accepted samples remain incomplete.
+`sampled_window_duration_ms` spans the first-to-last sample (normally 16 seconds on standard plans), not the full
+request phase; sampled memory-event deltas cover only that interval. RSS, heap, external memory and array buffers are
+bytes; Node `arrayBuffers` is part of `external`. GC entries are assigned by monotonic start time and clipped to the phase end.
+
+The web service emits bounded private `ssr_web_lifecycle` rows for active/trace-only mode, CPU-window scheduling,
+terminal outcomes, V8 profile start/terminal outcomes, and memory-window start/finalization. `started` follows the CPU
+baseline or successful V8 `Profiler.start`; closed terminal reasons distinguish finalized from failed capture. Rows use
+validated run/phase bindings, stay out of public reports and `cpu_diagnostic_` matching, and grant no acceptance credit.
 
 SSR correlation queries API and web journals separately under exact unit,
 cgroup and invocation filters, with 24 MiB/service, 64 KiB/line, 50,000-row

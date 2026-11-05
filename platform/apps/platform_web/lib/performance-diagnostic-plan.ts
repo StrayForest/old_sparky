@@ -24,6 +24,7 @@ import {
 import { releaseMetadataPathFromStandaloneCwd } from "./release-identity-path.mjs";
 import {
   claimWorkspaceCpuWindowStart,
+  emitSsrWebLifecycleEvent,
   scheduleAuthorizedWorkspaceCpuWindowEdges,
   scheduleWorkspaceCpuWindowStart,
 } from "./workspace-cpu-window-scheduler.mjs";
@@ -413,16 +414,14 @@ export async function runWithSsrDiagnosticPlan<T>(
   registerSsrStreamRequest(requestHeaders, diagnostic);
   if (diagnosticStorage.getStore()) return operation();
   if (diagnostic.traceOnly === true) {
+    emitSsrWebLifecycleEvent(diagnostic.plan, "none", "mode", "trace_only");
     return diagnosticStorage.run(diagnostic, operation);
   }
+  emitSsrWebLifecycleEvent(diagnostic.plan, diagnostic.phase, "mode", "active");
   startCpuUsageWindow(diagnostic.plan, diagnostic.phase);
   startNodeMemoryWindow(diagnostic.plan, diagnostic.phase);
-  if (diagnostic.plan.workload === WORKLOAD_HTML_SSR_CPU_PROFILE_20S
-      && diagnostic.phase === "on"
-      && !consumedCpuRunIds.has(diagnostic.plan.run_id)
-      && activeCpuRunId === null) {
-    consumedCpuRunIds.add(diagnostic.plan.run_id);
-    await startNodeCpuProfile(diagnostic.plan, Date.now());
+  if (diagnostic.plan.workload === WORKLOAD_HTML_SSR_CPU_PROFILE_20S && diagnostic.phase === "on") {
+    await startAuthorizedNodeCpuProfile(diagnostic.plan);
   }
   return diagnosticStorage.run(diagnostic, operation);
 }
@@ -462,16 +461,21 @@ export async function run_with_workspace_cpu_diagnostic<T>(
     )) {
       return diagnosticPrearmStorage.run(freshPlan, operation);
     }
+    const reason = freshPlan === null ? "stale" : "mismatch";
+    for (const skippedPhase of ["off", "on"] as const) {
+      const targetMs = skippedPhase === "off" ? plan.off_start_ms : plan.on_start_ms;
+      emitSsrWebLifecycleEvent(plan, skippedPhase, "cpu_window", "skipped", {
+        reason,
+        lagMs: Date.now() - targetMs,
+      });
+    }
     return operation();
   }
+  emitSsrWebLifecycleEvent(plan, phase, "mode", "active");
   startCpuUsageWindow(plan, phase);
   startNodeMemoryWindow(plan, phase);
   if ((plan.workload === WORKLOAD_CPU_PAIR || plan.workload === WORKLOAD_HTML_SSR_CPU_PROFILE_20S)
-      && phase === "on"
-      && !consumedCpuRunIds.has(plan.run_id) && activeCpuRunId === null) {
-    consumedCpuRunIds.add(plan.run_id);
-    await startNodeCpuProfile(plan, Date.now());
-  }
+      && phase === "on") await startAuthorizedNodeCpuProfile(plan);
   return diagnosticStorage.run({ plan, phase }, operation);
 }
 
@@ -547,6 +551,11 @@ function scheduleCpuUsageWindow(plan: DiagnosticPlan, phase: DiagnosticPhase): v
     scheduled: usageWindowsScheduled,
     failed: usageWindowsFailed,
     onStart: startCpuUsageWindow,
+    onLifecycle: ({ status, reason, lagMs }) => {
+      if (status !== "started") {
+        emitSsrWebLifecycleEvent(plan, phase, "cpu_window", status, { reason, lagMs });
+      }
+    },
     startToleranceMs: CPU_WINDOW_TOLERANCE_MS,
   });
 }
@@ -556,7 +565,13 @@ function startCpuUsageWindow(plan: DiagnosticPlan, phase: DiagnosticPhase): void
     started: usageWindowsStarted,
     scheduled: usageWindowsScheduled,
     failed: usageWindowsFailed,
-  })) return;
+  })) {
+    const targetMs = phase === "off" ? plan.off_start_ms : plan.on_start_ms;
+    emitSsrWebLifecycleEvent(plan, phase, "cpu_window", "skipped", {
+      reason: "already_claimed", lagMs: Date.now() - targetMs,
+    });
+    return;
+  }
   const snapshot = ensureCpuUsageWindowSnapshot(plan.run_id, phase);
   const key = cpuUsageWindowKey(plan.run_id, phase);
   runCpuWindowSetup(() => {
@@ -572,8 +587,13 @@ function startCpuUsageWindow(plan: DiagnosticPlan, phase: DiagnosticPhase): void
     const startLagMs = startMs - startTarget;
     const startCpu = process.cpuUsage();
     const startMonotonic = performance.now();
+    emitSsrWebLifecycleEvent(plan, phase, "cpu_window", "started", {
+      lagMs: startLagMs,
+    });
     const capacity = effectiveCpuCapacity();
     const timer = setTimeout(() => {
+      let finalStatus: "finalized" | "failed" = "failed";
+      let finalReason: "end_error" | "timing_incomplete" | "none" = "end_error";
       try {
         const endMs = Date.now();
         const endLagMs = endMs - endTarget;
@@ -586,6 +606,8 @@ function startCpuUsageWindow(plan: DiagnosticPlan, phase: DiagnosticPhase): void
           && windowMs >= expectedWindowMs - CPU_WINDOW_TOLERANCE_MS
           && windowMs <= expectedWindowMs + 2 * CPU_WINDOW_TOLERANCE_MS
         );
+        finalStatus = timingComplete ? "finalized" : "failed";
+        finalReason = timingComplete ? "none" : "timing_incomplete";
         console.info(
           `cpu_diagnostic_usage service=web run_id=${plan.run_id} phase=${phase}`
           + ` window_ms=${windowMs} cpu_ns=${cpuNs}`
@@ -593,7 +615,14 @@ function startCpuUsageWindow(plan: DiagnosticPlan, phase: DiagnosticPhase): void
           + ` start_lag_ms=${startLagMs} end_lag_ms=${endLagMs}`
           + ` timing_complete=${String(timingComplete)}`
         );
+      } catch (error) {
+        finalStatus = "failed";
+        finalReason = "end_error";
+        throw error;
       } finally {
+        emitSsrWebLifecycleEvent(plan, phase, "cpu_window", finalStatus, {
+          reason: finalReason,
+        });
         if (cpuUsageWindowSnapshots.get(key) === snapshot) {
           cpuUsageWindowSnapshots.delete(key);
         }
@@ -776,8 +805,12 @@ function captureNodeMemorySample(phaseStartMonotonicMs: number): NodeMemorySampl
 
 function startNodeMemoryWindow(plan: DiagnosticPlan, phase: DiagnosticPhase): void {
   const key = `${plan.run_id}:${phase}`;
-  if (memoryWindowsStarted.has(key)) return;
+  if (memoryWindowsStarted.has(key)) {
+    emitSsrWebLifecycleEvent(plan, phase, "memory", "skipped", { reason: "already_claimed" });
+    return;
+  }
   memoryWindowsStarted.add(key);
+  emitSsrWebLifecycleEvent(plan, phase, "memory", "started");
   const samples: NodeMemorySample[] = [];
   let gcCount = 0;
   let gcDurationMs = 0;
@@ -831,7 +864,7 @@ function startNodeMemoryWindow(plan: DiagnosticPlan, phase: DiagnosticPhase): vo
     : MEMORY_SAMPLE_INTERVAL_MS;
   const interval = setInterval(sample, sampleIntervalMs);
   interval.unref();
-  const finish = setTimeout(() => {
+  const finalizeMemoryWindow = (): void => {
     clearInterval(interval);
     sample();
     if (observer !== null) consumeGcEntries(observer.takeRecords());
@@ -896,11 +929,44 @@ function startNodeMemoryWindow(plan: DiagnosticPlan, phase: DiagnosticPhase): vo
     } catch {
       // Diagnostic output is supplementary and must not affect the request.
     }
+  };
+  const finish = setTimeout(() => {
+    let finalStatus: "finalized" | "failed" = "finalized";
+    try {
+      finalizeMemoryWindow();
+    } catch (error) {
+      finalStatus = "failed";
+      throw error;
+    } finally {
+      emitSsrWebLifecycleEvent(plan, phase, "memory", finalStatus, {
+        reason: finalStatus === "finalized" ? "none" : "end_error",
+        sampleCount: samples.length,
+      });
+    }
   }, Math.max(1, phaseEndMonotonicMs - performance.now()));
   finish.unref();
 }
 
 type InspectorResponse<T> = { readonly result?: T };
+
+async function startAuthorizedNodeCpuProfile(plan: DiagnosticPlan): Promise<void> {
+  const startedAtMs = Date.now();
+  const startLagMs = startedAtMs - plan.on_start_ms;
+  if (consumedCpuRunIds.has(plan.run_id)) {
+    emitSsrWebLifecycleEvent(plan, "on", "cpu_profile", "skipped", {
+      reason: "already_claimed", lagMs: startLagMs,
+    });
+    return;
+  }
+  if (activeCpuRunId !== null) {
+    emitSsrWebLifecycleEvent(plan, "on", "cpu_profile", "skipped", {
+      reason: "already_claimed", lagMs: startLagMs,
+    });
+    return;
+  }
+  consumedCpuRunIds.add(plan.run_id);
+  await startNodeCpuProfile(plan);
+}
 
 function post<T>(session: inspector.Session, method: string, params?: object): Promise<T> {
   return new Promise((resolvePromise, rejectPromise) => {
@@ -914,10 +980,10 @@ function post<T>(session: inspector.Session, method: string, params?: object): P
   });
 }
 
-async function startNodeCpuProfile(plan: DiagnosticPlan, startedAtMs: number): Promise<void> {
+async function startNodeCpuProfile(plan: DiagnosticPlan): Promise<void> {
   const session = new inspector.Session();
-  const startLagMs = Math.max(0, startedAtMs - plan.on_start_ms);
-  const startedMonotonicMs = performance.now();
+  let startLagMs = 0;
+  let startedMonotonicMs = 0;
   try {
     session.connect();
     await post<InspectorResponse<unknown>>(session, "Profiler.enable");
@@ -925,14 +991,28 @@ async function startNodeCpuProfile(plan: DiagnosticPlan, startedAtMs: number): P
       interval: CPU_PROFILE_SAMPLING.intervalUs,
     });
     await post<InspectorResponse<unknown>>(session, "Profiler.start");
+    const startedAtMs = Date.now();
+    startLagMs = Math.max(0, startedAtMs - plan.on_start_ms);
+    startedMonotonicMs = performance.now();
     activeCpuRunId = plan.run_id;
+    emitSsrWebLifecycleEvent(plan, "on", "cpu_profile", "started", {
+      lagMs: startLagMs,
+    });
     const delay = Math.max(1, plan.on_end_ms - Date.now());
     const timer = setTimeout(() => {
       void stopNodeCpuProfile(session, plan.run_id, startLagMs, startedMonotonicMs);
     }, delay);
     timer.unref();
   } catch {
-    session.disconnect();
+    if (activeCpuRunId === plan.run_id) activeCpuRunId = null;
+    emitSsrWebLifecycleEvent(plan, "on", "cpu_profile", "failed", {
+      reason: "start_error", lagMs: Date.now() - plan.on_start_ms,
+    });
+    try {
+      session.disconnect();
+    } catch {
+      // Inspector cleanup is best-effort and never changes the SSR response.
+    }
   }
 }
 
@@ -942,8 +1022,15 @@ async function stopNodeCpuProfile(
   startLagMs: number,
   startedMonotonicMs: number
 ): Promise<void> {
-  if (activeCpuRunId !== runId) return;
+  if (activeCpuRunId !== runId) {
+    emitSsrWebLifecycleEvent({ run_id: runId }, "on", "cpu_profile", "skipped", {
+      reason: "already_claimed",
+    });
+    return;
+  }
   activeCpuRunId = null;
+  let finalStatus: "finalized" | "failed" = "failed";
+  let finalReason: "profile_bounds" | "profile_stop" | "none" = "profile_stop";
   try {
     const response = await post<{ profile?: {
       nodes?: Array<{ id: number; callFrame?: {
@@ -962,6 +1049,7 @@ async function stopNodeCpuProfile(
         || profile.timeDeltas.some((delta) => !Number.isSafeInteger(delta) || delta < 0)
         || profile.timeDeltas.reduce((total, delta) => total + delta, 0) > MAX_PROFILE_CPU_US) {
       console.info(`cpu_diagnostic_complete service=web run_id=${runId} status=incomplete reason=profile_bounds`);
+      finalReason = "profile_bounds";
       return;
     }
     const profileNodes = profile.nodes;
@@ -1009,9 +1097,20 @@ async function stopNodeCpuProfile(
       + `categories=${summary.slice(0, 3000)} `
       + `top_samples=${functionSummary}`
     );
+    finalStatus = "finalized";
+    finalReason = "none";
   } catch {
     console.info(`cpu_diagnostic_complete service=web run_id=${runId} status=incomplete reason=profile_stop`);
+    finalReason = "profile_stop";
   } finally {
-    session.disconnect();
+    try {
+      session.disconnect();
+    } catch {
+      // Inspector cleanup is best-effort and never changes the SSR response.
+    }
+    emitSsrWebLifecycleEvent({ run_id: runId }, "on", "cpu_profile", finalStatus, {
+      reason: finalReason,
+      lagMs: startLagMs,
+    });
   }
 }

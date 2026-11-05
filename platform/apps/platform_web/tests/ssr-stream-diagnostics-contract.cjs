@@ -187,6 +187,157 @@ function bounded(value) {
   return String(value || "").slice(0, 4_000);
 }
 
+async function verifySsrWebLifecycleContract() {
+  const module = await import(path.resolve(
+    __dirname, "..", "lib", "workspace-cpu-window-scheduler.mjs",
+  ));
+  const plan = { run_id: "0123456789abcdef0123456789abcdef" };
+  const lines = [];
+  const writeLine = (line) => lines.push(line);
+  const event = (phase, name, status, options = {}) => module.emitSsrWebLifecycleEvent(
+    plan, phase, name, status, { ...options, writeLine, nowMs: Date.now() },
+  );
+
+  assert.equal(event("none", "mode", "trace_only"), true);
+  assert.equal(event("none", "mode", "trace_only"), false);
+  assert.equal(event("on", "mode", "active"), true);
+  assert.equal(event("on", "cpu_window", "scheduled", { lagMs: -100 }), true);
+  assert.equal(event("on", "cpu_window", "started", { lagMs: 250 }), true);
+  assert.equal(event("on", "memory", "started"), true);
+  assert.equal(event("on", "memory", "finalized", { sampleCount: 3 }), true);
+  assert.equal(event("off", "cpu_window", "started"), true);
+  assert.equal(event("off", "cpu_window", "finalized"), true);
+  assert.equal(event("off", "cpu_profile", "started"), true);
+  assert.equal(event("off", "cpu_profile", "failed", { reason: "profile_stop" }), true);
+  assert.equal(event("off", "memory", "started"), true);
+  assert.equal(event("off", "memory", "failed", { reason: "end_error" }), true);
+  assert.equal(event("off", "memory", "failed", { reason: "end_error" }), false);
+  assert.equal(event("off", "memory", "finalized", { sampleCount: 5 }), true);
+  assert.equal(event("on", "memory", "finalized", { sampleCount: 3 }), false);
+  assert.equal(module.emitSsrWebLifecycleEvent(null, "on", "mode", "active", { writeLine }), false);
+  assert.equal(module.emitSsrWebLifecycleEvent({ run_id: "bad" }, "on", "mode", "active", { writeLine }), false);
+  assert.equal(module.emitSsrWebLifecycleEvent(plan, "invalid", "mode", "active", { writeLine }), false);
+  assert.equal(event("on", "cpu_window", "failed", { reason: "/private/path" }), false);
+  assert.equal(event("on", "memory", "finalized", { sampleCount: 6 }), false);
+  assert.equal(module.emitSsrWebLifecycleEvent(
+    { run_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", expires_at_ms: Date.now() - 1 },
+    "on", "memory", "finalized", { sampleCount: 2, writeLine },
+  ), true);
+  assert(lines.every((line) => /^ssr_web_lifecycle service=web run_id=[0-9a-f]{32} /u.test(line)));
+  assert(lines.some((line) => line.includes("phase=none event=mode status=trace_only")));
+  assert(lines.some((line) => line.includes("lag_ms=250")));
+  assert(lines.some((line) => line.includes("sample_count=3")));
+  assert(lines.some((line) => line.includes("event=memory status=started")));
+  assert(lines.some((line) => line.includes("event=memory status=failed reason=end_error")));
+  assert(lines.every((line) => !/(?:private|cookie|token|request|email|source-map|\.js)/iu.test(line)));
+  assert(lines.every((line) => !line.startsWith("cpu_diagnostic_")));
+
+  const boundedNow = Date.now() + 1;
+  let accepted = 0;
+  for (let index = 0; index < 300; index += 1) {
+    const id = index.toString(16).padStart(32, "0");
+    if (module.emitSsrWebLifecycleEvent(
+      { run_id: id }, "off", "mode", "active", { nowMs: boundedNow, writeLine },
+    )) accepted += 1;
+  }
+  assert(accepted <= 256);
+  assert.equal(module.emitSsrWebLifecycleEvent(
+    { run_id: "ffffffffffffffffffffffffffffffff" }, "off", "mode", "active",
+    { nowMs: boundedNow + 600_001, writeLine },
+  ), true);
+
+  const schedulerPlan = {
+    run_id: "fedcba9876543210fedcba9876543210",
+    off_start_ms: 1_000, off_end_ms: 21_000,
+    on_start_ms: 26_000, on_end_ms: 46_000, expires_at_ms: 46_000,
+  };
+  function scheduleCase(offsetMs, { stale = false, throwStart = false, throwSchedule = false } = {}) {
+    let nowMs = 900;
+    let current = schedulerPlan;
+    if (stale) current = { ...schedulerPlan, expires_at_ms: schedulerPlan.expires_at_ms + 1 };
+    const scheduled = new Set();
+    const started = new Set();
+    const failed = new Set();
+    const events = [];
+    let callback;
+    const ok = module.scheduleWorkspaceCpuWindowStart(schedulerPlan, "off", {
+      now: () => nowMs,
+      schedule: (next) => {
+        if (throwSchedule) throw new Error("private setup detail");
+        callback = next;
+      },
+      readPlan: () => current,
+      samePlan: (expected, actual) => actual !== null
+        && JSON.stringify(expected) === JSON.stringify(actual),
+      phaseAt: (_current, atMs) => atMs >= 1_000 && atMs < 21_000 ? "off" : null,
+      startTarget: (_current, phase) => phase === "off" ? 1_000 : 26_000,
+      expiresAt: (value) => value.expires_at_ms,
+      started, scheduled, failed,
+      onStart: () => { if (throwStart) throw new Error("private callback detail"); },
+      onLifecycle: (row) => events.push(row),
+      startToleranceMs: 250,
+    });
+    if (!throwSchedule && ok) {
+      nowMs = 1_000 + offsetMs;
+      callback();
+    }
+    return { ok, events };
+  }
+  const onTime = scheduleCase(250);
+  assert.equal(onTime.ok, true);
+  assert(onTime.events.some((row) => row.status === "started" && row.lagMs === 250));
+  const late = scheduleCase(251);
+  assert(late.events.some((row) => row.status === "skipped" && row.reason === "late" && row.lagMs === 251));
+  const stale = scheduleCase(0, { stale: true });
+  assert(stale.events.some((row) => row.status === "skipped" && row.reason === "stale"));
+  const setupFailure = scheduleCase(0, { throwStart: true });
+  assert(setupFailure.events.some((row) => row.status === "failed" && row.reason === "start_error"));
+  const scheduleFailure = scheduleCase(0, { throwSchedule: true });
+  assert.equal(scheduleFailure.ok, false);
+  assert(scheduleFailure.events.some((row) => row.status === "failed" && row.reason === "start_error"));
+
+  const planSource = fs.readFileSync(path.resolve(
+    __dirname, "..", "lib", "performance-diagnostic-plan.ts",
+  ), "utf8");
+  for (const fragment of [
+    'emitSsrWebLifecycleEvent(diagnostic.plan, "none", "mode", "trace_only")',
+    'emitSsrWebLifecycleEvent(diagnostic.plan, diagnostic.phase, "mode", "active")',
+    'emitSsrWebLifecycleEvent(plan, phase, "memory", finalStatus',
+    'sampleCount: samples.length',
+    "startToleranceMs: CPU_WINDOW_TOLERANCE_MS",
+    'const reason = freshPlan === null ? "stale" : "mismatch"',
+    'reason: "start_error"',
+    'emitSsrWebLifecycleEvent(plan, "on", "cpu_profile", "failed"',
+  ]) {
+    if (!planSource.includes(fragment)) throw new Error(`Web lifecycle contract omitted ${fragment}`);
+  }
+  const usageStart = planSource.indexOf("function startCpuUsageWindow(");
+  const usageEnd = planSource.indexOf("function cpuUsageWindowKey(", usageStart);
+  const usageSource = planSource.slice(usageStart, usageEnd);
+  if (usageStart < 0 || usageEnd <= usageStart
+      || usageSource.indexOf("const startCpu = process.cpuUsage();") < 0
+      || usageSource.indexOf('emitSsrWebLifecycleEvent(plan, phase, "cpu_window", "started"')
+        <= usageSource.indexOf("const startCpu = process.cpuUsage();")
+      || usageSource.indexOf('emitSsrWebLifecycleEvent(plan, phase, "cpu_window", finalStatus')
+        <= usageSource.indexOf("const timingComplete = Boolean(")) {
+    throw new Error("CPU window lifecycle timestamps do not bracket the measurement");
+  }
+  const profileStart = planSource.indexOf("async function startNodeCpuProfile(");
+  const profileStop = planSource.indexOf("async function stopNodeCpuProfile(", profileStart);
+  const profileSource = planSource.slice(profileStart, profileStop);
+  if (profileStart < 0 || profileStop <= profileStart
+      || profileSource.indexOf('await post<InspectorResponse<unknown>>(session, "Profiler.start")') < 0
+      || profileSource.indexOf('emitSsrWebLifecycleEvent(plan, "on", "cpu_profile", "started"')
+        <= profileSource.indexOf('await post<InspectorResponse<unknown>>(session, "Profiler.start")')) {
+    throw new Error("CPU profile lifecycle start precedes successful Profiler.start");
+  }
+  const profileStopSource = planSource.slice(profileStop);
+  if (!profileStopSource.includes('emitSsrWebLifecycleEvent({ run_id: runId }, "on", "cpu_profile", finalStatus')
+      || !profileStopSource.includes('finalReason = "profile_bounds"')) {
+    throw new Error("CPU profile lifecycle terminal status is not captured");
+  }
+}
+
 function withTimeout(promise, timeoutMs) {
   let timer;
   const timeout = new Promise((resolve) => {
@@ -541,6 +692,7 @@ async function verifyCpuProfileSourceMapContract() {
 }
 
 async function main() {
+  await verifySsrWebLifecycleContract();
   await verifyCpuProfileSourceMapContract();
   const guardSource = fs.readFileSync(guardPath, "utf8");
   for (const fragment of [
@@ -630,7 +782,7 @@ async function main() {
   const traceOnlyReturn = planSource.indexOf("if (diagnostic.traceOnly === true)", runStart);
   const usageStart = planSource.indexOf("startCpuUsageWindow(diagnostic.plan, diagnostic.phase);", runStart);
   const memoryStart = planSource.indexOf("startNodeMemoryWindow(diagnostic.plan, diagnostic.phase);", runStart);
-  const profileStart = planSource.indexOf("await startNodeCpuProfile(diagnostic.plan, Date.now());", runStart);
+  const profileStart = planSource.indexOf("await startAuthorizedNodeCpuProfile(diagnostic.plan);", runStart);
   const runIdReader = planSource.indexOf("export function current_diagnostic_run_id(): string | null {");
   if (validatedStart < 0 || drainCheck <= validatedStart
       || activePhaseBranch <= drainCheck || activePhaseBranch >= traceOnlyFallback

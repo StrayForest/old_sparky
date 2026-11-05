@@ -15,6 +15,30 @@ export type WorkspaceCpuWindowState = {
   readonly failed: Set<string>;
 };
 
+export type SsrLifecyclePhase = WorkspaceCpuWindowPhase | "none";
+export type SsrLifecycleEvent = "mode" | "cpu_window" | "cpu_profile" | "memory";
+export type SsrLifecycleReason =
+  | "none" | "late" | "stale" | "mismatch" | "start_error"
+  | "end_error" | "timing_incomplete" | "profile_bounds" | "profile_stop"
+  | "already_claimed";
+export type SsrLifecycleStatus =
+  | "active" | "trace_only" | "scheduled" | "started" | "skipped"
+  | "failed" | "finalized";
+
+export declare function emitSsrWebLifecycleEvent(
+  plan: { readonly run_id: string } | null,
+  phase: SsrLifecyclePhase,
+  event: SsrLifecycleEvent,
+  status: SsrLifecycleStatus,
+  options?: {
+    reason?: SsrLifecycleReason;
+    lagMs?: number | null;
+    sampleCount?: number | null;
+    nowMs?: number;
+    writeLine?: (line: string) => void;
+  },
+): boolean;
+
 export declare function scheduleAuthorizedWorkspaceCpuWindowEdges<
   P extends WorkspaceCpuWindowPlan,
 >(
@@ -65,6 +89,11 @@ export declare function scheduleWorkspaceCpuWindowStart<
       current: P,
       phase: WorkspaceCpuWindowPhase,
     ) => void;
+    onLifecycle?: (event: {
+      readonly status: "scheduled" | "started" | "skipped" | "failed";
+      readonly reason: SsrLifecycleReason;
+      readonly lagMs: number | null;
+    }) => void;
     startToleranceMs: number;
   },
 ): boolean;

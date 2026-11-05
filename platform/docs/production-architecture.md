@@ -120,6 +120,24 @@ backfill writes. The authoritative auth dependency still validates the session
 and supplies roles, status and credits from PostgreSQL. Cache invalidation
 follows the relevant profile, identity, password, credit, role and
 private-tournament writes; Redis is never an auth or authorization authority.
+The account read-model uses the existing per-user key with a v2 envelope whose
+JSON body is an array, so the previous object-only reader treats it as a miss.
+Each cache miss atomically reserves a random generation in that key; a writer
+may publish only while the same generation remains present and its revision is
+not older than the cached one. Invalidation deletes the key, which makes an
+in-flight writer's generation check fail. New readers never serve v1 or
+malformed envelopes: they rebuild from PostgreSQL and replace them with a v2
+reservation. During rollback, the previous reader treats v2 arrays as misses
+and returns its PostgreSQL-built response; old writers may cause cache churn,
+but the v2 reader rejects their object envelope on the next read. Cache writes
+for `/users/me` happen only after its `UserResponse` and fresh monthly quota
+have been materialized and the request's database connection has been
+released. Redis read or write failures still leave PostgreSQL authoritative;
+failed reservation skips warming because there is no generation to guard.
+The diagnostic outcome `miss` means the request built its response from
+PostgreSQL; it does not certify that the cache write was accepted, since an
+invalidation or newer generation can reject that write without affecting the
+response.
 
 Authentication routes use a shared human-verification trust grant for the
 browser after a successful Cloudflare Turnstile Siteverify call. The grant is
