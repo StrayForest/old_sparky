@@ -185,6 +185,14 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                         raise OSError("private sentinel https://secret.invalid")
                     return None
 
+                def successful_closed_supervisor(**kwargs):
+                    # The merge fault is downstream of a readable child report;
+                    # an absent file correctly remains a supervisor-stage error.
+                    worker_report = Path(kwargs["worker_report_path"])
+                    worker_report.write_bytes(b"{}\n")
+                    os.chmod(worker_report, 0o600)
+                    return SimpleNamespace(namespace_closed=True, reason="none", returncode=0)
+
                 patches = [
                     patch.object(cpu_pair.external_load, "load_manifest_bytes", return_value=(manifest, users)),
                     patch.object(cpu_pair, "_ssh_plan", side_effect=fake_plan),
@@ -205,7 +213,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 if failure_stage == "post_prepare_merge":
                     patches.append(patch.object(
                         cpu_pair.load_runtime, "run_supervised",
-                        return_value=SimpleNamespace(namespace_closed=True, reason="none", returncode=0),
+                        side_effect=successful_closed_supervisor,
                     ))
 
                 stdout, stderr = io.StringIO(), io.StringIO()
