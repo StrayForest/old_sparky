@@ -2817,14 +2817,34 @@ class ExternalLoadTests(unittest.TestCase):
                 "visible_ancestors": [{"cpu_stat_completeness": "complete", "cpu_stat_delta": {"nr_throttled": 0}}],
             },
         }
-        report["logical"]["timing"]["executor_queue_wait"]["p95_ms"] = 2.1
+        report["logical"]["timing"]["executor_queue_wait"]["p95_ms"] = 1.9
         report["logical"]["timing"]["executor_queue_wait"]["p99_ms"] = 2.1
         report["logical"]["timing"]["executor_queue_wait"]["max_ms"] = 2.1
         queue_limited = external_load._capacity_attribution(report, usage)
-        self.assertEqual((queue_limited["status"], queue_limited["reason"]), ("ineligible", "client_queue_lag"))
+        self.assertEqual(
+            (queue_limited["status"], queue_limited["reason"]),
+            ("ineligible", "client_queue_lag"),
+            "queue p95=1.9ms, p99=2.1ms must trip the 2ms tail guard",
+        )
         report["logical"]["timing"]["executor_queue_wait"]["p95_ms"] = 0.0
         report["logical"]["timing"]["executor_queue_wait"]["p99_ms"] = 0.0
         report["logical"]["timing"]["executor_queue_wait"]["max_ms"] = 0.0
+        report["mode"] = "ready-vote"
+        report["scenario_kind"] = "capacity"
+        report["arrival_model"] = "open_loop_scheduled_rate"
+        report["logical"]["timing"]["schedule_delay"] = {
+            "p95_ms": 1.8,
+            "p99_ms": external_load.CAPACITY_ATTRIBUTION_LAG_FLOOR_MS + 0.1,
+        }
+        schedule_limited = external_load._capacity_attribution(report, usage)
+        self.assertEqual(
+            (schedule_limited["status"], schedule_limited["reason"]),
+            ("ineligible", "client_queue_lag"),
+            "schedule p95=1.8ms with p99 above 2ms must trip the tail guard",
+        )
+        report["mode"] = "read-mix"
+        report["scenario_kind"] = "stress"
+        report["arrival_model"] = "closed_loop_concurrency_ramp"
         report["logical"]["timing"]["completed_count"] = 9
         underdelivered = external_load._capacity_attribution(report, usage)
         self.assertEqual((underdelivered["status"], underdelivered["reason"]), ("ineligible", "work_under_delivered"))
@@ -2911,7 +2931,7 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertEqual(attribution["reason"], "headroom_observed")
         self.assertIsNone(attribution["schedule_delay_p95_ms"])
 
-    def test_real_open_loop_pacing_uses_material_schedule_lag_floor(self) -> None:
+    def test_real_open_loop_pacing_delivers_the_scheduled_cohort(self) -> None:
         users = [VirtualUser(f"paced-{index}", "synthetic", "s" * 32, "c" * 32) for index in range(40)]
 
         def immediate(_origin: str, _user: VirtualUser, phase: str, _timeout: float) -> RequestResult:
@@ -2921,7 +2941,7 @@ class ExternalLoadTests(unittest.TestCase):
                 started_at_monotonic=started, finished_at_monotonic=started + 0.0001,
             )
 
-        results, _window = run_rate_phase(
+        results, submission_window = run_rate_phase(
             "https://example.invalid", users, phase="capacity-paced",
             duration_seconds=1.0, concurrency=8, timeout=1, request_builder=immediate,
         )
@@ -2929,43 +2949,13 @@ class ExternalLoadTests(unittest.TestCase):
         for result in results:
             accumulator.add(result)
         timing = accumulator.summary(unit="actions", expected_count=40, submitted_count=40)
+        self.assertEqual(len(results), 40)
+        self.assertEqual(timing["expected_count"], 40)
+        self.assertEqual(timing["submitted_count"], 40)
+        self.assertEqual(timing["completed_count"], 40)
         self.assertEqual(timing["late_start_count"], 40)
-        self.assertGreater(timing["schedule_delay"]["p95_ms"], 0)
-        self.assertLessEqual(timing["schedule_delay"]["p95_ms"], external_load.CAPACITY_ATTRIBUTION_LAG_FLOOR_MS)
-        report = {
-            "mode": "ready-vote", "scenario_kind": "capacity",
-            "arrival_model": "open_loop_scheduled_rate", "wall_seconds": 1.0,
-            "logical": {"timing": timing},
-        }
-        usage = {"status": "complete", "cpu_capacity_status": "unknown", "samples": [{"process_cpu_percent": 20.0}]}
-        identity = {
-            "outer_pid_namespace_matches_pid1": True,
-            "outer_mount_namespace_matches_pid1": True,
-            "outer_cgroup_namespace_matches_pid1": True,
-            "target_cgroup_namespace_matches_outer": True,
-            "target_mount_namespace_is_isolated": True,
-            "target_pid_namespace_is_isolated": True,
-            "global_cgroup2_mount": True,
-            "workload_membership_matches_outer": True,
-        }
-        runner = {
-            "status": "complete", "reason": "none", "runner_environment": "github-hosted",
-            "identity": identity, "effective_cpu_capacity_cores": 2.0,
-            "max_cgroup_cpu_usage_cores": 0.2, "max_visible_throttled_periods_delta": 0,
-            "window_seconds": 2.0,
-        }
-        attribution = external_load._capacity_attribution(report, usage, runner)
-        self.assertEqual(attribution["status"], "eligible")
-        self.assertEqual(attribution["schedule_delay_p95_ms"], timing["schedule_delay"]["p95_ms"])
-
-        report["logical"]["timing"]["schedule_delay"]["p95_ms"] = (
-            external_load.CAPACITY_ATTRIBUTION_LAG_FLOOR_MS + 0.001
-        )
-        report["logical"]["timing"]["schedule_delay"]["p99_ms"] = (
-            external_load.CAPACITY_ATTRIBUTION_LAG_FLOOR_MS + 0.001
-        )
-        material_delay = external_load._capacity_attribution(report, usage, runner)
-        self.assertEqual((material_delay["status"], material_delay["reason"]), ("ineligible", "client_queue_lag"))
+        self.assertGreaterEqual(submission_window, 0.5)
+        self.assertLessEqual(submission_window, 2.0)
 
     def test_progress_callback_reports_only_completed_status_aggregates(self) -> None:
         users = [
