@@ -188,13 +188,13 @@ function bounded(value) {
 }
 
 async function verifySsrWebLifecycleContract() {
-  const module = await import(path.resolve(
+  const scheduler = await import(path.resolve(
     __dirname, "..", "lib", "workspace-cpu-window-scheduler.mjs",
   ));
   const plan = { run_id: "0123456789abcdef0123456789abcdef" };
   const lines = [];
   const writeLine = (line) => lines.push(line);
-  const event = (phase, name, status, options = {}) => module.emitSsrWebLifecycleEvent(
+  const event = (phase, name, status, options = {}) => scheduler.emitSsrWebLifecycleEvent(
     plan, phase, name, status, { ...options, writeLine, nowMs: Date.now() },
   );
 
@@ -214,12 +214,12 @@ async function verifySsrWebLifecycleContract() {
   assert.equal(event("off", "memory", "failed", { reason: "end_error" }), false);
   assert.equal(event("off", "memory", "finalized", { sampleCount: 5 }), true);
   assert.equal(event("on", "memory", "finalized", { sampleCount: 3 }), false);
-  assert.equal(module.emitSsrWebLifecycleEvent(null, "on", "mode", "active", { writeLine }), false);
-  assert.equal(module.emitSsrWebLifecycleEvent({ run_id: "bad" }, "on", "mode", "active", { writeLine }), false);
-  assert.equal(module.emitSsrWebLifecycleEvent(plan, "invalid", "mode", "active", { writeLine }), false);
+  assert.equal(scheduler.emitSsrWebLifecycleEvent(null, "on", "mode", "active", { writeLine }), false);
+  assert.equal(scheduler.emitSsrWebLifecycleEvent({ run_id: "bad" }, "on", "mode", "active", { writeLine }), false);
+  assert.equal(scheduler.emitSsrWebLifecycleEvent(plan, "invalid", "mode", "active", { writeLine }), false);
   assert.equal(event("on", "cpu_window", "failed", { reason: "/private/path" }), false);
   assert.equal(event("on", "memory", "finalized", { sampleCount: 6 }), false);
-  assert.equal(module.emitSsrWebLifecycleEvent(
+  assert.equal(scheduler.emitSsrWebLifecycleEvent(
     { run_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", expires_at_ms: Date.now() - 1 },
     "on", "memory", "finalized", { sampleCount: 2, writeLine },
   ), true);
@@ -236,12 +236,12 @@ async function verifySsrWebLifecycleContract() {
   let accepted = 0;
   for (let index = 0; index < 300; index += 1) {
     const id = index.toString(16).padStart(32, "0");
-    if (module.emitSsrWebLifecycleEvent(
+    if (scheduler.emitSsrWebLifecycleEvent(
       { run_id: id }, "off", "mode", "active", { nowMs: boundedNow, writeLine },
     )) accepted += 1;
   }
   assert(accepted <= 256);
-  assert.equal(module.emitSsrWebLifecycleEvent(
+  assert.equal(scheduler.emitSsrWebLifecycleEvent(
     { run_id: "ffffffffffffffffffffffffffffffff" }, "off", "mode", "active",
     { nowMs: boundedNow + 600_001, writeLine },
   ), true);
@@ -260,7 +260,7 @@ async function verifySsrWebLifecycleContract() {
     const failed = new Set();
     const events = [];
     let callback;
-    const ok = module.scheduleWorkspaceCpuWindowStart(schedulerPlan, "off", {
+    const ok = scheduler.scheduleWorkspaceCpuWindowStart(schedulerPlan, "off", {
       now: () => nowMs,
       schedule: (next) => {
         if (throwSchedule) throw new Error("private setup detail");
