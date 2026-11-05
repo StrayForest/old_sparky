@@ -875,6 +875,7 @@ test("web CPU profile maps only sampled verified standalone chunks within bounds
     writeFileSync(join(root, "elsewhere.map"), JSON.stringify({ version: 3, sources: ["node:internal/x"], names: [], mappings: "AAAA" }));
     expect(lstatSync(`${join(siblingChunks, "next.js")}.map`).isSymbolicLink()).toBe(true);
     expect(mapSampledFrames(raw, [1], runtimeCwd).get(1)).toEqual(raw.get(1));
+    rmSync(`${join(siblingChunks, "next.js")}.map`);
     expect(mapSampledFrames(raw, [1], runtimeCwd, { ...CPU_PROFILE_SOURCE_MAP_LIMITS, files: 0 }).get(1))
       .toEqual(raw.get(1));
     expect(mapSampledFrames(raw, [1], runtimeCwd, { ...CPU_PROFILE_SOURCE_MAP_LIMITS, mapBytes: 1 }).get(1))
