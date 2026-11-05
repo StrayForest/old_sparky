@@ -25,6 +25,7 @@ from tools.platform_evidence_sanitizer import (
     sanitized_log_summary,
 )
 from tools.platform_external_load import RequestResult, summarize_results
+from tools import platform_ssr_capacity_diagnostic as capacity_diagnostic
 from tools.platform_external_load_observer import (
     _public_timeline_sample_row,
     _safe_postgres_wait_snapshot,
@@ -1666,6 +1667,50 @@ class EvidencePrivacyTests(unittest.TestCase):
         self.assertEqual(safe_error_class("authentication_error", status=200), "auth")
         self.assertEqual(safe_error_class("authoritative_state_mismatch", status=401), "auth")
         self.assertEqual(safe_error_class("authoritative_state_mismatch", status=403), "auth")
+
+    def test_capacity_failure_transport_code_is_closed_and_reads_legacy_records(self) -> None:
+        result = RequestResult(
+            phase="on_worker",
+            method="GET",
+            path="/workspace",
+            status=0,
+            elapsed_ms=1.0,
+            ok=False,
+            response_bytes=0,
+            error_kind="RemoteDisconnected",
+            transport_error_code="remote_disconnect",
+            failure_stage="response_headers",
+            started_at_utc="2026-11-05T10:00:00+00:00",
+            exception_at_utc="2026-11-05T10:00:00.001+00:00",
+            finished_at_utc="2026-11-05T10:00:00.001+00:00",
+        )
+        evidence = capacity_diagnostic._failure_evidence(on_results=[result])
+        record = evidence["records"][0]
+        self.assertEqual(record["error_class"], "other")
+        self.assertEqual(record["transport_error_code"], "remote_disconnect")
+        self.assertTrue(capacity_diagnostic._failure_evidence_is_closed(evidence, completed=1))
+
+        legacy = copy.deepcopy(evidence)
+        del legacy["records"][0]["transport_error_code"]
+        self.assertTrue(capacity_diagnostic._failure_evidence_is_closed(legacy, completed=1))
+
+        invalid_code = copy.deepcopy(evidence)
+        invalid_code["records"][0]["transport_error_code"] = "remote_disconnect secret-token"
+        self.assertFalse(capacity_diagnostic._failure_evidence_is_closed(
+            invalid_code, completed=1,
+        ))
+
+        unknown = copy.deepcopy(result)
+        unknown.transport_error_code = "operator@example.test secret-token"
+        unknown.error_kind = "ValueError operator@example.test secret-token"
+        unknown_evidence = capacity_diagnostic._failure_evidence(on_results=[unknown])
+        self.assertEqual(unknown_evidence["records"][0]["error_class"], "other")
+        self.assertEqual(unknown_evidence["records"][0]["transport_error_code"], "other")
+        self.assertNotIn("operator@example.test", serialized(unknown_evidence))
+        self.assertNotIn("secret-token", serialized(unknown_evidence))
+        self.assertTrue(capacity_diagnostic._failure_evidence_is_closed(
+            unknown_evidence, completed=1,
+        ))
 
     def test_response_diagnostics_is_fixed_schema(self) -> None:
         response = httpx.Response(

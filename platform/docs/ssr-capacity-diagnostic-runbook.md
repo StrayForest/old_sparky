@@ -439,7 +439,11 @@ stay private; only existing IDs/categories are emitted. Workloads: `authenticate
 `authenticated_html_ssr_capacity_120s_v1`, `authenticated_html_ssr_cpu_profile_20s_v1`.
 
 For an incomplete diagnostic, use the one-day failure-fingerprint artifact to
-read only the bounded failure classifications. `capacity_phase.resource_abort_reason`
+read only the bounded failure classifications. Per-request failure records may
+include `transport_error_code`, a closed client-side transport class; it does
+not establish a server-side root cause. Historical records without this field
+remain valid, and `other` means the client code was unavailable or outside the
+closed set. `capacity_phase.resource_abort_reason`
 identifies the worker abort class; when it is `control_file_invalid`, use
 `capacity_phase.control_failure_reason` only if present. The
 `memory_observer_failure` fields classify observer handling and remote-watch

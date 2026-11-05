@@ -1373,6 +1373,7 @@ def _failure_evidence(
             "ordinal": ordinal,
             "phase": phase,
             "error_class": _capacity_error_code(item),
+            "transport_error_code": _capacity_transport_error_code(item),
             "stage": stage,
             "request_status": (
                 item.status if type(item.status) is int and 0 <= item.status <= 599 else 0
@@ -1394,6 +1395,15 @@ def _failure_evidence(
         "records": records,
         "records_truncated": len(phased) > FAILURE_RECORD_LIMIT,
     }
+
+
+def _capacity_transport_error_code(result: Any) -> str:
+    """Keep only the client's existing closed transport classification."""
+
+    code = getattr(result, "transport_error_code", None)
+    if isinstance(code, str) and code in external_load.TRANSPORT_ERROR_CODES:
+        return code
+    return "other"
 
 
 def _failure_evidence_is_closed(
@@ -1443,18 +1453,24 @@ def _failure_evidence_is_closed(
     if any(record_phase_counts[phase] > phase_data["failure_count"]
            for phase, phase_data in by_phase.items()):
         return False
+    legacy_record_keys = frozenset({
+        "ordinal", "phase", "error_class", "stage", "request_status", "observed_status",
+        "started_at_utc", "exception_at_utc", "finished_at_utc", "phase_timing_ms",
+    })
+    current_record_keys = legacy_record_keys | {"transport_error_code"}
+    allowed_transport_error_codes = external_load.TRANSPORT_ERROR_CODES | {"other"}
     for ordinal, record in enumerate(value["records"], start=1):
         if (not isinstance(record, dict)
-                or set(record) != {
-                    "ordinal", "phase", "error_class", "stage", "request_status", "observed_status",
-                    "started_at_utc", "exception_at_utc", "finished_at_utc",
-                    "phase_timing_ms",
-                }
+                or frozenset(record) not in {legacy_record_keys, current_record_keys}
                 or record.get("ordinal") != ordinal
                 or not isinstance(record.get("phase"), str)
                 or record.get("phase") not in {"off_probe", "on_worker"}
                 or not isinstance(record.get("error_class"), str)
                 or record.get("error_class") not in CAPACITY_ERROR_CODES
+                or ("transport_error_code" in record and (
+                    type(record.get("transport_error_code")) is not str
+                    or record["transport_error_code"] not in allowed_transport_error_codes
+                ))
                 or not isinstance(record.get("stage"), str)
                 or record.get("stage") not in FAILURE_STAGES
                 or type(record.get("request_status")) is not int
