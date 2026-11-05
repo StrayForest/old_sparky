@@ -8,6 +8,7 @@ import inspector from "node:inspector";
 import { getHeapStatistics } from "node:v8";
 import { headers } from "next/headers";
 import { hasAuthorizedDiagnosticRunMarker } from "./performance-diagnostic-marker";
+import type { CpuProfileFrame } from "./cpu-profile-source-maps.mjs";
 import {
   CPU_PROFILE_SAMPLING,
   categoryForFrame,
@@ -963,21 +964,23 @@ async function stopNodeCpuProfile(
       console.info(`cpu_diagnostic_complete service=web run_id=${runId} status=incomplete reason=profile_bounds`);
       return;
     }
+    const profileNodes = profile.nodes;
+    const profileSamples = profile.samples;
     const profileWindow = await mapAfterCpuWindowSnapshot(
       elapsedMs,
       waitForCpuUsageWindowSnapshot(runId, "on"),
       () => mapSampledFrames(
-        new Map(profile.nodes.map((node) => [node.id, node.callFrame ?? {}])),
-        profile.samples,
+        new Map<number, CpuProfileFrame>(profileNodes.map((node) => [node.id, node.callFrame ?? {}])),
+        profileSamples,
         process.cwd(),
       ),
     );
     const nodes = profileWindow.mapped;
     const totals = new Map<string, { samples: number; cpuUs: number }>();
-    const sampleClassCounts = summarizeSampleClasses(nodes, profile.samples);
-    const acceptedSamples = profile.samples.length;
-    for (let index = 0; index < profile.samples.length; index += 1) {
-      const frame = nodes.get(profile.samples[index]);
+    const sampleClassCounts = summarizeSampleClasses(nodes, profileSamples);
+    const acceptedSamples = profileSamples.length;
+    for (let index = 0; index < profileSamples.length; index += 1) {
+      const frame = nodes.get(profileSamples[index]);
       const category = categoryForFrame(frame?.url ?? "", frame?.functionName ?? "");
       const row = totals.get(category) ?? { samples: 0, cpuUs: 0 };
       row.samples += 1;
@@ -992,7 +995,7 @@ async function stopNodeCpuProfile(
       .map(([name, row]) => `${name}:${row.cpuUs}:${row.samples}`);
     summaryRows.push(`other:${otherTotals.cpuUs}:${otherTotals.samples}`);
     const summary = summaryRows.join(",");
-    const functionDetails = summarizeFunctionSamples(nodes, profile.samples);
+    const functionDetails = summarizeFunctionSamples(nodes, profileSamples);
     const functionSummary = functionDetails.rows
       .map(({ function_id, samples }) => `${function_id}:${samples}`)
       .join(",");

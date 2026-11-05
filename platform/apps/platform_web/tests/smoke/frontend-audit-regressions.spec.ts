@@ -841,19 +841,19 @@ test("web CPU profile maps only sampled verified standalone chunks within bounds
       [10, { url: indexedPath, functionName: "renderToResponseWithComponentsImpl", lineNumber: 0, columnNumber: 0 }],
     ]);
     const mapped = mapSampledFrames(raw, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], runtimeCwd);
-    expect(categoryForFrame(mapped.get(1)?.url, mapped.get(1)?.functionName)).toBe("web_framework");
-    expect(functionIdForFrame(mapped.get(1)?.url, mapped.get(1)?.functionName)).toBe("web.next.render_response");
-    expect(functionIdForFrame(mapped.get(2)?.url, mapped.get(2)?.functionName)).toBe("web.react.render_string");
+    expect(categoryForFrame(mapped.get(1)?.url ?? "", mapped.get(1)?.functionName)).toBe("web_framework");
+    expect(functionIdForFrame(mapped.get(1)?.url ?? "", mapped.get(1)?.functionName)).toBe("web.next.render_response");
+    expect(functionIdForFrame(mapped.get(2)?.url ?? "", mapped.get(2)?.functionName)).toBe("web.react.render_string");
     expect(mapped.get(3)).toEqual(raw.get(3));
     expect(mapped.get(4)).toEqual(raw.get(4));
-    expect(categoryForFrame(mapped.get(5)?.url, mapped.get(5)?.functionName)).toBe("other");
-    expect(functionIdForFrame(mapped.get(5)?.url, mapped.get(5)?.functionName)).toBeNull();
+    expect(categoryForFrame(mapped.get(5)?.url ?? "", mapped.get(5)?.functionName)).toBe("other");
+    expect(functionIdForFrame(mapped.get(5)?.url ?? "", mapped.get(5)?.functionName)).toBeNull();
     expect(mapped.get(6)).toEqual(raw.get(6));
-    expect(categoryForFrame(mapped.get(7)?.url, mapped.get(7)?.functionName)).toBe("web_framework");
-    expect(functionIdForFrame(mapped.get(7)?.url, mapped.get(7)?.functionName)).toBeNull();
-    expect(functionIdForFrame(mapped.get(8)?.url, mapped.get(8)?.functionName)).toBe("web.next.render_response");
+    expect(categoryForFrame(mapped.get(7)?.url ?? "", mapped.get(7)?.functionName)).toBe("web_framework");
+    expect(functionIdForFrame(mapped.get(7)?.url ?? "", mapped.get(7)?.functionName)).toBeNull();
+    expect(functionIdForFrame(mapped.get(8)?.url ?? "", mapped.get(8)?.functionName)).toBe("web.next.render_response");
     expect(mapped.get(9)).toEqual(raw.get(9));
-    expect(functionIdForFrame(mapped.get(10)?.url, mapped.get(10)?.functionName)).toBe("web.next.render_response");
+    expect(functionIdForFrame(mapped.get(10)?.url ?? "", mapped.get(10)?.functionName)).toBe("web.next.render_response");
     const summary = summarizeFunctionSamples(mapped, [1, 2, 1]);
     expect(summary.rows).toEqual([
       { function_id: "web.next.render_response", samples: 2 },
