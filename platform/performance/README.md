@@ -121,18 +121,26 @@ not from retained report counts.
 ## Current 11-profile production matrix
 
 The matrix is run serially. Cells 1–8 and 10–11 completed on the previous
-P4/C baseline. Cell 9 is `read-mix-concurrency-ramp-v1` run `41916053065/1`
-on the corrected application A
-`77d1d1bdffe0c07005982e9f696f108366333f7b`, with host-tools C
-`0de51aca4b4d04a80a2f0d392003cc258d8f1400`; exact cleanup passed. The client
-completed the full 170,000-action population, but the Ready Check state guard
-failed in all eight stages because the workspace request UTC bounds were
-omitted when timeout diagnostics were disabled. This cell does not validate a
-Ready Check concurrency knee; rerun cell 9 after the runner correction passes
-exact-SHA CI and the normal automatic app deployment chain, including its
-single source-bound backup. For each run, record
-runner S, application A and host-tools C from its exact workflow/deployment
-receipts; do not infer one identity from another. The separate corrected SSR
+P4/C baseline. Cell 9 is `read-mix-concurrency-ramp-v1` run `41937909055/1`
+with runner source S and app source A both
+`7c6034efe3878c3413090ca1bcdb5be6e93154e8`, and host-tools C
+`0de51aca4b4d04a80a2f0d392003cc258d8f1400`; exact cleanup passed. Each of the
+eight stages observed 40/40 active Ready Checks and passed the state guard;
+minimum deadline headroom was about 2,424 seconds. The full 170,000-action
+population succeeded (160,000 HTTP 200 and 10,000 conditional 304), with no
+errors, retries or drops. The stress contract failed with
+`capacity_ramp_evidence` as its sole failed evaluator check; per-stage logical
+p95/p99 budgets failed at all eight stages. Aggregate logical p95/p99 were
+209.4/331.2 seconds against 12/20-second limits; HTTP p95/p99 were 886/1,135 ms.
+Capacity attribution is unknown
+(`runner_window_incomplete`) because all offered ramp tasks started late and
+none were dropped. Stage goodput at c16/c32/c48/c64/c80/c96/c112/c128 was
+55.3/106.8/137.5/157.6/157.3/157.3/161.0/164.1 actions per second. Origin CPU
+was about 99.4–99.8% per core at c64–c128 (API about 1.42 cores, PostgreSQL
+0.23–0.24 cores); no lock waiters were observed. This run does not certify a
+server capacity ceiling. For each run, record runner S,
+application A and host-tools C from exact workflow/deployment receipts; do not
+infer one identity from another. The separate corrected SSR
 capacity diagnostic is not a matrix cell. Do not switch app or host-tools
 profiles while a cell is active.
 
@@ -155,16 +163,11 @@ change only `profile_id` for each cell; never batch-dispatch the matrix.
     cleanly and the operator's current safety/preflight checks still pass;
     otherwise mark it not run and leave the matrix incomplete.
 
-For the current matrix, rerun only cell 9 after the runner fix is source-bound
-and a fresh canonical FULL readiness receipt passes. Do not replay completed
-cells 1–8 or 10–11.
-
 Current disposition (2026-11-05): all 11 cells have run with authoritative
-cleanup. Cell 9's HTTP population and cleanup completed, but its state guard
-failed, so the profile's purpose—measuring an active Ready Check concurrency
-knee—remains unmet. Record the replacement run's runner S, app A and host-tools
-C from exact receipts. Keep cell 9 open until a corrected run passes the state
-guard and its exact cleanup is recorded.
+cleanup. Cell 9 passed the active Ready Check state guard in all stages, but
+the stress contract failed and capacity attribution remains unknown because
+the runner window was incomplete. No matrix rerun is pending. Record runner S,
+app A and host-tools C from exact receipts for any future run.
 
 | Cell | Profile | Contract result | Exact cleanup |
 | ---: | --- | --- | --- |
@@ -176,23 +179,15 @@ guard and its exact cleanup is recorded.
 | 6 | `authenticated-page-load-v1` | STRESS BEHAVIOR FAIL on whole-cohort schedule delay; 20,000 HTTP 200 responses | PASS |
 | 7 | `authenticated-page-load-v2` | STRESS BEHAVIOR FAIL; 53/20,000 `GET tournament_detail` requests timed out; retained samples show status 0 and about 30 seconds; time clustering and Nginx reconciliation unresolved | PASS |
 | 8 | `ready-vote-saturation-ramp-v4` | STRESS BEHAVIOR PASS under contract despite bounded 503 responses and shedding | PASS |
-| 9 | `read-mix-concurrency-ramp-v1` | FAIL: all 170,000 actions completed (160,000 HTTP 200 and 10,000 conditional 304; zero errors, retries or drops), but all eight stage state guards failed: 40/40 cohorts observed, 0 active, remaining/headroom unavailable. Logical p95/p99 were 192.7/305.6 s against 12/20 s limits; HTTP p95/p99 were 939/1,209 ms. No Ready Check knee is validly established; corrected rerun required. | PASS |
+| 9 | `read-mix-concurrency-ramp-v1` | STRESS BEHAVIOR FAIL: state guard passed at all stages (40/40 active, minimum deadline headroom about 2,424 s); 170,000/170,000 HTTP actions succeeded, with zero errors, retries or drops. The sole failed evaluator check was `capacity_ramp_evidence`: per-stage logical p95 and p99 budgets failed at every stage. Aggregate logical p95/p99 were 209.4/331.2 s against 12/20 s; HTTP p95/p99 were 886/1,135 ms. Capacity attribution is unknown (`runner_window_incomplete`): 100% of offered ramp tasks started late, none were dropped; no server ceiling is certified. | PASS |
 | 10 | `ready-vote-stress-15k-v2` | STRESS BEHAVIOR FAIL: 2,804/15,000 primary actions and 101/750 same-state duplicates failed; all HTTP errors were 503, with no idempotency state violation | PASS |
 | 11 | `ready-vote-stress-20k-v2` | STRESS BEHAVIOR FAIL: 16,520/21,000 logical actions succeeded; 24,224/40,744 HTTP requests returned 503 | PASS |
 
-Cells 9–11 failed their authored acceptance contracts; a completed HTTP
-population does not override a failed state or latency guard. Cell 11 showed
-CPU pressure and no database lock queue, but the protective-shed trigger
-remains unproven. Only cell 9 requires a corrected rerun; its original run had
-authoritative cleanup.
-
-Cell 9's state failure came from the runner requiring request UTC bounds that
-`_request` retained only when a timeout-diagnostic ID was present. The ramp
-does not enable those diagnostics. The runner fix captures these bounds only
-for scheduled workspace state checks, without adding diagnostic headers or
-retaining timestamps in public artifacts. It must pass exact-SHA CI and the
-normal automatic app deployment chain, including its single source-bound
-backup, before the cell is rerun.
+Cells 5–7 and 9–11 failed their authored acceptance contracts. Cell 9's state
+guard passed, but per-stage logical p95 and p99 budgets failed at all stages.
+Capacity attribution is unknown because 100% of offered ramp tasks started
+late; no server capacity ceiling is certified. Cell 11 showed CPU pressure and
+no database lock queue, but the protective-shed trigger remains unproven.
 
 Before every cell dispatch, obtain a fresh canonical FULL readiness receipt
 after the automatic production chain has completed and before fixture setup

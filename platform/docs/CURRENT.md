@@ -11,21 +11,24 @@ belong in the linked owner documents below.
 ## Live and pending state
 
 - Production app source A is
-  `77d1d1bdffe0c07005982e9f696f108366333f7b`; active host-tools generation C is
+  `7c6034efe3878c3413090ca1bcdb5be6e93154e8`; active host-tools generation C is
   `0de51aca4b4d04a80a2f0d392003cc258d8f1400`. Resolve A from the successful
   deployment receipt and C from the checked-in active pin for each operation.
   Keep workflow runner S, application A and host-tools C distinct; a matching
   runner SHA does not prove deployment or installation.
-- Cell 9, `read-mix-concurrency-ramp-v1`, completed as run `41916053065/1` on
-  app A `77d1d1bdffe0c07005982e9f696f108366333f7b` and host-tools C
-  `0de51aca4b4d04a80a2f0d392003cc258d8f1400`; exact cleanup passed. All
-  170,000 HTTP actions completed, but the Ready Check state guard failed in
-  every ramp stage because request UTC bounds were not captured when timeout
-  diagnostics were disabled. The cell does not establish a Ready Check
-  concurrency knee. Rerun this profile after the corrected external runner
-  passes exact-SHA CI and the normal automatic app deployment chain, including
-  its single source-bound backup; obtain a fresh canonical FULL readiness
-  receipt before fixture dispatch. See the
+- Cell 9, `read-mix-concurrency-ramp-v1`, completed as run `41937909055/1` on
+  runner S and app A, both `7c6034efe3878c3413090ca1bcdb5be6e93154e8`, with
+  host-tools C `0de51aca4b4d04a80a2f0d392003cc258d8f1400`; exact cleanup
+  passed. All eight stages observed 40/40 active Ready Checks and passed the
+  state guard, with minimum deadline headroom of about 2,424 seconds. All
+  170,000 HTTP actions succeeded (160,000 HTTP 200 and 10,000 conditional
+  304), with no errors, retries or drops. The stress contract failed, and its
+  sole failed evaluator check was `capacity_ramp_evidence`; per-stage logical
+  p95/p99 budgets failed at all eight stages. Aggregate logical p95/p99 were
+  209.4/331.2 seconds against 12/20-second limits; HTTP p95/p99 were
+  886/1,135 ms. Capacity attribution is unknown (`runner_window_incomplete`):
+  all offered ramp tasks started late, none were
+  dropped, and this run certifies no server capacity ceiling. See the
   [performance matrix](../performance/README.md#current-11-profile-production-matrix).
 - Cells 1–8 and 10–11 completed on the previous P4/C baseline. Their contract
   outcomes and cleanup status remain in the matrix table. The corrected SSR
@@ -39,10 +42,11 @@ belong in the linked owner documents below.
 
 ## Open QA and cleanup gates
 
-- The 11-profile matrix has run all cells with authoritative cleanup, but cell
-  9's state guard failed and its concurrency knee remains unvalidated. Rerun
-  that profile after the runner fix; do not repeat the other cells or describe
-  this external HTTP matrix as whole-site functional coverage. See the
+- All 11 matrix cells have run with authoritative cleanup. Cell 9 passed its
+  state guard but failed the stress contract; its capacity attribution is
+  unknown and no server ceiling is certified. No matrix rerun is pending. Do
+  not repeat completed cells or describe this external HTTP matrix as whole-site
+  functional coverage. See the
   [matrix procedure and scope](../performance/README.md#current-11-profile-production-matrix).
 - Cell 7's authenticated-page diagnostic still has unresolved client/origin
   reconciliation: the repeat had 19,971/20,000 successes, 28 status-0 and one
