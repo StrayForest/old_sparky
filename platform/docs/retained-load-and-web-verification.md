@@ -444,11 +444,11 @@ incomplete counts, partial work, observer failures, cleanup failures or
 artifact-identity mismatches remain invalid pipeline results and cannot be
 reclassified as completed failures.
 
-The optional CPU diagnostic pair removes its run-bound SSH files before the
-candidate report sanitizer runs. Cleanup runs even after a pair failure; a
-sanitized failure summary may be retained when cleanup succeeds. If cleanup
-fails, the raw report stays private, sanitization is skipped, no summary is
-uploaded, and the run fails.
+The optional CPU diagnostic pair removes run-bound SSH files before
+sanitization and retains a sanitized failure summary only if cleanup succeeds.
+Handled post-prepare failures retain a fixed operation stage and closed failure
+code, never exception text or paths. Cleanup failure keeps the raw report
+private, skips sanitization and upload, and fails the run.
 
 The QA system sampler keeps full process identity and CPU collection for all
 `/proc` rows while reading per-process RSS and I/O counters only for the seven

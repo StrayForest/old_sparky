@@ -83,6 +83,160 @@ def _profile_rejections(capture_reason: str = "complete") -> dict[str, object]:
 
 
 class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
+    def test_cpu_parent_preserves_post_prepare_failure_projection(self) -> None:
+        cases = (
+            ("post_prepare_binding", "PairError"),
+            ("post_prepare_ssh_hide", "PairError"),
+            ("post_prepare_ssh_receipt", "ValueError"),
+            ("post_prepare_worker_payload", "ValueError"),
+            ("post_prepare_supervisor", "ExternalLoadError"),
+            ("post_prepare_merge", "OSError"),
+        )
+        original_dumps = cpu_pair.json.dumps
+
+        for failure_stage, exception_class in cases:
+            with self.subTest(failure_stage=failure_stage), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                os.chmod(root, 0o700)
+                manifest_path = root / "manifest.json"
+                manifest_path.write_bytes(b"fixture manifest bytes\n")
+                os.chmod(manifest_path, 0o600)
+                handoff_path = root / "handoff.json"
+                handoff_path.write_text(json.dumps({
+                    "schema": 1, "confirmation": "RUN-PRODUCTION-CPU-DIAGNOSTIC",
+                    "target_sha": "a" * 40, "control_email": "operator@example.test",
+                    "setup_concurrency": "8", "run_id": "123", "profile": "external-vote",
+                    "tournament_count": "1", "users_per_tournament": "14",
+                    "timeout_diagnostics": "false", "fixture_kind": "cpu_diagnostic_only_v1",
+                }, sort_keys=True, separators=(",", ":")), encoding="ascii")
+                os.chmod(handoff_path, 0o600)
+                ssh_dir = root / "external-ssh"
+                ssh_dir.mkdir(mode=0o700)
+                for name, content in (("config", b"ssh config"), ("id_ed25519", b"private key"),
+                                      ("known_hosts", b"host key")):
+                    path = ssh_dir / name
+                    path.write_bytes(content)
+                    os.chmod(path, 0o600)
+                report_path = root / "report.json"
+                manifest = {
+                    "runner_sha": "a" * 40, "app_target_sha": "a" * 40,
+                    "source_binding": None, "source_binding_sha256": None,
+                    "origin": "https://old-sparky.com", "session_cookie_name": "session",
+                    "csrf_cookie_name": "csrf",
+                    "tournaments": [{"slug": "cpu-fixture", "user_count": 14}],
+                }
+                users = [SimpleNamespace(
+                    tournament_slug="cpu-fixture", session_token=f"s{index:031d}",
+                    csrf_token=f"c{index:042d}.{'a' * 64}",
+                ) for index in range(14)]
+
+                def fake_plan(_args, _host, _user, _config, _key, payload, lifecycle, **_kwargs):
+                    lifecycle.update({
+                        "closed": True, "mux_off_enforced": True, "last_command_returned": True,
+                    })
+                    if payload["operation"] == "prepare":
+                        lifecycle["plan_prepare_status"] = "prepared"
+                        lifecycle["plan_prepare_refusal_class"] = "none"
+                        lifecycle["prepare_transport"] = {
+                            "stage": "complete", "return_code": 0,
+                            "stdout_shape": "prepared_marker", "child_state": "reaped",
+                        }
+                        release = None if failure_stage == "post_prepare_binding" else "release-aaaaaaaaaaaa"
+                        return True, release, None
+                    lifecycle["plan_cleanup_status"] = "complete"
+                    lifecycle["plan_cleanup_refusal_class"] = "none"
+                    lifecycle["cleanup_transport"] = {
+                        "stage": "complete", "return_code": 0,
+                        "stdout_shape": "complete_marker", "child_state": "reaped",
+                    }
+                    return True, None, None
+
+                argv = [
+                    "parent", "--manifest", str(manifest_path), "--input-handoff", str(handoff_path),
+                    "--report", str(report_path), "--source-sha", "a" * 40,
+                    "--app-target-sha", "a" * 40, "--external-run-id", "123",
+                    "--external-run-attempt", "1", "--fixture-kind", "cpu_diagnostic_only_v1",
+                    "--ssh-config", str(ssh_dir / "config"), "--ssh-key", str(ssh_dir / "id_ed25519"),
+                ]
+                real_hide = cpu_pair._hide_ssh_material
+                real_validate = cpu_pair._validate_ssh_lifecycle_receipt
+
+                def failing_hide(*args, **kwargs):
+                    real_hide(*args, **kwargs)
+                    raise cpu_pair.PairError("private sentinel https://secret.invalid")
+
+                def receipt_validation(*args, **kwargs):
+                    if failure_stage == "post_prepare_ssh_receipt" and not receipt_validation.failed:
+                        receipt_validation.failed = True
+                        raise ValueError("private sentinel https://secret.invalid")
+                    return real_validate(*args, **kwargs)
+
+                receipt_validation.failed = False
+
+                def failing_dumps(value, *args, **kwargs):
+                    if failure_stage == "post_prepare_worker_payload" and isinstance(value, dict) \
+                            and value.get("workload") == cpu_pair.WORKLOAD \
+                            and "actor_payload" in value:
+                        raise ValueError("private sentinel https://secret.invalid")
+                    return original_dumps(value, *args, **kwargs)
+
+                def inject_merge_failure(*_args, **_kwargs):
+                    if failure_stage == "post_prepare_merge":
+                        raise OSError("private sentinel https://secret.invalid")
+                    return None
+
+                patches = [
+                    patch.object(cpu_pair.external_load, "load_manifest_bytes", return_value=(manifest, users)),
+                    patch.object(cpu_pair, "_ssh_plan", side_effect=fake_plan),
+                    patch.object(cpu_pair, "_wait_past"),
+                    patch.object(cpu_pair, "_validate_ssh_lifecycle_receipt", side_effect=receipt_validation),
+                    patch.object(cpu_pair, "_merge_supervisor_report", side_effect=inject_merge_failure),
+                    patch.dict(os.environ, {"PROD_SSH_HOST": "example.test", "PROD_SSH_USER": "deploy"}),
+                ]
+                if failure_stage == "post_prepare_ssh_hide":
+                    patches.append(patch.object(cpu_pair, "_hide_ssh_material", side_effect=failing_hide))
+                if failure_stage == "post_prepare_worker_payload":
+                    patches.append(patch.object(cpu_pair.json, "dumps", side_effect=failing_dumps))
+                if failure_stage == "post_prepare_supervisor":
+                    patches.append(patch.object(
+                        cpu_pair.load_runtime, "run_supervised",
+                        side_effect=cpu_pair.external_load.ExternalLoadError("private sentinel https://secret.invalid"),
+                    ))
+                if failure_stage == "post_prepare_merge":
+                    patches.append(patch.object(
+                        cpu_pair.load_runtime, "run_supervised",
+                        return_value=SimpleNamespace(namespace_closed=True, reason="none", returncode=0),
+                    ))
+
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with ExitStack() as stack:
+                    for item in patches:
+                        stack.enter_context(item)
+                    stack.enter_context(redirect_stdout(stdout))
+                    stack.enter_context(redirect_stderr(stderr))
+                    self.assertEqual(cpu_pair.main(argv), 2)
+
+                raw_report = report_path.read_text(encoding="ascii")
+                public = json.loads(raw_report)
+                self.assertEqual(public["failure_stage"], failure_stage)
+                self.assertEqual(public["failure_code"], {
+                    "PairError": "post_prepare_pair_error",
+                    "ExternalLoadError": "post_prepare_external_load_error",
+                    "OSError": "post_prepare_os_error",
+                    "ValueError": "post_prepare_value_error",
+                }[exception_class])
+                self.assertEqual(public["plan_cleanup_status"], "complete")
+                if failure_stage == "post_prepare_merge":
+                    self.assertTrue(public["namespace_closed"])
+                    self.assertEqual(public["worker_exit_code"], 0)
+                    self.assertEqual(public["supervisor_reason"], "none")
+                else:
+                    self.assertFalse(public["namespace_closed"])
+                self.assertFalse(public["capacity_slo_credit"])
+                self.assertFalse(public["diagnostic_credit"])
+                self.assertNotIn("private sentinel", raw_report + stdout.getvalue() + stderr.getvalue())
+                self.assertNotIn("secret.invalid", raw_report + stdout.getvalue() + stderr.getvalue())
+
     def test_html_ssr_profile_is_distinct_and_only_extends_concurrency_for_html(self) -> None:
         self.assertEqual(
             capacity_diagnostic.profile_payload(8),

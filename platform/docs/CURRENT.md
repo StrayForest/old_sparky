@@ -10,26 +10,26 @@ belong in the linked owner documents below.
 
 ## Live and pending state
 
-- Last verified production baseline is app A
-  `c116de3f78f85833646aa23d117c6a0a313db6cb` (deployment run
-  `42059556545/1`; previous app source
-  `82956d85cdc7cec034c74ac22e8cd7091c229fcc`), with active host-tools
-  generation C `0de51aca4b4d04a80a2f0d392003cc258d8f1400`. The exact read-only
-  baseline observation is bound in deployment run `42071875137`; that run did
-  not deploy the current runner source. Before future production work, use the
-  canonical full-readiness receipt to confirm the live baseline and locks.
+- Last verified production baseline, as of 2026-11-05, is app A
+  `9a73f6355ef65025a3668a5729ee5ab357b8d40f` (deployment child
+  `42079269172/1`; previous app source
+  `c116de3f78f85833646aa23d117c6a0a313db6cb`), with active host-tools
+  generation C `0de51aca4b4d04a80a2f0d392003cc258d8f1400`. Post-cleanup
+  canonical FULL readiness passed and confirms the app, runner, and host-tools
+  bindings; no fixture or load is active. One restore-verified backup pair is
+  retained. Before future production work, use a fresh canonical
+  full-readiness receipt to confirm the live baseline and locks.
   Resolve A from a successful deployment receipt and C from the checked-in
   active pin for each operation. Keep workflow runner S, application A and
   host-tools C distinct; a matching runner SHA does not prove deployment or
   installation.
-- The targeted API read-mix run `42034147480/1` has closed with authoritative
-  fixture cleanup; no load or fixture is active. One restore-verified backup
-  pair is retained. Post-run FULL readiness is not yet evidenced: two canonical
-  collector attempts returned generic failures without JSON, and a separate
-  traced invocation returned `ready` but retained only its trace projection,
-  not the canonical receipt. Preserve the failures as unexplained and obtain
-  and validate a complete canonical FULL receipt before the next consequential
-  production operation.
+- The latest `authenticated_workspace_read_pair_v1` diagnostic, run
+  `42085780534/1`, closed with authoritative fixture cleanup. Its report is
+  incomplete and contains no HTTP or phase measurements; the failure stage and
+  code remain unknown. A subsequent traced invocation of the unchanged
+  canonical FULL collector produced a complete 23-field receipt that passed
+  validation after cleanup. Preserve the earlier generic FULL failures as
+  unexplained; they do not supersede the later validated readiness result.
 - Cell 9, `read-mix-concurrency-ramp-v1`, completed as run `41937909055/1` on
   runner S and app A, both `7c6034efe3878c3413090ca1bcdb5be6e93154e8`, with
   host-tools C `0de51aca4b4d04a80a2f0d392003cc258d8f1400`; exact cleanup
@@ -66,6 +66,16 @@ belong in the linked owner documents below.
   reconciliation: the repeat had 19,971/20,000 successes, 28 status-0 and one
   status-502 failure, while Nginx recorded 19,990 HTML requests, all 200.
   There is no client-request join, so the transport cause remains unknown.
+- The SSR composite diagnostic `42081912538/1` on the 9a baseline stopped after
+  70.385 seconds of its 120-second capacity phase: four body-receive
+  `incomplete_response` failures observed HTTP 200 before the response body
+  ended. The bounded active Nginx error-log check found no entries in the
+  matching one-second buckets; this does not establish the client failure
+  cause. No CPU-profile phase completed and the run earns no capacity credit.
+  Exact fixture cleanup and post-cleanup FULL readiness passed. The separate
+  CPU-only diagnostic `42085780534/1` also remains unclassified because its
+  parent report contains no phase data or failure code. Do not rerun either
+  profile until the diagnostic gaps are addressed.
 
 ## Hard operational limits
 

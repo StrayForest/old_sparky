@@ -866,8 +866,8 @@ def _public_report(value: dict[str, Any]) -> dict[str, Any]:
         "workload": WORKLOAD,
         "fixture_kind": value.get("fixture_kind") if value.get("fixture_kind") in {"external_load", "cpu_diagnostic_only_v1"} else "other",
         "status": value.get("status") if value.get("status") in {"complete", "incomplete"} else "incomplete",
-        "failure_stage": value.get("failure_stage") if value.get("failure_stage") in {"none", "preflight", "fixture", "off_phase", "on_phase", "cleanup", "supervisor", "unknown"} else "unknown",
-        "failure_code": value.get("failure_code") if value.get("failure_code") in {"none", "invalid_binding", "fixture_invalid", "ssh_preflight_failed", "namespace_not_closed", "worker_failed", "cleanup_failed", "profile_incomplete", "unknown"} else "unknown",
+        "failure_stage": value.get("failure_stage") if value.get("failure_stage") in {"none", "preflight", "fixture", "off_phase", "on_phase", "cleanup", "supervisor", "post_prepare_binding", "post_prepare_ssh_hide", "post_prepare_ssh_receipt", "post_prepare_worker_payload", "post_prepare_supervisor", "post_prepare_merge", "unknown"} else "unknown",
+        "failure_code": value.get("failure_code") if value.get("failure_code") in {"none", "invalid_binding", "fixture_invalid", "ssh_preflight_failed", "namespace_not_closed", "worker_failed", "cleanup_failed", "profile_incomplete", "post_prepare_pair_error", "post_prepare_external_load_error", "post_prepare_os_error", "post_prepare_value_error", "unknown"} else "unknown",
         "capacity_slo_credit": False,
         "diagnostic_credit": False,
         "namespace_closed": value.get("namespace_closed") is True,
@@ -2562,6 +2562,7 @@ def _parent(args: argparse.Namespace) -> int:
     ssh_lifecycle_receipt_path = Path(args.report).with_name("ssh-lifecycle.json")
     if _path_exists_nofollow(ssh_lifecycle_receipt_path):
         raise PairError("SSH lifecycle receipt destination already exists")
+    post_prepare_stage: str | None = None
     try:
         prepare_attempted = True
         prepared, release_slug, _unused_usage = _ssh_plan(
@@ -2574,10 +2575,13 @@ def _parent(args: argparse.Namespace) -> int:
             report["failure_stage"] = "preflight"
             report["failure_code"] = "ssh_preflight_failed"
             raise _PlanPrepareRejected
+        post_prepare_stage = "post_prepare_binding"
         if release_slug is None or RELEASE_SLUG_RE.fullmatch(release_slug) is None:
             raise PairError("root release binding rejected")
         plan["release_slug"] = release_slug
+        post_prepare_stage = "post_prepare_ssh_hide"
         _hide_ssh_material(ssh_dir, ssh_files, ssh_lifecycle, ssh_hidden)
+        post_prepare_stage = "post_prepare_ssh_receipt"
         lifecycle_receipt = {
             "schema": 1,
             "event": "cpu_diagnostic_ssh_lifecycle",
@@ -2602,6 +2606,7 @@ def _parent(args: argparse.Namespace) -> int:
         )
         _require_path_absent(ssh_dir)
 
+        post_prepare_stage = "post_prepare_worker_payload"
         pair_payload = {
             "schema": 1,
             "workload": WORKLOAD,
@@ -2628,6 +2633,7 @@ def _parent(args: argparse.Namespace) -> int:
             1.0,
             (plan["on_end_ms"] + 5_000 - time.time_ns() // 1_000_000) / 1000 + 8.0,
         )
+        post_prepare_stage = "post_prepare_supervisor"
         result = load_runtime.run_supervised(
             worker_command=(sys.executable, str(Path(__file__).resolve()), "worker-entry"),
             report_path=report_path.with_name(report_path.name + ".supervisor"),
@@ -2642,6 +2648,22 @@ def _parent(args: argparse.Namespace) -> int:
             worker_stdin_payload_max_bytes=PAIR_PAYLOAD_CAP,
             clear_worker_environment=True,
             env={"SOURCE_GIT_SHA": args.source_sha},
+        )
+        # Preserve the supervisor's already-closed projection even if a later
+        # worker-report read or merge fails. These fields are already part of
+        # the bounded public report and carry no worker payload.
+        report["namespace_closed"] = bool(
+            result.namespace_closed and result.reason == "none"
+        )
+        report["worker_exit_code"] = (
+            result.returncode if result.returncode in {0, 1, 2} else None
+        )
+        report["supervisor_reason"] = (
+            result.reason if result.reason in {
+                "none", "max_duration_seconds", "max_runner_minutes",
+                "external_signal", "namespace_start_failed", "namespace_not_closed",
+                "worker_report_invalid", "worker_exit_nonzero",
+            } else "other"
         )
         child_report: dict[str, Any] | None = None
         try:
@@ -2659,6 +2681,7 @@ def _parent(args: argparse.Namespace) -> int:
             and child_report.get("capacity_slo_credit") is False
             and child_report.get("namespace_closed") is False
         )
+        post_prepare_stage = "post_prepare_merge"
         _merge_supervisor_report(
             report,
             closed=closed,
@@ -2677,6 +2700,18 @@ def _parent(args: argparse.Namespace) -> int:
         # inside this scope so cleanup failures cannot send main() to its
         # generic fallback report and erase the primary cause.
         status = 2
+    except (PairError, external_load.ExternalLoadError, OSError, ValueError) as exc:
+        if post_prepare_stage is not None:
+            report["failure_stage"] = post_prepare_stage
+            if isinstance(exc, PairError):
+                report["failure_code"] = "post_prepare_pair_error"
+            elif isinstance(exc, external_load.ExternalLoadError):
+                report["failure_code"] = "post_prepare_external_load_error"
+            elif isinstance(exc, OSError):
+                report["failure_code"] = "post_prepare_os_error"
+            elif isinstance(exc, ValueError):
+                report["failure_code"] = "post_prepare_value_error"
+        raise
     finally:
         if prepare_attempted:
             cleaned = False
