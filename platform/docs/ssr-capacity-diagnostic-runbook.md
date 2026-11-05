@@ -438,17 +438,13 @@ time is captured at stop and mapping waits for the process-CPU snapshot. Paths/p
 stay private; only existing IDs/categories are emitted. Workloads: `authenticated_html_ssr_capacity_v1`,
 `authenticated_html_ssr_capacity_120s_v1`, `authenticated_html_ssr_cpu_profile_20s_v1`.
 
-For an incomplete diagnostic, use the one-day failure-fingerprint artifact to
-read only the bounded failure classifications. Per-request failure records may
-include `transport_error_code`, a closed client-side transport class; it does
-not establish a server-side root cause. Historical records without this field
-remain valid, and `other` means the client code was unavailable or outside the
-closed set. `capacity_phase.resource_abort_reason`
-identifies the worker abort class; when it is `control_file_invalid`, use
-`capacity_phase.control_failure_reason` only if present. The
-`memory_observer_failure` fields classify observer handling and remote-watch
-failures. A missing or `unknown` value leaves the cause unresolved. These
-classifications do not establish why an underlying file or process failed.
+For incomplete diagnostics, read the one-day failure fingerprint's bounded classifications. Per-request
+records may include the closed client-side `transport_error_code`; older records without it remain valid.
+`other` means unavailable or outside the closed set; the code does not prove a server-side cause.
+`capacity_phase.resource_abort_reason` identifies the worker abort class; for `control_file_invalid`, use
+`capacity_phase.control_failure_reason` only if present. `memory_observer_failure` fields classify observer
+handling and remote-watch failures. Missing or `unknown` values leave the cause unresolved and do not
+establish why an underlying file or process failed.
 Control reason labels are value-free: `path_metadata` (initial path), `opened_metadata` (opened file), `replacement_target_metadata` (distinct target), and `snapshot_replaced` (retry exhausted); legacy `metadata` remains valid. No path, stat value or control payload is exposed.
 Do not inspect or export raw control files, worker/supervisor reports, or
 observer stderr. Any incomplete result remains zero-credit and follows the
