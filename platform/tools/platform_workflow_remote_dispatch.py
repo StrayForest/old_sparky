@@ -128,6 +128,7 @@ LIVE_USER_QA_HELPER = ACTIVE_TOOLS_DIR / "platform_live_user_qa_dispatch.py"
 CPU_DIAGNOSTIC_PLAN_HELPER = ACTIVE_TOOLS_DIR / "platform_cpu_diagnostic_plan.py"
 CPU_DIAGNOSTIC_OUTPUT_CAP = 32_768
 CPU_DIAGNOSTIC_FAILURE_CAP = 512
+CPU_DIAGNOSTIC_FAILURE_NGINX_MAX_RECORDS = 8
 CPU_DIAGNOSTIC_FAILURE_PREFIX = "CPU_DIAGNOSTIC_PLAN_FAILURE "
 CPU_DIAGNOSTIC_FAILURE_STAGES = frozenset({
     "helper_spawn", "helper_io", "helper_timeout",
@@ -1012,6 +1013,83 @@ def _run_sudo(
     )
 
 
+def _cpu_failure_nginx_projection_is_closed(value: Any) -> bool:
+    if (not isinstance(value, dict)
+            or set(value) != {
+                "failure_count", "records_truncated", "nginx_source_truncated", "records",
+            }
+            or type(value.get("failure_count")) is not int
+            or not 0 <= value["failure_count"] <= 100_000
+            or type(value.get("records_truncated")) is not bool
+            or value["records_truncated"] != (
+                value["failure_count"] > CPU_DIAGNOSTIC_FAILURE_NGINX_MAX_RECORDS
+            )
+            or type(value.get("nginx_source_truncated")) is not bool
+            or not isinstance(value.get("records"), list)
+            or len(value["records"]) != min(
+                value["failure_count"], CPU_DIAGNOSTIC_FAILURE_NGINX_MAX_RECORDS,
+            )):
+        return False
+    for ordinal, item in enumerate(value["records"], start=1):
+        if (not isinstance(item, dict)
+                or set(item) != {
+                    "ordinal", "phase", "id_status", "window_status", "sample_membership",
+                    "lookup", "status", "request_completion", "body_bytes",
+                }
+                or type(item.get("ordinal")) is not int or item["ordinal"] != ordinal
+                or any(not isinstance(item.get(key), str) for key in (
+                    "phase", "id_status", "window_status", "sample_membership", "lookup",
+                    "request_completion",
+                ))
+                or item.get("phase") not in {"off_probe", "on_worker"}
+                or item.get("id_status") not in {"missing", "malformed", "ambiguous", "valid_unique"}
+                or item.get("window_status") not in {"off_probe", "unknown", "outside_window", "on_window"}
+                or item.get("sample_membership") not in {"regular_sample", "failure_only", "unavailable"}
+                or item.get("lookup") not in {
+                    "not_attempted", "matched", "missing", "source_truncated", "ambiguous",
+                }
+                or (item.get("status") is not None and (
+                    type(item["status"]) is not int or not 100 <= item["status"] <= 599
+                ))
+                or item.get("request_completion") not in {"complete", "incomplete", "unknown"}
+                or (item.get("body_bytes") is not None and (
+                    type(item["body_bytes"]) is not int or not 0 <= item["body_bytes"] <= 10**12
+                ))):
+            return False
+        usable_id = (
+            item["id_status"] == "valid_unique"
+            and item["phase"] == "on_worker"
+            and item["window_status"] == "on_window"
+        )
+        if (usable_id == (item["lookup"] == "not_attempted")
+                or (item["lookup"] == "source_truncated" and not value["nginx_source_truncated"])
+                or (item["lookup"] == "missing" and value["nginx_source_truncated"])
+                or (item["lookup"] != "matched" and (
+                    item["status"] is not None
+                    or item["request_completion"] != "unknown"
+                    or item["body_bytes"] is not None
+                ))):
+            return False
+    return True
+
+
+def _cpu_request_telemetry_summary_is_closed(value: Any) -> bool:
+    base_fields = {
+        "schema_version", "phase", "cohort", "join", "timing_ms", "coverage",
+        "ssr_stream_coverage",
+    }
+    if not isinstance(value, dict) or type(value.get("schema_version")) is not int:
+        return False
+    schema_version = value["schema_version"]
+    if schema_version == 1:
+        return set(value) == base_fields
+    return (
+        schema_version == 2
+        and set(value) == base_fields | {"failure_nginx"}
+        and _cpu_failure_nginx_projection_is_closed(value.get("failure_nginx"))
+    )
+
+
 def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
     """Cross the pinned root boundary for one fixed, bounded plan operation."""
 
@@ -1236,11 +1314,9 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                         request_telemetry.get("summary") is None
                         and request_telemetry.get("status") == "incomplete"
                         or (
-                            isinstance(request_telemetry.get("summary"), dict)
-                            and set(request_telemetry["summary"]) == {
-                                "schema_version", "phase", "cohort", "join",
-                                "timing_ms", "coverage", "ssr_stream_coverage",
-                            }
+                            _cpu_request_telemetry_summary_is_closed(
+                                request_telemetry.get("summary")
+                            )
                             and isinstance(request_telemetry["summary"].get("coverage"), dict)
                             and source_collection_reason_valid
                             and isinstance(request_telemetry["summary"].get("ssr_stream_coverage"), dict)

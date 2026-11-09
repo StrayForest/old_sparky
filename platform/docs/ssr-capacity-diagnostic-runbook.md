@@ -271,10 +271,7 @@ sys.stdout.write("\n")
 PY
 ```
 
-The email must not be placed in shell arguments, environment variables, files,
-workflow logs, or artifacts. Reconcile the one newly created run by workflow,
-event, branch and exact `head_sha`; record its run ID and attempt before
-watching it:
+Never put the email in shell arguments, environment, files, logs or artifacts. Reconcile one new run by workflow/event/branch/exact `head_sha`; record its ID and attempt before watching it:
 
 ```bash
 gh api \
@@ -283,9 +280,15 @@ gh api \
 gh run watch <exact-load-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
-Do not dispatch a second run after an uncertain response. Reconcile the run
-list and artifacts first. Do not download the private input artifact; review
-only the sanitized report, manifest, phase evidence, and cleanup/abort receipts.
+Do not retry an uncertain dispatch; first reconcile its exact run and artifacts.
+Never download the private input artifact; inspect only the sanitized report, manifest, phase evidence and cleanup/abort receipts.
+
+If a failed Actions step is terminal while siblings run, fetch only its
+`gh api repos/StrayForest/old_sparky/actions/jobs/<job-id>/steps/<step-number>/logs`
+into a mode-0600 file in a mode-0700 `mktemp` directory (`umask 077`). Do not
+wait for the whole workflow, print raw logs or retain them past summary. Keep
+at most 16 failed test IDs, exception classes and source basename/line; omit
+messages, values, environment and request data.
 
 ## Decide whether the measurement is complete
 

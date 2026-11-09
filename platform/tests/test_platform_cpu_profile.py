@@ -323,7 +323,9 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertFalse(report["namespace_closed"])
             self.assertFalse(report["passed"])
             self.assertEqual(report["worker_failure"]["stage"], "worker_callback")
-            self.assertEqual(report["worker_failure"]["exception_class"], "PairError")
+            # The isolated runtime intentionally classifies unregistered
+            # application exception types as the closed fallback `other`.
+            self.assertEqual(report["worker_failure"]["exception_class"], "other")
             self.assertNotIn("worker_failure", completed.stdout.decode("ascii", errors="replace"))
             self.assertNotIn("worker_failure", completed.stderr.decode("ascii", errors="replace"))
 
@@ -8196,6 +8198,56 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
 
     def test_ssr_request_correlation_projection_retains_only_closed_aggregates(self) -> None:
         from tools import platform_cpu_diagnostic_plan as correlation
+
+        failure_nginx = {
+            "failure_count": 1,
+            "records_truncated": False,
+            "nginx_source_truncated": False,
+            "records": [{
+                "ordinal": 1, "phase": "on_worker", "id_status": "valid_unique",
+                "window_status": "on_window", "sample_membership": "failure_only",
+                "lookup": "missing", "status": None,
+                "request_completion": "unknown", "body_bytes": None,
+            }],
+        }
+        correlation_summary_v1 = {
+            "schema_version": 1, "phase": "on", "cohort": {}, "join": {},
+            "timing_ms": {}, "coverage": {}, "ssr_stream_coverage": {},
+        }
+        correlation_summary_v2 = {
+            **correlation_summary_v1,
+            "schema_version": 2,
+            "failure_nginx": failure_nginx,
+        }
+        self.assertTrue(
+            remote_dispatch._cpu_request_telemetry_summary_is_closed(
+                correlation_summary_v1,
+            )
+        )
+        self.assertTrue(
+            remote_dispatch._cpu_request_telemetry_summary_is_closed(
+                correlation_summary_v2,
+            )
+        )
+        self.assertFalse(
+            remote_dispatch._cpu_request_telemetry_summary_is_closed({
+                **correlation_summary_v2, "unexpected": True,
+            })
+        )
+        self.assertTrue(remote_dispatch._cpu_failure_nginx_projection_is_closed(failure_nginx))
+        for malformed_failure_nginx in (
+            {**failure_nginx, "raw_request_id": "f" * 32},
+            {**failure_nginx, "records_truncated": True},
+            {
+                **failure_nginx,
+                "records": [{**failure_nginx["records"][0], "lookup": "unknown"}],
+            },
+        ):
+            self.assertFalse(
+                remote_dispatch._cpu_failure_nginx_projection_is_closed(
+                    malformed_failure_nginx,
+                )
+            )
 
         request_id = "00000000000000000000000000000002"
         event_at = "2026-10-29T12:00:01+00:00"
