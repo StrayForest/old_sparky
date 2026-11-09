@@ -294,23 +294,21 @@ complete only when the report and canonical validators bind the exact run,
 attempt, source, profile, workload, concurrency, fixture manifest and phase
 identities, and all of these conditions hold:
 
-- The unprofiled capacity phase completes its full 120-second ON window with
-  every submitted request accounted for, successful HTTP status and HTML
-  validation, complete required SSR request identity/timing and origin CPU
-  evidence, no abort, and successful plan cleanup. Require
-  `server_telemetry.request_correlation.status=complete` in the sanitized
-  report; an incomplete correlation aggregate cannot receive a PASS even if
-  the report envelope says `complete`. In
-  `transient_ssr_join_counts`, require `submitted_html_count` to equal the
-  started-in-window HTML request count, `valid_response_id_count` to equal
-  `submitted_html_count`, and `missing_response_id_count`,
-  `duplicate_response_id_count` and `malformed_response_id_count` all to be
-  zero. `eligible_response_id_count` is the deterministic one-in-eight join
-  sample; `retained_sample_count` may also be limited by its fixed cap. The
-  HTTP/1.1 load client's closed response-header projection must retain
-  `x-platform-ssr-request-id`; the end-to-end transport contract is covered by
-  `test_ssr_response_id_survives_http11_page_capture_and_keeps_closed_validation`.
-  Require exactly one raw
+- The unprofiled capacity phase completes its full 120-second ON window with every submitted request accounted
+  for, successful HTTP status and HTML validation, required SSR identity/timing and origin CPU evidence, no abort,
+  and successful plan cleanup. Require `server_telemetry.request_correlation.status=complete`; incomplete
+  correlation cannot PASS even if the report envelope says `complete`. In `transient_ssr_join_counts`, require
+  `submitted_html_count` to equal started-in-window HTML requests, `valid_response_id_count` to equal
+  `submitted_html_count`, and missing, duplicate and malformed response-ID counts all to be zero. The
+  deterministic one-in-eight sample remains the only source of API, SSR and stream joins; its retained count may
+  also be limited by the fixed cap.
+  A separate short-lived handoff carries valid unique IDs for the first eight ON-window failures. The collector
+  scans Nginx once across the sample and these failures, capped at 1,008 IDs. Schema v2 adds at most eight
+  ordinal-only Nginx outcomes (status, completion, body bytes and explicit ID/lookup/source-truncation state),
+  exports no IDs, and performs no API/SSR lookup for failure-only IDs. Schema v1 remains accepted for retained
+  reports; this detail changes no acceptance, full-cohort requirement or capacity credit. The HTTP/1.1 client
+  must retain `x-platform-ssr-request-id`; its end-to-end contract is
+  `test_ssr_response_id_survives_http11_page_capture_and_keeps_closed_validation`. Require exactly one raw
   `ssr_stream_capture_coverage` record for the phase run with `status=complete`.
   In the normalized `ssr_stream_coverage` summary require
   `capture_marker_records=1`, `capture_status=complete`, and

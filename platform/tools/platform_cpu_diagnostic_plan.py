@@ -54,6 +54,8 @@ CAPACITY_NGINX_BYTES = 32 * 1024 * 1024
 CAPACITY_NGINX_ROWS = 50_000
 CAPACITY_NGINX_FILES = 8
 CAPACITY_REQUEST_SAMPLE_LIMIT = 1_000
+CAPACITY_FAILURE_TARGET_LIMIT = 8
+CAPACITY_NGINX_JOIN_ID_LIMIT = CAPACITY_REQUEST_SAMPLE_LIMIT + CAPACITY_FAILURE_TARGET_LIMIT
 CAPACITY_CAPTURE_DRAIN_MS = 15_000
 CAPACITY_CAPTURE_MARKER_GRACE_MS = 1_000
 CAPACITY_TRACE_START_SKEW_MS = 28_000
@@ -126,6 +128,95 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _client_failure_targets_are_closed(value: Any, sampled_ids: list[str]) -> bool:
+    if (not isinstance(value, dict)
+            or set(value) != {"failure_count", "records", "records_truncated"}
+            or type(value.get("failure_count")) is not int
+            or not 0 <= value["failure_count"] <= 100_000
+            or not isinstance(value.get("records"), list)
+            or len(value["records"]) != min(value["failure_count"], CAPACITY_FAILURE_TARGET_LIMIT)
+            or type(value.get("records_truncated")) is not bool
+            or value["records_truncated"] != (value["failure_count"] > CAPACITY_FAILURE_TARGET_LIMIT)):
+        return False
+    sample_set = set(sampled_ids)
+    seen_target_ids: set[str] = set()
+    for ordinal, item in enumerate(value["records"], start=1):
+        if (not isinstance(item, dict)
+                or set(item) != {"ordinal", "phase", "id_status", "window_status", "sample_membership", "request_id"}
+                or type(item.get("ordinal")) is not int or item["ordinal"] != ordinal
+                or any(not isinstance(item.get(key), str) for key in (
+                    "phase", "id_status", "window_status", "sample_membership",
+                ))
+                or item.get("phase") not in {"off_probe", "on_worker"}
+                or item.get("id_status") not in {"missing", "malformed", "ambiguous", "valid_unique"}
+                or item.get("window_status") not in {"off_probe", "unknown", "outside_window", "on_window"}
+                or item.get("sample_membership") not in {"regular_sample", "failure_only", "unavailable"}):
+            return False
+        request_id = item.get("request_id")
+        if (item["id_status"] == "valid_unique" and item["phase"] == "on_worker"
+                and item["window_status"] == "on_window"):
+            if (not isinstance(request_id, str) or RUN_RE.fullmatch(request_id) is None
+                    or item["sample_membership"] not in {"regular_sample", "failure_only"}
+                    or request_id in seen_target_ids
+                    or (item["sample_membership"] == "regular_sample") != (request_id in sample_set)):
+                return False
+            seen_target_ids.add(request_id)
+        elif (request_id is not None or item["sample_membership"] != "unavailable"
+              or (item["phase"] == "off_probe" and item["window_status"] != "off_probe")
+              or (item["phase"] == "on_worker" and item["window_status"] == "off_probe")):
+            return False
+    return len(sample_set | (seen_target_ids - sample_set)) <= CAPACITY_NGINX_JOIN_ID_LIMIT
+
+
+def _project_failure_nginx_targets(
+    targets: dict[str, Any], nginx_rows: list[dict[str, Any]], *, source_truncated: bool,
+) -> dict[str, Any]:
+    projected: list[dict[str, Any]] = []
+    for target in targets["records"]:
+        request_id = target["request_id"]
+        matches = [row for row in nginx_rows if row.get("request_id") == request_id] if request_id else []
+        lookup = "not_attempted"
+        status = None
+        completion = "unknown"
+        body_bytes = None
+        if request_id:
+            if len(matches) > 1:
+                lookup = "ambiguous"
+            elif not matches:
+                lookup = "source_truncated" if source_truncated else "missing"
+            else:
+                lookup = "matched"
+                raw_status = matches[0].get("status")
+                if type(raw_status) is int and 100 <= raw_status <= 599:
+                    status = raw_status
+                raw_completion = matches[0].get("request_completion")
+                completion = (
+                    "complete" if raw_completion == "OK"
+                    else "incomplete" if raw_completion == ""
+                    else "unknown"
+                )
+                raw_bytes = matches[0].get("bytes")
+                if type(raw_bytes) is int and 0 <= raw_bytes <= 10**12:
+                    body_bytes = raw_bytes
+        projected.append({
+            "ordinal": target["ordinal"],
+            "phase": target["phase"],
+            "id_status": target["id_status"],
+            "window_status": target["window_status"],
+            "sample_membership": target["sample_membership"],
+            "lookup": lookup,
+            "status": status,
+            "request_completion": completion,
+            "body_bytes": body_bytes,
+        })
+    return {
+        "failure_count": targets["failure_count"],
+        "records_truncated": targets["records_truncated"],
+        "nginx_source_truncated": source_truncated,
+        "records": projected,
+    }
+
+
 def _read_request(command: str, stream: Any = None) -> argparse.Namespace:
     source = stream if stream is not None else sys.stdin.buffer
     try:
@@ -160,7 +251,8 @@ def _read_request(command: str, stream: Any = None) -> argparse.Namespace:
     if command == "cleanup-stdin":
         base_fields = {"schema", "run_id"}
         correlation_fields = {"client_request_ids", "client_cohort_counts"}
-        if (set(payload) not in (base_fields, base_fields | correlation_fields)
+        failure_fields = correlation_fields | {"client_failure_targets"}
+        if (set(payload) not in (base_fields, base_fields | correlation_fields, base_fields | failure_fields)
                 or type(payload.get("schema")) is not int or payload.get("schema") != 1
                 or not isinstance(payload.get("run_id"), str)
                 or RUN_RE.fullmatch(payload["run_id"]) is None):
@@ -209,10 +301,18 @@ def _read_request(command: str, stream: Any = None) -> argparse.Namespace:
                 raise PlanError("cleanup request cohort counts are invalid")
         elif "client_cohort_counts" in payload:
             raise PlanError("cleanup request cohort counts are unbound")
+        failure_targets = payload.get("client_failure_targets")
+        if "client_failure_targets" in payload and not _client_failure_targets_are_closed(
+            failure_targets, request_ids or [],
+        ):
+            raise PlanError("cleanup request failure targets are invalid")
+        if failure_targets is not None and request_ids is None:
+            raise PlanError("cleanup request failure targets are unbound")
         return argparse.Namespace(
             command="cleanup", run_id=payload["run_id"],
             client_request_ids=request_ids,
             client_cohort_counts=cohort_counts,
+            client_failure_targets=failure_targets,
         )
     if command == "memory-watch-stdin":
         if (set(payload) != {"schema", "run_id", "source_sha", "workload"}
@@ -1367,6 +1467,7 @@ def _capacity_request_telemetry(
     *,
     selected_request_ids: list[str],
     cohort_counts: dict[str, int],
+    failure_targets: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Join a bounded client-ID sample to phase-scoped Nginx/SSR/API events."""
 
@@ -1392,6 +1493,10 @@ def _capacity_request_telemetry(
             or len(set(selected_request_ids)) != len(selected_request_ids)
             or selected_request_ids != sorted(selected_request_ids)):
         raise PlanError("capacity correlation identity is invalid")
+    if failure_targets is not None and not _client_failure_targets_are_closed(
+        failure_targets, selected_request_ids,
+    ):
+        raise PlanError("capacity failure correlation targets are invalid")
     counts_fields = {
         "submitted_html_count", "valid_response_id_count",
         "missing_response_id_count", "duplicate_response_id_count",
@@ -1492,8 +1597,16 @@ def _capacity_request_telemetry(
         # Sync runs before the query; retain its failure as the first observed
         # cause even if the following query also encounters a failure.
         web_collection_reason = "journal_sync_failed"
+    failure_only_ids = {
+        target["request_id"] for target in (failure_targets or {}).get("records", [])
+        if target.get("sample_membership") == "failure_only"
+        and isinstance(target.get("request_id"), str)
+    }
+    nginx_join_ids = selected_set | failure_only_ids
+    if len(nginx_join_ids) > CAPACITY_NGINX_JOIN_ID_LIMIT:
+        raise PlanError("capacity Nginx join exceeds its fixed ID limit")
     nginx_raw, nginx_truncated = _bounded_nginx_rows(
-        selected_set, since_ms=trace_start_ms, until_ms=capture_end_ms,
+        nginx_join_ids, since_ms=trace_start_ms, until_ms=capture_end_ms,
     )
 
     ssr_rows: list[dict[str, Any]] = []
@@ -1592,6 +1705,11 @@ def _capacity_request_telemetry(
         sample_limit=CAPACITY_REQUEST_SAMPLE_LIMIT,
         cf_ray_fallback_proven=False,
     )
+    if failure_targets is not None:
+        result["schema_version"] = 2
+        result["failure_nginx"] = _project_failure_nginx_targets(
+            failure_targets, nginx_raw, source_truncated=nginx_truncated,
+        )
     result["ssr_stream_coverage"] = {
         **stream_coverage,
         "capture_status": (
@@ -2907,6 +3025,7 @@ def cleanup(args: argparse.Namespace) -> dict[str, object]:
                     plans,
                     selected_request_ids=args.client_request_ids,
                     cohort_counts=args.client_cohort_counts,
+                    failure_targets=getattr(args, "client_failure_targets", None),
                 )
                 request_telemetry = {
                     "status": (

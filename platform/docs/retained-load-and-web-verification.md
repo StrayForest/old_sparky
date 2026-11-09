@@ -446,9 +446,10 @@ reclassified as completed failures.
 
 The optional CPU diagnostic pair removes run-bound SSH files before
 sanitization and retains a sanitized failure summary only if cleanup succeeds.
-Handled post-prepare failures retain a fixed operation stage and closed failure
-code, never exception text or paths. Cleanup failure keeps the raw report
-private, skips sanitization and upload, and fails the run.
+Handled post-prepare errors expose only fixed stages/codes. Worker-report reads
+distinguish unavailable, symlink, metadata-rejected and changed-during-read.
+Allowlisted supervisor reason/exit may survive a read failure; result remains
+incomplete/no-credit. Cleanup failure keeps the raw report private and skips upload.
 
 The QA system sampler keeps full process identity and CPU collection for all
 `/proc` rows while reading per-process RSS and I/O counters only for the seven

@@ -443,6 +443,14 @@ class PairError(ValueError):
     """A fixed diagnostic input or execution contract failed."""
 
 
+class _PrivateFileReadError(PairError):
+    """A bounded, non-sensitive reason for rejecting a private input file."""
+
+    def __init__(self, reason: str, message: str) -> None:
+        self.reason = reason
+        super().__init__(message)
+
+
 class _PlanPrepareRejected(Exception):
     """Keep the in-scope bounded report when remote plan prepare refuses."""
 
@@ -549,10 +557,10 @@ def _read_private_file(path: Path, *, cap: int, exact_mode: int | None = None) -
     try:
         path_before = path.lstat()
         if stat.S_ISLNK(path_before.st_mode):
-            raise PairError("input file path is a symbolic link")
+            raise _PrivateFileReadError("symlink", "input file path is a symbolic link")
         fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     except OSError as exc:
-        raise PairError("input file unavailable") from exc
+        raise _PrivateFileReadError("unavailable", "input file unavailable") from exc
     try:
         before = os.fstat(fd)
         if (
@@ -566,7 +574,7 @@ def _read_private_file(path: Path, *, cap: int, exact_mode: int | None = None) -
             or (path_before.st_dev, path_before.st_ino)
             != (before.st_dev, before.st_ino)
         ):
-            raise PairError("input file metadata rejected")
+            raise _PrivateFileReadError("metadata_rejected", "input file metadata rejected")
         data = bytearray()
         while len(data) <= cap:
             block = os.read(fd, min(16_384, cap + 1 - len(data)))
@@ -599,7 +607,7 @@ def _read_private_file(path: Path, *, cap: int, exact_mode: int | None = None) -
                 after.st_mtime_ns, after.st_ctime_ns,
             )
         ):
-            raise PairError("input file changed during read")
+            raise _PrivateFileReadError("changed_during_read", "input file changed during read")
         return bytes(data)
     finally:
         os.close(fd)
@@ -866,11 +874,17 @@ def _public_report(value: dict[str, Any]) -> dict[str, Any]:
         "workload": WORKLOAD,
         "fixture_kind": value.get("fixture_kind") if value.get("fixture_kind") in {"external_load", "cpu_diagnostic_only_v1"} else "other",
         "status": value.get("status") if value.get("status") in {"complete", "incomplete"} else "incomplete",
-        "failure_stage": value.get("failure_stage") if value.get("failure_stage") in {"none", "preflight", "fixture", "off_phase", "on_phase", "cleanup", "supervisor", "post_prepare_binding", "post_prepare_ssh_hide", "post_prepare_ssh_receipt", "post_prepare_worker_payload", "post_prepare_supervisor", "post_prepare_merge", "unknown"} else "unknown",
-        "failure_code": value.get("failure_code") if value.get("failure_code") in {"none", "invalid_binding", "fixture_invalid", "ssh_preflight_failed", "namespace_not_closed", "worker_failed", "cleanup_failed", "profile_incomplete", "post_prepare_pair_error", "post_prepare_external_load_error", "post_prepare_os_error", "post_prepare_value_error", "unknown"} else "unknown",
+        "failure_stage": value.get("failure_stage") if value.get("failure_stage") in {"none", "preflight", "fixture", "off_phase", "on_phase", "cleanup", "supervisor", "post_prepare_binding", "post_prepare_ssh_hide", "post_prepare_ssh_receipt", "post_prepare_worker_payload", "post_prepare_supervisor", "post_prepare_worker_report_read", "post_prepare_merge", "unknown"} else "unknown",
+        "failure_code": value.get("failure_code") if value.get("failure_code") in {"none", "invalid_binding", "fixture_invalid", "ssh_preflight_failed", "namespace_not_closed", "worker_failed", "cleanup_failed", "profile_incomplete", "post_prepare_pair_error", "post_prepare_external_load_error", "post_prepare_os_error", "post_prepare_value_error", "post_prepare_worker_report_unavailable", "post_prepare_worker_report_symlink", "post_prepare_worker_report_metadata_rejected", "post_prepare_worker_report_changed_during_read", "unknown"} else "unknown",
         "capacity_slo_credit": False,
         "diagnostic_credit": False,
         "namespace_closed": value.get("namespace_closed") is True,
+        "worker_exit_code": nonnegative_int(value.get("worker_exit_code"), maximum=2),
+        "supervisor_reason": value.get("supervisor_reason") if value.get("supervisor_reason") in {
+            "none", "max_duration_seconds", "max_runner_minutes", "external_signal",
+            "namespace_start_failed", "namespace_not_closed", "worker_report_invalid",
+            "worker_exit_nonzero", "other",
+        } else None,
         "plan_cleanup": value.get("plan_cleanup") if value.get("plan_cleanup") in {"complete", "failed", "unknown", "pending"} else "unknown",
         "plan_prepare_status": value.get("plan_prepare_status") if value.get("plan_prepare_status") in {"not_attempted", "prepared", "refused", "transport_failed", "bad_protocol"} else "not_attempted",
         "plan_prepare_refusal_class": value.get("plan_prepare_refusal_class") if value.get("plan_prepare_refusal_class") in {"PlanError", "OSError", "ValueError", "KeyError", "UntrustedHelper", "unexpected"} else "none",
@@ -1398,6 +1412,56 @@ def _quality_gate(
     }
 
 
+def _failure_nginx_telemetry_is_closed(value: Any) -> bool:
+    if (not isinstance(value, dict)
+            or set(value) != {"failure_count", "records_truncated", "nginx_source_truncated", "records"}
+            or type(value.get("failure_count")) is not int
+            or not 0 <= value["failure_count"] <= 100_000
+            or type(value.get("records_truncated")) is not bool
+            or value["records_truncated"] != (value["failure_count"] > 8)
+            or type(value.get("nginx_source_truncated")) is not bool
+            or not isinstance(value.get("records"), list)
+            or len(value["records"]) != min(value["failure_count"], 8)):
+        return False
+    for ordinal, item in enumerate(value["records"], start=1):
+        if (not isinstance(item, dict)
+                or set(item) != {
+                    "ordinal", "phase", "id_status", "window_status", "sample_membership",
+                    "lookup", "status", "request_completion", "body_bytes",
+                }
+                or type(item.get("ordinal")) is not int or item["ordinal"] != ordinal
+                or any(not isinstance(item.get(key), str) for key in (
+                    "phase", "id_status", "window_status", "sample_membership", "lookup",
+                    "request_completion",
+                ))
+                or item.get("phase") not in {"off_probe", "on_worker"}
+                or item.get("id_status") not in {"missing", "malformed", "ambiguous", "valid_unique"}
+                or item.get("window_status") not in {"off_probe", "unknown", "outside_window", "on_window"}
+                or item.get("sample_membership") not in {"regular_sample", "failure_only", "unavailable"}
+                or item.get("lookup") not in {"not_attempted", "matched", "missing", "source_truncated", "ambiguous"}
+                or (item.get("status") is not None and (
+                    type(item["status"]) is not int or not 100 <= item["status"] <= 599
+                ))
+                or item.get("request_completion") not in {"complete", "incomplete", "unknown"}
+                or (item.get("body_bytes") is not None and (
+                    type(item["body_bytes"]) is not int or not 0 <= item["body_bytes"] <= 10**12
+                ))):
+            return False
+        usable_id = (
+            item["id_status"] == "valid_unique" and item["phase"] == "on_worker"
+            and item["window_status"] == "on_window"
+        )
+        if (usable_id == (item["lookup"] == "not_attempted")
+                or (item["lookup"] == "source_truncated" and not value["nginx_source_truncated"])
+                or (item["lookup"] == "missing" and value["nginx_source_truncated"])
+                or (item["lookup"] != "matched" and (
+                    item["status"] is not None or item["request_completion"] != "unknown"
+                    or item["body_bytes"] is not None
+                ))):
+            return False
+    return True
+
+
 def _validate_usage_summary(
     value: Any, *, expected_workload: str = WORKLOAD,
     allow_projected_memory_rows: bool = False, allow_noop_cleanup: bool = False,
@@ -1477,9 +1541,17 @@ def _validate_usage_summary(
                 "schema_version", "phase", "cohort", "join", "timing_ms",
                 "coverage", "ssr_stream_coverage",
             }
-            if (not isinstance(raw_summary, dict) or set(raw_summary) != summary_fields
-                    or raw_summary.get("schema_version") != 1
+            schema_version = raw_summary.get("schema_version") if isinstance(raw_summary, dict) else None
+            if (not isinstance(raw_summary, dict)
+                    or type(schema_version) is not int
+                    or (schema_version == 1 and set(raw_summary) != summary_fields)
+                    or (schema_version == 2 and set(raw_summary) != summary_fields | {"failure_nginx"})
+                    or schema_version not in {1, 2}
                     or raw_summary.get("phase") != "on"):
+                return None
+            if schema_version == 2 and not _failure_nginx_telemetry_is_closed(
+                raw_summary.get("failure_nginx"),
+            ):
                 return None
             coverage_fields = {
                 "complete", "scope", "selection_rank_proof", "full_cohort",
@@ -2548,6 +2620,8 @@ def _parent(args: argparse.Namespace) -> int:
         "input_handoff_sha256": hashlib.sha256(handoff_raw).hexdigest(),
         "source_binding_sha256": manifest.get("source_binding_sha256"),
         "namespace_closed": False,
+        "worker_exit_code": None,
+        "supervisor_reason": None,
         "plan_cleanup": "unknown",
         "plan_prepare_status": "not_attempted",
         "plan_prepare_refusal_class": "none",
@@ -2666,6 +2740,7 @@ def _parent(args: argparse.Namespace) -> int:
             } else "other"
         )
         child_report: dict[str, Any] | None = None
+        post_prepare_stage = "post_prepare_worker_report_read"
         try:
             child_raw = _read_private_file(worker_report_path, cap=REPORT_CAP)
             parsed = json.loads(child_raw.decode("ascii"))
@@ -2703,7 +2778,9 @@ def _parent(args: argparse.Namespace) -> int:
     except (PairError, external_load.ExternalLoadError, OSError, ValueError) as exc:
         if post_prepare_stage is not None:
             report["failure_stage"] = post_prepare_stage
-            if isinstance(exc, PairError):
+            if isinstance(exc, _PrivateFileReadError) and post_prepare_stage == "post_prepare_worker_report_read":
+                report["failure_code"] = f"post_prepare_worker_report_{exc.reason}"
+            elif isinstance(exc, PairError):
                 report["failure_code"] = "post_prepare_pair_error"
             elif isinstance(exc, external_load.ExternalLoadError):
                 report["failure_code"] = "post_prepare_external_load_error"

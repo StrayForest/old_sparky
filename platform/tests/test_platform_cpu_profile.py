@@ -85,17 +85,21 @@ def _profile_rejections(capture_reason: str = "complete") -> dict[str, object]:
 class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
     def test_cpu_parent_preserves_post_prepare_failure_projection(self) -> None:
         cases = (
-            ("post_prepare_binding", "PairError"),
-            ("post_prepare_ssh_hide", "PairError"),
-            ("post_prepare_ssh_receipt", "ValueError"),
-            ("post_prepare_worker_payload", "ValueError"),
-            ("post_prepare_supervisor", "ExternalLoadError"),
-            ("post_prepare_merge", "OSError"),
+            ("post_prepare_binding", "post_prepare_pair_error", None),
+            ("post_prepare_ssh_hide", "post_prepare_pair_error", None),
+            ("post_prepare_ssh_receipt", "post_prepare_value_error", None),
+            ("post_prepare_worker_payload", "post_prepare_value_error", None),
+            ("post_prepare_supervisor", "post_prepare_external_load_error", None),
+            ("post_prepare_merge", "post_prepare_os_error", None),
+            ("post_prepare_worker_report_read", "post_prepare_worker_report_unavailable", "unavailable"),
+            ("post_prepare_worker_report_read", "post_prepare_worker_report_symlink", "symlink"),
+            ("post_prepare_worker_report_read", "post_prepare_worker_report_metadata_rejected", "metadata_rejected"),
+            ("post_prepare_worker_report_read", "post_prepare_worker_report_changed_during_read", "changed_during_read"),
         )
         original_dumps = cpu_pair.json.dumps
 
-        for failure_stage, exception_class in cases:
-            with self.subTest(failure_stage=failure_stage), tempfile.TemporaryDirectory() as temporary:
+        for failure_stage, expected_failure_code, read_reason in cases:
+            with self.subTest(failure_stage=failure_stage, failure_code=expected_failure_code), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 os.chmod(root, 0o700)
                 manifest_path = root / "manifest.json"
@@ -186,12 +190,44 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     return None
 
                 def successful_closed_supervisor(**kwargs):
-                    # The merge fault is downstream of a readable child report;
-                    # an absent file correctly remains a supervisor-stage error.
                     worker_report = Path(kwargs["worker_report_path"])
-                    worker_report.write_bytes(b"{}\n")
-                    os.chmod(worker_report, 0o600)
+                    if failure_stage == "post_prepare_worker_report_read":
+                        if read_reason == "unavailable":
+                            pass
+                        elif read_reason == "symlink":
+                            target = worker_report.with_name("worker-target.json")
+                            target.write_bytes(b"{}\n")
+                            os.chmod(target, 0o600)
+                            worker_report.symlink_to(target)
+                        elif read_reason == "metadata_rejected":
+                            worker_report.write_bytes(b"{}\n")
+                            os.chmod(worker_report, 0o644)
+                        else:
+                            worker_report.write_bytes(b"{}\n")
+                            os.chmod(worker_report, 0o600)
+                    else:
+                        # Merge faults are downstream of a valid readable child report.
+                        worker_report.write_bytes(b"{}\n")
+                        os.chmod(worker_report, 0o600)
                     return SimpleNamespace(namespace_closed=True, reason="none", returncode=0)
+
+                original_os_read = os.read
+                worker_report_path = report_path.with_name(report_path.name + ".worker")
+                worker_report_changed = False
+
+                def mutate_worker_report_during_read(fd, count):
+                    nonlocal worker_report_changed
+                    data = original_os_read(fd, count)
+                    if data and not worker_report_changed:
+                        fd_stat = os.fstat(fd)
+                        try:
+                            path_stat = worker_report_path.lstat()
+                        except OSError:
+                            return data
+                        if (fd_stat.st_dev, fd_stat.st_ino) == (path_stat.st_dev, path_stat.st_ino):
+                            worker_report_changed = True
+                            worker_report_path.write_bytes(b"changed during read\n")
+                    return data
 
                 patches = [
                     patch.object(cpu_pair.external_load, "load_manifest_bytes", return_value=(manifest, users)),
@@ -210,11 +246,13 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                         cpu_pair.load_runtime, "run_supervised",
                         side_effect=cpu_pair.external_load.ExternalLoadError("private sentinel https://secret.invalid"),
                     ))
-                if failure_stage == "post_prepare_merge":
+                if failure_stage in {"post_prepare_merge", "post_prepare_worker_report_read"}:
                     patches.append(patch.object(
                         cpu_pair.load_runtime, "run_supervised",
                         side_effect=successful_closed_supervisor,
                     ))
+                if read_reason == "changed_during_read":
+                    patches.append(patch.object(os, "read", side_effect=mutate_worker_report_during_read))
 
                 stdout, stderr = io.StringIO(), io.StringIO()
                 with ExitStack() as stack:
@@ -227,23 +265,67 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 raw_report = report_path.read_text(encoding="ascii")
                 public = json.loads(raw_report)
                 self.assertEqual(public["failure_stage"], failure_stage)
-                self.assertEqual(public["failure_code"], {
-                    "PairError": "post_prepare_pair_error",
-                    "ExternalLoadError": "post_prepare_external_load_error",
-                    "OSError": "post_prepare_os_error",
-                    "ValueError": "post_prepare_value_error",
-                }[exception_class])
+                self.assertEqual(public["failure_code"], expected_failure_code)
                 self.assertEqual(public["plan_cleanup_status"], "complete")
-                if failure_stage == "post_prepare_merge":
+                if failure_stage in {"post_prepare_merge", "post_prepare_worker_report_read"}:
                     self.assertTrue(public["namespace_closed"])
                     self.assertEqual(public["worker_exit_code"], 0)
                     self.assertEqual(public["supervisor_reason"], "none")
                 else:
                     self.assertFalse(public["namespace_closed"])
+                if failure_stage == "post_prepare_worker_report_read":
+                    self.assertIsNone(public["result"])
+                    self.assertEqual(public["failure_stage"], "post_prepare_worker_report_read")
                 self.assertFalse(public["capacity_slo_credit"])
                 self.assertFalse(public["diagnostic_credit"])
                 self.assertNotIn("private sentinel", raw_report + stdout.getvalue() + stderr.getvalue())
                 self.assertNotIn("secret.invalid", raw_report + stdout.getvalue() + stderr.getvalue())
+
+    def test_cpu_worker_entrypoint_starts_in_cleared_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            os.chmod(root, 0o700)
+            config_path = root / "worker-config.json"
+            report_path = root / "worker-report.json"
+            raw_payload = b"{}\n"
+            source_sha = "a" * 40
+            config_path.write_text(json.dumps({
+                "worker_report_path": str(report_path),
+                "pair_payload_sha256": hashlib.sha256(raw_payload).hexdigest(),
+                "binding": {
+                    "source_git_sha": source_sha,
+                    "app_target_sha": "b" * 40,
+                    "source_binding": None,
+                    "source_binding_sha256": None,
+                    "external_run_id": "123",
+                    "external_run_attempt": "1",
+                },
+            }, sort_keys=True, separators=(",", ":")), encoding="ascii")
+            os.chmod(config_path, 0o600)
+            completed = subprocess.run(
+                [sys.executable, str(Path(cpu_pair.__file__).resolve()), "worker-entry"],
+                input=raw_payload,
+                capture_output=True,
+                check=False,
+                env={
+                    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                    "LANG": "C.UTF-8",
+                    "LC_ALL": "C.UTF-8",
+                    "TZ": "UTC",
+                    "SOURCE_GIT_SHA": source_sha,
+                    "PLATFORM_LOAD_WORKER_CONFIG": str(config_path),
+                    "PYTHONUNBUFFERED": "1",
+                },
+            )
+            self.assertEqual(completed.returncode, 1, completed.stderr)
+            report = json.loads(report_path.read_text(encoding="ascii"))
+            self.assertTrue(report["report_complete"])
+            self.assertFalse(report["namespace_closed"])
+            self.assertFalse(report["passed"])
+            self.assertEqual(report["worker_failure"]["stage"], "worker_callback")
+            self.assertEqual(report["worker_failure"]["exception_class"], "PairError")
+            self.assertNotIn("worker_failure", completed.stdout.decode("ascii", errors="replace"))
+            self.assertNotIn("worker_failure", completed.stderr.decode("ascii", errors="replace"))
 
     def test_html_ssr_profile_is_distinct_and_only_extends_concurrency_for_html(self) -> None:
         self.assertEqual(
@@ -1769,6 +1851,9 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "request_window_evidence": join_evidence,
             "client_join_request_ids": joined_ids,
             "failure_evidence": capacity_diagnostic._failure_evidence(),
+            "client_failure_targets": {
+                "failure_count": 0, "records_truncated": False, "records": [],
+            },
             "actual_on_request_started_at_utc": "1970-01-01T00:00:30+00:00",
             "actual_on_request_finished_at_utc": "1970-01-01T00:00:47+00:00",
             "failure_evidence_status": "available",
@@ -5075,6 +5160,46 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         with self.assertRaises(PlanError):
             _read_request("cleanup-stdin", io.BytesIO(raw))
 
+        eligible_id = next(
+            f"{candidate:032x}" for candidate in range(1, 10_000)
+            if diagnostic_plan_tool.is_ssr_response_id_eligible("a" * 32, f"{candidate:032x}")
+        )
+        cleanup = {
+            "schema": 1, "run_id": "a" * 32,
+            "client_request_ids": [eligible_id],
+            "client_cohort_counts": {
+                "submitted_html_count": 1, "valid_response_id_count": 1,
+                "missing_response_id_count": 0, "duplicate_response_id_count": 0,
+                "malformed_response_id_count": 0, "eligible_response_id_count": 1,
+                "retained_sample_count": 1,
+                "sample_scheme": "sha256-runid-requestid-1of8-v1",
+                "sample_cap_truncated": False,
+            },
+            "client_failure_targets": {
+                "failure_count": 1, "records_truncated": False,
+                "records": [{
+                    "ordinal": 1, "phase": "on_worker", "id_status": "valid_unique",
+                    "window_status": "on_window", "sample_membership": "failure_only",
+                    "request_id": "f" * 32,
+                }],
+            },
+        }
+        parsed_cleanup = _read_request(
+            "cleanup-stdin", io.BytesIO(_canonical_payload(cleanup)),
+        )
+        self.assertEqual(parsed_cleanup.client_request_ids, [eligible_id])
+        self.assertEqual(parsed_cleanup.client_failure_targets, cleanup["client_failure_targets"])
+        for invalid_targets in (
+            {**cleanup["client_failure_targets"], "records": cleanup["client_failure_targets"]["records"] * 9},
+            {**cleanup["client_failure_targets"], "unexpected": True},
+            {**cleanup["client_failure_targets"], "records": [{
+                **cleanup["client_failure_targets"]["records"][0], "raw_url": "https://secret.invalid",
+            }]},
+        ):
+            malformed = {**cleanup, "client_failure_targets": invalid_targets}
+            with self.subTest(invalid_targets=invalid_targets), self.assertRaises(PlanError):
+                _read_request("cleanup-stdin", io.BytesIO(_canonical_payload(malformed)))
+
     def test_profile_rejection_taxonomy_reports_bounded_predicate_counts(self) -> None:
         self.assertEqual(
             set(diagnostic_plan_tool.PROFILE_REJECTION_CODES), cpu_pair.PROFILE_REJECTION_CODES,
@@ -8159,6 +8284,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         def producer_request_telemetry(
             workload: str,
             selected_ids: list[str], cohort_counts: dict[str, object],
+            failure_targets: dict[str, object] | None = None,
         ) -> dict[str, object]:
             on_end_ms = 146_000 if workload == diagnostic_plan_tool.HTML_CAPACITY_120S_WORKLOAD else 46_000
             plans = {
@@ -8189,6 +8315,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     plans,
                     selected_request_ids=selected_ids,
                     cohort_counts=cohort_counts,
+                    failure_targets=failure_targets,
                 )
             self.assertEqual(
                 [(service, call["since_ms"]) for service, call in collector_calls],
@@ -8296,6 +8423,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             workload: str,
             result: dict[str, object], selected_ids: list[str],
             cohort_counts: dict[str, object],
+            failure_targets: dict[str, object] | None = None,
         ) -> dict[str, object] | None:
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -8319,6 +8447,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     "client_request_ids": selected_ids,
                     "client_cohort_counts": cohort_counts,
                 }
+                if failure_targets is not None:
+                    payload["client_failure_targets"] = failure_targets
                 with (
                     patch.object(remote_dispatch, "_trusted_python_helper", return_value=True),
                     patch.object(remote_dispatch, "SUDO", str(fake_sudo)),
@@ -8388,6 +8518,36 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                         workload, contradictory_collection, selected_ids, counts,
                     ))
 
+        failure_id = "f" * 32
+        failure_targets = {
+            "failure_count": 1, "records_truncated": False,
+            "records": [{
+                "ordinal": 1, "phase": "on_worker", "id_status": "valid_unique",
+                "window_status": "on_window", "sample_membership": "failure_only",
+                "request_id": failure_id,
+            }],
+        }
+        produced_v2 = producer_request_telemetry(
+            diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD,
+            [sampled_id], sampled_counts, failure_targets,
+        )
+        self.assertEqual(produced_v2["summary"]["schema_version"], 2)
+        self.assertNotIn(failure_id, json.dumps(produced_v2["summary"]))
+        parsed_v2 = dispatch_and_validate(
+            diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD,
+            cleanup_summary(diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD, produced_v2),
+            [sampled_id], sampled_counts, failure_targets,
+        )
+        self.assertIsNotNone(parsed_v2)
+        self.assertNotIn(failure_id, json.dumps(parsed_v2))
+        malformed_v2 = cleanup_summary(
+            diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD, produced_v2,
+        )
+        malformed_v2["request_telemetry"]["summary"]["schema_version"] = True
+        self.assertIsNone(dispatch_and_validate(
+            diagnostic_plan_tool.HTML_CAPACITY_WORKLOAD, malformed_v2,
+            [sampled_id], sampled_counts, failure_targets,
+        ))
         selected_rank_ids: list[str] = []
         for index in range(1, 100_000):
             request_id = f"{index:032x}"
@@ -8491,6 +8651,194 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         self.assertIn("diagnostic_plan", info.call_args.args)
         self.assertIn("/api/v1/tournaments/{slug}/workspace", info.call_args.args)
         self.assertNotIn("private-fixture-slug", info.call_args.args)
+
+    def test_failure_targets_add_one_bounded_nginx_scan_and_v2_safe_projection(self) -> None:
+        from tools import platform_cpu_diagnostic_plan as collector
+
+        run_id = "0123456789abcdef0123456789abcdef"
+        sample_id = next(
+            f"{index:032x}" for index in range(1, 10_000)
+            if collector.is_ssr_response_id_eligible(run_id, f"{index:032x}")
+        )
+        failure_only_id = "f" * 32
+        start_ms, end_ms = 1_000_000, 1_020_000
+        event_time = datetime.fromtimestamp(1_005, tz=timezone.utc).isoformat()
+        plans = {
+            service: {
+                "run_id": run_id,
+                "workload": collector.HTML_CAPACITY_WORKLOAD,
+                "on_start_ms": start_ms,
+                "on_end_ms": end_ms,
+                "expires_at_ms": end_ms + 15_000,
+            }
+            for service in ("api", "web")
+        }
+        sample_counts = {
+            "submitted_html_count": 1, "valid_response_id_count": 1,
+            "missing_response_id_count": 0, "duplicate_response_id_count": 0,
+            "malformed_response_id_count": 0, "eligible_response_id_count": 1,
+            "retained_sample_count": 1,
+            "sample_scheme": "sha256-runid-requestid-1of8-v1",
+            "sample_cap_truncated": False,
+        }
+        failure_targets = {
+            "failure_count": 1, "records_truncated": False,
+            "records": [{
+                "ordinal": 1, "phase": "on_worker", "id_status": "valid_unique",
+                "window_status": "on_window", "sample_membership": "failure_only",
+                "request_id": failure_only_id,
+            }],
+        }
+        raw_nginx_rows = [
+            {"request_id": sample_id, "time": event_time, "request_time": "0.020",
+             "cf_ray": None, "status": 200, "request_completion": "OK", "bytes": 48},
+            {"request_id": failure_only_id, "time": event_time, "request_time": "0.010",
+             "cf_ray": None, "status": 200, "request_completion": "", "bytes": 0},
+        ]
+        journal_calls: list[tuple[str, set[str]]] = []
+        nginx_calls: list[set[str]] = []
+
+        def no_journal_rows(service, _plan, **kwargs):
+            journal_calls.append((service, set(kwargs["request_ids"])))
+            return [], "complete"
+
+        def one_nginx_scan(request_ids, **_kwargs):
+            nginx_calls.append(set(request_ids))
+            return raw_nginx_rows, False
+
+        with (
+            patch.object(collector, "_bounded_capacity_journal_rows", side_effect=no_journal_rows),
+            patch.object(collector, "_wait_and_sync_capacity_capture_marker", return_value=True),
+            patch.object(collector, "_bounded_nginx_rows", side_effect=one_nginx_scan),
+        ):
+            summary = collector._capacity_request_telemetry(
+                plans, selected_request_ids=[sample_id], cohort_counts=sample_counts,
+                failure_targets=failure_targets,
+            )
+
+        self.assertEqual(len(nginx_calls), 1)
+        self.assertEqual(nginx_calls[0], {sample_id, failure_only_id})
+        self.assertEqual(journal_calls, [("api", {sample_id}), ("web", {sample_id})])
+        self.assertEqual(summary["schema_version"], 2)
+        failure_projection = summary["failure_nginx"]
+        self.assertEqual(failure_projection["records"][0]["lookup"], "matched")
+        self.assertEqual(failure_projection["records"][0]["status"], 200)
+        self.assertEqual(failure_projection["records"][0]["request_completion"], "incomplete")
+        self.assertEqual(failure_projection["records"][0]["body_bytes"], 0)
+        self.assertNotIn(failure_only_id, json.dumps(summary))
+        self.assertNotIn(sample_id, json.dumps(summary))
+        self.assertTrue(capacity_diagnostic._failure_nginx_projection_is_closed(failure_projection))
+        self.assertEqual(
+            collector._project_failure_nginx_targets(
+                failure_targets, [], source_truncated=False,
+            )["records"][0]["lookup"],
+            "missing",
+        )
+        truncated = collector._project_failure_nginx_targets(
+            failure_targets, [], source_truncated=True,
+        )
+        self.assertEqual(truncated["records"][0]["lookup"], "source_truncated")
+        self.assertTrue(capacity_diagnostic._failure_nginx_projection_is_closed(truncated))
+        duplicate_log_rows = collector._project_failure_nginx_targets(
+            failure_targets, [
+                {"request_id": failure_only_id}, {"request_id": failure_only_id},
+            ], source_truncated=False,
+        )
+        self.assertEqual(duplicate_log_rows["records"][0]["lookup"], "ambiguous")
+        self.assertTrue(capacity_diagnostic._failure_nginx_projection_is_closed(duplicate_log_rows))
+        self.assertIsNotNone(capacity_diagnostic._project_request_correlation({
+            "status": "incomplete", "summary": summary,
+        }))
+        invalid_v2 = json.loads(json.dumps({"status": "incomplete", "summary": summary}))
+        invalid_v2["summary"]["failure_nginx"]["records"][0]["request_id"] = failure_only_id
+        self.assertIsNone(capacity_diagnostic._project_request_correlation(invalid_v2))
+        invalid_v2_bytes = json.loads(json.dumps({"status": "incomplete", "summary": summary}))
+        invalid_v2_bytes["summary"]["failure_nginx"]["records"][0]["body_bytes"] = 10**12 + 1
+        self.assertIsNone(capacity_diagnostic._project_request_correlation(invalid_v2_bytes))
+        invalid_v2_version = json.loads(json.dumps({"status": "incomplete", "summary": summary}))
+        invalid_v2_version["summary"]["schema_version"] = True
+        self.assertIsNone(capacity_diagnostic._project_request_correlation(invalid_v2_version))
+
+        failed = SimpleNamespace(
+            error_kind="response_failure", ok=False, started_at_utc="1970-01-01T00:00:10+00:00",
+            ssr_request_id=sample_id, ssr_request_id_malformed=False,
+        )
+        failure_only = SimpleNamespace(
+            error_kind="response_failure", ok=False, started_at_utc="1970-01-01T00:00:11+00:00",
+            ssr_request_id=failure_only_id, ssr_request_id_malformed=False,
+        )
+        missing = SimpleNamespace(
+            error_kind="response_failure", ok=False, started_at_utc="1970-01-01T00:00:12+00:00",
+            ssr_request_id=None, ssr_request_id_malformed=False,
+        )
+        malformed = SimpleNamespace(
+            error_kind="response_failure", ok=False, started_at_utc="1970-01-01T00:00:13+00:00",
+            ssr_request_id="bad", ssr_request_id_malformed=True,
+        )
+        duplicate = SimpleNamespace(
+            error_kind="response_failure", ok=False, started_at_utc="1970-01-01T00:00:14+00:00",
+            ssr_request_id="3" * 32, ssr_request_id_malformed=False,
+        )
+        duplicate_success = SimpleNamespace(
+            error_kind=None, ok=True, started_at_utc="1970-01-01T00:00:15+00:00",
+            ssr_request_id="3" * 32, ssr_request_id_malformed=False,
+        )
+        outside = SimpleNamespace(
+            error_kind="response_failure", ok=False, started_at_utc="1970-01-01T00:00:09+00:00",
+            ssr_request_id="4" * 32, ssr_request_id_malformed=False,
+        )
+        off = SimpleNamespace(
+            error_kind="response_failure", ok=False, started_at_utc="1970-01-01T00:00:08+00:00",
+            ssr_request_id="5" * 32, ssr_request_id_malformed=False,
+        )
+        targets = capacity_diagnostic._failure_correlation_targets(
+            off_results=[off],
+            on_results=[failed, failure_only, missing, malformed, duplicate,
+                         duplicate_success, outside],
+            start_ms=10_000, end_ms=20_000, sampled_ids=[sample_id],
+        )
+        self.assertEqual(
+            [(item["id_status"], item["window_status"], item["sample_membership"])
+             for item in targets["records"]],
+            [
+                ("valid_unique", "off_probe", "unavailable"),
+                ("valid_unique", "on_window", "regular_sample"),
+                ("valid_unique", "on_window", "failure_only"),
+                ("missing", "on_window", "unavailable"),
+                ("malformed", "on_window", "unavailable"),
+                ("ambiguous", "on_window", "unavailable"),
+                ("valid_unique", "outside_window", "unavailable"),
+            ],
+        )
+        self.assertTrue(capacity_diagnostic._failure_correlation_targets_are_closed(
+            targets, sampled_ids=[sample_id], phase_records=[
+                {"phase": "off_probe"}, *({"phase": "on_worker"} for _ in range(6)),
+            ],
+        ))
+        missing_id_target = {
+            "failure_count": 1, "records_truncated": False,
+            "records": [{**targets["records"][3], "ordinal": 1}],
+        }
+        unavailable_projection = collector._project_failure_nginx_targets(
+            missing_id_target, [], source_truncated=False,
+        )
+        self.assertEqual(unavailable_projection["records"][0]["id_status"], "missing")
+        self.assertEqual(unavailable_projection["records"][0]["lookup"], "not_attempted")
+        many_failures = [
+            SimpleNamespace(
+                error_kind="response_failure", ok=False,
+                started_at_utc="1970-01-01T00:00:11+00:00",
+                ssr_request_id=None, ssr_request_id_malformed=False,
+            )
+            for _ in range(10)
+        ]
+        bounded_targets = capacity_diagnostic._failure_correlation_targets(
+            on_results=many_failures, start_ms=10_000, end_ms=20_000,
+            sampled_ids=[],
+        )
+        self.assertEqual(bounded_targets["failure_count"], 10)
+        self.assertEqual(len(bounded_targets["records"]), 8)
+        self.assertTrue(bounded_targets["records_truncated"])
 
     def test_diagnostic_request_selector_is_exact_and_requires_internal_trace(self) -> None:
         scope = {

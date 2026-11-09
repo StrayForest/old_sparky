@@ -282,16 +282,33 @@ class SourceBindingDispatchTests(unittest.TestCase):
                 "sample_scheme": "sha256-runid-requestid-1of8-v1",
                 "sample_cap_truncated": False,
             },
+            "client_failure_targets": {
+                "failure_count": 1, "records_truncated": False,
+                "records": [{
+                    "ordinal": 1, "phase": "on_worker", "id_status": "valid_unique",
+                    "window_status": "on_window", "sample_membership": "failure_only",
+                    "request_id": "f" * 32,
+                }],
+            },
         }
         self.assertEqual(
             validate_cpu_diagnostic_payload(payload)["client_request_ids"],
             ["00000000000000000000000000000002"],
+        )
+        self.assertEqual(
+            validate_cpu_diagnostic_payload(payload)["client_failure_targets"],
+            payload["client_failure_targets"],
         )
         for malformed in (
             {**payload, "client_request_ids": ["11111111111111111111111111111111"]},
             {**payload, "client_request_ids": ["other"]},
             {**payload, "client_request_ids": ["b" * 32] * 1_001},
             {**payload, "client_cohort_counts": {**payload["client_cohort_counts"], "submitted_html_count": 3}},
+            {**payload, "client_failure_targets": {**payload["client_failure_targets"], "raw_request_ids": []}},
+            {**payload, "client_failure_targets": {**payload["client_failure_targets"], "records": [{
+                **payload["client_failure_targets"]["records"][0],
+                "request_id": "00000000000000000000000000000002",
+            }]}},
         ):
             with self.subTest(ids=malformed["client_request_ids"][:1]):
                 with self.assertRaises(WorkflowInputError):

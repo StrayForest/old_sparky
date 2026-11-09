@@ -1337,11 +1337,7 @@ def _capacity_worker_status(*, aborted: bool, all_200: bool) -> str:
 def _failure_evidence(
     *, off_results: list[Any] | None = None, on_results: list[Any] | None = None,
 ) -> dict[str, Any]:
-    phased = [
-        (phase, item)
-        for phase, results in (("off_probe", off_results or []), ("on_worker", on_results or []))
-        for item in results if item.error_kind is not None or item.ok is not True
-    ]
+    phased = _phased_failure_results(off_results=off_results, on_results=on_results)
     by_phase: dict[str, Any] = {}
     for phase in ("off_probe", "on_worker"):
         phase_items = [item for item_phase, item in phased if item_phase == phase]
@@ -1395,6 +1391,117 @@ def _failure_evidence(
         "records": records,
         "records_truncated": len(phased) > FAILURE_RECORD_LIMIT,
     }
+
+
+def _phased_failure_results(
+    *, off_results: list[Any] | None = None, on_results: list[Any] | None = None,
+) -> list[tuple[str, Any]]:
+    return [
+        (phase, item)
+        for phase, results in (("off_probe", off_results or []), ("on_worker", on_results or []))
+        for item in results if item.error_kind is not None or item.ok is not True
+    ]
+
+
+def _failure_correlation_targets(
+    *, off_results: list[Any] | None = None, on_results: list[Any] | None = None,
+    start_ms: int, end_ms: int, sampled_ids: list[str],
+) -> dict[str, Any]:
+    """Build a short-lived, bounded ID handoff for failed ON-window requests."""
+
+    phased = _phased_failure_results(off_results=off_results, on_results=on_results)
+    id_counts = Counter(
+        value for results in (off_results or [], on_results or []) for item in results
+        if isinstance((value := getattr(item, "ssr_request_id", None)), str)
+        and re.fullmatch(r"[0-9a-f]{32}", value)
+    )
+    sampled = set(sampled_ids)
+    records: list[dict[str, Any]] = []
+    for ordinal, (phase, item) in enumerate(phased[:FAILURE_RECORD_LIMIT], start=1):
+        request_id = getattr(item, "ssr_request_id", None)
+        malformed_id = getattr(item, "ssr_request_id_malformed", False) is True
+        if request_id is None:
+            id_status = "malformed" if malformed_id else "missing"
+        elif (malformed_id or not isinstance(request_id, str)
+              or re.fullmatch(r"[0-9a-f]{32}", request_id) is None):
+            id_status = "malformed"
+        elif id_counts[request_id] != 1:
+            id_status = "ambiguous"
+        else:
+            id_status = "valid_unique"
+        started_ms = _request_timestamp_ms(getattr(item, "started_at_utc", None))
+        window_status = (
+            "off_probe" if phase == "off_probe"
+            else "unknown" if started_ms is None
+            else "outside_window" if not start_ms <= started_ms < end_ms
+            else "on_window"
+        )
+        retained_id = request_id if id_status == "valid_unique" and window_status == "on_window" else None
+        records.append({
+            "ordinal": ordinal,
+            "phase": phase,
+            "id_status": id_status,
+            "window_status": window_status,
+            "sample_membership": (
+                "regular_sample" if retained_id in sampled
+                else "failure_only" if retained_id is not None
+                else "unavailable"
+            ),
+            "request_id": retained_id,
+        })
+    return {
+        "failure_count": len(phased),
+        "records": records,
+        "records_truncated": len(phased) > FAILURE_RECORD_LIMIT,
+    }
+
+
+def _failure_correlation_targets_are_closed(
+    value: Any, *, sampled_ids: list[str], phase_records: list[Any] | None = None,
+) -> bool:
+    if phase_records is not None and not isinstance(phase_records, list):
+        return False
+    if (not isinstance(value, dict)
+            or set(value) != {"failure_count", "records", "records_truncated"}
+            or type(value.get("failure_count")) is not int
+            or not 0 <= value["failure_count"] <= 100_000
+            or not isinstance(value.get("records"), list)
+            or len(value["records"]) != min(value["failure_count"], FAILURE_RECORD_LIMIT)
+            or type(value.get("records_truncated")) is not bool
+            or value["records_truncated"] != (value["failure_count"] > FAILURE_RECORD_LIMIT)):
+        return False
+    sample_set = set(sampled_ids)
+    seen_ids: set[str] = set()
+    for ordinal, item in enumerate(value["records"], start=1):
+        if (not isinstance(item, dict)
+                or set(item) != {"ordinal", "phase", "id_status", "window_status", "sample_membership", "request_id"}
+                or type(item.get("ordinal")) is not int or item["ordinal"] != ordinal
+                or any(not isinstance(item.get(key), str) for key in (
+                    "phase", "id_status", "window_status", "sample_membership",
+                ))
+                or item.get("phase") not in {"off_probe", "on_worker"}
+                or item.get("id_status") not in {"missing", "malformed", "ambiguous", "valid_unique"}
+                or item.get("window_status") not in {"off_probe", "unknown", "outside_window", "on_window"}
+                or item.get("sample_membership") not in {"regular_sample", "failure_only", "unavailable"}):
+            return False
+        request_id = item.get("request_id")
+        if item["id_status"] == "valid_unique" and item["phase"] == "on_worker" \
+                and item["window_status"] == "on_window":
+            if (not isinstance(request_id, str) or re.fullmatch(r"[0-9a-f]{32}", request_id) is None
+                    or item["sample_membership"] not in {"regular_sample", "failure_only"}
+                    or request_id in seen_ids
+                    or (item["sample_membership"] == "regular_sample") != (request_id in sample_set)):
+                return False
+            seen_ids.add(request_id)
+        elif (request_id is not None or item["sample_membership"] != "unavailable"
+              or (item["phase"] == "off_probe" and item["window_status"] != "off_probe")
+              or (item["phase"] == "on_worker" and item["window_status"] == "off_probe")):
+            return False
+        if phase_records is not None and ordinal <= len(phase_records):
+            if not isinstance(phase_records[ordinal - 1], dict) \
+                    or phase_records[ordinal - 1].get("phase") != item["phase"]:
+                return False
+    return phase_records is None or len(phase_records) == len(value["records"])
 
 
 def _capacity_transport_error_code(result: Any) -> str:
@@ -2340,6 +2447,11 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
     }
     if capacity["workload"] in SSR_CORRELATION_WORKLOADS:
         report["client_join_request_ids"] = _selected_ssr_join_request_ids(results, binding["run_id"])
+        report["client_failure_targets"] = _failure_correlation_targets(
+            off_results=off_results, on_results=results,
+            start_ms=capacity["on_start_ms"], end_ms=capacity["on_end_ms"],
+            sampled_ids=report["client_join_request_ids"],
+        )
     return report
 
 
@@ -2416,13 +2528,17 @@ def _incomplete_report(
             raise ValueError("capacity warmup failure projection rejected")
         report["warmup_failure"] = dict(warmup_failure)
     if capacity["workload"] in SSR_CORRELATION_WORKLOADS:
-        report["client_join_request_ids"] = _selected_ssr_join_request_ids(
+        sampled_ids = _selected_ssr_join_request_ids(
             _phase_request_window_evidence(
-                on_results or [],
-                start_ms=capacity["on_start_ms"], end_ms=capacity["on_end_ms"],
-                run_id=binding["run_id"],
-            )[0],
-            binding["run_id"],
+                on_results or [], start_ms=capacity["on_start_ms"],
+                end_ms=capacity["on_end_ms"], run_id=binding["run_id"],
+            )[0], binding["run_id"],
+        )
+        report["client_join_request_ids"] = sampled_ids
+        report["client_failure_targets"] = _failure_correlation_targets(
+            off_results=off_results, on_results=on_results,
+            start_ms=capacity["on_start_ms"], end_ms=capacity["on_end_ms"],
+            sampled_ids=sampled_ids,
         )
     return report
 
@@ -2674,6 +2790,10 @@ def run_isolated_capacity_worker(
         stage_state["transient_ssr_join_ids"] = list(
             worker_payload["client_join_request_ids"]
         )
+        if "client_failure_targets" in worker_payload:
+            stage_state["transient_ssr_failure_targets"] = dict(
+                worker_payload["client_failure_targets"]
+            )
         evidence = worker_payload["request_window_evidence"]
         stage_state["transient_ssr_join_counts"] = {
             "submitted_html_count": evidence["started_in_window_count"],
@@ -2842,6 +2962,7 @@ def _worker_report_matches(payload: Any, capacity_config: Mapping[str, Any]) -> 
         new_warmup_control_fields - {"client_join_request_ids"},
         new_warmup_control_fields - {"process_cpu_windows", "client_join_request_ids"},
     ))
+    new_shapes = new_shapes + tuple(shape | {"client_failure_targets"} for shape in new_shapes)
     legacy_failure_evidence = _normalize_failure_evidence_fields(
         payload, legacy_shapes=legacy_shapes, current_shapes=new_shapes,
     )
@@ -2887,6 +3008,18 @@ def _worker_report_matches(payload: Any, capacity_config: Mapping[str, Any]) -> 
     if (workload in SSR_CORRELATION_WORKLOADS
             and (request_window is None or join_ids is None)):
         return False
+    if "client_failure_targets" in payload:
+        evidence = payload.get("failure_evidence")
+        if (workload not in SSR_CORRELATION_WORKLOADS
+                or payload.get("failure_evidence_status") != "available"
+                or not isinstance(evidence, dict)
+                or not isinstance(payload["client_failure_targets"], dict)
+                or payload["client_failure_targets"].get("failure_count") != evidence.get("failure_count")
+                or not _failure_correlation_targets_are_closed(
+                    payload.get("client_failure_targets"), sampled_ids=join_ids or [],
+                    phase_records=evidence.get("records"),
+                )):
+            return False
     cpu_rows = payload.get("process_cpu_windows", _unknown_cpu_windows())
     return bool(
         type(payload.get("worker_report_schema")) is int
@@ -3184,6 +3317,7 @@ def _cleanup_remote_capacity_plan(
     lifecycle: dict[str, Any] | None = None,
     client_request_ids: list[str] | None = None,
     client_cohort_counts: Mapping[str, int] | None = None,
+    client_failure_targets: Mapping[str, Any] | None = None,
 ) -> tuple[bool, dict[str, Any] | None]:
     try:
         from tools import platform_cpu_diagnostic_pair as cpu_pair
@@ -3198,6 +3332,8 @@ def _cleanup_remote_capacity_plan(
     if client_request_ids is not None:
         payload["client_request_ids"] = client_request_ids
         payload["client_cohort_counts"] = dict(client_cohort_counts or {})
+        if client_failure_targets is not None:
+            payload["client_failure_targets"] = dict(client_failure_targets)
     result, _release_slug, summary = cpu_pair._ssh_plan(
         argparse.Namespace(), host, user, config, key, payload, lifecycle,
         allow_noop_cleanup=True,
@@ -3430,6 +3566,56 @@ def _valid_gc_duration_ms(value: Any) -> bool:
     )
 
 
+def _failure_nginx_projection_is_closed(value: Any) -> bool:
+    if (not isinstance(value, dict)
+            or set(value) != {"failure_count", "records_truncated", "nginx_source_truncated", "records"}
+            or type(value.get("failure_count")) is not int
+            or not 0 <= value["failure_count"] <= 100_000
+            or type(value.get("records_truncated")) is not bool
+            or value["records_truncated"] != (value["failure_count"] > FAILURE_RECORD_LIMIT)
+            or type(value.get("nginx_source_truncated")) is not bool
+            or not isinstance(value.get("records"), list)
+            or len(value["records"]) != min(value["failure_count"], FAILURE_RECORD_LIMIT)):
+        return False
+    for ordinal, item in enumerate(value["records"], start=1):
+        if (not isinstance(item, dict)
+                or set(item) != {
+                    "ordinal", "phase", "id_status", "window_status", "sample_membership",
+                    "lookup", "status", "request_completion", "body_bytes",
+                }
+                or type(item.get("ordinal")) is not int or item["ordinal"] != ordinal
+                or any(not isinstance(item.get(key), str) for key in (
+                    "phase", "id_status", "window_status", "sample_membership", "lookup",
+                    "request_completion",
+                ))
+                or item.get("phase") not in {"off_probe", "on_worker"}
+                or item.get("id_status") not in {"missing", "malformed", "ambiguous", "valid_unique"}
+                or item.get("window_status") not in {"off_probe", "unknown", "outside_window", "on_window"}
+                or item.get("sample_membership") not in {"regular_sample", "failure_only", "unavailable"}
+                or item.get("lookup") not in {"not_attempted", "matched", "missing", "source_truncated", "ambiguous"}
+                or (item.get("status") is not None and (
+                    type(item["status"]) is not int or not 100 <= item["status"] <= 599
+                ))
+                or item.get("request_completion") not in {"complete", "incomplete", "unknown"}
+                or (item.get("body_bytes") is not None and (
+                    type(item["body_bytes"]) is not int or not 0 <= item["body_bytes"] <= 10**12
+                ))):
+            return False
+        usable_id = (
+            item["id_status"] == "valid_unique" and item["phase"] == "on_worker"
+            and item["window_status"] == "on_window"
+        )
+        if (usable_id == (item["lookup"] == "not_attempted")
+                or (item["lookup"] == "source_truncated" and not value["nginx_source_truncated"])
+                or (item["lookup"] == "missing" and value["nginx_source_truncated"])
+                or (item["lookup"] != "matched" and (
+                    item["status"] is not None or item["request_completion"] != "unknown"
+                    or item["body_bytes"] is not None
+                ))):
+            return False
+    return True
+
+
 def _project_request_correlation(value: Any) -> dict[str, Any] | None:
     """Project the private SSR/API join to fixed aggregate-only keys."""
 
@@ -3440,8 +3626,12 @@ def _project_request_correlation(value: Any) -> dict[str, Any] | None:
     if summary is None:
         return {"status": "incomplete", "summary": None} if value["status"] == "incomplete" else None
     top = {"schema_version", "phase", "cohort", "join", "timing_ms", "coverage", "ssr_stream_coverage"}
-    if (not isinstance(summary, dict) or set(summary) != top
-            or summary.get("schema_version") != 1 or summary.get("phase") != "on"):
+    schema_version = summary.get("schema_version") if isinstance(summary, dict) else None
+    if (not isinstance(summary, dict)
+            or type(schema_version) is not int
+            or (schema_version == 1 and set(summary) != top)
+            or (schema_version == 2 and set(summary) != top | {"failure_nginx"})
+            or schema_version not in {1, 2} or summary.get("phase") != "on"):
         return None
 
     cohort_fields = {
@@ -3677,6 +3867,8 @@ def _project_request_correlation(value: Any) -> dict[str, Any] | None:
                 and (coverage["complete"] is not True or truncated_stream))
             or (value["status"] == "incomplete"
                 and coverage["complete"] is True and not truncated_stream)):
+        return None
+    if schema_version == 2 and not _failure_nginx_projection_is_closed(summary.get("failure_nginx")):
         return None
     return {"status": value["status"], "summary": summary}
 
@@ -4186,6 +4378,7 @@ def _parent_run_once(
                         lifecycle=cleanup_lifecycle,
                         client_request_ids=state.pop("transient_ssr_join_ids", None),
                         client_cohort_counts=state.pop("transient_ssr_join_counts", None),
+                        client_failure_targets=state.pop("transient_ssr_failure_targets", None),
                     )
             else:
                 cleanup_ok = False
@@ -4200,6 +4393,7 @@ def _parent_run_once(
             state["cleanup_ok"] = cleanup_ok
             state.pop("transient_ssr_join_ids", None)
             state.pop("transient_ssr_join_counts", None)
+            state.pop("transient_ssr_failure_targets", None)
             state["stage"] = "worker_supervision"
     if isinstance(outcome, dict):
         correlation_required = workload in {

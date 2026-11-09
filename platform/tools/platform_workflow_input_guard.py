@@ -573,7 +573,8 @@ def validate_cpu_diagnostic_payload(payload: Mapping[str, Any]) -> dict[str, Any
         base = {"schema", "operation", "run_id"}
         fields = set(payload)
         correlation_fields = {"client_request_ids", "client_cohort_counts"}
-        if fields not in (base, base | correlation_fields):
+        extended_fields = correlation_fields | {"client_failure_targets"}
+        if fields not in (base, base | correlation_fields, base | extended_fields):
             _require_exact_keys(payload, base)
         if type(payload.get("schema")) is not int or payload["schema"] != 1:
             raise _invalid()
@@ -624,6 +625,54 @@ def validate_cpu_diagnostic_payload(payload: Mapping[str, Any]) -> dict[str, Any
             }
         elif "client_cohort_counts" in payload:
             raise _invalid()
+        if "client_failure_targets" in payload:
+            targets = payload.get("client_failure_targets")
+            if "client_request_ids" not in payload:
+                raise _invalid()
+            sample_set = set(output.get("client_request_ids", []))
+            if (not isinstance(targets, Mapping)
+                    or set(targets) != {"failure_count", "records", "records_truncated"}
+                    or type(targets.get("failure_count")) is not int
+                    or not 0 <= targets["failure_count"] <= 100_000
+                    or not isinstance(targets.get("records"), list)
+                    or len(targets["records"]) != min(targets["failure_count"], 8)
+                    or type(targets.get("records_truncated")) is not bool
+                    or targets["records_truncated"] != (targets["failure_count"] > 8)):
+                raise _invalid()
+            target_ids: set[str] = set()
+            for ordinal, item in enumerate(targets["records"], start=1):
+                if (not isinstance(item, Mapping)
+                        or set(item) != {"ordinal", "phase", "id_status", "window_status", "sample_membership", "request_id"}
+                        or type(item.get("ordinal")) is not int or item["ordinal"] != ordinal
+                        or any(not isinstance(item.get(key), str) for key in (
+                            "phase", "id_status", "window_status", "sample_membership",
+                        ))
+                        or item.get("phase") not in {"off_probe", "on_worker"}
+                        or item.get("id_status") not in {"missing", "malformed", "ambiguous", "valid_unique"}
+                        or item.get("window_status") not in {"off_probe", "unknown", "outside_window", "on_window"}
+                        or item.get("sample_membership") not in {"regular_sample", "failure_only", "unavailable"}):
+                    raise _invalid()
+                request_id = item.get("request_id")
+                if (item["id_status"] == "valid_unique" and item["phase"] == "on_worker"
+                        and item["window_status"] == "on_window"):
+                    if (not isinstance(request_id, str)
+                            or re.fullmatch(r"[0-9a-f]{32}", request_id) is None
+                            or item["sample_membership"] not in {"regular_sample", "failure_only"}
+                            or request_id in target_ids
+                            or (item["sample_membership"] == "regular_sample") != (request_id in sample_set)):
+                        raise _invalid()
+                    target_ids.add(request_id)
+                elif (request_id is not None or item["sample_membership"] != "unavailable"
+                      or (item["phase"] == "off_probe" and item["window_status"] != "off_probe")
+                      or (item["phase"] == "on_worker" and item["window_status"] == "off_probe")):
+                    raise _invalid()
+            if len(sample_set | (target_ids - sample_set)) > 1_008:
+                raise _invalid()
+            output["client_failure_targets"] = {
+                "failure_count": targets["failure_count"],
+                "records_truncated": targets["records_truncated"],
+                "records": [dict(item) for item in targets["records"]],
+            }
         return output
     if operation != "prepare":
         raise _invalid()
