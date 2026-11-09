@@ -96,6 +96,7 @@ RECOVERY_BOOTSTRAP_FILES = frozenset(
         ".github/workflows/platform-production-autodeploy.yml",
         "platform/tools/platform_recovery_bootstrap.py",
         "platform/tools/platform_ssr_capacity_diagnostic.py",
+        "platform/tools/platform_cpu_diagnostic_pair.py",
         "platform/performance/README.md",
         "platform/tools/platform_abort_retained_load.py",
         "platform/tools/platform_noop_source_binding.py",

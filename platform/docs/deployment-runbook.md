@@ -64,6 +64,7 @@ to `dev`. The chain is:
    `Deploy production` job. Legacy slugs require root validation, GitHub attempt 1
    and passing exact checks; unknown formats, reruns and ambiguity fail closed.
    A no-backup child requires `cumulative_no_op=true` and `runtime_required=false` or fails before build or receipt. Candidate-packaging, storage and ordinary deploy routes retain the exact source-bound backup gate. The authenticated no-op receipt binds workflow SHA to active app baseline and may authorize live QA against that unchanged app; the recovery-bootstrap publisher's skip receipt is separate.
+   The closed recovery-bootstrap family includes `platform/tools/platform_cpu_diagnostic_pair.py` as a runner-side diagnostic entry point; it is not imported by application packages. This exact path grants no-op treatment only when every cumulative changed path remains in the closed recovery family or documentation, and any application/runtime path keeps the deploy route.
 5. After Security, classifier and any required backup proofs pass, a secret-free prerequisite validates the exact classifier artifact before the production child builds `TARGET_SHA` once.
    The production environment then repeats that exact-SHA validation immediately
    before its first production write, followed by the security/build check and

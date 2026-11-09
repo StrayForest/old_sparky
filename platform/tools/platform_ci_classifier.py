@@ -196,6 +196,7 @@ RECOVERY_BOOTSTRAP_FILES = frozenset(
         "platform/tools/platform_abort_retained_load.py",
         "platform/tools/platform_noop_source_binding.py",
         "platform/tools/platform_ssr_capacity_diagnostic.py",
+        "platform/tools/platform_cpu_diagnostic_pair.py",
         "platform/performance/README.md",
         "platform/tools/platform_release_capture_probe.py",
         "platform/tools/platform_release_active_artifact_proof.py",

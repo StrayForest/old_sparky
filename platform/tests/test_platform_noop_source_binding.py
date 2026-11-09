@@ -85,6 +85,7 @@ RECOVERY_BOOTSTRAP_CUMULATIVE_PATHS = [
     "platform/tools/platform_noop_source_binding.py",
     "platform/tools/platform_production_classifier_artifact.py",
     "platform/tools/platform_ssr_capacity_diagnostic.py",
+    "platform/tools/platform_cpu_diagnostic_pair.py",
     "platform/tools/platform_test_catalog.py",
     "platform/tests/test_platform_noop_source_binding.py",
 ]
@@ -385,6 +386,66 @@ class NoopSourceBindingTests(unittest.TestCase):
         self.assertNotEqual(binding["runner_sha"], binding["app_target_sha"])
 
     def test_runtime_sensitive_recovery_bootstrap_noop_roundtrips_runner_to_active_app(self) -> None:
+        first_source_sha = "a03128ee42317b2952275b543c17ec09a4a9b018"
+        final_source_sha = "580a822343a695ad630f10b0a0e982cc77d058a6"
+        actual_first_commit_paths = [
+            "platform/docs/CURRENT.md",
+            "platform/docs/retained-load-and-web-verification.md",
+            "platform/docs/test-suite-governance.md",
+            "platform/tests/test_platform_cpu_profile.py",
+            "platform/tools/platform_cpu_diagnostic_pair.py",
+            "platform/tools/platform_test_catalog.py",
+        ]
+        first_incremental = platform_ci_classifier.classify(
+            actual_first_commit_paths,
+            event="push",
+            branch="dev",
+            target_sha=first_source_sha,
+            repository_ready=True,
+        )
+        self.assertEqual(
+            first_incremental["reason"], platform_ci_classifier.RECOVERY_BOOTSTRAP_REASON
+        )
+        self.assertFalse(first_incremental["deployable"])
+
+        final_incremental = platform_ci_classifier.classify(
+            ["platform/tests/test_platform_cpu_profile.py"],
+            event="push",
+            branch="dev",
+            target_sha=final_source_sha,
+            repository_ready=True,
+        )
+        self.assertEqual(
+            final_incremental["reason"], platform_ci_classifier.RECOVERY_BOOTSTRAP_REASON
+        )
+        actual_cumulative = platform_noop_source_binding.classify_cumulative_baseline(
+            final_incremental,
+            actual_first_commit_paths,
+            expected_target_sha=final_source_sha,
+        )
+        self.assertTrue(actual_cumulative["no_op"])
+        self.assertEqual(
+            platform_noop_source_binding.validate_cumulative_reconcile_route(actual_cumulative),
+            {"no_op": True, "runtime_required": False},
+        )
+        runtime_mixed = platform_noop_source_binding.classify_cumulative_baseline(
+            final_incremental,
+            [*actual_first_commit_paths, "platform/apps/platform_api/app/main.py"],
+            expected_target_sha=final_source_sha,
+        )
+        self.assertFalse(runtime_mixed["no_op"])
+        self.assertTrue(runtime_mixed["manifest"]["deployable"])
+        unlisted_sibling = platform_noop_source_binding.classify_cumulative_baseline(
+            final_incremental,
+            [
+                *actual_first_commit_paths,
+                "platform/tools/platform_cpu_diagnostic_pair_extra.py",
+            ],
+            expected_target_sha=final_source_sha,
+        )
+        self.assertFalse(unlisted_sibling["no_op"])
+        self.assertTrue(unlisted_sibling["manifest"]["deployable"])
+
         incremental_files = [
             "platform/tools/platform_noop_source_binding.py",
             "platform/tools/platform_ci_classifier.py",

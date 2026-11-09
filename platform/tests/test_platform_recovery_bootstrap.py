@@ -145,6 +145,7 @@ RECOVERY_BOOTSTRAP_ALLOWLIST_ONLY_FILES = frozenset(
         "platform/tools/platform_release_capture_probe.py",
         "platform/tools/platform_validate_release_artifact.py",
         "platform/tools/platform_workflow_provenance.py",
+        "platform/tools/platform_cpu_diagnostic_pair.py",
     }
 )
 RECOVERY_BOOTSTRAP_PATCH_DOCS = frozenset(
