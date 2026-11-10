@@ -346,9 +346,9 @@ identities, and all of these conditions hold:
   session with no profile; no late start or retry. Raw V8 capture runs from
   prearm to ON end, but its prefix is discarded. A conservative
   `Date.now()`/monotonic mapping retains only complete sample intervals inside
-  ON. `start_lag_ms` is the first retained interval's start offset, while
-  `elapsed_ms` and category weights use retained intervals only; keep the 250 ms
-  start/end bounds. Clock disagreement or incomplete edge coverage yields no profile.
+  ON. `start_lag_ms` is the first retained interval's start offset. `end_lag_ms`
+  is signed (`start_lag_ms + elapsed_ms - window_ms`) and must remain within
+  −250..250 ms; `elapsed_ms` and category weights use retained intervals only. Clock disagreement or incomplete edge coverage yields no profile.
   All 32 capacity workers consume one response, close only their thread-local
   connection and retain its SSL context for authenticated OFF. OFF opens a fresh
   connection; setup is included in the OFF CPU baseline. Measured ON transport

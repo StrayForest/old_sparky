@@ -1563,6 +1563,27 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         projected = json.loads(dispatch_output.removeprefix("CPU_DIAGNOSTIC_PLAN "))
         self.assertEqual(projected["usage_rows"], rows)
 
+        # The producer reports signed endpoint lag; negative values are valid
+        # when the final retained sample interval ends before the ON edge.
+        for signed_lag in (-1, -250):
+            signed_profile = json.loads(json.dumps(complete_helper_result))
+            for profile_row in signed_profile["profile_rows"]:
+                profile_row["start_lag_ms_min"] = 0
+                profile_row["start_lag_ms_max"] = 0
+                profile_row["elapsed_ms_min"] = 20_000 + signed_lag
+                profile_row["elapsed_ms_max"] = 20_000 + signed_lag
+                profile_row["end_lag_ms_min"] = signed_lag
+                profile_row["end_lag_ms_max"] = signed_lag
+            signed_status, signed_output = invoke_with_helper_result(signed_profile)
+            self.assertEqual(signed_status, 0, signed_output)
+            signed_projected = json.loads(
+                signed_output.removeprefix("CPU_DIAGNOSTIC_PLAN "),
+            )
+            self.assertEqual(
+                [row["end_lag_ms_min"] for row in signed_projected["profile_rows"]],
+                [signed_lag, signed_lag],
+            )
+
         def assert_cleanup_failure_marker(output: str, *, stage: str) -> None:
             self.assertTrue(output.startswith("CPU_DIAGNOSTIC_PLAN_FAILURE "))
             self.assertTrue(output.endswith("\n"))
@@ -1589,6 +1610,19 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 marker["child_stdout_bytes"],
                 platform_workflow_remote_dispatch.CPU_DIAGNOSTIC_OUTPUT_CAP,
             )
+
+        for row_index, field, invalid_lag in (
+            (1, "end_lag_ms_min", -251),
+            (1, "end_lag_ms_max", 251),
+            (1, "end_lag_ms_min", False),
+            (1, "start_lag_ms_min", -1),
+            (1, "total_cpu_us", -1),
+        ):
+            invalid_lag_profile = json.loads(json.dumps(complete_helper_result))
+            invalid_lag_profile["profile_rows"][row_index][field] = invalid_lag
+            bad_status, bad_output = invoke_with_helper_result(invalid_lag_profile)
+            self.assertEqual(bad_status, 2)
+            assert_cleanup_failure_marker(bad_output, stage="profile_rows")
 
         real_popen = subprocess.Popen
 

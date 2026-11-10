@@ -1490,7 +1490,13 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
                     "elapsed_ms_min", "elapsed_ms_max", "end_lag_ms_min", "end_lag_ms_max",
                 ):
                     value = row.get(numeric)
-                    if value is not None and (type(value) is not int or not 0 <= value <= 10**10):
+                    if value is None:
+                        continue
+                    if numeric in {"end_lag_ms_min", "end_lag_ms_max"}:
+                        valid_numeric = type(value) is int and -250 <= value <= 250
+                    else:
+                        valid_numeric = type(value) is int and 0 <= value <= 10**10
+                    if not valid_numeric:
                         return emit_failure("profile_rows", process=process, output=output)
                 if service == "web" and row["sample_count"] is not None and row["sample_count"] > 2400:
                     return emit_failure("profile_rows", process=process, output=output)
