@@ -1386,6 +1386,9 @@ def _failure_evidence(
         if not isinstance(stage, str) or stage not in FAILURE_STAGES:
             stage = "unknown"
         timing = item.transport_timing if isinstance(item.transport_timing, dict) else {}
+        connection_reused = timing.get("connection_reused")
+        if type(connection_reused) is not bool:
+            connection_reused = None
         safe_timing = {
             key: round(float(timing[key]), 3)
             for key in sorted(FAILURE_TIMING_KEYS)
@@ -1397,6 +1400,7 @@ def _failure_evidence(
             "phase": phase,
             "error_class": _capacity_error_code(item),
             "transport_error_code": _capacity_transport_error_code(item),
+            "connection_reused": connection_reused,
             "stage": stage,
             "request_status": (
                 item.status if type(item.status) is int and 0 <= item.status <= 599 else 0
@@ -1667,14 +1671,18 @@ def _failure_evidence_is_closed(
         "started_at_utc", "exception_at_utc", "finished_at_utc", "phase_timing_ms",
     })
     current_record_keys = legacy_record_keys | {"transport_error_code"}
+    reuse_record_keys = current_record_keys | {"connection_reused"}
     marker_record_keysets = {
         legacy_record_keys | {"html_marker_diagnostics"},
         current_record_keys | {"html_marker_diagnostics"},
+        reuse_record_keys | {"html_marker_diagnostics"},
     }
     allowed_transport_error_codes = external_load.TRANSPORT_ERROR_CODES | {"other"}
     for ordinal, record in enumerate(value["records"], start=1):
         if (not isinstance(record, dict)
-                or (frozenset(record) not in {legacy_record_keys, current_record_keys}
+                or (frozenset(record) not in {
+                        legacy_record_keys, current_record_keys, reuse_record_keys,
+                    }
                     and frozenset(record) not in marker_record_keysets)
                 or record.get("ordinal") != ordinal
                 or not isinstance(record.get("phase"), str)
@@ -1685,6 +1693,9 @@ def _failure_evidence_is_closed(
                     type(record.get("transport_error_code")) is not str
                     or record["transport_error_code"] not in allowed_transport_error_codes
                 ))
+                or ("connection_reused" in record
+                    and record["connection_reused"] is not None
+                    and type(record["connection_reused"]) is not bool)
                 or not isinstance(record.get("stage"), str)
                 or record.get("stage") not in FAILURE_STAGES
                 or type(record.get("request_status")) is not int

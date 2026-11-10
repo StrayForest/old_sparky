@@ -481,6 +481,54 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "error_counts": {"private identity leaked": 1},
         }))
 
+        for reused in (True, False, None):
+            with self.subTest(connection_reused=reused):
+                transport_timing = (
+                    {"connection_reused": reused} if reused is not None else {}
+                )
+                failed_request = external_load.RequestResult(
+                    "on", "GET", "/private/route", 0, 1.0, False, 0,
+                    error_kind="TimeoutError", started_at_utc="2026-11-10T09:14:20Z",
+                    exception_at_utc="2026-11-10T09:14:20.500000Z",
+                    finished_at_utc="2026-11-10T09:14:21Z",
+                    transport_timing=transport_timing,
+                    failure_stage="response_headers",
+                )
+                reuse_evidence = capacity_diagnostic._failure_evidence(
+                    on_results=[failed_request],
+                )
+                record = reuse_evidence["records"][0]
+                self.assertIs(record["connection_reused"], reused)
+                self.assertTrue(capacity_diagnostic._failure_evidence_is_closed(
+                    reuse_evidence, completed=1,
+                    phase_completed={"off_probe": 0, "on_worker": 1},
+                ))
+
+                # A previously emitted record without the new field remains valid.
+                legacy_record = dict(record)
+                del legacy_record["connection_reused"]
+                reuse_evidence["records"][0] = legacy_record
+                self.assertTrue(capacity_diagnostic._failure_evidence_is_closed(
+                    reuse_evidence, completed=1,
+                    phase_completed={"off_probe": 0, "on_worker": 1},
+                ))
+
+        unsafe_reuse_evidence = capacity_diagnostic._failure_evidence(
+            on_results=[external_load.RequestResult(
+                "on", "GET", "/private/route", 0, 1.0, False, 0,
+                error_kind="TimeoutError", started_at_utc="2026-11-10T09:14:20Z",
+                exception_at_utc="2026-11-10T09:14:20.500000Z",
+                finished_at_utc="2026-11-10T09:14:21Z",
+                transport_timing={"connection_reused": True},
+                failure_stage="response_headers",
+            )],
+        )
+        unsafe_reuse_evidence["records"][0]["connection_reused"] = "socket detail"
+        self.assertFalse(capacity_diagnostic._failure_evidence_is_closed(
+            unsafe_reuse_evidence, completed=1,
+            phase_completed={"off_probe": 0, "on_worker": 1},
+        ))
+
         marker_body = (
             b'<span data-testid="tournament-detail-lifecycle" '
             b'data-ssr-workspace-ready="true"></span>'

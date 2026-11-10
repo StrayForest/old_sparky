@@ -428,8 +428,8 @@ stay private; only existing IDs/categories are emitted. Workloads: `authenticate
 `authenticated_html_ssr_capacity_120s_v1`, `authenticated_html_ssr_cpu_profile_20s_v1`.
 
 For incomplete diagnostics, read the one-day failure fingerprint's bounded classifications. Per-request
-records may include the closed client-side `transport_error_code`; older records without it remain valid.
-`other` means unavailable or outside the closed set; the code does not prove a server-side cause.
+records may include closed client-side `transport_error_code` and `connection_reused` (`true`/`false`/`null`);
+older records lacking these fields remain valid. Reuse describes the failed request's initial socket state; neither it nor `other` proves a server-side cause.
 For `page_marker_missing`, the bounded record may include capped response bytes, closed content-type,
 encoding/parser labels and four marker booleans after parsing; it omits body, raw headers, route and request ID, distinguishing marker mismatch from parser/size rejection without changing acceptance.
 `capacity_phase.resource_abort_reason` identifies the worker abort class; for `control_file_invalid`, use
