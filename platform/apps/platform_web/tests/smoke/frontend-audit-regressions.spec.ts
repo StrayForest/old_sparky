@@ -653,7 +653,18 @@ test("workspace CPU diagnostics require an exact private run marker", () => {
   expect(planModule).toContain("const expectedExpiry = onEnd + (typedHtmlWorkload ? 15_000 : 0)");
   expect(planModule).toContain("|| expires !== expectedExpiry");
   expect(planModule).toContain("HTML_CAPACITY_ON_WINDOW_MS = 120_000");
-  expect(planModule).toContain("plan.workload === WORKLOAD_CPU_PAIR || plan.workload === WORKLOAD_HTML_SSR_CPU_PROFILE_20S");
+  expect(planModule).toContain(
+    'if (diagnostic.plan.workload === WORKLOAD_HTML_SSR_CPU_PROFILE_20S) {\n'
+      + '    scheduleWebCpuProfile(diagnostic.plan, diagnostic.phase);',
+  );
+  expect(planModule).toContain(
+    'else if (diagnostic.plan.workload === WORKLOAD_CPU_PAIR && diagnostic.phase === "on") {\n'
+      + '    await startAuthorizedNodeCpuProfile(diagnostic.plan);',
+  );
+  expect(planModule).toContain(
+    'else if (plan.workload === WORKLOAD_CPU_PAIR && phase === "on") {\n'
+      + '    await startAuthorizedNodeCpuProfile(plan);',
+  );
   expect(planModule).toContain("hasAuthorizedDiagnosticRunMarker(incomingTrace, plan.run_id)");
   expect(planModule.indexOf("if (!hasAuthorizedDiagnosticRunMarker(incomingTrace, plan.run_id))"))
     .toBeLessThan(planModule.indexOf("diagnosticStorage.run({ plan, phase }, operation)"));
