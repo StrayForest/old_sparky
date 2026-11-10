@@ -114,12 +114,13 @@ umask 077
 testenv_dir="$(mktemp -d /tmp/oldsparky-dbfree-test-env.XXXXXX)"
 testenv_file="$testenv_dir/platform.env"
 trap 'rm -f -- "$testenv_file"; rmdir -- "$testenv_dir"' EXIT
-cat > "$testenv_file" <<'EOF'
-PLATFORM_ENVIRONMENT=test
-PLATFORM_DB_SCHEMA=platform
-PLATFORM_DATABASE_URL=postgresql+asyncpg://127.0.0.1:1/platformdb_test
-PLATFORM_REDIS_URL=redis://127.0.0.1:1/15
-EOF
+test_db_url='postgresql+asyncpg://127.0.0.1:1/platformdb_test'
+test_redis_url='redis://127.0.0.1:1/15'
+printf '%s\n' \
+  'PLATFORM_ENVIRONMENT=test' \
+  'PLATFORM_DB_SCHEMA=platform' \
+  "PLATFORM_DATABASE_URL=${test_db_url}" \
+  "PLATFORM_REDIS_URL=${test_redis_url}" > "$testenv_file"
 chmod 600 "$testenv_file"
 
 tools/platform_run_quiet.sh "CPU worker and SSR projection focused tests" -- \
@@ -127,8 +128,8 @@ tools/platform_run_quiet.sh "CPU worker and SSR projection focused tests" -- \
   PLATFORM_ENV_FILE="$testenv_file" \
   PLATFORM_ENVIRONMENT=test \
   PLATFORM_DB_SCHEMA=platform \
-  PLATFORM_DATABASE_URL=postgresql+asyncpg://127.0.0.1:1/platformdb_test \
-  PLATFORM_REDIS_URL=redis://127.0.0.1:1/15 \
+  "PLATFORM_DATABASE_URL=${test_db_url}" \
+  "PLATFORM_REDIS_URL=${test_redis_url}" \
   .venv_platform/bin/python tools/platform_verify.py performance-contract \
   --focused \
   tests.test_platform_cpu_profile.ReadyVoteCpuProfilerTests.test_cpu_worker_entrypoint_starts_in_cleared_environment \

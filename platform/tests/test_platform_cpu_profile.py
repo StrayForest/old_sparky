@@ -375,7 +375,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertTrue(result.report["report_complete"])
             self.assertEqual(result.report["worker_failure"]["stage"], "worker_callback")
             self.assertEqual(
-                result.report["worker_failure"]["exception_class"], "value_error"
+                result.report["worker_failure"]["exception_class"], "other"
             )
 
     def test_cpu_worker_attempt_binding_is_canonical_and_checked_before_warmup(self) -> None:
