@@ -1716,6 +1716,7 @@ class EvidencePrivacyTests(unittest.TestCase):
 
         legacy = copy.deepcopy(evidence)
         del legacy["records"][0]["transport_error_code"]
+        del legacy["records"][0]["connection_reused"]
         self.assertTrue(capacity_diagnostic._failure_evidence_is_closed(legacy, completed=1))
 
         invalid_code = copy.deepcopy(evidence)
