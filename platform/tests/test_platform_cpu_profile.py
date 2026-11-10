@@ -3781,11 +3781,20 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             capacity_diagnostic.load_runtime._write_json_atomic(config_path, config)
             pid, starttime = os.getpid(), 1
             on_namespace_init(pid, starttime)
-            capacity_control.write_control(Path(capacity["control_path"]), {
-                "schema": 1, **binding, "decision": "continue",
-                "reason": "none", "sequence": 0,
-                "updated_monotonic_ns": time.monotonic_ns(),
-            }, expected=binding)
+            control_sequence = -1
+            control_lock = threading.Lock()
+
+            def write_control_state(decision: str, reason: str) -> None:
+                nonlocal control_sequence
+                with control_lock:
+                    control_sequence += 1
+                    capacity_control.write_control(Path(capacity["control_path"]), {
+                        "schema": 1, **binding, "decision": decision,
+                        "reason": reason, "sequence": control_sequence,
+                        "updated_monotonic_ns": time.monotonic_ns(),
+                    }, expected=binding)
+
+            write_control_state("continue", "none")
             worker_result: dict[str, int] = {}
             worker_errors: list[BaseException] = []
 
@@ -3805,14 +3814,29 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
 
             if warmup_state["all_ready"]:
                 worker_thread = threading.Thread(target=run_worker_entry, daemon=True)
+                heartbeat_stop = threading.Event()
+
+                def refresh_control() -> None:
+                    # The callback fast-forwards its test wall clock to OFF;
+                    # keep the fake supervisor's real-monotonic heartbeat alive
+                    # instead of disabling the production stale-control guard.
+                    while not heartbeat_stop.wait(timeout=0.5):
+                        write_control_state("continue", "none")
+
+                heartbeat_thread = threading.Thread(
+                    target=refresh_control, daemon=True,
+                )
                 worker_thread.start()
-                requests_finished = off_requests_complete.wait(timeout=5)
+                heartbeat_thread.start()
+                try:
+                    requests_finished = off_requests_complete.wait(timeout=5)
+                finally:
+                    heartbeat_stop.set()
+                    heartbeat_thread.join(timeout=2)
+                    if heartbeat_thread.is_alive():
+                        raise AssertionError("fake supervisor heartbeat did not stop")
                 if requests_finished and not warmup_state["off_failure"]:
-                    capacity_control.write_control(Path(capacity["control_path"]), {
-                        "schema": 1, **binding, "decision": "abort",
-                        "reason": "memory_event", "sequence": 1,
-                        "updated_monotonic_ns": time.monotonic_ns(),
-                    }, expected=binding)
+                    write_control_state("abort", "memory_event")
                 worker_thread.join(timeout=5)
                 if worker_thread.is_alive():
                     raise AssertionError("valid OFF probe callback did not stop promptly")
