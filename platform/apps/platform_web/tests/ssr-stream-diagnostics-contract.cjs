@@ -296,6 +296,128 @@ async function verifySsrWebLifecycleContract() {
   assert.equal(scheduleFailure.ok, false);
   assert(scheduleFailure.events.some((row) => row.status === "failed" && row.reason === "start_error"));
 
+  async function profilePrearmCase({
+    replacePlan = false, lateTimerMs = 0, slowStartMs = 0,
+    hangPrepare = false, hangStart = false, cancel = false,
+  } = {}) {
+    const profilePlan = {
+      run_id: "abcdef0123456789abcdef0123456789",
+      off_start_ms: 10_000, off_end_ms: 30_000,
+      on_start_ms: 35_000, on_end_ms: 55_000, expires_at_ms: 70_000,
+    };
+    let nowMs = 20_000;
+    let currentPlan = profilePlan;
+    const scheduled = new Set();
+    const started = new Set();
+    const failed = new Set();
+    const timers = [];
+    const events = [];
+    const counts = { prepared: 0, started: 0, stopped: 0, closed: 0 };
+    const schedule = (callback, delayMs) => {
+      const timer = { callback, at: nowMs + delayMs, cancelled: false };
+      timers.push(timer);
+      return timer;
+    };
+    const flush = async () => {
+      for (let index = 0; index < 8; index += 1) await Promise.resolve();
+    };
+    const advance = async (targetMs, lateMs = 0) => {
+      for (let guard = 0; guard < 10; guard += 1) {
+        timers.sort((left, right) => left.at - right.at);
+        const timer = timers.find((item) => !item.cancelled && item.at <= targetMs);
+        if (!timer) break;
+        timer.cancelled = true;
+        nowMs = timer.at + (timer.at === profilePlan.on_start_ms ? lateMs : 0);
+        timer.callback();
+        await flush();
+      }
+      nowMs = Math.max(nowMs, targetMs);
+      await flush();
+    };
+    const profileOptions = {
+      now: () => nowMs,
+      schedule,
+      cancelTimer: (timer) => { timer.cancelled = true; },
+      readPlan: () => currentPlan,
+      samePlan: (expected, actual) => actual !== null
+        && JSON.stringify(expected) === JSON.stringify(actual),
+      phaseAt: (_current, atMs) => atMs >= 35_000 && atMs < 55_000 ? "on" : null,
+      prepare: async (_plan, retainSession) => {
+        counts.prepared += 1;
+        const session = { id: "session" };
+        retainSession(session);
+        return hangPrepare ? new Promise(() => {}) : session;
+      },
+      start: async () => {
+        counts.started += 1;
+        return hangStart ? new Promise(() => {}) : nowMs + slowStartMs;
+      },
+      stop: async () => { counts.stopped += 1; },
+      close: async () => { counts.closed += 1; },
+      scheduled, started, failed,
+      onStarted: (_session, _startedAtMs, _activeController) => {},
+      onLifecycle: (event) => events.push(event),
+      startToleranceMs: 250,
+    };
+    const controller = scheduler.scheduleWorkspaceCpuProfilePrearm(profilePlan, profileOptions);
+    assert(controller);
+    assert.equal(scheduler.scheduleWorkspaceCpuProfilePrearm(profilePlan, profileOptions), null);
+    if (hangPrepare) {
+      await advance(30_000);
+      assert.equal(counts.prepared, 1);
+      await advance(35_000);
+      return { counts, events, failed, controller };
+    }
+    if (cancel) {
+      await advance(30_000);
+      assert.equal(counts.prepared, 1);
+      await controller.cancel();
+      await advance(35_000);
+      return { counts, events, failed, controller };
+    }
+    await advance(30_000);
+    assert.equal(counts.prepared, 1);
+    if (replacePlan) currentPlan = { ...profilePlan, expires_at_ms: profilePlan.expires_at_ms + 1 };
+    await advance(35_000, lateTimerMs);
+    if (hangStart) await advance(35_251);
+    if (counts.started === 1 && !failed.has(profilePlan.run_id)) {
+      await controller.complete();
+    }
+    return { counts, events, failed, controller };
+  }
+  const profileOnTime = await profilePrearmCase();
+  assert.equal(profileOnTime.counts.prepared, 1);
+  assert.equal(profileOnTime.counts.started, 1);
+  assert.equal(profileOnTime.counts.stopped, 0);
+  assert.equal(profileOnTime.counts.closed, 1);
+  assert(profileOnTime.events.some((row) => row.status === "started" && row.lagMs === 0));
+  const replacedProfilePlan = await profilePrearmCase({ replacePlan: true });
+  assert.equal(replacedProfilePlan.counts.started, 0);
+  assert.equal(replacedProfilePlan.counts.closed, 1);
+  assert(replacedProfilePlan.events.some((row) => row.status === "skipped" && row.reason === "stale"));
+  const lateProfileTimer = await profilePrearmCase({ lateTimerMs: 251 });
+  assert.equal(lateProfileTimer.counts.started, 0);
+  assert(lateProfileTimer.events.some((row) => row.status === "skipped" && row.reason === "late" && row.lagMs === 251));
+  const slowProfileStart = await profilePrearmCase({ slowStartMs: 251 });
+  assert.equal(slowProfileStart.counts.started, 1);
+  assert.equal(slowProfileStart.counts.stopped, 1);
+  assert.equal(slowProfileStart.counts.closed, 1);
+  assert(slowProfileStart.events.some((row) => row.status === "skipped" && row.reason === "late" && row.lagMs === 251));
+  const hangingProfileSetup = await profilePrearmCase({ hangPrepare: true });
+  assert.equal(hangingProfileSetup.counts.started, 0);
+  assert.equal(hangingProfileSetup.counts.closed, 1);
+  assert(hangingProfileSetup.events.some((row) => row.status === "skipped" && row.reason === "late"));
+  const hangingProfileStart = await profilePrearmCase({ hangStart: true });
+  assert.equal(hangingProfileStart.counts.started, 1);
+  assert.equal(hangingProfileStart.counts.stopped, 1);
+  assert.equal(hangingProfileStart.counts.closed, 1);
+  assert(hangingProfileStart.events.some((row) => row.status === "skipped" && row.reason === "late"));
+  const cancelledProfile = await profilePrearmCase({ cancel: true });
+  assert.equal(cancelledProfile.counts.prepared, 1);
+  assert.equal(cancelledProfile.counts.started, 0);
+  assert.equal(cancelledProfile.counts.closed, 1);
+  assert(cancelledProfile.failed.has("abcdef0123456789abcdef0123456789"));
+
   const planSource = fs.readFileSync(path.resolve(
     __dirname, "..", "lib", "performance-diagnostic-plan.ts",
   ), "utf8");
@@ -330,6 +452,19 @@ async function verifySsrWebLifecycleContract() {
       || profileSource.indexOf('emitSsrWebLifecycleEvent(plan, "on", "cpu_profile", "started"')
         <= profileSource.indexOf('await post<InspectorResponse<unknown>>(session, "Profiler.start")')) {
     throw new Error("CPU profile lifecycle start precedes successful Profiler.start");
+  }
+  const webProfilePrearm = planSource.indexOf("function scheduleWebCpuProfile(");
+  const profilePrearmEnd = planSource.indexOf("function post<", webProfilePrearm);
+  const webProfileSource = planSource.slice(webProfilePrearm, profilePrearmEnd);
+  if (webProfilePrearm < 0 || profilePrearmEnd <= webProfilePrearm
+      || !webProfileSource.includes("scheduleWorkspaceCpuProfilePrearm(plan")
+      || !webProfileSource.includes("readPlan: safeReadPlan")
+      || !webProfileSource.includes('"Profiler.enable"')
+      || !webProfileSource.includes('"Profiler.setSamplingInterval"')
+      || webProfileSource.indexOf('"Profiler.start"') < 0
+      || webProfileSource.indexOf('"Profiler.start"') < webProfileSource.indexOf('"Profiler.setSamplingInterval"')
+      || !webProfileSource.includes("startToleranceMs: CPU_WINDOW_TOLERANCE_MS")) {
+    throw new Error("Web V8 prearm does not prepare at OFF end and start under the unchanged exact-plan guard");
   }
   const profileStopSource = planSource.slice(profileStop);
   if (!profileStopSource.includes('emitSsrWebLifecycleEvent({ run_id: runId }, "on", "cpu_profile", finalStatus')

@@ -26,6 +26,7 @@ import {
   claimWorkspaceCpuWindowStart,
   emitSsrWebLifecycleEvent,
   scheduleAuthorizedWorkspaceCpuWindowEdges,
+  scheduleWorkspaceCpuProfilePrearm,
   scheduleWorkspaceCpuWindowStart,
 } from "./workspace-cpu-window-scheduler.mjs";
 import {
@@ -108,6 +109,9 @@ const diagnosticStorage = new AsyncLocalStorage<ActiveDiagnostic>();
 // not make current_diagnostic_run_id() or generic SSR telemetry active.
 const diagnosticPrearmStorage = new AsyncLocalStorage<DiagnosticPlan>();
 const consumedCpuRunIds = new Set<string>();
+const webCpuProfileScheduled = new Set<string>();
+const webCpuProfileStarted = new Set<string>();
+const webCpuProfileFailed = new Set<string>();
 const usageWindowsStarted = new Set<string>();
 const usageWindowsScheduled = new Set<string>();
 const usageWindowsFailed = new Set<string>();
@@ -420,7 +424,9 @@ export async function runWithSsrDiagnosticPlan<T>(
   emitSsrWebLifecycleEvent(diagnostic.plan, diagnostic.phase, "mode", "active");
   startCpuUsageWindow(diagnostic.plan, diagnostic.phase);
   startNodeMemoryWindow(diagnostic.plan, diagnostic.phase);
-  if (diagnostic.plan.workload === WORKLOAD_HTML_SSR_CPU_PROFILE_20S && diagnostic.phase === "on") {
+  if (diagnostic.plan.workload === WORKLOAD_HTML_SSR_CPU_PROFILE_20S) {
+    scheduleWebCpuProfile(diagnostic.plan, diagnostic.phase);
+  } else if (diagnostic.plan.workload === WORKLOAD_CPU_PAIR && diagnostic.phase === "on") {
     await startAuthorizedNodeCpuProfile(diagnostic.plan);
   }
   return diagnosticStorage.run(diagnostic, operation);
@@ -459,6 +465,9 @@ export async function run_with_workspace_cpu_diagnostic<T>(
       (expected, current) => canonicalJson(expected) === canonicalJson(current),
       scheduleCpuUsageWindow,
     )) {
+      if (freshPlan.workload === WORKLOAD_HTML_SSR_CPU_PROFILE_20S) {
+        scheduleWebCpuProfile(freshPlan, null);
+      }
       return diagnosticPrearmStorage.run(freshPlan, operation);
     }
     const reason = freshPlan === null ? "stale" : "mismatch";
@@ -474,8 +483,11 @@ export async function run_with_workspace_cpu_diagnostic<T>(
   emitSsrWebLifecycleEvent(plan, phase, "mode", "active");
   startCpuUsageWindow(plan, phase);
   startNodeMemoryWindow(plan, phase);
-  if ((plan.workload === WORKLOAD_CPU_PAIR || plan.workload === WORKLOAD_HTML_SSR_CPU_PROFILE_20S)
-      && phase === "on") await startAuthorizedNodeCpuProfile(plan);
+  if (plan.workload === WORKLOAD_HTML_SSR_CPU_PROFILE_20S) {
+    scheduleWebCpuProfile(plan, phase);
+  } else if (plan.workload === WORKLOAD_CPU_PAIR && phase === "on") {
+    await startAuthorizedNodeCpuProfile(plan);
+  }
   return diagnosticStorage.run({ plan, phase }, operation);
 }
 
@@ -968,6 +980,87 @@ async function startAuthorizedNodeCpuProfile(plan: DiagnosticPlan): Promise<void
   await startNodeCpuProfile(plan);
 }
 
+function scheduleWebCpuProfile(
+  plan: DiagnosticPlan,
+  phase: DiagnosticPhase | null,
+): void {
+  const runId = plan.run_id;
+  if (plan.workload !== WORKLOAD_HTML_SSR_CPU_PROFILE_20S) return;
+  if (phase === "on") {
+    if (!consumedCpuRunIds.has(runId)) {
+      consumedCpuRunIds.add(runId);
+      webCpuProfileFailed.add(runId);
+      emitSsrWebLifecycleEvent(plan, "on", "cpu_profile", "skipped", {
+        reason: "late", lagMs: Date.now() - plan.on_start_ms,
+      });
+    }
+    return;
+  }
+  if (phase !== null && phase !== "off") return;
+  if (consumedCpuRunIds.has(runId)) return;
+  consumedCpuRunIds.add(runId);
+  const controller = scheduleWorkspaceCpuProfilePrearm(plan, {
+    now: Date.now,
+    schedule: (callback, delayMs) => {
+      const timer = setTimeout(callback, delayMs);
+      timer.unref();
+      return timer;
+    },
+    cancelTimer: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
+    readPlan: safeReadPlan,
+    samePlan: (expected, current) => current !== null
+      && canonicalJson(expected) === canonicalJson(current),
+    phaseAt: activePhase,
+    prepare: async (_current, retainSession) => {
+      const session = new inspector.Session();
+      retainSession(session);
+      session.connect();
+      await post<InspectorResponse<unknown>>(session, "Profiler.enable");
+      await post<InspectorResponse<unknown>>(session, "Profiler.setSamplingInterval", {
+        interval: CPU_PROFILE_SAMPLING.intervalUs,
+      });
+      return session;
+    },
+    start: async (session) => {
+      await post<InspectorResponse<unknown>>(session, "Profiler.start");
+      return Date.now();
+    },
+    stop: async (session) => {
+      await post<InspectorResponse<unknown>>(session, "Profiler.stop");
+    },
+    close: (session) => session.disconnect(),
+    scheduled: webCpuProfileScheduled,
+    started: webCpuProfileStarted,
+    failed: webCpuProfileFailed,
+    onStarted: (session, startedAtMs, profileController) => {
+      const startLagMs = startedAtMs - plan.on_start_ms;
+      const startedMonotonicMs = performance.now();
+      activeCpuRunId = runId;
+      const timer = setTimeout(() => {
+        void stopNodeCpuProfile(
+          session, runId, startLagMs, startedMonotonicMs, profileController,
+        );
+      }, Math.max(1, plan.on_end_ms - Date.now()));
+      timer.unref();
+    },
+    onLifecycle: ({ status, reason, lagMs }) => {
+      emitSsrWebLifecycleEvent(plan, "on", "cpu_profile", status, { reason, lagMs });
+      if (status === "failed" || status === "skipped") {
+        consumedCpuRunIds.add(runId);
+        if (activeCpuRunId === runId) activeCpuRunId = null;
+      }
+    },
+    startToleranceMs: CPU_WINDOW_TOLERANCE_MS,
+  });
+  if (controller === null) {
+    webCpuProfileFailed.add(runId);
+    emitSsrWebLifecycleEvent(plan, "on", "cpu_profile", "skipped", {
+      reason: "already_claimed",
+    });
+    return;
+  }
+}
+
 function post<T>(session: inspector.Session, method: string, params?: object): Promise<T> {
   return new Promise((resolvePromise, rejectPromise) => {
     const compatible = session as unknown as {
@@ -1020,12 +1113,20 @@ async function stopNodeCpuProfile(
   session: inspector.Session,
   runId: string,
   startLagMs: number,
-  startedMonotonicMs: number
+  startedMonotonicMs: number,
+  profileController?: {
+    complete: () => Promise<void>;
+  },
 ): Promise<void> {
   if (activeCpuRunId !== runId) {
     emitSsrWebLifecycleEvent({ run_id: runId }, "on", "cpu_profile", "skipped", {
       reason: "already_claimed",
     });
+    if (profileController) {
+      await profileController.complete();
+    } else {
+      try { session.disconnect(); } catch { /* cleanup cannot affect the request */ }
+    }
     return;
   }
   activeCpuRunId = null;
@@ -1103,10 +1204,14 @@ async function stopNodeCpuProfile(
     console.info(`cpu_diagnostic_complete service=web run_id=${runId} status=incomplete reason=profile_stop`);
     finalReason = "profile_stop";
   } finally {
-    try {
-      session.disconnect();
-    } catch {
-      // Inspector cleanup is best-effort and never changes the SSR response.
+    if (profileController) {
+      await profileController.complete();
+    } else {
+      try {
+        session.disconnect();
+      } catch {
+        // Inspector cleanup is best-effort and never changes the SSR response.
+      }
     }
     emitSsrWebLifecycleEvent({ run_id: runId }, "on", "cpu_profile", finalStatus, {
       reason: finalReason,

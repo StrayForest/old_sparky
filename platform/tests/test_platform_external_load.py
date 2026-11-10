@@ -1513,7 +1513,7 @@ class ExternalLoadTests(unittest.TestCase):
         )
         self.assertEqual(
             external_load._authenticated_html_marker_details("text/html", "not-bytes"),
-            (True, False, None),
+            (True, False, None, "body_not_bytes"),
         )
 
     def test_html_keepalive_request_retains_only_closed_marker_flags(self) -> None:

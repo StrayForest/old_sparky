@@ -16,42 +16,18 @@ acceptance credit.
 ## Release and host readiness
 
 Run only after the source fix and its operational instructions pass the full
-exact-head CI route. For a runtime-sensitive source change:
+exact-head CI route. For runtime-sensitive changes, follow the
+[deployment runbook](deployment-runbook.md) for exact-SHA Security, the
+classifier-selected automatic AUTO/production-child route, its required
+source-bound backup and host-tools provisioning. Keep runner source `S`, app
+source `A` and host-tools generation `C` distinct. Recovery-bootstrap/no-op
+routes keep `A` active and require their verified no-op receipt. Never dispatch
+a route manually or install directly; `RUNNER_TEMP` and SSH handoff checks
+stay in their owning workflow. See the
+[host-tools provisioning ADR](adr/production-host-tools-provisioning.md) for
+bundle closure and installed modes.
 
-1. Merge the reviewed change through the normal `dev` route. Record the exact
-   merged source SHA `S` and its successful Security run and attempt.
-2. Follow the exact-source AUTO route selected by the validated classifier.
-   For a deployable production change, start exactly one source-bound TMPFS
-   backup for `S` and its Security run/attempt; it may start during Security or
-   after success, and must start within AUTO's bounded proof wait. Require the
-   receipt to bind `S` and prove create, restore, Alembic and scratch cleanup.
-   A non-deployable recovery-bootstrap change uses automatic baseline
-   reconciliation and its verified no-op receipt; it does not require a
-   backup. Do not infer that route from the file list or manually dispatch a
-   different workflow.
-3. Let the normal auto-deploy parent verify its signed host-tools bundle and
-   attestation. Install a new host-tools generation only when that exact
-   source-bound route requires one, and only from its trusted parent artifact.
-   A pull-request candidate artifact is never production authority. Keep
-   runner source `S`, active app source `A`, and host-tools generation `C`
-   distinct in every receipt; confirm the active `C` pin even when the
-   recovery-bootstrap route reuses the installed generation.
-   Verify host-tool modes against the installed generation's normalized
-   manifest (`0555` executable members, `0444` data), not checkout source
-   modes. Runner-only checks requiring `RUNNER_TEMP` or an SSH handoff stay in
-   their owning workflow job, not the host shell. See the
-   [host-tools provisioning ADR](adr/production-host-tools-provisioning.md).
-4. If classifier evidence marks `S` deployable, let the normal deployment
-   child install the app. Require strict shared-venv reuse, the exact `S`
-   release marker, the expected previous-release pointer, healthy
-   `deadlock-api`, `deadlock-web`, and `deadlock-worker`, and no pending
-   operation or diagnostic lock. Do not manually install or dispatch a normal
-   production deployment. For a non-deployable recovery-bootstrap change, keep
-   app source `A` active and require the automatic baseline-reconcile child to
-   publish its exact verified no-op source-binding receipt for runner `S` and
-   app `A`; do not substitute a manually dispatched deploy or an unverified
-   no-op.
-5. Confirm the active app is healthy and the source binding is exact. For a
+1. Confirm the active app is healthy and the source binding is exact. For a
    deployed run, `S` must equal active app source `A`; for the verified no-op
    route, preserve distinct `S` and `A` and require the exact source-bound
    receipt. Run these read-only checks from the authorized host session; pass
@@ -359,7 +335,18 @@ identities, and all of these conditions hold:
   memory attribution incomplete;
   it cannot be accepted by widening the generic parser limit.
 - The separate profile phase completes its 20-second ON window against the
-  same fixture manifest after planned gap; trace-marked HTML warmups prearm API/web OFF/ON usage windows.
+  same fixture manifest after planned gap; trace-marked HTML requests prearm
+  API and Web OFF/ON usage windows. For the dedicated Web profile workload,
+  the first authorized root-bound plan request also schedules one internal
+  Inspector session to connect, enable the profiler and set its sampling
+  interval at OFF end, after the measured OFF baseline. It schedules
+  `Profiler.start` at the planned ON edge only after a fresh plan read confirms
+  the same plan, release and process identity. The actual start must still
+  complete within 250 ms of that edge; Node timers are advisory, so a late
+  timer, slow start, replaced/expired plan or setup failure closes the session
+  and yields no Web profile. Setup still pending at ON and start still pending
+  beyond the 250 ms bound are failed closed when their deadline callbacks run.
+  No late start or retry is allowed.
   All 32 capacity workers consume one response, close only their thread-local
   connection, and retain its SSL context for authenticated OFF. OFF opens a fresh
   connection; setup is included in the OFF CPU baseline. Measured ON transport
@@ -441,6 +428,8 @@ stay private; only existing IDs/categories are emitted. Workloads: `authenticate
 For incomplete diagnostics, read the one-day failure fingerprint's bounded classifications. Per-request
 records may include the closed client-side `transport_error_code`; older records without it remain valid.
 `other` means unavailable or outside the closed set; the code does not prove a server-side cause.
+For `page_marker_missing`, the bounded record may include capped response bytes, closed content-type,
+encoding/parser labels and four marker booleans after parsing; it omits body, raw headers, route and request ID, distinguishing marker mismatch from parser/size rejection without changing acceptance.
 `capacity_phase.resource_abort_reason` identifies the worker abort class; for `control_file_invalid`, use
 `capacity_phase.control_failure_reason` only if present. `memory_observer_failure` fields classify observer
 handling and remote-watch failures. Missing or `unknown` values leave the cause unresolved and do not

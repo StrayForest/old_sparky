@@ -1384,6 +1384,9 @@ def _failure_evidence(
             "finished_at_utc": item.finished_at_utc,
             "phase_timing_ms": safe_timing,
         }
+        marker_diagnostics = _html_marker_failure_diagnostics(item)
+        if marker_diagnostics is not None:
+            record["html_marker_diagnostics"] = marker_diagnostics
         records.append(record)
     return {
         "failure_count": len(phased),
@@ -1513,6 +1516,78 @@ def _capacity_transport_error_code(result: Any) -> str:
     return "other"
 
 
+def _html_marker_failure_diagnostics(result: Any) -> dict[str, Any] | None:
+    """Keep only bounded parser output for a completed HTML-marker failure."""
+
+    if _capacity_error_code(result) != "page_marker_missing":
+        return None
+    response_bytes = getattr(result, "response_bytes", None)
+    if type(response_bytes) is not int or response_bytes < 0:
+        return None
+    # Preserve a single sentinel value so an oversized body is distinguishable.
+    response_bytes = min(response_bytes, external_load.RESPONSE_BODY_LIMIT + 1)
+    content_type_ok = getattr(result, "html_content_type_ok", None)
+    if content_type_ok is not True:
+        return None
+    content_type = "html"
+    encoding = external_load._closed_html_content_encoding(
+        getattr(result, "html_content_encoding", None),
+    )
+    parse_outcome = getattr(result, "html_marker_parse_outcome", None)
+    if not isinstance(parse_outcome, str) or parse_outcome not in {
+        "parsed", "body_too_large", "body_not_bytes", "parser_error",
+    }:
+        return None
+    raw_flags = getattr(result, "html_marker_flags", None)
+    marker_names = {"lifecycle", "authenticated_header", "workspace_ready", "detail_fallback"}
+    markers = (
+        {key: raw_flags[key] for key in sorted(marker_names)}
+        if isinstance(raw_flags, Mapping)
+        and set(raw_flags) == marker_names
+        and all(type(raw_flags[key]) is bool for key in marker_names)
+        else None
+    )
+    return {
+        "response_bytes": response_bytes,
+        "content_type": content_type,
+        "content_encoding": encoding,
+        "parse_outcome": parse_outcome,
+        "markers": markers,
+    }
+
+
+def _html_marker_failure_diagnostics_are_closed(value: Any) -> bool:
+    marker_names = {"lifecycle", "authenticated_header", "workspace_ready", "detail_fallback"}
+    if (not isinstance(value, dict)
+            or set(value) != {
+                "response_bytes", "content_type", "content_encoding", "parse_outcome", "markers",
+            }
+            or type(value.get("response_bytes")) is not int
+            or not 0 <= value["response_bytes"] <= external_load.RESPONSE_BODY_LIMIT + 1
+            or value.get("content_type") != "html"
+            or value.get("content_encoding") not in {"identity", "gzip", "deflate", "br", "other", "unknown"}
+            or value.get("parse_outcome") not in {
+                "parsed", "body_too_large", "body_not_bytes", "parser_error",
+            }):
+        return False
+    markers = value.get("markers")
+    if markers is not None and (
+        not isinstance(markers, dict) or set(markers) != marker_names
+        or any(type(markers[key]) is not bool for key in marker_names)
+    ):
+        return False
+    if value["parse_outcome"] == "parsed":
+        return (
+            value["response_bytes"] <= external_load.RESPONSE_BODY_LIMIT
+            and markers is not None and not all(markers.values())
+        )
+    if value["parse_outcome"] == "body_too_large":
+        return value["response_bytes"] == external_load.RESPONSE_BODY_LIMIT + 1 and markers is None
+    if value["parse_outcome"] in {"body_not_bytes", "parser_error"}:
+        return markers is None
+    return False
+
+
 def _failure_evidence_is_closed(
     value: Any, *, completed: int, phase_completed: Mapping[str, int] | None = None,
 ) -> bool:
@@ -1565,10 +1640,15 @@ def _failure_evidence_is_closed(
         "started_at_utc", "exception_at_utc", "finished_at_utc", "phase_timing_ms",
     })
     current_record_keys = legacy_record_keys | {"transport_error_code"}
+    marker_record_keysets = {
+        legacy_record_keys | {"html_marker_diagnostics"},
+        current_record_keys | {"html_marker_diagnostics"},
+    }
     allowed_transport_error_codes = external_load.TRANSPORT_ERROR_CODES | {"other"}
     for ordinal, record in enumerate(value["records"], start=1):
         if (not isinstance(record, dict)
-                or frozenset(record) not in {legacy_record_keys, current_record_keys}
+                or (frozenset(record) not in {legacy_record_keys, current_record_keys}
+                    and frozenset(record) not in marker_record_keysets)
                 or record.get("ordinal") != ordinal
                 or not isinstance(record.get("phase"), str)
                 or record.get("phase") not in {"off_probe", "on_worker"}
@@ -1607,6 +1687,16 @@ def _failure_evidence_is_closed(
                     or not math.isfinite(float(number)) or number < 0
                     for key, number in record["phase_timing_ms"].items()
                 )):
+            return False
+        if "html_marker_diagnostics" in record and (
+            record.get("error_class") != "page_marker_missing"
+            or record.get("stage") != "response_complete"
+            or record.get("request_status") != 200
+            or record.get("observed_status") != 200
+            or not _html_marker_failure_diagnostics_are_closed(
+                record.get("html_marker_diagnostics"),
+            )
+        ):
             return False
         start = datetime.fromisoformat(record["started_at_utc"].replace("Z", "+00:00"))
         finish = datetime.fromisoformat(record["finished_at_utc"].replace("Z", "+00:00"))

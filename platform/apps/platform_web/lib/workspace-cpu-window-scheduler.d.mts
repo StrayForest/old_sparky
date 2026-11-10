@@ -90,10 +90,44 @@ export declare function scheduleWorkspaceCpuWindowStart<
       phase: WorkspaceCpuWindowPhase,
     ) => void;
     onLifecycle?: (event: {
-      readonly status: "scheduled" | "started" | "skipped" | "failed";
+      readonly status: "started" | "skipped" | "failed";
       readonly reason: SsrLifecycleReason;
       readonly lagMs: number | null;
     }) => void;
     startToleranceMs: number;
   },
 ): boolean;
+
+export declare function scheduleWorkspaceCpuProfilePrearm<
+  P extends WorkspaceCpuWindowPlan,
+  S,
+>(
+  plan: P,
+  options: WorkspaceCpuWindowState & {
+    now: () => number;
+    schedule: (callback: () => void, delayMs: number) => unknown;
+    cancelTimer: (timer: unknown) => void;
+    readPlan: () => P | null;
+    samePlan: (expected: P, current: P | null) => boolean;
+    phaseAt: (current: P, nowMs: number) => WorkspaceCpuWindowPhase | null;
+    prepare: (current: P, retainSession: (session: S) => void) => Promise<S | void>;
+    start: (session: S, current: P) => Promise<number>;
+    stop: (session: S) => unknown | Promise<unknown>;
+    close: (session: S) => unknown | Promise<unknown>;
+    onStarted: (session: S, startedAtMs: number, controller: {
+      cancel: () => Promise<void>;
+      complete: () => Promise<void>;
+      readonly state: string;
+    }) => void;
+    onLifecycle?: (event: {
+      readonly status: "scheduled" | "started" | "skipped" | "failed";
+      readonly reason: SsrLifecycleReason;
+      readonly lagMs: number | null;
+    }) => void;
+    startToleranceMs: number;
+  },
+): {
+  cancel: () => Promise<void>;
+  complete: () => Promise<void>;
+  readonly state: string;
+} | null;

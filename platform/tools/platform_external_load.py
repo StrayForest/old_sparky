@@ -1929,10 +1929,11 @@ class RequestResult:
     # Internal submission order used only to make bounded diagnostics
     # deterministic.  It is never serialized into a report.
     submission_index: int | None = None
-    # Warmup-only closed diagnostics; ordinary load reports never serialize
-    # these fields. The coding value is normalized before assignment.
+    # Closed authenticated-HTML diagnostics; ordinary load reports never
+    # serialize these fields. Values are normalized before assignment.
     html_content_encoding: str | None = None
     html_marker_flags: dict[str, bool] | None = None
+    html_marker_parse_outcome: str | None = None
     # Closed, low-cardinality transport classification; never raw exception data.
     transport_error_code: str | None = None
 
@@ -3704,6 +3705,7 @@ def _page_request_http11_keepalive(
         html_page_marker_ok: bool | None = None
         html_content_encoding: str | None = None
         html_marker_flags: dict[str, bool] | None = None
+        html_marker_parse_outcome: str | None = None
         if require_authenticated_html:
             content_type_is_html = getattr(response, "content_type_is_html", None)
             if type(content_type_is_html) is not bool:
@@ -3712,6 +3714,7 @@ def _page_request_http11_keepalive(
                 html_content_type_ok,
                 html_page_marker_ok,
                 html_marker_flags,
+                html_marker_parse_outcome,
             ) = _authenticated_html_marker_details(
                 "", response.body, content_type_is_html=content_type_is_html,
             )
@@ -3738,6 +3741,7 @@ def _page_request_http11_keepalive(
             html_page_marker_ok=html_page_marker_ok,
             html_content_encoding=html_content_encoding,
             html_marker_flags=html_marker_flags,
+            html_marker_parse_outcome=html_marker_parse_outcome,
             time_to_first_byte_ms=(
                 float(response.timing["ttfb_ms"])
                 if isinstance(response.timing.get("ttfb_ms"), (int, float))
@@ -3865,7 +3869,7 @@ class _AuthenticatedHtmlMarkerParser(HTMLParser):
 
 def _authenticated_html_marker_details(
     content_type: Any, body: Any, *, content_type_is_html: bool | None = None,
-) -> tuple[bool, bool, dict[str, bool] | None]:
+) -> tuple[bool, bool, dict[str, bool] | None, str]:
     """Return closed marker flags from one bounded parse; never retain content."""
 
     if type(content_type_is_html) is bool:
@@ -3874,7 +3878,10 @@ def _authenticated_html_marker_details(
         media_type = content_type.split(";", 1)[0].strip().lower() if isinstance(content_type, str) else ""
         content_type_ok = media_type == "text/html"
     if not isinstance(body, bytes) or len(body) > RESPONSE_BODY_LIMIT:
-        return content_type_ok, False, None
+        return (
+            content_type_ok, False, None,
+            "body_not_bytes" if not isinstance(body, bytes) else "body_too_large",
+        )
 
     parser = _AuthenticatedHtmlMarkerParser()
     try:
@@ -3892,14 +3899,14 @@ def _authenticated_html_marker_details(
             parser.feed(decoder.decode(b"", final=True))
         parser.close()
     except (AssertionError, ValueError):
-        return content_type_ok, False, None
-    return content_type_ok, parser.complete, parser.closed_flags()
+        return content_type_ok, False, None, "parser_error"
+    return content_type_ok, parser.complete, parser.closed_flags(), "parsed"
 
 
 def _authenticated_html_markers(content_type: Any, body: Any) -> tuple[bool, bool]:
     """Return the existing authenticated-page predicate without body values."""
 
-    content_type_ok, page_marker_ok, _marker_flags = _authenticated_html_marker_details(
+    content_type_ok, page_marker_ok, _marker_flags, _parse_outcome = _authenticated_html_marker_details(
         content_type, body,
     )
     return content_type_ok, page_marker_ok

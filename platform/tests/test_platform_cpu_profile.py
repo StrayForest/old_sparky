@@ -481,6 +481,109 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "error_counts": {"private identity leaked": 1},
         }))
 
+        marker_body = (
+            b'<span data-testid="tournament-detail-lifecycle" '
+            b'data-ssr-workspace-ready="true"></span>'
+            b'<span class="header-profile-avatar"></span>'
+            b'<section class="route-loading-shell"></section>'
+        )
+        content_type_ok, marker_ok, marker_flags, parse_outcome = (
+            external_load._authenticated_html_marker_details(
+                "", marker_body, content_type_is_html=True,
+            )
+        )
+        self.assertTrue(content_type_ok)
+        self.assertTrue(marker_ok)
+        self.assertEqual(parse_outcome, "parsed")
+        self.assertEqual(set(marker_flags), {
+            "lifecycle", "authenticated_header", "workspace_ready", "detail_fallback",
+        })
+        missing_marker_body = marker_body.replace(
+            b'data-ssr-workspace-ready="true"', b'data-ssr-workspace-ready="false"',
+        )
+        content_type_ok, marker_ok, marker_flags, parse_outcome = (
+            external_load._authenticated_html_marker_details(
+                "", missing_marker_body, content_type_is_html=True,
+            )
+        )
+        failed_marker = external_load.RequestResult(
+            "on", "GET", "/private/route-is-not-retained", 200, 100.0,
+            False, len(missing_marker_body),
+            html_content_type_ok=content_type_ok,
+            html_page_marker_ok=marker_ok,
+            html_content_encoding="identity",
+            html_marker_flags=marker_flags,
+            html_marker_parse_outcome=parse_outcome,
+            error_kind="page_marker_missing",
+            observed_status=200,
+            started_at_utc="2026-11-10T09:14:20.000000+00:00",
+            finished_at_utc="2026-11-10T09:14:23.000000+00:00",
+        )
+        failure_evidence = capacity_diagnostic._failure_evidence(
+            on_results=[failed_marker],
+        )
+        self.assertTrue(capacity_diagnostic._failure_evidence_is_closed(
+            failure_evidence, completed=1, phase_completed={"off_probe": 0, "on_worker": 1},
+        ))
+        marker_diagnostics = failure_evidence["records"][0]["html_marker_diagnostics"]
+        self.assertEqual(marker_diagnostics, {
+            "response_bytes": len(missing_marker_body),
+            "content_type": "html", "content_encoding": "identity",
+            "parse_outcome": "parsed",
+            "markers": {
+                "authenticated_header": True, "detail_fallback": True,
+                "lifecycle": True, "workspace_ready": False,
+            },
+        })
+        self.assertNotIn("/private/route-is-not-retained", json.dumps(failure_evidence))
+        self.assertNotIn(missing_marker_body.decode("ascii"), json.dumps(failure_evidence))
+        invalid_marker_evidence = json.loads(json.dumps(failure_evidence))
+        invalid_marker_evidence["records"][0]["html_marker_diagnostics"]["markers"][
+            "workspace_ready"
+        ] = "untrusted marker value"
+        self.assertFalse(capacity_diagnostic._failure_evidence_is_closed(
+            invalid_marker_evidence, completed=1,
+            phase_completed={"off_probe": 0, "on_worker": 1},
+        ))
+        _type_ok, oversized_ok, oversized_flags, oversized_outcome = (
+            external_load._authenticated_html_marker_details(
+                "", b"x" * (external_load.RESPONSE_BODY_LIMIT + 1),
+                content_type_is_html=True,
+            )
+        )
+        self.assertFalse(oversized_ok)
+        self.assertIsNone(oversized_flags)
+        self.assertEqual(oversized_outcome, "body_too_large")
+        with patch.object(external_load._AuthenticatedHtmlMarkerParser, "feed", side_effect=ValueError):
+            parser_type_ok, parser_marker_ok, parser_flags, parser_outcome = (
+                external_load._authenticated_html_marker_details(
+                    "", b"bounded body", content_type_is_html=True,
+                )
+            )
+        self.assertTrue(parser_type_ok)
+        self.assertFalse(parser_marker_ok)
+        self.assertIsNone(parser_flags)
+        self.assertEqual(parser_outcome, "parser_error")
+        parser_failure = external_load.RequestResult(
+            "on", "GET", "/fixture", 200, 100.0, False, len(b"bounded body"),
+            html_content_type_ok=parser_type_ok,
+            html_page_marker_ok=parser_marker_ok,
+            html_content_encoding="identity",
+            html_marker_flags=parser_flags,
+            html_marker_parse_outcome=parser_outcome,
+            error_kind="page_marker_missing", observed_status=200,
+            started_at_utc="2026-11-10T09:14:20.000000+00:00",
+            finished_at_utc="2026-11-10T09:14:23.000000+00:00",
+        )
+        parser_evidence = capacity_diagnostic._failure_evidence(on_results=[parser_failure])
+        self.assertEqual(
+            parser_evidence["records"][0]["html_marker_diagnostics"]["parse_outcome"],
+            "parser_error",
+        )
+        self.assertTrue(capacity_diagnostic._failure_evidence_is_closed(
+            parser_evidence, completed=1, phase_completed={"off_probe": 0, "on_worker": 1},
+        ))
+
     def test_ssr_capacity_control_is_bound_atomic_fresh_and_accepts_complete(self) -> None:
         expected = {
             "run_id": "a" * 32,

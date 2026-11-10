@@ -231,3 +231,345 @@ export function scheduleWorkspaceCpuWindowStart(
   if (didSchedule) report("scheduled", "none", nowMs - targetMs);
   return didSchedule;
 }
+
+export function scheduleWorkspaceCpuProfilePrearm(
+  plan,
+  {
+    now,
+    schedule,
+    cancelTimer,
+    readPlan,
+    samePlan,
+    phaseAt,
+    prepare,
+    start,
+    stop,
+    close,
+    scheduled,
+    started,
+    failed,
+    onStarted,
+    onLifecycle,
+    startToleranceMs,
+  },
+) {
+  if (!plan || typeof plan.run_id !== "string"
+      || !Number.isSafeInteger(plan.off_end_ms)
+      || !Number.isSafeInteger(plan.on_start_ms)
+      || !Number.isSafeInteger(plan.on_end_ms)
+      || typeof now !== "function" || typeof schedule !== "function"
+      || typeof cancelTimer !== "function" || typeof readPlan !== "function"
+      || typeof samePlan !== "function" || typeof phaseAt !== "function"
+      || typeof prepare !== "function" || typeof start !== "function"
+      || typeof stop !== "function" || typeof close !== "function"
+      || typeof onStarted !== "function"
+      || !Number.isSafeInteger(startToleranceMs) || startToleranceMs < 0) {
+    return null;
+  }
+
+  const key = plan.run_id;
+  if (scheduled.has(key) || started.has(key) || failed.has(key)) return null;
+
+  let state = "scheduled";
+  let timer = null;
+  let deadlineTimer = null;
+  let session = null;
+  let startAttempted = false;
+  let closed = false;
+  let stopPromise = null;
+  const report = (status, reason, lagMs = null) => {
+    try {
+      onLifecycle?.({ status, reason, lagMs });
+    } catch {
+      // Lifecycle output cannot change the profiler guard.
+    }
+  };
+  const closeSession = async () => {
+    if (session === null || closed) return;
+    closed = true;
+    try {
+      await close(session);
+    } catch {
+      // Inspector cleanup is best-effort after a fail-closed decision.
+    }
+  };
+  const stopSession = async () => {
+    if (session === null) return;
+    if (stopPromise === null) {
+      let timeout;
+      const timeoutCall = new Promise((resolve) => {
+        timeout = setTimeout(resolve, 100);
+      });
+      stopPromise = Promise.race([
+        Promise.resolve().then(() => stop(session)).catch(() => {}),
+        timeoutCall,
+      ]).finally(() => clearTimeout(timeout));
+    }
+    await stopPromise;
+  };
+  const clearTimer = (handle) => {
+    if (handle === null) return;
+    try {
+      cancelTimer(handle);
+    } catch {
+      // Timer cancellation is best-effort; every callback rechecks plan state.
+    }
+  };
+  const clearTimers = () => {
+    clearTimer(timer);
+    clearTimer(deadlineTimer);
+    timer = null;
+    deadlineTimer = null;
+  };
+  const finishFailed = async (reason, lagMs = null) => {
+    if (["failed", "cancelled", "complete"].includes(state)) return;
+    state = "failed";
+    scheduled.delete(key);
+    started.delete(key);
+    failed.add(key);
+    clearTimers();
+    if (startAttempted) await stopSession();
+    await closeSession();
+    report(reason === "late" || reason === "stale" ? "skipped" : "failed", reason, lagMs);
+  };
+  const matchingPlan = () => {
+    try {
+      const current = readPlan();
+      return current !== null && samePlan(plan, current) === true ? current : null;
+    } catch {
+      return null;
+    }
+  };
+  const scheduleAt = (targetMs, callback) => {
+    try {
+      timer = schedule(callback, Math.max(0, targetMs - now()));
+    } catch {
+      void finishFailed("start_error");
+    }
+  };
+  const scheduleDeadlineAt = (targetMs, callback) => {
+    try {
+      deadlineTimer = schedule(callback, Math.max(0, targetMs - now()));
+    } catch {
+      void finishFailed("start_error");
+    }
+  };
+
+  const startAtEdge = async () => {
+    if (state !== "prepared") return;
+    let actualMs;
+    try {
+      actualMs = now();
+    } catch {
+      await finishFailed("start_error");
+      return;
+    }
+    if (!Number.isSafeInteger(actualMs)) {
+      await finishFailed("start_error");
+      return;
+    }
+    if (actualMs < plan.on_start_ms) {
+      scheduleAt(plan.on_start_ms, () => { void startAtEdge(); });
+      return;
+    }
+    const lagMs = actualMs - plan.on_start_ms;
+    if (lagMs > startToleranceMs) {
+      await finishFailed("late", lagMs);
+      return;
+    }
+    const current = matchingPlan();
+    let phase;
+    try {
+      phase = current === null ? null : phaseAt(current, actualMs);
+    } catch {
+      await finishFailed("start_error", lagMs);
+      return;
+    }
+    if (current === null || phase !== "on" || actualMs > current.expires_at_ms) {
+      await finishFailed("stale", lagMs);
+      return;
+    }
+
+    state = "starting";
+    startAttempted = true;
+    const expireSlowStart = () => {
+      if (state !== "starting") return;
+      let timeoutAtMs;
+      try {
+        timeoutAtMs = now();
+      } catch {
+        void finishFailed("start_error");
+        return;
+      }
+      if (!Number.isSafeInteger(timeoutAtMs)) {
+        void finishFailed("start_error");
+        return;
+      }
+      if (timeoutAtMs - plan.on_start_ms <= startToleranceMs) {
+        scheduleDeadlineAt(plan.on_start_ms + startToleranceMs + 1, expireSlowStart);
+        return;
+      }
+      void finishFailed("late", timeoutAtMs - plan.on_start_ms);
+    };
+    scheduleDeadlineAt(plan.on_start_ms + startToleranceMs + 1, expireSlowStart);
+    if (state !== "starting") return;
+    let startedAtMs;
+    try {
+      startedAtMs = await start(session, current);
+    } catch {
+      clearTimer(deadlineTimer);
+      deadlineTimer = null;
+      let failureLag = null;
+      try {
+        const failedAtMs = now();
+        if (Number.isSafeInteger(failedAtMs)) failureLag = failedAtMs - plan.on_start_ms;
+      } catch {
+        // Keep the failure classification closed when the clock read fails.
+      }
+      await finishFailed("start_error", failureLag);
+      return;
+    }
+    clearTimer(deadlineTimer);
+    deadlineTimer = null;
+    if (state !== "starting") {
+      if (session !== null) {
+        if (startAttempted) await stopSession();
+        await closeSession();
+      }
+      return;
+    }
+    const startLagMs = Number.isSafeInteger(startedAtMs)
+      ? startedAtMs - plan.on_start_ms : null;
+    const afterStartPlan = matchingPlan();
+    let afterStartPhase = null;
+    try {
+      afterStartPhase = afterStartPlan === null || startLagMs === null
+        ? null : phaseAt(afterStartPlan, startedAtMs);
+    } catch {
+      await finishFailed("start_error", startLagMs);
+      return;
+    }
+    if (startLagMs === null || startLagMs < 0 || startLagMs > startToleranceMs) {
+      await finishFailed("late", startLagMs);
+      return;
+    }
+    if (afterStartPlan === null || afterStartPhase !== "on"
+        || startedAtMs > afterStartPlan.on_end_ms) {
+      await finishFailed("stale", startLagMs);
+      return;
+    }
+
+    state = "started";
+    scheduled.delete(key);
+    started.add(key);
+    try {
+      onStarted(session, startedAtMs, controller);
+    } catch {
+      await finishFailed("start_error", startLagMs);
+      return;
+    }
+    report("started", "none", startLagMs);
+  };
+
+  const prepareAtOffEnd = async () => {
+    if (state !== "scheduled") return;
+    let actualMs;
+    try {
+      actualMs = now();
+    } catch {
+      await finishFailed("start_error");
+      return;
+    }
+    if (!Number.isSafeInteger(actualMs)) {
+      await finishFailed("start_error");
+      return;
+    }
+    if (actualMs < plan.off_end_ms) {
+      scheduleAt(plan.off_end_ms, () => { void prepareAtOffEnd(); });
+      return;
+    }
+    if (actualMs >= plan.on_start_ms) {
+      await finishFailed("late", actualMs - plan.on_start_ms);
+      return;
+    }
+    const current = matchingPlan();
+    if (current === null || actualMs > current.expires_at_ms) {
+      await finishFailed("stale");
+      return;
+    }
+    state = "preparing";
+    const expireSlowPreparation = () => {
+      if (state !== "preparing") return;
+      let timeoutAtMs;
+      try {
+        timeoutAtMs = now();
+      } catch {
+        void finishFailed("start_error");
+        return;
+      }
+      if (!Number.isSafeInteger(timeoutAtMs)) {
+        void finishFailed("start_error");
+        return;
+      }
+      if (timeoutAtMs < plan.on_start_ms) {
+        scheduleDeadlineAt(plan.on_start_ms, expireSlowPreparation);
+        return;
+      }
+      void finishFailed("late", timeoutAtMs - plan.on_start_ms);
+    };
+    scheduleDeadlineAt(plan.on_start_ms, expireSlowPreparation);
+    if (state !== "preparing") return;
+    try {
+      const preparedSession = await prepare(current, (candidate) => {
+        if (state === "preparing" && session === null) session = candidate;
+      });
+      if (session === null && preparedSession !== undefined) session = preparedSession;
+    } catch {
+      clearTimer(deadlineTimer);
+      deadlineTimer = null;
+      await finishFailed("start_error");
+      return;
+    }
+    clearTimer(deadlineTimer);
+    deadlineTimer = null;
+    if (session === null || session === undefined) {
+      await finishFailed("start_error");
+      return;
+    }
+    if (state !== "preparing") {
+      await closeSession();
+      return;
+    }
+    const afterPrepareMs = now();
+    if (!Number.isSafeInteger(afterPrepareMs) || afterPrepareMs >= plan.on_start_ms) {
+      await finishFailed("late", Number.isSafeInteger(afterPrepareMs)
+        ? afterPrepareMs - plan.on_start_ms : null);
+      return;
+    }
+    const preparedPlan = matchingPlan();
+    if (preparedPlan === null || afterPrepareMs > preparedPlan.expires_at_ms) {
+      await finishFailed("stale");
+      return;
+    }
+    state = "prepared";
+    scheduleAt(plan.on_start_ms, () => { void startAtEdge(); });
+  };
+
+  const controller = {
+    cancel: () => finishFailed("stale"),
+    complete: async () => {
+      if (state !== "started") return;
+      state = "complete";
+      scheduled.delete(key);
+      started.delete(key);
+      clearTimers();
+      await closeSession();
+    },
+    get state() { return state; },
+  };
+
+  scheduled.add(key);
+  scheduleAt(plan.off_end_ms, () => { void prepareAtOffEnd(); });
+  if (!scheduled.has(key)) return null;
+  return controller;
+}

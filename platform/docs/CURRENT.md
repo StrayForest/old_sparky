@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-11-05
+- Last reviewed: 2026-11-10
 
 Read this page for live pins, pending release work, open QA gates and hard
 operational limits. Product contracts, procedures and detailed run evidence
@@ -10,26 +10,30 @@ belong in the linked owner documents below.
 
 ## Live and pending state
 
-- Last verified production baseline, as of 2026-11-05, is app A
-  `9a73f6355ef65025a3668a5729ee5ab357b8d40f` (deployment child
-  `42079269172/1`; previous app source
-  `c116de3f78f85833646aa23d117c6a0a313db6cb`), with active host-tools
-  generation C `0de51aca4b4d04a80a2f0d392003cc258d8f1400`. Post-cleanup
-  canonical FULL readiness passed and confirms the app, runner, and host-tools
-  bindings; no fixture or load is active. One restore-verified backup pair is
-  retained. Before future production work, use a fresh canonical
-  full-readiness receipt to confirm the live baseline and locks.
-  Resolve A from a successful deployment receipt and C from the checked-in
-  active pin for each operation. Keep workflow runner S, application A and
-  host-tools C distinct; a matching runner SHA does not prove deployment or
-  installation.
-- The latest `authenticated_workspace_read_pair_v1` diagnostic, run
-  `42085780534/1`, closed with authoritative fixture cleanup. Its report is
-  incomplete and contains no HTTP or phase measurements; the failure stage and
-  code remain unknown. A subsequent traced invocation of the unchanged
-  canonical FULL collector produced a complete 23-field receipt that passed
-  validation after cleanup. Preserve the earlier generic FULL failures as
-  unexplained; they do not supersede the later validated readiness result.
+- Last verified production baseline, as of 2026-11-10, is app A
+  `2835f9b2144c7b1d56e04bfdd0169f7912e06ffd` (release
+  `gha-42776600827-1-2835f9b2144c`), previous app
+  `3faa30b5aaa71dc96c541d5197c71c9bb47d7354`, and active host-tools C2
+  `c92dce69ed204d39b16884e62fad2b61addaa996`. Source S
+  `c0fa2dde03338cad922e36ec9c35e080f08c8110` passed exact-SHA Security and
+  automatic AUTO/baseline-reconcile as a verified no-op; it did not deploy a
+  new app. Corrected SSR run `42788095845/1` used S, A and C2 with one fixture.
+  Its exact cleanup and post-cleanup FULL readiness passed. One restore-verified
+  backup pair, from run `42780859484/1`, remains retained. Keep runner S, app A
+  and host-tools C distinct in later evidence; the post-run storage preview
+  found no deletion candidates. No fixture is active. Obtain fresh canonical
+  FULL readiness before any new production work.
+- Corrected SSR diagnostic `42788095845/1` completed its 120-second capacity
+  phase with 3,944/3,944 HTTP 200 responses. The separate profile phase is
+  incomplete: 57/57 responses were HTTP 200, but one response failed the
+  authenticated-page marker (`page_marker_missing`). API cProfile data was
+  observed for both expected targets; Web V8 data was missing, with one
+  `profile_start_lag` rejection at 416 ms. The composite remains incomplete
+  and earns no capacity, SLO or performance credit. Exact fixture cleanup,
+  namespace closure and post-cleanup FULL readiness passed. Do not treat the
+  partial profiles as a complete comparison or capacity result; use the
+  [SSR capacity diagnostic runbook](ssr-capacity-diagnostic-runbook.md) for
+  the procedure and current owner follow-up.
 - Cell 9, `read-mix-concurrency-ramp-v1`, completed as run `41937909055/1` on
   runner S and app A, both `7c6034efe3878c3413090ca1bcdb5be6e93154e8`, with
   host-tools C `0de51aca4b4d04a80a2f0d392003cc258d8f1400`; exact cleanup
@@ -66,16 +70,16 @@ belong in the linked owner documents below.
   reconciliation: the repeat had 19,971/20,000 successes, 28 status-0 and one
   status-502 failure, while Nginx recorded 19,990 HTML requests, all 200.
   There is no client-request join, so the transport cause remains unknown.
-- The SSR composite diagnostic `42081912538/1` on the 9a baseline stopped after
-  70.385 seconds of its 120-second capacity phase: four body-receive
+- The older SSR composite diagnostic `42081912538/1` on app `9a73f635` stopped
+  after 70.385 seconds of its 120-second capacity phase. Four body-receive
   `incomplete_response` failures observed HTTP 200 before the response body
-  ended. The bounded active Nginx error-log check found no entries in the
-  matching one-second buckets; this does not establish the client failure
-  cause. No CPU-profile phase completed and the run earns no capacity credit.
-  Exact fixture cleanup and post-cleanup FULL readiness passed. The separate
-  CPU-only diagnostic `42085780534/1` also remains unclassified because its
-  parent report contains no phase data or failure code. Do not rerun either
-  profile until the diagnostic gaps are addressed.
+  ended; the bounded Nginx error-log check found no matching entries. Its
+  cause and any server capacity ceiling remain unproven. The later corrected
+  run `42788095845/1` does not retroactively explain or validate that older
+  result. The separate CPU-only diagnostic `42085780534/1` also remains
+  unclassified because its parent report has no phase data or failure code.
+  Keep these older runs at zero credit and follow the owner runbook before any
+  further production profile.
 
 ## Hard operational limits
 
