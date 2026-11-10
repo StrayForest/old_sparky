@@ -453,6 +453,16 @@ authoritative attempt and outer artifact digest before reading the one expected
 member, then prints only closed failure classifications. Keep the private
 artifact with the exact run evidence; do not paste its JSON into a ticket or
 job log.
+
+Web `ssr_web_lifecycle event=cpu_profile` rows carry a closed `stage` that
+separates `prepare_timer`, `prepare_deadline`, `prepare_completion`,
+`start_timer`, `start_command_deadline` and `start_command_completion` at the
+unchanged 250 ms guard. `on_request` means ON arrived without a prearm claim;
+`prearm_claim`, `prearm_validation`, `prearm_cancel` and
+`start_command_failure` classify other exits. For this prearmed workload,
+`started` means `Profiler.start` completed within the guard; `profile_stop`
+marks terminal processing. A started profile without terminal completion
+evidence remains incomplete and receives no credit.
 ## Abort and close the exact fixture
 
 If the selected run has an active or uncertain remote process tree, use the

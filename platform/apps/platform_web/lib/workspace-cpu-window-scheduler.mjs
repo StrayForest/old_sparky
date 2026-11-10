@@ -10,6 +10,12 @@ const LIFECYCLE_REASONS = new Set([
   "none", "late", "stale", "mismatch", "start_error", "end_error",
   "timing_incomplete", "profile_bounds", "profile_stop", "already_claimed",
 ]);
+const LIFECYCLE_PROFILE_STAGES = new Set([
+  "on_request", "prearm_claim", "prepare_timer", "prepare_deadline",
+  "prepare_completion", "start_timer", "start_command_deadline",
+  "start_command_completion", "start_command_failure", "profile_stop",
+  "prearm_validation", "prearm_cancel",
+]);
 const LIFECYCLE_EVENT_LIMIT = 256;
 const LIFECYCLE_DEDUPE_TTL_MS = 600_000;
 const lifecycleEvents = new Map();
@@ -20,12 +26,18 @@ export function emitSsrWebLifecycleEvent(
   phase,
   event,
   status,
-  { reason = "none", lagMs = null, sampleCount = null, nowMs = Date.now(), writeLine } = {},
+  {
+    reason = "none", lagMs = null, sampleCount = null, stage = null,
+    nowMs = Date.now(), writeLine,
+  } = {},
 ) {
   try {
     if (!plan || typeof plan.run_id !== "string" || !/^[0-9a-f]{32}$/u.test(plan.run_id)
         || !LIFECYCLE_PHASES.has(phase) || !LIFECYCLE_FIELDS[event]?.has(status)
         || !LIFECYCLE_REASONS.has(reason) || !Number.isSafeInteger(nowMs)
+        || (event === "cpu_profile"
+          ? !LIFECYCLE_PROFILE_STAGES.has(stage)
+          : stage !== null)
         || (lagMs !== null && (!Number.isSafeInteger(lagMs) || Math.abs(lagMs) > 1_000_000))
         || (sampleCount !== null && (!Number.isSafeInteger(sampleCount) || sampleCount < 0 || sampleCount > 5))) {
       return false;
@@ -41,7 +53,8 @@ export function emitSsrWebLifecycleEvent(
     const lag = lagMs === null ? "unknown" : String(lagMs);
     const count = sampleCount === null ? "unknown" : String(sampleCount);
     const line = `ssr_web_lifecycle service=web run_id=${plan.run_id} phase=${phase} `
-      + `event=${event} status=${status} reason=${reason} lag_ms=${lag} sample_count=${count}`;
+      + `event=${event} status=${status} reason=${reason} lag_ms=${lag} sample_count=${count}`
+      + (event === "cpu_profile" ? ` stage=${stage}` : "");
     (typeof writeLine === "function" ? writeLine : console.info)(line);
     return true;
   } catch {
@@ -277,9 +290,9 @@ export function scheduleWorkspaceCpuProfilePrearm(
   let startAttempted = false;
   let closed = false;
   let stopPromise = null;
-  const report = (status, reason, lagMs = null) => {
+  const report = (status, reason, lagMs = null, stage = "prearm_validation") => {
     try {
-      onLifecycle?.({ status, reason, lagMs });
+      onLifecycle?.({ status, reason, lagMs, stage });
     } catch {
       // Lifecycle output cannot change the profiler guard.
     }
@@ -321,7 +334,7 @@ export function scheduleWorkspaceCpuProfilePrearm(
     timer = null;
     deadlineTimer = null;
   };
-  const finishFailed = async (reason, lagMs = null) => {
+  const finishFailed = async (reason, lagMs = null, stage = "prearm_validation") => {
     if (["failed", "cancelled", "complete"].includes(state)) return;
     state = "failed";
     scheduled.delete(key);
@@ -330,7 +343,7 @@ export function scheduleWorkspaceCpuProfilePrearm(
     clearTimers();
     if (startAttempted) await stopSession();
     await closeSession();
-    report(reason === "late" || reason === "stale" ? "skipped" : "failed", reason, lagMs);
+    report(reason === "late" || reason === "stale" ? "skipped" : "failed", reason, lagMs, stage);
   };
   const matchingPlan = () => {
     try {
@@ -340,18 +353,18 @@ export function scheduleWorkspaceCpuProfilePrearm(
       return null;
     }
   };
-  const scheduleAt = (targetMs, callback) => {
+  const scheduleAt = (targetMs, callback, stage) => {
     try {
       timer = schedule(callback, Math.max(0, targetMs - now()));
     } catch {
-      void finishFailed("start_error");
+      void finishFailed("start_error", null, stage);
     }
   };
-  const scheduleDeadlineAt = (targetMs, callback) => {
+  const scheduleDeadlineAt = (targetMs, callback, stage) => {
     try {
       deadlineTimer = schedule(callback, Math.max(0, targetMs - now()));
     } catch {
-      void finishFailed("start_error");
+      void finishFailed("start_error", null, stage);
     }
   };
 
@@ -361,20 +374,20 @@ export function scheduleWorkspaceCpuProfilePrearm(
     try {
       actualMs = now();
     } catch {
-      await finishFailed("start_error");
+      await finishFailed("start_error", null, "start_timer");
       return;
     }
     if (!Number.isSafeInteger(actualMs)) {
-      await finishFailed("start_error");
+      await finishFailed("start_error", null, "start_timer");
       return;
     }
     if (actualMs < plan.on_start_ms) {
-      scheduleAt(plan.on_start_ms, () => { void startAtEdge(); });
+      scheduleAt(plan.on_start_ms, () => { void startAtEdge(); }, "start_timer");
       return;
     }
     const lagMs = actualMs - plan.on_start_ms;
     if (lagMs > startToleranceMs) {
-      await finishFailed("late", lagMs);
+      await finishFailed("late", lagMs, "start_timer");
       return;
     }
     const current = matchingPlan();
@@ -382,11 +395,11 @@ export function scheduleWorkspaceCpuProfilePrearm(
     try {
       phase = current === null ? null : phaseAt(current, actualMs);
     } catch {
-      await finishFailed("start_error", lagMs);
+      await finishFailed("start_error", lagMs, "prearm_validation");
       return;
     }
     if (current === null || phase !== "on" || actualMs > current.expires_at_ms) {
-      await finishFailed("stale", lagMs);
+      await finishFailed("stale", lagMs, "prearm_validation");
       return;
     }
 
@@ -398,20 +411,28 @@ export function scheduleWorkspaceCpuProfilePrearm(
       try {
         timeoutAtMs = now();
       } catch {
-        void finishFailed("start_error");
+        void finishFailed("start_error", null, "start_command_deadline");
         return;
       }
       if (!Number.isSafeInteger(timeoutAtMs)) {
-        void finishFailed("start_error");
+        void finishFailed("start_error", null, "start_command_deadline");
         return;
       }
       if (timeoutAtMs - plan.on_start_ms <= startToleranceMs) {
-        scheduleDeadlineAt(plan.on_start_ms + startToleranceMs + 1, expireSlowStart);
+        scheduleDeadlineAt(
+          plan.on_start_ms + startToleranceMs + 1,
+          expireSlowStart,
+          "start_command_deadline",
+        );
         return;
       }
-      void finishFailed("late", timeoutAtMs - plan.on_start_ms);
+      void finishFailed("late", timeoutAtMs - plan.on_start_ms, "start_command_deadline");
     };
-    scheduleDeadlineAt(plan.on_start_ms + startToleranceMs + 1, expireSlowStart);
+    scheduleDeadlineAt(
+      plan.on_start_ms + startToleranceMs + 1,
+      expireSlowStart,
+      "start_command_deadline",
+    );
     if (state !== "starting") return;
     let startedAtMs;
     try {
@@ -426,7 +447,7 @@ export function scheduleWorkspaceCpuProfilePrearm(
       } catch {
         // Keep the failure classification closed when the clock read fails.
       }
-      await finishFailed("start_error", failureLag);
+      await finishFailed("start_error", failureLag, "start_command_failure");
       return;
     }
     clearTimer(deadlineTimer);
@@ -446,16 +467,16 @@ export function scheduleWorkspaceCpuProfilePrearm(
       afterStartPhase = afterStartPlan === null || startLagMs === null
         ? null : phaseAt(afterStartPlan, startedAtMs);
     } catch {
-      await finishFailed("start_error", startLagMs);
+      await finishFailed("start_error", startLagMs, "prearm_validation");
       return;
     }
     if (startLagMs === null || startLagMs < 0 || startLagMs > startToleranceMs) {
-      await finishFailed("late", startLagMs);
+      await finishFailed("late", startLagMs, "start_command_completion");
       return;
     }
     if (afterStartPlan === null || afterStartPhase !== "on"
         || startedAtMs > afterStartPlan.on_end_ms) {
-      await finishFailed("stale", startLagMs);
+      await finishFailed("stale", startLagMs, "prearm_validation");
       return;
     }
 
@@ -465,10 +486,10 @@ export function scheduleWorkspaceCpuProfilePrearm(
     try {
       onStarted(session, startedAtMs, controller);
     } catch {
-      await finishFailed("start_error", startLagMs);
+      await finishFailed("start_error", startLagMs, "start_command_completion");
       return;
     }
-    report("started", "none", startLagMs);
+    report("started", "none", startLagMs, "start_command_completion");
   };
 
   const prepareAtOffEnd = async () => {
@@ -477,24 +498,24 @@ export function scheduleWorkspaceCpuProfilePrearm(
     try {
       actualMs = now();
     } catch {
-      await finishFailed("start_error");
+      await finishFailed("start_error", null, "prepare_timer");
       return;
     }
     if (!Number.isSafeInteger(actualMs)) {
-      await finishFailed("start_error");
+      await finishFailed("start_error", null, "prepare_timer");
       return;
     }
     if (actualMs < plan.off_end_ms) {
-      scheduleAt(plan.off_end_ms, () => { void prepareAtOffEnd(); });
+      scheduleAt(plan.off_end_ms, () => { void prepareAtOffEnd(); }, "prepare_timer");
       return;
     }
     if (actualMs >= plan.on_start_ms) {
-      await finishFailed("late", actualMs - plan.on_start_ms);
+      await finishFailed("late", actualMs - plan.on_start_ms, "prepare_timer");
       return;
     }
     const current = matchingPlan();
     if (current === null || actualMs > current.expires_at_ms) {
-      await finishFailed("stale");
+      await finishFailed("stale", null, "prearm_validation");
       return;
     }
     state = "preparing";
@@ -504,20 +525,20 @@ export function scheduleWorkspaceCpuProfilePrearm(
       try {
         timeoutAtMs = now();
       } catch {
-        void finishFailed("start_error");
+        void finishFailed("start_error", null, "prepare_deadline");
         return;
       }
       if (!Number.isSafeInteger(timeoutAtMs)) {
-        void finishFailed("start_error");
+        void finishFailed("start_error", null, "prepare_deadline");
         return;
       }
       if (timeoutAtMs < plan.on_start_ms) {
-        scheduleDeadlineAt(plan.on_start_ms, expireSlowPreparation);
+        scheduleDeadlineAt(plan.on_start_ms, expireSlowPreparation, "prepare_deadline");
         return;
       }
-      void finishFailed("late", timeoutAtMs - plan.on_start_ms);
+      void finishFailed("late", timeoutAtMs - plan.on_start_ms, "prepare_deadline");
     };
-    scheduleDeadlineAt(plan.on_start_ms, expireSlowPreparation);
+    scheduleDeadlineAt(plan.on_start_ms, expireSlowPreparation, "prepare_deadline");
     if (state !== "preparing") return;
     try {
       const preparedSession = await prepare(current, (candidate) => {
@@ -527,13 +548,13 @@ export function scheduleWorkspaceCpuProfilePrearm(
     } catch {
       clearTimer(deadlineTimer);
       deadlineTimer = null;
-      await finishFailed("start_error");
+      await finishFailed("start_error", null, "prepare_completion");
       return;
     }
     clearTimer(deadlineTimer);
     deadlineTimer = null;
     if (session === null || session === undefined) {
-      await finishFailed("start_error");
+      await finishFailed("start_error", null, "prepare_completion");
       return;
     }
     if (state !== "preparing") {
@@ -543,20 +564,20 @@ export function scheduleWorkspaceCpuProfilePrearm(
     const afterPrepareMs = now();
     if (!Number.isSafeInteger(afterPrepareMs) || afterPrepareMs >= plan.on_start_ms) {
       await finishFailed("late", Number.isSafeInteger(afterPrepareMs)
-        ? afterPrepareMs - plan.on_start_ms : null);
+        ? afterPrepareMs - plan.on_start_ms : null, "prepare_completion");
       return;
     }
     const preparedPlan = matchingPlan();
     if (preparedPlan === null || afterPrepareMs > preparedPlan.expires_at_ms) {
-      await finishFailed("stale");
+      await finishFailed("stale", null, "prearm_validation");
       return;
     }
     state = "prepared";
-    scheduleAt(plan.on_start_ms, () => { void startAtEdge(); });
+    scheduleAt(plan.on_start_ms, () => { void startAtEdge(); }, "start_timer");
   };
 
   const controller = {
-    cancel: () => finishFailed("stale"),
+    cancel: () => finishFailed("stale", null, "prearm_cancel"),
     complete: async () => {
       if (state !== "started") return;
       state = "complete";
@@ -569,7 +590,7 @@ export function scheduleWorkspaceCpuProfilePrearm(
   };
 
   scheduled.add(key);
-  scheduleAt(plan.off_end_ms, () => { void prepareAtOffEnd(); });
+  scheduleAt(plan.off_end_ms, () => { void prepareAtOffEnd(); }, "prepare_timer");
   if (!scheduled.has(key)) return null;
   return controller;
 }

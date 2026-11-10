@@ -967,12 +967,14 @@ async function startAuthorizedNodeCpuProfile(plan: DiagnosticPlan): Promise<void
   if (consumedCpuRunIds.has(plan.run_id)) {
     emitSsrWebLifecycleEvent(plan, "on", "cpu_profile", "skipped", {
       reason: "already_claimed", lagMs: startLagMs,
+      stage: "on_request",
     });
     return;
   }
   if (activeCpuRunId !== null) {
     emitSsrWebLifecycleEvent(plan, "on", "cpu_profile", "skipped", {
       reason: "already_claimed", lagMs: startLagMs,
+      stage: "on_request",
     });
     return;
   }
@@ -992,6 +994,7 @@ function scheduleWebCpuProfile(
       webCpuProfileFailed.add(runId);
       emitSsrWebLifecycleEvent(plan, "on", "cpu_profile", "skipped", {
         reason: "late", lagMs: Date.now() - plan.on_start_ms,
+        stage: "on_request",
       });
     }
     return;
@@ -1043,8 +1046,8 @@ function scheduleWebCpuProfile(
       }, Math.max(1, plan.on_end_ms - Date.now()));
       timer.unref();
     },
-    onLifecycle: ({ status, reason, lagMs }) => {
-      emitSsrWebLifecycleEvent(plan, "on", "cpu_profile", status, { reason, lagMs });
+    onLifecycle: ({ status, reason, lagMs, stage }) => {
+      emitSsrWebLifecycleEvent(plan, "on", "cpu_profile", status, { reason, lagMs, stage });
       if (status === "failed" || status === "skipped") {
         consumedCpuRunIds.add(runId);
         if (activeCpuRunId === runId) activeCpuRunId = null;
@@ -1056,6 +1059,7 @@ function scheduleWebCpuProfile(
     webCpuProfileFailed.add(runId);
     emitSsrWebLifecycleEvent(plan, "on", "cpu_profile", "skipped", {
       reason: "already_claimed",
+      stage: "prearm_claim",
     });
     return;
   }
@@ -1090,6 +1094,7 @@ async function startNodeCpuProfile(plan: DiagnosticPlan): Promise<void> {
     activeCpuRunId = plan.run_id;
     emitSsrWebLifecycleEvent(plan, "on", "cpu_profile", "started", {
       lagMs: startLagMs,
+      stage: "start_command_completion",
     });
     const delay = Math.max(1, plan.on_end_ms - Date.now());
     const timer = setTimeout(() => {
@@ -1100,6 +1105,7 @@ async function startNodeCpuProfile(plan: DiagnosticPlan): Promise<void> {
     if (activeCpuRunId === plan.run_id) activeCpuRunId = null;
     emitSsrWebLifecycleEvent(plan, "on", "cpu_profile", "failed", {
       reason: "start_error", lagMs: Date.now() - plan.on_start_ms,
+      stage: "start_command_failure",
     });
     try {
       session.disconnect();
@@ -1121,6 +1127,7 @@ async function stopNodeCpuProfile(
   if (activeCpuRunId !== runId) {
     emitSsrWebLifecycleEvent({ run_id: runId }, "on", "cpu_profile", "skipped", {
       reason: "already_claimed",
+      stage: "profile_stop",
     });
     if (profileController) {
       await profileController.complete();
@@ -1216,6 +1223,7 @@ async function stopNodeCpuProfile(
     emitSsrWebLifecycleEvent({ run_id: runId }, "on", "cpu_profile", finalStatus, {
       reason: finalReason,
       lagMs: startLagMs,
+      stage: "profile_stop",
     });
   }
 }

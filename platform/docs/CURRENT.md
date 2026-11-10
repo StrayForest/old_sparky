@@ -10,30 +10,26 @@ belong in the linked owner documents below.
 
 ## Live and pending state
 
-- Last verified production baseline, as of 2026-11-10, is app A
-  `2835f9b2144c7b1d56e04bfdd0169f7912e06ffd` (release
-  `gha-42776600827-1-2835f9b2144c`), previous app
-  `3faa30b5aaa71dc96c541d5197c71c9bb47d7354`, and active host-tools C2
-  `c92dce69ed204d39b16884e62fad2b61addaa996`. Source S
-  `c0fa2dde03338cad922e36ec9c35e080f08c8110` passed exact-SHA Security and
-  automatic AUTO/baseline-reconcile as a verified no-op; it did not deploy a
-  new app. Corrected SSR run `42788095845/1` used S, A and C2 with one fixture.
-  Its exact cleanup and post-cleanup FULL readiness passed. One restore-verified
-  backup pair, from run `42780859484/1`, remains retained. Keep runner S, app A
-  and host-tools C distinct in later evidence; the post-run storage preview
-  found no deletion candidates. No fixture is active. Obtain fresh canonical
-  FULL readiness before any new production work.
-- Corrected SSR diagnostic `42788095845/1` completed its 120-second capacity
-  phase with 3,944/3,944 HTTP 200 responses. The separate profile phase is
-  incomplete: 57/57 responses were HTTP 200, but one response failed the
-  authenticated-page marker (`page_marker_missing`). API cProfile data was
-  observed for both expected targets; Web V8 data was missing, with one
-  `profile_start_lag` rejection at 416 ms. The composite remains incomplete
-  and earns no capacity, SLO or performance credit. Exact fixture cleanup,
-  namespace closure and post-cleanup FULL readiness passed. Do not treat the
-  partial profiles as a complete comparison or capacity result; use the
+- Production app and runner source S are
+  `e1299e4818c8b2f684a76af5424109532d0c71a0` (release
+  `gha-42806619801-1-e1299e4818c8`); previous app is
+  `2835f9b2144c7b1d56e04bfdd0169f7912e06ffd`. Active host-tools C2 is
+  `c92dce69ed204d39b16884e62fad2b61addaa996`. Exact-SHA Security
+  `42803016028/1`, AUTO `42804838560/1` and automatic production child
+  `42806619801/1` completed. Keep S, app and C2 identities explicit. Storage
+  maintenance `42811006436/1` completed with one restore-verified backup pair
+  retained. SSR diagnostic fixture `42808854934/1` is cleaned; its exact
+  cleanup and post-cleanup FULL readiness passed. Obtain fresh canonical FULL
+  readiness before any new production work.
+- SSR diagnostic `42808854934/1` completed its 120-second capacity phase with
+  3,965/3,965 HTTP 200 responses. The separate 20-second profile phase is
+  incomplete: 310/310 requests completed, but only 35 of 37 selected ON-phase
+  Web roots joined to API request-performance rows, and the Web CPU profile
+  missed its start deadline. The composite earns no capacity, SLO or
+  performance credit. Do not treat partial profile data as a complete
+  comparison or capacity result; use the
   [SSR capacity diagnostic runbook](ssr-capacity-diagnostic-runbook.md) for
-  the procedure and current owner follow-up.
+  the phase acceptance and cleanup contract.
 - Cell 9, `read-mix-concurrency-ramp-v1`, completed as run `41937909055/1` on
   runner S and app A, both `7c6034efe3878c3413090ca1bcdb5be6e93154e8`, with
   host-tools C `0de51aca4b4d04a80a2f0d392003cc258d8f1400`; exact cleanup

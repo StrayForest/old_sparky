@@ -21,22 +21,37 @@ export type SsrLifecycleReason =
   | "none" | "late" | "stale" | "mismatch" | "start_error"
   | "end_error" | "timing_incomplete" | "profile_bounds" | "profile_stop"
   | "already_claimed";
+export type SsrLifecycleProfileStage =
+  | "on_request" | "prearm_claim" | "prepare_timer" | "prepare_deadline"
+  | "prepare_completion" | "start_timer" | "start_command_deadline"
+  | "start_command_completion" | "start_command_failure" | "profile_stop"
+  | "prearm_validation" | "prearm_cancel";
 export type SsrLifecycleStatus =
   | "active" | "trace_only" | "scheduled" | "started" | "skipped"
   | "failed" | "finalized";
 
+type SsrLifecycleOptions = {
+  reason?: SsrLifecycleReason;
+  lagMs?: number | null;
+  sampleCount?: number | null;
+  nowMs?: number;
+  writeLine?: (line: string) => void;
+};
+
 export declare function emitSsrWebLifecycleEvent(
   plan: { readonly run_id: string } | null,
   phase: SsrLifecyclePhase,
-  event: SsrLifecycleEvent,
+  event: "cpu_profile",
   status: SsrLifecycleStatus,
-  options?: {
-    reason?: SsrLifecycleReason;
-    lagMs?: number | null;
-    sampleCount?: number | null;
-    nowMs?: number;
-    writeLine?: (line: string) => void;
-  },
+  options: SsrLifecycleOptions & { stage: SsrLifecycleProfileStage },
+): boolean;
+
+export declare function emitSsrWebLifecycleEvent(
+  plan: { readonly run_id: string } | null,
+  phase: SsrLifecyclePhase,
+  event: Exclude<SsrLifecycleEvent, "cpu_profile">,
+  status: SsrLifecycleStatus,
+  options?: SsrLifecycleOptions & { stage?: never },
 ): boolean;
 
 export declare function scheduleAuthorizedWorkspaceCpuWindowEdges<
@@ -123,6 +138,7 @@ export declare function scheduleWorkspaceCpuProfilePrearm<
       readonly status: "scheduled" | "started" | "skipped" | "failed";
       readonly reason: SsrLifecycleReason;
       readonly lagMs: number | null;
+      readonly stage: SsrLifecycleProfileStage;
     }) => void;
     startToleranceMs: number;
   },
