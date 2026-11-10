@@ -11,46 +11,45 @@ belong in the linked owner documents below.
 ## Live and pending state
 
 - Production app and runner source S are
-  `5278c6b9a8fcd079ee8959bacf017ac0cd920297` (release
-  `gha-42820897465-1-5278c6b9a8fc`); previous app is
-  `e1299e4818c8b2f684a76af5424109532d0c71a0`. Active host-tools C2 is
-  `c92dce69ed204d39b16884e62fad2b61addaa996`. Exact-SHA Security
-  `42817990724/1`, AUTO `42820087780/1` and automatic production child
-  `42820897465/1` completed. The source-bound backup `42820387537/1` passed
-  restore and Alembic verification; one pair is retained. After the latest
-  diagnostic cleanup, maintenance `42830070535/1` passed, deleted one stale
-  release and retained the verified backup. Post-maintenance FULL readiness
-  passed (SHA-256
-  `7c9256c757183ba1c0ec2230d4dea617a8950afde12140696a47c7f3b11b73d6`):
-  health checks are 200, all 15 C2 tools verified, locks are clear and no
-  release marker, diagnostic plan or pending systemd job remains. Keep S, app
-  and C2 identities explicit. No fixture is active; obtain fresh canonical
-  FULL readiness before any new production work.
-- SSR diagnostic `42808854934/1` ran on previous app A
-  `e1299e4818c8b2f684a76af5424109532d0c71a0` with C2. It completed its
-  120-second capacity phase with 3,965/3,965 HTTP 200 responses. The separate
-  20-second profile phase is incomplete: 310/310 requests completed, but only
-  35 of 37 selected ON-phase Web roots joined to API request-performance rows;
-  the Web CPU profile also missed its start deadline by 260 ms. The composite
-  earns no capacity, SLO or performance credit, and the run does not validate
-  the newly deployed scheduler instrumentation. Do not treat partial profile
-  data as a complete comparison or capacity result; a follow-up workload waits
-  for a fresh source-bound packet and independent review. Use the
+  `f7c9238a6e0c930146189ffcf084a6ad9f367614` (release
+  `gha-42875219963-1-f7c9238a6e0c`); previous app A is
+  `645a5ee0d14b98e4784be2dbf276f64961c9eb66`. Active host-tools C is
+  `3159dd2abf5ac5dbb8ad75a34362d5abc9fb55e9`; previous C2
+  `c92dce69ed204d39b16884e62fad2b61addaa996` remains preserved. Exact-SHA
+  Security `42868249915/1`, AUTO `42870765131/1` and its automatic production
+  child `42875219963/1` completed successfully. The source-bound backup
+  `42871039003/1` passed restore and Alembic verification. Maintenance
+  `42877571389/1` deleted one stale release, created and verified the latest
+  backup archive, and retained exactly one pair; its disk checks passed.
+  Post-maintenance FULL readiness
+  passed for app/verifier S and C (SHA-256
+  `7e18c2dee8e3177f3c1630937a012252bfa954b7233548e9e5bc9b448224be48`): health
+  checks are 200, all 15 pinned C tools verified, locks are clear and no
+  release marker, diagnostic plan or pending systemd job remains. No fixture
+  is active; obtain fresh canonical FULL readiness before new production work.
+- SSR composite `42862469594/1` measured on app A
+  `645a5ee0d14b98e4784be2dbf276f64961c9eb66`, runner source S
+  `154be3f847007accd83f077f3079b3f3ccf85813` and host-tools C2. Its unprofiled
+  120-second capacity phase completed with 3,911/3,911 HTTP 200 responses.
+  API service CPU was 83.797 CPU-seconds over 120.009 seconds and Web service
+  CPU was 88.967 CPU-seconds over 120.028 seconds. The separate 20-second
+  profile phase completed its HTTP window, but the public report remained
+  incomplete because its profile-row projection rejected a valid signed Web
+  end lag. A bounded, exact-window journal recovery independently validated
+  two API cProfile rows, one Web V8 profile and all three ON service-CPU rows;
+  the Web end lag was -12 ms, within the intended ±250 ms contract. This
+  recovered attribution does not rewrite the workflow report or grant capacity,
+  SLO or performance credit. The dispatcher now accepts the signed lag. Treat
+  cProfile/V8 results as profiled attribution, not an unprofiled benchmark or
+  a capacity ceiling; traced ORM and serialization shares are prioritization
+  signals, not route-causal shares or guaranteed gains. The private analysis
+  report retains the detailed breakdown.
+- Earlier SSR diagnostics `42808854934/1` and `42824003998/1` remain incomplete
+  and zero-credit; the latter's abort `42825813580/1` and exact fixture cleanup
+  `42826290267/1` completed. These results are not upgraded by the recovered
+  profile from `42862469594/1`. Use the
   [SSR capacity diagnostic runbook](ssr-capacity-diagnostic-runbook.md) for
-  the phase acceptance and cleanup contract.
-- SSR composite `42824003998/1` on source/app
-  `5278c6b9a8fcd079ee8959bacf017ac0cd920297` was rejected by the
-  `cpu_profile_phase` report projection and received no measurement credit.
-  The documented abort `42825813580/1` returned
-  `safe_for_exact_fixture_cleanup` with `namespace_closed=false`; exact cleanup
-  `42826290267/1` then passed, deleting 14 fixture users and one tournament
-  while preserving the control account. Post-maintenance FULL is ready for app
-  `5278c6b9a8fcd079ee8959bacf017ac0cd920297` and host-tools C2
-  `c92dce69ed204d39b16884e62fad2b61addaa996` (SHA-256
-  `7c9256c757183ba1c0ec2230d4dea617a8950afde12140696a47c7f3b11b73d6`). The
-  run remains incomplete and zero-credit; do not infer a profile result from
-  the projection rejection. Do not repeat the workload until the reviewed Web
-  profile fix is released and a fresh packet is reviewed.
+  phase acceptance and cleanup requirements.
 - Cell 9, `read-mix-concurrency-ramp-v1`, completed as run `41937909055/1` on
   runner S and app A, both `7c6034efe3878c3413090ca1bcdb5be6e93154e8`, with
   host-tools C `0de51aca4b4d04a80a2f0d392003cc258d8f1400`; exact cleanup
@@ -87,16 +86,22 @@ belong in the linked owner documents below.
   reconciliation: the repeat had 19,971/20,000 successes, 28 status-0 and one
   status-502 failure, while Nginx recorded 19,990 HTML requests, all 200.
   There is no client-request join, so the transport cause remains unknown.
+- SSR diagnostic `42849326329/1` on app A
+  `645a5ee0d14b98e4784be2dbf276f64961c9eb66` had 31/32 successful ON
+  responses and one `remote_disconnect` at response headers; its separate OFF
+  probe completed 32/32 HTTP 200. The bounded Nginx projection found no error
+  entry in the failure second, but has no request-ID join. The cause remains
+  unknown; neither the 19.5–25 second OFF-to-ON idle interval nor a 30-second
+  downstream keepalive setting proves that a reused connection expired.
 - The older SSR composite diagnostic `42081912538/1` on app `9a73f635` stopped
   after 70.385 seconds of its 120-second capacity phase. Four body-receive
   `incomplete_response` failures observed HTTP 200 before the response body
-  ended; the bounded Nginx error-log check found no matching entries. Its
-  cause and any server capacity ceiling remain unproven. The later corrected
-  run `42788095845/1` does not retroactively explain or validate that older
-  result. The separate CPU-only diagnostic `42085780534/1` also remains
-  unclassified because its parent report has no phase data or failure code.
-  Keep these older runs at zero credit and follow the owner runbook before any
-  further production profile.
+  ended; its cause and any server capacity ceiling remain unproven. The later
+  corrected run `42788095845/1` does not retroactively explain or validate
+  that older result. The separate CPU-only diagnostic `42085780534/1` also
+  remains unclassified because its parent report has no phase data or failure
+  code. Keep these older runs at zero credit and follow the owner runbook before
+  any further production profile.
 
 ## Hard operational limits
 
