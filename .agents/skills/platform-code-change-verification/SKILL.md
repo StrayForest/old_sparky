@@ -32,10 +32,17 @@ Select the smallest relevant verification set.
   commitments after a terminal tournament state.
 - Web: run from `platform/` as
   `tools/platform_run_quiet.sh "web build" -- tools/platform_web_npm.sh --prefix apps/platform_web run build`.
-- Release from the repository root: syntax-check the release state machine and,
-  on a live host, run
-  `platform/tools/platform_run_quiet.sh "release preflight" -- platform/tools/platform_release_preflight.sh --require-previous --require-edge-parity`;
-  deploy only through `platform/tools/platform_release_deploy.sh`. A retained
+- Release: syntax-check the release state machine. For production, follow the
+  `platform/docs/deployment-runbook.md`: publish a
+  reviewed change to `dev`, require successful exact-SHA Security, then let the
+  automatic AUTO/production-child chain select and complete the authorized
+  route; out-of-scope no-op routes do not dispatch a child. Before a normal
+  app release, the operator must provide the source-bound restore-verified
+  backup. When a host-tools pin change needs parent-bound provisioning, AUTO
+  builds and attests the tools and waits; the operator follows the runbook to
+  provision before the child, after checking the approved exact source,
+  backup, and pre-child window. Do not invoke `platform_release_deploy.sh`
+  directly or manually dispatch normal production deployment. A retained
   migration/post-restart state is a recovery outcome, not a passing release.
 - Docs/skills-only: run `tools/platform_verify.py docs`, the verification
   contract gate when instruction or workflow policy changed, and syntax/
