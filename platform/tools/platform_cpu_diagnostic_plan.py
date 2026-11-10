@@ -865,10 +865,17 @@ def _terminate_journal(process: subprocess.Popen[bytes]) -> None:
 
 
 def _journal_rows(plans: dict[str, dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
-    """Read per-service exact-Invocation selections; retain rows only in memory."""
+    """Read per-service exact-Invocation selections; retain rows only in memory.
+
+    A failed API journal invocation must not discard independently collected
+    Web evidence. Keep that API failure as the overall capture status, discard
+    any partial API output, and continue to Web under the same shared limits.
+    """
 
     all_rows: list[dict[str, Any]] = []
     total_bytes = 0
+    total_rows_seen = 0
+    overall_status = "complete"
     for service in ("api", "web"):
         plan = plans[service]
         try:
@@ -882,11 +889,15 @@ def _journal_rows(plans: dict[str, dict[str, Any]]) -> tuple[str, list[dict[str,
                 env={"LANG": "C", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "TZ": "UTC"},
             )
         except OSError:
-            return "journal_failed", all_rows
+            if service == "api":
+                overall_status = "journal_failed"
+                continue
+            return overall_status if overall_status != "complete" else "journal_failed", all_rows
         assert process.stdout is not None
         fd = process.stdout.fileno()
         selector = selectors.DefaultSelector()
         pending = bytearray()
+        service_rows: list[dict[str, Any]] = []
         deadline = time.monotonic() + JOURNAL_TIMEOUT_SECONDS
         eof = False
         status = "complete"
@@ -943,10 +954,11 @@ def _journal_rows(plans: dict[str, dict[str, Any]]) -> tuple[str, list[dict[str,
                         if not isinstance(record, dict):
                             status = "invalid_event"
                             continue
+                        total_rows_seen += 1
                         # Raw journal values are consumed only for this transient
                         # exact-identity match and never copied to the result.
-                        all_rows.append(record)
-                        if len(all_rows) > MAX_JOURNAL_ROWS:
+                        service_rows.append(record)
+                        if total_rows_seen > MAX_JOURNAL_ROWS:
                             status = "line_cap"
                             _terminate_journal(process)
                             eof = True
@@ -972,8 +984,16 @@ def _journal_rows(plans: dict[str, dict[str, Any]]) -> tuple[str, list[dict[str,
                 _terminate_journal(process)
             pending[:] = b"\0" * len(pending)
         if status != "complete":
-            return status, all_rows
-    return "complete", all_rows
+            # journalctl may return status 1 for either an empty selection or
+            # an actual query failure. Preserve the closed failure reason and
+            # never consume that service's partial output, but still let the
+            # independent Web query contribute evidence under the shared caps.
+            if service == "api" and status == "journal_failed":
+                overall_status = "journal_failed"
+                continue
+            return overall_status if overall_status != "complete" else status, all_rows
+        all_rows.extend(service_rows)
+    return overall_status, all_rows
 
 
 def _journal_epoch(milliseconds: int) -> str:
