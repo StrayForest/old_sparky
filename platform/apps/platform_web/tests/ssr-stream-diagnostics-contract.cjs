@@ -456,8 +456,9 @@ async function verifySsrWebLifecycleContract() {
   const webProfilePrearm = planSource.indexOf("function scheduleWebCpuProfile(");
   const profilePrearmEnd = planSource.indexOf("function post<", webProfilePrearm);
   const webProfileSource = planSource.slice(webProfilePrearm, profilePrearmEnd);
+  const prearmCall = /scheduleWorkspaceCpuProfilePrearm(?:<[^>]+>)?\s*\(\s*plan\s*,/u;
   if (webProfilePrearm < 0 || profilePrearmEnd <= webProfilePrearm
-      || !webProfileSource.includes("scheduleWorkspaceCpuProfilePrearm(plan")
+      || !prearmCall.test(webProfileSource)
       || !webProfileSource.includes("readPlan: safeReadPlan")
       || !webProfileSource.includes('"Profiler.enable"')
       || !webProfileSource.includes('"Profiler.setSamplingInterval"')
