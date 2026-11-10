@@ -694,6 +694,8 @@ def _validate_actor_payload(value: dict[str, Any]) -> list[external_load.Virtual
 
 
 def _safe_error(value: Any) -> str:
+    if value is None:
+        return "none"
     return value if isinstance(value, str) and value in SAFE_ERRORS else "other"
 
 
@@ -791,10 +793,20 @@ def _leg(
             future.cancel()
         raise PairError("phase drain deadline exceeded")
     elapsed = time.monotonic() - monotonic_start
+    drained_before_deadline = (
+        not in_flight
+        and len(results) == next_index
+        and all(
+            result.finished_at_monotonic is not None
+            and result.finished_at_monotonic <= finish_deadline
+            for result in results
+        )
+    )
     status_counts: Counter[str] = Counter()
     error_counts: Counter[str] = Counter()
     latencies: list[float] = []
     in_window = 0
+    successful = 0
     for result in results:
         status_key = (
             str(result.status)
@@ -804,6 +816,8 @@ def _leg(
         )
         status_counts[status_key] += 1
         error_counts[_safe_error(result.error_kind)] += 1
+        if result.status == 200 and result.ok:
+            successful += 1
         if isinstance(result.elapsed_ms, (int, float)) and result.elapsed_ms >= 0:
             latencies.append(float(result.elapsed_ms))
         if result.finished_at_monotonic is not None and result.finished_at_monotonic <= monotonic_end:
@@ -819,6 +833,9 @@ def _leg(
         "submitted": next_index,
         "completed": len(results),
         "completed_in_window": in_window,
+        "successful": successful,
+        "error_count": sum(result.error_kind is not None for result in results),
+        "drained_before_deadline": drained_before_deadline,
         "status_counts": dict(sorted(status_counts.items())),
         "error_kinds": dict(sorted(error_counts.items())),
         "latency_ms": {
@@ -834,6 +851,51 @@ def _leg(
             capture_complete and all(result.status == 200 and result.ok for result in results)
         ),
     }
+
+
+def _clean_underquota_off_can_continue(
+    off: Any, plan: dict[str, Any], *, now_ms: int,
+) -> bool:
+    """Allow only a fully drained, all-200 OFF quota miss to proceed to ON."""
+    if not isinstance(off, dict):
+        return False
+    submitted = off.get("submitted")
+    completed = off.get("completed")
+    latency = off.get("latency_ms")
+    window_fields = tuple(plan.get(name) for name in (
+        "off_start_ms", "off_end_ms", "on_start_ms", "on_end_ms",
+    ))
+    if (
+        off.get("complete") is not False
+        or off.get("all_expected_statuses") is not False
+        or off.get("scheduled") != REQUESTS_PER_LEG
+        or type(submitted) is not int
+        or not 0 < submitted < REQUESTS_PER_LEG
+        or type(completed) is not int
+        or completed != submitted
+        or off.get("drained_before_deadline") is not True
+        or type(off.get("completed_in_window")) is not int
+        or not 0 <= off["completed_in_window"] <= completed
+        or type(off.get("successful")) is not int
+        or off["successful"] != submitted
+        or type(off.get("error_count")) is not int
+        or off["error_count"] != 0
+        or off.get("status_counts") != {"200": submitted}
+        or off.get("error_kinds") != {"none": submitted}
+        or not isinstance(latency, dict)
+        or type(latency.get("count")) is not int
+        or latency.get("count") != submitted
+        or any(type(value) is not int for value in window_fields)
+        or window_fields[1] - window_fields[0] != LEG_MS
+        or window_fields[2] - window_fields[1] != IDLE_MS
+        or window_fields[3] - window_fields[2] != LEG_MS
+        or type(now_ms) is not int
+        or now_ms > window_fields[2]
+    ):
+        return False
+    # A returned leg proves every submitted future drained before its fixed
+    # deadline; _leg raises when any future remains pending at that boundary.
+    return True
 
 
 def _write_report(path: Path, report: dict[str, Any]) -> None:
@@ -1038,16 +1100,28 @@ def _public_report(value: dict[str, Any]) -> dict[str, Any]:
                 clean_result[phase] = None
                 continue
             clean_leg: dict[str, Any] = {"complete": leg.get("complete") is True, "all_expected_statuses": leg.get("all_expected_statuses") is True}
-            for key in ("scheduled", "submitted", "completed", "completed_in_window"):
+            for key in (
+                "scheduled", "submitted", "completed", "completed_in_window",
+                "successful", "error_count",
+            ):
                 selected = nonnegative_int(leg.get(key), maximum=REQUESTS_PER_LEG)
                 if selected is not None:
                     clean_leg[key] = selected
+            clean_leg["drained_before_deadline"] = leg.get("drained_before_deadline") is True
             counts = leg.get("status_counts")
             if isinstance(counts, dict):
                 clean_leg["status_counts"] = {
                     key: selected
                     for key, raw in counts.items()
                     if isinstance(key, str) and re.fullmatch(r"[1-5][0-9]{2}|invalid", key)
+                    and (selected := nonnegative_int(raw, maximum=REQUESTS_PER_LEG)) is not None
+                }
+            errors = leg.get("error_kinds")
+            if isinstance(errors, dict):
+                clean_leg["error_kinds"] = {
+                    key: selected
+                    for key, raw in errors.items()
+                    if isinstance(key, str) and key in SAFE_ERRORS | {"none"}
                     and (selected := nonnegative_int(raw, maximum=REQUESTS_PER_LEG)) is not None
                 }
             latency = leg.get("latency_ms")
@@ -1449,8 +1523,20 @@ def _quality_gate(
     on: dict[str, Any],
     *,
     service_cpu_delta_percentage_points: dict[str, float | None] | None,
+    comparison_valid: bool = True,
 ) -> dict[str, Any]:
     """Keep capture completeness separate from instrumentation overhead."""
+
+    if not comparison_valid:
+        return {
+            "status": "unmeasured",
+            "request_p95_delta_percent": None,
+            "request_p95_limit_percent": 5.0,
+            "request_p95_within_limit": None,
+            "service_cpu_delta_percentage_points": {"api": None, "web": None},
+            "service_cpu_delta_limit_percentage_points": 3.0,
+            "service_cpu_within_limit": {"api": None, "web": None},
+        }
 
     off_p95 = off.get("latency_ms", {}).get("p95")
     on_p95 = on.get("latency_ms", {}).get("p95")
@@ -2340,7 +2426,15 @@ def _worker_callback(config: dict[str, Any]) -> dict[str, Any]:
             plan, "off", executor,
         )
         report["off"] = off
-        if not off["complete"] or (time.time_ns() // 1_000_000) > plan["on_start_ms"]:
+        off_complete = off["complete"] is True
+        now_ms = time.time_ns() // 1_000_000
+        on_window_open = now_ms <= plan["on_start_ms"]
+        if not (
+            (off_complete or _clean_underquota_off_can_continue(
+                off, plan, now_ms=now_ms,
+            ))
+            and on_window_open
+        ):
             return report
         on = _leg(
             actor_payload["origin"], actors,
@@ -2350,11 +2444,12 @@ def _worker_callback(config: dict[str, Any]) -> dict[str, Any]:
         report["on"] = on
         complete = bool(off["complete"] and on["complete"])
         report["capture_complete"] = complete
-        report["quality_gate"] = _quality_gate(
-            off, on, service_cpu_delta_percentage_points=None
-        )
         report["all_expected_statuses"] = bool(
             complete and off["all_expected_statuses"] and on["all_expected_statuses"]
+        )
+        report["quality_gate"] = _quality_gate(
+            off, on, service_cpu_delta_percentage_points=None,
+            comparison_valid=report["capture_complete"] and report["all_expected_statuses"],
         )
         # The namespace worker reports capture completion only. The trusted
         # parent evaluates HTTP outcomes and the off/on quality gates after
@@ -2984,12 +3079,16 @@ def _parent(args: argparse.Namespace) -> int:
                     off_leg = off_leg if isinstance(off_leg, dict) else {}
                     on_leg = on_leg if isinstance(on_leg, dict) else {}
                     deltas = _usage_delta_percentage_points(usage_summary)
-                    quality = _quality_gate(
-                        off_leg, on_leg, service_cpu_delta_percentage_points=deltas
-                    )
-                    pair_result["quality_gate"] = quality
                     completed_capture = pair_result.get("capture_complete") is True
                     all_statuses = pair_result.get("all_expected_statuses") is True
+                    quality = _quality_gate(
+                        off_leg, on_leg,
+                        service_cpu_delta_percentage_points=(
+                            deltas if completed_capture and all_statuses else None
+                        ),
+                        comparison_valid=completed_capture and all_statuses,
+                    )
+                    pair_result["quality_gate"] = quality
                     quality_ok = quality.get("status") == "passed"
                     overall_complete = bool(
                         closed and valid_child and completed_capture and all_statuses

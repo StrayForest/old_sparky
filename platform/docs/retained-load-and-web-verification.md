@@ -442,12 +442,14 @@ incomplete counts, partial work, observer failures, cleanup failures or
 artifact-identity mismatches remain invalid pipeline results and cannot be
 reclassified as completed failures.
 
-The optional CPU diagnostic pair removes run-bound SSH files before
-sanitization and retains a sanitized failure summary only if cleanup succeeds.
-Handled post-prepare errors expose only fixed stages/codes. Worker-report reads
-distinguish unavailable, symlink, metadata-rejected and changed-during-read.
-Allowlisted supervisor reason/exit may survive a read failure; result remains
+The optional CPU diagnostic pair removes run-bound SSH files before sanitization and retains a
+sanitized failure summary only if cleanup succeeds. Handled post-prepare errors expose fixed
+stages/codes. Worker-report reads distinguish unavailable, symlink, metadata-rejected and
+changed-during-read. Allowlisted supervisor reason/exit may survive a read failure; result remains
 incomplete/no-credit. Cleanup failure keeps the raw report private and skips upload.
+Underquota OFF may continue to planned ON only when a nonempty submission fully drains by deadline
+with all HTTP 200/no errors and ON has not started; preserve counts and incomplete/no-credit status,
+with completed profiles for attribution only. Any error, pending work or missed/empty window stops before ON; the 500-request contract remains.
 
 The QA system sampler keeps full process identity and CPU collection for all
 `/proc` rows while reading per-process RSS and I/O counters only for the seven

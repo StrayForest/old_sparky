@@ -4674,7 +4674,11 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(capture["scheduled"], 4)
         self.assertEqual(capture["submitted"], 4)
         self.assertEqual(capture["completed"], 4)
+        self.assertEqual(capture["successful"], 0)
+        self.assertEqual(capture["error_count"], 4)
+        self.assertTrue(capture["drained_before_deadline"])
         self.assertEqual(capture["status_counts"], {"500": 4})
+        self.assertEqual(capture["error_kinds"], {"unexpected_status": 4})
         self.assertEqual(request.call_count, 4)
         transport_tripwire.assert_not_called()
         urllib_tripwire.assert_not_called()
@@ -4759,6 +4763,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         self.assertTrue(in_drain["all_expected_statuses"])
         self.assertEqual(in_drain["submitted"], 500)
         self.assertEqual(in_drain["completed"], 500)
+        self.assertEqual(in_drain["successful"], 500)
+        self.assertEqual(in_drain["error_count"], 0)
+        self.assertTrue(in_drain["drained_before_deadline"])
+        self.assertEqual(in_drain["error_kinds"], {"none": 500})
         self.assertEqual(in_drain["completed_in_window"], 499)
         self.assertEqual(in_drain["drain_deadline_ms"], 125_000)
         self.assertAlmostEqual(in_drain["elapsed_seconds"], 20.05, places=6)
@@ -4817,6 +4825,9 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "submitted": 500,
             "completed": 500,
             "completed_in_window": 500,
+            "successful": 500,
+            "error_count": 0,
+            "drained_before_deadline": True,
             "status_counts": {"200": 500},
             "error_kinds": {"none": 500},
             "latency_ms": {"count": 500, "p50": 10.0, "p95": 20.0, "p99": 30.0},
@@ -4846,6 +4857,120 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         self.assertTrue(worker_report["passed"])
         self.assertEqual(worker_report["status"], "complete")
         self.assertEqual(executor_stub.shutdown_args, (False, True))
+
+        partial_off = {
+            **leg_result,
+            "submitted": 416,
+            "completed": 416,
+            "completed_in_window": 408,
+            "successful": 416,
+            "error_count": 0,
+            "drained_before_deadline": True,
+            "status_counts": {"200": 416},
+            "error_kinds": {"none": 416},
+            "latency_ms": {"count": 416, "p50": 10.0, "p95": 20.0, "p99": 30.0},
+            "complete": False,
+            "all_expected_statuses": False,
+        }
+        on_with_different_latency = {
+            **leg_result,
+            "latency_ms": {"count": 500, "p50": 20.0, "p95": 40.0, "p99": 60.0},
+        }
+        with (
+            patch.object(cpu_pair.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(worker_bytes))),
+            patch.dict(os.environ, {"SOURCE_GIT_SHA": "b" * 40}),
+            patch.object(cpu_pair, "_warmup", return_value=(8, 8, 8, executor_stub)),
+            patch.object(cpu_pair, "_leg", side_effect=[partial_off, on_with_different_latency]) as leg_call,
+        ):
+            underquota_report = cpu_pair._worker_callback({
+                "pair_payload_sha256": cpu_pair.hashlib.sha256(worker_bytes).hexdigest(),
+                "binding": {
+                    "source_git_sha": "b" * 40,
+                    "app_target_sha": "b" * 40,
+                    "source_binding": {"schema": 1},
+                    "source_binding_sha256": "c" * 64,
+                    "external_run_id": "12345",
+                },
+            })
+        self.assertEqual(leg_call.call_count, 2)
+        self.assertFalse(underquota_report["capture_complete"])
+        self.assertFalse(underquota_report["all_expected_statuses"])
+        self.assertFalse(underquota_report["passed"])
+        self.assertEqual(underquota_report["status"], "incomplete")
+        self.assertEqual(underquota_report["off"]["submitted"], 416)
+        self.assertEqual(underquota_report["on"]["completed"], 500)
+        self.assertEqual(underquota_report["quality_gate"]["status"], "unmeasured")
+        self.assertIsNone(underquota_report["quality_gate"]["request_p95_delta_percent"])
+        self.assertEqual(underquota_report["on"]["latency_ms"]["p95"], 40.0)
+        underquota_public = cpu_pair._public_report({"result": underquota_report})
+        self.assertEqual(underquota_public["result"]["off"]["status_counts"], {"200": 416})
+        self.assertEqual(underquota_public["result"]["off"]["error_kinds"], {"none": 416})
+        self.assertEqual(underquota_public["result"]["off"]["successful"], 416)
+        self.assertEqual(underquota_public["result"]["off"]["error_count"], 0)
+        self.assertTrue(underquota_public["result"]["off"]["drained_before_deadline"])
+        profile_rows = [
+            {
+                "service": "api", "expected_targets": 2, "observed_targets": 2,
+                "event_count": 2, "total_cpu_us": 1_000, "sample_count": None,
+                "timer": "thread_cpu", "observation_unit": "calls",
+                "categories": [{"category": "other", "cpu_us": 1_000, "observations": 2}],
+            },
+            {
+                "service": "web", "expected_targets": 1, "observed_targets": 1,
+                "event_count": 1, "total_cpu_us": 1_000, "sample_count": 100,
+                "timer": "v8_cpu", "observation_unit": "samples",
+                "categories": [{"category": "other", "cpu_us": 1_000, "observations": 100}],
+            },
+        ]
+        attribution_report = cpu_pair._public_report({
+            "status": "incomplete",
+            "result": underquota_report,
+            "cpu_profile_attribution": {
+                "status": "complete", "reason": "none", "rows": profile_rows,
+            },
+        })
+        self.assertEqual(attribution_report["status"], "incomplete")
+        self.assertFalse(attribution_report["capacity_slo_credit"])
+        self.assertFalse(attribution_report["diagnostic_credit"])
+        self.assertFalse(attribution_report["result"]["capture_complete"])
+        self.assertEqual(attribution_report["cpu_profile_attribution"]["status"], "complete")
+        self.assertEqual(len(attribution_report["cpu_profile_attribution"]["rows"]), 2)
+
+        for invalid_off in (
+            {**partial_off, "error_kinds": {"TimeoutError": 1, "none": 415}},
+            {**partial_off, "status_counts": {"200": 415, "500": 1}},
+            {**partial_off, "completed": 415},
+            {**partial_off, "successful": 415},
+            {**partial_off, "submitted": 0, "completed": 0, "successful": 0,
+             "error_kinds": {}, "status_counts": {}, "latency_ms": {"count": 0}},
+            {**partial_off, "error_count": 1},
+            {**partial_off, "drained_before_deadline": False},
+            {**partial_off, "complete": True},
+        ):
+            self.assertFalse(cpu_pair._clean_underquota_off_can_continue(
+                invalid_off, worker_plan, now_ms=worker_plan["on_start_ms"],
+            ))
+        self.assertFalse(cpu_pair._clean_underquota_off_can_continue(
+            partial_off, worker_plan, now_ms=worker_plan["on_start_ms"] + 1,
+        ))
+        with (
+            patch.object(cpu_pair.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(worker_bytes))),
+            patch.dict(os.environ, {"SOURCE_GIT_SHA": "b" * 40}),
+            patch.object(cpu_pair, "_warmup", return_value=(8, 8, 8, executor_stub)),
+            patch.object(cpu_pair, "_leg", side_effect=cpu_pair.PairError("phase drain deadline exceeded")) as leg_call,
+        ):
+            with self.assertRaises(cpu_pair.PairError):
+                cpu_pair._worker_callback({
+                    "pair_payload_sha256": cpu_pair.hashlib.sha256(worker_bytes).hexdigest(),
+                    "binding": {
+                        "source_git_sha": "b" * 40,
+                        "app_target_sha": "b" * 40,
+                        "source_binding": {"schema": 1},
+                        "source_binding_sha256": "c" * 64,
+                        "external_run_id": "12345",
+                    },
+                })
+        self.assertEqual(leg_call.call_count, 1)
 
         # The parent validates its early receipt before it launches the
         # namespace child. Bind the accepted receipt to this exact run/source
