@@ -410,9 +410,8 @@ request correlation is the only incomplete capacity evidence and both phase
 namespaces and plan cleanups are proven closed, the separate 20-second profile
 still runs for diagnosis. Its presence does not complete the composite: full
 cohort correlation remains required for `PASS`, and incomplete correlation
-receives no credit. Worker failure, resource abort, incomplete non-correlation
-telemetry, unclosed namespace, failed plan cleanup, fixture/source mismatch,
-quiescence failure, or insufficient wall budget still prevents the profile.
+receives no credit. This continuation accepts only normal worker completion
+(`resource_abort_reason` absent or `window_complete`); any other abort, HTTP error, incomplete request/telemetry/ID evidence, truncation, open namespace, failed cleanup, binding mismatch, quiescence failure or insufficient budget still prevents profiling.
 The profiled phase is never capacity evidence. API function self-time is measured
 on the event-loop thread and excludes other threads. API profile rows include
 at most 20 fixed function IDs with self CPU, cumulative CPU, total and

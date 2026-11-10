@@ -5207,7 +5207,7 @@ def _capacity_phase_allows_profile_attribution(value: Any) -> bool:
         return False
     worker = phase.get("worker")
     if (not isinstance(worker, dict) or worker.get("status") != "complete"
-            or worker.get("resource_abort_reason") is not None
+            or worker.get("resource_abort_reason") not in (None, "window_complete")
             or worker.get("completed") != worker.get("submitted")
             or worker.get("http_status_counts") != {"200": worker.get("submitted")}
             or worker.get("error_counts") != {}):

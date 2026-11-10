@@ -10798,23 +10798,58 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertFalse(sanitized_incomplete["diagnostic_credit"])
 
             correlation_gap_capacity = json.loads(json.dumps(capacity))
-            correlation_request_id = next(
-                f"{index:032x}"
-                for index in range(1, 10_000)
+            selected_request_ids: list[str] = []
+            for index in range(1, 20_000):
+                request_id = f"{index:032x}"
                 if diagnostic_plan_tool.is_ssr_response_id_eligible(
-                    correlation_gap_capacity["run_id"], f"{index:032x}",
-                )
-            )
+                    correlation_gap_capacity["run_id"], request_id,
+                ):
+                    selected_request_ids.append(request_id)
+                    if len(selected_request_ids) == 500:
+                        break
+            self.assertEqual(len(selected_request_ids), 500)
+            correlation_window_start = "2026-10-29T12:00:00+00:00"
+            correlation_window_end = "2026-10-29T12:02:00+00:00"
+            correlation_event_at = "2026-10-29T12:00:01+00:00"
+
+            def correlated_row(request_id: str) -> dict[str, Any]:
+                return {
+                    "run_id": correlation_gap_capacity["run_id"], "phase": "on",
+                    "window_start_utc": correlation_window_start,
+                    "window_end_utc": correlation_window_end,
+                    "event_at_utc": correlation_event_at, "request_id": request_id,
+                }
+
             correlation_gap = diagnostic_plan_tool.summarize_ssr_request_correlation(
-                selected_request_ids=[correlation_request_id],
-                submitted_html_count=1, valid_response_id_count=1,
-                eligible_response_id_count=1,
+                selected_request_ids=selected_request_ids,
+                submitted_html_count=4_067, valid_response_id_count=4_067,
+                eligible_response_id_count=500,
                 selection_scheme="sha256-runid-requestid-1of8-v1",
                 missing_response_id_count=0, duplicate_response_id_count=0,
-                malformed_response_id_count=0, run_id=correlation_gap_capacity["run_id"],
-                phase="on", window_start_utc="2026-10-29T12:00:00+00:00",
-                window_end_utc="2026-10-29T12:00:15+00:00", nginx_rows=[], ssr_rows=[],
-                stream_rows=[], api_rows=[],
+                malformed_response_id_count=0,
+                run_id=correlation_gap_capacity["run_id"], phase="on",
+                window_start_utc=correlation_window_start,
+                window_end_utc=correlation_window_end,
+                nginx_rows=[
+                    {**correlated_row(request_id), "request_time_ms": 50.0, "cf_ray": None}
+                    for request_id in selected_request_ids
+                ],
+                ssr_rows=[
+                    {**correlated_row(request_id), "stage": "page_component", "duration_ms": 40.0}
+                    for request_id in selected_request_ids
+                ],
+                stream_rows=[
+                    {**correlated_row(request_id), "stage": "request_start", "elapsed_ms": 0.5}
+                    for request_id in selected_request_ids
+                ],
+                # One selected API event is absent; the other 499 are joined.
+                api_rows=[
+                    {**correlated_row(request_id), "route_class": "tournament_workspace",
+                     "total_ms": 20.0, "sql_ms": 4.0, "max_sql_ms": 2.0,
+                     "pool_checkout_wait_ms": 1.0, "pool_connection_hold_ms": 3.0,
+                     "compute_ms": 8.0, "sql_count": 2}
+                    for request_id in selected_request_ids[:-1]
+                ],
                 source_collection_reason={"api": "complete", "web": "complete"},
             )
             correlation_gap["ssr_stream_coverage"] = {
@@ -10826,9 +10861,86 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             }
             correlation_gap_capacity["status"] = "incomplete"
             correlation_gap_capacity["passed"] = False
+            correlation_gap_capacity["worker"]["submitted"] = 4_067
+            correlation_gap_capacity["worker"]["completed"] = 4_067
+            correlation_gap_capacity["worker"]["http_status_counts"] = {"200": 4_067}
+            correlation_gap_capacity["worker"]["latency_ms"] = {
+                "sample_count": 4_067, "p50": 949.411, "p95": 1_333.597,
+                "p99": 1_999.994, "max": 2_297.31,
+            }
+            correlation_gap_capacity["worker"]["resource_abort_reason"] = "window_complete"
+            correlation_gap_capacity["worker"]["request_window_evidence"].update({
+                "submitted_results": 4_067, "started_in_window_count": 4_067,
+                "completed_by_window_end_count": 4_035,
+                "drain_completed_after_window_count": 32,
+                "cf_ray_present_count": 4_067, "cf_ray_missing_count": 0,
+                "ssr_request_id_singleton_count": 4_067,
+                "eligible_response_id_count": 500, "retained_sample_count": 500,
+            })
             self.assertIsNotNone(
                 capacity_diagnostic._project_capacity_report(correlation_gap_capacity),
             )
+            self.assertTrue(
+                capacity_diagnostic._capacity_phase_allows_profile_attribution(
+                    capacity_diagnostic._project_capacity_report(correlation_gap_capacity),
+                ),
+            )
+
+            # The continuation accepts only the normal end-of-window sentinel.
+            # A real abort, failed HTTP response, incomplete collection, or
+            # damaged ID sample still refuses the profile phase.
+            for invalid_capacity in (
+                {**correlation_gap_capacity,
+                 "worker": {**correlation_gap_capacity["worker"],
+                            "resource_abort_reason": "memory_event"}},
+                {**correlation_gap_capacity,
+                 "worker": {**correlation_gap_capacity["worker"],
+                            "http_status_counts": {"200": 4_066, "503": 1}}},
+                {**correlation_gap_capacity,
+                 "worker": {**correlation_gap_capacity["worker"],
+                            "request_window_evidence": {
+                                **correlation_gap_capacity["worker"]["request_window_evidence"],
+                                "status": "incomplete",
+                            }}},
+                {**correlation_gap_capacity,
+                 "server_telemetry": {
+                     **correlation_gap_capacity["server_telemetry"],
+                     "request_correlation": {
+                         "status": "incomplete",
+                         "summary": {
+                             **correlation_gap,
+                             "cohort": {
+                                 **correlation_gap["cohort"],
+                                 "selected_sample_malformed_ids": 1,
+                             },
+                         },
+                     },
+                 }},
+                {**correlation_gap_capacity,
+                 "server_telemetry": {
+                     **correlation_gap_capacity["server_telemetry"],
+                     "request_correlation": {
+                         "status": "incomplete",
+                         "summary": {
+                             **correlation_gap,
+                             "coverage": {
+                                 **correlation_gap["coverage"],
+                                 "source_rows_truncated": {
+                                     "nginx": False, "ssr": False,
+                                     "stream": False, "api": True,
+                                 },
+                             },
+                         },
+                     },
+                 }},
+            ):
+                with self.subTest(resource_abort_reason=invalid_capacity["worker"].get(
+                        "resource_abort_reason")):
+                    self.assertFalse(
+                        capacity_diagnostic._capacity_phase_allows_profile_attribution(
+                            invalid_capacity,
+                        ),
+                    )
             args.report = str(root / "producer-correlation-gap.json")
             profile_calls: list[str] = []
 
