@@ -359,21 +359,22 @@ identities, and all of these conditions hold:
   memory attribution incomplete;
   it cannot be accepted by widening the generic parser limit.
 - The separate profile phase completes its 20-second ON window against the
-  same fixture manifest after the planned gap. Its trace-marked HTML warmups
-  prearm API and web OFF/ON usage windows; API also arms a thread-CPU cProfile
-  callback on each worker event loop. The callback rechecks the exact plan and
-  starts at the planned ON edge; the API rechecks actual start time around
-  profiler construction and activation. The monotonic start is captured after
-  profiler enable; stop captures the end immediately after disable, before
-  plan revalidation or profile summarization. Usage-window CPU and monotonic
-  endpoints are likewise snapshotted before plan revalidation. A missing, late,
-  replaced, or unreadable plan remains
-  incomplete; the first ON request cannot start or shift this profile. Keep the
-  250 ms start and end bounds. Web V8 sampling uses a bounded 10 ms interval
-  in this opt-in workload, with at most 2,400 samples and 10,000 profile
-  nodes. The 120-second capacity workload never enables
-  API cProfile. Profile data is attribution only; do not merge it into
-  capacity-window latency or CPU results.
+  same fixture manifest after planned gap; trace-marked HTML warmups prearm API/web OFF/ON usage windows.
+  All 32 capacity workers consume one response, close only their thread-local
+  connection, and retain its SSL context for authenticated OFF. OFF opens a fresh
+  connection; setup is included in the OFF CPU baseline. Measured ON transport
+  and 25-second OFF-start-to-ON-start schedule stay unchanged; compare OFF CPU
+  deltas only across matching connection baselines. API rechecks the exact plan
+  before arming thread-CPU cProfile on each worker event loop at planned ON;
+  actual start is checked around construction and activation. Monotonic profile timing starts after enable and ends immediately on disable, before plan revalidation or summarization.
+  Usage-window CPU and monotonic endpoints are snapshotted before revalidation.
+  Missing, late, replaced, or unreadable plans remain incomplete; the first ON
+  request cannot start or shift this profile. Keep the
+  250 ms start and end bounds. Web V8 sampling uses a bounded 10 ms interval in
+  this opt-in workload, with at most 2,400 samples and 10,000 profile nodes.
+  The 120-second capacity workload never enables API cProfile. Profile data
+  is attribution only; do not merge it into capacity-window latency or CPU
+  results.
 - When the API profiler emits more than ten categories, it retains the
   CPU-ranked top nine non-`other` categories (with a category-name tie-break)
   and folds omitted CPU and call counts, including any prior `other` entry,
@@ -388,12 +389,13 @@ identities, and all of these conditions hold:
   unexpected profile events when the workload does not request profiling;
   they are not a raw journal-row total, and separate predicates may count the
   same failed target. `complete` requires a complete capture and every counter
-  to be zero. For an incomplete profile, preserve `profile_status` and
-  `profile_reason` and inspect only the closed counters to identify the
-  rejecting predicate. The projection contains no journal messages, process
-  identities, or profile category values from rejected records. Keep all
-  capacity, SLO, matrix and profile performance credit false for this
-  diagnostic, including when both phases complete.
+  to be zero. The sanitized CPU report preserves `profile_status`,
+  `profile_reason`, and closed counters for incomplete profiles; inspect only
+  those counters to identify the rejecting predicate. Output contains no
+  journal messages, process identities, or categories from rejected records.
+  If one service's journal query fails, successful rows may remain descriptive,
+  but capture stays `journal_failed`/incomplete with zero credit. Keep capacity,
+  SLO, matrix and profile performance credit false, even when both phases complete.
 - Both phase records, the top-level completion state and the full source and
   fixture bindings pass their closed validators. The phases fit within the
   600-second outer deadline, and finalization and exact fixture cleanup pass.

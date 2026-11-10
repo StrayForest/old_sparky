@@ -2118,17 +2118,37 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
 
     off_results: list[Any] = []
     off_failed = False
+    probe_timeout = 5.0
 
-    def plan_marked_warmup(actor: external_load.VirtualUser):
-        return external_load._page_request(
-            manifest["origin"], actor, "authenticated_workspace_capacity_warmup", 5.0,
-            session_cookie_name=cookie_names[0], csrf_cookie_name=cookie_names[1],
-            transport=external_load.HTTP11_KEEPALIVE_TRANSPORT,
-            diagnostic_trace_run_id=_warmup_diagnostic_trace_run_id(
-                capacity["workload"], binding["run_id"],
-            ),
-            require_authenticated_html=_is_html_workload(capacity["workload"]),
-        )
+    warmup_barrier = threading.Barrier(probe_count)
+
+    def plan_marked_warmup(
+        actor: external_load.VirtualUser, barrier: threading.Barrier,
+    ):
+        try:
+            return external_load._page_request(
+                manifest["origin"], actor, "authenticated_workspace_capacity_warmup",
+                probe_timeout,
+                session_cookie_name=cookie_names[0], csrf_cookie_name=cookie_names[1],
+                transport=external_load.HTTP11_KEEPALIVE_TRANSPORT,
+                diagnostic_trace_run_id=_warmup_diagnostic_trace_run_id(
+                    capacity["workload"], binding["run_id"],
+                ),
+                require_authenticated_html=_is_html_workload(capacity["workload"]),
+            )
+        finally:
+            try:
+                # The origin and timeout match OFF, so this returns this worker's
+                # warmed HTTP11 client. Keep its SSLContext, but discard the idle
+                # socket before the planned gap can exceed the origin timeout.
+                external_load._http11_keepalive_client(
+                    manifest["origin"], probe_timeout,
+                ).close()
+            finally:
+                # Hold each finished task until all executor threads have primed
+                # their own thread-local client. The OFF barrier then runs on
+                # this same fixed worker set.
+                barrier.wait(timeout=5.5)
 
     def marked_probe(actor: external_load.VirtualUser, barrier: threading.Barrier):
         try:
@@ -2136,7 +2156,8 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
         except threading.BrokenBarrierError:
             return None
         return external_load._page_request(
-            manifest["origin"], actor, "authenticated_workspace_capacity_off_probe", 5.0,
+            manifest["origin"], actor, "authenticated_workspace_capacity_off_probe",
+            probe_timeout,
             session_cookie_name=cookie_names[0], csrf_cookie_name=cookie_names[1],
             transport=external_load.HTTP11_KEEPALIVE_TRANSPORT,
             capture_timestamps=True,
@@ -2161,7 +2182,9 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
         )
 
     warm_futures = [
-        capacity_executor.submit(plan_marked_warmup, selected[index % len(selected)])
+        capacity_executor.submit(
+            plan_marked_warmup, selected[index % len(selected)], warmup_barrier,
+        )
         for index in range(probe_count)
     ]
     warmup_failure = _new_warmup_failure(probe_count)
@@ -2198,8 +2221,10 @@ def _worker_callback(config: Mapping[str, Any]) -> Mapping[str, Any]:
         )
 
     # Warm the same thread-local HTTP/1.1 clients before the plan's OFF
-    # boundary. HTML warmups carry only the root-bound plan marker to prearm
-    # API CPU edges; page diagnostics and warmup latency remain unmeasured.
+    # boundary. Their sockets are closed after each response, while the
+    # per-thread SSLContexts remain primed for fresh OFF connections. HTML
+    # warmups carry only the root-bound plan marker to prearm API CPU edges;
+    # page diagnostics and warmup latency remain unmeasured.
     while True:
         initial = guard()
         if initial is not None:

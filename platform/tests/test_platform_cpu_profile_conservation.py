@@ -3,6 +3,7 @@ from __future__ import annotations
 import cProfile
 import pstats
 from pathlib import Path
+import sys
 import time
 import unittest
 from unittest.mock import patch
@@ -15,6 +16,74 @@ from tools import platform_ssr_capacity_diagnostic as ssr_diagnostic
 
 
 class ApiCpuProfileConservationTests(unittest.TestCase):
+    def test_api_journal_failure_preserves_independent_web_rows_without_credit(self) -> None:
+        plans = {
+            service: {
+                "targets": [{"invocation_id": "c" * 32}],
+                "off_start_ms": 1_000,
+                "on_end_ms": 2_000,
+            }
+            for service in ("api", "web")
+        }
+        web_record = {
+            "MESSAGE": "cpu_diagnostic_complete service=web",
+            "_SYSTEMD_UNIT": "deadlock-web.service",
+        }
+        web_script = (
+            "import json; print(json.dumps(" + repr(web_record) + "))"
+        )
+
+        # journalctl status 1 is ambiguous: it can accompany an empty result or
+        # a query failure after partial output. Both remain failures; neither
+        # may discard an independently successful Web query.
+        for partial_api_output in (False, True):
+            with self.subTest(partial_api_output=partial_api_output):
+                calls: list[str] = []
+                api_script = (
+                    "import json,sys; "
+                    + ("print(json.dumps({'MESSAGE':'partial api row'})); "
+                       if partial_api_output else "")
+                    + "sys.exit(1)"
+                )
+                commands = {
+                    "api": [sys.executable, "-c", api_script],
+                    "web": [sys.executable, "-c", web_script],
+                }
+
+                def command_for(_plan: object, service: str) -> list[str]:
+                    calls.append(service)
+                    return commands[service]
+
+                with patch.object(cpu_plan, "_journal_command", side_effect=command_for):
+                    status, rows = cpu_plan._journal_rows(plans)
+
+                self.assertEqual(status, "journal_failed")
+                self.assertEqual(calls, ["api", "web"])
+                self.assertEqual(rows, [web_record])
+
+    def test_api_invalid_journal_output_keeps_fail_fast_behavior(self) -> None:
+        plans = {
+            service: {
+                "targets": [{"invocation_id": "c" * 32}],
+                "off_start_ms": 1_000,
+                "on_end_ms": 2_000,
+            }
+            for service in ("api", "web")
+        }
+        calls: list[str] = []
+
+        def command_for(_plan: object, service: str) -> list[str]:
+            calls.append(service)
+            body = "print('not-json')" if service == "api" else "print('{}')"
+            return [sys.executable, "-c", body]
+
+        with patch.object(cpu_plan, "_journal_command", side_effect=command_for):
+            status, rows = cpu_plan._journal_rows(plans)
+
+        self.assertEqual(status, "invalid_event")
+        self.assertEqual(calls, ["api"])
+        self.assertEqual(rows, [])
+
     def _profile(
         self, names: list[str], *, unclassified: bool = False,
         disable: bool = True,

@@ -50,6 +50,10 @@ PROFILE_CAPTURE_REASONS = frozenset({
     "not_started", "complete", "journal_failed", "timeout", "byte_cap",
     "line_cap", "invalid_event", "summary_exception", "summary_validation",
 })
+PROFILE_REASON_CODES = frozenset({
+    "none", "missing", "duplicate", "identity_changed", "journal_failed",
+    "byte_cap", "line_cap", "timeout", "invalid_profile",
+})
 MAX_PROFILE_REJECTION_COUNT = 640
 TRACE_HEADER = "x-platform-ssr-trace"
 EXPECTED_USERS = 20_000
@@ -269,10 +273,7 @@ def _validate_profile_projection(
     fields = {"profile_status", "profile_reason", "profile_rows", "profile_rejections"}
     if (not isinstance(value, dict) or set(value) != fields
             or value.get("profile_status") not in {"complete", "incomplete", "unavailable"}
-            or value.get("profile_reason") not in {
-                "none", "missing", "duplicate", "identity_changed", "journal_failed",
-                "byte_cap", "line_cap", "timeout", "invalid_profile",
-            }
+            or value.get("profile_reason") not in PROFILE_REASON_CODES
             or not isinstance(value.get("profile_rows"), list)
             or len(value["profile_rows"]) > 2):
         return None
@@ -1172,10 +1173,15 @@ def _public_report(value: dict[str, Any]) -> dict[str, Any]:
         output["service_cpu_usage"] = clean_usage
     profile = value.get("cpu_profile_attribution")
     if isinstance(profile, dict):
+        profile_reason = profile.get("reason")
+        profile_rejections = _validate_profile_rejections(profile.get("rejections"))
+        if profile_rejections is None:
+            raise PairError("profile rejection projection rejected")
         clean_profile: dict[str, Any] = {
             "status": profile.get("status") if profile.get("status") in {"complete", "incomplete", "unavailable"} else "unavailable",
-            "reason": profile.get("reason") if profile.get("reason") in {"none", "incomplete", "unavailable", "other"} else "other",
+            "reason": profile_reason if profile_reason in PROFILE_REASON_CODES | {"incomplete", "unavailable"} else "other",
             "rows": [],
+            "rejections": profile_rejections,
         }
         rows = profile.get("rows")
         if isinstance(rows, list):
@@ -3065,6 +3071,7 @@ def _parent(args: argparse.Namespace) -> int:
                     "status": usage_summary["profile_status"],
                     "reason": usage_summary["profile_reason"],
                     "rows": usage_summary["profile_rows"],
+                    "rejections": usage_summary["profile_rejections"],
                 }
                 report["memory_attribution"] = {
                     "status": usage_summary["memory_status"],

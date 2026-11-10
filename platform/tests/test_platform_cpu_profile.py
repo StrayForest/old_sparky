@@ -3615,9 +3615,13 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         request_encodings: list[str | None] = []
         request_paths: list[str] = []
         warmup_trace_headers: list[str | None] = []
+        request_observations: list[dict[str, object]] = []
         request_count_lock = threading.Lock()
-        requests_complete = threading.Event()
-        warmup_state = {"all_ready": False, "request_count": 0}
+        off_requests_complete = threading.Event()
+        warmup_state = {
+            "all_ready": False, "off_failure": False,
+            "request_count": 0, "off_request_count": 0,
+        }
 
         class WarmupHandler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -3634,12 +3638,17 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     actor_index = int(session_value[:2])
                 except ValueError:
                     actor_index = -1
+                phase = self.headers.get("X-Platform-QA-Phase")
                 status = 200
                 content_type = "text/html; charset=utf-8"
                 body = ready_html
                 coding: str | None = None
                 if warmup_state["all_ready"]:
-                    pass
+                    if (
+                        phase == "authenticated_workspace_capacity_off_probe"
+                        and warmup_state["off_failure"] and actor_index == 0
+                    ):
+                        status = 503
                 elif actor_index == 0:
                     status = 503
                 elif actor_index == 1:
@@ -3679,10 +3688,13 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 self.wfile.write(body)
                 with request_count_lock:
                     if warmup_state["all_ready"] and warmup_state["request_count"] < 8:
-                        warmup_trace_headers.append(self.headers.get("x-platform-ssr-trace"))
+                        if phase == "authenticated_workspace_capacity_warmup":
+                            warmup_trace_headers.append(self.headers.get("x-platform-ssr-trace"))
                     warmup_state["request_count"] += 1
-                    if warmup_state["all_ready"] and warmup_state["request_count"] == 8:
-                        requests_complete.set()
+                    if phase == "authenticated_workspace_capacity_off_probe":
+                        warmup_state["off_request_count"] += 1
+                        if warmup_state["off_request_count"] == 8:
+                            off_requests_complete.set()
 
             def log_message(self, _format: str, *_args: object) -> None:
                 return
@@ -3794,17 +3806,18 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             if warmup_state["all_ready"]:
                 worker_thread = threading.Thread(target=run_worker_entry, daemon=True)
                 worker_thread.start()
-                requests_finished = requests_complete.wait(timeout=2)
-                capacity_control.write_control(Path(capacity["control_path"]), {
-                    "schema": 1, **binding, "decision": "abort",
-                    "reason": "memory_event", "sequence": 1,
-                    "updated_monotonic_ns": time.monotonic_ns(),
-                }, expected=binding)
+                requests_finished = off_requests_complete.wait(timeout=5)
+                if requests_finished and not warmup_state["off_failure"]:
+                    capacity_control.write_control(Path(capacity["control_path"]), {
+                        "schema": 1, **binding, "decision": "abort",
+                        "reason": "memory_event", "sequence": 1,
+                        "updated_monotonic_ns": time.monotonic_ns(),
+                    }, expected=binding)
                 worker_thread.join(timeout=5)
                 if worker_thread.is_alive():
-                    raise AssertionError("valid warmup callback did not stop after control abort")
+                    raise AssertionError("valid OFF probe callback did not stop promptly")
                 if not requests_finished:
-                    raise AssertionError("valid warmup cohort did not finish promptly")
+                    raise AssertionError("OFF probe cohort did not finish promptly")
             else:
                 run_worker_entry()
             if worker_errors:
@@ -3907,6 +3920,68 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             success_args[success_args.index("--failure-report") + 1] = str(
                 success_fingerprint_path,
             )
+
+            real_page_request = capacity_diagnostic.external_load._page_request
+
+            def observe_page_request(*request_args, **request_kwargs):
+                phase = request_args[2]
+                client = getattr(
+                    capacity_diagnostic.external_load._page_transport_local,
+                    "client", None,
+                )
+                connection = getattr(client, "_connection", None)
+                socket_live_before = bool(
+                    connection is not None and connection.sock is not None
+                )
+                result = real_page_request(*request_args, **request_kwargs)
+                client_after = getattr(
+                    capacity_diagnostic.external_load._page_transport_local,
+                    "client", None,
+                )
+                observation = {
+                    "phase": phase,
+                    "thread_id": threading.get_ident(),
+                    "client_id": id(client_after) if client_after is not None else None,
+                    "ssl_context_id": (
+                        id(client_after._ssl_context) if client_after is not None else None
+                    ),
+                    "socket_live_before": socket_live_before,
+                    "connection_reused": (
+                        result.transport_timing.get("connection_reused")
+                        if isinstance(result, external_load.RequestResult)
+                        and isinstance(result.transport_timing, dict) else None
+                    ),
+                }
+                with request_count_lock:
+                    request_observations.append(observation)
+                return result
+
+            class FastWorkerClock:
+                """Advance only callback wall time; keep transport timing real."""
+
+                def __init__(self) -> None:
+                    self._now_ns = time.time_ns()
+
+                def time_ns(self) -> int:
+                    self._now_ns += 25_000_000
+                    return self._now_ns
+
+                def sleep(self, _seconds: float) -> None:
+                    return
+
+                def __getattr__(self, name: str):
+                    return getattr(time, name)
+
+            def run_fast_worker_clock(callback, *callback_args, **callback_kwargs):
+                with patch.object(capacity_diagnostic, "time", FastWorkerClock()):
+                    return callback(*callback_args, **callback_kwargs)
+
+            original_worker_entry = capacity_diagnostic.load_runtime.worker_entry
+
+            def fast_worker_entry(*entry_args, **entry_kwargs):
+                return run_fast_worker_clock(
+                    original_worker_entry, *entry_args, **entry_kwargs,
+                )
             with patch.dict(os.environ, {
                 "SOURCE_GIT_SHA": source_sha, "APP_TARGET_SHA": source_sha,
                 "SOURCE_BINDING_BASE64": "", "SOURCE_BINDING_SHA256": "",
@@ -3924,11 +3999,20 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 capacity_diagnostic.load_runtime, "run_supervised", side_effect=fake_supervised,
             ), patch.object(
                 capacity_diagnostic.external_load, "EXPECTED_ORIGIN", loopback_origin,
+            ), patch.object(
+                capacity_diagnostic.external_load, "_page_request",
+                side_effect=observe_page_request,
+            ), patch.object(
+                capacity_diagnostic.load_runtime, "worker_entry",
+                side_effect=fast_worker_entry,
             ):
                 warmup_state["all_ready"] = True
+                warmup_state["off_failure"] = False
                 warmup_state["request_count"] = 0
+                warmup_state["off_request_count"] = 0
                 warmup_trace_headers.clear()
-                requests_complete.clear()
+                off_requests_complete.clear()
+                request_observations.clear()
                 self.assertEqual(capacity_diagnostic.main(success_args), 2)
                 self.assertEqual(warmup_trace_headers, [prepared_run_ids[-1]] * 8)
                 successful_report = json.loads(
@@ -3940,11 +4024,86 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 ))
                 self.assertNotIn("warmup_failure", successful_report["worker"])
                 self.assertEqual(successful_report["worker"]["off_probe"], {
-                    "submitted": 0, "completed": 0, "http_status": None,
+                    "submitted": 8, "completed": 8, "http_status": 200,
                 })
                 self.assertFalse(successful_report["diagnostic_credit"])
-                warmup_state["all_ready"] = False
+                successful_observations = list(request_observations)
+                warm_observations = [
+                    item for item in successful_observations
+                    if item["phase"] == "authenticated_workspace_capacity_warmup"
+                ]
+                off_observations = [
+                    item for item in successful_observations
+                    if item["phase"] == "authenticated_workspace_capacity_off_probe"
+                ]
+                self.assertEqual(len(warm_observations), 8)
+                self.assertEqual(len(off_observations), 8)
+                warm_by_thread = {item["thread_id"]: item for item in warm_observations}
+                off_by_thread = {item["thread_id"]: item for item in off_observations}
+                self.assertEqual(len(warm_by_thread), 8)
+                self.assertEqual(set(warm_by_thread), set(off_by_thread))
+                for thread_id, warm in warm_by_thread.items():
+                    off = off_by_thread[thread_id]
+                    self.assertEqual(off["client_id"], warm["client_id"])
+                    self.assertEqual(off["ssl_context_id"], warm["ssl_context_id"])
+                    self.assertFalse(off["socket_live_before"])
+                    self.assertFalse(off["connection_reused"])
+
+                failure_root = root / "off-failure"
+                failure_root.mkdir(mode=0o700)
+                failure_report_path = failure_root / "report.json"
+                failure_fingerprint_path = failure_root / "failure-fingerprint.json"
+                failure_args = list(args)
+                failure_args[failure_args.index("--report") + 1] = str(failure_report_path)
+                failure_args[failure_args.index("--failure-report") + 1] = str(
+                    failure_fingerprint_path,
+                )
+                warmup_state["off_failure"] = True
                 warmup_state["request_count"] = 0
+                warmup_state["off_request_count"] = 0
+                off_requests_complete.clear()
+                request_observations.clear()
+                self.assertEqual(capacity_diagnostic.main(failure_args), 2)
+                failed_off_report = json.loads(
+                    failure_report_path.read_text(encoding="ascii"),
+                )
+                self.assertEqual(
+                    failed_off_report["worker"]["resource_abort_reason"],
+                    "off_probe_failed",
+                )
+                failed_off_probe = failed_off_report["worker"]["off_probe"]
+                self.assertEqual(
+                    {key: failed_off_probe[key] for key in ("submitted", "completed", "http_status")},
+                    {"submitted": 8, "completed": 8, "http_status": None},
+                )
+                self.assertEqual(
+                    failed_off_probe["diagnostics"][
+                        "reason_counts"]["http_status"],
+                    1,
+                )
+                self.assertEqual(
+                    failed_off_probe["diagnostics"][
+                        "status_classes"]["5xx"],
+                    1,
+                )
+                self.assertFalse(failed_off_report["diagnostic_credit"])
+                self.assertTrue(failed_off_report["namespace_closed"])
+                self.assertEqual(failed_off_report["remote_plan_cleanup"], "complete")
+                off_failure_observations = [
+                    item for item in request_observations
+                    if item["phase"] == "authenticated_workspace_capacity_off_probe"
+                ]
+                self.assertEqual(len(off_failure_observations), 8)
+                self.assertEqual(
+                    sum(item["connection_reused"] is True for item in off_failure_observations),
+                    0,
+                )
+                self.assertEqual(warmup_state["off_request_count"], 8)
+
+                warmup_state["all_ready"] = False
+                warmup_state["off_failure"] = False
+                warmup_state["request_count"] = 0
+                warmup_state["off_request_count"] = 0
                 self.assertEqual(capacity_diagnostic.main(args), 2)
 
             raw_report = json.loads(report_path.read_text(encoding="ascii"))
@@ -4010,7 +4169,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertGreaterEqual(warmup["failure_counts"]["marker_authenticated_header_missing"], 1)
             self.assertGreaterEqual(warmup["failure_counts"]["marker_workspace_not_ready"], 2)
             self.assertGreaterEqual(warmup["failure_counts"]["marker_detail_fallback_missing"], 1)
-            self.assertEqual(len(request_encodings), 16)
+            self.assertEqual(len(request_encodings), 40)
             self.assertEqual(set(request_encodings), {"identity"})
             self.assertEqual(
                 set(request_paths), {"/tournaments/ssr-fixture-0001"},
@@ -4927,6 +5086,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "result": underquota_report,
             "cpu_profile_attribution": {
                 "status": "complete", "reason": "none", "rows": profile_rows,
+                "rejections": _profile_rejections(),
             },
         })
         self.assertEqual(attribution_report["status"], "incomplete")
@@ -4935,6 +5095,53 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         self.assertFalse(attribution_report["result"]["capture_complete"])
         self.assertEqual(attribution_report["cpu_profile_attribution"]["status"], "complete")
         self.assertEqual(len(attribution_report["cpu_profile_attribution"]["rows"]), 2)
+        self.assertEqual(
+            attribution_report["cpu_profile_attribution"]["rejections"],
+            _profile_rejections(),
+        )
+
+        timeout_rejections = _profile_rejections("timeout")
+        timeout_rejections["service_counts"]["api"]["profile_parser"] = 1
+        incomplete_attribution = cpu_pair._public_report({
+            "status": "incomplete",
+            "cpu_profile_attribution": {
+                "status": "incomplete", "reason": "timeout", "rows": [],
+                "rejections": timeout_rejections,
+            },
+        })
+        self.assertEqual(
+            incomplete_attribution["cpu_profile_attribution"]["reason"], "timeout",
+        )
+        self.assertEqual(
+            incomplete_attribution["cpu_profile_attribution"]["rejections"],
+            timeout_rejections,
+        )
+        self.assertFalse(incomplete_attribution["capacity_slo_credit"])
+        self.assertFalse(incomplete_attribution["diagnostic_credit"])
+        unknown_reason = cpu_pair._public_report({
+            "status": "incomplete",
+            "cpu_profile_attribution": {
+                "status": "incomplete", "reason": "raw-private-detail", "rows": [],
+                "rejections": timeout_rejections,
+            },
+        })
+        self.assertEqual(unknown_reason["cpu_profile_attribution"]["reason"], "other")
+        self.assertNotIn("raw-private-detail", json.dumps(unknown_reason))
+        malformed_counts = json.loads(json.dumps(timeout_rejections))
+        malformed_counts["service_counts"]["api"]["profile_parser"] = 641
+        for invalid_rejections in (
+            malformed_counts,
+            {**timeout_rejections, "untrusted": "private-value"},
+        ):
+            with self.subTest(invalid_rejections=type(invalid_rejections).__name__):
+                with self.assertRaises(cpu_pair.PairError):
+                    cpu_pair._public_report({
+                        "status": "incomplete",
+                        "cpu_profile_attribution": {
+                            "status": "incomplete", "reason": "timeout", "rows": [],
+                            "rejections": invalid_rejections,
+                        },
+                    })
 
         for invalid_off in (
             {**partial_off, "error_kinds": {"TimeoutError": 1, "none": 415}},
