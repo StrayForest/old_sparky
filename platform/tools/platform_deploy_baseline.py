@@ -30,6 +30,7 @@ from tools.platform_ci_classifier import (
     ClassifierError,
     classify,
     classify_cumulative_baseline_paths,
+    route_files_without_root_guide,
     validate_manifest,
 )
 from tools.platform_workflow_provenance import (
@@ -233,6 +234,7 @@ def validate_report_only_recovery_baseline(
         raise ProvenanceError(f"recovery classifier manifest is invalid: {exc}") from exc
     manifest = classifier_manifest
     files = manifest.get("files")
+    route_files = route_files_without_root_guide(files) if isinstance(files, list) else []
     if (
         manifest.get("target_sha") != target_sha
         or manifest.get("event") != "push"
@@ -246,10 +248,10 @@ def validate_report_only_recovery_baseline(
         or not files
         or any(not isinstance(path, str) for path in files)
         or len(set(files)) != len(files)
-        or not any(path in RECOVERY_BOOTSTRAP_FILES for path in files)
+        or not any(path in RECOVERY_BOOTSTRAP_FILES for path in route_files)
         or any(
             path not in RECOVERY_BOOTSTRAP_FILES and not path.startswith(DOCS_PREFIX)
-            for path in files
+            for path in route_files
         )
     ):
         raise ProvenanceError("classifier manifest is not the exact recovery-only route")
@@ -344,6 +346,11 @@ def classify_cumulative_baseline(
     if not isinstance(incremental_manifest, Mapping):
         raise ProvenanceError("incremental classifier manifest is missing")
     incremental_files = incremental_manifest.get("files")
+    incremental_route_files = (
+        route_files_without_root_guide(incremental_files)
+        if isinstance(incremental_files, list)
+        else []
+    )
     docs_only_source = bool(
         incremental_manifest.get("event") == "push"
         and incremental_manifest.get("class") == "docs-only"
@@ -353,8 +360,8 @@ def classify_cumulative_baseline(
         and incremental_manifest.get("deployable") is False
         and incremental_manifest.get("reason") == DOCS_ONLY_REASON
         and isinstance(incremental_files, list)
-        and bool(incremental_files)
-        and all(isinstance(path, str) and path.startswith(DOCS_PREFIX) for path in incremental_files)
+        and bool(incremental_route_files)
+        and all(isinstance(path, str) and path.startswith(DOCS_PREFIX) for path in incremental_route_files)
     )
     if (
         incremental_manifest.get("event") != "push"
@@ -370,18 +377,18 @@ def classify_cumulative_baseline(
     ):
         raise ProvenanceError("incremental manifest is not a full non-deployable source route")
     recovery_bootstrap_only = bool(
-        any(path in RECOVERY_BOOTSTRAP_FILES for path in incremental_files)
+        any(path in RECOVERY_BOOTSTRAP_FILES for path in incremental_route_files)
         and all(
             path in RECOVERY_BOOTSTRAP_FILES or path.startswith("platform/docs/")
-            for path in incremental_files
+            for path in incremental_route_files
         )
         and incremental_manifest.get("reason") == RECOVERY_BOOTSTRAP_REASON
     )
     candidate_packaging_only = bool(
-        any(path in CANDIDATE_PACKAGING_FILES for path in incremental_files)
+        any(path in CANDIDATE_PACKAGING_FILES for path in incremental_route_files)
         and all(
             path in CANDIDATE_PACKAGING_FILES or path.startswith("platform/docs/")
-            for path in incremental_files
+            for path in incremental_route_files
         )
         and incremental_manifest.get("reason") == CANDIDATE_PACKAGING_REASON
     )
@@ -427,6 +434,11 @@ def classify_cumulative_baseline(
     except ClassifierError as exc:
         raise ProvenanceError(f"cumulative classifier route is unsafe: {exc}") from exc
     cumulative_files = cumulative.get("files")
+    cumulative_route_files = (
+        route_files_without_root_guide(cumulative_files)
+        if isinstance(cumulative_files, list)
+        else []
+    )
     if docs_only_source:
         docs_only_cumulative = bool(
             cumulative.get("class") == "docs-only"
@@ -436,8 +448,8 @@ def classify_cumulative_baseline(
             and cumulative.get("deployable") is False
             and cumulative.get("reason") == DOCS_ONLY_REASON
             and isinstance(cumulative_files, list)
-            and bool(cumulative_files)
-            and all(isinstance(path, str) and path.startswith(DOCS_PREFIX) for path in cumulative_files)
+            and bool(cumulative_route_files)
+            and all(isinstance(path, str) and path.startswith(DOCS_PREFIX) for path in cumulative_route_files)
         )
         if not docs_only_cumulative:
             raise ProvenanceError(
@@ -452,12 +464,12 @@ def classify_cumulative_baseline(
         and cumulative.get("runtime_sensitive") is True
         and type(cumulative.get("deployable")) is bool
         and isinstance(cumulative_files, list)
-        and any(path in STORAGE_OPERATIONS_TRIGGER_FILES for path in cumulative_files)
+        and any(path in STORAGE_OPERATIONS_TRIGGER_FILES for path in cumulative_route_files)
         and all(
             path in STORAGE_OPERATIONS_FILES
             or path in RECOVERY_BOOTSTRAP_FILES
             or path.startswith(DOCS_PREFIX)
-            for path in cumulative_files
+            for path in cumulative_route_files
         )
     )
     if cumulative.get("deployable") is True:
@@ -476,18 +488,18 @@ def classify_cumulative_baseline(
             raise ProvenanceError("cumulative non-deployable file list is malformed")
         recovery_no_op = bool(
             cumulative.get("reason") == RECOVERY_BOOTSTRAP_REASON
-            and any(path in RECOVERY_BOOTSTRAP_FILES for path in cumulative_files)
+            and any(path in RECOVERY_BOOTSTRAP_FILES for path in cumulative_route_files)
             and all(
                 path in RECOVERY_BOOTSTRAP_FILES or path.startswith("platform/docs/")
-                for path in cumulative_files
+                for path in cumulative_route_files
             )
         )
         candidate_no_op = bool(
             cumulative.get("reason") == CANDIDATE_PACKAGING_REASON
-            and any(path in CANDIDATE_PACKAGING_FILES for path in cumulative_files)
+            and any(path in CANDIDATE_PACKAGING_FILES for path in cumulative_route_files)
             and all(
                 path in CANDIDATE_PACKAGING_FILES or path.startswith("platform/docs/")
-                for path in cumulative_files
+                for path in cumulative_route_files
             )
         )
         if storage_recovery_no_op:
@@ -554,32 +566,35 @@ def validate_cumulative_reconcile_route(route: object) -> dict[str, bool]:
         if canonical != dict(manifest):
             raise ProvenanceError("cumulative no-op manifest is not the canonical path classification")
 
+        route_files = route_files_without_root_guide(files)
+
         docs_family = bool(
             docs_only_manifest
-            and all(path.startswith(DOCS_PREFIX) for path in files)
+            and bool(route_files)
+            and all(path.startswith(DOCS_PREFIX) for path in route_files)
         )
 
         recovery_family = bool(
-            any(path in RECOVERY_BOOTSTRAP_FILES for path in files)
-            and all(path in RECOVERY_BOOTSTRAP_FILES or path.startswith(DOCS_PREFIX) for path in files)
+            any(path in RECOVERY_BOOTSTRAP_FILES for path in route_files)
+            and all(path in RECOVERY_BOOTSTRAP_FILES or path.startswith(DOCS_PREFIX) for path in route_files)
             and manifest.get("reason") == RECOVERY_BOOTSTRAP_REASON
             and manifest["deployable"] is False
         )
         candidate_family = bool(
-            any(path in CANDIDATE_PACKAGING_FILES for path in files)
-            and all(path in CANDIDATE_PACKAGING_FILES or path.startswith(DOCS_PREFIX) for path in files)
+            any(path in CANDIDATE_PACKAGING_FILES for path in route_files)
+            and all(path in CANDIDATE_PACKAGING_FILES or path.startswith(DOCS_PREFIX) for path in route_files)
             and manifest.get("reason") == CANDIDATE_PACKAGING_REASON
             and manifest["runtime_sensitive"] is False
             and manifest["deployable"] is False
         )
         storage_recovery_family = bool(
-            any(path in RECOVERY_BOOTSTRAP_FILES for path in files)
-            and any(path in STORAGE_OPERATIONS_TRIGGER_FILES for path in files)
+            any(path in RECOVERY_BOOTSTRAP_FILES for path in route_files)
+            and any(path in STORAGE_OPERATIONS_TRIGGER_FILES for path in route_files)
             and all(
                 path in STORAGE_OPERATIONS_FILES
                 or path in RECOVERY_BOOTSTRAP_FILES
                 or path.startswith(DOCS_PREFIX)
-                for path in files
+                for path in route_files
             )
             and manifest["runtime_sensitive"] is True
         )

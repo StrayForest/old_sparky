@@ -74,6 +74,17 @@ INVOCATION_RE = re.compile(r"^(?:[0-9a-f]{32}|[0-9a-f-]{36})$")
 CPU_CGROUP_RE = re.compile(r"^0::(?P<path>/[A-Za-z0-9._/-]{0,512})$")
 CPU_WINDOW_TOLERANCE_MS = 250
 API_CPU_PREARM_LEAD_MS = 52_000
+DIAGNOSTIC_ACTIVATION_OUTCOMES = frozenset({
+    "trace_absent",
+    "trace_invalid",
+    "no_valid_plan",
+    "run_mismatch",
+    "outside_phase",
+    "prearm_accepted",
+    "event_loop_unavailable",
+    "plan_active_off",
+    "plan_active_on",
+})
 
 
 def _warn_cpu_diagnostic_journal_failure(reason: str) -> None:
@@ -1000,49 +1011,63 @@ class ApiCpuDiagnostic:
     def activate_for_scope(
         cls,
         scope: dict[str, Any],
-    ) -> tuple[DiagnosticPlan | None, str | None]:
+    ) -> tuple[DiagnosticPlan | None, str | None, str | None]:
+        """Apply the workspace plan decision and return its closed outcome.
+
+        The outcome describes the trace/plan/phase decision only. It does not
+        certify that scheduled profiling or a journal event later completed.
+        """
+
         global _active_profile
         if scope.get("method") != "GET":
-            return None, None
+            return None, None, None
         path = str(scope.get("path") or "")
         pieces = path.strip("/").split("/")
         if (len(pieces) != 5 or pieces[0] != "api" or pieces[1] != "v1"
                 or pieces[2] != "tournaments" or not pieces[3]
                 or pieces[4] != "workspace"):
-            return None, None
+            return None, None, None
+        trace_present = any(
+            raw_name.lower() == b"x-platform-ssr-trace"
+            for raw_name, _raw_value in scope.get("headers") or []
+        )
         trace_run_id = _header_from_scope(scope, b"x-platform-ssr-trace")
-        if trace_run_id is None or RUN_RE.fullmatch(trace_run_id) is None:
-            return None, None
+        if trace_run_id is None:
+            return None, None, "trace_invalid" if trace_present else "trace_absent"
+        if RUN_RE.fullmatch(trace_run_id) is None:
+            return None, None, "trace_invalid"
         plan = read_process_plan("api")
         if plan is None:
             prearm_plan = _read_process_plan_for_cpu_prearm()
-            if prearm_plan is None or trace_run_id != prearm_plan.run_id:
-                return None, None
+            if prearm_plan is None:
+                return None, None, "no_valid_plan"
+            if trace_run_id != prearm_plan.run_id:
+                return None, None, "run_mismatch"
             try:
                 import asyncio
 
                 loop = asyncio.get_running_loop()
             except RuntimeError:
-                return None, None
+                return None, None, "event_loop_unavailable"
             _prearm_cpu_usage_windows(prearm_plan, loop)
             if prearm_plan.workload == WORKLOAD_HTML_SSR_CPU_PROFILE_20S:
                 _schedule_cpu_profile_window(prearm_plan, loop)
             # Prearming records no request phase or profiler context. Bound
             # callbacks start usage windows and, for the dedicated profile
             # workload only, cProfile at the immutable ON edge.
-            return None, None
+            return None, None, "prearm_accepted"
         if trace_run_id != plan.run_id:
-            return None, None
+            return None, None, "run_mismatch"
         now_ms = int(time.time_ns() // 1_000_000)
         phase = plan.phase_at(now_ms)
         if phase is None:
-            return None, None
+            return None, None, "outside_phase"
         try:
             import asyncio
 
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            return plan, phase
+            return plan, phase, "event_loop_unavailable"
         if phase == "off" and plan.workload in CPU_USAGE_PREARM_WORKLOADS:
             _schedule_cpu_usage_window(plan, "on", loop, now_ms=now_ms)
             if plan.workload == WORKLOAD_HTML_SSR_CPU_PROFILE_20S:
@@ -1052,19 +1077,19 @@ class ApiCpuDiagnostic:
         # low-cost CPU usage window, but never enable the expensive cProfile
         # capture reserved for the dedicated CPU-pair workload.
         if plan.workload not in PROFILE_WORKLOADS:
-            return plan, phase
+            return plan, phase, f"plan_active_{phase}"
         if phase == "off" or plan.run_id in _consumed_run_ids or _active_profile is not None:
-            return plan, phase
+            return plan, phase, f"plan_active_{phase}"
         if plan.run_id in _profile_windows_scheduled:
-            return plan, phase
+            return plan, phase, f"plan_active_{phase}"
         if plan.workload == WORKLOAD_HTML_SSR_CPU_PROFILE_20S:
             # This workload's profile must be armed by a bound prearm or OFF
             # request and start on the event-loop ON edge. An ON request may
             # not shift the capture start or rescue a missing edge callback.
             _consumed_run_ids.add(plan.run_id)
-            return plan, phase
+            return plan, phase, f"plan_active_{phase}"
         cls._start_for_plan(plan, loop, now_ms=now_ms)
-        return plan, phase
+        return plan, phase, f"plan_active_{phase}"
 
     def stop(self) -> None:
         global _active_profile

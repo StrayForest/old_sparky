@@ -51,11 +51,16 @@
   needed before a risky operation. Repeat an expensive check only after fixing
   the cause it exposed.
 - For every fix, update the affected operational instructions or scripts in
-  the same change before declaring it done. Replace obsolete commands and
-  steps rather than appending a postmortem. Keep operational runbooks actionable
-  with exact commands, required inputs and source bindings, validation and
-  success criteria, and abort and cleanup steps; omit investigation history
-  and implementation chronology.
+  the same change before declaring the corresponding stage done. When you find
+  a stale, wrong or ambiguous instruction, or a repeated failure that reveals
+  one, identify its owner document and repair it in the same task. Distinguish
+  a documentation defect from an execution error against a correct instruction;
+  for the latter, follow the existing procedure and do not add redundant rules.
+  Replace obsolete commands and steps rather than appending a postmortem. Keep
+  operational runbooks actionable with exact commands, required inputs and
+  source bindings, validation and success criteria, and abort and cleanup
+  steps; omit investigation history and implementation chronology. See
+  `platform/docs/documentation-governance.md` for the maintenance workflow.
 - Define behavior, owner layer, permissions, data impact, rollback risk and
   focused tests before changing behavior. Put test placement and gate ownership
   in `platform/docs/test-suite-governance.md`.

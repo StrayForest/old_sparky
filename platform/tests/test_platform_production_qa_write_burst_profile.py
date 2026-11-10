@@ -643,6 +643,7 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
             [
                 "request_perf request_id=one method=GET path=/api/v1/tournaments/demo/workspace "
                 "route=/tournaments/{slug}/workspace status=200 total_ms=125.00 sql_ms=80.00 "
+                "diagnostic_activation=trace_absent "
                 "sql_count=6 max_sql_ms=30.00 compute_ms=5.00 compute_blocks=1 "
                 "workspace_auth_ms=3.00 workspace_tournament_base_ms=20.00 "
                 "workspace_media_ms=4.00 workspace_access_ms=8.00 "
@@ -651,6 +652,7 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
                 "workspace_etag_ms=0.10 response_bytes=640 qa_phase=- pool_wait_ms=12.00",
                 "request_perf request_id=two method=GET path=/api/v1/tournaments/demo/workspace "
                 "route=/tournaments/{slug}/workspace status=200 total_ms=250.00 sql_ms=160.00 "
+                "diagnostic_activation=secret@example.test "
                 "sql_count=6 max_sql_ms=40.00 compute_ms=8.00 compute_blocks=1 "
                 "workspace_auth_ms=4.00 workspace_tournament_base_ms=30.00 "
                 "workspace_media_ms=5.00 workspace_access_ms=9.00 "
@@ -668,6 +670,10 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
         self.assertEqual(workspace["pool_checkout_wait_ms"]["p99_ms"], 19.92)
         self.assertEqual(workspace["workspace"]["workspace_auth_ms"]["avg_ms"], 3.5)
         self.assertEqual(workspace["workspace"]["workspace_bracket_ms"]["p95_ms"], 10.95)
+        self.assertEqual(
+            workspace["diagnostic_activation_counts"],
+            {"other": 1, "trace_absent": 1},
+        )
 
     def test_request_perf_summary_exposes_connection_hold_and_read_admission(self) -> None:
         summary = summarize_request_perf_logs(

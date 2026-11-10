@@ -35,6 +35,7 @@ from tools import platform_ssr_capacity_diagnostic as capacity_diagnostic
 from tools import platform_workflow_remote_dispatch as remote_dispatch
 from python_packages.platform_infra.performance_diagnostic import (
     ApiCpuDiagnostic,
+    DiagnosticPlan,
     authorize_html_request_perf_capture,
     parse_plan_payload,
 )
@@ -6815,9 +6816,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     patch.object(diagnostic_module, "_active_profile", None),
                     patch("asyncio.get_running_loop", return_value=object()),
                 ):
-                    bound_plan, phase = ApiCpuDiagnostic.activate_for_scope(scope)
+                    bound_plan, phase, activation = ApiCpuDiagnostic.activate_for_scope(scope)
                 self.assertIs(bound_plan, plan)
                 self.assertEqual(phase, "on")
+                self.assertEqual(activation, "plan_active_on")
                 usage_window.assert_called_once()
                 self.assertEqual(usage_window.call_args.args[:2], (plan, "on"))
                 self.assertIsNone(diagnostic_module._active_profile)
@@ -6875,7 +6877,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                         ),
                         patch("asyncio.get_running_loop", return_value=loop),
                     ):
-                        self.assertEqual(worker.ApiCpuDiagnostic.activate_for_scope(scope), (None, None))
+                        self.assertEqual(
+                            worker.ApiCpuDiagnostic.activate_for_scope(scope),
+                            (None, None, "prearm_accepted"),
+                        )
                     self.assertEqual([delay for delay, _callback in loop.calls], [52.0, 77.0, 77.0])
                     self.assertEqual(worker._profile_windows_scheduled, {plan.run_id})
                     self.assertIn((plan.run_id, "off"), worker._usage_windows_scheduled)
@@ -6982,7 +6987,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     patch.object(diagnostic_module.time, "time_ns", side_effect=lambda: clock["now_ms"] * 1_000_000),
                     patch("asyncio.get_running_loop", return_value=loop),
                 ):
-                    self.assertEqual(ApiCpuDiagnostic.activate_for_scope(scope), (None, None))
+                    self.assertEqual(
+                        ApiCpuDiagnostic.activate_for_scope(scope),
+                        (None, None, "prearm_accepted"),
+                    )
                 clock["now_ms"] = plan.on_start_ms + (251 if scenario == "late" else 0)
                 current = replacement if replacement is not None else plan
 
@@ -7113,7 +7121,8 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 ),
             ):
                 self.assertEqual(
-                    ApiCpuDiagnostic.activate_for_scope(wrong_marker_scope), (None, None),
+                    ApiCpuDiagnostic.activate_for_scope(wrong_marker_scope),
+                    (None, None, "run_mismatch"),
                 )
             self.assertFalse(prearm_loop.calls)
 
@@ -7129,7 +7138,10 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 ),
                 patch("asyncio.get_running_loop", return_value=prearm_loop),
             ):
-                self.assertEqual(ApiCpuDiagnostic.activate_for_scope(prearm_scope), (None, None))
+                self.assertEqual(
+                    ApiCpuDiagnostic.activate_for_scope(prearm_scope),
+                    (None, None, "prearm_accepted"),
+                )
             self.assertEqual([delay for delay, _callback in prearm_loop.calls], [52.0, 77.0])
             self.assertEqual(diagnostic_module._usage_windows_scheduled, plan_keys)
             self.assertFalse(plan_keys & diagnostic_module._usage_windows_started)
@@ -9151,7 +9163,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             sent.append(message)
 
         with (
-            patch("python_packages.platform_infra.performance.ApiCpuDiagnostic.activate_for_scope", return_value=(None, None)),
+            patch("python_packages.platform_infra.performance.ApiCpuDiagnostic.activate_for_scope", return_value=(None, None, "prearm_accepted")),
             patch("python_packages.platform_infra.performance.authorize_html_request_perf_capture", return_value=(plan, "on", True)),
             patch(
                 "python_packages.platform_infra.performance.get_settings",
@@ -9171,7 +9183,9 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         info.assert_called_once()
         self.assertIn("request_perf request_id=%s", info.call_args.args[0])
         self.assertIn("request_perf_selection=%s", info.call_args.args[0])
+        self.assertTrue(info.call_args.args[0].endswith("request_perf_sample_interval=%s%s%s"))
         self.assertIn("diagnostic_plan", info.call_args.args)
+        self.assertEqual(info.call_args.args[-1], " diagnostic_activation=prearm_accepted")
         self.assertIn("/api/v1/tournaments/{slug}/workspace", info.call_args.args)
         self.assertNotIn("private-fixture-slug", info.call_args.args)
 
@@ -9373,11 +9387,16 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         with patch(
             "python_packages.platform_infra.performance_diagnostic.read_process_plan",
             return_value=None,
-        ) as read_plan:
-            plan, phase = ApiCpuDiagnostic.activate_for_scope(scope)
+        ) as read_plan, patch(
+            "python_packages.platform_infra.performance_diagnostic._read_process_plan_for_cpu_prearm",
+            return_value=None,
+        ) as read_prearm:
+            plan, phase, activation = ApiCpuDiagnostic.activate_for_scope(scope)
             self.assertIsNone(plan)
             self.assertIsNone(phase)
+            self.assertEqual(activation, "no_valid_plan")
             read_plan.assert_called_once_with("api")
+            read_prearm.assert_called_once_with()
         for method, path, headers in (
             ("POST", "/api/v1/tournaments/safe-slug/workspace", [(b"x-platform-ssr-trace", b"1")]),
             ("GET", "/api/v1/tournaments/safe-slug/workspace", []),
@@ -9386,10 +9405,33 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         ):
             rejected_scope = {**scope, "method": method, "path": path, "headers": headers}
             with patch(
-                "python_packages.platform_infra.performance_diagnostic.read_process_plan"
+                "python_packages.platform_infra.performance_diagnostic.read_process_plan",
+                return_value=None,
             ) as read_plan:
-                self.assertEqual(ApiCpuDiagnostic.activate_for_scope(rejected_scope), (None, None))
+                self.assertEqual(
+                    ApiCpuDiagnostic.activate_for_scope(rejected_scope),
+                    (None, None, "trace_absent") if method == "GET" and path.endswith("workspace") and not headers
+                    else (None, None, "trace_invalid") if method == "GET" and path.endswith("workspace")
+                    else (None, None, None),
+                )
                 read_plan.assert_not_called()
+
+        outside_plan_payload = _diagnostic_payload()
+        outside_plan_payload["run_id"] = "d" * 32
+        outside_plan = parse_plan_payload(
+            _canonical_payload(outside_plan_payload), expected_service="api",
+        )
+        with (
+            patch(
+                "python_packages.platform_infra.performance_diagnostic.read_process_plan",
+                return_value=outside_plan,
+            ),
+            patch.object(DiagnosticPlan, "phase_at", return_value=None),
+        ):
+            self.assertEqual(
+                ApiCpuDiagnostic.activate_for_scope(scope),
+                (None, None, "outside_phase"),
+            )
 
     def test_profile_summary_exports_only_allowlisted_names_and_fixed_categories(self) -> None:
         import cProfile
@@ -9519,17 +9561,19 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         ) as emit_event, patch.object(
             diagnostic_module, "_read_process_plan_uncached", return_value=plan,
         ) as revalidate:
-            bound_plan, phase = ApiCpuDiagnostic.activate_for_scope(scope)
+            bound_plan, phase, activation = ApiCpuDiagnostic.activate_for_scope(scope)
             self.assertIs(bound_plan, plan)
             self.assertEqual(phase, "on")
+            self.assertEqual(activation, "plan_active_on")
             active = diagnostic_module._active_profile
             self.assertIsNotNone(active)
             self.assertIsNotNone(active.profile)
             self.assertIsNotNone(active.stop_handle)
             sum(range(5_000))
-            second_plan, second_phase = ApiCpuDiagnostic.activate_for_scope(scope)
+            second_plan, second_phase, second_activation = ApiCpuDiagnostic.activate_for_scope(scope)
             self.assertIs(second_plan, plan)
             self.assertEqual(second_phase, "on")
+            self.assertEqual(second_activation, "plan_active_on")
             self.assertIs(diagnostic_module._active_profile, active)
             clock["now_ms"] = plan.on_end_ms
             active.stop()

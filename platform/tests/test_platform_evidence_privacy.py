@@ -1300,6 +1300,11 @@ class EvidencePrivacyTests(unittest.TestCase):
                         "sample_interval": 16,
                         "client_identity": "Authorization Bearer secret-token",
                     },
+                    "diagnostic_activation_counts": {
+                        "trace_absent": 2,
+                        "plan_active_on": 1,
+                        "private-route-value": 50,
+                    },
                     "authenticated_read_admission_shed": {
                         "observed": 4,
                         "shed": 2,
@@ -1311,6 +1316,11 @@ class EvidencePrivacyTests(unittest.TestCase):
                     "by_route": {
                         "tournament_workspace": {
                             "requests": 4,
+                            "diagnostic_activation_counts": {
+                                "trace_invalid": 1,
+                                "no_valid_plan": 2,
+                                "operator@example.test": 100,
+                            },
                             "authenticated_read_admission_shed": {
                                 "observed": 4,
                                 "shed": 2,
@@ -1369,6 +1379,16 @@ class EvidencePrivacyTests(unittest.TestCase):
         request_perf = report["server_request_perf_logs"]
         self.assertEqual(request_perf["scope"], "diagnostic_sample")
         self.assertEqual(
+            request_perf["diagnostic_activation_counts"],
+            {"plan_active_on": 1, "trace_absent": 2},
+        )
+        self.assertEqual(
+            request_perf["by_route"]["tournament_workspace"][
+                "diagnostic_activation_counts"
+            ],
+            {"no_valid_plan": 2, "trace_invalid": 1},
+        )
+        self.assertEqual(
             request_perf["ready_vote_cpu_pressure_percent"]["max_percent"], 80.5
         )
         self.assertEqual(
@@ -1405,6 +1425,10 @@ class EvidencePrivacyTests(unittest.TestCase):
             request_perf["by_route"]["tournament_workspace"],
             {
                 "requests": 4,
+                "diagnostic_activation_counts": {
+                    "no_valid_plan": 2,
+                    "trace_invalid": 1,
+                },
                 "authenticated_read_admission_shed": {
                     "observed": 4,
                     "shed": 2,

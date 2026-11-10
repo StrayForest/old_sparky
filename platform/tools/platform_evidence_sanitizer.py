@@ -995,6 +995,18 @@ PUBLIC_QUEUE_NAMES = frozenset(
 PUBLIC_CPU_CORE_KEYS = frozenset(f"cpu{index}" for index in range(256))
 PUBLIC_OBSERVER_TIMELINE_LIMIT = 4096
 PUBLIC_CLIENT_RESOURCE_SAMPLE_LIMIT = 4096
+PUBLIC_DIAGNOSTIC_ACTIVATION_OUTCOMES = frozenset({
+    "trace_absent",
+    "trace_invalid",
+    "no_valid_plan",
+    "run_mismatch",
+    "outside_phase",
+    "prearm_accepted",
+    "event_loop_unavailable",
+    "plan_active_off",
+    "plan_active_on",
+    "other",
+})
 PUBLIC_REQUEST_PERF_STAGES = frozenset(
     {
         "auth_bootstrap_auth_query_ms",
@@ -1743,6 +1755,12 @@ def _project_summary(value: Any) -> dict[str, Any]:
     )
     if request_perf_sampling:
         output["request_perf_sampling"] = request_perf_sampling
+    diagnostic_activation_counts = _project_counter(
+        source.get("diagnostic_activation_counts"),
+        PUBLIC_DIAGNOSTIC_ACTIVATION_OUTCOMES,
+    )
+    if diagnostic_activation_counts:
+        output["diagnostic_activation_counts"] = diagnostic_activation_counts
     admission_shed = _project_admission_shed_counts(
         source.get("authenticated_read_admission_shed")
     )

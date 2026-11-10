@@ -67,6 +67,17 @@ For a code, workflow, deployment, instruction or skill change:
    copyable, every mutation should be marked, and every unresolved action
    should have an owner.
 
+When work exposes a stale, incorrect or ambiguous instruction, or a repeated
+failure shows that an instruction is incomplete, trace it to its owner document
+and repair that document or its owning script in the same task before declaring
+the affected stage complete. First distinguish a documentation defect from an
+execution error against a correct procedure: in the latter case, follow the
+existing procedure and do not add duplicate rules or checks. Replace obsolete
+steps instead of appending an incident narrative. Make operational instructions
+reproducible: state exact commands, required inputs and source bindings,
+validation and success criteria, and abort and cleanup steps. Keep unrelated
+work moving when the documentation repair does not block it.
+
 ## Verification
 
 From `platform/`, run:

@@ -51,6 +51,7 @@ class RequestPerformanceMiddlewareTests(unittest.TestCase):
         rendered = log_info.call_args.args[0] % log_info.call_args.args[1:]
         self.assertIn("response_bytes=320 qa_phase=-", rendered)
         self.assertIn("pool_wait_ms=0.00 cf_ray=- client=-", rendered)
+        self.assertNotIn("diagnostic_activation=", rendered)
 
     def test_fast_reads_are_not_logged_by_mutation_rule(self) -> None:
         middleware = performance.RequestPerformanceMiddleware(app=None)
@@ -468,6 +469,8 @@ class RequestPerformanceMiddlewareTests(unittest.TestCase):
         middleware = performance.RequestPerformanceMiddleware(app=None)
         metrics = self.metrics(method="GET")
         metrics.started_at = perf_counter() - 2.0
+        metrics.path = "/api/v1/tournaments/demo/workspace"
+        metrics.diagnostic_activation = "trace_absent"
         diagnostic_id = "tdiag-123-00001"
         with (
             patch.object(performance, "get_settings", return_value=self.settings()),
@@ -487,6 +490,7 @@ class RequestPerformanceMiddlewareTests(unittest.TestCase):
         log_info.assert_called_once()
         rendered = log_info.call_args.args[0] % log_info.call_args.args[1:]
         self.assertIn("request_perf request_id=request", rendered)
+        self.assertIn("diagnostic_activation=trace_absent", rendered)
         self.assertNotIn("diagnostic_id=", rendered)
         self.assertNotIn(diagnostic_id, rendered)
 

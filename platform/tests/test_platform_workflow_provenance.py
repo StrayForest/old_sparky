@@ -712,6 +712,31 @@ class WorkflowProvenanceTests(unittest.TestCase):
             {"no_op": True, "runtime_required": False},
         )
 
+        bootstrap_paths_with_guide = [
+            ".github/workflows/platform-production-deploy.yml",
+            "AGENTS.md",
+        ]
+        bootstrap_with_guide = classify(
+            bootstrap_paths_with_guide,
+            event="push",
+            branch="dev",
+            target_sha=self.SHA,
+        )
+        bootstrap_no_op_with_guide = classify_cumulative_baseline(
+            bootstrap_with_guide,
+            bootstrap_paths_with_guide,
+            expected_target_sha=self.SHA,
+        )
+        self.assertTrue(bootstrap_no_op_with_guide["no_op"])
+        self.assertEqual(
+            bootstrap_no_op_with_guide["manifest"]["files"],
+            sorted(bootstrap_paths_with_guide),
+        )
+        self.assertEqual(
+            validate_cumulative_reconcile_route(bootstrap_no_op_with_guide),
+            {"no_op": True, "runtime_required": False},
+        )
+
         docs_path = "platform/docs/operations-runbook.md"
         docs_incremental = classify(
             [docs_path], event="push", branch="dev", target_sha=self.SHA
@@ -726,6 +751,28 @@ class WorkflowProvenanceTests(unittest.TestCase):
         self.assertTrue(docs_no_op["no_op"])
         self.assertEqual(
             validate_cumulative_reconcile_route(docs_no_op),
+            {"no_op": True, "runtime_required": False},
+        )
+
+        docs_paths_with_guide = [docs_path, "AGENTS.md"]
+        docs_with_guide = classify(
+            docs_paths_with_guide,
+            event="push",
+            branch="dev",
+            target_sha=self.SHA,
+        )
+        docs_no_op_with_guide = classify_cumulative_baseline(
+            docs_with_guide,
+            docs_paths_with_guide,
+            expected_target_sha=self.SHA,
+        )
+        self.assertTrue(docs_no_op_with_guide["no_op"])
+        self.assertEqual(
+            docs_no_op_with_guide["manifest"]["files"],
+            sorted(docs_paths_with_guide),
+        )
+        self.assertEqual(
+            validate_cumulative_reconcile_route(docs_no_op_with_guide),
             {"no_op": True, "runtime_required": False},
         )
 
@@ -780,10 +827,9 @@ class WorkflowProvenanceTests(unittest.TestCase):
 
         # The exact active-X to prospective-D range includes one known root
         # guide alongside the previously unshipped app/runtime and rollback
-        # changes. The normal event classifier must continue to fail closed;
-        # only cumulative reconciliation may treat the guide as non-artifact
-        # documentation, and only because the remaining range is already a
-        # canonical runtime-sensitive deployable release.
+        # changes. The guide remains in the manifest, while the recognized
+        # route and its runtime-sensitive classification come from the other
+        # paths.
         x_to_c_paths = [
             ".github/workflows/platform-draft-cloudflare.yml",
             "AGENTS.md",
@@ -829,8 +875,9 @@ class WorkflowProvenanceTests(unittest.TestCase):
             branch="dev",
             target_sha=self.SHA,
         )
-        self.assertTrue(direct_event_route["fallback"])
-        self.assertFalse(direct_event_route["deployable"])
+        self.assertFalse(direct_event_route["fallback"])
+        self.assertTrue(direct_event_route["deployable"])
+        self.assertTrue(direct_event_route["runtime_sensitive"])
 
         without_root_guide = [
             path for path in x_to_prospective_d_paths if path != "AGENTS.md"
@@ -870,17 +917,21 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 unknown_mixed,
                 expected_target_sha=self.SHA,
             )
-        with self.assertRaises(ProvenanceError):
-            classify_cumulative_baseline(
-                classify(
-                    ["platform/tools/platform_recovery_bootstrap.py"],
-                    event="push",
-                    branch="dev",
-                    target_sha=self.SHA,
-                ),
-                ["AGENTS.md", "platform/tools/platform_recovery_bootstrap.py"],
-                expected_target_sha=self.SHA,
-            )
+        recovery_with_guide = classify_cumulative_baseline(
+            classify(
+                ["platform/tools/platform_recovery_bootstrap.py"],
+                event="push",
+                branch="dev",
+                target_sha=self.SHA,
+            ),
+            ["AGENTS.md", "platform/tools/platform_recovery_bootstrap.py"],
+            expected_target_sha=self.SHA,
+        )
+        self.assertTrue(recovery_with_guide["no_op"])
+        self.assertEqual(
+            validate_cumulative_reconcile_route(recovery_with_guide),
+            {"no_op": True, "runtime_required": False},
+        )
 
         tampered_deployable = dict(prospective_d_manifest)
         tampered_deployable["files"] = sorted(
@@ -1154,6 +1205,22 @@ class WorkflowProvenanceTests(unittest.TestCase):
             {"no_op": True, "runtime_required": False},
         )
 
+        actual16_paths_with_guide = [*historical_storage_paths, "AGENTS.md"]
+        actual16_with_guide = classify_cumulative_baseline(
+            historical_incremental,
+            actual16_paths_with_guide,
+            expected_target_sha=self.SHA,
+        )
+        self.assertTrue(actual16_with_guide["no_op"])
+        self.assertEqual(
+            actual16_with_guide["manifest"]["files"],
+            sorted(actual16_paths_with_guide),
+        )
+        self.assertEqual(
+            validate_cumulative_reconcile_route(actual16_with_guide),
+            {"no_op": True, "runtime_required": False},
+        )
+
         source_fix_incremental = classify(
             [
                 "platform/tests/test_platform_workflow_provenance.py",
@@ -1295,6 +1362,28 @@ class WorkflowProvenanceTests(unittest.TestCase):
             classify_cumulative_baseline(
                 incremental, [candidate_path], expected_target_sha=self.SHA
             )
+
+        candidate_paths_with_guide = [*candidate_paths, "AGENTS.md"]
+        candidate_with_guide = classify(
+            candidate_paths_with_guide,
+            event="push",
+            branch="dev",
+            target_sha=self.SHA,
+        )
+        candidate_no_op_with_guide = classify_cumulative_baseline(
+            candidate_with_guide,
+            candidate_paths_with_guide,
+            expected_target_sha=self.SHA,
+        )
+        self.assertTrue(candidate_no_op_with_guide["no_op"])
+        self.assertEqual(
+            candidate_no_op_with_guide["manifest"]["files"],
+            sorted(candidate_paths_with_guide),
+        )
+        self.assertEqual(
+            validate_cumulative_reconcile_route(candidate_no_op_with_guide),
+            {"no_op": True, "runtime_required": False},
+        )
 
         mixed_candidate_and_application = classify_cumulative_baseline(
             incremental,

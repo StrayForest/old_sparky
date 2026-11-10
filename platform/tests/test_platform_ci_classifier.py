@@ -37,6 +37,7 @@ from tools.platform_ci_classifier import (
     SECURITY_WORKFLOW_NAME,
     SECURITY_WORKFLOW_PATH,
     classify,
+    classify_cumulative_baseline_paths,
     _is_same_repository_dev_pr,
     manifest_digest,
     validate_security_workflow_run,
@@ -379,6 +380,32 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertFalse(manifest["runtime_sensitive"])
         self.assertFalse(manifest["deployable"])
         validate_manifest(manifest, expected_target_sha=self.TARGET_SHA)
+
+        candidate_with_guide = classify(
+            sorted(codex_files | {"AGENTS.md"}),
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(candidate_with_guide["class"], "full")
+        self.assertEqual(candidate_with_guide["expected_gates"], list(FULL_GATE_IDS))
+        self.assertEqual(candidate_with_guide["reason"], CANDIDATE_PACKAGING_REASON)
+        self.assertFalse(candidate_with_guide["fallback"])
+        self.assertFalse(candidate_with_guide["runtime_sensitive"])
+        self.assertFalse(candidate_with_guide["deployable"])
+        validate_manifest(candidate_with_guide, expected_target_sha=self.TARGET_SHA)
+        with tempfile.TemporaryDirectory() as temporary:
+            candidate_archive = self._write_production_classifier_archive(
+                Path(temporary), candidate_with_guide
+            )
+            self.assertEqual(
+                validate_production_classifier_manifest(
+                    candidate_archive,
+                    target_sha=self.TARGET_SHA,
+                    require_candidate_packaging=True,
+                ),
+                candidate_with_guide,
+            )
 
         mixed_runtime = classify(
             [
@@ -873,6 +900,88 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertFalse(manifest["fallback"])
         validate_manifest(manifest, expected_target_sha=self.TARGET_SHA)
 
+        guide_only = classify(
+            ["AGENTS.md"],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(guide_only["class"], "out-of-scope")
+        self.assertEqual(guide_only["expected_gates"], list(OUT_OF_SCOPE_GATE_IDS))
+        self.assertFalse(guide_only["fallback"])
+        self.assertFalse(guide_only["deployable"])
+        with tempfile.TemporaryDirectory() as temporary:
+            guide_archive = self._write_production_classifier_archive(
+                Path(temporary), guide_only
+            )
+            self.assertEqual(
+                validate_production_classifier_manifest(
+                    guide_archive,
+                    target_sha=self.TARGET_SHA,
+                    allow_out_of_scope=True,
+                ),
+                guide_only,
+            )
+
+        api_with_guide = classify(
+            ["AGENTS.md", "platform/python_packages/platform_infra/performance_diagnostic.py"],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(api_with_guide["class"], "full")
+        self.assertEqual(api_with_guide["expected_gates"], list(FULL_GATE_IDS))
+        self.assertFalse(api_with_guide["fallback"])
+        self.assertFalse(api_with_guide["runtime_sensitive"])
+        self.assertTrue(api_with_guide["deployable"])
+        validate_manifest(api_with_guide, expected_target_sha=self.TARGET_SHA)
+        with tempfile.TemporaryDirectory() as temporary:
+            api_archive = self._write_production_classifier_archive(
+                Path(temporary), api_with_guide
+            )
+            self.assertEqual(
+                validate_production_classifier_manifest(
+                    api_archive,
+                    target_sha=self.TARGET_SHA,
+                ),
+                api_with_guide,
+            )
+
+        recovery_with_guide_paths = [
+            "AGENTS.md",
+            "platform/tools/platform_cpu_diagnostic_pair.py",
+        ]
+        recovery_with_guide = classify(
+            recovery_with_guide_paths,
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        cumulative_recovery_with_guide = classify_cumulative_baseline_paths(
+            recovery_with_guide_paths,
+            target_sha=self.TARGET_SHA,
+        )
+        for recovery in (recovery_with_guide, cumulative_recovery_with_guide):
+            self.assertEqual(recovery["class"], "full")
+            self.assertEqual(recovery["expected_gates"], list(FULL_GATE_IDS))
+            self.assertEqual(recovery["reason"], RECOVERY_BOOTSTRAP_REASON)
+            self.assertFalse(recovery["fallback"])
+            self.assertFalse(recovery["runtime_sensitive"])
+            self.assertFalse(recovery["deployable"])
+            validate_manifest(recovery, expected_target_sha=self.TARGET_SHA)
+        with tempfile.TemporaryDirectory() as temporary:
+            recovery_archive = self._write_production_classifier_archive(
+                Path(temporary), recovery_with_guide
+            )
+            self.assertEqual(
+                validate_production_classifier_manifest(
+                    recovery_archive,
+                    target_sha=self.TARGET_SHA,
+                    require_reconcile_source=True,
+                ),
+                recovery_with_guide,
+            )
+
     def test_unknown_global_dependency_and_merge_events_fail_closed(self) -> None:
         unknown = classify(
             ["new-root-build-config.toml"],
@@ -884,6 +993,14 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertTrue(unknown["fallback"])
         self.assertTrue(unknown["runtime_sensitive"])
         self.assertFalse(unknown["deployable"])
+        with tempfile.TemporaryDirectory() as temporary:
+            unknown_archive = self._write_production_classifier_archive(
+                Path(temporary), unknown
+            )
+            with self.assertRaises(ClassifierArtifactError):
+                validate_production_classifier_manifest(
+                    unknown_archive, target_sha=self.TARGET_SHA
+                )
 
         merge_group = classify(
             ["platform/docs/CURRENT.md"],
@@ -1661,6 +1778,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
             auto,
         )
         production = PRODUCTION_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("route_files_without_root_guide", production)
         self.assertEqual(
             production.count("manifest_args+=(--require-reconcile-source --allow-docs-only)"),
             1,
@@ -3228,6 +3346,25 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 ),
                 manifest,
             )
+            docs_with_guide = classify(
+                [*files, "AGENTS.md"],
+                event="push",
+                target_sha=self.TARGET_SHA,
+                branch="dev",
+            )
+            docs_with_guide_root = root / "with-guide"
+            docs_with_guide_root.mkdir()
+            docs_with_guide_archive = self._write_production_classifier_archive(
+                docs_with_guide_root, docs_with_guide
+            )
+            self.assertEqual(
+                validate_production_classifier_manifest(
+                    docs_with_guide_archive,
+                    target_sha=self.TARGET_SHA,
+                    require_docs_only=True,
+                ),
+                docs_with_guide,
+            )
             self.assertEqual(
                 validate_production_classifier_manifest(
                     archive,
@@ -3466,6 +3603,26 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     target_sha=self.TARGET_SHA,
                     require_reconcile_source=True,
                 )
+
+            storage_with_guide = classify(
+                [*files, "AGENTS.md"],
+                event="push",
+                target_sha=self.TARGET_SHA,
+                branch="dev",
+            )
+            self.assertEqual(storage_with_guide["reason"], STORAGE_OPERATIONS_REASON)
+            self.assertTrue(storage_with_guide["runtime_sensitive"])
+            self.assertFalse(storage_with_guide["deployable"])
+            storage_with_guide_archive = self._write_production_classifier_archive(
+                root, storage_with_guide
+            )
+            self.assertEqual(
+                validate_production_classifier_manifest(
+                    storage_with_guide_archive,
+                    target_sha=self.TARGET_SHA,
+                ),
+                storage_with_guide,
+            )
 
             inconsistent = dict(manifest)
             inconsistent["runtime_sensitive"] = False

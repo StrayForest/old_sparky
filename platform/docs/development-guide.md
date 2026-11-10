@@ -219,6 +219,11 @@ deterministic suite but can never authorize deployment. The classifier and
 manifest schema are maintained in the [canonical classifier source](../tools/platform_ci_classifier.py);
 the [security workflow](../../.github/workflows/platform-security.yml)
 and both release consumers validate the exact manifest before side effects.
+The exact root `AGENTS.md` may accompany a recognized changed-file route: the
+classifier preserves the route formed by the other paths and keeps `AGENTS.md`
+in the manifest. This does not promote recovery-bootstrap, candidate-packaging,
+storage or out-of-scope no-op routes; an unknown additional path still triggers
+the fail-closed full fallback. `AGENTS.md` alone remains out-of-scope.
 
 ## Commit and push safety
 

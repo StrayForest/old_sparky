@@ -464,11 +464,7 @@ explicit overload code at most twice with full bounded jitter, then shows a
 temporary busy message and a short cooldown. Authentication, CSRF, validation,
 eligibility, closed-round and other business errors are never retried.
 
-Performance reports keep full-population HTTP client measurements separate from
-the diagnostic `request_perf` journal sample. The client summary covers every
-request issued by the QA phase; server request metrics include only lines
-selected by the existing slow-request/failure/diagnostic logging policy and
-must not be interpreted as a population count.
+Performance reports keep full-population HTTP client measurements separate from the diagnostic `request_perf` journal sample. The client summary covers every request issued by the QA phase; server request metrics include only lines selected by the existing slow-request/failure/diagnostic logging policy and must not be interpreted as a population count. Sampled API workspace requests may include the closed `diagnostic_activation` outcome: `plan_active_off`/`plan_active_on` means only that the request trace and plan matched an accepted phase, not that profiling or journal capture succeeded. Other values are bounded activation decisions such as an absent/invalid trace, no valid plan, run mismatch, or prearming; no trace ID or header value is logged, non-workspace requests omit the field, and aggregate counts cover only the selected sample.
 
 The external Ready Vote fixture creates and joins every tournament before it
 starts any Ready Check. This keeps the first tournament's ten-minute manual

@@ -35,6 +35,7 @@ if __package__:
         STORAGE_OPERATIONS_REASON,
         _is_out_of_scope,
         _is_storage_operations_only,
+        route_files_without_root_guide,
     )
 else:  # Executed as a script under Python isolated mode on a runner.
     _TRUSTED_TOOLS_PACKAGE = "_oldsparky_trusted_platform_tools"
@@ -60,6 +61,7 @@ else:  # Executed as a script under Python isolated mode on a runner.
     STORAGE_OPERATIONS_REASON = _CI_CLASSIFIER_MODULE.STORAGE_OPERATIONS_REASON
     _is_out_of_scope = _CI_CLASSIFIER_MODULE._is_out_of_scope
     _is_storage_operations_only = _CI_CLASSIFIER_MODULE._is_storage_operations_only
+    route_files_without_root_guide = _CI_CLASSIFIER_MODULE.route_files_without_root_guide
 
 
 MAX_JSON_BYTES = 4 * 1024 * 1024
@@ -483,23 +485,25 @@ def _manifest_digest(manifest: Mapping[str, Any]) -> str:
 
 
 def _is_recovery_bootstrap_only(files: Sequence[object]) -> bool:
+    route_files = route_files_without_root_guide(files)
     return bool(
-        any(path in RECOVERY_BOOTSTRAP_FILES for path in files)
+        any(path in RECOVERY_BOOTSTRAP_FILES for path in route_files)
         and all(
             path in RECOVERY_BOOTSTRAP_FILES
             or (isinstance(path, str) and path.startswith(DOCS_PREFIX))
-            for path in files
+            for path in route_files
         )
     )
 
 
 def _is_candidate_packaging_only(files: Sequence[object]) -> bool:
+    route_files = route_files_without_root_guide(files)
     return bool(
-        any(path in CANDIDATE_PACKAGING_FILES for path in files)
+        any(path in CANDIDATE_PACKAGING_FILES for path in route_files)
         and all(
             path in CANDIDATE_PACKAGING_FILES
             or (isinstance(path, str) and path.startswith(DOCS_PREFIX))
-            for path in files
+            for path in route_files
         )
     )
 
@@ -509,7 +513,10 @@ def _is_docs_only(files: Sequence[object]) -> bool:
         return False
     if len(files) != len(set(files)):
         return False
-    for path in files:
+    route_files = route_files_without_root_guide(files)
+    if not route_files:
+        return False
+    for path in route_files:
         if not path.startswith("platform/docs/") or "\\" in path:
             return False
         components = path.split("/")

@@ -68,6 +68,7 @@ from apps.platform_api.app.services.tournament_participant_capacity import (
     ensure_participant_slot_claimed,
 )
 from tools.platform_evidence_sanitizer import (
+    PUBLIC_DIAGNOSTIC_ACTIVATION_OUTCOMES,
     SAFE_ROUTE_CLASSES,
     finite_number,
     safe_backend,
@@ -1885,6 +1886,13 @@ def parse_request_perf_line(line: str) -> dict[str, Any] | None:
             continue
         with suppress(ValueError):
             values[key] = caster(values[key])
+    if "diagnostic_activation" in values:
+        raw_activation = values["diagnostic_activation"]
+        values["diagnostic_activation"] = (
+            raw_activation
+            if raw_activation in PUBLIC_DIAGNOSTIC_ACTIVATION_OUTCOMES
+            else "other"
+        )
     if "authenticated_read_admission_shed" in values:
         shed_value = values["authenticated_read_admission_shed"]
         if shed_value in {"True", "1"}:
@@ -2019,6 +2027,14 @@ def summarize_request_perf_logs(
             "not_shed": len(observed) - sum(observed),
             "unknown": len(row_values) - len(observed),
         }
+
+    def diagnostic_activation_counts(row_values: list[dict[str, Any]]) -> dict[str, int]:
+        counts = Counter(
+            row["diagnostic_activation"]
+            for row in row_values
+            if row.get("diagnostic_activation") in PUBLIC_DIAGNOSTIC_ACTIVATION_OUTCOMES
+        )
+        return dict(sorted(counts.items()))
 
     def non_sql_after_pool_time(row: dict[str, Any]) -> float:
         return max(
@@ -2159,6 +2175,7 @@ def summarize_request_perf_logs(
             if any(isinstance(row.get(key), (int, float)) for row in row_values)
         }
         ready_vote_units = ready_vote_unit_summary(row_values)
+        activation_counts = diagnostic_activation_counts(row_values)
         workspace_stages = {
             key: row_metric_stats(key, row_values)
             for key in WORKSPACE_PERF_KEYS
@@ -2166,6 +2183,7 @@ def summarize_request_perf_logs(
         }
         return {
             "requests": len(row_values),
+            **({"diagnostic_activation_counts": activation_counts} if activation_counts else {}),
             "total": row_metric_stats("request_ms", row_values),
             "request": row_metric_stats("request_ms", row_values),
             "avg_sql_queries_per_request": round(
@@ -2218,6 +2236,7 @@ def summarize_request_perf_logs(
             },
         }
 
+    activation_counts = diagnostic_activation_counts(rows)
     summary = {
         "logged_requests": len(rows),
         "scope": diagnostic_scope,
@@ -2234,6 +2253,7 @@ def summarize_request_perf_logs(
         "pool_connection_hold_ms": metric_stats(pool_hold_times),
         "authenticated_read_admission_wait_ms": metric_stats(admission_wait_times),
         "authenticated_read_admission_shed": admission_shed_counts(rows),
+        **({"diagnostic_activation_counts": activation_counts} if activation_counts else {}),
         "non_sql_after_pool_time": metric_stats([
             non_sql_after_pool_time(row)
             for row in rows

@@ -101,8 +101,7 @@ to `dev`. The chain is:
 
 This automatic-only path authenticates exact source/caller/parent attempts, the pinned host baseline and its deployment proof, plus first-parent ancestry to `dev`.
 Classification follows event ownership (the bundled live-QA installer stays full/runtime). Bootstrap-only is a verified no-op; deployable routes require canonical gates and exact-target runtime proof when sensitive. When reconciliation needs `baseline-runtime`, Auto dispatches it on the exact target; the guard verifies every canonical gate from the exact source Security attempt, then the proof run reuses those results and must pass both runtime gates before its distinct status and receipt complete. Operators never dispatch this proof manually.
-The finalizer preserves push context. Cumulative baseline-to-target classification recognizes root `AGENTS.md` as a non-artifact companion only if removing it yields a canonical, deployable, runtime-sensitive `full` route.
-The cumulative manifest still binds `AGENTS.md`; normal event classification, unknown paths and bootstrap-only no-op rules remain fail-closed.
+The finalizer preserves push context. The exact root `AGENTS.md` is a non-artifact companion only when the remaining paths already form a recognized route; the manifest still binds the guide. Route selection preserves that underlying route, so recovery-bootstrap, candidate-packaging, storage and out-of-scope no-op rules remain intact. Unknown additional paths still trigger the fail-closed full fallback.
 
 Only marker-bound temporary ingress and lock files may precede comparison.
 Under both locks, the immutable supervisor checks tuple match, no pending

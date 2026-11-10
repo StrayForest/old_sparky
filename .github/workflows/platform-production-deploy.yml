@@ -1825,6 +1825,11 @@ jobs:
               raise SystemExit("no-backup no-op-only input is malformed")
           if no_backup_noop_only == "true":
               incremental_files = incremental.get("files")
+              incremental_route_files = (
+                  baseline_contract.route_files_without_root_guide(incremental_files)
+                  if isinstance(incremental_files, list)
+                  else []
+              )
               docs_only_incremental = bool(
                   incremental.get("class") == "docs-only"
                   and incremental.get("expected_gates") == list(baseline_contract.DOCS_ONLY_GATE_IDS)
@@ -1833,10 +1838,10 @@ jobs:
                   and incremental.get("deployable") is False
                   and incremental.get("reason") == baseline_contract.DOCS_ONLY_REASON
                   and isinstance(incremental_files, list)
-                  and bool(incremental_files)
+                  and bool(incremental_route_files)
                   and all(
                       isinstance(path, str) and path.startswith(baseline_contract.DOCS_PREFIX)
-                      for path in incremental_files
+                      for path in incremental_route_files
                   )
               )
               recovery_bootstrap_incremental = bool(
@@ -1847,8 +1852,8 @@ jobs:
                   and incremental.get("reason") == baseline_contract.RECOVERY_BOOTSTRAP_REASON
                   and isinstance(incremental_files, list)
                   and any(
-                      isinstance(path, str) and path in baseline_contract.RECOVERY_BOOTSTRAP_FILES
-                      for path in incremental_files
+                      path in baseline_contract.RECOVERY_BOOTSTRAP_FILES
+                      for path in incremental_route_files
                   )
                   and all(
                       isinstance(path, str)
@@ -1856,7 +1861,7 @@ jobs:
                           path in baseline_contract.RECOVERY_BOOTSTRAP_FILES
                           or path.startswith(baseline_contract.DOCS_PREFIX)
                       )
-                      for path in incremental_files
+                      for path in incremental_route_files
                   )
               )
               if not (docs_only_incremental or recovery_bootstrap_incremental):

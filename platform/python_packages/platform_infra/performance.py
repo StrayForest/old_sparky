@@ -14,6 +14,7 @@ from sqlalchemy import event
 from python_packages.platform_infra.config import get_settings
 from python_packages.platform_infra.performance_diagnostic import (
     ApiCpuDiagnostic,
+    DIAGNOSTIC_ACTIVATION_OUTCOMES,
     authorize_html_request_perf_capture,
 )
 
@@ -99,6 +100,7 @@ class RequestPerformanceMetrics:
     ready_vote_spans: dict[str, float] = field(default_factory=dict)
     diagnostic_run_id: str | None = None
     diagnostic_phase: str | None = None
+    diagnostic_activation: str | None = None
     diagnostic_request_perf_capture: bool = False
     diagnostic_plan_bound: bool = False
 
@@ -232,6 +234,7 @@ def start_request_metrics(
     client_fingerprint: str | None = None,
     diagnostic_run_id: str | None = None,
     diagnostic_phase: str | None = None,
+    diagnostic_activation: str | None = None,
 ) -> Token[RequestPerformanceMetrics | None]:
     metrics = RequestPerformanceMetrics(
         request_id=request_id or uuid4().hex[:12],
@@ -243,6 +246,11 @@ def start_request_metrics(
         client_fingerprint=client_fingerprint,
         diagnostic_run_id=diagnostic_run_id,
         diagnostic_phase=diagnostic_phase,
+        diagnostic_activation=(
+            diagnostic_activation
+            if diagnostic_activation in DIAGNOSTIC_ACTIVATION_OUTCOMES
+            else None
+        ),
     )
     return _current_metrics.set(metrics)
 
@@ -521,7 +529,9 @@ class RequestPerformanceMiddleware:
             await self.app(scope, receive, send)
             return
 
-        diagnostic_plan, diagnostic_phase = ApiCpuDiagnostic.activate_for_scope(scope)
+        diagnostic_plan, diagnostic_phase, diagnostic_activation = (
+            ApiCpuDiagnostic.activate_for_scope(scope)
+        )
         request_perf_plan, request_perf_phase, request_perf_eligible = authorize_html_request_perf_capture(
             scope, plan=diagnostic_plan,
         )
@@ -558,6 +568,7 @@ class RequestPerformanceMiddleware:
             ),
             diagnostic_run_id=diagnostic_plan.run_id if diagnostic_plan is not None else None,
             diagnostic_phase=diagnostic_phase,
+            diagnostic_activation=diagnostic_activation,
         )
         metrics = current_request_metrics()
         if metrics is not None:
@@ -723,7 +734,7 @@ class RequestPerformanceMiddleware:
             "response_bytes=%s qa_phase=%s "
             "pool_wait_ms=%.2f cf_ray=%s client=%s "
             "request_perf_selection=%s request_perf_completion_count=%s "
-            "request_perf_sample_interval=%s%s",
+            "request_perf_sample_interval=%s%s%s",
             metrics.request_id,
             metrics.method,
             safe_diagnostic_path if metrics.diagnostic_plan_bound else metrics.path,
@@ -814,6 +825,11 @@ class RequestPerformanceMiddleware:
                 f" diagnostic_run_id={metrics.diagnostic_run_id}"
                 f" diagnostic_phase={metrics.diagnostic_phase}"
                 if metrics.diagnostic_run_id is not None and metrics.diagnostic_phase is not None
+                else ""
+            ),
+            (
+                f" diagnostic_activation={metrics.diagnostic_activation}"
+                if metrics.diagnostic_activation in DIAGNOSTIC_ACTIVATION_OUTCOMES
                 else ""
             ),
         )

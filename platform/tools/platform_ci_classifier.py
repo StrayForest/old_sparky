@@ -431,9 +431,18 @@ def _is_out_of_scope(path: str) -> bool:
     return path in OUT_OF_SCOPE_EXACT or path.startswith(OUT_OF_SCOPE_PREFIXES)
 
 
+def route_files_without_root_guide(files: Sequence[str]) -> list[str]:
+    """Ignore only root AGENTS.md when another route path is present."""
+
+    if files.count("AGENTS.md") == 1 and len(files) > 1:
+        return [path for path in files if path != "AGENTS.md"]
+    return list(files)
+
+
 def _is_candidate_packaging_only(files: Sequence[str]) -> bool:
     """Return whether a path set is limited to candidate packaging/CI docs."""
 
+    files = route_files_without_root_guide(files)
     return bool(
         any(path in CANDIDATE_PACKAGING_FILES for path in files)
         and all(
@@ -446,6 +455,7 @@ def _is_candidate_packaging_only(files: Sequence[str]) -> bool:
 def _is_recovery_bootstrap_only(files: Sequence[str]) -> bool:
     """Return whether files are the closed recovery-bootstrap route plus docs."""
 
+    files = route_files_without_root_guide(files)
     return bool(
         any(path in RECOVERY_BOOTSTRAP_FILES for path in files)
         and all(
@@ -458,6 +468,7 @@ def _is_recovery_bootstrap_only(files: Sequence[str]) -> bool:
 def _is_storage_operations_only(files: Sequence[str]) -> bool:
     """Return whether files are the exact storage-operations route plus docs."""
 
+    files = route_files_without_root_guide(files)
     return bool(
         any(path in STORAGE_OPERATIONS_TRIGGER_FILES for path in files)
         and all(
@@ -657,11 +668,17 @@ def classify(
             runtime_sensitive=runtime_sensitive,
         )
 
-    route_class, expected_gates, reason, fallback = _route_for_files(normalised)
+    # The root agent guide is a non-artifact companion. Classify the remaining
+    # paths first so it cannot turn an otherwise recognized recovery,
+    # candidate-packaging, storage or docs route into an ordinary deployable
+    # full route. Unknown paths in the remaining set still take the usual
+    # fail-closed fallback.
+    route_files = route_files_without_root_guide(normalised)
+    route_class, expected_gates, reason, fallback = _route_for_files(route_files)
     runtime_sensitive = runtime_sensitive or fallback
-    candidate_packaging_only = _is_candidate_packaging_only(normalised)
-    recovery_bootstrap_only = _is_recovery_bootstrap_only(normalised)
-    storage_operations_only = _is_storage_operations_only(normalised)
+    candidate_packaging_only = _is_candidate_packaging_only(route_files)
+    recovery_bootstrap_only = _is_recovery_bootstrap_only(route_files)
+    storage_operations_only = _is_storage_operations_only(route_files)
     if storage_operations_only:
         route_class = "full"
         expected_gates = FULL_GATE_IDS
@@ -709,62 +726,20 @@ def classify_cumulative_baseline_paths(
 ) -> dict[str, object]:
     """Classify a complete X-to-target path set for baseline reconciliation.
 
-    The normal event classifier remains fail-closed for root-level ``AGENTS.md``.
-    A baseline range may treat that one known non-artifact guide as accompanying
-    documentation only when removing it yields a canonical deployable full
-    ``push/dev`` route that already contains a runtime-sensitive application
-    change. The returned manifest retains the complete path set, including the
-    guide, so its digest and provenance still bind every changed path.
-
-    In particular, this does not promote a recovery-bootstrap-only range or an
-    unknown path into a deployable route.
+    Root ``AGENTS.md`` is handled by :func:`classify` as a non-artifact
+    companion only when the remaining paths already form a recognized route.
+    The returned manifest retains the complete path set, including the guide,
+    so its digest and provenance still bind every changed path. Recovery,
+    candidate-packaging and storage no-op routes keep their existing
+    non-deployable classification; unknown paths remain fail-closed.
     """
 
-    cumulative = classify(
+    return classify(
         files,
         event="push",
         branch="dev",
         target_sha=target_sha,
         repository_ready=True,
-    )
-    cumulative_files = cumulative.get("files")
-    if (
-        cumulative.get("fallback") is not True
-        or cumulative.get("reason")
-        != "unknown or global path requires fail-closed full verification"
-        or not isinstance(cumulative_files, list)
-        or cumulative_files.count("AGENTS.md") != 1
-    ):
-        return cumulative
-
-    without_guide = [path for path in cumulative_files if path != "AGENTS.md"]
-    if not without_guide:
-        return cumulative
-    recognized = classify(
-        without_guide,
-        event="push",
-        branch="dev",
-        target_sha=target_sha,
-        repository_ready=True,
-    )
-    if (
-        recognized.get("class") != "full"
-        or recognized.get("expected_gates") != list(FULL_GATE_IDS)
-        or recognized.get("fallback") is not False
-        or recognized.get("deployable") is not True
-        or recognized.get("runtime_sensitive") is not True
-    ):
-        return cumulative
-    return _build_manifest(
-        target_sha=target_sha,
-        event="push",
-        files=cumulative_files,
-        branch="dev",
-        fallback=False,
-        reason=str(recognized["reason"]),
-        route_class="full",
-        expected_gates=FULL_GATE_IDS,
-        runtime_sensitive=True,
     )
 
 
