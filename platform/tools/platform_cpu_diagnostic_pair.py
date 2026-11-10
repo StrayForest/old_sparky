@@ -481,6 +481,10 @@ def _decode_canonical(raw: bytes, *, cap: int) -> dict[str, Any]:
     return value
 
 
+def _valid_external_run_attempt(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9]{1,6}", value) is not None
+
+
 def _project_cpu_plan_failure_detail(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
@@ -854,6 +858,68 @@ def _write_report(path: Path, report: dict[str, Any]) -> None:
         os.close(fd)
 
 
+def _project_supervisor_evidence(value: Any) -> dict[str, Any]:
+    """Keep only the existing closed runtime startup diagnostics."""
+
+    runtime_report = getattr(value, "report", None)
+    runtime_report = runtime_report if isinstance(runtime_report, Mapping) else {}
+    runtime_budget = runtime_report.get("runtime_budget")
+    runtime_budget = runtime_budget if isinstance(runtime_budget, Mapping) else {}
+    runtime_supervisor = runtime_report.get("runtime_supervisor")
+    runtime_supervisor = runtime_supervisor if isinstance(runtime_supervisor, Mapping) else {}
+    report_error = runtime_budget.get("report_error", runtime_supervisor.get("report_error"))
+    report_phase = runtime_budget.get("phase")
+
+    def project_stage(name: str, allowed: frozenset[str]) -> str | None:
+        stage = getattr(value, name, None)
+        if stage is None:
+            return None
+        return stage if isinstance(stage, str) and stage in allowed else "unknown"
+
+    worker_started = getattr(value, "worker_started", None)
+    return {
+        "worker_started": worker_started if type(worker_started) is bool else None,
+        "startup_failure_stage": project_stage(
+            "startup_failure_stage", load_runtime.SUPERVISOR_STARTUP_FAILURE_STAGES,
+        ),
+        "namespace_ready_failure_stage": project_stage(
+            "namespace_ready_failure_stage",
+            frozenset(load_runtime.NAMESPACE_STARTUP_FAILURE_STAGES),
+        ),
+        "namespace_post_ready_failure_stage": project_stage(
+            "namespace_post_ready_failure_stage",
+            frozenset(load_runtime.NAMESPACE_STARTUP_FAILURE_STAGES),
+        ),
+        "watchdog_startup_failure_stage": project_stage(
+            "watchdog_startup_failure_stage", load_runtime.WATCHDOG_STARTUP_FAILURE_STAGES,
+        ),
+        "report_error_class": (
+            report_error
+            if isinstance(report_error, str) and report_error in {
+                "AttributeError", "NamespaceCapabilityError", "NamespaceIntegrityError",
+                "OSError", "preflight_deadline_exceeded", "preflight_setup_deadline_exceeded",
+            }
+            else "other" if report_error is not None else None
+        ),
+        "report_phase": report_phase
+        if report_phase in {"namespace_probe", "supervisor"}
+        else "other" if report_phase is not None else None,
+    }
+
+
+def _attach_supervisor_evidence(report: dict[str, Any], value: Any) -> None:
+    evidence = _project_supervisor_evidence(value)
+    report.update({
+        "supervisor_process_started": evidence["worker_started"],
+        "supervisor_startup_failure_stage": evidence["startup_failure_stage"],
+        "supervisor_namespace_ready_failure_stage": evidence["namespace_ready_failure_stage"],
+        "supervisor_namespace_post_ready_failure_stage": evidence["namespace_post_ready_failure_stage"],
+        "supervisor_watchdog_startup_failure_stage": evidence["watchdog_startup_failure_stage"],
+        "supervisor_report_error_class": evidence["report_error_class"],
+        "supervisor_report_phase": evidence["report_phase"],
+    })
+
+
 def _public_report(value: dict[str, Any]) -> dict[str, Any]:
     """Return a bounded, identity-free projection for workflow artifacts."""
 
@@ -880,6 +946,28 @@ def _public_report(value: dict[str, Any]) -> dict[str, Any]:
         "diagnostic_credit": False,
         "namespace_closed": value.get("namespace_closed") is True,
         "worker_exit_code": nonnegative_int(value.get("worker_exit_code"), maximum=2),
+        "supervisor_process_started": value.get("supervisor_process_started")
+        if type(value.get("supervisor_process_started")) is bool else None,
+        "supervisor_startup_failure_stage": value.get("supervisor_startup_failure_stage")
+        if value.get("supervisor_startup_failure_stage") in load_runtime.SUPERVISOR_STARTUP_FAILURE_STAGES | {"unknown"}
+        else None,
+        "supervisor_namespace_ready_failure_stage": value.get("supervisor_namespace_ready_failure_stage")
+        if value.get("supervisor_namespace_ready_failure_stage") in frozenset(load_runtime.NAMESPACE_STARTUP_FAILURE_STAGES) | {"unknown"}
+        else None,
+        "supervisor_namespace_post_ready_failure_stage": value.get("supervisor_namespace_post_ready_failure_stage")
+        if value.get("supervisor_namespace_post_ready_failure_stage") in frozenset(load_runtime.NAMESPACE_STARTUP_FAILURE_STAGES) | {"unknown"}
+        else None,
+        "supervisor_watchdog_startup_failure_stage": value.get("supervisor_watchdog_startup_failure_stage")
+        if value.get("supervisor_watchdog_startup_failure_stage") in load_runtime.WATCHDOG_STARTUP_FAILURE_STAGES | {"unknown"}
+        else None,
+        "supervisor_report_error_class": value.get("supervisor_report_error_class")
+        if value.get("supervisor_report_error_class") in {
+            "AttributeError", "NamespaceCapabilityError", "NamespaceIntegrityError",
+            "OSError", "preflight_deadline_exceeded", "preflight_setup_deadline_exceeded", "other",
+        } else None,
+        "supervisor_report_phase": value.get("supervisor_report_phase")
+        if value.get("supervisor_report_phase") in {"namespace_probe", "supervisor", "other"}
+        else None,
         "supervisor_reason": value.get("supervisor_reason") if value.get("supervisor_reason") in {
             "none", "max_duration_seconds", "max_runner_minutes", "external_signal",
             "namespace_start_failed", "namespace_not_closed", "worker_report_invalid",
@@ -1145,6 +1233,7 @@ def _merge_supervisor_report(
     elif not valid_child and report.get("failure_stage") in {"unknown", "none"}:
         report["failure_stage"] = "supervisor"
         report["failure_code"] = "worker_failed"
+    _attach_supervisor_evidence(report, worker_result)
     report.update({
         "status": "incomplete",
         "canonical_fixture": {
@@ -2188,7 +2277,7 @@ def _worker_callback(config: dict[str, Any]) -> dict[str, Any]:
         not isinstance(binding, dict)
         or set(binding) != {
             "source_git_sha", "app_target_sha", "source_binding",
-            "source_binding_sha256", "external_run_id", "external_run_attempt",
+            "source_binding_sha256", "external_run_id",
         }
         or not isinstance(binding.get("source_git_sha"), str)
         or SOURCE_SHA_RE.fullmatch(binding["source_git_sha"]) is None
@@ -2197,15 +2286,16 @@ def _worker_callback(config: dict[str, Any]) -> dict[str, Any]:
         or not isinstance(binding.get("external_run_id"), str)
         or not binding["external_run_id"].isdecimal()
         or not 1 <= len(binding["external_run_id"]) <= 20
-        or not isinstance(binding.get("external_run_attempt"), str)
-        or not binding["external_run_attempt"].isdecimal()
-        or not 1 <= len(binding["external_run_attempt"]) <= 6
         or os.environ.get("SOURCE_GIT_SHA") != binding.get("source_git_sha")
     ):
         raise PairError("worker source binding rejected")
     payload = _decode_canonical(raw[:-1], cap=PAIR_PAYLOAD_CAP)
-    if set(payload) != {"schema", "workload", "actor_payload", "plan"}:
+    if set(payload) != {
+        "schema", "workload", "actor_payload", "plan", "external_run_attempt",
+    }:
         raise PairError("worker payload shape rejected")
+    if not _valid_external_run_attempt(payload["external_run_attempt"]):
+        raise PairError("worker attempt binding rejected")
     if type(payload["schema"]) is not int or payload["schema"] != 1 or payload["workload"] != WORKLOAD:
         raise PairError("worker payload version rejected")
     actor_payload = payload["actor_payload"]
@@ -2686,6 +2776,7 @@ def _parent(args: argparse.Namespace) -> int:
             "workload": WORKLOAD,
             "actor_payload": actor_payload,
             "plan": {key: value for key, value in plan.items() if key != "operation"},
+            "external_run_attempt": args.external_run_attempt,
         }
         pair_bytes = json.dumps(
             pair_payload, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")
@@ -2698,7 +2789,6 @@ def _parent(args: argparse.Namespace) -> int:
             "source_binding": source_binding,
             "source_binding_sha256": manifest.get("source_binding_sha256"),
             "external_run_id": args.external_run_id,
-            "external_run_attempt": args.external_run_attempt,
         }
         report_path = Path(args.report)
         if worker_report_path.exists() or worker_report_path.is_symlink():
@@ -2739,6 +2829,9 @@ def _parent(args: argparse.Namespace) -> int:
                 "worker_report_invalid", "worker_exit_nonzero",
             } else "other"
         )
+        # Attach the closed supervisor diagnosis before reading the child report.
+        # A missing report must not erase the startup branch that caused it.
+        _attach_supervisor_evidence(report, result)
         child_report: dict[str, Any] | None = None
         post_prepare_stage = "post_prepare_worker_report_read"
         try:
@@ -3521,8 +3614,7 @@ def main(argv: list[str] | None = None) -> int:
             or SOURCE_SHA_RE.fullmatch(args.app_target_sha) is None
             or not args.external_run_id.isdecimal()
             or not 1 <= len(args.external_run_id) <= 20
-            or not args.external_run_attempt.isdecimal()
-            or not 1 <= len(args.external_run_attempt) <= 6
+            or not _valid_external_run_attempt(args.external_run_attempt)
         ):
             raise PairError("parent source binding rejected")
         return _parent(args)

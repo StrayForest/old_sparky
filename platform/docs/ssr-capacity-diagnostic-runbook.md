@@ -212,29 +212,27 @@ from its exact source commit. Follow the [private staging procedure](read-only-p
 This alternate establishes readiness only; it never authorizes runtime or
 fixture mutations.
 
-Require exit 0 and `status=ready`; the JSON must bind `verifier_source_sha`
-separately from installed `app_target_sha` and, for an alternate verifier,
-include the verified `verifier_manifest_sha256`. It must also bind the supplied
-current and previous app sources/release-manifest digests and C generation values, verify
-all 15 pinned C members by digest and normalized manifest mode,
-confirm that a directory exists at the expected previous C generation path
-(presence only; it is not a verification of that prior generation's contents),
-validate the current, previous and shared-venv origin identities, and show the expected allowlisted
-service profile, HTTP 200 health, clear locks, no marker/plans/jobs, and the
-enabled maintenance timer with its service terminal and idle. The workflow's
-runner-only `host-capability-preflight` remains authoritative for its own
-`RUNNER_TEMP` and SSH handoff; do not run
-`platform_host_tools_installed_check.py` from the host shell. A terminal-idle
-maintenance service is not proof that maintenance succeeded; use its exact
-receipt for that claim.
-The collector rechecks release pointers, service identities, locks, plans and
-maintenance state immediately before returning `status=ready`; these checks
-form a bounded observation, not an atomic snapshot.
+Require exit 0 and `status=ready`. Bind `verifier_source_sha` separately from installed `app_target_sha`; an
+alternate verifier must include its verified `verifier_manifest_sha256`. Bind current/previous app sources and
+release-manifest digests plus C generations; verify all 15 pinned C members by digest/mode and confirm the previous
+C directory exists (presence only, not verification of that prior generation). Validate current/previous/shared-venv
+identities and show the allowlisted service profile, HTTP 200 health, clear locks, no marker/plans/jobs, and idle
+enabled maintenance timer/service. The workflow's runner-only `host-capability-preflight` is authoritative for
+`RUNNER_TEMP` and SSH handoff; do not run `platform_host_tools_installed_check.py` from the host. An idle
+maintenance service does not prove success; use its receipt. The collector rechecks release pointers, service
+identities, locks, plans and maintenance before `status=ready`; this is a bounded observation, not an atomic snapshot.
 
-The source-bound backup and release admission rules are in the
-[backup and restore runbook](backup-restore-runbook.md) and
-[deployment runbook](deployment-runbook.md). Never use a PR artifact to fill a
-production source, backup, host-tools or release identity.
+The [backup and restore runbook](backup-restore-runbook.md) and [deployment runbook](deployment-runbook.md) own
+source-bound admission. Never use a PR artifact to fill a production source, backup, host-tools or release identity.
+
+## Verify worker startup without a fixture
+
+The hosted `performance-contract` gate owns a fixture-free regression that sends a synthetic malformed CPU worker
+payload through `run_supervised()` → sudo/setpriv/PID namespace → READY/ACK → CPU worker-entry; it must reject before
+actor warmup and prove namespace closure. Run its selector on the hosted Ubuntu 24.04 non-root runner before a fixture:
+`cd platform && tools/platform_verify.py performance-contract --focused tests.test_platform_cpu_profile.ReadyVoteCpuProfilerTests.test_cpu_pair_worker_entry_uses_supervised_namespace_before_rejecting_payload`
+A missing runner identity or namespace capability fails the test. Local root is `LOCAL GATE BLOCKED`, not a skip.
+The smoke has no network or fixture work and does not replace pre-fixture capability admission.
 
 ## Dispatch one diagnostic
 

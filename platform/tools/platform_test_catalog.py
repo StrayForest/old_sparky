@@ -103,6 +103,7 @@ TEST_NONROOT_PID_NAMESPACE_REQUIREMENTS: frozenset[str] = frozenset(
         "tests.test_platform_load_runtime.LoadRuntimeBudgetTests.test_forced_kill_preserves_timeout_when_child_report_is_missing",
         "tests.test_platform_load_runtime.LoadRuntimeBudgetTests.test_pdeathsig_reclaims_namespace_when_supervisor_is_sigkilled",
         "tests.test_platform_load_runtime.LoadRuntimeBudgetTests.test_external_term_is_reaped_and_reported",
+        "tests.test_platform_cpu_profile.ReadyVoteCpuProfilerTests.test_cpu_pair_worker_entry_uses_supervised_namespace_before_rejecting_payload",
     }
 )
 
@@ -695,10 +696,10 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
     "module_count": 176,
     "module_digest": "5f5168273bae9359473f971b7c853b7c517f39f21ea91cf025a2ff24eca391c4",
-    "test_count": 2379,
-    "test_id_digest": "d817ce551b0b1e248a7dfb438908e911f27c9c4d46fe7ae4e22099a9a14c458b",
-    "backend_test_count": 2299,
-    "backend_test_id_digest": "e4e1ebfb14ee196ab9d2dc640590bd674ac013a6ae83da0868e0a7edfcce45f5",
+    "test_count": 2381,
+    "test_id_digest": "51b8488526c3354426e05c657ded3d20916db88ad07b2af2f90b76e12cbfe04a",
+    "backend_test_count": 2301,
+    "backend_test_id_digest": "9701945603c5f77d7e7f97096cb6d52c05c83f0f08b1b9cadb03803d9cbe0e77",
     "verification_test_count": 80,
     "verification_test_id_digest": "441f275842aceea8043797eade1732b5ae6236284f09555d21c8bb4791511d35",
     "verification_classifier_test_count": 43,
@@ -745,8 +746,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "performance-contract": {
         "module_count": 13,
         "module_digest": "4ea556fb7b11d6a6cbebe774d6e5e49745861ca2ed36e2596d19c74435beab3d",
-        "test_count": 312,
-        "test_id_digest": "6b7555aa4e4c095183ed187fadba40004164fd7248f84dce712eb92dc9cfee7c",
+        "test_count": 314,
+        "test_id_digest": "2875a091fad8f26871c8a0e76cad1ef5c86b9786126b049a19f91083a36d5489",
     },
     VERIFICATION_CONTOUR: {
         "module_count": 3,

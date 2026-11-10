@@ -287,7 +287,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             os.chmod(root, 0o700)
             config_path = root / "worker-config.json"
             report_path = root / "worker-report.json"
-            raw_payload = b"{}\n"
+            raw_payload = b'{"external_run_attempt":"1"}\n'
             source_sha = "a" * 40
             config_path.write_text(json.dumps({
                 "worker_report_path": str(report_path),
@@ -298,7 +298,6 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     "source_binding": None,
                     "source_binding_sha256": None,
                     "external_run_id": "123",
-                    "external_run_attempt": "1",
                 },
             }, sort_keys=True, separators=(",", ":")), encoding="ascii")
             os.chmod(config_path, 0o600)
@@ -328,6 +327,93 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertEqual(report["worker_failure"]["exception_class"], "other")
             self.assertNotIn("worker_failure", completed.stdout.decode("ascii", errors="replace"))
             self.assertNotIn("worker_failure", completed.stderr.decode("ascii", errors="replace"))
+
+    def test_cpu_pair_worker_entry_uses_supervised_namespace_before_rejecting_payload(self) -> None:
+        """Exercise the production namespace/ACK path without fixture or HTTP work."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_sha = "a" * 40
+            payload = b'{"external_run_attempt":"1"}\n'
+            result = cpu_pair.load_runtime.run_supervised(
+                worker_command=(
+                    sys.executable,
+                    str(Path(cpu_pair.__file__).resolve()),
+                    "worker-entry",
+                ),
+                report_path=root / "final.json",
+                worker_report_path=root / "child.json",
+                max_duration_seconds=10,
+                max_runner_minutes=1,
+                worker_config={
+                    "binding": {
+                        "source_git_sha": source_sha,
+                        "app_target_sha": source_sha,
+                        "source_binding": None,
+                        "source_binding_sha256": None,
+                        "external_run_id": "1",
+                    },
+                    "pair_payload_sha256": hashlib.sha256(payload).hexdigest(),
+                },
+                worker_stdin_payload=payload,
+                worker_stdin_payload_max_bytes=32 * 1024,
+                clear_worker_environment=True,
+                env={"SOURCE_GIT_SHA": source_sha},
+            )
+
+            self.assertEqual(
+                result.reason,
+                "none",
+                "the supported hosted runner must complete the real namespace handshake; "
+                f"reason={result.reason!r}, startup_stage={result.startup_failure_stage!r}, "
+                f"watchdog_stage={result.watchdog_startup_failure_stage!r}",
+            )
+            self.assertTrue(result.worker_started)
+            self.assertTrue(result.worker_exited)
+            self.assertTrue(result.namespace_closed)
+            self.assertEqual(result.returncode, 1)
+            self.assertTrue(result.report["report_complete"])
+            self.assertEqual(result.report["worker_failure"]["stage"], "worker_callback")
+            self.assertEqual(
+                result.report["worker_failure"]["exception_class"], "value_error"
+            )
+
+    def test_cpu_worker_attempt_binding_is_canonical_and_checked_before_warmup(self) -> None:
+        source_sha = "a" * 40
+        binding = {
+            "source_git_sha": source_sha,
+            "app_target_sha": source_sha,
+            "source_binding": None,
+            "source_binding_sha256": None,
+            "external_run_id": "1",
+        }
+        for attempt in (None, "", "1234567", "١"):
+            with self.subTest(attempt=attempt):
+                payload = {
+                    "schema": 1,
+                    "workload": cpu_pair.WORKLOAD,
+                    "actor_payload": {},
+                    "plan": {},
+                }
+                if attempt is not None:
+                    payload["external_run_attempt"] = attempt
+                raw_payload = json.dumps(
+                    payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+                ).encode("ascii") + b"\n"
+                config = {
+                    "pair_payload_sha256": hashlib.sha256(raw_payload).hexdigest(),
+                    "binding": binding,
+                }
+                with (
+                    patch.object(cpu_pair.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(raw_payload))),
+                    patch.dict(os.environ, {"SOURCE_GIT_SHA": source_sha}),
+                    patch.object(cpu_pair, "_warmup") as warmup,
+                ):
+                    with self.assertRaises(cpu_pair.PairError):
+                        cpu_pair._worker_callback(config)
+                warmup.assert_not_called()
+        for attempt in ("1", "123456"):
+            self.assertTrue(cpu_pair._valid_external_run_attempt(attempt))
 
     def test_html_ssr_profile_is_distinct_and_only_extends_concurrency_for_html(self) -> None:
         self.assertEqual(
@@ -4715,6 +4801,7 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             "workload": cpu_pair.WORKLOAD,
             "actor_payload": actor_payload,
             "plan": worker_plan,
+            "external_run_attempt": "1",
         }
         worker_bytes = json.dumps(
             worker_payload, sort_keys=True, separators=(",", ":")
@@ -4752,7 +4839,6 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                     "source_binding": {"schema": 1},
                     "source_binding_sha256": "c" * 64,
                     "external_run_id": "12345",
-                    "external_run_attempt": "1",
                 },
             })
         self.assertTrue(worker_report["capture_complete"])
@@ -7293,6 +7379,35 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             **receipt, "plan_cleanup_status": "complete", "remote_plan_cleanup": "complete",
         }
         self.assertIsNone(capacity_diagnostic._project_parent_failure_receipt(invalid_success_receipt))
+
+        startup_failure = {
+            "status": "incomplete", "failure_stage": "unknown", "failure_code": "unknown",
+            "plan_prepare_status": "prepared", "plan_cleanup_status": "not_attempted",
+        }
+        cpu_pair._attach_supervisor_evidence(startup_failure, SimpleNamespace(
+            worker_started=True,
+            startup_failure_stage="namespace_ready_write",
+            namespace_ready_failure_stage="namespace_ready_write",
+            namespace_post_ready_failure_stage=None,
+            watchdog_startup_failure_stage=None,
+            report={"runtime_budget": {
+                "phase": "supervisor", "report_error": "NamespaceIntegrityError",
+            }},
+        ))
+        startup_public = cpu_pair._public_report(startup_failure)
+        self.assertTrue(startup_public["supervisor_process_started"])
+        self.assertEqual(
+            startup_public["supervisor_startup_failure_stage"], "namespace_ready_write",
+        )
+        self.assertEqual(
+            startup_public["supervisor_namespace_ready_failure_stage"],
+            "namespace_ready_write",
+        )
+        self.assertEqual(
+            startup_public["supervisor_report_error_class"], "NamespaceIntegrityError",
+        )
+        self.assertEqual(startup_public["supervisor_report_phase"], "supervisor")
+        self.assertNotIn("report_error", startup_public)
 
         failure_fingerprint = capacity_diagnostic._parent_failure_fingerprint(
             {

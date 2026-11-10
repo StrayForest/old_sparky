@@ -356,7 +356,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
             set(TEST_NONROOT_PID_NAMESPACE_REQUIREMENTS),
         )
         registered_ids = {case.test_id for case in discover_test_cases()}
-        self.assertEqual(len(TEST_NONROOT_PID_NAMESPACE_REQUIREMENTS), 11)
+        self.assertEqual(len(TEST_NONROOT_PID_NAMESPACE_REQUIREMENTS), 12)
         self.assertLessEqual(TEST_NONROOT_PID_NAMESPACE_REQUIREMENTS, registered_ids)
         negative_probe_id = (
             "tests.test_platform_load_runtime.LoadRuntimeBudgetTests."

@@ -85,6 +85,59 @@ venvs or run heavy local suites; hosted CI is authoritative. See the
 [test-suite resource policy](test-suite-governance.md)
 before any focused local check.
 
+For the DB-free CPU/SSR contract smoke, use the `performance-contract` contour
+and only these focused selectors. Run it outside measured workload windows.
+The contour is cataloged without PostgreSQL or Redis requirements; do not
+substitute the `backend` aggregate or an integration contour, which performs
+resource readiness checks. Install the locked `.venv_platform` only when it is
+absent; otherwise reuse the existing locked test venv. Do not remove or replace
+an app/runtime venv or create a second test venv.
+
+Use a private temporary env file containing only synthetic test settings. The
+explicit `PLATFORM_ENV_FILE` prevents settings from falling back to
+`.env.platform`, and `env -i` prevents inherited credentials from reaching
+the verifier or tests. The loopback URLs use port 1 and this contour does not
+open database or Redis connections.
+
+```bash
+cd /root/old_sparky/platform
+set -euo pipefail
+if [[ ! -e .venv_platform && ! -L .venv_platform ]]; then
+  tools/platform_run_quiet.sh "locked Python 3.12 test venv install" -- \
+    env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+    PLATFORM_CI_PYTHON=/usr/bin/python3 \
+    PLATFORM_CI_VENV_DIR=.venv_platform \
+    tools/platform_install_ci_python.sh
+fi
+
+umask 077
+testenv_dir="$(mktemp -d /tmp/oldsparky-dbfree-test-env.XXXXXX)"
+testenv_file="$testenv_dir/platform.env"
+trap 'rm -f -- "$testenv_file"; rmdir -- "$testenv_dir"' EXIT
+cat > "$testenv_file" <<'EOF'
+PLATFORM_ENVIRONMENT=test
+PLATFORM_DB_SCHEMA=platform
+PLATFORM_DATABASE_URL=postgresql+asyncpg://127.0.0.1:1/platformdb_test
+PLATFORM_REDIS_URL=redis://127.0.0.1:1/15
+EOF
+chmod 600 "$testenv_file"
+
+tools/platform_run_quiet.sh "CPU worker and SSR projection focused tests" -- \
+  env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  PLATFORM_ENV_FILE="$testenv_file" \
+  PLATFORM_ENVIRONMENT=test \
+  PLATFORM_DB_SCHEMA=platform \
+  PLATFORM_DATABASE_URL=postgresql+asyncpg://127.0.0.1:1/platformdb_test \
+  PLATFORM_REDIS_URL=redis://127.0.0.1:1/15 \
+  .venv_platform/bin/python tools/platform_verify.py performance-contract \
+  --focused \
+  tests.test_platform_cpu_profile.ReadyVoteCpuProfilerTests.test_cpu_worker_entrypoint_starts_in_cleared_environment \
+  tests.test_platform_cpu_profile.ReadyVoteCpuProfilerTests.test_ssr_request_correlation_projection_retains_only_closed_aggregates
+```
+
+The temporary env file is removed on success or failure. The safe-env parser
+rejects an empty file, so keep only the four synthetic assignments shown.
+
 The generator bootstraps its exact hash-locked pip-tools environment from
 [`requirements-ci-locker.lock.txt`](../requirements-ci-locker.lock.txt), so it
 does not depend on an ambient `pip-compile`. Its default mode is a freshness

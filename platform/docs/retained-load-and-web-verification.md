@@ -4,38 +4,36 @@
 - Owner: Performance and web verification owners
 - Last reviewed: 2026-11-04
 
-This document owns the detailed retained-load cleanup, hermetic web verification,
-external-load workflow barrier and evidence-projection contracts. The
-[operations runbook](operations-runbook.md) owns the surrounding operator
-procedure and links here rather than duplicating these contracts.
+This document owns the detailed retained-load cleanup, hermetic web verification, external-load workflow barrier and evidence-projection contracts. The
+[operations runbook](operations-runbook.md) owns the surrounding operator procedure and links here rather than duplicating these contracts.
 
 ## Retained-load cleanup and hermetic web verification
 
-The exact retained-load supervisor deletes each selected tournament's four
-rebuildable read-model keys (`teams`, `workspace_detail`, `bracket_summary`,
-`bracket_full`) and rechecks them; zero residual keys is mandatory. A Redis
-outage, failed delete or surviving key fails closed even though ordinary reads
-may treat Redis as optional. It also verifies zero fixture users, tournaments,
-sessions and audit rows while preserving the control account. The [cleanup
-tool](../tools/platform_cleanup_retained_matrix.py) calls `dispose_engine()` and
-`dispose_redis_clients()`; close warnings are failures, not harmless noise.
+The exact retained-load supervisor deletes each selected tournament's four rebuildable read-model keys (`teams`, `workspace_detail`, `bracket_summary`, `bracket_full`) and rechecks them; zero residual keys is mandatory. A Redis outage, failed delete or surviving key fails closed even though ordinary reads may treat Redis as optional. It also verifies zero fixture users, tournaments, sessions and audit rows while preserving the control account. The [cleanup tool](../tools/platform_cleanup_retained_matrix.py) calls `dispose_engine()` and `dispose_redis_clients()`; close warnings are failures, not harmless noise.
+Use the [canonical retained-load abort workflow](../../.github/workflows/platform-production-retained-load-abort.yml) for the exact run/attempt; see the [SSR diagnostic runbook](ssr-capacity-diagnostic-runbook.md) for dispatch inputs and Security identity. If `supervisor.exit` is absent, abort accepts only the latest exact failed run with reviewed source/workflow, matching actor and complete jobs; it rechecks the attempt around abort/normalization. Under release/retained locks, the helper revalidates the marker and requires two clean zero-process scans at least 100 ms apart. Its schema-2 receipt records missing exit, null code and `namespace_closed=false` but does not prove namespace closure; continue only after normalization and never create receipts by hand. Inspect the exact-run finalizer receipt first; dispatch cleanup only if it is missing or incomplete, not when it passed with zero residuals.
+For setup failure with one recognized profile directory but no manifest, use the same run-bound workflow after source/process/namespace barriers. The non-root dispatcher validates runner/app binding and invokes `/opt/oldsparky/platform/current/tools/platform_production_retained_load_cleanup_qa.sh` via `sudo`; root rechecks release/source and locks before inventory reconstruction. Require exactly one durable `PreprodTestRun` row at the exact report path (origin, mode, marker, scoped user count, tournament IDs); cleanup validates report and summary. Never synthesize manifests or use the empty-root no-op with fixture evidence.
+For private operator input, match the exact `control_email=value` key before `=` (not `:`), require one line, and validate it before forming the full JSON body. This is the existing stdin dispatch with a private-file producer instead of its hidden prompt; the email remains in pipes and process memory only:
 
-Use the [canonical retained-load abort workflow](../../.github/workflows/platform-production-retained-load-abort.yml) for the exact run/attempt; see the [SSR diagnostic runbook](ssr-capacity-diagnostic-runbook.md) for dispatch inputs and Security identity. If
-`supervisor.exit` is absent, abort accepts only the latest exact failed run
-with reviewed source/workflow, matching actor and complete jobs; it rechecks
-the attempt around abort/normalization. Under release/retained locks, the helper
-revalidates the marker and requires two clean zero-process scans at least
-100 ms apart. Its schema-2 receipt records missing exit, null code and
-`namespace_closed=false` but does not prove namespace closure; continue only after normalization and never create receipts by hand.
-Inspect the exact-run finalizer receipt first; dispatch cleanup only if it is
-missing or incomplete, not when it passed with zero residuals.
+Invoke the following from a checkout whose `HEAD` is the exact reviewed source `S`; the snippet resolves `platform/` dynamically, which does not establish source binding.
 
-For setup failure with one recognized profile directory but no manifest, use the same run-bound workflow after source/process/namespace barriers.
-The non-root dispatcher validates runner/app binding and invokes `/opt/oldsparky/platform/current/tools/platform_production_retained_load_cleanup_qa.sh` via `sudo`; root rechecks release/source and locks before inventory reconstruction.
-Require exactly one durable `PreprodTestRun` row at the exact report path (origin, mode, marker, scoped user count, tournament IDs); cleanup validates report and summary.
-Never synthesize manifests or use the empty-root no-op with fixture evidence.
-Read only the exact `control_email` field from private inputs, validate silently and use the hidden prompt/private stdin.
-Use bounded stage diagnostics for child failures; generic lock errors are not diagnostic.
+```bash
+set -euo pipefail
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root/platform"
+python3 - <<'PY'
+import json, subprocess, sys
+from pathlib import Path
+
+with Path("/root/old_sparky/.local/private/operator-inputs.md").open(encoding="utf-8") as operator_inputs:
+    matches = [value for line in operator_inputs for key, sep, value in [line.rstrip("\r\n").partition("=")] if sep and key == "control_email"]
+if len(matches) != 1: raise SystemExit("control_email input must occur exactly once")
+email = subprocess.run([sys.executable, "tools/platform_workflow_input_guard.py", "control-email-json-stdin"], input=json.dumps({"schema": 1, "control_email": matches[0]}).encode(), stdout=subprocess.PIPE, check=True).stdout.decode().rstrip("\n")
+body = {"ref": "dev", "inputs": {"confirmation": "RUN-PRODUCTION-SSR-CAPACITY-DIAGNOSTIC", "control_email": email, "profile_id": "authenticated-page-load-v1", "timeout_diagnostics": "false", "cpu_diagnostic_pair": "false", "cpu_diagnostic_only": "false", "ssr_capacity_diagnostic_only": "true", "ssr_capacity_concurrency": "32", "ssr_capacity_workload": "authenticated_html_ssr_capacity_120s_plus_cpu_profile_20s_v1"}}
+subprocess.run(["gh", "api", "--method", "POST", "repos/StrayForest/old_sparky/actions/workflows/platform-production-external-load.yml/dispatches", "--input", "-"], input=json.dumps(body, separators=(",", ":")).encode(), check=True)
+PY
+```
+
+Never put the value in shell arguments, environment, temporary files, logs or artifacts. If missing, duplicated or invalid, stop before dispatch; never send an empty body or placeholder. Reconcile the exact run before retry. Use bounded stage diagnostics for child failures; generic lock errors are not diagnostic.
 
 If the reviewed abort helper is on recovery-only runner SHA `R` while the active app is at freshly verified SHA `A`, use this order. Runner binding permits the same app SHA or an exact verified no-op receipt; the host helper checks the bound app SHA against current `RELEASE.json`.
 For a deployable source not active, follow the [deploy-before-cleanup sequence in the SSR diagnostic runbook](ssr-capacity-diagnostic-runbook.md#abort-and-close-the-exact-fixture): abort → one source-bound backup → AUTO normal deployment/readiness → verify source and pin active → exact old-run cleanup. Keep load closed; do not override target, alias no-op, or start another workload.
