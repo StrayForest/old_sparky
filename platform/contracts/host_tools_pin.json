@@ -73,10 +73,10 @@
     {
       "mode": 420,
       "path": "platform/tools/platform_cpu_diagnostic_plan.py",
-      "sha256": "a8be76aab50c063f3c05c65f0bc56f8b2f830758afba7d31fcee68012a35a066"
+      "sha256": "51d9e5d8b9df4a4a66993431e1a4a316c172f3df8e36c06d95a65aa792aca1c9"
     }
   ],
-  "host_tools_sha": "f0f10506948b327ff217f34124bf8d1f1d78f0c4",
+  "host_tools_sha": "c92dce69ed204d39b16884e62fad2b61addaa996",
   "repository": "StrayForest/old_sparky",
   "schema": 1
 }
