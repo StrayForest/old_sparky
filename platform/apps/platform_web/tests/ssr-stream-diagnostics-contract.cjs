@@ -323,6 +323,7 @@ async function verifySsrWebLifecycleContract() {
     replacePlan = false, lateTimerMs = 0, lateOffEndMs = 0,
     slowPrepareMs = 0, slowStartMs = 0,
     hangPrepare = false, hangStart = false, cancel = false,
+    replaceBetweenStartAndOn = false, cancelAfterPrestart = false,
   } = {}) {
     const profilePlan = {
       run_id: "abcdef0123456789abcdef0123456789",
@@ -336,7 +337,7 @@ async function verifySsrWebLifecycleContract() {
     const failed = new Set();
     const timers = [];
     const events = [];
-    const counts = { prepared: 0, started: 0, stopped: 0, closed: 0 };
+    const counts = { prepared: 0, started: 0, stopped: 0, closed: 0, startAtMs: null, activatedAtMs: null };
     const schedule = (callback, delayMs) => {
       const timer = { callback, at: nowMs + delayMs, cancelled: false };
       timers.push(timer);
@@ -375,12 +376,14 @@ async function verifySsrWebLifecycleContract() {
       },
       start: async () => {
         counts.started += 1;
+        counts.startAtMs = nowMs;
         return hangStart ? new Promise(() => {}) : nowMs + slowStartMs;
       },
       stop: async () => { counts.stopped += 1; },
       close: async () => { counts.closed += 1; },
       scheduled, started, failed,
-      onStarted: (_session, _startedAtMs, _activeController) => {},
+      startLeadMs: 500,
+      onStarted: (_session, activatedAtMs, _activeController) => { counts.activatedAtMs = activatedAtMs; },
       onLifecycle: (event) => events.push(event),
       startToleranceMs: 250,
     };
@@ -407,6 +410,17 @@ async function verifySsrWebLifecycleContract() {
     await advance(30_000);
     assert.equal(counts.prepared, 1);
     if (replacePlan) currentPlan = { ...profilePlan, expires_at_ms: profilePlan.expires_at_ms + 1 };
+    if (replaceBetweenStartAndOn || cancelAfterPrestart) {
+      await advance(34_500);
+      assert.equal(counts.started, 1);
+      if (replaceBetweenStartAndOn) {
+        currentPlan = { ...profilePlan, expires_at_ms: profilePlan.expires_at_ms + 1 };
+      } else {
+        await controller.cancel();
+      }
+      await advance(35_000);
+      return { counts, events, failed, controller };
+    }
     await advance(35_000, lateTimerMs);
     if (hangStart) await advance(35_251);
     if (counts.started === 1 && !failed.has(profilePlan.run_id)) {
@@ -417,6 +431,8 @@ async function verifySsrWebLifecycleContract() {
   const profileOnTime = await profilePrearmCase();
   assert.equal(profileOnTime.counts.prepared, 1);
   assert.equal(profileOnTime.counts.started, 1);
+  assert.equal(profileOnTime.counts.startAtMs, 34_500);
+  assert.equal(profileOnTime.counts.activatedAtMs, 35_000);
   assert.equal(profileOnTime.counts.stopped, 0);
   assert.equal(profileOnTime.counts.closed, 1);
   assert(profileOnTime.events.some((row) => row.status === "started" && row.lagMs === 0));
@@ -424,10 +440,32 @@ async function verifySsrWebLifecycleContract() {
   assert.equal(replacedProfilePlan.counts.started, 0);
   assert.equal(replacedProfilePlan.counts.closed, 1);
   assert(replacedProfilePlan.events.some((row) => row.status === "skipped" && row.reason === "stale"));
+  const replacedAfterPrestart = await profilePrearmCase({ replaceBetweenStartAndOn: true });
+  assert.equal(replacedAfterPrestart.counts.activatedAtMs, null);
+  assert.equal(replacedAfterPrestart.counts.stopped, 1);
+  assert.equal(replacedAfterPrestart.counts.closed, 1);
+  assert(replacedAfterPrestart.events.some((row) => row.status === "skipped" && row.reason === "stale"));
+  const cancelledAfterPrestart = await profilePrearmCase({ cancelAfterPrestart: true });
+  assert.equal(cancelledAfterPrestart.counts.activatedAtMs, null);
+  assert.equal(cancelledAfterPrestart.counts.stopped, 1);
+  assert.equal(cancelledAfterPrestart.counts.closed, 1);
   const lateProfileTimer = await profilePrearmCase({ lateTimerMs: 251 });
-  assert.equal(lateProfileTimer.counts.started, 0);
+  assert.equal(lateProfileTimer.counts.started, 1, "prestart may run, but a late ON activation must be discarded");
+  assert.equal(lateProfileTimer.counts.activatedAtMs, null);
+  assert.equal(lateProfileTimer.counts.stopped, 1);
+  assert.equal(lateProfileTimer.counts.closed, 1);
   assert(lateProfileTimer.events.some((row) => row.status === "skipped" && row.reason === "late" && row.lagMs === 251));
   assert(lateProfileTimer.events.some((row) => row.stage === "start_timer"));
+  const completedEarlyProfileStart = await profilePrearmCase({ slowStartMs: 278 });
+  assert.equal(completedEarlyProfileStart.counts.startAtMs, 34_500);
+  assert.equal(completedEarlyProfileStart.counts.activatedAtMs, 35_000);
+  assert.equal(completedEarlyProfileStart.counts.stopped, 0);
+  assert.equal(completedEarlyProfileStart.counts.closed, 1);
+  const completedAfterEdgeProfileStart = await profilePrearmCase({ slowStartMs: 600 });
+  assert.equal(completedAfterEdgeProfileStart.counts.activatedAtMs, 35_100);
+  assert(completedAfterEdgeProfileStart.events.some(
+    (row) => row.status === "started" && row.stage === "start_command_completion" && row.lagMs === 100,
+  ));
   const latePrepareTimer = await profilePrearmCase({ lateOffEndMs: 5_001 });
   assert.equal(latePrepareTimer.counts.prepared, 0);
   assert(latePrepareTimer.events.some((row) => row.reason === "late" && row.stage === "prepare_timer"));
@@ -439,7 +477,7 @@ async function verifySsrWebLifecycleContract() {
   assert.equal(latePrepareDeadline.counts.started, 0);
   assert(latePrepareDeadline.events.some((row) => row.reason === "late" && row.stage === "prepare_deadline"));
   assert.equal(latePrepareDeadline.counts.closed, 1);
-  const slowProfileStart = await profilePrearmCase({ slowStartMs: 251 });
+  const slowProfileStart = await profilePrearmCase({ slowStartMs: 751 });
   assert.equal(slowProfileStart.counts.started, 1);
   assert.equal(slowProfileStart.counts.stopped, 1);
   assert.equal(slowProfileStart.counts.closed, 1);
@@ -520,8 +558,9 @@ async function verifySsrWebLifecycleContract() {
       || !webProfileSource.includes('"Profiler.setSamplingInterval"')
       || webProfileSource.indexOf('"Profiler.start"') < 0
       || webProfileSource.indexOf('"Profiler.start"') < webProfileSource.indexOf('"Profiler.setSamplingInterval"')
+      || !webProfileSource.includes("startLeadMs: 500")
       || !webProfileSource.includes("startToleranceMs: CPU_WINDOW_TOLERANCE_MS")) {
-    throw new Error("Web V8 prearm does not prepare at OFF end and start under the unchanged exact-plan guard");
+    throw new Error("Web V8 prearm does not prepare after OFF, arm 500 ms early and retain exact-plan start guards");
   }
   const profileStopSource = planSource.slice(profileStop);
   if (!profileStopSource.includes('emitSsrWebLifecycleEvent({ run_id: runId }, "on", "cpu_profile", finalStatus')
@@ -737,12 +776,74 @@ async function verifyCpuProfileSourceMapContract() {
   const { categoryForFrame, functionIdForFrame, summarizeFunctionSamples } = await import(
     path.resolve(__dirname, "../lib/cpu-profile-categories.mjs")
   );
+  const {
+    clipCpuProfileToPlannedWindow,
+    intersectCpuProfileClockAnchors,
+  } = await import(path.resolve(__dirname, "../lib/cpu-profile-window.mjs"));
   const { CPU_PROFILE_SOURCE_MAP_LIMITS, mapSampledFrames } = await import(
     path.resolve(__dirname, "../lib/cpu-profile-source-maps.mjs")
   );
   const { mapAfterCpuWindowSnapshot, runCpuWindowSetup } = await import(
     path.resolve(__dirname, "../lib/cpu-profile-window.mjs")
   );
+
+  const anchors = [
+    { beforeNs: 2_000_000_000n, wallMs: 2_000, afterNs: 2_000_000_500n },
+    { beforeNs: 22_000_000_100n, wallMs: 22_000, afterNs: 22_000_000_400n },
+  ];
+  const offsetRange = intersectCpuProfileClockAnchors(anchors);
+  assert(offsetRange);
+  assert.equal(intersectCpuProfileClockAnchors([
+    anchors[0], { beforeNs: 24_000_000_000n, wallMs: 23_000, afterNs: 24_000_000_100n },
+  ]), null, "wall/monotonic clock discontinuity must fail closed");
+  const profileStartUs = 1_500_000;
+  const deltas = [400_000, ...Array(2_140).fill(10_000)];
+  const totalDeltaUs = deltas.reduce((sum, delta) => sum + delta, 0);
+  const profile = {
+    startTime: profileStartUs,
+    endTime: profileStartUs + totalDeltaUs + 10_000,
+    nodes: [{ id: 1, callFrame: {} }],
+    samples: Array(deltas.length).fill(1),
+    timeDeltas: deltas,
+  };
+  const profileClipOptions = {
+    ...offsetRange,
+    startWallMs: 2_000,
+    endWallMs: 22_000,
+    startBracket: {
+      beforeNs: BigInt(profileStartUs) * 1_000n - 1_000n,
+      afterNs: BigInt(profileStartUs) * 1_000n + 1_000n,
+    },
+    stopBracket: {
+      beforeNs: BigInt(profile.endTime) * 1_000n - 1_000n,
+      afterNs: BigInt(profile.endTime) * 1_000n + 1_000n,
+    },
+    maxSamples: 2_400,
+    maxNodes: 10_000,
+    maxCpuUs: 60_000_000,
+  };
+  const clipped = clipCpuProfileToPlannedWindow(profile, profileClipOptions);
+  assert(clipped, "valid ON intervals should survive despite a long pre-ON startup interval");
+  assert(clipped.samples.length < profile.samples.length);
+  assert(clipped.timeDeltas.every((delta) => delta === 10_000), "OFF/gap prefix must be discarded");
+  assert(clipped.elapsedMs >= 19_750 && clipped.elapsedMs <= 20_000);
+  assert(clipped.startLagMs >= 0 && clipped.startLagMs <= 250);
+  assert.equal(clipCpuProfileToPlannedWindow(profile, {
+    ...profileClipOptions,
+    maxSamples: profile.samples.length - 1,
+  }), null, "the raw V8 sample cap remains fail-closed");
+  const crossedOnGap = {
+    ...profile,
+    endTime: profile.endTime + 200_000,
+    timeDeltas: [600_000, ...deltas.slice(1)],
+  };
+  assert.equal(clipCpuProfileToPlannedWindow(crossedOnGap, {
+    ...profileClipOptions,
+    stopBracket: {
+      beforeNs: BigInt(crossedOnGap.endTime) * 1_000n - 1_000n,
+      afterNs: BigInt(crossedOnGap.endTime) * 1_000n + 1_000n,
+    },
+  }), null, "an excessive gap crossing ON must fail closed");
 
   let releaseSnapshot;
   const snapshot = new Promise((resolve) => { releaseSnapshot = resolve; });
@@ -768,11 +869,13 @@ async function verifyCpuProfileSourceMapContract() {
   const planPath = path.resolve(__dirname, "../lib/performance-diagnostic-plan.ts");
   const planSource = fs.readFileSync(planPath, "utf8");
   const stopped = planSource.indexOf('"Profiler.stop"');
-  const elapsed = planSource.indexOf("const elapsedAtStopMs = Math.max", stopped);
+  const elapsed = planSource.indexOf("const elapsedAtStopMs = profileClock === undefined", stopped);
   const snapshotWait = planSource.indexOf('waitForCpuUsageWindowSnapshot(runId, "on")', elapsed);
+  const clipping = planSource.indexOf("clipCpuProfileToPlannedWindow(profile", elapsed);
   const mapping = planSource.indexOf("mapSampledFrames(", snapshotWait);
-  if (stopped < 0 || elapsed <= stopped || snapshotWait <= elapsed || mapping <= snapshotWait) {
-    throw new Error("Web profile maps before the process-CPU snapshot or changes stop-time elapsed accounting");
+  if (stopped < 0 || elapsed <= stopped || clipping <= elapsed
+      || snapshotWait <= clipping || mapping <= snapshotWait) {
+    throw new Error("Web profile must clip to the planned ON interval before waiting to map after the process-CPU snapshot");
   }
   if (!planSource.includes("Math.max(0, endTarget - startMs)")
       || !planSource.includes("const usage = process.cpuUsage(startCpu);")) {

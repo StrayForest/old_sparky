@@ -11,25 +11,46 @@ belong in the linked owner documents below.
 ## Live and pending state
 
 - Production app and runner source S are
-  `e1299e4818c8b2f684a76af5424109532d0c71a0` (release
-  `gha-42806619801-1-e1299e4818c8`); previous app is
-  `2835f9b2144c7b1d56e04bfdd0169f7912e06ffd`. Active host-tools C2 is
+  `5278c6b9a8fcd079ee8959bacf017ac0cd920297` (release
+  `gha-42820897465-1-5278c6b9a8fc`); previous app is
+  `e1299e4818c8b2f684a76af5424109532d0c71a0`. Active host-tools C2 is
   `c92dce69ed204d39b16884e62fad2b61addaa996`. Exact-SHA Security
-  `42803016028/1`, AUTO `42804838560/1` and automatic production child
-  `42806619801/1` completed. Keep S, app and C2 identities explicit. Storage
-  maintenance `42811006436/1` completed with one restore-verified backup pair
-  retained. SSR diagnostic fixture `42808854934/1` is cleaned; its exact
-  cleanup and post-cleanup FULL readiness passed. Obtain fresh canonical FULL
-  readiness before any new production work.
-- SSR diagnostic `42808854934/1` completed its 120-second capacity phase with
-  3,965/3,965 HTTP 200 responses. The separate 20-second profile phase is
-  incomplete: 310/310 requests completed, but only 35 of 37 selected ON-phase
-  Web roots joined to API request-performance rows, and the Web CPU profile
-  missed its start deadline. The composite earns no capacity, SLO or
-  performance credit. Do not treat partial profile data as a complete
-  comparison or capacity result; use the
+  `42817990724/1`, AUTO `42820087780/1` and automatic production child
+  `42820897465/1` completed. The source-bound backup `42820387537/1` passed
+  restore and Alembic verification; one pair is retained. After the latest
+  diagnostic cleanup, maintenance `42830070535/1` passed, deleted one stale
+  release and retained the verified backup. Post-maintenance FULL readiness
+  passed (SHA-256
+  `7c9256c757183ba1c0ec2230d4dea617a8950afde12140696a47c7f3b11b73d6`):
+  health checks are 200, all 15 C2 tools verified, locks are clear and no
+  release marker, diagnostic plan or pending systemd job remains. Keep S, app
+  and C2 identities explicit. No fixture is active; obtain fresh canonical
+  FULL readiness before any new production work.
+- SSR diagnostic `42808854934/1` ran on previous app A
+  `e1299e4818c8b2f684a76af5424109532d0c71a0` with C2. It completed its
+  120-second capacity phase with 3,965/3,965 HTTP 200 responses. The separate
+  20-second profile phase is incomplete: 310/310 requests completed, but only
+  35 of 37 selected ON-phase Web roots joined to API request-performance rows;
+  the Web CPU profile also missed its start deadline by 260 ms. The composite
+  earns no capacity, SLO or performance credit, and the run does not validate
+  the newly deployed scheduler instrumentation. Do not treat partial profile
+  data as a complete comparison or capacity result; a follow-up workload waits
+  for a fresh source-bound packet and independent review. Use the
   [SSR capacity diagnostic runbook](ssr-capacity-diagnostic-runbook.md) for
   the phase acceptance and cleanup contract.
+- SSR composite `42824003998/1` on source/app
+  `5278c6b9a8fcd079ee8959bacf017ac0cd920297` was rejected by the
+  `cpu_profile_phase` report projection and received no measurement credit.
+  The documented abort `42825813580/1` returned
+  `safe_for_exact_fixture_cleanup` with `namespace_closed=false`; exact cleanup
+  `42826290267/1` then passed, deleting 14 fixture users and one tournament
+  while preserving the control account. Post-maintenance FULL is ready for app
+  `5278c6b9a8fcd079ee8959bacf017ac0cd920297` and host-tools C2
+  `c92dce69ed204d39b16884e62fad2b61addaa996` (SHA-256
+  `7c9256c757183ba1c0ec2230d4dea617a8950afde12140696a47c7f3b11b73d6`). The
+  run remains incomplete and zero-credit; do not infer a profile result from
+  the projection rejection. Do not repeat the workload until the reviewed Web
+  profile fix is released and a fresh packet is reviewed.
 - Cell 9, `read-mix-concurrency-ramp-v1`, completed as run `41937909055/1` on
   runner S and app A, both `7c6034efe3878c3413090ca1bcdb5be6e93154e8`, with
   host-tools C `0de51aca4b4d04a80a2f0d392003cc258d8f1400`; exact cleanup

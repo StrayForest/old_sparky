@@ -337,27 +337,29 @@ identities, and all of these conditions hold:
 - The separate profile phase completes its 20-second ON window against the
   same fixture manifest after planned gap; trace-marked HTML requests prearm
   API and Web OFF/ON usage windows. For the dedicated Web profile workload,
-  the first authorized root-bound plan request also schedules one internal
-  Inspector session to connect, enable the profiler and set its sampling
-  interval at OFF end, after the measured OFF baseline. It schedules
-  `Profiler.start` at the planned ON edge only after a fresh plan read confirms
-  the same plan, release and process identity. The actual start must still
-  complete within 250 ms of that edge; Node timers are advisory, so a late
-  timer, slow start, replaced/expired plan or setup failure closes the session
-  and yields no Web profile. Setup still pending at ON and start still pending
-  beyond the 250 ms bound are failed closed when their deadline callbacks run.
-  No late start or retry is allowed.
+  the first authorized root-bound plan request schedules one internal Inspector
+  session to connect, enable and set its interval at OFF end, after the measured
+  OFF baseline. `Profiler.start` is armed 500 ms before ON;
+  only the same fresh plan, release and process identity can activate it at ON.
+  The start command must complete by ON+250 ms, and activation at ON retains
+  its 250 ms edge bound. Setup/start deadlines, a late timer or a replaced/expired plan close the
+  session with no profile; no late start or retry. Raw V8 capture runs from
+  prearm to ON end, but its prefix is discarded. A conservative
+  `Date.now()`/monotonic mapping retains only complete sample intervals inside
+  ON. `start_lag_ms` is the first retained interval's start offset, while
+  `elapsed_ms` and category weights use retained intervals only; keep the 250 ms
+  start/end bounds. Clock disagreement or incomplete edge coverage yields no profile.
   All 32 capacity workers consume one response, close only their thread-local
-  connection, and retain its SSL context for authenticated OFF. OFF opens a fresh
+  connection and retain its SSL context for authenticated OFF. OFF opens a fresh
   connection; setup is included in the OFF CPU baseline. Measured ON transport
   and 25-second OFF-start-to-ON-start schedule stay unchanged; compare OFF CPU
   deltas only across matching connection baselines. API rechecks the exact plan
   before arming thread-CPU cProfile on each worker event loop at planned ON;
-  actual start is checked around construction and activation. Monotonic profile timing starts after enable and ends immediately on disable, before plan revalidation or summarization.
+  actual start is checked around construction/activation. API cProfile timing
+  starts after enable and ends on disable, before plan revalidation or summary.
   Usage-window CPU and monotonic endpoints are snapshotted before revalidation.
   Missing, late, replaced, or unreadable plans remain incomplete; the first ON
-  request cannot start or shift this profile. Keep the
-  250 ms start and end bounds. Web V8 sampling uses a bounded 10 ms interval in
+  request cannot start or shift this profile. Web V8 sampling uses a bounded 10 ms interval in
   this opt-in workload, with at most 2,400 samples and 10,000 profile nodes.
   The 120-second capacity workload never enables API cProfile. Profile data
   is attribution only; do not merge it into capacity-window latency or CPU
@@ -439,12 +441,12 @@ Do not inspect or export raw control files, worker/supervisor reports, or
 observer stderr. Any incomplete result remains zero-credit and follows the
 exact-run abort and cleanup procedure below.
 
-If the report sanitizer emits `report_projection_rejected`, preserve its
-closed `composite_report` field path and `projection_reason` for diagnosis.
-These are static schema labels and structural types/counts only; they do not
-contain report values or unexpected key names. A rejected report grants no
-credit. Do not infer whether either phase ran from missing projected phase IDs;
-use independently bound phase evidence and the exact run window.
+For `report_projection_rejected`, retain the closed parent field/reason and
+`phase_projection_detail` field/reason/type. `phase_identity_binding` includes
+each phase ID, digest and window only when independently bound to the exact
+invocation and manifest; an invalid sibling does not erase a valid phase ID.
+These diagnostics never validate metrics or grant credit. Raw `report.json`
+remains runner-local and is not uploaded.
 
 When a one-day fingerprint or sanitizer-rejection artifact is available, use
 the [bounded SSR failure-artifact procedure](retained-load-and-web-verification.md#retrieve-a-bounded-ssr-failure-artifact)

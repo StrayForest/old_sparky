@@ -140,6 +140,7 @@ export declare function scheduleWorkspaceCpuProfilePrearm<
       readonly lagMs: number | null;
       readonly stage: SsrLifecycleProfileStage;
     }) => void;
+    startLeadMs: number;
     startToleranceMs: number;
   },
 ): {

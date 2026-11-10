@@ -10806,6 +10806,212 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             self.assertFalse(sanitized["matrix_credit"])
             self.assertFalse(sanitized["slo_credit"])
             self.assertFalse(sanitized["diagnostic_credit"])
+            marker_body = (
+                b'<span data-testid="tournament-detail-lifecycle" '
+                b'data-ssr-workspace-ready="false"></span>'
+                b'<span class="header-profile-avatar"></span>'
+                b'<section class="route-loading-shell"></section>'
+            )
+            content_type_ok, marker_ok, marker_flags, marker_parse_outcome = (
+                external_load._authenticated_html_marker_details(
+                    "", marker_body, content_type_is_html=True,
+                )
+            )
+            marker_result = external_load.RequestResult(
+                "on", "GET", "/private/marker-failure-path", 200, 100.0,
+                False, len(marker_body), html_content_type_ok=content_type_ok,
+                html_page_marker_ok=marker_ok, html_content_encoding="identity",
+                html_marker_flags=marker_flags,
+                html_marker_parse_outcome=marker_parse_outcome,
+                error_kind="page_marker_missing", observed_status=200,
+                started_at_utc="2026-10-29T12:00:01+00:00",
+                finished_at_utc="2026-10-29T12:00:02+00:00",
+            )
+            marker_profile = json.loads(json.dumps(profile))
+            marker_profile["status"] = "incomplete"
+            marker_profile["passed"] = False
+            marker_profile["worker"]["status"] = "failed"
+            marker_profile["worker"]["error_counts"] = {"page_marker_missing": 1}
+            marker_profile["worker"]["failure_evidence"] = capacity_diagnostic._failure_evidence(
+                on_results=[marker_result],
+            )
+            marker_profile["worker"]["latency_ms"].update({
+                "sample_count": 1, "p50": 100.0, "p95": 100.0,
+                "p99": 100.0, "max": 100.0,
+            })
+            args.report = str(root / "producer-marker-failure-report.json")
+            marker_state: dict[str, Any] = {}
+            with (
+                patch.object(capacity_diagnostic, "_read_manifest", return_value=(manifest_raw, manifest, actors)),
+                patch.object(capacity_diagnostic, "_parent_run_once", side_effect=[capacity, marker_profile]),
+                patch.object(capacity_diagnostic, "_composite_wait_for_profile_gap", return_value=True),
+            ):
+                marker_produced = capacity_diagnostic._parent_composite_run(args, marker_state)
+            self.assertEqual(marker_produced["status"], "incomplete")
+            self.assertFalse(marker_produced["passed"])
+            self.assertFalse(marker_produced["matrix_credit"])
+            self.assertFalse(marker_produced["slo_credit"])
+            self.assertFalse(marker_produced["diagnostic_credit"])
+            capacity_diagnostic._write_report(Path(args.report), marker_produced)
+            with patch.object(
+                capacity_diagnostic, "_read_manifest",
+                return_value=(manifest_raw, manifest, actors),
+            ):
+                marker_decision = capacity_diagnostic.sanitize_capacity_report(
+                    input_path=Path(args.report), output_path=root / "sanitized-marker-failure.json",
+                    manifest_path=root / "manifest.json", source_sha=source_sha,
+                    app_target_sha=app_sha, run_id=external_run_id, attempt=attempt,
+                    workload=capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+                )
+            self.assertEqual(marker_decision, "FAIL")
+            marker_sanitized = json.loads(
+                (root / "sanitized-marker-failure.json").read_text(encoding="ascii"),
+            )
+            self.assertEqual(marker_sanitized["status"], "incomplete")
+            self.assertEqual(
+                marker_sanitized["cpu_profile_phase"]["worker"]["error_counts"],
+                {"page_marker_missing": 1},
+            )
+            self.assertEqual(
+                marker_sanitized["cpu_profile_phase"]["worker"]["failure_evidence"]
+                ["records"][0]["html_marker_diagnostics"],
+                {
+                    "response_bytes": len(marker_body), "content_type": "html",
+                    "content_encoding": "identity", "parse_outcome": "parsed",
+                    "markers": {
+                        "authenticated_header": True, "detail_fallback": True,
+                        "lifecycle": True, "workspace_ready": False,
+                    },
+                },
+            )
+            marker_json = json.dumps(marker_sanitized)
+            self.assertNotIn("/private/marker-failure-path", marker_json)
+            self.assertNotIn(marker_body.decode("ascii"), marker_json)
+            self.assertFalse(marker_sanitized["cpu_profile_phase"]["performance_credit"])
+            self.assertFalse(marker_sanitized["matrix_credit"])
+            self.assertFalse(marker_sanitized["slo_credit"])
+            self.assertFalse(marker_sanitized["diagnostic_credit"])
+            valid_phase_identity = capacity_diagnostic._composite_phase_identity_binding(
+                marker_produced, source_sha=source_sha, app_target_sha=app_sha,
+                external_run_id=external_run_id, external_run_attempt=attempt,
+                manifest_sha256=manifest_sha, manifest_bytes=len(manifest_raw),
+            )
+            self.assertEqual(valid_phase_identity["status"], "validated")
+            self.assertEqual(valid_phase_identity["cpu_profile_phase"]["run_id"], "2" * 32)
+            self.assertEqual(valid_phase_identity["cpu_profile_phase"]["window_ms"], 20_000)
+            wrong_capacity_outer_id = json.loads(json.dumps(marker_produced))
+            wrong_capacity_outer_id["phase_run_ids"][0] = "a" * 32
+            capacity_identity_rejected = capacity_diagnostic._composite_phase_identity_binding(
+                wrong_capacity_outer_id, source_sha=source_sha, app_target_sha=app_sha,
+                external_run_id=external_run_id, external_run_attempt=attempt,
+                manifest_sha256=manifest_sha, manifest_bytes=len(manifest_raw),
+            )
+            self.assertEqual(capacity_identity_rejected["status"], "partial")
+            self.assertIsNone(capacity_identity_rejected["capacity_phase"])
+            self.assertEqual(capacity_identity_rejected["cpu_profile_phase"]["run_id"], "2" * 32)
+            wrong_profile_outer_digest = json.loads(json.dumps(marker_produced))
+            wrong_profile_outer_digest["phase_profile_digests"][1] = "f" * 64
+            profile_identity_rejected = capacity_diagnostic._composite_phase_identity_binding(
+                wrong_profile_outer_digest, source_sha=source_sha, app_target_sha=app_sha,
+                external_run_id=external_run_id, external_run_attempt=attempt,
+                manifest_sha256=manifest_sha, manifest_bytes=len(manifest_raw),
+            )
+            self.assertEqual(profile_identity_rejected["status"], "partial")
+            self.assertEqual(profile_identity_rejected["capacity_phase"]["run_id"], "1" * 32)
+            self.assertIsNone(profile_identity_rejected["cpu_profile_phase"])
+            malformed_outer_ids = json.loads(json.dumps(marker_produced))
+            malformed_outer_ids["phase_run_ids"] = ["not-a-run-id"]
+            self.assertEqual(
+                capacity_diagnostic._composite_phase_identity_binding(
+                    malformed_outer_ids, source_sha=source_sha, app_target_sha=app_sha,
+                    external_run_id=external_run_id, external_run_attempt=attempt,
+                    manifest_sha256=manifest_sha, manifest_bytes=len(manifest_raw),
+                )["status"],
+                "unavailable",
+            )
+
+            invalid_marker_profile = json.loads(json.dumps(marker_profile))
+            invalid_marker_profile["worker"]["failure_evidence"]["records"][0][
+                "html_marker_diagnostics"]["response_bytes"] = "invalid-size-type"
+            args.report = str(root / "producer-invalid-marker-report.json")
+            invalid_marker_state: dict[str, Any] = {}
+            with (
+                patch.object(capacity_diagnostic, "_read_manifest", return_value=(manifest_raw, manifest, actors)),
+                patch.object(capacity_diagnostic, "_parent_run_once", side_effect=[capacity, invalid_marker_profile]),
+                patch.object(capacity_diagnostic, "_composite_wait_for_profile_gap", return_value=True),
+            ):
+                invalid_marker_produced = capacity_diagnostic._parent_composite_run(
+                    args, invalid_marker_state,
+                )
+            self.assertEqual(invalid_marker_produced["status"], "incomplete")
+            invalid_marker_path = Path(args.report)
+            capacity_diagnostic._write_report(invalid_marker_path, invalid_marker_produced)
+            with patch.object(
+                capacity_diagnostic, "_read_manifest",
+                return_value=(manifest_raw, manifest, actors),
+            ):
+                with self.assertRaises(
+                    capacity_diagnostic._CapacitySanitizationError,
+                ) as caught_marker:
+                    capacity_diagnostic.sanitize_capacity_report(
+                        input_path=invalid_marker_path,
+                        output_path=root / "rejected-invalid-marker.json",
+                        manifest_path=root / "manifest.json", source_sha=source_sha,
+                        app_target_sha=app_sha, run_id=external_run_id, attempt=attempt,
+                        workload=capacity_diagnostic.HTML_COMPOSITE_WORKLOAD,
+                    )
+            rejection = caught_marker.exception.payload
+            self.assertEqual(rejection["field"], "cpu_profile_phase")
+            self.assertEqual(rejection["projection_reason"], "phase_projection_rejected")
+            self.assertEqual(rejection["phase_projection_detail"], {
+                "phase": "cpu_profile_phase", "field": "worker.failure_evidence",
+                "reason": "failure_evidence_rejected", "value_type": "object", "present": True,
+            })
+            self.assertEqual(rejection["phase_identity_binding"]["status"], "validated")
+            self.assertEqual(
+                rejection["phase_identity_binding"]["cpu_profile_phase"]["run_id"],
+                "2" * 32,
+            )
+            self.assertEqual(
+                rejection["phase_identity_binding"]["cpu_profile_phase"]["window_ms"],
+                20_000,
+            )
+            rejection_json = json.dumps(rejection)
+            self.assertNotIn("invalid-size-type", rejection_json)
+            self.assertNotIn("/private/marker-failure-path", rejection_json)
+            fingerprint = capacity_diagnostic._parent_failure_fingerprint(
+                invalid_marker_produced, args=args, stage_state=invalid_marker_state,
+            )
+            self.assertFalse(fingerprint["binding_valid"])
+            self.assertEqual(fingerprint["phase_identity_binding"]["status"], "validated")
+            self.assertEqual(
+                fingerprint["phase_identity_binding"]["cpu_profile_phase"]["window_ms"],
+                20_000,
+            )
+            self.assertFalse(fingerprint["passed"])
+            self.assertFalse(fingerprint["matrix_credit"])
+            self.assertFalse(fingerprint["slo_credit"])
+            self.assertFalse(fingerprint["diagnostic_credit"])
+            profile_source_mismatch = json.loads(json.dumps(invalid_marker_produced))
+            profile_source_mismatch["cpu_profile_phase"]["source_sha"] = "f" * 40
+            partial_phase_identity = capacity_diagnostic._composite_phase_identity_binding(
+                profile_source_mismatch, source_sha=source_sha, app_target_sha=app_sha,
+                external_run_id=external_run_id, external_run_attempt=attempt,
+                manifest_sha256=manifest_sha, manifest_bytes=len(manifest_raw),
+            )
+            self.assertEqual(partial_phase_identity["status"], "partial")
+            self.assertIsNotNone(partial_phase_identity["capacity_phase"])
+            self.assertIsNone(partial_phase_identity["cpu_profile_phase"])
+            self.assertEqual(
+                capacity_diagnostic._composite_phase_identity_binding(
+                    invalid_marker_produced, source_sha="f" * 40,
+                    app_target_sha=app_sha, external_run_id=external_run_id,
+                    external_run_attempt=attempt, manifest_sha256=manifest_sha,
+                    manifest_bytes=len(manifest_raw),
+                )["status"],
+                "unavailable",
+            )
+            args.report = str(root / "producer-report.json")
             complete_cli_output = root / "sanitized-by-cli.json"
             complete_diagnostic = root / "should-not-exist.json"
             complete_stdout = io.StringIO()

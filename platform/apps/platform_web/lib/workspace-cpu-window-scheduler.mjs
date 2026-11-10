@@ -263,6 +263,7 @@ export function scheduleWorkspaceCpuProfilePrearm(
     failed,
     onStarted,
     onLifecycle,
+    startLeadMs,
     startToleranceMs,
   },
 ) {
@@ -276,6 +277,8 @@ export function scheduleWorkspaceCpuProfilePrearm(
       || typeof prepare !== "function" || typeof start !== "function"
       || typeof stop !== "function" || typeof close !== "function"
       || typeof onStarted !== "function"
+      || !Number.isSafeInteger(startLeadMs) || startLeadMs <= 0
+      || plan.on_start_ms - startLeadMs <= plan.off_end_ms
       || !Number.isSafeInteger(startToleranceMs) || startToleranceMs < 0) {
     return null;
   }
@@ -368,7 +371,7 @@ export function scheduleWorkspaceCpuProfilePrearm(
     }
   };
 
-  const startAtEdge = async () => {
+  const startAtPrearm = async () => {
     if (state !== "prepared") return;
     let actualMs;
     try {
@@ -381,8 +384,9 @@ export function scheduleWorkspaceCpuProfilePrearm(
       await finishFailed("start_error", null, "start_timer");
       return;
     }
-    if (actualMs < plan.on_start_ms) {
-      scheduleAt(plan.on_start_ms, () => { void startAtEdge(); }, "start_timer");
+    const startTargetMs = plan.on_start_ms - startLeadMs;
+    if (actualMs < startTargetMs) {
+      scheduleAt(startTargetMs, () => { void startAtPrearm(); }, "start_timer");
       return;
     }
     const lagMs = actualMs - plan.on_start_ms;
@@ -398,7 +402,8 @@ export function scheduleWorkspaceCpuProfilePrearm(
       await finishFailed("start_error", lagMs, "prearm_validation");
       return;
     }
-    if (current === null || phase !== "on" || actualMs > current.expires_at_ms) {
+    if (current === null || actualMs < current.off_end_ms
+        || phase === "off" || actualMs > current.expires_at_ms) {
       await finishFailed("stale", lagMs, "prearm_validation");
       return;
     }
@@ -461,35 +466,100 @@ export function scheduleWorkspaceCpuProfilePrearm(
     }
     const startLagMs = Number.isSafeInteger(startedAtMs)
       ? startedAtMs - plan.on_start_ms : null;
-    const afterStartPlan = matchingPlan();
-    let afterStartPhase = null;
-    try {
-      afterStartPhase = afterStartPlan === null || startLagMs === null
-        ? null : phaseAt(afterStartPlan, startedAtMs);
-    } catch {
-      await finishFailed("start_error", startLagMs, "prearm_validation");
-      return;
-    }
-    if (startLagMs === null || startLagMs < 0 || startLagMs > startToleranceMs) {
+    if (startLagMs === null || startedAtMs < startTargetMs
+        || startLagMs > startToleranceMs) {
       await finishFailed("late", startLagMs, "start_command_completion");
       return;
     }
-    if (afterStartPlan === null || afterStartPhase !== "on"
-        || startedAtMs > afterStartPlan.on_end_ms) {
+    const afterStartPlan = matchingPlan();
+    if (afterStartPlan === null || startedAtMs > afterStartPlan.on_end_ms) {
       await finishFailed("stale", startLagMs, "prearm_validation");
       return;
     }
+    if (startedAtMs < plan.on_start_ms) {
+      state = "armed";
+      scheduleAt(plan.on_start_ms, () => { void activateAtOnEdge(); }, "start_timer");
+      const expireUnactivatedStart = () => {
+        if (state !== "armed") return;
+        let timeoutAtMs;
+        try {
+          timeoutAtMs = now();
+        } catch {
+          void finishFailed("start_error", null, "start_command_deadline");
+          return;
+        }
+        if (!Number.isSafeInteger(timeoutAtMs)) {
+          void finishFailed("start_error", null, "start_command_deadline");
+          return;
+        }
+        if (timeoutAtMs - plan.on_start_ms <= startToleranceMs) {
+          scheduleDeadlineAt(
+            plan.on_start_ms + startToleranceMs + 1,
+            expireUnactivatedStart,
+            "start_command_deadline",
+          );
+          return;
+        }
+        void finishFailed("late", timeoutAtMs - plan.on_start_ms, "start_command_deadline");
+      };
+      scheduleDeadlineAt(
+        plan.on_start_ms + startToleranceMs + 1,
+        expireUnactivatedStart,
+        "start_command_deadline",
+      );
+      return;
+    }
+    await activateAtOnEdge(startedAtMs);
+  };
 
+  const activateAtOnEdge = async (knownNowMs = null) => {
+    if (state !== "starting" && state !== "armed") return;
+    const activationStage = knownNowMs === null ? "start_timer" : "start_command_completion";
+    let actualMs;
+    try {
+      actualMs = knownNowMs === null ? now() : knownNowMs;
+    } catch {
+      await finishFailed("start_error", null, "start_timer");
+      return;
+    }
+    if (!Number.isSafeInteger(actualMs)) {
+      await finishFailed("start_error", null, "start_timer");
+      return;
+    }
+    if (actualMs < plan.on_start_ms) {
+      scheduleAt(plan.on_start_ms, () => { void activateAtOnEdge(); }, "start_timer");
+      return;
+    }
+    const lagMs = actualMs - plan.on_start_ms;
+    const current = matchingPlan();
+    let phase = null;
+    try {
+      phase = current === null ? null : phaseAt(current, actualMs);
+    } catch {
+      await finishFailed("start_error", lagMs, "prearm_validation");
+      return;
+    }
+    if (lagMs > startToleranceMs) {
+      await finishFailed("late", lagMs, "start_timer");
+      return;
+    }
+    if (current === null || phase !== "on" || actualMs > current.expires_at_ms
+        || actualMs > current.on_end_ms) {
+      await finishFailed("stale", lagMs, "prearm_validation");
+      return;
+    }
+    clearTimer(deadlineTimer);
+    deadlineTimer = null;
     state = "started";
     scheduled.delete(key);
     started.add(key);
     try {
-      onStarted(session, startedAtMs, controller);
+      onStarted(session, actualMs, controller);
     } catch {
-      await finishFailed("start_error", startLagMs, "start_command_completion");
+      await finishFailed("start_error", lagMs, activationStage);
       return;
     }
-    report("started", "none", startLagMs, "start_command_completion");
+    report("started", "none", lagMs, activationStage);
   };
 
   const prepareAtOffEnd = async () => {
@@ -509,7 +579,8 @@ export function scheduleWorkspaceCpuProfilePrearm(
       scheduleAt(plan.off_end_ms, () => { void prepareAtOffEnd(); }, "prepare_timer");
       return;
     }
-    if (actualMs >= plan.on_start_ms) {
+    const startTargetMs = plan.on_start_ms - startLeadMs;
+    if (actualMs >= startTargetMs) {
       await finishFailed("late", actualMs - plan.on_start_ms, "prepare_timer");
       return;
     }
@@ -532,13 +603,13 @@ export function scheduleWorkspaceCpuProfilePrearm(
         void finishFailed("start_error", null, "prepare_deadline");
         return;
       }
-      if (timeoutAtMs < plan.on_start_ms) {
-        scheduleDeadlineAt(plan.on_start_ms, expireSlowPreparation, "prepare_deadline");
+      if (timeoutAtMs < startTargetMs) {
+        scheduleDeadlineAt(startTargetMs, expireSlowPreparation, "prepare_deadline");
         return;
       }
       void finishFailed("late", timeoutAtMs - plan.on_start_ms, "prepare_deadline");
     };
-    scheduleDeadlineAt(plan.on_start_ms, expireSlowPreparation, "prepare_deadline");
+    scheduleDeadlineAt(startTargetMs, expireSlowPreparation, "prepare_deadline");
     if (state !== "preparing") return;
     try {
       const preparedSession = await prepare(current, (candidate) => {
@@ -562,7 +633,7 @@ export function scheduleWorkspaceCpuProfilePrearm(
       return;
     }
     const afterPrepareMs = now();
-    if (!Number.isSafeInteger(afterPrepareMs) || afterPrepareMs >= plan.on_start_ms) {
+    if (!Number.isSafeInteger(afterPrepareMs) || afterPrepareMs >= startTargetMs) {
       await finishFailed("late", Number.isSafeInteger(afterPrepareMs)
         ? afterPrepareMs - plan.on_start_ms : null, "prepare_completion");
       return;
@@ -573,7 +644,7 @@ export function scheduleWorkspaceCpuProfilePrearm(
       return;
     }
     state = "prepared";
-    scheduleAt(plan.on_start_ms, () => { void startAtEdge(); }, "start_timer");
+    scheduleAt(startTargetMs, () => { void startAtPrearm(); }, "start_timer");
   };
 
   const controller = {

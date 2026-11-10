@@ -16,7 +16,13 @@ import {
   summarizeFunctionSamples,
 } from "./cpu-profile-categories.mjs";
 import { mapSampledFrames } from "./cpu-profile-source-maps.mjs";
-import { mapAfterCpuWindowSnapshot, runCpuWindowSetup } from "./cpu-profile-window.mjs";
+import {
+  clipCpuProfileToPlannedWindow,
+  intersectCpuProfileClockAnchors,
+  mapAfterCpuWindowSnapshot,
+  readCpuProfileClockAnchor,
+  runCpuWindowSetup,
+} from "./cpu-profile-window.mjs";
 import {
   isHtmlSsrCaptureEligible,
   isHtmlSsrTraceDrainEligible,
@@ -982,6 +988,17 @@ async function startAuthorizedNodeCpuProfile(plan: DiagnosticPlan): Promise<void
   await startNodeCpuProfile(plan);
 }
 
+type CpuProfileClockBracket = {
+  readonly beforeNs: bigint;
+  readonly afterNs: bigint;
+};
+type CpuProfileWindowClock = {
+  readonly startBracket: CpuProfileClockBracket;
+  readonly anchors: ReturnType<typeof readCpuProfileClockAnchor>[];
+  readonly startWallMs: number;
+  readonly endWallMs: number;
+};
+
 function scheduleWebCpuProfile(
   plan: DiagnosticPlan,
   phase: DiagnosticPhase | null,
@@ -1002,6 +1019,8 @@ function scheduleWebCpuProfile(
   if (phase !== null && phase !== "off") return;
   if (consumedCpuRunIds.has(runId)) return;
   consumedCpuRunIds.add(runId);
+  let profileStartClock: CpuProfileClockBracket | null = null;
+  let profileStartAnchor: ReturnType<typeof readCpuProfileClockAnchor> | null = null;
   const controller = scheduleWorkspaceCpuProfilePrearm<DiagnosticPlan, inspector.Session>(plan, {
     now: Date.now,
     schedule: (callback, delayMs) => {
@@ -1014,6 +1033,7 @@ function scheduleWebCpuProfile(
     samePlan: (expected, current) => current !== null
       && canonicalJson(expected) === canonicalJson(current),
     phaseAt: activePhase,
+    startLeadMs: 500,
     prepare: async (_current, retainSession) => {
       const session = new inspector.Session();
       retainSession(session);
@@ -1025,7 +1045,11 @@ function scheduleWebCpuProfile(
       return session;
     },
     start: async (session) => {
+      const beforeNs = process.hrtime.bigint();
       await post<InspectorResponse<unknown>>(session, "Profiler.start");
+      const afterNs = process.hrtime.bigint();
+      profileStartClock = { beforeNs, afterNs };
+      profileStartAnchor = readCpuProfileClockAnchor();
       return Date.now();
     },
     stop: async (session) => {
@@ -1035,13 +1059,22 @@ function scheduleWebCpuProfile(
     scheduled: webCpuProfileScheduled,
     started: webCpuProfileStarted,
     failed: webCpuProfileFailed,
-    onStarted: (session, startedAtMs, profileController) => {
-      const startLagMs = startedAtMs - plan.on_start_ms;
-      const startedMonotonicMs = performance.now();
+    onStarted: (session, _startedAtMs, profileController) => {
+      const startBracket = profileStartClock;
+      const startAnchor = profileStartAnchor;
+      if (startBracket === null || startAnchor === null) {
+        throw new Error("Web CPU profile start clock was not captured");
+      }
+      const profileClock = {
+        startBracket,
+        anchors: [startAnchor, readCpuProfileClockAnchor()],
+        startWallMs: plan.on_start_ms,
+        endWallMs: plan.on_end_ms,
+      } satisfies CpuProfileWindowClock;
       activeCpuRunId = runId;
       const timer = setTimeout(() => {
         void stopNodeCpuProfile(
-          session, runId, startLagMs, startedMonotonicMs, profileController,
+          session, runId, 0, 0, profileController, profileClock,
         );
       }, Math.max(1, plan.on_end_ms - Date.now()));
       timer.unref();
@@ -1123,6 +1156,7 @@ async function stopNodeCpuProfile(
   profileController?: {
     complete: () => Promise<void>;
   },
+  profileClock?: CpuProfileWindowClock,
 ): Promise<void> {
   if (activeCpuRunId !== runId) {
     emitSsrWebLifecycleEvent({ run_id: runId }, "on", "cpu_profile", "skipped", {
@@ -1140,15 +1174,20 @@ async function stopNodeCpuProfile(
   let finalStatus: "finalized" | "failed" = "failed";
   let finalReason: "profile_bounds" | "profile_stop" | "none" = "profile_stop";
   try {
+    const stopBeforeNs = process.hrtime.bigint();
     const response = await post<{ profile?: {
       nodes?: Array<{ id: number; callFrame?: {
         url?: string; functionName?: string; lineNumber?: number; columnNumber?: number;
       } }>;
       samples?: number[];
       timeDeltas?: number[];
+      startTime?: number;
+      endTime?: number;
     } }>(session, "Profiler.stop");
-    const elapsedAtStopMs = Math.max(0, Math.floor(performance.now() - startedMonotonicMs));
-    const elapsedMs = elapsedAtStopMs;
+    const stopAfterNs = process.hrtime.bigint();
+    const stopAnchor = readCpuProfileClockAnchor();
+    const elapsedAtStopMs = profileClock === undefined
+      ? Math.max(0, Math.floor(performance.now() - startedMonotonicMs)) : 0;
     const profile = response.profile;
     if (!profile || !Array.isArray(profile.nodes) || !Array.isArray(profile.samples)
         || !Array.isArray(profile.timeDeltas) || profile.samples.length > MAX_SAMPLES
@@ -1160,8 +1199,30 @@ async function stopNodeCpuProfile(
       finalReason = "profile_bounds";
       return;
     }
+    const clipped = profileClock === undefined ? null : (() => {
+      const offsetRange = intersectCpuProfileClockAnchors([...profileClock.anchors, stopAnchor]);
+      if (offsetRange === null) return null;
+      return clipCpuProfileToPlannedWindow(profile, {
+        ...offsetRange,
+        startWallMs: profileClock.startWallMs,
+        endWallMs: profileClock.endWallMs,
+        startBracket: profileClock.startBracket,
+        stopBracket: { beforeNs: stopBeforeNs, afterNs: stopAfterNs },
+        maxSamples: MAX_SAMPLES,
+        maxNodes: MAX_PROFILE_NODES,
+        maxCpuUs: MAX_PROFILE_CPU_US,
+      });
+    })();
+    if (profileClock !== undefined && clipped === null) {
+      console.info(`cpu_diagnostic_complete service=web run_id=${runId} status=incomplete reason=profile_bounds`);
+      finalReason = "profile_bounds";
+      return;
+    }
+    const profileSamples = clipped?.samples ?? profile.samples;
+    const profileTimeDeltas = clipped?.timeDeltas ?? profile.timeDeltas;
+    const elapsedMs = clipped?.elapsedMs ?? elapsedAtStopMs;
+    const effectiveStartLagMs = clipped?.startLagMs ?? startLagMs;
     const profileNodes = profile.nodes;
-    const profileSamples = profile.samples;
     const profileWindow = await mapAfterCpuWindowSnapshot(
       elapsedMs,
       waitForCpuUsageWindowSnapshot(runId, "on"),
@@ -1180,7 +1241,7 @@ async function stopNodeCpuProfile(
       const category = categoryForFrame(frame?.url ?? "", frame?.functionName ?? "");
       const row = totals.get(category) ?? { samples: 0, cpuUs: 0 };
       row.samples += 1;
-      row.cpuUs += Math.max(0, profile.timeDeltas[index]);
+      row.cpuUs += Math.max(0, profileTimeDeltas[index]);
       totals.set(category, row);
     }
     const otherTotals = totals.get("other") ?? { samples: 0, cpuUs: 0 };
@@ -1197,7 +1258,7 @@ async function stopNodeCpuProfile(
       .join(",");
     console.info(
       `cpu_diagnostic_complete service=web run_id=${runId} timer=v8_cpu `
-      + `start_lag_ms=${startLagMs} elapsed_ms=${elapsedMs} `
+      + `start_lag_ms=${effectiveStartLagMs} elapsed_ms=${elapsedMs} `
       + `sample_interval_us=10000 sample_count=${acceptedSamples} `
       + `sample_classes=idle:${sampleClassCounts.idle},gc:${sampleClassCounts.garbage_collector},`
       + `program:${sampleClassCounts.program},unmapped_busy:${sampleClassCounts.unmapped_busy},`
