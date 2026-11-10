@@ -1189,20 +1189,31 @@ async function stopNodeCpuProfile(
     const elapsedAtStopMs = profileClock === undefined
       ? Math.max(0, Math.floor(performance.now() - startedMonotonicMs)) : 0;
     const profile = response.profile;
+    const profileStartTime = profile?.startTime;
+    const profileEndTime = profile?.endTime;
     if (!profile || !Array.isArray(profile.nodes) || !Array.isArray(profile.samples)
         || !Array.isArray(profile.timeDeltas) || profile.samples.length > MAX_SAMPLES
         || profile.samples.length !== profile.timeDeltas.length
         || profile.nodes.length > MAX_PROFILE_NODES
+        || typeof profileStartTime !== "number" || !Number.isSafeInteger(profileStartTime)
+        || typeof profileEndTime !== "number" || !Number.isSafeInteger(profileEndTime)
         || profile.timeDeltas.some((delta) => !Number.isSafeInteger(delta) || delta < 0)
         || profile.timeDeltas.reduce((total, delta) => total + delta, 0) > MAX_PROFILE_CPU_US) {
       console.info(`cpu_diagnostic_complete service=web run_id=${runId} status=incomplete reason=profile_bounds`);
       finalReason = "profile_bounds";
       return;
     }
+    const boundedProfile = {
+      nodes: profile.nodes,
+      samples: profile.samples,
+      timeDeltas: profile.timeDeltas,
+      startTime: profileStartTime,
+      endTime: profileEndTime,
+    };
     const clipped = profileClock === undefined ? null : (() => {
       const offsetRange = intersectCpuProfileClockAnchors([...profileClock.anchors, stopAnchor]);
       if (offsetRange === null) return null;
-      return clipCpuProfileToPlannedWindow(profile, {
+      return clipCpuProfileToPlannedWindow(boundedProfile, {
         ...offsetRange,
         startWallMs: profileClock.startWallMs,
         endWallMs: profileClock.endWallMs,

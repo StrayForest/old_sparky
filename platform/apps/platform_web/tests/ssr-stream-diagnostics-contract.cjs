@@ -870,12 +870,17 @@ async function verifyCpuProfileSourceMapContract() {
   const planSource = fs.readFileSync(planPath, "utf8");
   const stopped = planSource.indexOf('"Profiler.stop"');
   const elapsed = planSource.indexOf("const elapsedAtStopMs = profileClock === undefined", stopped);
+  const profileStartGuard = planSource.indexOf('typeof profileStartTime !== "number"', elapsed);
+  const profileEndGuard = planSource.indexOf('typeof profileEndTime !== "number"', elapsed);
+  const boundedProfile = planSource.indexOf("const boundedProfile = {", profileEndGuard);
   const snapshotWait = planSource.indexOf('waitForCpuUsageWindowSnapshot(runId, "on")', elapsed);
-  const clipping = planSource.indexOf("clipCpuProfileToPlannedWindow(profile", elapsed);
+  const clipping = planSource.indexOf("clipCpuProfileToPlannedWindow(boundedProfile", elapsed);
   const mapping = planSource.indexOf("mapSampledFrames(", snapshotWait);
-  if (stopped < 0 || elapsed <= stopped || clipping <= elapsed
+  if (stopped < 0 || elapsed <= stopped || profileStartGuard <= elapsed
+      || profileEndGuard <= profileStartGuard || boundedProfile <= profileEndGuard
+      || clipping <= boundedProfile
       || snapshotWait <= clipping || mapping <= snapshotWait) {
-    throw new Error("Web profile must clip to the planned ON interval before waiting to map after the process-CPU snapshot");
+    throw new Error("Web profile must validate required clock fields, clip to ON and map after its process-CPU snapshot");
   }
   if (!planSource.includes("Math.max(0, endTarget - startMs)")
       || !planSource.includes("const usage = process.cpuUsage(startCpu);")) {
