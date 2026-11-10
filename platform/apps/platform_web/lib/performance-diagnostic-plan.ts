@@ -999,7 +999,7 @@ function scheduleWebCpuProfile(
   if (phase !== null && phase !== "off") return;
   if (consumedCpuRunIds.has(runId)) return;
   consumedCpuRunIds.add(runId);
-  const controller = scheduleWorkspaceCpuProfilePrearm(plan, {
+  const controller = scheduleWorkspaceCpuProfilePrearm<DiagnosticPlan, inspector.Session>(plan, {
     now: Date.now,
     schedule: (callback, delayMs) => {
       const timer = setTimeout(callback, delayMs);
