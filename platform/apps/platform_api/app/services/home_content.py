@@ -37,9 +37,9 @@ DEADLOCK_ASSET_BASE_URL = "https://deadlock.io"
 HOME_CONTENT_KEY = "platform:home-content:v4"
 HOME_CONTENT_STALE_KEY = "platform:home-content:stale:v4"
 HOME_CONTENT_LOCK_KEY = "platform:home-content:refresh-lock:v4"
-PATCH_DETAIL_KEY_PREFIX = "platform:home-content:patch:v14:"
-PATCH_ASSET_CATALOG_KEY = "platform:home-content:patch-assets:v8"
-PATCH_ASSET_CATALOG_STALE_KEY = "platform:home-content:patch-assets-stale:v2"
+PATCH_DETAIL_KEY_PREFIX = "platform:home-content:patch:v15:"
+PATCH_ASSET_CATALOG_KEY = "platform:home-content:patch-assets:v9"
+PATCH_ASSET_CATALOG_STALE_KEY = "platform:home-content:patch-assets-stale:v3"
 PATCH_ASSET_PENDING_RETRY_KEY = "platform:home-content:patch-assets-pending-retry:v1"
 PATCH_SITEMAP_INDEX_KEY = "platform:seo:patch-index:v1"
 PATCH_DETAIL_TTL_SECONDS = 30 * 24 * 60 * 60
@@ -911,9 +911,11 @@ def _supplemental_hero_abilities(
             "stats_pending": stats_pending,
             "icon_url": icon_url,
         }
-    # Patchable auxiliary abilities can be exported as weapon assets rather
-    # than signature slots. Join only an exact hero-class prefix with a unique
-    # owner; shared/base assets and explicit hero slots are not auxiliary rows.
+    # Patchable auxiliary abilities can be exported outside signature slots
+    # as either weapon or ability assets. Ability assets need an exact unique
+    # hero-class prefix: ordinary weapon_melee slots describe hero-level
+    # mechanics and do not establish ownership of a new ability card. Existing
+    # explicitly referenced weapon auxiliaries retain their catalog precedence.
     hero_class_name = str(hero.get("class_name") or "").strip().casefold()
     hero_class_match = re.fullmatch(r"hero_([a-z0-9]+(?:_[a-z0-9]+)*)", hero_class_name)
     owner_classes = supplemental_hero_class_names or [hero_class_name]
@@ -922,9 +924,10 @@ def _supplemental_hero_abilities(
         for ability_class, ability in supplemental_items.items():
             if (
                 not ability_class.startswith("ability_")
-                or str(ability.get("type") or "").casefold() != "weapon"
+                or str(ability.get("type") or "").casefold() not in {"weapon", "ability"}
             ):
                 continue
+            ability_type = str(ability.get("type") or "").casefold()
             explicitly_referenced = ability_class in referenced_classes
             candidate_owners = []
             for owner_class in owner_classes:
@@ -936,10 +939,12 @@ def _supplemental_hero_abilities(
                     f"ability_{owner_match.group(1)}_"
                 ):
                     candidate_owners.append(str(owner_class).strip().casefold())
-            if not explicitly_referenced and candidate_owners != [hero_class_name]:
+            if ability_type == "ability" and candidate_owners != [hero_class_name]:
+                continue
+            if ability_type == "weapon" and not explicitly_referenced and candidate_owners != [hero_class_name]:
                 continue
             catalog_name = str(ability.get("name") or "").strip()
-            if not catalog_name:
+            if not catalog_name or catalog_name.casefold() == ability_class:
                 continue
             ability_alias = catalog_name.casefold()
             if ability_alias in abilities:
@@ -953,11 +958,19 @@ def _supplemental_hero_abilities(
                 continue
             if icon_url is None:
                 continue
+            localized_ability = localized_items.get(ability_class)
+            localized_name = (
+                str(localized_ability.get("name") or "").strip()
+                if isinstance(localized_ability, dict)
+                else ""
+            )
             auxiliary_candidates.setdefault(ability_alias, []).append(
                 {
                     "id": ability.get("id"),
                     "slug": ability_class,
                     "name": catalog_name,
+                    "display_name": localized_name or None,
+                    "russian_metadata_available": bool(localized_name),
                     "icon_url": icon_url,
                     "patch_only": True,
                 }

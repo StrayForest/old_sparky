@@ -69,11 +69,25 @@
         "hero": "Paige",
         "mode": "Street Brawl"
       }
+    },
+    {
+      "patch_id": "1847920302240420",
+      "path": "sections[hero=Silver].abilities[Go For The Throat]",
+      "source_feed_line_occurrences": 1,
+      "change_rows_moved": 1,
+      "catalog_class_name": "ability_werewolf_frenzy",
+      "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/werewolf/werewolf_bite.png"
+    },
+    {
+      "patch_id": "1847920302240420",
+      "path": "sections[hero=Solomon].abilities[Move Piece].display_name",
+      "catalog_class_name": "ability_chessmaster_movechesspiece",
+      "display_name": "Ход фигурой"
     }
   ],
   "renderer_fixtures": {
     "1846651706696737": "ce37f05e3cd820d976b67b54ab8f45ef3e977fbfb49427b108980bb933487da6",
-    "1847920302240420": "43eb328d274c0d169c1a09a6610deaac7bc52e72643b333edc3f06dccd7821c1",
+    "1847920302240420": "59684991847b42d9e2509adc0df936c1cf0a0b2a6f8e8d7ecf8f5772803b3eee",
     "1848664643339845": "6db61a6999f445547ef006c081b9940b1a760ec7c32711ce919a898bed838fab",
     "1848664643342973": "aaa141e4ce47a51de440bee9acde15fe757a61cf30be452448239d54a966eb13"
   },

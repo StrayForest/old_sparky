@@ -232,7 +232,7 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
         )
         expected_renderer_fixture_digests = {
             "1846651706696737": "ce37f05e3cd820d976b67b54ab8f45ef3e977fbfb49427b108980bb933487da6",
-            "1847920302240420": "43eb328d274c0d169c1a09a6610deaac7bc52e72643b333edc3f06dccd7821c1",
+            "1847920302240420": "59684991847b42d9e2509adc0df936c1cf0a0b2a6f8e8d7ecf8f5772803b3eee",
             "1848664643339845": "6db61a6999f445547ef006c081b9940b1a760ec7c32711ce919a898bed838fab",
             "1848664643342973": "aaa141e4ce47a51de440bee9acde15fe757a61cf30be452448239d54a966eb13",
         }
@@ -269,6 +269,20 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
                         "changes": 1,
                     },
                 },
+                {
+                    "patch_id": "1847920302240420",
+                    "path": "sections[hero=Silver].abilities[Go For The Throat]",
+                    "source_feed_line_occurrences": 1,
+                    "change_rows_moved": 1,
+                    "catalog_class_name": "ability_werewolf_frenzy",
+                    "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/werewolf/werewolf_bite.png",
+                },
+                {
+                    "patch_id": "1847920302240420",
+                    "path": "sections[hero=Solomon].abilities[Move Piece].display_name",
+                    "catalog_class_name": "ability_chessmaster_movechesspiece",
+                    "display_name": "Ход фигурой",
+                },
             ],
         )
         expected_ids = {
@@ -300,13 +314,15 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
                 },
                 old_catalog,
             )
-            for version in range(6, 14):
+            for version in range(6, 15):
                 old_values[f"platform:home-content:patch:v{version}:{patch_id}"] = json.dumps(
                     compact_detail
                 )
         old_catalog_keys = {
             "platform:home-content:patch-assets:v7": json.dumps(old_catalog),
+            "platform:home-content:patch-assets:v8": json.dumps(old_catalog),
             "platform:home-content:patch-assets-stale:v1": json.dumps(old_catalog),
+            "platform:home-content:patch-assets-stale:v2": json.dumps(old_catalog),
         }
         cache = _Cache({**old_values, **old_catalog_keys})
         requests: list[httpx.Request] = []
@@ -431,7 +447,9 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
             },
         )
         self.assertNotIn("platform:home-content:patch-assets:v7", cache.get_calls)
+        self.assertNotIn("platform:home-content:patch-assets:v8", cache.get_calls)
         self.assertNotIn("platform:home-content:patch-assets-stale:v1", cache.get_calls)
+        self.assertNotIn("platform:home-content:patch-assets-stale:v2", cache.get_calls)
         for old_key, old_value in old_catalog_keys.items():
             self.assertEqual(cache.values[old_key], old_value)
         self.assertIn(home_content.PATCH_ASSET_CATALOG_KEY, cache.values)
@@ -527,7 +545,68 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
                 translation_source_hash(registered_patches[patch_id]),
                 translation_source_hash(updated_detail),
             )
+            if patch_id == "1848664643339845":
+                baba_catalog = current_catalog["heroes"]["baba"]
+                self.assertNotIn("melee", baba_catalog["abilities"])
+                baba_section = next(
+                    section
+                    for section in updated_detail["sections"]
+                    if section.get("kind") == "hero"
+                    and section.get("hero_name") == "Baba"
+                )
+                self.assertTrue(
+                    any("Melee damage per boon reduced by 10%" == change for change in baba_section["changes"])
+                )
+                self.assertFalse(
+                    any(ability.get("name") == "Melee" for ability in baba_section["abilities"])
+                )
             if patch_id == "1847920302240420":
+                silver_catalog = current_catalog["heroes"]["silver"]
+                go_for_the_throat_catalog = silver_catalog["abilities"]["go for the throat"]
+                source_go_rows = [
+                    line
+                    for line in home_content._patch_lines(updated_detail["content"])
+                    if line.casefold().startswith("silver: go for the throat")
+                ]
+                self.assertEqual(len(source_go_rows), 1)
+                source_go_change = source_go_rows[0].split(":", 1)[1].strip()
+                ability_prefix = "Go For The Throat - "
+                self.assertTrue(source_go_change.startswith(ability_prefix))
+                source_ability_change = source_go_change[len(ability_prefix):]
+                silver_section = next(
+                    section
+                    for section in updated_detail["sections"]
+                    if section.get("kind") == "hero"
+                    and section.get("hero_name") == "Silver"
+                    and not section.get("mode_name")
+                )
+                go_for_the_throat = [
+                    ability
+                    for ability in silver_section["abilities"]
+                    if ability.get("name") == "Go For The Throat"
+                ]
+                self.assertEqual(len(go_for_the_throat), 1)
+                self.assertEqual(go_for_the_throat[0]["changes"], [source_ability_change])
+                self.assertEqual(
+                    go_for_the_throat[0]["icon_url"],
+                    next(
+                        item["image"]
+                        for item in catalog_inputs["items_english"]
+                        if item.get("class_name") == "ability_werewolf_frenzy"
+                    ),
+                )
+                self.assertTrue(go_for_the_throat_catalog["patch_only"])
+                self.assertEqual(
+                    go_for_the_throat[0]["display_name"],
+                    next(
+                        item["name"]
+                        for item in catalog_inputs["items_russian"]
+                        if item.get("class_name") == "ability_werewolf_frenzy"
+                    ),
+                )
+                self.assertFalse(
+                    any("Go For The Throat" in change for change in silver_section["changes"])
+                )
                 normal_nurse = next(
                     section
                     for section in updated_detail["sections"]
@@ -618,6 +697,14 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
                 ]
                 self.assertEqual(len(move_piece), 1)
                 self.assertEqual(len(move_piece[0]["changes"]), 2)
+                self.assertEqual(
+                    move_piece[0]["display_name"],
+                    next(
+                        item["name"]
+                        for item in catalog_inputs["items_russian"]
+                        if item.get("class_name") == "ability_chessmaster_movechesspiece"
+                    ),
+                )
                 self.assertTrue(any("50m" in change and "65m" in change for change in move_piece[0]["changes"]))
                 self.assertTrue(any("improved placement" in change.casefold() for change in move_piece[0]["changes"]))
             if patch_id == "1846651706696737":

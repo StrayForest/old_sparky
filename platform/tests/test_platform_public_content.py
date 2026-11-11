@@ -2242,14 +2242,14 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
     def test_public_content_cache_versions_keep_home_contract_stable(self) -> None:
         self.assertEqual(home_content.HOME_CONTENT_KEY, "platform:home-content:v4")
         self.assertEqual(home_content.HOME_CONTENT_STALE_KEY, "platform:home-content:stale:v4")
-        self.assertEqual(home_content.PATCH_DETAIL_KEY_PREFIX, "platform:home-content:patch:v14:")
+        self.assertEqual(home_content.PATCH_DETAIL_KEY_PREFIX, "platform:home-content:patch:v15:")
         self.assertEqual(
             home_content.PATCH_ASSET_CATALOG_KEY,
-            "platform:home-content:patch-assets:v8",
+            "platform:home-content:patch-assets:v9",
         )
         self.assertEqual(
             home_content.PATCH_ASSET_CATALOG_STALE_KEY,
-            "platform:home-content:patch-assets-stale:v2",
+            "platform:home-content:patch-assets-stale:v3",
         )
 
     def test_supplemental_patch_ability_uses_catalogued_solomon_move_piece_icon(self) -> None:
@@ -2279,6 +2279,19 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
                     "name": "Move King",
                     "image": image,
                 },
+                "ability_chessmaster_gambit": {
+                    "id": 912,
+                    "class_name": "ability_chessmaster_gambit",
+                    "type": "ability",
+                    "name": "Queen's Gambit",
+                    "image": image,
+                },
+                "ability_chessmaster_internal_trigger": {
+                    "class_name": "ability_chessmaster_internal_trigger",
+                    "type": "ability",
+                    "name": "ability_chessmaster_internal_trigger",
+                    "image": image,
+                },
                 "ability_melee_chessmaster": {
                     "class_name": "ability_melee_chessmaster",
                     "type": "weapon",
@@ -2292,7 +2305,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
                     "image": image,
                 },
             },
-            {},
+            {"ability_chessmaster_gambit": {"name": "Королевский гамбит"}},
             supplemental_hero_class_names=["hero_chessmaster"],
         )
 
@@ -2303,8 +2316,34 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
         self.assertNotIn("stats", abilities["move piece"])
         self.assertTrue(abilities["move piece"]["patch_only"])
         self.assertEqual(abilities["move king"]["name"], "Move King")
+        self.assertEqual(abilities["queen's gambit"]["name"], "Queen's Gambit")
+        self.assertEqual(abilities["queen's gambit"]["display_name"], "Королевский гамбит")
+        self.assertEqual(abilities["queen's gambit"]["slug"], "ability_chessmaster_gambit")
+        self.assertEqual(abilities["queen's gambit"]["icon_url"], image)
+        self.assertTrue(abilities["queen's gambit"]["patch_only"])
+        self.assertNotIn("description", abilities["queen's gambit"])
+        self.assertNotIn("stats", abilities["queen's gambit"])
+        self.assertNotIn("ability chessmaster internal trigger", abilities)
         self.assertNotIn("melee", abilities)
         self.assertNotIn("alekhine's gun", abilities)
+
+        generic_melee_reference = home_content._supplemental_hero_abilities(
+            {
+                "name": "Baba",
+                "class_name": "hero_baba",
+                "items": {"weapon_melee": "ability_melee_baba"},
+            },
+            {
+                "ability_melee_baba": {
+                    "type": "ability",
+                    "name": "Melee",
+                    "image": image,
+                },
+            },
+            {},
+            supplemental_hero_class_names=["hero_baba"],
+        )
+        self.assertEqual(generic_melee_reference, {})
 
         explicit_ability_image = (
             "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/"
@@ -2342,7 +2381,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
                     "image": image,
                 },
                 "ability_chessmaster_aux_two": {
-                    "type": "weapon",
+                    "type": "ability",
                     "name": "Auxiliary Move",
                     "image": image,
                 },
@@ -2375,7 +2414,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
             colliding_hero,
             {
                 "ability_test_extra_move": {
-                    "type": "weapon",
+                    "type": "ability",
                     "name": "Move Extra",
                     "image": image,
                 },
@@ -2401,6 +2440,23 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
             supplemental_hero_class_names=["hero_test", "hero_test_extra"],
         )
         self.assertEqual(explicit_reference["move extra"]["icon_url"], image)
+
+        shared_ability_reference = home_content._supplemental_hero_abilities(
+            {
+                **colliding_hero,
+                "items": {"auxiliary": "ability_test_extra_move"},
+            },
+            {
+                "ability_test_extra_move": {
+                    "type": "ability",
+                    "name": "Move Extra",
+                    "image": image,
+                },
+            },
+            {},
+            supplemental_hero_class_names=["hero_test", "hero_test_extra"],
+        )
+        self.assertEqual(shared_ability_reference, {})
 
         invalid_icon = home_content._supplemental_hero_abilities(
             hero,

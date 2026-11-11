@@ -1856,8 +1856,7 @@
       "objective_key": null,
       "objective_icon_url": null,
       "changes": [
-        "Base health regen increased from 2.5 to 3",
-        "Go For The Throat - Now counts weapon damage from Point Blank and Opening Rounds"
+        "Base health regen increased from 2.5 to 3"
       ],
       "abilities": [
         {
@@ -1871,6 +1870,18 @@
           "changes": [
             "Fixed Unstoppable flying targets being made to fall",
             "Fixed not grounding Grey Talon during his Rain of Arrows"
+          ]
+        },
+        {
+          "name": "Go For The Throat",
+          "display_name": "Зубами в горло",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/werewolf/werewolf_bite.png",
+          "changes": [
+            "Now counts weapon damage from Point Blank and Opening Rounds"
           ]
         }
       ]
@@ -1944,7 +1955,7 @@
         },
         {
           "name": "Move Piece",
-          "display_name": null,
+          "display_name": "Ход фигурой",
           "description": null,
           "presentation_kind": "balance",
           "stats": [],

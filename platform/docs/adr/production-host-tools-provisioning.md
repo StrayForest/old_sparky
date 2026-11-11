@@ -440,17 +440,15 @@ authority.
 
 ## Intentional host-tools bump lifecycle
 
-The performance follow-up candidate extends the previous 14-member host
-closure with the fixed CPU diagnostic plan controller, producing a
-15-member, four-component bundle. The new `cpu_diagnostic_control` component
-contains only `platform_cpu_diagnostic_plan.py`; the installed immutable
-dispatcher may invoke it only as its exact trusted sibling through the closed
-`cpu-diagnostic-plan` stdin action. The capability contract adds
-`cpu_diagnostic_plan_control=1` and advances the dispatcher schema to 4. This
-candidate is not authorized by an earlier pin: the normal C/P sequence must
-record all 15 source paths, modes and digests, pass exact-SHA CI, and provision
-and attest the new generation before the action can be used. The 14-member
-counts below are historical records for their respective prior generations.
+The active v4 host-tools closure has 15 source files in four components; its
+signed bundle adds `capabilities.txt` and `manifest.json` (17 regular files).
+The `cpu_diagnostic_control` component contains only
+`platform_cpu_diagnostic_plan.py`; the dispatcher may invoke it only as its
+exact trusted sibling through the closed `cpu-diagnostic-plan` stdin action.
+The capability contract adds `cpu_diagnostic_plan_control=1` and uses
+dispatcher schema 4. The 14-member counts below are historical. Any closure or
+capability change requires C/P, exact-SHA CI, signed preflight, provisioning
+and installed self-test before use.
 
 Changes to any member of the host-control closure, its closure declaration or
 the bundle helper must be handled as a reviewed **C → P** source sequence,
@@ -489,11 +487,13 @@ The bounded cleanup-failure diagnostics use source **C14** `314afc65d3c3d8ef88e3
 1. Commit **C** changes the host-control closure. The previously installed pin
    cannot authorize the modified closure, so ordinary deployment remains
    blocked.
-2. Commit **P**, descended from **C** in the same reviewed change, updates only
-   the pin with respect to host control: `host_tools_sha` becomes **C** and the
-   exact closure baseline records **C**'s paths, modes and digests; record C/P provenance in this ADR and run `tests.test_platform_host_tools_bundle.HostToolsBundleTests.test_host_tools_provisioning_adr_matches_enforced_generation_pin` against the committed target. The
-   application target may contain tests or documentation alongside this pin
-   update; the host-control closure itself must match **C** byte for byte.
+2. Commit **P**, descended from **C** in the same reviewed change, updates the
+   host pin: `host_tools_sha` selects **C** and the exact closure baseline
+   records its paths, modes and digests. The pin/resolver is the C source of
+   truth; record the actual C/P pair in the signed receipt and verified
+   `CURRENT.md`, not in this generic procedure. Run
+   `tests.test_platform_host_tools_bundle.HostToolsBundleTests.test_host_tools_provisioning_adr_matches_enforced_generation_pin`
+   against P; the host-control closure must match **C** byte for byte.
 3. Require full CI success for exact merged **P**, then use the documented
    read-only `mode=preflight` run at **P** to produce the signed
    `build-host-tools` bundle. Verify its exact workflow run/attempt, successful

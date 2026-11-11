@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
+import json
 import unittest
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch as mock_patch
 
+from apps.platform_api.app.services import home_content
 from apps.platform_api.app.services import patch_translation as translation
 from apps.platform_api.app.services import patch_translation_runtime as runtime
 from python_packages.platform_infra.config import PlatformSettings
@@ -171,10 +175,171 @@ class PatchTranslationRealRegressionTests(unittest.TestCase):
             "Базовый урон от оружия увеличен на 5%.",
         )
 
+        # Exercise the actual current Steam article with the full retained asset
+        # catalog. Rem's cataloged ability is itself named "Gun Damage", so this
+        # catches an ENTITY placeholder taking precedence over the mechanic alias.
+        fixture_root = Path(__file__).parent / "fixtures" / "patch-acceptance"
+        steam_fixture = json.loads(
+            (fixture_root / "steam-news-four-patches.json").read_text(encoding="utf-8")
+        )
+        catalog_fixture = json.loads(
+            gzip.decompress(
+                (fixture_root / "deadlock-catalog-inputs.json.gz").read_bytes()
+            )
+        )
+        catalog_inputs = catalog_fixture["inputs"]
+        full_catalog = home_content._build_asset_catalog(
+            {},
+            {},
+            supplemental_hero_payload=catalog_inputs["heroes_english"],
+            supplemental_item_payload=catalog_inputs["items_english"],
+            localized_supplemental_hero_payload=catalog_inputs["heroes_russian"],
+            localized_supplemental_item_payload=catalog_inputs["items_russian"],
+            icon_payload=catalog_inputs["icons"],
+        )
+        rem_gun_damage = full_catalog["heroes"]["rem"]["abilities"]["gun damage"]
+        self.assertEqual(rem_gun_damage["name"], "Gun Damage")
+        self.assertEqual(rem_gun_damage["slug"], "ability_familiar_primary_weapon_bubblegun")
+
+        raw_patch = next(
+            item for item in steam_fixture["items"]
+            if item["gid"] == "1847920302240420"
+        )
+        source_patch = home_content._structure_patch_detail(
+            {**raw_patch, "content": raw_patch["contents"]},
+            full_catalog,
+        )
+        source_patch["id"] = raw_patch["gid"]
+        full_source_segments = runtime.extract_translation_segments(source_patch)
+        mechanic_ids = [
+            segment["id"]
+            for segment in full_source_segments
+            if runtime._GUN_DAMAGE_MECHANIC_SOURCE_RE.search(segment["text"])
+        ]
+        self.assertEqual(len(mechanic_ids), 3)
+        prepared_full, entities_full, facts_full = runtime._prepare_segments(
+            source_patch,
+            full_catalog,
+        )
+        prepared_by_id = {segment["id"]: segment for segment in prepared_full}
+        source_by_id = {segment["id"]: segment for segment in full_source_segments}
+        mechanic_source = [source_by_id[segment_id] for segment_id in mechanic_ids]
+        mechanic_prepared = [prepared_by_id[segment_id] for segment_id in mechanic_ids]
+        self.assertTrue(all("Base gun damage" in segment["text"] for segment in mechanic_prepared))
+        self.assertTrue(all("[[ENTITY_" not in segment["text"] for segment in mechanic_prepared))
+
+        # The same full catalog still protects a sentence that names the Rem
+        # ability, because it is not a source-backed stat use.
+        named_ability_patch = {
+            "sections": [{
+                "kind": "general",
+                "title": "Ability reference",
+                "changes": ["The Gun Damage ability remains unchanged."],
+                "abilities": [],
+            }],
+        }
+        named_prepared, named_entities, _ = runtime._prepare_segments(
+            named_ability_patch,
+            full_catalog,
+        )
+        self.assertIn("[[ENTITY_0000]]", named_prepared[0]["text"])
+        self.assertEqual(
+            named_entities["s000-c000"]["[[ENTITY_0000]]"],
+            "Gun Damage",
+        )
+
+        class FixtureResponse:
+            def __init__(self, rows: list[dict[str, str]]) -> None:
+                self.rows = rows
+
+            @staticmethod
+            def raise_for_status() -> None:
+                return None
+
+            def json(self) -> dict[str, object]:
+                return {
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": json.dumps({"segments": self.rows}, ensure_ascii=False),
+                        }],
+                    }],
+                }
+
+        class FixtureClient:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def post(self, *_args, **kwargs):
+                request = kwargs["json"]
+                self.calls.append(request)
+                request_segments = json.loads(request["input"])["segments"]
+                if "CORRECTION ATTEMPT" in request["instructions"]:
+                    rows = [
+                        {
+                            "id": segment["id"],
+                            "text": (
+                                "Базовый урон от оружия уменьшен на [[FACT_0000]]."
+                                if "reduced" in source_by_id[segment["id"]]["text"].lower()
+                                else "Базовый урон от оружия увеличен на [[FACT_0000]]."
+                            ),
+                        }
+                        for segment in request_segments
+                    ]
+                else:
+                    rows = [
+                        {
+                            "id": segment["id"],
+                            "text": "Базовый gun damage изменен на [[FACT_0000]].",
+                        }
+                        for segment in request_segments
+                    ]
+                return FixtureResponse(rows)
+
+        async def translate_full_source() -> tuple[dict[str, str], FixtureClient, runtime._TranslationProviderCallBudget]:
+            client = FixtureClient()
+            budget = runtime._TranslationProviderCallBudget()
+            with mock_patch.object(runtime.httpx, "AsyncClient", return_value=client):
+                translated = await runtime._request_openai_batches(
+                    patch_id=source_patch["id"],
+                    source_segments=mechanic_source,
+                    prepared_segments=mechanic_prepared,
+                    glossary=runtime._glossary_payload(translation.CANONICAL_GLOSSARY),
+                    settings=PlatformSettings(platform_openai_api_key="fixture-key"),
+                    entity_replacements={key: entities_full[key] for key in mechanic_ids},
+                    fact_replacements={key: facts_full[key] for key in mechanic_ids},
+                    call_budget=budget,
+                )
+            return translated, client, budget
+
+        full_translated, fixture_client, fixture_budget = asyncio.run(translate_full_source())
+        self.assertEqual(len(fixture_client.calls), 2)
+        self.assertEqual(fixture_budget.provider_calls, 2)
+        self.assertIn("gun damage", fixture_client.calls[0]["instructions"].lower())
+        self.assertEqual(
+            [segment["id"] for segment in json.loads(fixture_client.calls[1]["input"])["segments"]],
+            mechanic_ids,
+        )
+        self.assertEqual(
+            [full_translated[segment_id] for segment_id in mechanic_ids],
+            [
+                "Базовый урон от оружия увеличен на 5%.",
+                "Базовый урон от оружия увеличен на 3%.",
+                "Базовый урон от оружия уменьшен на 10%.",
+            ],
+        )
+
     def test_known_collision_set_stays_explicit_and_minimal(self) -> None:
         self.assertEqual(
             translation.ENTITY_MECHANIC_COLLISIONS,
-            ("Bullet Lifesteal", "Spirit Lifesteal", "Melee Lifesteal"),
+            ("Bullet Lifesteal", "Spirit Lifesteal", "Melee Lifesteal", "Gun Damage"),
         )
 
 

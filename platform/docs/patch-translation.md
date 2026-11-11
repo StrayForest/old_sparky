@@ -25,17 +25,19 @@ one delayed automatic retry after 15 minutes when its error is a known network
 or timeout failure and its attempt count is below the fixed retry limit. Other
 failures remain durable and do not incur repeated model calls.
 
-The translation version configured in this source tree is `ru-v15`, defined in
+The translation version configured in this source tree is `ru-v16`, defined in
 `apps/platform_api/app/services/patch_translation_config.py`. It includes the
 durable DB-first state, the reviewed ambiguity handling and the immutable
 numeric/tier validation described below. It gathers typed ENTITY/FACT
 placeholder failures, numeric-fact mismatches and the reviewed effectiveness
 comparison failure across the initial batches before using the single shared
 follow-up request. That request contains only the affected stable segment IDs.
-`Gun Damage` and `Base gun damage` are explicit wording aliases for the
-canonical `Weapon Damage` concept and use its checked-in Russian glossary
-value; the application does not infer a different mechanic from the word
-“gun.”
+The `Gun Damage` entity/mechanic collision is source-sensitive: named ability
+references such as Rem's `Gun Damage` stay protected as entity names, while
+source-backed `Base gun damage` stat lines remain visible to the model and use
+the checked-in `Weapon Damage` glossary value. A source-matched gun-damage stat
+row that still contains the English mechanic label is rejected into the same
+single follow-up correction path; named ability references remain protected.
 The four-patch regression procedure
 and its historical evidence live in
 [`archive/patch-translation-qa-2026-08-22.md`](archive/patch-translation-qa-2026-08-22.md).
@@ -146,7 +148,7 @@ per-request glossary filtering. A small number of demonstrated wording aliases
 may be explicit glossary keys that point to the same canonical Russian value.
 Changing glossary terminology is a normal reviewed code change.
 
-The entire canonical glossary is sent with every translation request because it is deliberately small. An English key is a **semantic concept anchor**, not an exact-match trigger. For example, `Move Speed` also governs semantically equivalent source wording such as `Movement Speed`, `Movespeed` and `move-speed`; the demonstrated `Gun Damage` wording is explicitly mapped to `Weapon Damage` because it names the same mechanic in the source. Keep aliases narrow and evidence-based; do not add a general generated alias table.
+The entire canonical glossary is sent with every translation request because it is deliberately small. An English key is a **semantic concept anchor**, not an exact-match trigger. For example, `Move Speed` also governs semantically equivalent source wording such as `Movement Speed`, `Movespeed` and `move-speed`; source-backed `Gun Damage` mechanic wording maps to the `Weapon Damage` concept, while exact named-ability references use ENTITY protection. Keep aliases narrow and evidence-based; do not add a general generated alias table.
 
 Compound wording must retain the mechanic family. For example, `Bullet, Spirit and Melee Lifesteal` represents `Bullet Lifesteal`, `Spirit Lifesteal` and `Melee Lifesteal`; it must never be reinterpreted as resistance terminology.
 
@@ -178,6 +180,8 @@ The immutable checks are:
 - the source-specific meaning of `only N% as effective`, which denotes a
   fraction of baseline effectiveness rather than an increase or decrease by N
   percent.
+- source-matched `Base gun damage` stat lines, which must not leave `Gun Damage`
+  untranslated; named ability references keep their protected entity spelling.
 
 Operators, arrows, English sentence order and other prose formatting are not treated as immutable facts.
 
@@ -220,6 +224,13 @@ For prose, prefer Valve terminology and natural constructions. The model may inf
 9. Numeric values and tiers are compared against the English source.
 10. Successful translations are committed to PostgreSQL first, then written to Redis under `PATCH_TRANSLATION_VERSION` and served by the patch API.
 11. A Redis miss falls back to PostgreSQL; a missing database translation does not invoke OpenAI from the user request.
+
+Patch source/cache projection generations are versioned independently from
+translation state. The active patch detail prefix is `v15`; the current and
+last-good asset-catalog keys are `v9` and `v3`. These namespaces force patch
+details and the assembled catalog to be rebuilt with the current auxiliary
+ability ownership projection. Old keys remain untouched; no Redis flush or
+database reset is part of the refresh.
 
 An automatic retry of a failed translation task is limited to one delayed retry
 for known network/timeout errors, guarded by the same source hash and row lock.

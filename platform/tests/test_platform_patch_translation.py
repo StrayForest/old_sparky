@@ -206,7 +206,7 @@ class PatchTranslationCanonicalGlossaryTests(unittest.TestCase):
     def test_entity_mechanic_collisions_are_small_explicit_subset(self) -> None:
         self.assertEqual(
             set(translation.ENTITY_MECHANIC_COLLISIONS),
-            {"Bullet Lifesteal", "Spirit Lifesteal", "Melee Lifesteal"},
+            {"Bullet Lifesteal", "Spirit Lifesteal", "Melee Lifesteal", "Gun Damage"},
         )
         self.assertTrue(
             set(translation.ENTITY_MECHANIC_COLLISIONS).issubset(

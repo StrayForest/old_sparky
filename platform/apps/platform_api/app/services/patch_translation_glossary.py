@@ -68,13 +68,14 @@ CANONICAL_GLOSSARY: CanonicalGlossary = {
     "Souls": ("Души",),
 }
 
-# These strings are both actual Deadlock item names and gameplay mechanic names.
-# They must remain visible to the model so segment context can decide which sense
-# is intended. This is a tiny explicit ambiguity list, not a glossary alias table.
+# These strings are actual Deadlock entity names and gameplay mechanic names.
+# They remain visible to the model when the source is ambiguous; the segment
+# context distinguishes a named entity from the mechanic meaning.
 ENTITY_MECHANIC_COLLISIONS: tuple[str, ...] = (
     "Bullet Lifesteal",
     "Spirit Lifesteal",
     "Melee Lifesteal",
+    "Gun Damage",
 )
 
 

@@ -60,8 +60,9 @@ _IMAGE_URL_RE = re.compile(
     r"[a-f0-9]{32,64}\.(?:avif|gif|jpe?g|png|webp)$",
     re.IGNORECASE,
 )
-_GUN_DAMAGE_SOURCE_RE = re.compile(
-    r"\b(?:base\s+)?gun[\s-]+damage\b",
+_GUN_DAMAGE_MECHANIC_SOURCE_RE = re.compile(
+    r"\bbase\s+gun[\s-]+damage\b|"
+    r"\bgun[\s-]+damage\b(?=\s+(?:increased|reduced|decreased|raised|lowered|boosted|adjusted))",
     re.IGNORECASE,
 )
 _GUN_DAMAGE_TRANSLATION_RE = re.compile(r"\bgun[\s-]+damage\b", re.IGNORECASE)
@@ -944,12 +945,15 @@ async def _request_openai(
             "concept: use the glossary wording 'коэффициент масштабирования от спиритической "
             "мощности' rather than shortening it to 'коэффициент спиритической мощности' or "
             "'коэффициент от спиритической мощности'.\n\n"
-            "AMBIGUOUS ITEM/MECHANIC NAMES: entity_mechanic_collisions lists the small set of "
-            "English strings that are both real Deadlock item names and gameplay mechanic names. "
-            "They are intentionally NOT hidden behind ENTITY placeholders. Decide their meaning "
-            "from the source sentence and segment.context. If the text refers to the named item, "
-            "preserve that item name in English exactly. If it refers to a numeric/stat mechanic, "
-            "translate it using the glossary. Examples of mechanic usage include '+10% Bullet "
+            "AMBIGUOUS ENTITY/MECHANIC NAMES: entity_mechanic_collisions lists the small set of "
+            "English strings that are both real Deadlock entity names (items or abilities) and "
+            "gameplay mechanic names. They are intentionally NOT hidden behind ENTITY placeholders "
+            "when used as mechanics. Decide their meaning from the source sentence and "
+            "segment.context. If the text refers to the named entity, preserve that name in English "
+            "exactly. If it refers to a numeric/stat mechanic, translate it using the glossary. "
+            "For example, 'Base gun damage increased by 5%' is a stat and must use the Weapon "
+            "Damage glossary value, while a reference to the Rem ability named 'Gun Damage' keeps "
+            "that ability name. Examples of mechanic usage include '+10% Bullet "
             "Lifesteal' and '+60% Bullet, Spirit and Melee Lifesteal'; examples of item usage "
             "include references such as 'the same change for Melee Lifesteal'. That exact item "
             "reference must keep the literal English item name 'Melee Lifesteal'; it is not a "
@@ -1072,7 +1076,7 @@ async def _request_openai(
         else:
             candidate = text.strip()
             if (
-                _GUN_DAMAGE_SOURCE_RE.search(source_by_id[segment_id])
+                _GUN_DAMAGE_MECHANIC_SOURCE_RE.search(source_by_id[segment_id])
                 and _GUN_DAMAGE_TRANSLATION_RE.search(candidate)
             ):
                 if not collect_placeholder_failures:
@@ -1366,18 +1370,26 @@ def _prepare_segments(
     dict[str, dict[str, str]],
 ]:
     collision_keys = {term.casefold() for term in ENTITY_MECHANIC_COLLISIONS}
-    protected_terms = [
-        term
-        for term in catalog_protected_terms(catalog)
-        if term.casefold() not in collision_keys
-    ]
+    protected_terms = catalog_protected_terms(catalog)
     contexts = _segment_contexts(patch)
     prepared: list[dict[str, Any]] = []
     entity_replacements: dict[str, dict[str, str]] = {}
     fact_replacements: dict[str, dict[str, str]] = {}
     for segment in extract_translation_segments(patch):
         fact_protected, fact_map = protect_facts(segment["text"])
-        text, entity_map = protect_entities(fact_protected, protected_terms)
+        source_is_gun_damage_mechanic = bool(
+            _GUN_DAMAGE_MECHANIC_SOURCE_RE.search(segment["text"])
+        )
+        segment_protected_terms = [
+            term
+            for term in protected_terms
+            if term.casefold() not in collision_keys
+            or (
+                term.casefold() == "gun damage"
+                and not source_is_gun_damage_mechanic
+            )
+        ]
+        text, entity_map = protect_entities(fact_protected, segment_protected_terms)
         prepared_segment: dict[str, Any] = {
             "id": segment["id"],
             "text": text,
