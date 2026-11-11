@@ -138,6 +138,14 @@ class PatchSitemapProjectionTests(PlatformIsolatedAsyncioTestCase):
     async def test_successful_refresh_updates_index_after_translation_registration(self) -> None:
         patches = [_patch_summary(str(index), index) for index in range(1, 5)]
         details = {patch["id"]: _patch_detail(patch["id"], index) for index, patch in enumerate(patches, 1)}
+        complete_asset_catalog = {
+            "heroes": {},
+            "items": {},
+            "ranks": {},
+            "objectives": {},
+            "hero_image_candidates_version": home_content.HERO_IMAGE_CANDIDATES_VERSION,
+            "hero_image_candidates_pending": False,
+        }
         cache = _Cache()
         events: list[str] = []
 
@@ -158,7 +166,11 @@ class PatchSitemapProjectionTests(PlatformIsolatedAsyncioTestCase):
             patch.object(home_content_security, "BoundedNoRedirectAsyncClient", return_value=_ClientContext()),
             patch.object(home_content, "_fetch_steam_patches", new=AsyncMock(return_value=(patches, details))),
             patch.object(home_content, "_fetch_youtube_videos", new=AsyncMock(return_value=[])),
-            patch.object(home_content, "_fetch_deadlock_asset_catalog", new=AsyncMock(return_value={})),
+            patch.object(
+                home_content,
+                "_fetch_deadlock_asset_catalog",
+                new=AsyncMock(return_value=complete_asset_catalog),
+            ),
             patch.object(home_content_security, "ensure_patch_translation_records", new=AsyncMock(side_effect=register)),
             patch.object(home_content, "publish_patch_sitemap_index", new=AsyncMock(side_effect=publish)),
         ):

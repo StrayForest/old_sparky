@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import type { Locator } from "@playwright/test";
 import LiveCountReporter from "../support/live-count-reporter.cjs";
 import { assertLiveQaChromiumSandbox } from "../support/live-qa-sandbox";
 import { patchAcceptanceIssues } from "../support/patch-acceptance";
@@ -119,6 +120,23 @@ function sectionHeading(section: PlatformPatchSection): string {
   if (section.objective_key === "unstable_rift") return "Нестабильный разлом";
   if (section.objective_key === "mid_boss") return "Mid Boss";
   return section.title;
+}
+
+async function expectDecodedImage(image: Locator, label: string): Promise<void> {
+  await image.scrollIntoViewIfNeeded();
+  await expect.poll(
+    () => image.evaluate(async (element) => {
+      const loadedImage = element as HTMLImageElement;
+      if (!loadedImage.complete) return false;
+      try {
+        await loadedImage.decode();
+      } catch {
+        return false;
+      }
+      return loadedImage.naturalWidth > 0 && loadedImage.naturalHeight > 0;
+    }),
+    { message: `${label} should decode`, timeout: 15_000 },
+  ).toBe(true);
 }
 
 function hasOwnerPrefix(change: string): boolean {
@@ -671,6 +689,7 @@ test("live current patch route and objective source icons remain available", asy
 });
 
 test("live four current patch DTOs render owner-scoped hero and ability changes", async ({ page, request }) => {
+  test.setTimeout(120_000);
   const patchIds = await currentIndexedPatchIds(request);
   expect(patchIds).toHaveLength(4);
   expect(new Set(patchIds).size).toBe(4);
@@ -702,6 +721,32 @@ test("live four current patch DTOs render owner-scoped hero and ability changes"
       if (section.kind === "hero" && section.hero_presentation_kind !== "introduction") {
         await expect(renderedSection.locator(".patch-hero-description")).toHaveCount(0);
       }
+      if (section.kind === "hero") {
+        const candidates = section.hero_image_candidates ?? [];
+        if (candidates.length) {
+          expect(candidates.length).toBeLessThanOrEqual(4);
+          expect(new Set(candidates).size).toBe(candidates.length);
+          expect(candidates[0]).toBe(section.hero_image_url);
+        }
+        if (section.hero_image_url) {
+          const heroImage = renderedSection.locator(".patch-hero-image");
+          await expect(heroImage).toHaveCount(1);
+          await expectDecodedImage(heroImage, `${patchId} ${section.hero_name ?? section.title} portrait`);
+          const renderedSource = await heroImage.getAttribute("src");
+          const bundledSource = `/assets/heroes/${encodeURIComponent(
+            (section.hero_name ?? section.title).replaceAll(" ", "_"),
+          )}.png`;
+          expect([...candidates, section.hero_image_url, bundledSource]).toContain(renderedSource);
+        }
+      }
+
+      if (section.objective_icon_url) {
+        const objectiveImage = renderedSection.locator(".patch-objective-image");
+        await expect(objectiveImage).toHaveCount(1);
+        await expect(renderedSection.locator(".patch-objective-fallback")).toHaveCount(0);
+        await expect(objectiveImage).toHaveAttribute("src", section.objective_icon_url);
+        await expectDecodedImage(objectiveImage, `${patchId} ${sectionHeading(section)} objective icon`);
+      }
 
       const sectionRows = renderedSection.locator(":scope > .patch-change-list > li");
       await expect(sectionRows).toHaveCount(section.changes.length);
@@ -717,6 +762,13 @@ test("live four current patch DTOs render owner-scoped hero and ability changes"
         const iconCount = await renderedAbility.locator(".patch-ability-icon").count();
         const fallbackCount = await renderedAbility.locator(".patch-ability-icon-fallback").count();
         expect(iconCount + fallbackCount).toBe(1);
+        if (ability.icon_url) {
+          const icon = renderedAbility.locator(".patch-ability-icon");
+          await expect(icon).toHaveCount(1);
+          await expect(renderedAbility.locator(".patch-ability-icon-fallback")).toHaveCount(0);
+          await expect(icon).toHaveAttribute("src", ability.icon_url);
+          await expectDecodedImage(icon, `${patchId} ${ability.display_name || ability.name} ability icon`);
+        }
 
         const abilityRows = renderedAbility.locator(":scope > .patch-change-list > li");
         await expect(abilityRows).toHaveCount(ability.changes.length);

@@ -274,14 +274,42 @@ test("atomic captain editor preserves hero picker layout and save semantics", as
   await expect(page.locator(".dream-hero-picker-panel")).toHaveCount(1);
   const newlyCataloguedHero = page.getByTestId("profile-dream-slot-1-hero-source-new-hero");
   await expect(newlyCataloguedHero).toBeVisible();
-  await newlyCataloguedHero.locator("img").evaluate((image) => new Promise<void>((resolve, reject) => {
-    if ((image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth > 0) {
-      resolve();
-    } else {
-      image.addEventListener("load", () => resolve(), { once: true });
-      image.addEventListener("error", () => reject(new Error("New catalog hero image did not load")), { once: true });
+  const pickerImages = picker.locator("img");
+  const pickerImageCount = await pickerImages.count();
+  expect(pickerImageCount).toBeGreaterThan(0);
+  const gameAssetsResponse = await page.request.get("/api/v1/content/game-assets");
+  expect(gameAssetsResponse.ok()).toBe(true);
+  const gameAssets = await gameAssetsResponse.json() as {
+    heroes: Array<{ name: string; image_url?: string | null; image_candidates?: string[] }>;
+  };
+  const imageAssetsByName = new Map(gameAssets.heroes.map((hero) => [hero.name, hero]));
+  for (let imageIndex = 0; imageIndex < pickerImageCount; imageIndex += 1) {
+    const image = pickerImages.nth(imageIndex);
+    await image.scrollIntoViewIfNeeded();
+    await expect.poll(
+      () => image.evaluate(async (element) => {
+        const pickerImage = element as HTMLImageElement;
+        if (!pickerImage.complete) return false;
+        try {
+          await pickerImage.decode();
+        } catch {
+          return false;
+        }
+        return pickerImage.naturalWidth > 0 && pickerImage.naturalHeight > 0;
+      }),
+      { message: `Profile picker hero image ${imageIndex + 1} should decode`, timeout: 10_000 },
+    ).toBe(true);
+    const heroName = (await image.locator("xpath=ancestor::button").innerText()).trim();
+    const imageAsset = imageAssetsByName.get(heroName);
+    if (imageAsset?.image_url || imageAsset?.image_candidates?.length) {
+      const expectedSources = [
+        ...(imageAsset.image_candidates ?? []),
+        imageAsset.image_url,
+        `/assets/heroes/${encodeURIComponent(heroName.replaceAll(" ", "_"))}.png`,
+      ].filter((source): source is string => Boolean(source));
+      expect(expectedSources).toContain(await image.getAttribute("src"));
     }
-  }));
+  }
   const teammateGridBox = await page.locator(".teammate-grid").boundingBox();
   const pickerBox = await picker.boundingBox();
   expect(pickerBox?.width).toBeGreaterThanOrEqual(
