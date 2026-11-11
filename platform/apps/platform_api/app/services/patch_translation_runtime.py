@@ -37,7 +37,7 @@ from apps.platform_api.app.services.patch_translation_glossary import (
     get_translation_glossary,
 )
 from apps.platform_api.app.services.patch_translation_terms import (
-    ProtectedFactPlaceholderError,
+    ProtectedPlaceholderError,
     catalog_protected_terms,
     fact_fingerprint,
     localize_russian_notation,
@@ -88,7 +88,6 @@ _RETRYABLE_TRANSLATION_ERRORS = frozenset({
     "ReadError", "ReadTimeout", "RemoteProtocolError", "WriteError", "WriteTimeout",
     "WorkerTimeout",
 })
-PATCH_TRANSLATION_FACT_CORRECTION_ATTEMPTS = 1
 _RETRYABLE_OPENAI_ERRORS = frozenset({
     "ConnectError", "ConnectTimeout", "NetworkError", "PoolTimeout", "TimeoutError",
     "ReadError", "ReadTimeout", "RemoteProtocolError", "WriteError", "WriteTimeout",
@@ -146,6 +145,21 @@ class _TranslationProviderCallBudget:
             self.follow_up_call_started = True
         self.provider_calls += 1
         return min(self.call_timeout_seconds, remaining)
+
+
+class _OpenAITranslationBatch(dict[str, str]):
+    """Valid in-memory translations plus IDs rejected only by placeholder checks."""
+
+    def __init__(
+        self,
+        translations: dict[str, str],
+        *,
+        returned_ids: list[str],
+        invalid_placeholder_ids: list[str],
+    ) -> None:
+        super().__init__(translations)
+        self.returned_ids = tuple(returned_ids)
+        self.invalid_placeholder_ids = tuple(invalid_placeholder_ids)
 
 
 def _iter_changes(patch: dict[str, Any]):
@@ -884,7 +898,8 @@ async def _request_openai(
     glossary: dict[str, list[str]],
     settings: PlatformSettings,
     fact_correction_ids: list[str] | None = None,
-) -> dict[str, str]:
+    collect_placeholder_failures: bool = False,
+) -> dict[str, str] | _OpenAITranslationBatch:
     api_key = (settings.platform_openai_api_key or "").strip()
     if not api_key:
         raise RuntimeError("PLATFORM_OPENAI_API_KEY is not configured.")
@@ -966,13 +981,16 @@ async def _request_openai(
     }
     if fact_correction_ids:
         request_payload["instructions"] += (
-            "\n\nCORRECTION ATTEMPT: Your previous draft changed or added an "
-            "immutable numeric value or ability tier in these source segments: "
+            "\n\nCORRECTION ATTEMPT: Your previous draft either changed a protected "
+            "ENTITY/FACT placeholder or changed an immutable numeric/ability-tier "
+            "fact fingerprint in these source segments: "
             + ", ".join(fact_correction_ids)
-            + ". Translate the same source faithfully. Preserve every FACT "
-            "placeholder exactly, do not add digits or numeric facts outside those "
-            "placeholders, and return the complete requested segment set. This is "
-            "the only correction attempt."
+            + ". Translate the same source faithfully. Keep every segment.id "
+            "byte-for-byte unchanged and in the same order. Preserve every ENTITY "
+            "and FACT placeholder byte-for-byte, including its exact token number; "
+            "do not translate, renumber, omit or duplicate any placeholder, and do "
+            "not add numeric facts outside FACT placeholders. Return the complete "
+            "requested segment set. This is the only correction attempt."
         )
     timeout = httpx.Timeout(max(60.0, settings.platform_openai_timeout_seconds))
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -1012,6 +1030,7 @@ async def _request_openai(
     }
     returned_ids: list[str] = []
     translated: dict[str, str] = {}
+    invalid_placeholder_ids: list[str] = []
     for segment in returned:
         if not isinstance(segment, dict):
             raise ValueError("OpenAI returned an invalid segment.")
@@ -1019,13 +1038,25 @@ async def _request_openai(
         text = segment.get("text")
         if not isinstance(segment_id, str) or not isinstance(text, str):
             raise ValueError("OpenAI returned an invalid segment.")
-        if segment_id in translated or segment_id not in source_by_id:
+        if segment_id in returned_ids or segment_id not in source_by_id:
             raise ValueError("OpenAI returned duplicate or unexpected segment ids.")
-        validate_prepared_translation(source_by_id[segment_id], text)
+        try:
+            validate_prepared_translation(source_by_id[segment_id], text)
+        except ProtectedPlaceholderError:
+            if not collect_placeholder_failures:
+                raise
+            invalid_placeholder_ids.append(segment_id)
+        else:
+            translated[segment_id] = text.strip()
         returned_ids.append(segment_id)
-        translated[segment_id] = text.strip()
     if returned_ids != expected_ids:
         raise ValueError("OpenAI changed or omitted segment ids.")
+    if collect_placeholder_failures:
+        return _OpenAITranslationBatch(
+            translated,
+            returned_ids=returned_ids,
+            invalid_placeholder_ids=invalid_placeholder_ids,
+        )
     return translated
 
 
@@ -1110,7 +1141,8 @@ async def _request_openai_with_budget(
     glossary: dict[str, list[str]],
     settings: PlatformSettings,
     fact_correction_ids: list[str] | None,
-) -> dict[str, str]:
+    collect_placeholder_failures: bool = False,
+) -> dict[str, str] | _OpenAITranslationBatch:
     """Issue one provider request and use the single follow-up slot for retry or correction."""
 
     follow_up_kind = "fact_correction" if fact_correction_ids else None
@@ -1123,24 +1155,7 @@ async def _request_openai_with_budget(
                 glossary=glossary,
                 settings=settings,
                 fact_correction_ids=fact_correction_ids,
-            )
-    except ProtectedFactPlaceholderError:
-        if (
-            follow_up_kind is not None
-            or not call_budget.claim_follow_up("protected_fact_retry")
-        ):
-            raise
-        correction_ids = [str(segment["id"]) for segment in segments]
-        timeout_seconds = call_budget.begin_call(
-            follow_up_kind="protected_fact_retry"
-        )
-        async with asyncio.timeout(timeout_seconds):
-            return await _request_openai(
-                patch_id=patch_id,
-                segments=segments,
-                glossary=glossary,
-                settings=settings,
-                fact_correction_ids=correction_ids,
+                collect_placeholder_failures=collect_placeholder_failures,
             )
     except Exception as error:
         if (
@@ -1162,6 +1177,7 @@ async def _request_openai_with_budget(
                 glossary=glossary,
                 settings=settings,
                 fact_correction_ids=fact_correction_ids,
+                collect_placeholder_failures=collect_placeholder_failures,
             )
 
 
@@ -1184,18 +1200,20 @@ async def _request_openai_batches(
     async def translate_batch(
         source_batch: list[dict[str, str]],
         prepared_batch: list[dict[str, Any]],
-    ) -> dict[str, str]:
+    ) -> _OpenAITranslationBatch:
         async with semaphore:
-            return await _request_openai_with_fact_correction(
+            result = await _request_openai_with_budget(
                 patch_id=patch_id,
-                source_segments=source_batch,
-                prepared_segments=prepared_batch,
+                segments=prepared_batch,
                 glossary=glossary,
                 settings=settings,
-                entity_replacements=entity_replacements,
-                fact_replacements=fact_replacements,
                 call_budget=call_budget,
+                fact_correction_ids=None,
+                collect_placeholder_failures=True,
             )
+            if not isinstance(result, _OpenAITranslationBatch):
+                raise ValueError("Patch translation batch omitted placeholder-validation results.")
+            return result
 
     tasks = [
         asyncio.create_task(translate_batch(source_batch, prepared_batch))
@@ -1212,86 +1230,80 @@ async def _request_openai_batches(
 
     expected_ids = [segment["id"] for segment in source_segments]
     expected_id_set = set(expected_ids)
-    merged: dict[str, str] = {}
-    for result in batch_results:
+    initial_translations: dict[str, str] = {}
+    invalid_placeholder_ids: set[str] = set()
+    for (source_batch, _), result in zip(batches, batch_results, strict=True):
+        batch_ids = [segment["id"] for segment in source_batch]
+        batch_id_set = set(batch_ids)
+        result_ids = list(result)
+        invalid_ids = list(result.invalid_placeholder_ids)
+        if (
+            list(result.returned_ids) != batch_ids
+            or len(invalid_ids) != len(set(invalid_ids))
+            or not set(result_ids).issubset(batch_id_set)
+            or not set(invalid_ids).issubset(batch_id_set)
+            or set(result_ids).intersection(invalid_ids)
+            or set(result_ids).union(invalid_ids) != batch_id_set
+        ):
+            raise ValueError("Patch translation batch has an invalid segment result partition.")
         for segment_id, text in result.items():
-            if segment_id not in expected_id_set or segment_id in merged:
+            if segment_id not in expected_id_set or segment_id in initial_translations:
                 raise ValueError("Patch translation batch merge contains unexpected or duplicate ids.")
-            merged[segment_id] = text
-    if set(merged) != set(expected_ids):
+            initial_translations[segment_id] = text
+        if invalid_placeholder_ids.intersection(invalid_ids):
+            raise ValueError("Patch translation batches reported duplicate invalid ids.")
+        invalid_placeholder_ids.update(invalid_ids)
+
+    if set(initial_translations).union(invalid_placeholder_ids) != expected_id_set:
         raise ValueError("Patch translation batch merge is missing source ids.")
-    call_budget.ensure_time_remaining()
-    return {segment_id: merged[segment_id] for segment_id in expected_ids}
 
-
-async def _request_openai_with_fact_correction(
-    *,
-    patch_id: str,
-    source_segments: list[dict[str, str]],
-    prepared_segments: list[dict[str, Any]],
-    glossary: dict[str, list[str]],
-    settings: PlatformSettings,
-    entity_replacements: dict[str, dict[str, str]],
-    fact_replacements: dict[str, dict[str, str]],
-    call_budget: _TranslationProviderCallBudget | None = None,
-) -> dict[str, str]:
-    """Allow one bounded correction, then require the original fact fingerprint."""
-
-    call_budget = call_budget or _TranslationProviderCallBudget()
-    correction_ids: list[str] | None = None
-    translated_prepared: dict[str, str] | None = None
     source_by_id = {segment["id"]: segment["text"] for segment in source_segments}
-    expected_ids = [segment["id"] for segment in source_segments]
-    for attempt in range(PATCH_TRANSLATION_FACT_CORRECTION_ATTEMPTS + 1):
-        request_segments = (
-            prepared_segments
-            if correction_ids is None
-            else [
-                segment
-                for segment in prepared_segments
-                if segment["id"] in correction_ids
-            ]
-        )
-        corrected_segments = await _request_openai_with_budget(
+    prepared_by_id = {segment["id"]: segment for segment in prepared_segments}
+
+    def restore_all(translated_prepared: dict[str, str]) -> tuple[dict[str, str], list[str]]:
+        restored_by_id: dict[str, str] = {}
+        invalid_fact_ids: list[str] = []
+        for segment_id, text in translated_prepared.items():
+            restored = restore_placeholders(text, entity_replacements.get(segment_id, {}))
+            restored = restore_placeholders(restored, fact_replacements.get(segment_id, {}))
+            restored = localize_russian_notation(restored)
+            restored_by_id[segment_id] = restored
+            if fact_fingerprint(source_by_id[segment_id]) != fact_fingerprint(restored):
+                invalid_fact_ids.append(segment_id)
+        return restored_by_id, invalid_fact_ids
+
+    _, invalid_fact_ids = restore_all(initial_translations)
+    correction_id_set = invalid_placeholder_ids.union(invalid_fact_ids)
+    correction_ids = [segment_id for segment_id in expected_ids if segment_id in correction_id_set]
+    if correction_ids:
+        corrected = await _request_openai_with_budget(
             patch_id=patch_id,
-            segments=request_segments,
+            segments=[prepared_by_id[segment_id] for segment_id in correction_ids],
             glossary=glossary,
             settings=settings,
             call_budget=call_budget,
             fact_correction_ids=correction_ids,
         )
-        if translated_prepared is None:
-            translated_prepared = corrected_segments
-        else:
-            translated_prepared.update(corrected_segments)
-        if list(translated_prepared) != expected_ids:
+        if list(corrected) != correction_ids:
             raise ValueError("OpenAI changed or omitted segment ids during correction.")
+        initial_translations.update(corrected)
 
-        translated: dict[str, str] = {}
-        for segment_id, text in translated_prepared.items():
-            restored = restore_placeholders(
-                text,
-                entity_replacements.get(segment_id, {}),
-            )
-            restored = restore_placeholders(
-                restored,
-                fact_replacements.get(segment_id, {}),
-            )
-            translated[segment_id] = localize_russian_notation(restored)
-
-        correction_ids = [
-            segment_id
-            for segment_id, text in translated.items()
-            if fact_fingerprint(source_by_id[segment_id]) != fact_fingerprint(text)
-        ]
-        if not correction_ids:
-            return translated
-        if attempt == PATCH_TRANSLATION_FACT_CORRECTION_ATTEMPTS:
-            break
-
-    raise ValueError(
-        "Translation changed a numeric value or ability tier after the bounded correction."
-    )
+    if list(initial_translations) != expected_ids:
+        # Initial batch outputs arrive in completion order; normalize only after the exact
+        # global identity set has been proven complete.
+        if set(initial_translations) != expected_id_set:
+            raise ValueError("Patch translation batch merge is missing source ids.")
+        initial_translations = {
+            segment_id: initial_translations[segment_id]
+            for segment_id in expected_ids
+        }
+    translated, remaining_fact_ids = restore_all(initial_translations)
+    if remaining_fact_ids:
+        raise ValueError(
+            "Translation changed a numeric value or ability tier after the bounded correction."
+        )
+    call_budget.ensure_time_remaining()
+    return translated
 
 
 def _prepare_segments(

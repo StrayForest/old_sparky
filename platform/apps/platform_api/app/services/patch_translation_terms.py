@@ -19,7 +19,15 @@ FACT_TOKEN_RE = re.compile(
 _DECIMAL_RE = re.compile(r"(?<![A-Za-z0-9])([+-]?\d+)\.(\d+)")
 
 
-class ProtectedFactPlaceholderError(ValueError):
+class ProtectedPlaceholderError(ValueError):
+    """A model response changed a protected entity, numeric or tier placeholder."""
+
+
+class ProtectedEntityPlaceholderError(ProtectedPlaceholderError):
+    """A model response changed a protected Deadlock entity placeholder."""
+
+
+class ProtectedFactPlaceholderError(ProtectedPlaceholderError):
     """A model response changed an immutable numeric or tier placeholder."""
 
 
@@ -135,7 +143,9 @@ def validate_prepared_translation(source: str, translated: str) -> None:
     if Counter(ENTITY_PLACEHOLDER_RE.findall(source)) != Counter(
         ENTITY_PLACEHOLDER_RE.findall(translated)
     ):
-        raise ValueError("OpenAI changed a protected Deadlock entity placeholder.")
+        raise ProtectedEntityPlaceholderError(
+            "OpenAI changed a protected Deadlock entity placeholder."
+        )
     if Counter(FACT_PLACEHOLDER_RE.findall(source)) != Counter(
         FACT_PLACEHOLDER_RE.findall(translated)
     ):

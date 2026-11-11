@@ -25,12 +25,12 @@ one delayed automatic retry after 15 minutes when its error is a known network
 or timeout failure and its attempt count is below the fixed retry limit. Other
 failures remain durable and do not incur repeated model calls.
 
-The deployed translation version is `ru-v12`, defined in
+The deployed translation version is `ru-v13`, defined in
 `apps/platform_api/app/services/patch_translation_config.py`. It includes the
 durable DB-first state, the reviewed ambiguity handling and the immutable
-numeric/tier validation described below. The shared one-request follow-up may
-correct a protected numeric or tier placeholder if no other retry or correction
-has claimed it. The four-patch regression procedure
+numeric/tier validation described below. It gathers placeholder and numeric
+fact mismatches across the initial batches before using the single shared
+follow-up request. The four-patch regression procedure
 and its historical evidence live in
 [`archive/patch-translation-qa-2026-08-22.md`](archive/patch-translation-qa-2026-08-22.md).
 
@@ -205,15 +205,17 @@ are partition targets, not truncation limits. It preserves each segment ID and
 all extracted text. The 30,000-character cap applies to normalized Steam
 article content; required catalog-backed introduction and replacement
 descriptions may add translated text beyond the article body and are not
-subject to a new aggregate cap. Across all batches, one shared follow-up request
-may be used for a transient provider retry, a numeric-fact correction, or a
-retry of the affected batch after a protected numeric/tier placeholder changes.
-That placeholder retry is selected by a dedicated validation exception, not by
-matching error text; it resends the same batch and stable IDs with the same
-protected placeholders. Any second placeholder failure fails the task, and no
-batch is persisted unless every batch passes validation. If another retry or
-correction already claimed the shared slot, the placeholder failure is returned
-without another provider request.
+subject to a new aggregate cap. After all initial batches finish, the worker
+collects only stable segment IDs with a typed ENTITY/FACT placeholder failure
+or a numeric-fact fingerprint mismatch. It keeps valid translations in memory
+and, if needed, sends one source-ordered correction request containing only the
+affected segments. The correction prompt requires unchanged IDs and exact
+ENTITY/FACT placeholders; it does not retry arbitrary schema, ID or provider
+errors. A transient provider retry and this aggregate validation correction
+share one follow-up slot across the task. If that slot is already used, the
+task fails; if corrected output still fails placeholder or fact validation,
+the task fails without another request. No result is persisted unless every
+source ID passes final validation.
 The task therefore makes at most four provider calls and does not persist
 partial batch results. At most two requests run at once within a task. The
 worker's default concurrency is two tasks per worker instance, so that
@@ -280,10 +282,10 @@ Redis lock, may call OpenAI and writes the translation cache. The workflow is
 named `Platform patch translation warm-up`, requires an explicit maximum number
 of cache-miss patch translations (four by default), and reports that patch
 translation budget in its result. A translation may make one additional
-bounded request from the shared transient-retry, numeric-fact-correction or
-protected-placeholder-correction allowance. It must not run in a polling loop
-or be described as a pure QA check. A read-only check must fail on cache miss
-instead of invoking the translator.
+bounded request from the shared transient-retry or aggregate validation
+correction allowance. It must not run in a polling loop or be described as a
+pure QA check. A read-only check must fail on cache miss instead of invoking
+the translator.
 
 Manual/diagnostic comparison is still required when changing prompt/glossary behavior because numeric correctness alone cannot detect terminology mistakes, item/mechanic ambiguity, prose truncation or awkward Russian phrasing.
 

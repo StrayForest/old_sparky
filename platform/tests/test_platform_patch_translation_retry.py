@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -9,6 +10,10 @@ import httpx
 
 from apps.platform_api.app.services import patch_translation as translation
 from apps.platform_api.app.services import patch_translation_runtime as runtime
+from apps.platform_api.app.services.patch_translation_terms import (
+    ProtectedEntityPlaceholderError,
+    ProtectedFactPlaceholderError,
+)
 from python_packages.platform_infra.config import PlatformSettings
 from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
@@ -99,7 +104,11 @@ class PatchTranslationRetryTests(PlatformIsolatedAsyncioTestCase):
             try:
                 # The final source chunk finishes first, exercising ID-based merging.
                 await asyncio.sleep(0.03 if ids[0].endswith("200") else 0.001)
-                return {segment_id: f"Перевод {segment_id}" for segment_id in ids}
+                return runtime._OpenAITranslationBatch(
+                    {segment_id: f"Перевод {segment_id}" for segment_id in ids},
+                    returned_ids=ids,
+                    invalid_placeholder_ids=[],
+                )
             finally:
                 active -= 1
 
@@ -139,15 +148,17 @@ class PatchTranslationRetryTests(PlatformIsolatedAsyncioTestCase):
 
         async def request(**kwargs):
             ids = [segment["id"] for segment in kwargs["segments"]]
-            text = valid if kwargs["fact_correction_ids"] else invalid
-            return {segment_id: text for segment_id in ids}
+            if kwargs["fact_correction_ids"]:
+                return {segment_id: valid for segment_id in ids}
+            return runtime._OpenAITranslationBatch(
+                {segment_id: invalid for segment_id in ids},
+                returned_ids=ids,
+                invalid_placeholder_ids=[],
+            )
 
         budget = runtime._TranslationProviderCallBudget()
-        with (
-            patch.object(runtime, "_request_openai", side_effect=request) as provider,
-            self.assertRaises(runtime._ProviderCallBudgetExceeded),
-        ):
-            await runtime._request_openai_batches(
+        with patch.object(runtime, "_request_openai", side_effect=request) as provider:
+            translated = await runtime._request_openai_batches(
                 patch_id="1847920302240420",
                 source_segments=source,
                 prepared_segments=prepared,
@@ -158,63 +169,223 @@ class PatchTranslationRetryTests(PlatformIsolatedAsyncioTestCase):
                 call_budget=budget,
             )
 
+        self.assertEqual(set(translated), {segment["id"] for segment in source})
+        self.assertEqual(len(translated), len(source))
         self.assertEqual(provider.await_count, 3)
         self.assertEqual(budget.provider_calls, 3)
         self.assertEqual(budget.follow_up_kind, "fact_correction")
+        self.assertEqual(
+            [segment["id"] for segment in provider.await_args.kwargs["segments"]],
+            [segment["id"] for segment in source],
+        )
 
-    async def test_protected_numeric_placeholder_failure_gets_one_corrective_retry(self) -> None:
-        source = [{"id": "s000-c000", "text": "Cooldown is 10 seconds."}]
-        protected_text, fact_map = translation.protect_facts(source[0]["text"])
-        prepared = [{"id": "s000-c000", "text": protected_text}]
-        with self.assertRaises(runtime.ProtectedFactPlaceholderError):
-            runtime.validate_prepared_translation(
-                prepared[0]["text"], "Cooldown is [[FACT_0001]] seconds."
+    async def test_placeholder_failures_across_batches_correct_only_invalid_ids(self) -> None:
+        source = [
+            {"id": f"s000-c{index:03d}", "text": "Nurse Harrow cooldown 10 seconds."}
+            for index in range(301)
+        ]
+        fact_protected, fact_map = translation.protect_facts(source[0]["text"])
+        protected_text, entity_map = translation.protect_entities(
+            fact_protected, ["Nurse Harrow"]
+        )
+        prepared = [
+            {"id": segment["id"], "text": protected_text}
+            for segment in source
+        ]
+        entity_replacements = {segment["id"]: entity_map for segment in source}
+        fact_replacements = {segment["id"]: fact_map for segment in source}
+        invalid_ids = ["s000-c000", "s000-c101", "s000-c300"]
+        expected_prepared_text = "[[ENTITY_0000]] снизила время перезарядки до [[FACT_0000]] секунд."
+
+        source_entity = "[[ENTITY_0000]] [[FACT_0000]] секунд."
+        provider_rows = [
+            {"id": "valid", "text": "[[ENTITY_0000]] готово за [[FACT_0000]] секунд."},
+            {"id": "bad-entity", "text": "[[ENTITY_0001]] готово за [[FACT_0000]] секунд."},
+            {"id": "bad-fact", "text": "[[ENTITY_0000]] готово за [[FACT_0001]] секунд."},
+        ]
+        provider_payload = {
+            "output": [{
+                "type": "message",
+                "content": [{
+                    "type": "output_text",
+                    "text": json.dumps({"segments": provider_rows}),
+                }],
+            }],
+        }
+
+        class FakeResponse:
+            @staticmethod
+            def raise_for_status() -> None:
+                return None
+
+            @staticmethod
+            def json() -> dict[str, object]:
+                return provider_payload
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def post(self, *_args, **_kwargs):
+                return FakeResponse()
+
+        provider_segments = [
+            {"id": "valid", "text": source_entity},
+            {"id": "bad-entity", "text": source_entity},
+            {"id": "bad-fact", "text": source_entity},
+        ]
+        settings = PlatformSettings(
+            platform_openai_api_key="test-key",
+            platform_openai_model="test-model",
+        )
+        with patch.object(runtime.httpx, "AsyncClient", return_value=FakeClient()):
+            collected = await runtime._request_openai(
+                patch_id="1847920302240420",
+                segments=provider_segments,
+                glossary={},
+                settings=settings,
+                collect_placeholder_failures=True,
             )
-        error = runtime.ProtectedFactPlaceholderError(
-            "OpenAI changed a protected numeric/tier placeholder."
-        )
-        request = AsyncMock(
-            side_effect=[error, {"s000-c000": "Перезарядка — [[FACT_0000]] секунд."}]
-        )
-        budget = runtime._TranslationProviderCallBudget()
+            self.assertIsInstance(collected, runtime._OpenAITranslationBatch)
+            self.assertEqual(list(collected), ["valid"])
+            self.assertEqual(
+                list(collected.invalid_placeholder_ids),
+                ["bad-entity", "bad-fact"],
+            )
 
-        with patch.object(runtime, "_request_openai", request):
-            translated = await runtime._request_openai_with_fact_correction(
+            malformed_rows = [provider_rows[0], provider_rows[0], provider_rows[2]]
+            provider_payload["output"][0]["content"][0]["text"] = json.dumps(
+                {"segments": malformed_rows}
+            )
+            with self.assertRaisesRegex(ValueError, "duplicate or unexpected"):
+                await runtime._request_openai(
+                    patch_id="1847920302240420",
+                    segments=provider_segments,
+                    glossary={},
+                    settings=settings,
+                    collect_placeholder_failures=True,
+                )
+
+        async def request(**kwargs):
+            ids = [segment["id"] for segment in kwargs["segments"]]
+            if kwargs["fact_correction_ids"]:
+                self.assertEqual(kwargs["fact_correction_ids"], invalid_ids)
+                self.assertEqual(ids, invalid_ids)
+                return {segment_id: expected_prepared_text for segment_id in ids}
+            batch_invalid = [segment_id for segment_id in ids if segment_id in invalid_ids]
+            valid_translations = {
+                segment_id: expected_prepared_text
+                for segment_id in ids
+                if segment_id not in batch_invalid
+            }
+            return runtime._OpenAITranslationBatch(
+                valid_translations,
+                returned_ids=ids,
+                invalid_placeholder_ids=batch_invalid,
+            )
+
+        budget = runtime._TranslationProviderCallBudget()
+        with patch.object(runtime, "_request_openai", side_effect=request) as provider:
+            translated = await runtime._request_openai_batches(
                 patch_id="1847920302240420",
                 source_segments=source,
                 prepared_segments=prepared,
                 glossary={},
                 settings=PlatformSettings(),
-                entity_replacements={},
+                entity_replacements=entity_replacements,
+                fact_replacements=fact_replacements,
+                call_budget=budget,
+            )
+        self.assertEqual(provider.await_count, 4)
+        self.assertEqual(budget.provider_calls, 4)
+        self.assertEqual(budget.follow_up_kind, "fact_correction")
+        self.assertEqual(len(translated), len(source))
+        self.assertEqual(set(translated), {segment["id"] for segment in source})
+        self.assertEqual(translated["s000-c001"], "Nurse Harrow снизила время перезарядки до 10 секунд.")
+        self.assertEqual(
+            [segment["id"] for segment in provider.await_args.kwargs["segments"]],
+            invalid_ids,
+        )
+
+    async def test_protected_numeric_placeholder_failure_gets_one_corrective_retry(self) -> None:
+        source = [{"id": "s000-c000", "text": "Nurse Harrow cooldown 10 seconds."}]
+        fact_protected, fact_map = translation.protect_facts(source[0]["text"])
+        protected_text, entity_map = translation.protect_entities(
+            fact_protected, ["Nurse Harrow"]
+        )
+        prepared = [{"id": "s000-c000", "text": protected_text}]
+        with self.assertRaises(ProtectedFactPlaceholderError):
+            runtime.validate_prepared_translation(
+                prepared[0]["text"], "[[ENTITY_0000]] Cooldown is [[FACT_0001]] seconds."
+            )
+        with self.assertRaises(ProtectedEntityPlaceholderError):
+            runtime.validate_prepared_translation(
+                prepared[0]["text"], "[[ENTITY_0001]] Cooldown is [[FACT_0000]] seconds."
+            )
+        corrected_prepared = "[[ENTITY_0000]] снизила время перезарядки до [[FACT_0000]] секунд."
+        initial_result = runtime._OpenAITranslationBatch(
+            {},
+            returned_ids=["s000-c000"],
+            invalid_placeholder_ids=["s000-c000"],
+        )
+        request = AsyncMock(side_effect=[initial_result, {"s000-c000": corrected_prepared}])
+        budget = runtime._TranslationProviderCallBudget()
+
+        with patch.object(runtime, "_request_openai", request):
+            translated = await runtime._request_openai_batches(
+                patch_id="1847920302240420",
+                source_segments=source,
+                prepared_segments=prepared,
+                glossary={},
+                settings=PlatformSettings(),
+                entity_replacements={"s000-c000": entity_map},
                 fact_replacements={"s000-c000": fact_map},
                 call_budget=budget,
             )
 
-        self.assertEqual(translated, {"s000-c000": "Перезарядка — 10 секунд."})
+        self.assertEqual(
+            translated,
+            {"s000-c000": "Nurse Harrow снизила время перезарядки до 10 секунд."},
+        )
         self.assertEqual(request.await_count, 2)
         self.assertEqual(request.await_args.kwargs["fact_correction_ids"], ["s000-c000"])
+        self.assertEqual(
+            [segment["id"] for segment in request.await_args.kwargs["segments"]],
+            ["s000-c000"],
+        )
         self.assertEqual(budget.provider_calls, 2)
-        self.assertEqual(budget.follow_up_kind, "protected_fact_retry")
+        self.assertEqual(budget.follow_up_kind, "fact_correction")
 
         shared_budget = runtime._TranslationProviderCallBudget()
         shared_budget.begin_call()
-        shared_budget.begin_call(follow_up_kind="fact_correction")
-        blocked_request = AsyncMock(side_effect=error)
+        shared_budget.begin_call(follow_up_kind="transient_retry")
+        invalid_result = runtime._OpenAITranslationBatch(
+            {},
+            returned_ids=["s000-c000"],
+            invalid_placeholder_ids=["s000-c000"],
+        )
+        blocked_request = AsyncMock(return_value=invalid_result)
         with (
             patch.object(runtime, "_request_openai", blocked_request),
-            self.assertRaises(runtime.ProtectedFactPlaceholderError),
+            self.assertRaises(runtime._ProviderCallBudgetExceeded),
         ):
-            await runtime._request_openai_with_budget(
-                call_budget=shared_budget,
+            await runtime._request_openai_batches(
                 patch_id="1847920302240420",
-                segments=prepared,
+                source_segments=source,
+                prepared_segments=prepared,
                 glossary={},
                 settings=PlatformSettings(),
-                fact_correction_ids=None,
+                entity_replacements={"s000-c000": entity_map},
+                fact_replacements={"s000-c000": fact_map},
+                call_budget=shared_budget,
             )
         self.assertEqual(blocked_request.await_count, 1)
-        self.assertEqual(shared_budget.follow_up_kind, "fact_correction")
+        self.assertEqual(shared_budget.follow_up_kind, "transient_retry")
         self.assertEqual(shared_budget.provider_calls, 3)
+
 
     async def test_transient_retry_and_fact_correction_compete_for_same_slot(self) -> None:
         source_text = "Next Tuesday, October 20th at 2pm PDT."
@@ -222,14 +393,19 @@ class PatchTranslationRetryTests(PlatformIsolatedAsyncioTestCase):
         source = [{"id": "s000-c000", "text": source_text}]
         prepared = [{"id": "s000-c000", "text": protected_text}]
         invalid = "Следующий вторник, [[FACT_0000]] октября в [[FACT_0001]]; 99."
-        request = AsyncMock(side_effect=[httpx.ReadTimeout("timeout"), {"s000-c000": invalid}])
+        initial_result = runtime._OpenAITranslationBatch(
+            {"s000-c000": invalid},
+            returned_ids=["s000-c000"],
+            invalid_placeholder_ids=[],
+        )
+        request = AsyncMock(side_effect=[httpx.ReadTimeout("timeout"), initial_result])
         budget = runtime._TranslationProviderCallBudget()
 
         with (
             patch.object(runtime, "_request_openai", request),
             self.assertRaises(runtime._ProviderCallBudgetExceeded),
         ):
-            await runtime._request_openai_with_fact_correction(
+            await runtime._request_openai_batches(
                 patch_id="1847920302240420",
                 source_segments=source,
                 prepared_segments=prepared,
@@ -266,7 +442,7 @@ class PatchTranslationRetryTests(PlatformIsolatedAsyncioTestCase):
 
     async def test_failed_batch_never_persists_partial_translation(self) -> None:
         source = [
-            {"id": f"s000-c{index:03d}", "text": "A small gameplay update."}
+            {"id": f"s000-c{index:03d}", "text": "Cooldown changed from 10 to 12 seconds."}
             for index in range(150)
         ]
         patch_detail = _patch_with_segments(source)
@@ -284,10 +460,28 @@ class PatchTranslationRetryTests(PlatformIsolatedAsyncioTestCase):
             first_batch_calls = 0
             sibling_started = asyncio.Event()
             sibling_cancelled = False
+            initial_batches = 0
 
             async def request(**kwargs):
-                nonlocal first_batch_calls, sibling_cancelled
+                nonlocal first_batch_calls, sibling_cancelled, initial_batches
                 ids = [segment["id"] for segment in kwargs["segments"]]
+                if kwargs["fact_correction_ids"]:
+                    if isinstance(error, httpx.ReadTimeout):
+                        self.fail("A transport retry should have exhausted the follow-up slot.")
+                    raise error
+                initial_batches += 1
+                if not isinstance(error, httpx.ReadTimeout):
+                    invalid_id = ids[0] if initial_batches == 1 else ids[-1]
+                    valid = {
+                        segment["id"]: segment["text"]
+                        for segment in kwargs["segments"]
+                        if segment["id"] != invalid_id
+                    }
+                    return runtime._OpenAITranslationBatch(
+                        valid,
+                        returned_ids=ids,
+                        invalid_placeholder_ids=[invalid_id],
+                    )
                 if ids[0] == "s000-c000":
                     first_batch_calls += 1
                     if first_batch_calls == 1:
@@ -333,9 +527,13 @@ class PatchTranslationRetryTests(PlatformIsolatedAsyncioTestCase):
             self.assertFalse(result["ok"])
             self.assertEqual(result["status"], runtime.TRANSLATION_STATUS_FAILED)
             self.assertEqual(result["error"], type(error).__name__)
-            self.assertEqual(first_batch_calls, 2)
             self.assertEqual(provider.await_count, 3)
-            self.assertTrue(sibling_cancelled)
+            if isinstance(error, httpx.ReadTimeout):
+                self.assertEqual(first_batch_calls, 2)
+                self.assertTrue(sibling_cancelled)
+            else:
+                self.assertEqual(initial_batches, 2)
+                self.assertFalse(sibling_cancelled)
             claim.assert_awaited_once()
             persist.assert_not_awaited()
             cache_write.assert_not_awaited()
@@ -344,7 +542,7 @@ class PatchTranslationRetryTests(PlatformIsolatedAsyncioTestCase):
             cache.aclose.assert_awaited_once()
 
         await assert_atomic_failure(
-            runtime.ProtectedFactPlaceholderError(
+            ProtectedFactPlaceholderError(
                 "OpenAI changed a protected numeric/tier placeholder."
             )
         )
@@ -374,19 +572,19 @@ class PatchTranslationRetryTests(PlatformIsolatedAsyncioTestCase):
             "Следующий вторник, [[FACT_0000]] октября в [[FACT_0001]] "
             "по тихоокеанскому времени."
         )
-        request = AsyncMock(
-            side_effect=[
-                {
-                    "s000-c000": "Виолетта уже доступна в игре.",
-                    "s000-c001": initial,
-                },
-                {"s000-c001": corrected},
-            ]
+        initial_result = runtime._OpenAITranslationBatch(
+            {
+                "s000-c000": "Виолетта уже доступна в игре.",
+                "s000-c001": initial,
+            },
+            returned_ids=["s000-c000", "s000-c001"],
+            invalid_placeholder_ids=[],
         )
+        request = AsyncMock(side_effect=[initial_result, {"s000-c001": corrected}])
         budget = runtime._TranslationProviderCallBudget()
 
         with patch.object(runtime, "_request_openai", request):
-            translated = await runtime._request_openai_with_fact_correction(
+            translated = await runtime._request_openai_batches(
                 patch_id="1846651706683085",
                 source_segments=source_segments,
                 prepared_segments=prepared_segments,
@@ -424,7 +622,11 @@ class PatchTranslationRetryTests(PlatformIsolatedAsyncioTestCase):
         invalid = "Следующий вторник, [[FACT_0000]] октября в [[FACT_0001]]; 99."
         request = AsyncMock(
             side_effect=[
-                {"s000-c001": invalid},
+                runtime._OpenAITranslationBatch(
+                    {"s000-c001": invalid},
+                    returned_ids=["s000-c001"],
+                    invalid_placeholder_ids=[],
+                ),
                 {"s000-c001": invalid},
             ]
         )
@@ -434,7 +636,7 @@ class PatchTranslationRetryTests(PlatformIsolatedAsyncioTestCase):
             patch.object(runtime, "_request_openai", request),
             self.assertRaisesRegex(ValueError, "bounded correction"),
         ):
-            await runtime._request_openai_with_fact_correction(
+            await runtime._request_openai_batches(
                 patch_id="1846651706683085",
                 source_segments=source_segments,
                 prepared_segments=prepared_segments,
