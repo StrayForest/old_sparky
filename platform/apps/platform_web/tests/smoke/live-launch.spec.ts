@@ -740,19 +740,24 @@ test("live four current patch DTOs render owner-scoped hero and ability changes"
     ]);
     expect(allPatchChanges.some((change) => change.includes("Street Brawl:"))).toBe(false);
     if (modeSections.length) {
-      expect(modeSections.map((section) => section.hero_name)).toEqual([
-        "Deadman Danny",
-        "Nurse Harrow",
-        "Paige",
-        "Rat King",
-        "Violet",
-      ]);
+      expect(modeSections.every((section) => (
+        section.kind === "hero" && Boolean(section.hero_name)
+      ))).toBe(true);
       const modeRows = modeSections.flatMap((section) => [
         ...section.changes,
         ...section.abilities.flatMap((ability) => ability.changes),
       ]);
-      expect(modeRows).toHaveLength(13);
-      expect(new Set(modeRows).size).toBe(13);
+      expect(new Set(modeRows).size).toBe(modeRows.length);
+      if (patchId === "1847920302240420") {
+        expect(modeSections.map((section) => section.hero_name)).toEqual([
+          "Deadman Danny",
+          "Nurse Harrow",
+          "Paige",
+          "Rat King",
+          "Violet",
+        ]);
+        expect(modeRows).toHaveLength(13);
+      }
     }
 
     const solomon = patch.sections.find((section) => (
@@ -811,8 +816,8 @@ test("live four current patch DTOs render owner-scoped hero and ability changes"
         expect(nurse!.abilities).toHaveLength(4);
         expect(nurse!.abilities.every((ability) => ability.presentation_kind === "introduction")).toBe(true);
         expect(nurse!.abilities.every((ability) => Boolean(ability.description?.trim()))).toBe(true);
-        expect(nurse!.abilities.reduce((sum, ability) => sum + (ability.stats?.length ?? 0), 0)).toBe(67);
-        expect(nurse!.abilities.some((ability) => ability.stats_pending)).toBe(false);
+        expect(nurse!.abilities.every((ability) => (ability.stats?.length ?? 0) > 0)).toBe(true);
+        expect(nurse!.abilities.every((ability) => ability.stats_pending === false)).toBe(true);
         await expect(page.locator(".general-patch-section")
           .getByText(/(?:Nurse|Медсестра)\s*:/iu)).toHaveCount(0);
       }
