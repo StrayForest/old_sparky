@@ -472,6 +472,8 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
         published_keys = [call[0][0] for call in cache.pipeline_instance.set_calls]
         self.assertIn(home_content.HOME_CONTENT_KEY, published_keys)
         self.assertIn(home_content.HOME_CONTENT_STALE_KEY, published_keys)
+        self.assertIn(home_content.PATCH_ASSET_CATALOG_KEY, published_keys)
+        self.assertIn(home_content.PATCH_ASSET_CATALOG_STALE_KEY, published_keys)
 
     async def test_pending_hero_asset_retry_respects_shared_backoff_key(self) -> None:
         stale_home = {
@@ -582,6 +584,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(asset_fetch.await_args.kwargs["previous_catalog"], legacy_catalog)
         stored_keys = [call[0][0] for call in cache.pipeline_instance.set_calls]
         self.assertIn(home_content.PATCH_ASSET_CATALOG_KEY, stored_keys)
+        self.assertIn(home_content.PATCH_ASSET_CATALOG_STALE_KEY, stored_keys)
 
     async def test_unknown_intro_stats_from_stale_catalog_schedule_asset_retry(self) -> None:
         patch_id = "stale-intro"
@@ -2242,11 +2245,11 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(home_content.PATCH_DETAIL_KEY_PREFIX, "platform:home-content:patch:v14:")
         self.assertEqual(
             home_content.PATCH_ASSET_CATALOG_KEY,
-            "platform:home-content:patch-assets:v7",
+            "platform:home-content:patch-assets:v8",
         )
         self.assertEqual(
             home_content.PATCH_ASSET_CATALOG_STALE_KEY,
-            "platform:home-content:patch-assets-stale:v1",
+            "platform:home-content:patch-assets-stale:v2",
         )
 
     def test_supplemental_patch_ability_uses_catalogued_solomon_move_piece_icon(self) -> None:

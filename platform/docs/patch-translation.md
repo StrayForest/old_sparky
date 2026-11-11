@@ -249,16 +249,37 @@ Validation failures are not retried in a loop.
 
 ## Parser and catalog cache changes
 
-When patch parsing, source normalization or the game-asset catalog changes extracted segments, bump the detail
-cache namespace so new reads cannot reuse stale structure. The detail namespace configured in this source tree is
-v14. A v14 cache miss
-ignores older detail namespaces without reading, reparsing, promoting or deleting their entries. It uses the bounded
-negative/global refresh gates to fetch the current full Steam feed with `maxlength=0`, publishes current details
-under v14, and registers translations keyed by the newly extracted source hashes. The full HTTP response remains
-subject to the 8 MiB byte cap, and each normalized article remains capped at 30,000 characters. A cold catalog may
-defer one bounded refresh through that same full-feed path; it must not fan out a full-history reprocess. Existing
-translation rows are not automatically valid for changed segments. Hero display metadata follows the current catalog
-refresh, while English source content and canonical patch labels remain intact.
+When patch parsing or source normalization changes extracted sections, bump the
+detail cache namespace so new reads cannot reuse stale structure. When the
+assembled game-asset catalog projection changes, bump both its current and
+last-good cache namespaces, even if Steam patch IDs are unchanged. The
+namespaces configured in this source tree are detail v14, current asset
+catalog v8 and last-good asset catalog v2. A v14 detail-cache miss ignores
+older detail namespaces without reading, reparsing, promoting or deleting
+their entries. Catalog readers use v8, then v2, and do not read older catalog
+namespaces. The base `home_content.refresh_home_content`, the guarded
+`home_content_security.refresh_home_content`, and the bounded
+`patch_detail_security._refresh_patch_cache_after_miss` path publish a rebuilt
+catalog to both v8 and v2 in one cache pipeline. The platform worker reaches
+catalog to both v8 and v2 in one cache pipeline. The worker task
+`platform.home_content_refresh` and public `/home` route call
+`home_content_runtime.refresh_home_content`, which uses the guarded home
+refresh. Public `/game-assets` uses the guarded catalog reader. Public patch
+detail reads use `patch_detail_security.get_patch_detail`; a detail-cache miss
+uses the bounded patch-miss path. The base catalog reader is also used by
+`patch_detail.get_patch_detail` and rebuilds through the base home refresh.
+Thus an old warm catalog cannot suppress rebuilding the new projection after
+a namespace bump. Existing older cache entries remain untouched. The
+patch-miss refresh uses bounded negative/global gates to fetch the current
+full Steam feed with `maxlength=0`, publishes current details under v14, and
+registers translations keyed by the newly extracted source hashes. The full
+HTTP response remains subject to the 8 MiB byte cap, and each normalized
+article remains capped at 30,000 characters. A cold catalog may defer one
+bounded refresh through that same full-feed path; it must not fan out a
+full-history reprocess. Existing translation rows are not automatically valid
+for changed segments. Hero display metadata follows the current catalog
+refresh, while English source content and canonical patch labels remain
+intact.
 
 A translation-version bump intentionally invalidates previous translation result cache entries when the translation contract or canonical glossary changes.
 

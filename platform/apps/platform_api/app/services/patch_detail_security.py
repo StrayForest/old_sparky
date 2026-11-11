@@ -99,10 +99,20 @@ async def _publish_patch_refresh(
     try:
         async with cache.pipeline(transaction=True) as pipeline:
             if publish_catalog:
+                encoded_catalog = json.dumps(
+                    catalog,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
                 pipeline.set(
                     base.PATCH_ASSET_CATALOG_KEY,
-                    json.dumps(catalog, ensure_ascii=False, separators=(",", ":")),
+                    encoded_catalog,
                     ex=base.PATCH_ASSET_CATALOG_TTL_SECONDS,
+                )
+                pipeline.set(
+                    base.PATCH_ASSET_CATALOG_STALE_KEY,
+                    encoded_catalog,
+                    ex=base.PATCH_ASSET_CATALOG_STALE_TTL_SECONDS,
                 )
             for patch_id, raw_detail in details.items():
                 structured = structure_patch_detail(raw_detail, catalog)

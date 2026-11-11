@@ -137,7 +137,7 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
 
     async def test_unknown_patch_sets_negative_cache_and_schedules_background_refresh(self) -> None:
         patch_id = "1847920302240420"
-        catalog = {
+        old_catalog = {
             "heroes": {},
             "items": {
                 "high-velocity rounds": {
@@ -149,6 +149,35 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
             "ranks": {},
             "objectives": {},
         }
+        move_piece_icon = (
+            "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/"
+            "chess/chessmaster_movepiece.png"
+        )
+        rebuilt_catalog = home_content._build_asset_catalog(
+            {"heroes": []},
+            {"items": []},
+            supplemental_hero_payload=[
+                {
+                    "id": 42,
+                    "name": "Solomon",
+                    "class_name": "hero_chessmaster",
+                    "player_selectable": True,
+                    "disabled": False,
+                    "development_state": "release",
+                    "items": {},
+                }
+            ],
+            supplemental_item_payload=[
+                {
+                    "id": 3284310919,
+                    "class_name": "ability_chessmaster_movechesspiece",
+                    "type": "weapon",
+                    "name": "Move Piece",
+                    "image": move_piece_icon,
+                }
+            ],
+        )
+        rebuilt_catalog["items"].update(old_catalog["items"])
         full_content = (
             "[p][b]General:[/b][/p]"
             "[p]- Past Dues: Now channels their special attack, creating an aura."
@@ -156,6 +185,8 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
             "[p]- Latest 6 heroes now have normal unlocking requirements.[/p]"
             "[p][b]Items:[/b][/p]"
             "[p]- High-Velocity Rounds: Bullet Velocity reduced from 60% to 45%[/p]"
+            "[p][b]Heroes:[/b][/p]"
+            "[p]- Solomon: Move Piece - Range to grab pieces increased from 50m to 65m[/p]"
         )
         compact_content = (
             "General: Past Dues: Now channels their special attack, creating an aura."
@@ -170,7 +201,7 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
             "url": f"https://store.steampowered.com/news/app/1422450/view/{patch_id}",
         }
         compact_detail = patch_detail.structure_patch_detail(
-            {**source_metadata, "content": compact_content}, catalog
+            {**source_metadata, "content": compact_content}, old_catalog
         )
         compact_source_hash = translation_source_hash(compact_detail)
         old_prefixes = (
@@ -186,12 +217,11 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
         old_values = {
             prefix + patch_id: json.dumps(compact_detail) for prefix in old_prefixes
         }
-        cache = _Cache(
-            {
-                **old_values,
-                home_content.PATCH_ASSET_CATALOG_KEY: json.dumps(catalog),
-            }
-        )
+        old_catalog_keys = {
+            "platform:home-content:patch-assets:v7": json.dumps(old_catalog),
+            "platform:home-content:patch-assets-stale:v1": json.dumps(old_catalog),
+        }
+        cache = _Cache({**old_values, **old_catalog_keys})
         news_item = {
             **source_metadata,
             "gid": patch_id,
@@ -233,6 +263,11 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
                 side_effect=bounded_client_factory,
             ),
             patch.object(
+                home_content,
+                "_fetch_deadlock_asset_catalog",
+                AsyncMock(return_value=rebuilt_catalog),
+            ) as fetch_catalog,
+            patch.object(
                 patch_detail_security,
                 "ensure_patch_translation_records",
                 AsyncMock(
@@ -260,10 +295,22 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(len(tasks), 1)
         self.assertIsInstance(refreshed, dict)
         self.assertEqual(len(requests), 1)
+        fetch_catalog.assert_awaited_once()
         self.assertEqual(requests[0].url.params.get("maxlength"), "0")
         self.assertLessEqual(
             response_sizes[0],
             patch_detail_security.PATCH_MISS_RESPONSE_MAX_BYTES,
+        )
+        self.assertNotIn("platform:home-content:patch-assets:v7", cache.get_calls)
+        self.assertNotIn("platform:home-content:patch-assets-stale:v1", cache.get_calls)
+        for old_key, old_value in old_catalog_keys.items():
+            self.assertEqual(cache.values[old_key], old_value)
+        self.assertIn(home_content.PATCH_ASSET_CATALOG_KEY, cache.values)
+        self.assertIn(home_content.PATCH_ASSET_CATALOG_STALE_KEY, cache.values)
+        stored_catalog = json.loads(cache.values[home_content.PATCH_ASSET_CATALOG_KEY])
+        self.assertEqual(
+            stored_catalog["heroes"]["solomon"]["abilities"]["move piece"]["icon_url"],
+            move_piece_icon,
         )
         cached_key = home_content.PATCH_DETAIL_KEY_PREFIX + patch_id
         self.assertIn(cached_key, cache.values)
@@ -295,6 +342,17 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
             if section["kind"] == "general"
         )
         self.assertEqual(public_general["changes"], general["changes"])
+        solomon = next(
+            section
+            for section in updated_detail["sections"]
+            if section["kind"] == "hero" and section["hero_name"] == "Solomon"
+        )
+        move_piece = next(ability for ability in solomon["abilities"] if ability["name"] == "Move Piece")
+        self.assertEqual(move_piece["icon_url"], move_piece_icon)
+        self.assertEqual(
+            move_piece["changes"],
+            ["Range to grab pieces increased from 50m to 65m"],
+        )
         apply_cached.assert_awaited_once()
         self.assertIn(
             patch_detail_security.PATCH_MISS_NEGATIVE_KEY_PREFIX + patch_id,

@@ -38,8 +38,8 @@ HOME_CONTENT_KEY = "platform:home-content:v4"
 HOME_CONTENT_STALE_KEY = "platform:home-content:stale:v4"
 HOME_CONTENT_LOCK_KEY = "platform:home-content:refresh-lock:v4"
 PATCH_DETAIL_KEY_PREFIX = "platform:home-content:patch:v14:"
-PATCH_ASSET_CATALOG_KEY = "platform:home-content:patch-assets:v7"
-PATCH_ASSET_CATALOG_STALE_KEY = "platform:home-content:patch-assets-stale:v1"
+PATCH_ASSET_CATALOG_KEY = "platform:home-content:patch-assets:v8"
+PATCH_ASSET_CATALOG_STALE_KEY = "platform:home-content:patch-assets-stale:v2"
 PATCH_ASSET_PENDING_RETRY_KEY = "platform:home-content:patch-assets-pending-retry:v1"
 PATCH_SITEMAP_INDEX_KEY = "platform:seo:patch-index:v1"
 PATCH_DETAIL_TTL_SECONDS = 30 * 24 * 60 * 60
@@ -1946,10 +1946,20 @@ async def refresh_home_content(*, force: bool = False) -> dict[str, Any]:
             pipeline.set(HOME_CONTENT_KEY, encoded, ex=settings.platform_home_content_cache_seconds)
             pipeline.set(HOME_CONTENT_STALE_KEY, encoded, ex=settings.platform_home_content_stale_seconds)
             if (asset_catalog is None or has_new_patch) and not isinstance(asset_result, Exception):
+                encoded_asset_catalog = json.dumps(
+                    asset_result,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
                 pipeline.set(
                     PATCH_ASSET_CATALOG_KEY,
-                    json.dumps(asset_result, ensure_ascii=False, separators=(",", ":")),
+                    encoded_asset_catalog,
                     ex=PATCH_ASSET_CATALOG_TTL_SECONDS,
+                )
+                pipeline.set(
+                    PATCH_ASSET_CATALOG_STALE_KEY,
+                    encoded_asset_catalog,
+                    ex=PATCH_ASSET_CATALOG_STALE_TTL_SECONDS,
                 )
             for patch_id, content in patch_details.items():
                 pipeline.set(
