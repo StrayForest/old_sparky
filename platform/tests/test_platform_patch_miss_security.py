@@ -7,8 +7,13 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 
-from apps.platform_api.app.services import home_content, patch_detail_security
+from apps.platform_api.app.services import (
+    home_content,
+    patch_detail,
+    patch_detail_security,
+)
 from apps.platform_api.app.services.patch_translation import translation_source_hash
+from python_packages.platform_infra.config import PlatformSettings
 from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
@@ -129,26 +134,154 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
         refresh.assert_not_awaited()
 
     async def test_unknown_patch_sets_negative_cache_and_schedules_background_refresh(self) -> None:
-        cache = _Cache()
+        patch_id = "1847920302240420"
+        catalog = {
+            "heroes": {},
+            "items": {
+                "high-velocity rounds": {
+                    "name": "High-Velocity Rounds",
+                    "category": "weapon",
+                    "icon_url": "https://assets-bucket.deadlock-api.com/high-velocity.png",
+                }
+            },
+            "ranks": {},
+            "objectives": {},
+        }
+        full_content = (
+            "[p][b]General:[/b][/p]"
+            "[p]- Past Dues: Now channels their special attack, creating an aura."
+            "[/p][p]- Fixed some bugs with Walker stomp logic[/p]"
+            "[p]- Latest 6 heroes now have normal unlocking requirements.[/p]"
+            "[p][b]Items:[/b][/p]"
+            "[p]- High-Velocity Rounds: Bullet Velocity reduced from 60% to 45%[/p]"
+        )
+        compact_content = (
+            "General: Past Dues: Now channels their special attack, creating an aura."
+            " - Fixed some bugs with Walker stomp logic - Latest 6 heroes now have normal "
+            "unlocking requirements. Items: - High-Velocity Rounds: Bullet Velocity "
+            "reduced from 60% to 45%"
+        )
+        source_metadata = {
+            "id": patch_id,
+            "title": "Halloween 2026 + Gameplay Update",
+            "published_at": "2026-10-31T00:00:00+00:00",
+            "url": f"https://store.steampowered.com/news/app/1422450/view/{patch_id}",
+        }
+        compact_detail = patch_detail.structure_patch_detail(
+            {**source_metadata, "content": compact_content}, catalog
+        )
+        compact_source_hash = translation_source_hash(compact_detail)
+        cache = _Cache(
+            {
+                # The deployed d6 cache stores this compact v11 projection.
+                "platform:home-content:patch:v11:" + patch_id: json.dumps(compact_detail),
+                home_content.PATCH_ASSET_CATALOG_KEY: json.dumps(catalog),
+            }
+        )
+        news_item = {
+            **source_metadata,
+            "gid": patch_id,
+            "contents": full_content,
+            "date": 1_793_404_800,
+            "feedlabel": "Community Announcements",
+            "tags": ["patchnotes"],
+        }
+        requests: list[httpx.Request] = []
+        response_sizes: list[int] = []
+
+        async def steam_handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            response = httpx.Response(
+                200,
+                json={"appnews": {"newsitems": [news_item]}},
+                request=request,
+            )
+            response_sizes.append(len(response.content))
+            return response
+
+        bounded_client_type = patch_detail_security._BoundedPatchRefreshClient
+        transport = httpx.MockTransport(steam_handler)
+
+        def bounded_client_factory(**kwargs):
+            return bounded_client_type(transport=transport, **kwargs)
+
         tasks, registered, refresh_patch = _capture_refresh_tasks()
         with (
             patch.object(patch_detail_security, "redis_client", return_value=cache),
             patch.object(
                 patch_detail_security,
-                "_refresh_patch_cache_after_miss",
-                AsyncMock(),
-            ) as refresh,
+                "get_settings",
+                return_value=PlatformSettings(_env_file=None),
+            ),
+            patch.object(
+                patch_detail_security,
+                "_BoundedPatchRefreshClient",
+                side_effect=bounded_client_factory,
+            ),
+            patch.object(
+                patch_detail_security,
+                "ensure_patch_translation_records",
+                AsyncMock(
+                    return_value={
+                        "registered": 1,
+                        "enqueued": 1,
+                        "enqueue_failures": 0,
+                    }
+                ),
+            ) as register,
+            patch.object(
+                patch_detail_security,
+                "apply_cached_patch_translation",
+                AsyncMock(side_effect=lambda detail: detail),
+            ) as apply_cached,
             refresh_patch,
         ):
-            result = await patch_detail_security._cached_patch_source("999")
+            result = await patch_detail_security._cached_patch_source(patch_id)
             await asyncio.wait_for(registered.wait(), timeout=_REFRESH_OBSERVER_TIMEOUT_SECONDS)
             await _await_refresh_tasks(tasks)
+            refreshed = await patch_detail_security._cached_patch_source(patch_id)
+            public_detail = await patch_detail_security.get_patch_detail(patch_id)
 
         self.assertIsNone(result)
         self.assertEqual(len(tasks), 1)
-        refresh.assert_awaited_once()
+        self.assertIsInstance(refreshed, dict)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].url.params.get("maxlength"), "0")
+        self.assertLessEqual(
+            response_sizes[0],
+            patch_detail_security.PATCH_MISS_RESPONSE_MAX_BYTES,
+        )
+        cached_key = home_content.PATCH_DETAIL_KEY_PREFIX + patch_id
+        self.assertIn(cached_key, cache.values)
+        self.assertIn("platform:home-content:patch:v11:" + patch_id, cache.values)
+        updated_detail = json.loads(cache.values[cached_key])
+        updated_source_hash = translation_source_hash(updated_detail)
+        self.assertNotEqual(updated_source_hash, compact_source_hash)
+        general = next(
+            section
+            for section in updated_detail["sections"]
+            if section["kind"] == "general"
+        )
+        self.assertEqual(
+            general["changes"],
+            [
+                "Past Dues: Now channels their special attack, creating an aura.",
+                "Fixed some bugs with Walker stomp logic",
+                "Latest 6 heroes now have normal unlocking requirements.",
+            ],
+        )
+        register.assert_awaited_once()
+        registered_patch = register.await_args.args[0][patch_id]
+        self.assertEqual(translation_source_hash(registered_patch), updated_source_hash)
+        public_general = next(
+            section
+            for section in public_detail["sections"]
+            if section["kind"] == "general"
+        )
+        self.assertEqual(public_general["changes"], general["changes"])
+        apply_cached.assert_awaited_once()
         self.assertIn(
-            patch_detail_security.PATCH_MISS_NEGATIVE_KEY_PREFIX + "999",
+            patch_detail_security.PATCH_MISS_NEGATIVE_KEY_PREFIX + patch_id,
             cache.values,
         )
         self.assertIn(patch_detail_security.PATCH_MISS_REFRESH_GATE_KEY, cache.values)

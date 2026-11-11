@@ -105,6 +105,16 @@ using sentence and segment context.
 
 Patch changes are parsed from Valve/Steam content in English.
 
+[`ISteamNews/GetNewsForApp`](https://partner.steamgames.com/doc/webapi/ISteamNews)
+requests `maxlength=0`; Steam documents this as
+returning full content, while a nonzero limit may return a generated blurb that
+loses BBCode and paragraph boundaries before parsing. The decoded response is
+bounded at 8 MiB in both the home refresh and patch-detail miss refresh; each
+announcement's normalized text remains capped at 30,000 characters. Parser
+changes must bump the patch-detail cache namespace and register translations
+under the hash of the newly extracted segments, so old flattened source cannot
+be reused as current detail or translation input.
+
 The translation glossary is a **small checked-in canonical glossary owned by Old Sparky**. It is curated from Valve/Steam Russian Deadlock terminology and contains only important reusable gameplay mechanics: movement, damage, resistances, lifesteal, cooldowns, duration, range/radius, control durations and similar core concepts.
 
 The glossary intentionally does **not** contain:

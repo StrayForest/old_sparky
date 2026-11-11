@@ -183,11 +183,51 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
 
         patches, details = await home_content._fetch_steam_patches(client)
 
+        client.get.assert_awaited_once_with(
+            home_content.STEAM_NEWS_URL,
+            params={
+                "appid": home_content.DEADLOCK_APP_ID,
+                "count": 20,
+                "maxlength": 0,
+                "format": "json",
+            },
+        )
         self.assertEqual([patch["id"] for patch in patches], ["124", "123"])
         self.assertEqual(details["123"]["content"], "Balance\nChanged hero")
         self.assertEqual(details["124"]["content"], "New ranked mode")
         self.assertNotIn("125", details)
         self.assertNotIn("<p>", patches[0]["excerpt"])
+        with patch.object(home_content, "STEAM_NEWS_RESPONSE_MAX_BYTES", 3):
+            oversized_client = Mock()
+            oversized_client.get = AsyncMock(
+                return_value=_Response(content=b"1234")
+            )
+            with self.assertRaisesRegex(ValueError, "response exceeded the byte limit"):
+                await home_content._fetch_steam_patches(oversized_client)
+        oversized_client.get.assert_awaited_once()
+
+        long_content = "Complete patch wording. " * 1_500
+        long_client = Mock()
+        long_client.get = AsyncMock(
+            return_value=_Response(
+                json_payload={
+                    "appnews": {
+                        "newsitems": [
+                            {
+                                "gid": "126",
+                                "title": "Long Patch",
+                                "contents": long_content,
+                                "date": 1_700_000_003,
+                                "feedlabel": "Community Announcements",
+                                "tags": ["patchnotes"],
+                            }
+                        ]
+                    }
+                }
+            )
+        )
+        _, long_details = await home_content._fetch_steam_patches(long_client)
+        self.assertEqual(long_details["126"]["content"], long_content.strip()[:30000])
 
     async def test_home_feed_sorts_and_limits_patch_cards_to_four(self) -> None:
         client = Mock()
@@ -2173,7 +2213,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
     def test_public_content_cache_versions_keep_home_contract_stable(self) -> None:
         self.assertEqual(home_content.HOME_CONTENT_KEY, "platform:home-content:v4")
         self.assertEqual(home_content.HOME_CONTENT_STALE_KEY, "platform:home-content:stale:v4")
-        self.assertEqual(home_content.PATCH_DETAIL_KEY_PREFIX, "platform:home-content:patch:v11:")
+        self.assertEqual(home_content.PATCH_DETAIL_KEY_PREFIX, "platform:home-content:patch:v12:")
         self.assertEqual(
             home_content.PATCH_ASSET_CATALOG_KEY,
             "platform:home-content:patch-assets:v7",

@@ -37,7 +37,7 @@ DEADLOCK_ASSET_BASE_URL = "https://deadlock.io"
 HOME_CONTENT_KEY = "platform:home-content:v4"
 HOME_CONTENT_STALE_KEY = "platform:home-content:stale:v4"
 HOME_CONTENT_LOCK_KEY = "platform:home-content:refresh-lock:v4"
-PATCH_DETAIL_KEY_PREFIX = "platform:home-content:patch:v11:"
+PATCH_DETAIL_KEY_PREFIX = "platform:home-content:patch:v12:"
 PATCH_ASSET_CATALOG_KEY = "platform:home-content:patch-assets:v7"
 PATCH_ASSET_CATALOG_STALE_KEY = "platform:home-content:patch-assets-stale:v1"
 PATCH_ASSET_PENDING_RETRY_KEY = "platform:home-content:patch-assets-pending-retry:v1"
@@ -49,6 +49,7 @@ PATCH_ASSET_PENDING_RETRY_SECONDS = 5 * 60
 REFRESH_LOCK_SECONDS = 30
 HOME_PATCH_LIMIT = 4
 HOME_VIDEO_LIMIT = 4
+STEAM_NEWS_RESPONSE_MAX_BYTES = 8 * 1024 * 1024
 SOURCE_DATE_MAX_FUTURE_SKEW = timedelta(days=1)
 STEAM_NEWS_HOST_SUFFIXES = (
     "steampowered.com",
@@ -1545,11 +1546,28 @@ async def _fetch_steam_patches(client: httpx.AsyncClient) -> tuple[list[dict[str
         params={
             "appid": DEADLOCK_APP_ID,
             "count": 20,
-            "maxlength": 30000,
+            "maxlength": 0,
             "format": "json",
         },
     )
     response.raise_for_status()
+    content_length = (
+        response.headers.get("Content-Length")
+        if hasattr(response, "headers")
+        else None
+    )
+    if (
+        content_length
+        and content_length.isdigit()
+        and int(content_length) > STEAM_NEWS_RESPONSE_MAX_BYTES
+    ):
+        raise ValueError("Steam News response exceeded the byte limit.")
+    response_content = getattr(response, "content", b"")
+    if (
+        isinstance(response_content, (bytes, bytearray))
+        and len(response_content) > STEAM_NEWS_RESPONSE_MAX_BYTES
+    ):
+        raise ValueError("Steam News response exceeded the byte limit.")
     items = response.json().get("appnews", {}).get("newsitems", [])
     patches_by_id: dict[str, dict[str, Any]] = {}
     details: dict[str, dict[str, Any]] = {}
