@@ -85,6 +85,7 @@ class PatchSectionResponse(BaseModel):
     hero_display_name: str | None = Field(default=None, max_length=120)
     hero_image_url: str | None = Field(default=None, max_length=1000)
     hero_presentation_kind: Literal["balance", "introduction"] | None = None
+    mode_name: str | None = Field(default=None, max_length=80)
     hero_description: str | None = Field(default=None, max_length=8000)
     hero_metadata_pending: bool = False
     item_name: str | None = Field(default=None, max_length=120)
@@ -112,6 +113,9 @@ class PatchSectionResponse(BaseModel):
             ):
                 raise ValueError("Hero patch sections cannot include item or objective metadata.")
             return self
+
+        if self.mode_name is not None:
+            raise ValueError("Only hero patch sections can include a mode name.")
 
         if self.kind == "item":
             if self.item_name is None or self.item_category is None:

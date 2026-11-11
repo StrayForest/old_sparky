@@ -89,6 +89,11 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
       const sectionCard = sections.nth(sectionIndex);
       await expect(sectionCard.getByRole("heading", { level: 2 })).toHaveText(sectionHeading(section));
       await expect(sectionCard.locator(".patch-hero-display-name")).toHaveCount(0);
+      if (section.mode_name) {
+        await expect(sectionCard.locator(".patch-mode-context")).toHaveText(section.mode_name);
+      } else {
+        await expect(sectionCard.locator(".patch-mode-context")).toHaveCount(0);
+      }
       if (section.kind === "hero" && section.hero_presentation_kind !== "introduction") {
         await expect(sectionCard.locator(".patch-hero-description")).toHaveCount(0);
       }
@@ -126,6 +131,46 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
       }
     }
 
+    if (patchId === nursePatchId) {
+      const modeSections = fixture!.sections.filter((section) => section.mode_name === "Street Brawl");
+      expect(modeSections.map((section) => section.hero_name)).toEqual([
+        "Deadman Danny",
+        "Nurse Harrow",
+        "Paige",
+        "Rat King",
+        "Violet",
+      ]);
+      const modeRows = modeSections.flatMap((section) => [
+        ...section.changes,
+        ...section.abilities.flatMap((ability) => ability.changes),
+      ]);
+      expect(modeRows).toHaveLength(13);
+      expect(new Set(modeRows).size).toBe(13);
+      expect(modeRows.filter((change) => change.includes("Street Brawl:"))).toHaveLength(0);
+      const yamato = fixture!.sections.find((section) => section.hero_name === "Yamato");
+      expect(yamato?.mode_name).toBeFalsy();
+      expect(yamato?.abilities.flatMap((ability) => ability.changes)
+        .some((change) => change.includes("Street Brawl:"))).toBe(false);
+      expect(fixture!.sections.some((section) => section.changes.includes("Street Brawl:"))).toBe(false);
+
+      const solomonIndex = fixture!.sections.findIndex((section) => section.hero_name === "Solomon");
+      expect(solomonIndex).toBeGreaterThanOrEqual(0);
+      const solomon = fixture!.sections[solomonIndex];
+      const movePieceIndex = solomon.abilities.findIndex((ability) => ability.name === "Move Piece");
+      expect(movePieceIndex).toBeGreaterThanOrEqual(0);
+      const movePiece = solomon.abilities[movePieceIndex];
+      expect(movePiece).toBeDefined();
+      expect(movePiece?.icon_url).toBe(
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/chess/chessmaster_movepiece.png",
+      );
+      expect(movePiece?.changes).toHaveLength(2);
+      const movePieceCard = sections.nth(solomonIndex).locator(".patch-ability").nth(movePieceIndex);
+      await movePieceCard.locator(".patch-ability-icon").scrollIntoViewIfNeeded();
+      await expect.poll(() => movePieceCard.locator(".patch-ability-icon").evaluate((image) => (
+        (image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth > 0
+      ))).toBe(true);
+    }
+
     const celesteIndex = fixture!.sections.findIndex((section) => (
       section.kind === "hero"
       && `${section.hero_name ?? ""} ${section.title}`.toLowerCase().includes("celeste")
@@ -148,6 +193,7 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
 
     const nurseIndex = fixture!.sections.findIndex((section) => (
       section.kind === "hero"
+      && !section.mode_name
       && `${section.hero_name ?? ""} ${section.title}`.toLowerCase().includes("nurse")
     ));
     if (nurseIndex >= 0) {
@@ -165,12 +211,17 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
           (image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth > 0
         ))).toBe(true);
         expect(nurse.abilities.every((ability) => ability.presentation_kind === "balance")).toBe(true);
-        expect(nurse.abilities.map((ability) => ability.changes.length)).toEqual([4, 1, 3, 5]);
+        expect(nurse.abilities.map((ability) => ability.changes.length)).toEqual([3, 1, 3, 3]);
         expect(nurse.abilities.every((ability) => !ability.description && !(ability.stats?.length))).toBe(true);
         expect(abilityNames).toEqual(expect.arrayContaining([
           expect.stringMatching(/Wretched Vapors|Гнусные пары/i),
           expect.stringMatching(/Healing Needles|Лечебные иглы/i),
         ]));
+        const modeNurse = fixture!.sections.find((section) => (
+          section.hero_name === "Nurse Harrow" && section.mode_name === "Street Brawl"
+        ));
+        expect(modeNurse?.abilities.map((ability) => [ability.name, ability.changes.length]))
+          .toEqual([["Leech Therapy", 1], ["Lurking Terrors", 2]]);
         await nurseCard.locator(".patch-ability-icon").first().scrollIntoViewIfNeeded();
         await expect.poll(() => nurseCard.locator(".patch-ability-icon").first().evaluate((image) => (
           (image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth > 0

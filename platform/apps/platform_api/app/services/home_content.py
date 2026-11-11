@@ -37,7 +37,7 @@ DEADLOCK_ASSET_BASE_URL = "https://deadlock.io"
 HOME_CONTENT_KEY = "platform:home-content:v4"
 HOME_CONTENT_STALE_KEY = "platform:home-content:stale:v4"
 HOME_CONTENT_LOCK_KEY = "platform:home-content:refresh-lock:v4"
-PATCH_DETAIL_KEY_PREFIX = "platform:home-content:patch:v13:"
+PATCH_DETAIL_KEY_PREFIX = "platform:home-content:patch:v14:"
 PATCH_ASSET_CATALOG_KEY = "platform:home-content:patch-assets:v7"
 PATCH_ASSET_CATALOG_STALE_KEY = "platform:home-content:patch-assets-stale:v1"
 PATCH_ASSET_PENDING_RETRY_KEY = "platform:home-content:patch-assets-pending-retry:v1"
@@ -111,6 +111,7 @@ PATCH_SCOPE_HEADINGS = {
     "items": "items",
     "heroes": "heroes",
 }
+PATCH_MODE_HEADINGS = {"street brawl": "Street Brawl"}
 logger = logging.getLogger(__name__)
 STEAM_CLAN_IMAGE_RE = re.compile(
     r"\{STEAM_CLAN(?:_LOC)?_IMAGE\}/(?P<clan_id>\d+)/(?P<asset>[a-fA-F0-9]{32,64}\.(?:avif|gif|jpe?g|png|webp))",
@@ -387,6 +388,17 @@ def _patch_scope_heading(line: str) -> str | None:
     return PATCH_SCOPE_HEADINGS.get(label)
 
 
+def _patch_mode_heading(line: str) -> str | None:
+    normalized = " ".join(line.split()).casefold()
+    if len(normalized) >= 2 and normalized[0] == "[" and normalized[-1] == "]":
+        label = normalized[1:-1].strip()
+    elif normalized.endswith(":"):
+        label = normalized[:-1].strip()
+    else:
+        label = normalized
+    return PATCH_MODE_HEADINGS.get(label)
+
+
 def _has_whole_token_anchor(line: str, alias: str) -> bool:
     return re.search(
         rf"(?<![a-z0-9_]){re.escape(alias)}(?![a-z0-9_])",
@@ -559,6 +571,11 @@ def _build_asset_catalog(
         and hero.get("disabled") is False
         and str(hero.get("development_state") or "").casefold() == "release"
     }
+    supplemental_hero_class_names = [
+        str(hero.get("class_name") or "").strip().casefold()
+        for hero in supplemental_heroes.values()
+        if str(hero.get("class_name") or "").strip()
+    ]
     supplemental_items = {
         str(item.get("class_name") or "").strip().casefold(): item
         for item in supplemental_item_payload or []
@@ -640,13 +657,23 @@ def _build_asset_catalog(
                 existing["russian_metadata_available"] = bool(localized_name and russian_lore)
             _merge_hero_abilities(
                 existing,
-                _supplemental_hero_abilities(hero, supplemental_items, localized_items),
+                _supplemental_hero_abilities(
+                    hero,
+                    supplemental_items,
+                    localized_items,
+                    supplemental_hero_class_names=supplemental_hero_class_names,
+                ),
             )
             continue
         hero_id = hero.get("id")
         if not class_name or not isinstance(hero_id, int) or hero_id <= 0:
             continue
-        abilities = _supplemental_hero_abilities(hero, supplemental_items, localized_items)
+        abilities = _supplemental_hero_abilities(
+            hero,
+            supplemental_items,
+            localized_items,
+            supplemental_hero_class_names=supplemental_hero_class_names,
+        )
         images = hero.get("images") if isinstance(hero.get("images"), dict) else {}
         icon_url = None
         for image_key in ("icon_hero_card_webp", "icon_hero_card", "icon_image_small_webp", "icon_image_small"):
@@ -812,8 +839,15 @@ def _supplemental_hero_abilities(
     hero: dict[str, Any],
     supplemental_items: dict[str, dict[str, Any]],
     localized_items: dict[str, dict[str, Any]],
+    *,
+    supplemental_hero_class_names: list[str] | None = None,
 ) -> dict[str, Any]:
     slot_items = hero.get("items") if isinstance(hero.get("items"), dict) else {}
+    referenced_classes = {
+        str(class_name).strip().casefold()
+        for class_name in slot_items.values()
+        if isinstance(class_name, str) and class_name.strip()
+    }
     abilities: dict[str, Any] = {}
     for slot in ("signature1", "signature2", "signature3", "signature4"):
         ability_class = str(slot_items.get(slot) or "").strip().casefold()
@@ -877,6 +911,60 @@ def _supplemental_hero_abilities(
             "stats_pending": stats_pending,
             "icon_url": icon_url,
         }
+    # Patchable auxiliary abilities can be exported as weapon assets rather
+    # than signature slots. Join only an exact hero-class prefix with a unique
+    # owner; shared/base assets and explicit hero slots are not auxiliary rows.
+    hero_class_name = str(hero.get("class_name") or "").strip().casefold()
+    hero_class_match = re.fullmatch(r"hero_([a-z0-9]+(?:_[a-z0-9]+)*)", hero_class_name)
+    owner_classes = supplemental_hero_class_names or [hero_class_name]
+    auxiliary_candidates: dict[str, list[dict[str, Any]]] = {}
+    if hero_class_match is not None:
+        for ability_class, ability in supplemental_items.items():
+            if (
+                not ability_class.startswith("ability_")
+                or str(ability.get("type") or "").casefold() != "weapon"
+            ):
+                continue
+            explicitly_referenced = ability_class in referenced_classes
+            candidate_owners = []
+            for owner_class in owner_classes:
+                owner_match = re.fullmatch(
+                    r"hero_([a-z0-9]+(?:_[a-z0-9]+)*)",
+                    str(owner_class).strip().casefold(),
+                )
+                if owner_match is not None and ability_class.startswith(
+                    f"ability_{owner_match.group(1)}_"
+                ):
+                    candidate_owners.append(str(owner_class).strip().casefold())
+            if not explicitly_referenced and candidate_owners != [hero_class_name]:
+                continue
+            catalog_name = str(ability.get("name") or "").strip()
+            if not catalog_name:
+                continue
+            ability_alias = catalog_name.casefold()
+            if ability_alias in abilities:
+                continue
+            try:
+                icon_url = _https_url(
+                    ability.get("image"),
+                    host_suffixes=DEADLOCK_API_ASSET_HOST_SUFFIXES,
+                )
+            except ValueError:
+                continue
+            if icon_url is None:
+                continue
+            auxiliary_candidates.setdefault(ability_alias, []).append(
+                {
+                    "id": ability.get("id"),
+                    "slug": ability_class,
+                    "name": catalog_name,
+                    "icon_url": icon_url,
+                    "patch_only": True,
+                }
+            )
+    for ability_alias, candidates in auxiliary_candidates.items():
+        if len(candidates) == 1 and ability_alias not in abilities:
+            abilities[ability_alias] = candidates[0]
     return abilities
 
 
@@ -1067,6 +1155,7 @@ def _merge_hero_abilities(target: dict[str, Any], abilities: Any) -> None:
             "icon_url",
             "stats",
             "stats_pending",
+            "patch_only",
         ):
             if ability.get(field) not in (None, ""):
                 merged[field] = ability[field]

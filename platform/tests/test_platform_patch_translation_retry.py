@@ -553,9 +553,21 @@ class PatchTranslationRetryTests(PlatformIsolatedAsyncioTestCase):
     ) -> None:
         source_text = "Next Tuesday, October 20th at 2pm PDT."
         protected_text, fact_map = translation.protect_facts(source_text)
+        comparison_source = (
+            "Resistance reductions are now only 50% as effective against the Mid-Boss."
+        )
+        comparison_prepared, comparison_fact_map = translation.protect_facts(
+            comparison_source
+        )
+        comparison_token = next(
+            token
+            for token, value in comparison_fact_map.items()
+            if value == "50%"
+        )
         source_segments = [
             {"id": "s000-c000", "text": "Violet is available in-game now."},
             {"id": "s000-c001", "text": source_text},
+            {"id": "s000-c002", "text": comparison_source},
         ]
         prepared_segments = [
             {
@@ -563,6 +575,7 @@ class PatchTranslationRetryTests(PlatformIsolatedAsyncioTestCase):
                 "text": "Violet is available in-game now.",
             },
             {"id": "s000-c001", "text": protected_text},
+            {"id": "s000-c002", "text": comparison_prepared},
         ]
         initial = (
             "Следующий вторник, [[FACT_0000]] октября в [[FACT_0001]] "
@@ -572,15 +585,30 @@ class PatchTranslationRetryTests(PlatformIsolatedAsyncioTestCase):
             "Следующий вторник, [[FACT_0000]] октября в [[FACT_0001]] "
             "по тихоокеанскому времени."
         )
+        reversed_comparison = (
+            "Снижение сопротивляемости теперь действует против Mid-Boss "
+            f"на {comparison_token} эффективнее."
+        )
+        corrected_comparison = (
+            "Снижение сопротивляемости теперь действует против Mid-Boss "
+            f"только на {comparison_token} от прежней эффективности."
+        )
         initial_result = runtime._OpenAITranslationBatch(
             {
                 "s000-c000": "Виолетта уже доступна в игре.",
                 "s000-c001": initial,
+                "s000-c002": reversed_comparison,
             },
-            returned_ids=["s000-c000", "s000-c001"],
+            returned_ids=["s000-c000", "s000-c001", "s000-c002"],
             invalid_placeholder_ids=[],
         )
-        request = AsyncMock(side_effect=[initial_result, {"s000-c001": corrected}])
+        request = AsyncMock(side_effect=[
+            initial_result,
+            {
+                "s000-c001": corrected,
+                "s000-c002": corrected_comparison,
+            },
+        ])
         budget = runtime._TranslationProviderCallBudget()
 
         with patch.object(runtime, "_request_openai", request):
@@ -591,7 +619,10 @@ class PatchTranslationRetryTests(PlatformIsolatedAsyncioTestCase):
                 glossary={},
                 settings=PlatformSettings(),
                 entity_replacements={},
-                fact_replacements={"s000-c001": fact_map},
+                fact_replacements={
+                    "s000-c001": fact_map,
+                    "s000-c002": comparison_fact_map,
+                },
                 call_budget=budget,
             )
 
@@ -600,11 +631,11 @@ class PatchTranslationRetryTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(budget.follow_up_kind, "fact_correction")
         self.assertEqual(
             request.await_args_list[1].kwargs["fact_correction_ids"],
-            ["s000-c001"],
+            ["s000-c001", "s000-c002"],
         )
         self.assertEqual(
             [segment["id"] for segment in request.await_args_list[1].kwargs["segments"]],
-            ["s000-c001"],
+            ["s000-c001", "s000-c002"],
         )
         self.assertEqual(
             translated["s000-c000"], "Виолетта уже доступна в игре."
@@ -612,6 +643,12 @@ class PatchTranslationRetryTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(
             translation._fact_fingerprint(source_text),
             translation._fact_fingerprint(translated["s000-c001"]),
+        )
+        self.assertTrue(
+            translation._preserves_effectiveness_comparison(
+                comparison_source,
+                translated["s000-c002"],
+            )
         )
 
     async def test_repeated_fact_mismatch_fails_after_one_correction(self) -> None:

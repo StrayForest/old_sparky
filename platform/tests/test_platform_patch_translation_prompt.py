@@ -30,6 +30,7 @@ class PatchTranslationPromptInputTests(unittest.TestCase):
                 "kind": "hero",
                 "title": "Haze",
                 "hero_name": "Haze",
+                "mode_name": "Street Brawl",
                 "changes": ["Base health increased from 500 to 525."],
                 "abilities": [{
                     "name": "Sleep Dagger",
@@ -46,6 +47,7 @@ class PatchTranslationPromptInputTests(unittest.TestCase):
                 "section_kind": "hero",
                 "section_title": "Haze",
                 "hero_name": "Haze",
+                "mode_name": "Street Brawl",
             },
         )
         self.assertEqual(
@@ -54,6 +56,7 @@ class PatchTranslationPromptInputTests(unittest.TestCase):
                 "section_kind": "hero",
                 "section_title": "Haze",
                 "hero_name": "Haze",
+                "mode_name": "Street Brawl",
                 "ability_name": "Sleep Dagger",
             },
         )
@@ -98,9 +101,9 @@ class PatchTranslationPromptInputTests(unittest.TestCase):
         )
 
     def test_prompt_cache_key_is_stable_per_translation_version(self) -> None:
-        self.assertEqual(runtime._PROMPT_CACHE_KEY, "oldsparky-patch-ru-ru-v13")
+        self.assertEqual(runtime._PROMPT_CACHE_KEY, "oldsparky-patch-ru-ru-v14")
 
-    def test_ru_v10_prompt_locks_collision_and_scaling_regressions(self) -> None:
+    def test_prompt_locks_comparison_and_unit_regressions(self) -> None:
         source = inspect.getsource(runtime._request_openai)
 
         self.assertIn("коэффициент масштабирования от спиритической", source)
@@ -108,6 +111,8 @@ class PatchTranslationPromptInputTests(unittest.TestCase):
         self.assertIn("Move speed bonus reduced from +3.5m to +2m", source)
         self.assertIn("MUST be rendered as m/s", source)
         self.assertIn("Distance, range and radius values remain m", source)
+        self.assertIn("only N% as effective", source)
+        self.assertIn("Percentage values, including speed bonuses, are dimensionless", source)
 
 
 if __name__ == "__main__":

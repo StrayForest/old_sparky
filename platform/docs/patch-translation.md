@@ -6,7 +6,7 @@
 
 This document owns the contract for automatic Russian translation of Deadlock patch-note changes.
 
-## Current implementation — 2026-11-11
+## Source implementation — 2026-11-11
 
 Translation state is durable in the PostgreSQL `platform.patch_translations`
 table. A record is identified by the patch ID, the hash of the extracted
@@ -25,12 +25,14 @@ one delayed automatic retry after 15 minutes when its error is a known network
 or timeout failure and its attempt count is below the fixed retry limit. Other
 failures remain durable and do not incur repeated model calls.
 
-The deployed translation version is `ru-v13`, defined in
+The translation version configured in this source tree is `ru-v14`, defined in
 `apps/platform_api/app/services/patch_translation_config.py`. It includes the
 durable DB-first state, the reviewed ambiguity handling and the immutable
-numeric/tier validation described below. It gathers placeholder and numeric
-fact mismatches across the initial batches before using the single shared
-follow-up request. The four-patch regression procedure
+numeric/tier validation described below. It gathers typed ENTITY/FACT
+placeholder failures, numeric-fact mismatches and the reviewed effectiveness
+comparison failure across the initial batches before using the single shared
+follow-up request. That request contains only the affected stable segment IDs.
+The four-patch regression procedure
 and its historical evidence live in
 [`archive/patch-translation-qa-2026-08-22.md`](archive/patch-translation-qa-2026-08-22.md).
 
@@ -81,8 +83,12 @@ source groups into a single change, leave a group heading in change text, drop
 an unmatched line, or route an entity change into General. Structural titles
 and entity labels use canonical English names; localized display labels may
 appear only as separate subtitles when the UI explicitly requests them.
-Translated-text counts and section totals alone do not establish that this
-contract holds.
+Mode-specific hero changes are separate hero sections carrying their source
+mode label in `mode_name`; the mode heading must not become a change under the
+preceding hero ability or General. A catalog-backed auxiliary ability can be
+attached to its owning hero even when it is not one of that hero's four
+signature slots. Translated-text counts and section totals alone do not
+establish that this contract holds.
 
 The current hero, ability and shop-item catalog combines the community Deadlock API's per-patch game-data endpoints (`/v1/assets/heroes` and `/v1/assets/items`) with the legacy deadlock.io index when it returns valid JSON. The community endpoints expose the latest known client build and accept a `language=russian` parameter. Old Sparky joins English and Russian payloads by stable hero ID, ability class name and shop item name. Shop entries are projected from released `type=upgrade` records with a recognized `item_slot_type` and validated image URL. If either legacy endpoint is unavailable, redirected or non-JSON, valid community hero and item data supplies the catalog; if all sources fail, the last-good catalog is retained. These are community-parsed game files, not a Valve-operated API; Steam's announcement feed remains the source for patch prose. The API selects Russian values when present and English values otherwise, strips HTML and inline game tokens from descriptions, and constructs image URLs only from validated relative `/assets/` paths or the fixed Deadlock API asset CDN host. Public hero image projections prefer that validated CDN image, then a bundled static image that exists, then the placeholder; the obsolete deadlock.io card URLs are never treated as healthy merely because they return an HTTP response. Catalog HTML is never rendered.
 
@@ -162,6 +168,9 @@ The immutable checks are:
 - ability upgrade tiers such as `T1`, `T2`, `T3`, etc.;
 - protected entity placeholders;
 - segment IDs/order and structured output shape.
+- the source-specific meaning of `only N% as effective`, which denotes a
+  fraction of baseline effectiveness rather than an increase or decrease by N
+  percent.
 
 Operators, arrows, English sentence order and other prose formatting are not treated as immutable facts.
 
@@ -178,6 +187,14 @@ After placeholders are restored, deterministic formatting aligns common numeric 
 - milliseconds use `мс`.
 
 Numeric comparison canonicalizes `.` and `,` so this localization does not cause a false fact mismatch.
+
+Percent FACTs are dimensionless, including movement-speed percentages. During
+placeholder restoration only, an immediately adjacent duplicate `%` or `m/s` /
+`м/с` attached to a source FACT that itself ends in `%` is removed. This is
+source-bound cleanup; it does not globally rewrite repeated percent signs or
+alter absolute speed facts. The comparison check above is likewise limited to
+the explicit source construction `only N% as effective`; it is not a general
+Russian prose classifier.
 
 For source shorthand where an `m` value semantically represents movement/sprint/dash speed, the model should use Valve-style `м/с`; distance/range/radius values remain `м`. This distinction is semantic and belongs in the translation instruction rather than a literal code-side keyword filter.
 
@@ -233,15 +250,15 @@ Validation failures are not retried in a loop.
 ## Parser and catalog cache changes
 
 When patch parsing, source normalization or the game-asset catalog changes extracted segments, bump the detail
-cache namespace so new reads cannot reuse stale structure. Detail entries before v13 were parsed before the current
-Steam list-closer and separator normalization. A v13 cache miss ignores older detail namespaces without reading,
-reparsing, promoting or deleting their entries. It uses the bounded negative/global refresh gates to fetch the
-current full Steam feed with `maxlength=0`, publishes current details under v13, and registers translations keyed
-by the newly extracted source hashes. The full HTTP response remains subject to the 8 MiB byte cap, and each
-normalized article remains capped at 30,000 characters. A cold catalog may defer one bounded refresh through that
-same full-feed path; it must not fan out a full-history reprocess. Existing translation rows are not automatically
-valid for changed segments. Hero display metadata follows the current catalog refresh, while English source content
-and canonical patch labels remain intact.
+cache namespace so new reads cannot reuse stale structure. The detail namespace configured in this source tree is
+v14. A v14 cache miss
+ignores older detail namespaces without reading, reparsing, promoting or deleting their entries. It uses the bounded
+negative/global refresh gates to fetch the current full Steam feed with `maxlength=0`, publishes current details
+under v14, and registers translations keyed by the newly extracted source hashes. The full HTTP response remains
+subject to the 8 MiB byte cap, and each normalized article remains capped at 30,000 characters. A cold catalog may
+defer one bounded refresh through that same full-feed path; it must not fan out a full-history reprocess. Existing
+translation rows are not automatically valid for changed segments. Hero display metadata follows the current catalog
+refresh, while English source content and canonical patch labels remain intact.
 
 A translation-version bump intentionally invalidates previous translation result cache entries when the translation contract or canonical glossary changes.
 

@@ -43,6 +43,7 @@ from apps.platform_api.app.services.patch_translation_terms import (
     localize_russian_notation,
     protect_entities,
     protect_facts,
+    preserves_effectiveness_comparison,
     restore_placeholders,
     validate_prepared_translation,
 )
@@ -261,6 +262,7 @@ def _segment_contexts(patch: dict[str, Any]) -> dict[str, dict[str, str]]:
                 ("section_title", section.get("title")),
                 ("hero_name", section.get("hero_name")),
                 ("item_name", section.get("item_name")),
+                ("mode_name", section.get("mode_name")),
             )
             if (value := str(raw_value or "").strip())
         }
@@ -919,7 +921,9 @@ async def _request_openai(
             "clause, including long prose segments and headings embedded inside a segment. A long "
             "segment must remain complete even when concise Russian wording is possible. FACT "
             "placeholders contain immutable numeric values or T1/T2/T3-style tiers and must stay "
-            "byte-for-byte unchanged.\n\n"
+            "byte-for-byte unchanged. COMPARISON MEANING: 'only N% as effective' means only N% "
+            "of baseline effectiveness, not N% more effective. Preserve that fractional meaning; "
+            "in Russian, wording such as 'только на N% от прежней эффективности' is appropriate.\n\n"
             "GLOSSARY POLICY: the attached glossary is the complete authoritative English concept "
             "to official Russian localization map for this task. Apply it semantically, not by "
             "exact string matching. Canonical English keys are concept anchors: spelling, case, "
@@ -945,6 +949,9 @@ async def _request_openai(
             "remain resistance terminology.\n\n"
             "STYLE: match concise Valve Russian Steam patch-note language. Prefer natural phrases "
             "such as 'время перезарядки' when describing a cooldown value. Units are not protected. "
+            "Percentage values, including speed bonuses, are dimensionless; never append m/s or "
+            "another unit to a FACT value ending in %. The bare source m rule below applies only "
+            "when the source actually carries m, not to a percentage. "
             "A bare source m attached to Move Speed, Movement Speed, Sprint Speed or Dash Speed is "
             "a speed unit and MUST be rendered as m/s before Russian unit localization. For example, "
             "'Move speed bonus reduced from +3.5m to +2m' must use '+3.5m/s' and '+2m/s' in the "
@@ -989,7 +996,10 @@ async def _request_openai(
             "byte-for-byte unchanged and in the same order. Preserve every ENTITY "
             "and FACT placeholder byte-for-byte, including its exact token number; "
             "do not translate, renumber, omit or duplicate any placeholder, and do "
-            "not add numeric facts outside FACT placeholders. Return the complete "
+            "not add numeric facts outside FACT placeholders. Preserve comparison "
+            "direction: 'only N% as effective' means N% of baseline effectiveness, "
+            "never N% more effective. Keep percentage FACTs dimensionless; do not "
+            "append m/s to them. Return the complete "
             "requested segment set. This is the only correction attempt."
         )
     timeout = httpx.Timeout(max(60.0, settings.platform_openai_timeout_seconds))
@@ -1268,7 +1278,13 @@ async def _request_openai_batches(
             restored = restore_placeholders(restored, fact_replacements.get(segment_id, {}))
             restored = localize_russian_notation(restored)
             restored_by_id[segment_id] = restored
-            if fact_fingerprint(source_by_id[segment_id]) != fact_fingerprint(restored):
+            if (
+                fact_fingerprint(source_by_id[segment_id]) != fact_fingerprint(restored)
+                or not preserves_effectiveness_comparison(
+                    source_by_id[segment_id],
+                    restored,
+                )
+            ):
                 invalid_fact_ids.append(segment_id)
         return restored_by_id, invalid_fact_ids
 
@@ -1300,7 +1316,8 @@ async def _request_openai_batches(
     translated, remaining_fact_ids = restore_all(initial_translations)
     if remaining_fact_ids:
         raise ValueError(
-            "Translation changed a numeric value or ability tier after the bounded correction."
+            "Translation changed a numeric value, ability tier or effectiveness comparison "
+            "after the bounded correction."
         )
     call_budget.ensure_time_remaining()
     return translated

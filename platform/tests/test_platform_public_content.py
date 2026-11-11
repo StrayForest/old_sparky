@@ -2119,6 +2119,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
             {"kind": "objective", "title": "Urn"},
             {"kind": "general", "title": "General", "objective_key": "urn"},
             {"kind": "general", "title": "General", "hero_description": "Hero text"},
+            {"kind": "general", "title": "General", "mode_name": "Street Brawl"},
             {"kind": "item", "title": "Item", "item_name": "Item"},
             {
                 "kind": "hero",
@@ -2136,6 +2137,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
                 "kind": "hero",
                 "title": "Celeste",
                 "hero_name": "Celeste",
+                "mode_name": "Street Brawl",
                 "hero_display_name": "Селеста",
                 "hero_image_url": "https://deadlock.io/assets/celeste.png",
                 "hero_description": "История героя",
@@ -2149,6 +2151,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
                 ],
             }
         )
+        self.assertEqual(hero.mode_name, "Street Brawl")
         self.assertEqual(hero.hero_display_name, "Селеста")
         self.assertEqual(hero.abilities[0].display_name, "Пожиратель света")
 
@@ -2236,7 +2239,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
     def test_public_content_cache_versions_keep_home_contract_stable(self) -> None:
         self.assertEqual(home_content.HOME_CONTENT_KEY, "platform:home-content:v4")
         self.assertEqual(home_content.HOME_CONTENT_STALE_KEY, "platform:home-content:stale:v4")
-        self.assertEqual(home_content.PATCH_DETAIL_KEY_PREFIX, "platform:home-content:patch:v13:")
+        self.assertEqual(home_content.PATCH_DETAIL_KEY_PREFIX, "platform:home-content:patch:v14:")
         self.assertEqual(
             home_content.PATCH_ASSET_CATALOG_KEY,
             "platform:home-content:patch-assets:v7",
@@ -2245,6 +2248,174 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
             home_content.PATCH_ASSET_CATALOG_STALE_KEY,
             "platform:home-content:patch-assets-stale:v1",
         )
+
+    def test_supplemental_patch_ability_uses_catalogued_solomon_move_piece_icon(self) -> None:
+        hero = {
+            "name": "Solomon",
+            "class_name": "hero_chessmaster",
+            "items": {},
+        }
+        image = (
+            "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/"
+            "chess/chessmaster_movepiece.png"
+        )
+
+        abilities = home_content._supplemental_hero_abilities(
+            hero,
+            {
+                "ability_chessmaster_movechesspiece": {
+                    "id": 3284310919,
+                    "class_name": "ability_chessmaster_movechesspiece",
+                    "type": "weapon",
+                    "name": "Move Piece",
+                    "image": image,
+                },
+                "ability_chessmaster_knightbuff_trigger": {
+                    "class_name": "ability_chessmaster_knightbuff_trigger",
+                    "type": "weapon",
+                    "name": "Move King",
+                    "image": image,
+                },
+                "ability_melee_chessmaster": {
+                    "class_name": "ability_melee_chessmaster",
+                    "type": "weapon",
+                    "name": "Melee",
+                    "image": image,
+                },
+                "citadel_weapon_chessmaster_shotgun": {
+                    "class_name": "citadel_weapon_chessmaster_shotgun",
+                    "type": "weapon",
+                    "name": "Alekhine's Gun",
+                    "image": image,
+                },
+            },
+            {},
+            supplemental_hero_class_names=["hero_chessmaster"],
+        )
+
+        self.assertEqual(abilities["move piece"]["name"], "Move Piece")
+        self.assertEqual(abilities["move piece"]["slug"], "ability_chessmaster_movechesspiece")
+        self.assertEqual(abilities["move piece"]["icon_url"], image)
+        self.assertNotIn("description", abilities["move piece"])
+        self.assertNotIn("stats", abilities["move piece"])
+        self.assertTrue(abilities["move piece"]["patch_only"])
+        self.assertEqual(abilities["move king"]["name"], "Move King")
+        self.assertNotIn("melee", abilities)
+        self.assertNotIn("alekhine's gun", abilities)
+
+        explicit_ability_image = (
+            "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/"
+            "chess/chessmaster_bishop.png"
+        )
+        duplicate_name = home_content._supplemental_hero_abilities(
+            {
+                **hero,
+                "items": {"signature1": "ability_chessmaster_throwbishop"},
+            },
+            {
+                "ability_chessmaster_throwbishop": {
+                    "type": "ability",
+                    "name": "Setup Bishop",
+                    "image": explicit_ability_image,
+                },
+                "ability_chessmaster_setupbishop_aux": {
+                    "type": "weapon",
+                    "name": "Setup Bishop",
+                    "image": image,
+                },
+            },
+            {},
+            supplemental_hero_class_names=["hero_chessmaster"],
+        )
+        self.assertEqual(duplicate_name["setup bishop"]["icon_url"], explicit_ability_image)
+        self.assertFalse(duplicate_name["setup bishop"].get("patch_only", False))
+
+        duplicate_auxiliary_name = home_content._supplemental_hero_abilities(
+            hero,
+            {
+                "ability_chessmaster_aux_one": {
+                    "type": "weapon",
+                    "name": "Auxiliary Move",
+                    "image": image,
+                },
+                "ability_chessmaster_aux_two": {
+                    "type": "weapon",
+                    "name": "Auxiliary Move",
+                    "image": image,
+                },
+            },
+            {},
+            supplemental_hero_class_names=["hero_chessmaster"],
+        )
+        self.assertNotIn("auxiliary move", duplicate_auxiliary_name)
+
+        duplicate_owner = home_content._supplemental_hero_abilities(
+            hero,
+            {
+                "ability_chessmaster_movechesspiece": {
+                    "type": "weapon",
+                    "name": "Move Piece",
+                    "image": image,
+                },
+            },
+            {},
+            supplemental_hero_class_names=["hero_chessmaster", "hero_chessmaster"],
+        )
+        self.assertEqual(duplicate_owner, {})
+
+        colliding_hero = {
+            "name": "Test",
+            "class_name": "hero_test",
+            "items": {},
+        }
+        colliding_prefix = home_content._supplemental_hero_abilities(
+            colliding_hero,
+            {
+                "ability_test_extra_move": {
+                    "type": "weapon",
+                    "name": "Move Extra",
+                    "image": image,
+                },
+            },
+            {},
+            supplemental_hero_class_names=["hero_test", "hero_test_extra"],
+        )
+        self.assertEqual(colliding_prefix, {})
+
+        explicit_reference = home_content._supplemental_hero_abilities(
+            {
+                **colliding_hero,
+                "items": {"auxiliary": "ability_test_extra_move"},
+            },
+            {
+                "ability_test_extra_move": {
+                    "type": "weapon",
+                    "name": "Move Extra",
+                    "image": image,
+                },
+            },
+            {},
+            supplemental_hero_class_names=["hero_test", "hero_test_extra"],
+        )
+        self.assertEqual(explicit_reference["move extra"]["icon_url"], image)
+
+        invalid_icon = home_content._supplemental_hero_abilities(
+            hero,
+            {
+                "ability_chessmaster_movechesspiece": {
+                    "type": "weapon",
+                    "name": "Move Piece",
+                    "image": "https://example.com/fake.png",
+                },
+            },
+            {},
+            supplemental_hero_class_names=["hero_chessmaster"],
+        )
+        self.assertEqual(invalid_icon, {})
+        no_match = home_content._supplemental_hero_abilities(
+            hero, {}, {}, supplemental_hero_class_names=["hero_chessmaster"]
+        )
+        self.assertEqual(no_match, {})
 
     def test_supplemental_asset_catalog_adds_baba_once_with_its_four_abilities(self) -> None:
         baba_hero = {

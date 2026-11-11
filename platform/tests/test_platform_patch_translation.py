@@ -47,6 +47,67 @@ class PatchTranslationProtectionTests(unittest.TestCase):
             translation._fact_fingerprint("Damage scaling 0.73 -> 0.63"),
             translation._fact_fingerprint("Масштабирование 0,73 → 0,63"),
         )
+        source = "Resistance reductions are only 50% as effective against the Mid-Boss."
+        self.assertTrue(
+            translation._preserves_effectiveness_comparison(
+                source,
+                "Снижение сопротивляемости действует против Mid-Boss только на 50% от прежней эффективности.",
+            )
+        )
+        self.assertFalse(
+            translation._preserves_effectiveness_comparison(
+                source,
+                "Снижение сопротивляемости действует против Mid-Boss на 50% эффективнее.",
+            )
+        )
+        self.assertTrue(
+            translation._preserves_effectiveness_comparison(
+                "Damage increased by 50%.",
+                "Урон увеличен на 50%.",
+            )
+        )
+        quarter_source = "The effect is only 25% as effective against the Mid-Boss."
+        self.assertTrue(
+            translation._preserves_effectiveness_comparison(
+                quarter_source,
+                "Эффект действует против Mid-Boss только с эффективностью 25% от базовой.",
+            )
+        )
+        self.assertTrue(
+            translation._preserves_effectiveness_comparison(
+                quarter_source,
+                "Эффект действует против Mid-Boss эффективно лишь на 25%.",
+            )
+        )
+        self.assertTrue(
+            translation._preserves_effectiveness_comparison(
+                quarter_source,
+                "Эффект эффективен против Mid-Boss только на 25%.",
+            )
+        )
+        self.assertFalse(
+            translation._preserves_effectiveness_comparison(
+                quarter_source,
+                "Эффект действует против Mid-Boss на 25% лучше.",
+            )
+        )
+        self.assertFalse(
+            translation._preserves_effectiveness_comparison(
+                quarter_source,
+                "Эффект действует против Mid-Boss на 25% менее эффективно.",
+            )
+        )
+        for reversed_russian in (
+            "Эффект действует против Mid-Boss только на 25% менее эффективно.",
+            "Эффект действует против Mid-Boss только на 25% лучше.",
+        ):
+            with self.subTest(reversed_russian=reversed_russian):
+                self.assertFalse(
+                    translation._preserves_effectiveness_comparison(
+                        quarter_source,
+                        reversed_russian,
+                    )
+                )
 
     def test_russian_notation_matches_valve_style(self) -> None:
         self.assertEqual(
@@ -54,6 +115,58 @@ class PatchTranslationProtectionTests(unittest.TestCase):
                 "Range 28m, cooldown 12s, dash 2m/s, delay 250ms, scaling 0.75."
             ),
             "Range 28 м, cooldown 12 с, dash 2 м/с, delay 250 мс, scaling 0,75.",
+        )
+        for value in ("10%", "-32%", "50%"):
+            source = f'Quoted source value "{value}".'
+            protected, replacements = translation.protect_facts(source)
+            token = next(key for key, replacement in replacements.items() if replacement == value)
+            model_text = f'Перевод с источником "{token}%".'
+            restored = translation.restore_placeholders(model_text, replacements)
+            self.assertEqual(restored, f'Перевод с источником "{value}".')
+            self.assertNotIn(f"{value}%", restored)
+        quoted_source = (
+            'T3 changed from "Immune to damage while channeling" to '
+            '"Takes 50% Reduced Damage while channeling".'
+        )
+        quoted_prepared, quoted_facts = translation.protect_facts(quoted_source)
+        quoted_token = next(token for token, value in quoted_facts.items() if value == "50%")
+        quoted_translation = (
+            'T3 changed from "Неуязвим к урону во время поддержания" to '
+            f'"Получает на {quoted_token}% меньше урона во время поддержания".'
+        )
+        self.assertIn(quoted_token, quoted_prepared)
+        self.assertEqual(
+            translation.restore_placeholders(quoted_translation, quoted_facts),
+            'T3 changed from "Неуязвим к урону во время поддержания" to '
+            '"Получает на 50% меньше урона во время поддержания".',
+        )
+        literal = translation.restore_placeholders(
+            "Literal %% stays; value [[FACT_0000]]%.",
+            {"[[FACT_0000]]": "50%"},
+        )
+        self.assertEqual(literal, "Literal %% stays; value 50%.")
+
+        speed_source = (
+            "Move speed reduced from +70% to +50%; dash distance changed from 5m/s to 4m/s."
+        )
+        speed_prepared, speed_facts = translation.protect_facts(speed_source)
+        tokens_by_source = {value: token for token, value in speed_facts.items()}
+        self.assertEqual(
+            list(speed_facts.values()),
+            ["+70%", "+50%", "5", "4"],
+        )
+        self.assertNotIn("+70%", speed_prepared)
+        self.assertIn("m/s", speed_prepared)
+        model_text = (
+            f"Скорость передвижения снижена с {tokens_by_source['+70%']}% м/с "
+            f"до {tokens_by_source['+50%']}% м/с; дальность рывка изменена "
+            f"с {tokens_by_source['5']} м/с до {tokens_by_source['4']} м/с."
+        )
+        restored = translation.restore_placeholders(model_text, speed_facts)
+        self.assertEqual(
+            restored,
+            "Скорость передвижения снижена с +70% до +50%; дальность рывка "
+            "изменена с 5 м/с до 4 м/с.",
         )
 
 

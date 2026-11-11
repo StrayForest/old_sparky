@@ -17,6 +17,10 @@ FACT_TOKEN_RE = re.compile(
     re.IGNORECASE,
 )
 _DECIMAL_RE = re.compile(r"(?<![A-Za-z0-9])([+-]?\d+)\.(\d+)")
+_ONLY_PERCENT_AS_EFFECTIVE_RE = re.compile(
+    r"\bonly\s+(?P<value>\d+(?:[.,]\d+)?)%\s+as\s+effective\b",
+    re.IGNORECASE,
+)
 
 
 class ProtectedPlaceholderError(ValueError):
@@ -123,6 +127,17 @@ def protect_facts(text: str) -> tuple[str, dict[str, str]]:
 
 def restore_placeholders(text: str, replacements: dict[str, str]) -> str:
     for placeholder, source in replacements.items():
+        if placeholder.startswith("[[FACT_") and source.endswith("%"):
+            # Percent is already part of the immutable source token. A model may
+            # redundantly add the same sign or a speed unit after a percentage
+            # bonus; remove only those units adjacent to this FACT placeholder.
+            text = re.sub(
+                re.escape(placeholder) + r"%*\s*(?:m/s|м/с)\b",
+                placeholder,
+                text,
+                flags=re.IGNORECASE,
+            )
+            text = re.sub(re.escape(placeholder) + r"%+", placeholder, text)
         text = text.replace(placeholder, source)
     return text
 
@@ -135,6 +150,55 @@ def _canonical_fact(token: str) -> str:
 
 def fact_fingerprint(text: str) -> Counter[str]:
     return Counter(_canonical_fact(token) for token in FACT_TOKEN_RE.findall(text))
+
+
+def preserves_effectiveness_comparison(source: str, translated: str) -> bool:
+    """Require ``only N% as effective`` to remain a fraction of baseline effect."""
+
+    translated_text = translated.casefold()
+    for match in _ONLY_PERCENT_AS_EFFECTIVE_RE.finditer(source):
+        source_value = match.group("value")
+        number_pattern = re.escape(source_value).replace(r"\.", r"[.,]")
+        percent_pattern = rf"{number_pattern}\s*%"
+        comparative_direction = re.search(
+            rf"(?:{percent_pattern}.{{0,28}}\b(?:эффективнее|лучше|выше|больше|хуже|слабее|ниже|"
+            rf"более\s+эффективн\w*|менее\s+эффективн\w*|меньше\s+эффективн\w*)\b"
+            rf"|\b(?:эффективнее|лучше|выше|больше|хуже|слабее|ниже|"
+            rf"более\s+эффективн\w*|менее\s+эффективн\w*|меньше\s+эффективн\w*)\b"
+            rf".{{0,28}}{percent_pattern})",
+            translated_text,
+        )
+        if comparative_direction is not None:
+            return False
+
+        baseline_fraction = re.search(
+            rf"\b{percent_pattern}.{{0,48}}\bот\b.{{0,48}}"
+            r"\b(?:обычн|прежн|исходн|базов|нормальн|эффективност)",
+            translated_text,
+        )
+        only_effective_fraction = re.search(
+            rf"\b(?:только|лишь|всего)\b.{{0,32}}\b{percent_pattern}"
+            r".{0,24}\bэффектив\w*",
+            translated_text,
+        )
+        effective_only_fraction = re.search(
+            rf"\bэффектив\w*.{{0,32}}\b(?:только|лишь|всего)\b"
+            rf".{{0,24}}\b{percent_pattern}",
+            translated_text,
+        )
+        effectiveness_fraction = re.search(
+            rf"\bэффективност\w*.{{0,32}}\b(?:только|лишь|всего)\b"
+            rf".{{0,24}}\b{percent_pattern}",
+            translated_text,
+        )
+        if (
+            baseline_fraction is None
+            and only_effective_fraction is None
+            and effective_only_fraction is None
+            and effectiveness_fraction is None
+        ):
+            return False
+    return True
 
 
 def validate_prepared_translation(source: str, translated: str) -> None:

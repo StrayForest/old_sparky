@@ -75,6 +75,9 @@ export function PatchDetailPage({ patchId }: { patchId: string }) {
                     )}
                     <div>
                       {section.kind === "general" ? <span>{t("patch.generalChanges")}</span> : null}
+                      {section.kind === "hero" && section.mode_name ? (
+                        <p className="patch-mode-context">{section.mode_name}</p>
+                      ) : null}
                       <h2>{section.objective_key === "urn"
                         ? t("patch.objective.urn")
                         : section.objective_key === "unstable_rift"

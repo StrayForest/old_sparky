@@ -1908,6 +1908,10 @@ a.tournament-card:focus-visible {
   border-color: var(--ui-border);
 }
 
+.patch-mode-context {
+  color: var(--ui-text-muted);
+}
+
 .patch-section-header > div > span {
   color: var(--ui-primary-bright);
 }

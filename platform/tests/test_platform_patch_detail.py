@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from apps.platform_api.app.services import home_content
 from apps.platform_api.app.services.patch_detail import structure_patch_detail
 
 
@@ -300,6 +301,150 @@ Deadman Danny: Rocket Jumping - Self damage from 6.5% max HP to 5% and is now sp
             ],
         )
         self.assertEqual(danny_abilities["Strix Salvo"], ["Cooldown from 30s to 25s"])
+
+    def test_mode_heading_scopes_source_rows_and_solomon_move_piece_is_catalogued(self) -> None:
+        move_piece_icon = (
+            "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/"
+            "chess/chessmaster_movepiece.png"
+        )
+        heroes = {
+            "solomon": {
+                "name": "Solomon",
+                "slug": "chessmaster",
+                "abilities": {
+                    "move piece": {
+                        "name": "Move Piece",
+                        "icon_url": move_piece_icon,
+                        "patch_only": True,
+                    },
+                },
+            },
+            "yamato": {
+                "name": "Yamato",
+                "slug": "yamato",
+                "abilities": {
+                    "shadow transformation": {
+                        "name": "Shadow Transformation",
+                        "icon_url": None,
+                    },
+                },
+            },
+            "deadman danny": {
+                "name": "Deadman Danny",
+                "slug": "deadman-danny",
+                "abilities": {
+                    "chimera mk1": {"name": "Chimera Mk1", "icon_url": None},
+                },
+            },
+            "nurse harrow": {
+                "name": "Nurse Harrow",
+                "slug": "nurse-harrow",
+                "abilities": {
+                    "leech therapy": {"name": "Leech Therapy", "icon_url": None},
+                    "lurking terrors": {"name": "Lurking Terrors", "icon_url": None},
+                },
+            },
+            "paige": {
+                "name": "Paige",
+                "slug": "paige",
+                "abilities": {"bookwyrm": {"name": "Bookwyrm", "icon_url": None}},
+            },
+            "rat king": {
+                "name": "Rat King",
+                "slug": "rat-king",
+                "abilities": {
+                    "scrap grenade": {"name": "Scrap Grenade", "icon_url": None},
+                    "rule, ratannia!": {"name": "Rule, Ratannia!", "icon_url": None},
+                },
+            },
+            "violet": {
+                "name": "Violet",
+                "slug": "violet",
+                "abilities": {
+                    "abstract landscape": {"name": "Abstract Landscape", "icon_url": None},
+                },
+            },
+        }
+        heroes["nurse"] = heroes["nurse harrow"]
+        raw = {
+            "id": "1847920302240420",
+            "title": "Halloween 2026 + Gameplay Update",
+            "content": home_content._plain_text(
+                "[Heroes]\n"
+                "Solomon: Move Piece - Range to grab pieces increased from 50m to 65m\n"
+                "Solomon: Move Piece - Improved placement: pieces no longer fall through geometry or end up under the map\n"
+                "Nurse Harrow: Leech Therapy - Leeches on the ground are now removed on round reset\n"
+                "Yamato: Shadow Transformation - Cooldown increased from 150s to 160s (moved to T2)\n"
+                "[b]Street Brawl:[/b]\n"
+                "Deadman Danny: Chimera Mk1 - Cooldown reduction per boon reduced from -0.4s to -0.25s\n"
+                "Deadman Danny: Chimera Mk1 - Cooldown refund on hit from T3 reduced from 50% to 30%\n"
+                "Nurse Harrow: Leech Therapy - Mode-specific leech duration reduced\n"
+                "Nurse: Lurking Terrors - Duration reduced from 7s to 5s\n"
+                "Nurse: Lurking Terrors - T3 reduced from +3s Duration to +2s\n"
+                "Paige: Bookwyrm - T2 Trail Duration reduced from +2s to +1s\n"
+                "Rat King: Scrap Grenade - Radius reduced from 8m to 6m\n"
+                "Rat King: Scrap Grenade - Large explosion radius reduced from 14m to 10m\n"
+                "Rat King: Rule, Ratannia! - Radius reduced from 20m to 16m\n"
+                "Rat King: Rule, Ratannia! - T2 Radius reduced from +8m to +6m\n"
+                "Rat King: Rule, Ratannia! - Duration reduced from 12s to 9s\n"
+                "Violet: Abstract Landscape - Duration reduced from 6s to 5s\n"
+                "Violet: Abstract Landscape - T3 reduced from +4s to +3s",
+                max_length=30000,
+            ),
+        }
+
+        result = structure_patch_detail(raw, {"heroes": heroes, "items": {}, "objectives": {}})
+        sections = [section for section in result["sections"] if section["kind"] == "hero"]
+        ordinary_nurse = next(
+            section for section in sections
+            if section["hero_name"] == "Nurse Harrow" and section.get("mode_name") is None
+        )
+        mode_nurse = next(
+            section for section in sections
+            if section["hero_name"] == "Nurse Harrow" and section.get("mode_name") == "Street Brawl"
+        )
+        solomon = next(section for section in sections if section["hero_name"] == "Solomon")
+        move_piece = next(ability for ability in solomon["abilities"] if ability["name"] == "Move Piece")
+        mode_rows = [
+            change
+            for section in sections
+            if section.get("mode_name") == "Street Brawl"
+            for change in section["changes"] + [
+                change for ability in section["abilities"] for change in ability["changes"]
+            ]
+        ]
+
+        self.assertEqual(
+            move_piece["changes"],
+            [
+                "Range to grab pieces increased from 50m to 65m",
+                "Improved placement: pieces no longer fall through geometry or end up under the map",
+            ],
+        )
+        self.assertEqual(move_piece["icon_url"], move_piece_icon)
+        self.assertEqual(solomon["changes"], [])
+        self.assertIsNone(ordinary_nurse.get("mode_name"))
+        self.assertEqual(
+            [change for ability in ordinary_nurse["abilities"] for change in ability["changes"]],
+            ["Leeches on the ground are now removed on round reset"],
+        )
+        self.assertEqual(mode_nurse["changes"], [])
+        self.assertEqual(mode_nurse["abilities"][0]["changes"], ["Mode-specific leech duration reduced"])
+        self.assertEqual(len(mode_rows), 13)
+        self.assertFalse(any(change == "Street Brawl:" for section in result["sections"] for change in section["changes"]))
+
+        intro = structure_patch_detail(
+            {
+                "id": "solomon-intro",
+                "title": "Solomon is available in-game now",
+                "content": "Solomon is available in-game now.",
+            },
+            {"heroes": heroes, "items": {}, "objectives": {}},
+        )
+        solomon_intro = next(
+            section for section in intro["sections"] if section.get("hero_name") == "Solomon"
+        )
+        self.assertNotIn("Move Piece", [ability["name"] for ability in solomon_intro["abilities"]])
 
     def test_legacy_ability_heading_does_not_capture_following_item_or_general_line(self) -> None:
         raw = {

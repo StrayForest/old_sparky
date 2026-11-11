@@ -88,10 +88,17 @@ def _hero_section(
     hero_sections: dict[str, dict[str, Any]],
     hero: dict[str, Any],
     alias: str,
+    *,
+    mode_name: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     hero_key = str(hero.get("slug") or hero.get("name") or alias)
+    section_key = (
+        f"{hero_key}::mode:{mode_name.casefold()}"
+        if mode_name
+        else hero_key
+    )
     section = hero_sections.setdefault(
-        hero_key,
+        section_key,
         {
             "kind": "hero",
             "title": str(hero.get("name") or alias.title()),
@@ -99,6 +106,7 @@ def _hero_section(
             "hero_display_name": hero.get("display_name"),
             "hero_image_url": hero.get("hero_image_url") or hero.get("icon_url"),
             "hero_presentation_kind": "balance",
+            "mode_name": mode_name,
             "hero_description": hero.get("description"),
             "hero_description_requires_translation": hero.get(
                 "description_requires_translation"
@@ -116,7 +124,7 @@ def _hero_section(
             "_ability_map": {},
         },
     )
-    return hero_key, section
+    return section_key, section
 
 
 def _item_section(
@@ -364,14 +372,17 @@ def _unresolved_announcement_hero_names(raw: dict[str, Any]) -> list[str]:
 
 
 def _hero_metadata_is_complete(hero: dict[str, Any]) -> bool:
-    abilities = hero.get("abilities")
+    abilities = [
+        ability
+        for ability in (hero.get("abilities") or {}).values()
+        if isinstance(ability, dict) and not ability.get("patch_only")
+    ] if isinstance(hero.get("abilities"), dict) else []
     return bool(
         hero.get("hero_id")
         and hero.get("hero_image_url")
         and hero.get("display_name")
         and hero.get("description")
         and hero.get("russian_metadata_available")
-        and isinstance(abilities, dict)
         and abilities
         and all(
             isinstance(ability, dict)
@@ -379,13 +390,16 @@ def _hero_metadata_is_complete(hero: dict[str, Any]) -> bool:
             and ability.get("description")
             and ability.get("icon_url")
             and ability.get("russian_metadata_available")
-            for ability in abilities.values()
+            for ability in abilities
         )
     )
 
 
 def _hero_catalog_is_complete(hero: dict[str, Any], section: dict[str, Any]) -> bool:
-    abilities = section.get("abilities")
+    abilities = [
+        ability for ability in (section.get("abilities") or [])
+        if isinstance(ability, dict) and not ability.get("patch_only")
+    ]
     return bool(
         hero.get("hero_id")
         and hero.get("hero_image_url")
@@ -483,6 +497,7 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
     general_changes: list[str] = []
 
     current_scope: str | None = None
+    current_mode_name: str | None = None
     current_hero_key: str | None = None
     current_hero_alias: str | None = None
     current_item_key: str | None = None
@@ -490,9 +505,21 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
     current_general_ability_pending = False
 
     for line in _patch_lines(str(raw.get("content") or "")):
+        mode_name = base._patch_mode_heading(line)
+        if mode_name is not None:
+            current_scope = "heroes"
+            current_mode_name = mode_name
+            current_hero_key = None
+            current_hero_alias = None
+            current_item_key = None
+            current_ability_alias = None
+            current_general_ability_pending = False
+            continue
+
         scope_heading = base._patch_scope_heading(line)
         if scope_heading is not None:
             current_scope = scope_heading
+            current_mode_name = None
             current_hero_key = None
             current_hero_alias = None
             current_item_key = None
@@ -505,7 +532,12 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
             if hero_match is not None:
                 hero_alias, remainder = hero_match
                 hero = hero_catalog[hero_alias]
-                current_hero_key, section = _hero_section(hero_sections, hero, hero_alias)
+                current_hero_key, section = _hero_section(
+                    hero_sections,
+                    hero,
+                    hero_alias,
+                    mode_name=current_mode_name,
+                )
                 current_hero_alias = hero_alias
                 current_item_key = None
                 current_ability_alias = None
@@ -591,7 +623,12 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
             if hero_match is not None:
                 hero_alias, remainder = hero_match
                 hero = hero_catalog[hero_alias]
-                current_hero_key, section = _hero_section(hero_sections, hero, hero_alias)
+                current_hero_key, section = _hero_section(
+                    hero_sections,
+                    hero,
+                    hero_alias,
+                    mode_name=current_mode_name,
+                )
                 current_hero_alias = hero_alias
                 current_item_key = None
                 current_ability_alias = None
@@ -710,7 +747,12 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
         if hero_match is not None:
             hero_alias, remainder = hero_match
             hero = hero_catalog[hero_alias]
-            current_hero_key, section = _hero_section(hero_sections, hero, hero_alias)
+            current_hero_key, section = _hero_section(
+                hero_sections,
+                hero,
+                hero_alias,
+                mode_name=current_mode_name,
+            )
             current_hero_alias = hero_alias
             current_item_key = None
             current_ability_alias = None
@@ -759,7 +801,9 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
         _hero_key, section = _hero_section(hero_sections, hero, hero_alias)
         section["hero_presentation_kind"] = "introduction"
         section["hero_metadata_pending"] = not _hero_metadata_is_complete(hero)
-        for ability_alias in (hero.get("abilities") or {}):
+        for ability_alias, catalog_ability in (hero.get("abilities") or {}).items():
+            if isinstance(catalog_ability, dict) and catalog_ability.get("patch_only"):
+                continue
             ability_section = _ability_section(section, hero, ability_alias)
             if not ability_section.get("description"):
                 sentence = _announcement_ability_description(
@@ -768,7 +812,7 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
                     [
                         str(item.get("name") or "")
                         for item in (hero.get("abilities") or {}).values()
-                        if isinstance(item, dict) and item.get("name")
+                        if isinstance(item, dict) and item.get("name") and not item.get("patch_only")
                     ],
                 )
                 if sentence:

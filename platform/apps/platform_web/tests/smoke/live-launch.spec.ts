@@ -692,6 +692,11 @@ test("live four current patch DTOs render owner-scoped hero and ability changes"
       await expect(renderedSection.getByRole("heading", { level: 2 }))
         .toHaveText(sectionHeading(section));
       await expect(renderedSection.locator(".patch-hero-display-name")).toHaveCount(0);
+      if (section.mode_name) {
+        await expect(renderedSection.locator(".patch-mode-context")).toHaveText(section.mode_name);
+      } else {
+        await expect(renderedSection.locator(".patch-mode-context")).toHaveCount(0);
+      }
       if (section.kind === "hero" && section.hero_presentation_kind !== "introduction") {
         await expect(renderedSection.locator(".patch-hero-description")).toHaveCount(0);
       }
@@ -724,6 +729,37 @@ test("live four current patch DTOs render owner-scoped hero and ability changes"
             .toHaveCount(0);
         }
       }
+    }
+
+    const modeSections = patch.sections.filter((section) => section.mode_name === "Street Brawl");
+    const allPatchChanges = patch.sections.flatMap((section) => [
+      ...section.changes,
+      ...section.abilities.flatMap((ability) => ability.changes),
+    ]);
+    expect(allPatchChanges.some((change) => change.includes("Street Brawl:"))).toBe(false);
+    if (modeSections.length) {
+      expect(modeSections.map((section) => section.hero_name)).toEqual([
+        "Deadman Danny",
+        "Nurse Harrow",
+        "Paige",
+        "Rat King",
+        "Violet",
+      ]);
+      const modeRows = modeSections.flatMap((section) => [
+        ...section.changes,
+        ...section.abilities.flatMap((ability) => ability.changes),
+      ]);
+      expect(modeRows).toHaveLength(13);
+      expect(new Set(modeRows).size).toBe(13);
+    }
+
+    const solomon = patch.sections.find((section) => (
+      section.kind === "hero" && section.hero_name === "Solomon" && !section.mode_name
+    ));
+    if (solomon) {
+      const movePiece = solomon.abilities.find((ability) => ability.name === "Move Piece");
+      expect(movePiece?.changes).toHaveLength(2);
+      expect(movePiece?.icon_url).toContain("chessmaster_movepiece.png");
     }
 
     const celesteIndex = patch.sections.findIndex((section) => (
