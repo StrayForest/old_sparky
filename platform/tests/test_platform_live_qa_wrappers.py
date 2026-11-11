@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
+import base64
 from io import BytesIO, StringIO, TextIOWrapper
 import json
 import hashlib
@@ -244,6 +245,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             results.mkdir(mode=0o700)
             counts_path = results / platform_live_qa_guard.LIVE_BROWSER_COUNTS_FILE
             failures_path = results / platform_live_qa_guard.LIVE_BROWSER_FAILURES_FILE
+            identities_path = results / platform_live_qa_guard.LIVE_BROWSER_FAILURE_IDENTITIES_FILE
             node = shutil.which("node")
             if node is None:
                 self.fail("Node is required for the reporter-to-guard integration contract")
@@ -271,6 +273,12 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                   "live Cloudflare Analytics is conditionally observed without widening CSP",
                   "live image currentSrc inventory stays inside the exact CSP hosts",
                 ];
+                const mappedTitles = Reporter.publicTestTitles();
+                if (!Reporter.publicFailureIdentityMappingIsComplete()
+                    || mappedTitles.length !== titles.length
+                    || titles.some((title) => !mappedTitles.includes(title))) {
+                  throw new Error("public test titles and closed failure ID mapping differ");
+                }
                 const skips = new Map([
                   ["production Chromium live QA keeps its process sandbox enabled|live-webkit-mobile", "chromium_only:live-webkit-mobile"],
                   ...projects.map((project) => [
@@ -387,13 +395,21 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 )
             self.assertEqual(counts_path.lstat().st_mode & 0o777, 0o600)
             self.assertEqual(failures_path.lstat().st_mode & 0o777, 0o600)
+            self.assertEqual(identities_path.lstat().st_mode & 0o777, 0o600)
             count_payload = json.loads(counts_path.read_text(encoding="ascii"))
             failure_payload = json.loads(failures_path.read_text(encoding="ascii"))
+            identities_payload = json.loads(identities_path.read_text(encoding="ascii"))
             self.assertEqual(count_payload["logical_total"], 57)
             self.assertEqual(count_payload["logical_pass"], 50)
             self.assertEqual(count_payload["logical_fail"], 1)
             self.assertEqual(count_payload["logical_skip"], 6)
             self.assertEqual(failure_payload["failures"][0]["id"], "patch_owner_sections")
+            self.assertEqual(identities_payload["failures"][0], {
+                "id": "patch_owner_sections",
+                "project": "live-webkit-mobile",
+                "status": "failed",
+                "attempt": 1,
+            })
             self.assertEqual(failure_payload["failures"][0]["source_file"], "tests/support/live-qa-sandbox.ts")
             self.assertEqual(failure_payload["failures"][0]["source_line"], 2)
             self.assertEqual(failure_payload["failures"][0]["source_kind"], "assertion")
@@ -430,6 +446,22 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     app_sha=app_sha,
                     marker_sha256=marker_sha,
                 )
+                results_path = gate / "test-results"
+                saved_results_path = gate / "test-results.identity-reader-test"
+                os.rename(results_path, saved_results_path)
+                os.symlink(saved_results_path, results_path)
+                try:
+                    with self.assertRaises(platform_live_qa_guard.GuardError):
+                        platform_live_qa_guard._read_ephemeral_failure_identity_summary(
+                            gate,
+                            source_sha=source_sha,
+                            app_sha=app_sha,
+                            marker_sha256=marker_sha,
+                            counts=count_payload,
+                        )
+                finally:
+                    results_path.unlink()
+                    os.rename(saved_results_path, results_path)
                 user_gate = run_root / "live-user-qa.Abc123"
                 user_gate.mkdir(mode=0o700)
                 user_results = user_gate / "test-results"
@@ -773,6 +805,9 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 self.assertFalse(private_report.exists())
                 counts_path.write_text(json.dumps(count_payload) + "\n", encoding="ascii")
                 counts_path.chmod(0o600)
+                # Exercise the legacy rich-report-only rejection path when
+                # the independent identity fallback itself is unavailable.
+                identities_path.unlink()
                 failures_path.write_text(json.dumps(failure_payload) + "\n", encoding="ascii")
                 failures_path.chmod(0o600)
                 failure_payload["source_sha"] = "d" * 40
@@ -1025,6 +1060,122 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 self.assertIn(private_report.name, retained_names)
                 self.assertNotIn(old_name, retained_names)
 
+                def write_identity_only_gate(name: str, *, invalid_rich: bool = False) -> Path:
+                    fallback_gate = self._recreate_diagnostic_gate(run_root, name)
+                    fallback_results = fallback_gate / "test-results"
+                    fallback_counts = dict(count_payload)
+                    (fallback_results / platform_live_qa_guard.LIVE_BROWSER_COUNTS_FILE).write_text(
+                        json.dumps(fallback_counts) + "\n", encoding="ascii"
+                    )
+                    (fallback_results / platform_live_qa_guard.LIVE_BROWSER_COUNTS_FILE).chmod(0o600)
+                    fallback_identities = dict(identities_payload)
+                    fallback_identities.update(gate=fallback_gate.name)
+                    identity_path = fallback_results / platform_live_qa_guard.LIVE_BROWSER_FAILURE_IDENTITIES_FILE
+                    identity_path.write_text(
+                        json.dumps(fallback_identities) + "\n", encoding="ascii"
+                    )
+                    identity_path.chmod(0o600)
+                    if invalid_rich:
+                        malformed_rich = fallback_results / platform_live_qa_guard.LIVE_BROWSER_FAILURES_FILE
+                        malformed_rich.write_bytes(b'{"schema":true}\n')
+                        malformed_rich.chmod(0o600)
+                    return fallback_gate
+
+                fallback_gate = write_identity_only_gate("public-live-qa.b1c2d3e5")
+                platform_live_qa_guard.prepare_public_browser_failure_diagnostics(
+                    fallback_gate,
+                    source_sha=source_sha,
+                    app_sha=app_sha,
+                    marker_sha256=marker_sha,
+                )
+                with self.assertRaises(platform_live_qa_guard.BrowserFailureCounts):
+                    platform_live_qa_guard.public_browser_counts_line(
+                        fallback_gate,
+                        source_sha=source_sha,
+                        app_sha=app_sha,
+                        marker_sha256=marker_sha,
+                        persist_failure_report=True,
+                        fail_on_failure_counts=True,
+                    )
+                fallback_private = diagnostic_directory / f"{fallback_gate.name}.failure-v4.json"
+                fallback_bytes = fallback_private.read_bytes()
+                fallback_payload = json.loads(fallback_bytes)
+                self.assertEqual(fallback_payload["schema"], 4)
+                self.assertEqual(fallback_payload["failure_reason"], "rich_report_unavailable")
+                self.assertEqual(fallback_payload["source_sha"], source_sha)
+                self.assertEqual(fallback_payload["app_sha"], app_sha)
+                self.assertEqual(fallback_payload["marker_sha256"], marker_sha)
+                self.assertEqual(fallback_payload["failures"], identities_payload["failures"])
+                self.assertNotIn(b"private assertion text", fallback_bytes)
+                platform_live_qa_guard._validate_retained_failure_report(
+                    fallback_private.name, fallback_bytes
+                )
+                with patch.object(platform_live_qa_guard, "assert_liveqa_idle"):
+                    platform_live_qa_guard.remove_public_browser_gate(fallback_gate)
+
+                invalid_rich_gate = write_identity_only_gate(
+                    "public-live-qa.b1c2d3e7", invalid_rich=True
+                )
+                platform_live_qa_guard.prepare_public_browser_failure_diagnostics(
+                    invalid_rich_gate,
+                    source_sha=source_sha,
+                    app_sha=app_sha,
+                    marker_sha256=marker_sha,
+                )
+                with self.assertRaises(platform_live_qa_guard.BrowserFailureCounts):
+                    platform_live_qa_guard.public_browser_counts_line(
+                        invalid_rich_gate,
+                        source_sha=source_sha,
+                        app_sha=app_sha,
+                        marker_sha256=marker_sha,
+                        persist_failure_report=True,
+                        fail_on_failure_counts=True,
+                    )
+                invalid_private = diagnostic_directory / f"{invalid_rich_gate.name}.failure-v4.json"
+                self.assertEqual(json.loads(invalid_private.read_bytes())["failure_reason"], "rich_report_unavailable")
+                with patch.object(platform_live_qa_guard, "assert_liveqa_idle"):
+                    platform_live_qa_guard.remove_public_browser_gate(invalid_rich_gate)
+
+                store_failure_gate = write_identity_only_gate("public-live-qa.b1c2d3e6")
+                platform_live_qa_guard.prepare_public_browser_failure_diagnostics(
+                    store_failure_gate,
+                    source_sha=source_sha,
+                    app_sha=app_sha,
+                    marker_sha256=marker_sha,
+                )
+                with patch.object(
+                    platform_live_qa_guard,
+                    "_write_all",
+                    side_effect=platform_live_qa_guard.GuardError("synthetic private store failure"),
+                ):
+                    with self.assertRaises(
+                        platform_live_qa_guard.BrowserFailureReportUnavailable
+                    ) as store_failure:
+                        platform_live_qa_guard.public_browser_counts_line(
+                            store_failure_gate,
+                            source_sha=source_sha,
+                            app_sha=app_sha,
+                            marker_sha256=marker_sha,
+                            persist_failure_report=True,
+                            fail_on_failure_counts=True,
+                        )
+                self.assertEqual(store_failure.exception.failure_reason, "private_store_unavailable")
+                self.assertIsNotNone(store_failure.exception.failure_summary_token)
+                summary_bytes = base64.urlsafe_b64decode(
+                    store_failure.exception.failure_summary_token
+                    + "=" * ((4 - len(store_failure.exception.failure_summary_token) % 4) % 4)
+                )
+                summary_payload = json.loads(summary_bytes)
+                self.assertEqual(summary_payload["source_sha"], source_sha)
+                self.assertEqual(summary_payload["app_sha"], app_sha)
+                self.assertEqual(summary_payload["marker_sha256"], marker_sha)
+                self.assertEqual(summary_payload["failures"], [[
+                    "patch_owner_sections", "live-webkit-mobile", "failed", 1
+                ]])
+                self.assertNotIn(b"private assertion text", summary_bytes)
+                with patch.object(platform_live_qa_guard, "assert_liveqa_idle"):
+                    platform_live_qa_guard.remove_public_browser_gate(store_failure_gate)
+
                 recovery_gate = self._recreate_diagnostic_gate(run_root, gate.name)
                 unsafe_store = diagnostic_directory
                 unsafe_store.chmod(0o755)
@@ -1056,7 +1207,8 @@ class LiveQaWrapperContractTests(unittest.TestCase):
     @staticmethod
     def _recreate_diagnostic_gate(run_root: Path, name: str) -> Path:
         gate = run_root / name
-        (gate / "test-results").mkdir(parents=True, mode=0o700)
+        gate.mkdir(mode=0o700)
+        (gate / "test-results").mkdir(mode=0o700)
         return gate
 
     def test_live_dispatcher_lock_capability_uses_manifest_bound_canonical_helper(self) -> None:
@@ -2284,6 +2436,59 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertIn("failure_report_unavailable", supervisor)
         self.assertIn("failure_report_unavailable", browser_wrapper)
         self.assertIn("failure_report_unavailable", user_wrapper)
+        supervisor_diagnostic_start = supervisor.index(
+            'if [[ "$browser_diagnostic" =~'
+        )
+        supervisor_diagnostic_end = supervisor.index(
+            "if (( browser_status != 0 )); then", supervisor_diagnostic_start
+        )
+        supervisor_diagnostic_block = supervisor[
+            supervisor_diagnostic_start:supervisor_diagnostic_end
+        ]
+
+        def run_supervisor_diagnostic(token: str) -> subprocess.CompletedProcess[str]:
+            diagnostic = (
+                "LIVE_QA_CHILD_DIAGNOSTIC schema=2 kind=failure_report_unavailable "
+                "stdout_bytes=0 stderr_bytes=0 truncated=false child_exit=0 "
+                "failure_reason=private_store_unavailable failure_summary=" + token
+            )
+            script = "\n".join(
+                (
+                    "set -euo pipefail",
+                    f"browser_diagnostic={shlex.quote(diagnostic)}",
+                    "browser_status=0",
+                    "exec 3>&1",
+                    supervisor_diagnostic_block,
+                    "printf 'RESULT=%s\\n' \"$browser_status\"",
+                )
+            )
+            return subprocess.run(
+                ["/bin/bash", "-c", script],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=3,
+            )
+
+        bounded_supervisor_token = "A" * (12 * 1024)
+        bounded_supervisor_diagnostic = run_supervisor_diagnostic(
+            bounded_supervisor_token
+        )
+        self.assertEqual(bounded_supervisor_diagnostic.returncode, 0)
+        self.assertIn(
+            "failure_summary=" + bounded_supervisor_token,
+            bounded_supervisor_diagnostic.stdout,
+        )
+        self.assertIn("RESULT=0", bounded_supervisor_diagnostic.stdout)
+        oversized_supervisor_diagnostic = run_supervisor_diagnostic(
+            "A" * (16 * 1024 + 1)
+        )
+        self.assertEqual(oversized_supervisor_diagnostic.returncode, 0)
+        self.assertNotIn(
+            "LIVE_QA_CHILD_DIAGNOSTIC",
+            oversized_supervisor_diagnostic.stdout,
+        )
+        self.assertIn("RESULT=2", oversized_supervisor_diagnostic.stdout)
         self.assertIn("--fail-on-failure-counts", browser_wrapper)
         self.assertIn("if (( count_status != 0 )); then", browser_wrapper)
         preflight_start = browser_wrapper.index(
@@ -2342,12 +2547,15 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 browser_exit: int = 0,
                 preflight: bool = False,
                 fd3_mode: str = "report",
+                failure_summary_line: str = "",
             ):
                 fake_guard = fixture / f"guard-{status}-{browser_exit}-{int(preflight)}"
                 fake_guard.write_text(
                     "#!/bin/sh\n"
                     'if [ "$1" = prepare-public-failure-diagnostics ]; then exit 1; fi\n'
-                    'if [ "$1" = emit-public-browser-counts ]; then printf "%s\\n" "$FAKE_COUNT_LINE"; exit "$FAKE_COUNT_STATUS"; fi\n'
+                    'if [ "$1" = emit-public-browser-counts ]; then printf "%s\\n" "$FAKE_COUNT_LINE"; '
+                    'if [ -n "${FAKE_FAILURE_SUMMARY_LINE:-}" ]; then printf "%s\\n" "$FAKE_FAILURE_SUMMARY_LINE"; fi; '
+                    'exit "$FAKE_COUNT_STATUS"; fi\n'
                     "exit 2\n",
                     encoding="ascii",
                 )
@@ -2389,6 +2597,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                         **os.environ,
                         "FAKE_COUNT_LINE": count_line,
                         "FAKE_COUNT_STATUS": str(status),
+                        "FAKE_FAILURE_SUMMARY_LINE": failure_summary_line,
                         "COUNT_OUTPUT": str(count_output),
                     },
                     capture_output=True,
@@ -2426,6 +2635,48 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             self.assertIn("kind=failure_report_unavailable", unavailable_failure.stdout)
             self.assertIn("child_exit=0", unavailable_failure.stdout)
             self.assertEqual(unavailable_counts.read_text(encoding="ascii"), failed_counts_line + "\n")
+
+            failure_summary = (
+                "LIVE_BROWSER_FAILURE_SUMMARY schema=1 reason=private_store_unavailable "
+                "token=eyJzY2hlbWEiOjF9"
+            )
+            summarized_failure, summarized_counts = run_count_tail(
+                42,
+                failed_counts_line,
+                failure_summary_line=failure_summary,
+            )
+            self.assertEqual(summarized_failure.returncode, 1)
+            self.assertIn("schema=2 kind=failure_report_unavailable", summarized_failure.stdout)
+            self.assertIn("failure_reason=private_store_unavailable", summarized_failure.stdout)
+            self.assertIn("failure_summary=eyJzY2hlbWEiOjF9", summarized_failure.stdout)
+            self.assertEqual(summarized_counts.read_text(encoding="ascii"), failed_counts_line + "\n")
+
+            bounded_summary_token = "A" * (12 * 1024)
+            bounded_summary, bounded_summary_counts = run_count_tail(
+                42,
+                failed_counts_line,
+                failure_summary_line=(
+                    "LIVE_BROWSER_FAILURE_SUMMARY schema=1 "
+                    "reason=private_store_unavailable token=" + bounded_summary_token
+                ),
+            )
+            self.assertEqual(bounded_summary.returncode, 1)
+            self.assertIn("failure_summary=" + bounded_summary_token, bounded_summary.stdout)
+            self.assertEqual(bounded_summary_counts.read_text(encoding="ascii"), failed_counts_line + "\n")
+
+            oversized_summary, oversized_summary_counts = run_count_tail(
+                42,
+                failed_counts_line,
+                failure_summary_line=(
+                    "LIVE_BROWSER_FAILURE_SUMMARY schema=1 "
+                    "reason=private_store_unavailable token=" + "A" * (16 * 1024 + 1)
+                ),
+            )
+            self.assertEqual(oversized_summary.returncode, 1)
+            self.assertNotIn("LIVE_QA_CHILD_DIAGNOSTIC", oversized_summary.stdout)
+            self.assertNotIn("LIVE_BROWSER_QA_SUCCESS", oversized_summary.stdout)
+            self.assertIn("Public browser QA count record is unavailable.", oversized_summary.stderr)
+            self.assertEqual(oversized_summary_counts.read_text(encoding="ascii"), failed_counts_line + "\n")
 
             original_failure, _original_counts = run_count_tail(
                 42, failed_counts_line, browser_exit=7
@@ -4043,6 +4294,121 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 unavailable_diagnostic
             )
         )
+        failure_counts = dict(
+            counts,
+            run_status="failed",
+            logical_pass=1,
+            logical_fail=1,
+            logical_expected_fail=0,
+        )
+        failure_summary = {
+            "schema": 1,
+            "gate": "public-live-qa.a1b2c3d4",
+            "source_sha": source_sha,
+            "app_sha": app_sha,
+            "marker_sha256": marker_sha,
+            "run_status": "failed",
+            "failure_reason": "private_store_unavailable",
+            "failures": [["patch_owner_sections", "live-mobile", "failed", 1]],
+        }
+        failure_token = base64.urlsafe_b64encode(
+            json.dumps(failure_summary, separators=(",", ":")).encode("ascii")
+        ).rstrip(b"=")
+        summarized_diagnostic = (
+            b"LIVE_QA_CHILD_DIAGNOSTIC schema=2 kind=failure_report_unavailable "
+            b"stdout_bytes=0 stderr_bytes=0 truncated=false child_exit=0 "
+            b"failure_reason=private_store_unavailable failure_summary="
+            + failure_token
+            + b"\n"
+        )
+        self.assertTrue(
+            platform_workflow_remote_dispatch._valid_live_qa_diagnostic(
+                summarized_diagnostic, 1
+            )
+        )
+        self.assertTrue(
+            platform_workflow_remote_dispatch._valid_browser_failure_summary(
+                summarized_diagnostic,
+                failure_counts,
+                expected_sha=source_sha,
+                expected_app_sha=app_sha,
+                expected_marker_sha256=marker_sha,
+            )
+        )
+        self.assertFalse(
+            platform_workflow_remote_dispatch._valid_browser_failure_summary(
+                summarized_diagnostic,
+                failure_counts,
+                expected_sha=source_sha,
+                expected_app_sha=app_sha,
+                expected_marker_sha256="d" * 64,
+            )
+        )
+        self.assertFalse(
+            platform_workflow_remote_dispatch._valid_browser_failure_summary(
+                summarized_diagnostic,
+                dict(failure_counts, attempt_fail=0),
+                expected_sha=source_sha,
+                expected_app_sha=app_sha,
+                expected_marker_sha256=marker_sha,
+            )
+        )
+        large_failure_counts = dict(
+            failure_counts,
+            logical_total=128,
+            logical_pass=0,
+            logical_fail=0,
+            logical_expected_fail=0,
+            logical_interrupted=128,
+            attempt_total=128,
+            attempt_pass=0,
+            attempt_fail=0,
+            attempt_interrupted=128,
+        )
+        large_failure_summary = dict(
+            failure_summary,
+            failures=[
+                ["route_profile_lisalexy_overflow", "live-webkit-mobile", "interrupted", attempt]
+                for attempt in range(1, 129)
+            ],
+        )
+        large_failure_token = base64.urlsafe_b64encode(
+            json.dumps(large_failure_summary, separators=(",", ":")).encode("ascii")
+        ).rstrip(b"=")
+        self.assertGreater(len(large_failure_token), 12 * 1024)
+        large_summary_diagnostic = (
+            b"LIVE_QA_CHILD_DIAGNOSTIC schema=2 kind=failure_report_unavailable "
+            b"stdout_bytes=0 stderr_bytes=0 truncated=false child_exit=0 "
+            b"failure_reason=private_store_unavailable failure_summary="
+            + large_failure_token
+            + b"\n"
+        )
+        self.assertTrue(
+            platform_workflow_remote_dispatch._valid_browser_failure_summary(
+                large_summary_diagnostic,
+                large_failure_counts,
+                expected_sha=source_sha,
+                expected_app_sha=app_sha,
+                expected_marker_sha256=marker_sha,
+            )
+        )
+        oversized_summary_diagnostic = (
+            b"LIVE_QA_CHILD_DIAGNOSTIC schema=2 kind=failure_report_unavailable "
+            b"stdout_bytes=0 stderr_bytes=0 truncated=false child_exit=0 "
+            b"failure_reason=private_store_unavailable failure_summary="
+            + b"x" * (platform_workflow_remote_dispatch.LIVE_LAUNCH_FAILURE_SUMMARY_MAX_TOKEN_CHARS + 1)
+            + b"\n"
+        )
+        self.assertFalse(
+            platform_workflow_remote_dispatch._valid_live_qa_diagnostic(
+                oversized_summary_diagnostic, 1
+            )
+        )
+        self.assertIsNone(
+            platform_workflow_remote_dispatch._extract_live_qa_diagnostic(
+                oversized_summary_diagnostic
+            )
+        )
         self.assertTrue(
             platform_workflow_remote_dispatch._valid_live_qa_diagnostic(
                 unavailable_diagnostic, 1
@@ -4169,6 +4535,42 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 + failed_count_line
                 + failed_count_status_line
             ).decode("ascii"),
+        )
+        large_failure_counts_line = (
+            "LIVE_BROWSER_COUNTS schema=1 "
+            + " ".join(
+                f"{name}={large_failure_counts[name]}"
+                for name in (
+                    "run_status",
+                    *platform_workflow_remote_dispatch.LIVE_BROWSER_COUNT_FIELDS,
+                    "source_sha",
+                    "app_sha",
+                    "marker_sha256",
+                )
+            )
+            + "\n"
+        ).encode("ascii")
+        large_failure_status_line = (
+            "LIVE_LAUNCH_STATUS schema=2 status=failed stage=browser_qa check=browser_qa "
+            f"child_exit=1 source_sha={source_sha}\n"
+        ).encode("ascii")
+        large_failure_child = (
+            f"import os; os.write(1, bytes.fromhex({(large_summary_diagnostic + large_failure_counts_line + large_failure_status_line).hex()!r})); "
+            "raise SystemExit(1)"
+        )
+        large_failure_output = StringIO()
+        with redirect_stdout(large_failure_output):
+            large_failure_exit = platform_workflow_remote_dispatch._run_bounded_child(
+                [sys.executable, "-c", large_failure_child],
+                timeout_seconds=3,
+                expected_live_launch_sha=source_sha,
+                expected_live_app_sha=app_sha,
+                expected_live_marker_sha256=marker_sha,
+            )
+        self.assertEqual(large_failure_exit, 1)
+        self.assertEqual(
+            large_failure_output.getvalue(),
+            (large_summary_diagnostic + large_failure_counts_line + large_failure_status_line).decode("ascii"),
         )
         ordinary_failure_diagnostic = unavailable_diagnostic.replace(
             b"failure_report_unavailable", b"unclassified"
@@ -6306,6 +6708,45 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 "failure_report_unavailable",
             )
             self.assertNotIn("private", json.dumps(unavailable_report))
+            unavailable_schema2 = (
+                "LIVE_QA_CHILD_DIAGNOSTIC schema=2 kind=failure_report_unavailable "
+                "stdout_bytes=0 stderr_bytes=0 truncated=false child_exit=0 "
+                "failure_reason=identity_summary_unavailable failure_summary=none\n"
+            )
+            raw.write_text(unavailable_schema2 + failed_counts, encoding="ascii")
+            unavailable_schema2_run = subprocess.run(
+                [sys.executable, "-c", sanitizer, str(raw), str(report), "1", runner_sha, app_sha, binding_digest],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(unavailable_schema2_run.returncode, 0, unavailable_schema2_run.stderr)
+            unavailable_schema2_report = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual(unavailable_schema2_report["status"], "failed")
+            self.assertEqual(unavailable_schema2_report["child_diagnostic"]["schema"], 2)
+            self.assertEqual(
+                unavailable_schema2_report["child_diagnostic"]["kind"],
+                "failure_report_unavailable",
+            )
+            invalid_failure_unavailable = unavailable.replace(
+                "kind=failure_report_unavailable", "kind=unclassified"
+            )
+            raw.write_text(
+                invalid_failure_unavailable + failed_counts,
+                encoding="ascii",
+            )
+            invalid_failure_unavailable_run = subprocess.run(
+                [sys.executable, "-c", sanitizer, str(raw), str(report), "1", runner_sha, app_sha, binding_digest],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(invalid_failure_unavailable_run.returncode, 0)
+            invalid_failure_unavailable_report = json.loads(
+                report.read_text(encoding="utf-8")
+            )
+            self.assertEqual(invalid_failure_unavailable_report["status"], "error")
+            self.assertIsNone(invalid_failure_unavailable_report["child_diagnostic"])
             raw.write_text(unavailable, encoding="ascii")
             invalid_unavailable = subprocess.run(
                 [sys.executable, "-c", sanitizer, str(raw), str(report), "2", runner_sha, app_sha, binding_digest],

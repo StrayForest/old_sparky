@@ -1,0 +1,86 @@
+{
+  "catalog_fixture": {
+    "path": "deadlock-catalog-inputs.json.gz",
+    "sha256": "b7b12e4dafec35729768f438bb851f2f0fad5edf9ac92d60140ff74ebd75cf22",
+    "sources": {
+      "heroes_english": {
+        "records": 65,
+        "response_bytes": 1911878,
+        "response_sha256": "b81ee8edc0584a18d5d7dda746f58092a2d88db42fa246131cd4ac474bd64c6a",
+        "status": 200,
+        "url": "https://api.deadlock-api.com/v1/assets/heroes?language=english"
+      },
+      "heroes_russian": {
+        "records": 65,
+        "response_bytes": 1947806,
+        "response_sha256": "5779a7eac0ade8111d609206a412fe9e6d625e011befb187f34315e4f3efcaa7",
+        "status": 200,
+        "url": "https://api.deadlock-api.com/v1/assets/heroes?language=russian"
+      },
+      "icons": {
+        "records": 73,
+        "response_bytes": 187335,
+        "response_sha256": "9a88b66c9de031d761eaf19be7c76e0b096ae1f9e08d3b2ae4616b0e742afc4a",
+        "status": 200,
+        "url": "https://api.deadlock-api.com/v1/assets/icons"
+      },
+      "items_english": {
+        "records": 782,
+        "response_bytes": 6458065,
+        "response_sha256": "ed77a501256bee9cdd862948ea736e89afad62392461bc3a978dc9d0bbc7a4f4",
+        "status": 200,
+        "url": "https://api.deadlock-api.com/v1/assets/items?language=english"
+      },
+      "items_russian": {
+        "records": 782,
+        "response_bytes": 6913589,
+        "response_sha256": "1acea03299d595b4553732464a2fe1304ab4c962c8ce8468a990961ed39e6e65",
+        "status": 200,
+        "url": "https://api.deadlock-api.com/v1/assets/items?language=russian"
+      }
+    }
+  },
+  "metadata_updates": [
+    {
+      "ability_cards": 4,
+      "patch_id": "1846651706696737",
+      "path": "sections[].abilities[].stats",
+      "stat_rows": 67,
+      "unchanged_verified": [
+        "owners",
+        "ability names",
+        "descriptions",
+        "images",
+        "row counts",
+        "stats_pending"
+      ]
+    },
+    {
+      "patch_id": "1847920302240420",
+      "removed_fixture_node": {
+        "ability": "Bookwyrm",
+        "changes": 0,
+        "hero": "Paige",
+        "mode": null
+      },
+      "retained_source_group": {
+        "ability": "Bookwyrm",
+        "changes": 1,
+        "hero": "Paige",
+        "mode": "Street Brawl"
+      }
+    }
+  ],
+  "renderer_fixtures": {
+    "1846651706696737": "ce37f05e3cd820d976b67b54ab8f45ef3e977fbfb49427b108980bb933487da6",
+    "1847920302240420": "43eb328d274c0d169c1a09a6610deaac7bc52e72643b333edc3f06dccd7821c1",
+    "1848664643339845": "6db61a6999f445547ef006c081b9940b1a760ec7c32711ce919a898bed838fab",
+    "1848664643342973": "aaa141e4ce47a51de440bee9acde15fe757a61cf30be452448239d54a966eb13"
+  },
+  "schema": 1,
+  "source_news_fixture": {
+    "path": "steam-news-four-patches.json",
+    "sha256": "291ba3b941df4758a2840554aed857c832afd580aad458df7b7b16e32cb20b5c",
+    "upstream_response_sha256": "0621e418c64c4fbabe92ce8008a43a7591dfadaafd39dfca868c52e781a0aaf8"
+  }
+}

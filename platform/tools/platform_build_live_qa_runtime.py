@@ -16,8 +16,10 @@ import hashlib
 import importlib.util
 import json
 import os
+import posixpath
 from pathlib import Path
 from pathlib import PurePosixPath
+import re
 import secrets
 import shutil
 import stat
@@ -100,8 +102,15 @@ RUNTIME_SOURCE_FILES = (
     "tests/support/live-qa-origin.ts",
     "tests/support/live-qa-sandbox.ts",
     "tests/support/live-count-reporter.cjs",
+    "tests/support/patch-acceptance.ts",
     "tests/support/live-engine-preflight.cjs",
     "package-lock.json",
+)
+RUNTIME_IMPORT_RE = re.compile(
+    r"^\s*import\s+(?!type\b).*?\sfrom\s+[\"'](\.{1,2}/[^\"']+)[\"']"
+    r"|^\s*export\s+.*?\sfrom\s+[\"'](\.{1,2}/[^\"']+)[\"']"
+    r"|\brequire\(\s*[\"'](\.{1,2}/[^\"']+)[\"']\s*\)",
+    re.MULTILINE,
 )
 PLAYWRIGHT_PACKAGES = (
     "@playwright/test",
@@ -263,6 +272,32 @@ def _copy_file(source: Path, destination: Path, *, executable: bool = False) -> 
         os.close(descriptor)
     if destination.stat().st_size != metadata.st_size:
         raise RuntimeBuildError("live-QA runtime source changed while copying")
+
+
+def validate_runtime_source_imports(web_root: Path, source_files: tuple[str, ...]) -> None:
+    """Reject a runtime suite whose static relative imports are not packaged."""
+    packaged = set(source_files)
+    suffixes = ("", ".ts", ".tsx", ".js", ".cjs", ".mjs", "/index.ts", "/index.js")
+    for relative in source_files:
+        try:
+            source = (web_root / relative).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise RuntimeBuildError(
+                "live-QA runtime source import inventory is unavailable",
+                reason="unsafe-source",
+                phase="validate-input",
+            ) from exc
+        for match in RUNTIME_IMPORT_RE.finditer(source):
+            specifier = next((group for group in match.groups() if group is not None), None)
+            if specifier is None:
+                continue
+            resolved = posixpath.normpath((PurePosixPath(relative).parent / specifier).as_posix())
+            if not any(resolved + suffix in packaged for suffix in suffixes):
+                raise RuntimeBuildError(
+                    "live-QA runtime source import is not packaged",
+                    reason="unsafe-source",
+                    phase="validate-input",
+                )
 
 
 def _copy_tree(source: Path, destination: Path) -> None:
@@ -836,6 +871,7 @@ def build(
     node = node_home / "bin/node"
     try:
         _metadata(node)
+        validate_runtime_source_imports(web, RUNTIME_SOURCE_FILES)
         output.mkdir(mode=0o700)
         output_created = True
         phase = "copy-source"

@@ -305,15 +305,41 @@ COUNT_REPORT_FD=3
 if [[ "${PLATFORM_LIVE_QA_LOCK_FD:-}" == "3" ]] || ! { : >&3; } 2>/dev/null; then
   COUNT_REPORT_FD=1
 fi
-if "${GUARD[@]}" emit-public-browser-counts \
+count_protocol=""
+if count_protocol="$("${GUARD[@]}" emit-public-browser-counts \
   --gate "$BROWSER_GATE" \
   --source-sha "$LIVE_QA_RUNNER_SHA" \
   --app-sha "$LIVE_QA_TARGET_SHA" \
   --marker-sha256 "$LIVE_QA_MARKER_SHA256" \
-  "${COUNT_DIAGNOSTIC_ARGS[@]}" >&"$COUNT_REPORT_FD"; then
+  "${COUNT_DIAGNOSTIC_ARGS[@]}")"; then
   count_status=0
 else
   count_status=$?
+fi
+count_line="${count_protocol%%$'\n'*}"
+failure_summary_line=""
+if [[ "$count_protocol" == *$'\n'* ]]; then
+  failure_summary_line="${count_protocol#*$'\n'}"
+fi
+failure_summary_token=""
+failure_summary_reason=""
+if [[ "$count_line" =~ ^LIVE_BROWSER_COUNTS\ schema=1\ .+$ ]]; then
+  printf '%s\n' "$count_line" >&"$COUNT_REPORT_FD"
+else
+  count_status=2
+fi
+if [[ "$failure_summary_line" =~ ^LIVE_BROWSER_FAILURE_SUMMARY\ schema=1\ reason=(identity_summary_unavailable|private_store_unavailable)\ token=([A-Za-z0-9_-]+|none)$ ]]; then
+  failure_summary_reason="${BASH_REMATCH[1]}"
+  failure_summary_candidate="${BASH_REMATCH[2]}"
+  if ((${#failure_summary_candidate} > 16384)); then
+    count_status=2
+    diagnostic_valid=0
+    failure_summary_reason=""
+  elif [[ "$failure_summary_candidate" != "none" ]]; then
+    failure_summary_token="$failure_summary_candidate"
+  fi
+elif [[ -n "$failure_summary_line" ]]; then
+  count_status=2
 fi
 if (( count_status == 42 )); then
   diagnostic_valid=1
@@ -326,9 +352,16 @@ elif (( count_status == 43 && browser_status == 0 )); then
   diagnostic_valid=0
 fi
 if (( diagnostic_valid == 1 )); then
-  printf 'LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=%s stdout_bytes=%s stderr_bytes=%s truncated=%s child_exit=%s\n' \
-    "$diagnostic_kind" "$diagnostic_stdout_bytes" "$diagnostic_stderr_bytes" \
-    "$diagnostic_truncated" "$diagnostic_child_exit"
+  if [[ -n "$failure_summary_reason" ]]; then
+    printf 'LIVE_QA_CHILD_DIAGNOSTIC schema=2 kind=%s stdout_bytes=%s stderr_bytes=%s truncated=%s child_exit=%s failure_reason=%s failure_summary=%s\n' \
+      "$diagnostic_kind" "$diagnostic_stdout_bytes" "$diagnostic_stderr_bytes" \
+      "$diagnostic_truncated" "$diagnostic_child_exit" \
+      "$failure_summary_reason" "${failure_summary_token:-none}"
+  else
+    printf 'LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=%s stdout_bytes=%s stderr_bytes=%s truncated=%s child_exit=%s\n' \
+      "$diagnostic_kind" "$diagnostic_stdout_bytes" "$diagnostic_stderr_bytes" \
+      "$diagnostic_truncated" "$diagnostic_child_exit"
+  fi
 fi
 if (( browser_status != 0 )); then
   exit "$browser_status"

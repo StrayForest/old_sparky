@@ -596,6 +596,7 @@ jobs:
           /usr/bin/python3 - "$raw_report" "$safe_report" "$SUPERVISOR_STATUS" \
             "$GITHUB_SHA" "$APP_TARGET_SHA" "$SOURCE_BINDING_SHA256" "$LIVE_MARKER" <<'PY'
           import hashlib
+          import base64
           import json
           from pathlib import Path
           import re
@@ -610,7 +611,7 @@ jobs:
           expected_sha, app_sha, binding_digest, marker_value = sys.argv[4:]
           marker_sha256 = hashlib.sha256(marker_value.encode("ascii")).hexdigest()
           raw_size = source.stat().st_size
-          raw = source.read_bytes() if raw_size <= 1024 else b""
+          raw = source.read_bytes() if raw_size <= 20 * 1024 else b""
           marker_pattern = re.compile(
               rb"LIVE_LAUNCH_STATUS schema=2 status=(passed|failed) "
               rb"stage=(validation|trusted_generation|identity|engine_preflight|account_install|"
@@ -642,29 +643,55 @@ jobs:
               + rb"marker_sha256=([0-9a-f]{64})\n"
           )
           child_diagnostic_pattern = re.compile(
-              rb"LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind="
+              rb"LIVE_QA_CHILD_DIAGNOSTIC schema=(1|2) kind="
               rb"(none|playwright_cli_usage|node_module_missing|browser_executable_missing|"
               rb"browser_launch_error|child_timeout|cleanup_failure|failure_report_unavailable|unclassified) "
               rb"stdout_bytes=([0-9]{1,16}) stderr_bytes=([0-9]{1,16}) "
-              rb"truncated=(true|false) child_exit=([0-9]{1,3})\n"
+              rb"truncated=(true|false) child_exit=([0-9]{1,3})"
+              rb"(?: failure_reason=(identity_summary_unavailable|private_store_unavailable) "
+              rb"failure_summary=([A-Za-z0-9_-]{1,16384}|none))?\n"
           )
-          lines = raw.splitlines(keepends=True) if raw_size <= 1024 else []
+          lines = raw.splitlines(keepends=True) if raw_size <= 20 * 1024 else []
           diagnostic_lines = [line for line in lines if line.startswith(b"LIVE_QA_CHILD_DIAGNOSTIC ")]
           child_diagnostic = None
           if len(diagnostic_lines) == 1:
               diagnostic_match = child_diagnostic_pattern.fullmatch(diagnostic_lines[0])
               if diagnostic_match is not None:
                   child_diagnostic = {
-                      "kind": diagnostic_match.group(1).decode("ascii"),
-                      "stdout_bytes": int(diagnostic_match.group(2)),
-                      "stderr_bytes": int(diagnostic_match.group(3)),
-                      "truncated": diagnostic_match.group(4) == b"true",
-                      "child_exit_code": int(diagnostic_match.group(5)),
+                      "schema": int(diagnostic_match.group(1)),
+                      "kind": diagnostic_match.group(2).decode("ascii"),
+                      "stdout_bytes": int(diagnostic_match.group(3)),
+                      "stderr_bytes": int(diagnostic_match.group(4)),
+                      "truncated": diagnostic_match.group(5) == b"true",
+                      "child_exit_code": int(diagnostic_match.group(6)),
                   }
+                  if diagnostic_match.group(7) is not None:
+                      child_diagnostic["failure_reason"] = diagnostic_match.group(7).decode("ascii")
+                      if diagnostic_match.group(8) != b"none":
+                          child_diagnostic["failure_summary_token"] = diagnostic_match.group(8).decode("ascii")
+          diagnostic_child_exit_matches = child_diagnostic is not None and (
+              child_diagnostic["child_exit_code"] == process_status
+              or (
+                  child_diagnostic["kind"] == "failure_report_unavailable"
+                  and child_diagnostic["child_exit_code"] == 0
+                  and process_status == 1
+              )
+          )
           diagnostic_valid = not diagnostic_lines or (
               len(diagnostic_lines) == 1
               and child_diagnostic is not None
-              and child_diagnostic["child_exit_code"] == process_status
+              and diagnostic_child_exit_matches
+              and (
+                  child_diagnostic["schema"] == 1
+                  or (
+                      child_diagnostic["schema"] == 2
+                      and child_diagnostic["kind"] == "failure_report_unavailable"
+                      and (
+                          "failure_summary_token" in child_diagnostic
+                          or child_diagnostic.get("failure_reason") == "identity_summary_unavailable"
+                      )
+                  )
+              )
           )
           protocol_lines = [line for line in lines if not line.startswith(b"LIVE_QA_CHILD_DIAGNOSTIC ")]
           count_values = None
@@ -693,6 +720,79 @@ jobs:
                       and attempt_sum == values["attempt_total"]
                   ):
                       count_values = values
+          browser_failure_metadata = None
+          if child_diagnostic is not None and "failure_summary_token" in child_diagnostic:
+              try:
+                  token = child_diagnostic["failure_summary_token"]
+                  decoded = base64.urlsafe_b64decode(token + "=" * ((4 - len(token) % 4) % 4))
+                  def unique_object(pairs):
+                      result = {}
+                      for key, value in pairs:
+                          if key in result:
+                              raise ValueError("duplicate closed failure summary key")
+                          result[key] = value
+                      return result
+                  summary = json.loads(decoded.decode("ascii"), object_pairs_hook=unique_object)
+                  summary_keys = {
+                      "schema", "gate", "source_sha", "app_sha", "marker_sha256",
+                      "run_status", "failure_reason", "failures",
+                  }
+                  allowed_failure_ids = {
+                      "route_root_overflow", "route_info_overflow", "route_tournaments_overflow",
+                      "route_tournaments_new_overflow", "route_profile_me_overflow",
+                      "route_profile_lisalexy_overflow", "chromium_sandbox", "csp_nonce_rotation",
+                      "csp_negative_probes", "tournament_hub", "tournament_catalog_containment",
+                      "tournament_detail_bracket", "admin_anonymous_protection", "home_steps_overflow",
+                      "contact_recipient_privacy", "objective_icons", "patch_owner_sections",
+                      "analytics_csp", "image_csp_hosts",
+                  }
+                  failures = summary.get("failures") if isinstance(summary, dict) else None
+                  if (
+                      set(summary) != summary_keys
+                      or type(summary.get("schema")) is not int
+                      or summary.get("schema") != 1
+                      or not re.fullmatch(r"public-live-qa\.[a-z0-9_]{8}", summary.get("gate", ""))
+                      or summary.get("source_sha") != expected_sha
+                      or summary.get("app_sha") != app_sha
+                      or summary.get("marker_sha256") != marker_sha256
+                      or summary.get("failure_reason") != child_diagnostic.get("failure_reason")
+                      or summary.get("failure_reason") != "private_store_unavailable"
+                      or summary.get("run_status") == "passed"
+                      or count_values is None
+                      or summary.get("run_status") != count_values.get("run_status")
+                      or not isinstance(failures, list)
+                      or not 1 <= len(failures) <= 128
+                  ):
+                      raise ValueError("invalid closed failure summary")
+                  seen_failures = set()
+                  status_counts = {"failed": 0, "interrupted": 0, "timedOut": 0}
+                  for failure in failures:
+                      if (
+                          not isinstance(failure, list)
+                          or len(failure) != 4
+                          or failure[0] not in allowed_failure_ids
+                          or failure[1] not in {"live-desktop", "live-mobile", "live-webkit-mobile"}
+                          or failure[2] not in status_counts
+                          or type(failure[3]) is not int
+                          or not 1 <= failure[3] <= 32768
+                      ):
+                          raise ValueError("invalid closed failure identity")
+                      identity = tuple(failure)
+                      if identity in seen_failures:
+                          raise ValueError("duplicate closed failure identity")
+                      seen_failures.add(identity)
+                      status_counts[failure[2]] += 1
+                  if status_counts != {
+                      "failed": count_values["attempt_fail"],
+                      "interrupted": count_values["attempt_interrupted"],
+                      "timedOut": count_values["attempt_timedout"],
+                  }:
+                      raise ValueError("failure identities do not match counts")
+                  browser_failure_metadata = summary
+              except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+                  diagnostic_valid = False
+          if child_diagnostic is not None:
+              child_diagnostic.pop("failure_summary_token", None)
           status_line = protocol_lines[-1] if protocol_lines else b""
           match = marker_pattern.fullmatch(status_line)
           marker = None
@@ -838,6 +938,7 @@ jobs:
               "status_counts": status_counts or {},
               "error_class_counts": errors,
               "child_diagnostic": child_diagnostic,
+              "browser_failure_metadata": browser_failure_metadata,
           }
           destination.write_text(json.dumps(report, sort_keys=True) + "\n", encoding="utf-8")
           PY

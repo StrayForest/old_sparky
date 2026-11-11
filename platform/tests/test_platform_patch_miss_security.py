@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
+import hashlib
 import json
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -12,12 +15,14 @@ from apps.platform_api.app.services import (
     patch_detail,
     patch_detail_security,
 )
+from apps.platform_api.app.api.schemas import PatchDetailResponse
 from apps.platform_api.app.services.patch_translation import translation_source_hash
 from python_packages.platform_infra.config import PlatformSettings
 from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
 _REFRESH_OBSERVER_TIMEOUT_SECONDS = 0.5
+_SOURCE_REPLAY_TIMEOUT_SECONDS = 15.0
 
 
 def _capture_refresh_tasks() -> tuple[list[asyncio.Task[None]], asyncio.Event, object]:
@@ -35,12 +40,16 @@ def _capture_refresh_tasks() -> tuple[list[asyncio.Task[None]], asyncio.Event, o
     )
 
 
-async def _await_refresh_tasks(tasks: list[asyncio.Task[None]]) -> None:
+async def _await_refresh_tasks(
+    tasks: list[asyncio.Task[None]],
+    *,
+    timeout: float = _REFRESH_OBSERVER_TIMEOUT_SECONDS,
+) -> None:
     if not tasks:
         return
     results = await asyncio.wait_for(
         asyncio.gather(*tasks, return_exceptions=True),
-        timeout=_REFRESH_OBSERVER_TIMEOUT_SECONDS,
+        timeout=timeout,
     )
     for result in results:
         if isinstance(result, BaseException):
@@ -136,115 +145,212 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
         refresh.assert_not_awaited()
 
     async def test_unknown_patch_sets_negative_cache_and_schedules_background_refresh(self) -> None:
-        patch_id = "1847920302240420"
-        old_catalog = {
-            "heroes": {},
-            "items": {
-                "high-velocity rounds": {
-                    "name": "High-Velocity Rounds",
-                    "category": "weapon",
-                    "icon_url": "https://assets-bucket.deadlock-api.com/high-velocity.png",
-                }
+        fixture_root = Path(__file__).parent / "fixtures" / "patch-acceptance"
+        source_path = fixture_root / "steam-news-four-patches.json"
+        source_digest, _ = (fixture_root / "steam-news-four-patches.sha256").read_text().split()
+        source_bytes = source_path.read_bytes()
+        self.assertEqual(
+            hashlib.sha256(source_bytes).hexdigest(),
+            "291ba3b941df4758a2840554aed857c832afd580aad458df7b7b16e32cb20b5c",
+        )
+        self.assertEqual(hashlib.sha256(source_bytes).hexdigest(), source_digest)
+        source_fixture = json.loads(source_bytes)
+        self.assertEqual(
+            source_fixture["source"]["response_sha256"],
+            "0621e418c64c4fbabe92ce8008a43a7591dfadaafd39dfca868c52e781a0aaf8",
+        )
+        self.assertEqual(
+            source_fixture["source"]["url"],
+            "https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid=1422450&count=20&maxlength=0&format=json",
+        )
+        catalog_path = fixture_root / "deadlock-catalog-inputs.json.gz"
+        catalog_digest, _ = (fixture_root / "deadlock-catalog-inputs.sha256").read_text().split()
+        catalog_bytes = catalog_path.read_bytes()
+        self.assertEqual(hashlib.sha256(catalog_bytes).hexdigest(), catalog_digest)
+        self.assertEqual(
+            catalog_digest,
+            "b7b12e4dafec35729768f438bb851f2f0fad5edf9ac92d60140ff74ebd75cf22",
+        )
+        catalog_fixture = json.loads(gzip.decompress(catalog_bytes))
+        catalog_inputs = catalog_fixture["inputs"]
+        expected_catalog_sources = {
+            "heroes_english": {
+                "url": "https://api.deadlock-api.com/v1/assets/heroes?language=english",
+                "status": 200,
+                "records": 65,
+                "response_bytes": 1_911_878,
+                "response_sha256": "b81ee8edc0584a18d5d7dda746f58092a2d88db42fa246131cd4ac474bd64c6a",
             },
-            "ranks": {},
-            "objectives": {},
+            "items_english": {
+                "url": "https://api.deadlock-api.com/v1/assets/items?language=english",
+                "status": 200,
+                "records": 782,
+                "response_bytes": 6_458_065,
+                "response_sha256": "ed77a501256bee9cdd862948ea736e89afad62392461bc3a978dc9d0bbc7a4f4",
+            },
+            "heroes_russian": {
+                "url": "https://api.deadlock-api.com/v1/assets/heroes?language=russian",
+                "status": 200,
+                "records": 65,
+                "response_bytes": 1_947_806,
+                "response_sha256": "5779a7eac0ade8111d609206a412fe9e6d625e011befb187f34315e4f3efcaa7",
+            },
+            "items_russian": {
+                "url": "https://api.deadlock-api.com/v1/assets/items?language=russian",
+                "status": 200,
+                "records": 782,
+                "response_bytes": 6_913_589,
+                "response_sha256": "1acea03299d595b4553732464a2fe1304ab4c962c8ce8468a990961ed39e6e65",
+            },
+            "icons": {
+                "url": "https://api.deadlock-api.com/v1/assets/icons",
+                "status": 200,
+                "records": 73,
+                "response_bytes": 187_335,
+                "response_sha256": "9a88b66c9de031d761eaf19be7c76e0b096ae1f9e08d3b2ae4616b0e742afc4a",
+            },
         }
-        move_piece_icon = (
-            "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/"
-            "chess/chessmaster_movepiece.png"
+        self.assertEqual(catalog_fixture["source"], expected_catalog_sources)
+        provenance_path = fixture_root / "renderer-metadata-provenance.json"
+        provenance = json.loads(provenance_path.read_text())
+        self.assertEqual(provenance["schema"], 1)
+        self.assertEqual(
+            provenance["source_news_fixture"],
+            {
+                "path": "steam-news-four-patches.json",
+                "sha256": "291ba3b941df4758a2840554aed857c832afd580aad458df7b7b16e32cb20b5c",
+                "upstream_response_sha256": source_fixture["source"]["response_sha256"],
+            },
         )
-        rebuilt_catalog = home_content._build_asset_catalog(
-            {"heroes": []},
-            {"items": []},
-            supplemental_hero_payload=[
+        self.assertEqual(
+            provenance["catalog_fixture"],
+            {
+                "path": "deadlock-catalog-inputs.json.gz",
+                "sha256": catalog_digest,
+                "sources": expected_catalog_sources,
+            },
+        )
+        expected_renderer_fixture_digests = {
+            "1846651706696737": "ce37f05e3cd820d976b67b54ab8f45ef3e977fbfb49427b108980bb933487da6",
+            "1847920302240420": "43eb328d274c0d169c1a09a6610deaac7bc52e72643b333edc3f06dccd7821c1",
+            "1848664643339845": "6db61a6999f445547ef006c081b9940b1a760ec7c32711ce919a898bed838fab",
+            "1848664643342973": "aaa141e4ce47a51de440bee9acde15fe757a61cf30be452448239d54a966eb13",
+        }
+        self.assertEqual(provenance["renderer_fixtures"], expected_renderer_fixture_digests)
+        self.assertEqual(
+            provenance["metadata_updates"],
+            [
                 {
-                    "id": 42,
-                    "name": "Solomon",
-                    "class_name": "hero_chessmaster",
-                    "player_selectable": True,
-                    "disabled": False,
-                    "development_state": "release",
-                    "items": {},
-                }
-            ],
-            supplemental_item_payload=[
+                    "patch_id": "1846651706696737",
+                    "path": "sections[].abilities[].stats",
+                    "ability_cards": 4,
+                    "stat_rows": 67,
+                    "unchanged_verified": [
+                        "owners",
+                        "ability names",
+                        "descriptions",
+                        "images",
+                        "row counts",
+                        "stats_pending",
+                    ],
+                },
                 {
-                    "id": 3284310919,
-                    "class_name": "ability_chessmaster_movechesspiece",
-                    "type": "weapon",
-                    "name": "Move Piece",
-                    "image": move_piece_icon,
-                }
+                    "patch_id": "1847920302240420",
+                    "removed_fixture_node": {
+                        "hero": "Paige",
+                        "ability": "Bookwyrm",
+                        "mode": None,
+                        "changes": 0,
+                    },
+                    "retained_source_group": {
+                        "hero": "Paige",
+                        "ability": "Bookwyrm",
+                        "mode": "Street Brawl",
+                        "changes": 1,
+                    },
+                },
             ],
         )
-        rebuilt_catalog["items"].update(old_catalog["items"])
-        full_content = (
-            "[p][b]General:[/b][/p]"
-            "[p]- Past Dues: Now channels their special attack, creating an aura."
-            "[/p][p]- Fixed some bugs with Walker stomp logic[/p]"
-            "[p]- Latest 6 heroes now have normal unlocking requirements.[/p]"
-            "[p][b]Items:[/b][/p]"
-            "[p]- High-Velocity Rounds: Bullet Velocity reduced from 60% to 45%[/p]"
-            "[p][b]Heroes:[/b][/p]"
-            "[p]- Solomon: Move Piece - Range to grab pieces increased from 50m to 65m[/p]"
-        )
-        compact_content = (
-            "General: Past Dues: Now channels their special attack, creating an aura."
-            " - Fixed some bugs with Walker stomp logic - Latest 6 heroes now have normal "
-            "unlocking requirements. Items: - High-Velocity Rounds: Bullet Velocity "
-            "reduced from 60% to 45%"
-        )
-        source_metadata = {
-            "id": patch_id,
-            "title": "Halloween 2026 + Gameplay Update",
-            "published_at": "2026-10-31T00:00:00+00:00",
-            "url": f"https://store.steampowered.com/news/app/1422450/view/{patch_id}",
+        expected_ids = {
+            "1848664643342973",
+            "1848664643339845",
+            "1847920302240420",
+            "1846651706696737",
         }
-        compact_detail = patch_detail.structure_patch_detail(
-            {**source_metadata, "content": compact_content}, old_catalog
-        )
-        compact_source_hash = translation_source_hash(compact_detail)
-        old_prefixes = (
-            "platform:home-content:patch:v6:",
-            "platform:home-content:patch:v7:",
-            "platform:home-content:patch:v8:",
-            "platform:home-content:patch:v9:",
-            "platform:home-content:patch:v10:",
-            "platform:home-content:patch:v11:",
-            "platform:home-content:patch:v12:",
-            "platform:home-content:patch:v13:",
-        )
-        old_values = {
-            prefix + patch_id: json.dumps(compact_detail) for prefix in old_prefixes
+        self.assertEqual({str(row["gid"]) for row in source_fixture["items"]}, expected_ids)
+        source_items_by_id = {
+            str(row["gid"]): row for row in source_fixture["items"]
         }
+        self.assertEqual(
+            {name for name in catalog_fixture["source"]},
+            {"heroes_english", "heroes_russian", "items_english", "items_russian", "icons"},
+        )
+        patch_ids = sorted(expected_ids, key=int)
+        old_catalog = {"heroes": {}, "items": {}, "ranks": {}, "objectives": {}}
+        old_values = {}
+        for source_item in source_fixture["items"]:
+            patch_id = str(source_item["gid"])
+            compact_detail = patch_detail.structure_patch_detail(
+                {
+                    "id": patch_id,
+                    "title": source_item["title"],
+                    "published_at": home_content._source_datetime(source_item["date"]).isoformat(),
+                    "url": source_item["url"],
+                    "content": "",
+                },
+                old_catalog,
+            )
+            for version in range(6, 14):
+                old_values[f"platform:home-content:patch:v{version}:{patch_id}"] = json.dumps(
+                    compact_detail
+                )
         old_catalog_keys = {
             "platform:home-content:patch-assets:v7": json.dumps(old_catalog),
             "platform:home-content:patch-assets-stale:v1": json.dumps(old_catalog),
         }
         cache = _Cache({**old_values, **old_catalog_keys})
-        news_item = {
-            **source_metadata,
-            "gid": patch_id,
-            "contents": full_content,
-            "date": 1_793_404_800,
-            "feedlabel": "Community Announcements",
-            "tags": ["patchnotes"],
-        }
         requests: list[httpx.Request] = []
-        response_sizes: list[int] = []
+        steam_response_sizes: list[int] = []
+        source_feed = json.dumps(
+            {"appnews": {"newsitems": source_fixture["items"]}},
+            ensure_ascii=False,
+        ).encode()
 
-        async def steam_handler(request: httpx.Request) -> httpx.Response:
+        async def source_handler(request: httpx.Request) -> httpx.Response:
             requests.append(request)
-            response = httpx.Response(
-                200,
-                json={"appnews": {"newsitems": [news_item]}},
-                request=request,
+            if request.url.host == "api.steampowered.com":
+                steam_response_sizes.append(len(source_feed))
+                return httpx.Response(200, content=source_feed, request=request)
+            if request.url.host == "api.deadlock-api.com":
+                path = request.url.path
+                if path == "/v1/assets/heroes":
+                    language = request.url.params.get("language")
+                    key = f"heroes_{language}"
+                elif path == "/v1/assets/items":
+                    language = request.url.params.get("language")
+                    key = f"items_{language}"
+                elif path == "/v1/assets/icons":
+                    key = "icons"
+                else:
+                    key = ""
+                if key in catalog_inputs:
+                    return httpx.Response(
+                        200,
+                        json=catalog_inputs[key],
+                        request=request,
+                    )
+            if request.url in {
+                httpx.URL(home_content.DEADLOCK_HERO_INDEX_URL),
+                httpx.URL(home_content.DEADLOCK_ITEM_INDEX_URL),
+                httpx.URL(home_content.DEADLOCK_RANK_INDEX_URL),
+            }:
+                return httpx.Response(503, content=b"", request=request)
+            raise AssertionError(
+                f"unexpected patch-miss request host={request.url.host} path={request.url.path}"
             )
-            response_sizes.append(len(response.content))
-            return response
 
         bounded_client_type = patch_detail_security._BoundedPatchRefreshClient
-        transport = httpx.MockTransport(steam_handler)
+        transport = httpx.MockTransport(source_handler)
 
         def bounded_client_factory(**kwargs):
             return bounded_client_type(transport=transport, **kwargs)
@@ -263,17 +369,12 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
                 side_effect=bounded_client_factory,
             ),
             patch.object(
-                home_content,
-                "_fetch_deadlock_asset_catalog",
-                AsyncMock(return_value=rebuilt_catalog),
-            ) as fetch_catalog,
-            patch.object(
                 patch_detail_security,
                 "ensure_patch_translation_records",
                 AsyncMock(
                     return_value={
-                        "registered": 1,
-                        "enqueued": 1,
+                        "registered": len(patch_ids),
+                        "enqueued": len(patch_ids),
                         "enqueue_failures": 0,
                     }
                 ),
@@ -285,21 +386,49 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
             ) as apply_cached,
             refresh_patch,
         ):
-            result = await patch_detail_security._cached_patch_source(patch_id)
-            await asyncio.wait_for(registered.wait(), timeout=_REFRESH_OBSERVER_TIMEOUT_SECONDS)
-            await _await_refresh_tasks(tasks)
-            refreshed = await patch_detail_security._cached_patch_source(patch_id)
-            public_detail = await patch_detail_security.get_patch_detail(patch_id)
+            result = await patch_detail_security._cached_patch_source(patch_ids[0])
+            await asyncio.wait_for(registered.wait(), timeout=_SOURCE_REPLAY_TIMEOUT_SECONDS)
+            await _await_refresh_tasks(tasks, timeout=_SOURCE_REPLAY_TIMEOUT_SECONDS)
+            refreshed = {
+                patch_id: await patch_detail_security._cached_patch_source(patch_id)
+                for patch_id in patch_ids
+            }
+            public_details = {
+                patch_id: await patch_detail_security.get_patch_detail(patch_id)
+                for patch_id in patch_ids
+            }
 
         self.assertIsNone(result)
         self.assertEqual(len(tasks), 1)
-        self.assertIsInstance(refreshed, dict)
-        self.assertEqual(len(requests), 1)
-        fetch_catalog.assert_awaited_once()
-        self.assertEqual(requests[0].url.params.get("maxlength"), "0")
+        self.assertTrue(all(isinstance(detail, dict) for detail in refreshed.values()))
+        self.assertEqual(len(steam_response_sizes), 1)
         self.assertLessEqual(
-            response_sizes[0],
+            steam_response_sizes[0],
             patch_detail_security.PATCH_MISS_RESPONSE_MAX_BYTES,
+        )
+        steam_requests = [
+            request for request in requests
+            if request.url.host == "api.steampowered.com"
+        ]
+        self.assertEqual(len(steam_requests), 1)
+        self.assertEqual(steam_requests[0].url.params.get("maxlength"), "0")
+        self.assertEqual(
+            steam_requests[0].url.params.get("appid"),
+            str(home_content.DEADLOCK_APP_ID),
+        )
+        self.assertEqual(
+            {
+                (request.url.path, request.url.params.get("language"))
+                for request in requests
+                if request.url.host == "api.deadlock-api.com"
+                and request.url.path in {"/v1/assets/heroes", "/v1/assets/items"}
+            },
+            {
+                ("/v1/assets/heroes", "english"),
+                ("/v1/assets/heroes", "russian"),
+                ("/v1/assets/items", "english"),
+                ("/v1/assets/items", "russian"),
+            },
         )
         self.assertNotIn("platform:home-content:patch-assets:v7", cache.get_calls)
         self.assertNotIn("platform:home-content:patch-assets-stale:v1", cache.get_calls)
@@ -307,55 +436,279 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
             self.assertEqual(cache.values[old_key], old_value)
         self.assertIn(home_content.PATCH_ASSET_CATALOG_KEY, cache.values)
         self.assertIn(home_content.PATCH_ASSET_CATALOG_STALE_KEY, cache.values)
-        stored_catalog = json.loads(cache.values[home_content.PATCH_ASSET_CATALOG_KEY])
+        current_catalog = json.loads(cache.values[home_content.PATCH_ASSET_CATALOG_KEY])
+        stale_catalog = json.loads(cache.values[home_content.PATCH_ASSET_CATALOG_STALE_KEY])
+        self.assertEqual(current_catalog, stale_catalog)
+        self.assertEqual(len(requests), 9)
         self.assertEqual(
-            stored_catalog["heroes"]["solomon"]["abilities"]["move piece"]["icon_url"],
-            move_piece_icon,
+            current_catalog["objectives"]["mid_boss"]["icon_url"],
+            catalog_inputs["icons"]["minimap"]["boss_marker_neutral_psd.png"],
         )
-        cached_key = home_content.PATCH_DETAIL_KEY_PREFIX + patch_id
-        self.assertIn(cached_key, cache.values)
+        self.assertEqual(
+            current_catalog["heroes"]["solomon"]["abilities"]["move piece"]["icon_url"],
+            next(
+                item["image"]
+                for item in catalog_inputs["items_english"]
+                if item.get("class_name") == "ability_chessmaster_movechesspiece"
+            ),
+        )
         for old_key, old_value in old_values.items():
             self.assertEqual(cache.values[old_key], old_value)
             self.assertNotIn(old_key, cache.get_calls)
-        updated_detail = json.loads(cache.values[cached_key])
-        updated_source_hash = translation_source_hash(updated_detail)
-        self.assertNotEqual(updated_source_hash, compact_source_hash)
-        general = next(
-            section
-            for section in updated_detail["sections"]
-            if section["kind"] == "general"
-        )
-        self.assertEqual(
-            general["changes"],
-            [
-                "Past Dues: Now channels their special attack, creating an aura.",
-                "Fixed some bugs with Walker stomp logic",
-                "Latest 6 heroes now have normal unlocking requirements.",
-            ],
-        )
+
         register.assert_awaited_once()
-        registered_patch = register.await_args.args[0][patch_id]
-        self.assertEqual(translation_source_hash(registered_patch), updated_source_hash)
-        public_general = next(
-            section
-            for section in public_detail["sections"]
-            if section["kind"] == "general"
+        registered_patches = register.await_args.args[0]
+        self.assertEqual(set(registered_patches), set(patch_ids))
+        self.assertEqual(apply_cached.await_count, len(patch_ids))
+        renderer_fixture_root = (
+            Path(__file__).parents[1]
+            / "apps"
+            / "platform_web"
+            / "tests"
+            / "fixtures"
+            / "patch-details"
         )
-        self.assertEqual(public_general["changes"], general["changes"])
-        solomon = next(
-            section
-            for section in updated_detail["sections"]
-            if section["kind"] == "hero" and section["hero_name"] == "Solomon"
-        )
-        move_piece = next(ability for ability in solomon["abilities"] if ability["name"] == "Move Piece")
-        self.assertEqual(move_piece["icon_url"], move_piece_icon)
-        self.assertEqual(
-            move_piece["changes"],
-            ["Range to grab pieces increased from 50m to 65m"],
-        )
-        apply_cached.assert_awaited_once()
+
+        def structural_projection(detail: dict) -> dict:
+            sections = []
+            for section in detail["sections"]:
+                section_metadata = {
+                    key: section.get(key)
+                    for key in (
+                        "kind",
+                        "title",
+                        "hero_name",
+                        "hero_display_name",
+                        "hero_presentation_kind",
+                        "mode_name",
+                        "hero_image_url",
+                        "hero_description",
+                        "hero_description_requires_translation",
+                        "hero_description_russian_metadata_available",
+                        "hero_metadata_pending",
+                        "item_name",
+                        "item_category",
+                        "item_icon_url",
+                        "objective_key",
+                        "objective_icon_url",
+                    )
+                }
+                section_metadata["changes_count"] = len(section.get("changes") or [])
+                section_metadata["abilities"] = []
+                for ability in section.get("abilities") or []:
+                    ability_metadata = {
+                        key: ability.get(key)
+                        for key in (
+                            "name",
+                            "display_name",
+                            "description",
+                            "description_requires_translation",
+                            "russian_metadata_available",
+                            "presentation_kind",
+                            "stats",
+                            "stats_pending",
+                            "icon_url",
+                        )
+                    }
+                    ability_metadata["changes_count"] = len(ability.get("changes") or [])
+                    section_metadata["abilities"].append(ability_metadata)
+                sections.append(section_metadata)
+            return {
+                "id": detail["id"],
+                "title": detail["title"],
+                "sections": sections,
+            }
+
+        for patch_id in patch_ids:
+            cached_key = home_content.PATCH_DETAIL_KEY_PREFIX + patch_id
+            self.assertIn(cached_key, cache.values)
+            updated_detail = json.loads(cache.values[cached_key])
+            self.assertEqual(
+                translation_source_hash(registered_patches[patch_id]),
+                translation_source_hash(updated_detail),
+            )
+            if patch_id == "1847920302240420":
+                normal_nurse = next(
+                    section
+                    for section in updated_detail["sections"]
+                    if section.get("kind") == "hero"
+                    and section.get("hero_name") == "Nurse Harrow"
+                    and not section.get("mode_name")
+                )
+                self.assertEqual(
+                    [(ability["name"], len(ability["changes"])) for ability in normal_nurse["abilities"]],
+                    [
+                        ("Leech Therapy", 3),
+                        ("Wretched Vapors", 1),
+                        ("Healing Needles", 3),
+                        ("Lurking Terrors", 3),
+                    ],
+                )
+                self.assertFalse(
+                    any(
+                        change.casefold().startswith(("nurse:", "nurse harrow:"))
+                        for section in updated_detail["sections"]
+                        if section.get("kind") == "general"
+                        for change in section.get("changes", [])
+                    )
+                )
+                mid_boss = next(
+                    section
+                    for section in updated_detail["sections"]
+                    if section.get("objective_key") == "mid_boss"
+                )
+                self.assertEqual(len(mid_boss["changes"]), 11)
+                self.assertFalse(
+                    any(change.casefold().startswith(("mid boss:", "mid-boss:")) for change in mid_boss["changes"])
+                )
+                self.assertTrue(
+                    any("only 50% as effective" in change.casefold() for change in mid_boss["changes"])
+                )
+                mode_sections = [
+                    section
+                    for section in updated_detail["sections"]
+                    if section.get("mode_name") == "Street Brawl"
+                ]
+                mode_rows = [
+                    change
+                    for section in mode_sections
+                    for change in section.get("changes", [])
+                    + [
+                        change
+                        for ability in section.get("abilities", [])
+                        for change in ability.get("changes", [])
+                    ]
+                ]
+                self.assertEqual(len(mode_rows), 13)
+                self.assertEqual(len(set(mode_rows)), 13)
+                self.assertFalse(any("Street Brawl:" in change for change in mode_rows))
+                ordinary_paige = next(
+                    section
+                    for section in updated_detail["sections"]
+                    if section.get("kind") == "hero"
+                    and section.get("hero_name") == "Paige"
+                    and not section.get("mode_name")
+                )
+                self.assertFalse(
+                    any(ability.get("name") == "Bookwyrm" for ability in ordinary_paige["abilities"])
+                )
+                mode_paige = next(
+                    section
+                    for section in mode_sections
+                    if section.get("hero_name") == "Paige"
+                )
+                bookwyrm = [
+                    ability
+                    for ability in mode_paige["abilities"]
+                    if ability.get("name") == "Bookwyrm"
+                ]
+                self.assertEqual(len(bookwyrm), 1)
+                self.assertEqual(len(bookwyrm[0]["changes"]), 1)
+                normal_solomon = next(
+                    section
+                    for section in updated_detail["sections"]
+                    if section.get("kind") == "hero"
+                    and section.get("hero_name") == "Solomon"
+                    and not section.get("mode_name")
+                )
+                move_piece = [
+                    ability
+                    for ability in normal_solomon["abilities"]
+                    if ability.get("name") == "Move Piece"
+                ]
+                self.assertEqual(len(move_piece), 1)
+                self.assertEqual(len(move_piece[0]["changes"]), 2)
+                self.assertTrue(any("50m" in change and "65m" in change for change in move_piece[0]["changes"]))
+                self.assertTrue(any("improved placement" in change.casefold() for change in move_piece[0]["changes"]))
+            if patch_id == "1846651706696737":
+                nurse_intro = next(
+                    section
+                    for section in updated_detail["sections"]
+                    if section.get("kind") == "hero"
+                    and section.get("hero_name") == "Nurse Harrow"
+                )
+                self.assertEqual(len(nurse_intro["abilities"]), 4)
+                self.assertTrue(
+                    all(ability.get("description") for ability in nurse_intro["abilities"])
+                )
+                self.assertEqual(
+                    sum(len(ability.get("stats") or []) for ability in nurse_intro["abilities"]),
+                    67,
+                )
+                self.assertFalse(
+                    any(ability.get("stats_pending") for ability in nurse_intro["abilities"])
+                )
+            self.assertEqual(
+                updated_detail["content"],
+                home_content._plain_text(
+                    source_items_by_id[patch_id]["contents"],
+                    max_length=30000,
+                ),
+            )
+            self.assertIsInstance(public_details[patch_id], dict)
+            expected_path = renderer_fixture_root / f"{patch_id}.json"
+            expected_bytes = expected_path.read_bytes()
+            self.assertEqual(
+                hashlib.sha256(expected_bytes).hexdigest(),
+                expected_renderer_fixture_digests[patch_id],
+            )
+            expected = json.loads(expected_bytes)
+            generated = public_details[patch_id]
+            generated_wire = PatchDetailResponse.model_validate(generated).model_dump(mode="json")
+            generated_projection = structural_projection(generated_wire)
+            expected_projection = structural_projection(expected)
+            if generated_projection != expected_projection:
+                differences = []
+                for key in ("id", "title"):
+                    if generated_projection[key] != expected_projection[key]:
+                        differences.append(f"top-level.{key}")
+                if (
+                    len(generated_projection["sections"])
+                    != len(expected_projection["sections"])
+                ):
+                    differences.append("top-level.sections_count")
+                for section_index, (generated_section, expected_section) in enumerate(
+                    zip(
+                        generated_projection["sections"],
+                        expected_projection["sections"],
+                    )
+                ):
+                    if (
+                        len(generated_section["abilities"])
+                        != len(expected_section["abilities"])
+                    ):
+                        differences.append(f"section[{section_index}].abilities_count")
+                    for key in generated_section:
+                        if key == "abilities":
+                            for ability_index, (generated_ability, expected_ability) in enumerate(
+                                zip(generated_section[key], expected_section[key])
+                            ):
+                                for ability_key in generated_ability:
+                                    if generated_ability[ability_key] != expected_ability[ability_key]:
+                                        differences.append(
+                                            f"section[{section_index}].ability[{ability_index}].{ability_key}"
+                                        )
+                        elif generated_section[key] != expected_section[key]:
+                            differences.append(f"section[{section_index}].{key}")
+                self.fail(f"{patch_id} renderer projection fields differ: {differences[:24]}")
+            rendered_changes = "\n".join(
+                change
+                for section in generated["sections"]
+                for change in (
+                    section.get("changes", [])
+                    + [
+                        change
+                        for ability in section.get("abilities", [])
+                        for change in ability.get("changes", [])
+                    ]
+                )
+            )
+            self.assertNotRegex(
+                rendered_changes,
+                r"STEAM_CLAN_LOC_IMAGE|clan\.fastly\.steamstatic\.com|\[\s*\/?\s*(?:img|url)\b",
+            )
         self.assertIn(
-            patch_detail_security.PATCH_MISS_NEGATIVE_KEY_PREFIX + patch_id,
+            patch_detail_security.PATCH_MISS_NEGATIVE_KEY_PREFIX + patch_ids[0],
             cache.values,
         )
         self.assertIn(patch_detail_security.PATCH_MISS_REFRESH_GATE_KEY, cache.values)

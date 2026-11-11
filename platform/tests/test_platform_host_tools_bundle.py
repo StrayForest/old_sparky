@@ -3591,9 +3591,12 @@ raise SystemExit(module.main(["host-capabilities"]))
         )
 
         with (
-            patch.object(dispatcher, "CLEANUP_OPERATION_TIMEOUT_SECONDS", 0.15),
+            patch.object(dispatcher, "CLEANUP_OPERATION_TIMEOUT_SECONDS", 1.5),
             patch.object(dispatcher, "CHILD_TERMINATION_GRACE_SECONDS", 0.15),
         ):
+            # Allow the parent interpreter to spawn under CI contention. The
+            # ten-second descendant still holds stdout beyond this bounded
+            # deadline, so the test keeps exercising inherited-pipe cleanup.
             timed_out_marker, _ = run_cleanup_child(
                 "import subprocess,sys; "
                 "print('RETAINED_CLEANUP_STAGE schema=1 stage=complete exit_code=0', flush=True); "

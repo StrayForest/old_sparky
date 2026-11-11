@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 import LiveCountReporter from "../support/live-count-reporter.cjs";
 import { assertLiveQaChromiumSandbox } from "../support/live-qa-sandbox";
+import { patchAcceptanceIssues } from "../support/patch-acceptance";
 import type { PlatformPatchDetail, PlatformPatchSection } from "../../lib/platform-types";
 
 type BrowserEvidence = {
@@ -683,6 +684,7 @@ test("live four current patch DTOs render owner-scoped hero and ability changes"
     expect(detailResponse.ok()).toBe(true);
     const patch = await detailResponse.json() as PlatformPatchDetail;
     expect(patch.id).toBe(patchId);
+    expect(patchAcceptanceIssues(patch), `Patch ${patchId} failed content acceptance`).toEqual([]);
     await expect(page.locator(".patch-article")).toBeVisible();
     const renderedSections = page.locator(".patch-section");
     await expect(renderedSections).toHaveCount(patch.sections.length);

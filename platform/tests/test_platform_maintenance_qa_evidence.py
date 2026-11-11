@@ -285,6 +285,10 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
         app_target_sha = "a" * 40
         launch = _canonical_workflow_report("platform-live-launch.yml", runner_sha)
         evidence.validate_live_launch_report(launch, runner_sha, app_target_sha)
+        legacy_launch = {
+            key: value for key, value in launch.items() if key != "browser_failure_metadata"
+        }
+        evidence.validate_live_launch_report(legacy_launch, runner_sha, app_target_sha)
         user = _canonical_workflow_report("platform-live-user-qa.yml", runner_sha)
         evidence.validate_live_user_qa_report(user, runner_sha, app_target_sha)
         self.assertIsNone(user["failure_origin"])
@@ -303,6 +307,7 @@ class MaintenanceQaEvidenceTests(unittest.TestCase):
             ("launch-skip-count", {**launch, "logical_counts": {**launch["logical_counts"], "logical_skip": 5}}, "launch"),
             ("launch-bool-status-count", {**launch, "status_counts": {**launch["status_counts"], "passed": True}}, "launch"),
             ("launch-failure", {**launch, "success": False}, "launch"),
+            ("launch-failure-identities-on-success", {**launch, "browser_failure_metadata": {"schema": 1}}, "launch"),
             ("user-bool-counter", {**user, "logical_total": True}, "user"),
             ("user-child-diagnostic-missing", {**user, "child_diagnostic": None}, "user"),
             ("user-failure-origin", {**user, "failure_origin": "dispatcher"}, "user"),

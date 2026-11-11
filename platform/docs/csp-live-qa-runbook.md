@@ -215,7 +215,7 @@ The fixed desktop journey uses a 1,500-second child cap for its 600-second Playw
 The remote operation cap is 2,400 seconds (900 seconds planning reserve) inside the 45-minute job (final 300 seconds shared with bounded handoff/report steps; pre-helper checks consume part); external setup/network time is not guaranteed, other action limits are unchanged, and timeout/cleanup uncertainty fails closed.
 The workflow accepts a bounded dispatcher diagnostic only when its fixed schema and child exit code agree. Early-failure `stage` and `check` values are closed enums; the sanitizer publishes no exception text, paths, environment values or stderr. Once the trusted dispatcher starts, fixed markers identify validated pre-child, helper-trust, spawn, and known live-user wrapper boundaries; a started child’s unmarked nonzero exit remains stage-free `unclassified`, timeout remains `child_timeout`, and a zero-exit child missing valid counts or its success diagnostic becomes `protocol_failure` and cannot pass. Failures before the dispatcher starts—including SSH setup—and SSH exit 255 remain unclassified. Markers preserve the original failure outcome and ordinary fixture cleanup. The direct-exec UserQA entrypoint uses `/usr/bin/env -S /usr/bin/python3.12 -I -B` so the fixed sudo command keeps isolated imports and disables bytecode writes. These diagnostics cannot establish the cause of historical runs.
 
-A failed canonical browser run writes closed reporter data beside counts. Under the QA lock, the guard validates ID, project, status, attempts and safe source locations against the immutable payload before atomically publishing `public-live-qa.<gate-id>.failure-v2.json` under `/root/.oldsparky/liveqa/diagnostics/`. Failed attempts include a closed page-error class and route; a source asset basename and bounded line/column are retained only when a stack frame matches a successfully loaded same-origin Next chunk. The afterEach hook attaches an explicit empty-or-captured result; observed empty is absent, while missing or malformed evidence is unavailable. When the 16 KiB budget drops event detail, test identities, statuses and source locations remain, and removed event data is marked unavailable/truncated. Raw error messages, stacks, full URLs or queries, DOM, attachment bytes, credentials and personal data are never persisted. The root-only directory and regular files use `0700`/`0600`; reports are capped at 16 KiB, retained seven days and at most ten records. They are private operator records, excluded from GitHub artifacts and public counts. Gate/source/app/manifest/tree/marker digests and timestamp support workflow/ledger correlation but do not cryptographically bind a GitHub run/attempt. Existing v1 records remain readable by retention. Store preparation is best effort and cannot skip the browser suite or change a passing result; when failed counts cannot be privately published, the fixed `failure_report_unavailable` marker accompanies the failed QA result and ordinary gate cleanup still runs.
+A failed canonical browser run writes two separately bounded, closed records beside counts. The reporter first writes an identity-only fallback with the gate/source/app/marker binding and each failed test ID, project, status and attempt; it contains no source locations or error detail. It then attempts the richer record. Under the QA lock, the guard validates IDs, projects, statuses, attempt counts and safe source locations against the immutable payload before atomically publishing `public-live-qa.<gate-id>.failure-v2.json` under `/root/.oldsparky/liveqa/diagnostics/`. Failed attempts include a closed page-error class and route; a source asset basename and bounded line/column are retained only when a stack frame matches a successfully loaded same-origin Next chunk. The afterEach hook attaches an explicit empty-or-captured result; observed empty is absent, while missing or malformed evidence is unavailable. When the rich record is missing or invalid but the identity fallback validates, the guard publishes a summary-only `failure-v4.json` with the fixed `rich_report_unavailable` reason and preserves the failed QA outcome. If the root-only store cannot publish a record, the trusted workflow diagnostic carries only the validated, capped identity summary and a fixed reason category; the workflow still fails. If the identity fallback is also unavailable, the diagnostic contains the fixed unavailable reason without guessed IDs. Raw error messages, stacks, full URLs or queries, DOM, attachment bytes, credentials and personal data are never persisted or projected. The root-only directory and regular files use `0700`/`0600`; reports are capped at 16 KiB, retained seven days and at most ten records. They are private operator records, excluded from GitHub artifacts and public counts. Gate/source/app/manifest/tree/marker digests and timestamp support workflow/ledger correlation but do not cryptographically bind a GitHub run/attempt. Existing v1 records remain readable by retention. Store preparation is best effort and cannot skip the browser suite or change a passing result; ordinary gate cleanup still runs after either diagnostic path.
 
 LiveUserQA failures use the same private store through `live-user-failures-v3.json` and are published before gate cleanup as `live-user-qa.<gate-id>.failure-v3.json`. The guard binds the record to the gate, source/app SHAs and marker, then validates it against the active immutable payload; this does not cryptographically bind a GitHub run or attempt. A record retains only the fixed journey ID/project, failure `status` (`failed`, `timedOut` or `interrupted`), matching `run_status` (`failed`, `timedout` or `interrupted`) and attempt, an allowlisted repository-relative `TestResult.errors[].location`, and a closed `apiJson` operation/method/status/error-kind tuple only when its candidate frame exactly matches the terminal error location. Missing, malformed or unmatched fields are `unavailable`; raw messages, stacks, URLs, IDs, request/response bodies and credentials are never persisted. Public counts and failure status remain unchanged; the private report is excluded from public artifacts and uses the same size and retention limits above.
 
@@ -316,17 +316,24 @@ shortly before the run.
 
 ### Automated tournament/bracket contour
 
-First run the complete public production-browser suite through the dedicated
-non-root supervisor. Direct production `npm run test:live`, root Playwright,
-and root Chromium are forbidden:
+Run the complete public browser suite through the dedicated non-root
+supervisor, bound to the exact deployed source's immutable LiveQA generation.
+Do not use the mutable checkout, direct `npm run test:live`, root Playwright or
+root Chromium:
 
 ```bash
-cd /root/old_sparky
-PLATFORM_APP_DIR=/opt/oldsparky/platform \
-PLATFORM_LIVE_CSP_QA_BUNDLE=/root/.oldsparky/liveqa/csp-live-qa.json \
-PLAYWRIGHT_LIVE_BASE_URL=https://old-sparky.com \
-platform/tools/platform_live_browser_qa.sh public
+set -euo pipefail
+source_sha="$(/usr/bin/python3.12 -c 'import json; from pathlib import Path; print(json.loads(Path("/opt/oldsparky/platform/current/RELEASE.json").read_text(encoding="utf-8"))["source_git_commit"])')"; install_root="/root/.oldsparky/liveqa/releases/$source_sha"
+[[ "$source_sha" = "${install_root##*/}" && -x "$install_root/platform/tools/platform_live_browser_qa.sh" ]]
+PLATFORM_APP_DIR=/opt/oldsparky/platform PLATFORM_LIVE_QA_INSTALL_ROOT="$install_root" \
+PLATFORM_LIVE_QA_TARGET_SHA="$source_sha" PLATFORM_LIVE_QA_RUNNER_SHA="$source_sha" \
+PLATFORM_LIVE_CSP_QA_BUNDLE=/root/.oldsparky/liveqa/csp-live-qa.json PLAYWRIGHT_LIVE_BASE_URL=https://old-sparky.com \
+"$install_root/platform/tools/platform_live_browser_qa.sh" public
 ```
+
+The entrypoint verifies the immutable target before acquiring the QA lock.
+Leave `PLATFORM_LIVE_QA_MARKER_SHA256` unset for a no-marker run; use the
+managed workflow when a release or launch marker is present.
 
 The browser runner reserves FD 3 only when invoked by the trusted launch
 supervisor for its bounded count/status protocol. A direct public-runner call

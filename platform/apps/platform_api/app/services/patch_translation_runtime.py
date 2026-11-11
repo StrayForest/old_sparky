@@ -60,6 +60,11 @@ _IMAGE_URL_RE = re.compile(
     r"[a-f0-9]{32,64}\.(?:avif|gif|jpe?g|png|webp)$",
     re.IGNORECASE,
 )
+_GUN_DAMAGE_SOURCE_RE = re.compile(
+    r"\b(?:base\s+)?gun[\s-]+damage\b",
+    re.IGNORECASE,
+)
+_GUN_DAMAGE_TRANSLATION_RE = re.compile(r"\bgun[\s-]+damage\b", re.IGNORECASE)
 _CACHE_PREFIX = (
     f"platform:patch-translation:{PATCH_TRANSLATION_VERSION}:{PATCH_TRANSLATION_LOCALE}:"
 )
@@ -149,7 +154,7 @@ class _TranslationProviderCallBudget:
 
 
 class _OpenAITranslationBatch(dict[str, str]):
-    """Valid in-memory translations plus IDs rejected only by placeholder checks."""
+    """Valid in-memory translations plus IDs requiring the shared correction."""
 
     def __init__(
         self,
@@ -157,10 +162,12 @@ class _OpenAITranslationBatch(dict[str, str]):
         *,
         returned_ids: list[str],
         invalid_placeholder_ids: list[str],
+        invalid_mechanic_ids: list[str] | None = None,
     ) -> None:
         super().__init__(translations)
         self.returned_ids = tuple(returned_ids)
         self.invalid_placeholder_ids = tuple(invalid_placeholder_ids)
+        self.invalid_mechanic_ids = tuple(invalid_mechanic_ids or ())
 
 
 def _iter_changes(patch: dict[str, Any]):
@@ -924,12 +931,14 @@ async def _request_openai(
             "byte-for-byte unchanged. COMPARISON MEANING: 'only N% as effective' means only N% "
             "of baseline effectiveness, not N% more effective. Preserve that fractional meaning; "
             "in Russian, wording such as 'только на N% от прежней эффективности' is appropriate.\n\n"
-            "GLOSSARY POLICY: the attached glossary is the complete authoritative English concept "
-            "to official Russian localization map for this task. Apply it semantically, not by "
+            "GLOSSARY POLICY: the attached glossary is the authoritative English-to-Russian "
+            "map for its listed canonical mechanics. Apply those entries semantically, not by "
             "exact string matching. Canonical English keys are concept anchors: spelling, case, "
             "spaces, hyphens, concatenation and normal wording variants still map to the same "
             "concept. For example Move Speed also governs Movement Speed, Movespeed, move-speed "
-            "and similar phrasing. If the source expresses a glossary concept, use the Russian "
+            "and similar phrasing. Gun Damage and Base gun damage are wording variants of the "
+            "Weapon Damage concept and use its canonical Russian glossary value. If the source "
+            "expresses a glossary concept, use the Russian "
             "value from that glossary entry; do not leave the English mechanic term untranslated "
             "and do not invent another Russian synonym. Spirit Scaling is a canonical glossary "
             "concept: use the glossary wording 'коэффициент масштабирования от спиритической "
@@ -990,13 +999,16 @@ async def _request_openai(
         request_payload["instructions"] += (
             "\n\nCORRECTION ATTEMPT: Your previous draft either changed a protected "
             "ENTITY/FACT placeholder or changed an immutable numeric/ability-tier "
-            "fact fingerprint in these source segments: "
+            "fact fingerprint or left a source-backed Gun Damage mechanic untranslated "
+            "in these source segments: "
             + ", ".join(fact_correction_ids)
             + ". Translate the same source faithfully. Keep every segment.id "
             "byte-for-byte unchanged and in the same order. Preserve every ENTITY "
             "and FACT placeholder byte-for-byte, including its exact token number; "
             "do not translate, renumber, omit or duplicate any placeholder, and do "
-            "not add numeric facts outside FACT placeholders. Preserve comparison "
+            "not add numeric facts outside FACT placeholders. Translate every "
+            "source-backed Gun Damage phrase with the canonical Weapon Damage "
+            "glossary value; do not leave 'gun damage' in English. Preserve comparison "
             "direction: 'only N% as effective' means N% of baseline effectiveness, "
             "never N% more effective. Keep percentage FACTs dimensionless; do not "
             "append m/s to them. Return the complete "
@@ -1041,6 +1053,7 @@ async def _request_openai(
     returned_ids: list[str] = []
     translated: dict[str, str] = {}
     invalid_placeholder_ids: list[str] = []
+    invalid_mechanic_ids: list[str] = []
     for segment in returned:
         if not isinstance(segment, dict):
             raise ValueError("OpenAI returned an invalid segment.")
@@ -1057,7 +1070,18 @@ async def _request_openai(
                 raise
             invalid_placeholder_ids.append(segment_id)
         else:
-            translated[segment_id] = text.strip()
+            candidate = text.strip()
+            if (
+                _GUN_DAMAGE_SOURCE_RE.search(source_by_id[segment_id])
+                and _GUN_DAMAGE_TRANSLATION_RE.search(candidate)
+            ):
+                if not collect_placeholder_failures:
+                    raise ValueError(
+                        "OpenAI left a source-backed Gun Damage mechanic untranslated."
+                    )
+                invalid_mechanic_ids.append(segment_id)
+            else:
+                translated[segment_id] = candidate
         returned_ids.append(segment_id)
     if returned_ids != expected_ids:
         raise ValueError("OpenAI changed or omitted segment ids.")
@@ -1066,6 +1090,7 @@ async def _request_openai(
             translated,
             returned_ids=returned_ids,
             invalid_placeholder_ids=invalid_placeholder_ids,
+            invalid_mechanic_ids=invalid_mechanic_ids,
         )
     return translated
 
@@ -1242,18 +1267,24 @@ async def _request_openai_batches(
     expected_id_set = set(expected_ids)
     initial_translations: dict[str, str] = {}
     invalid_placeholder_ids: set[str] = set()
+    invalid_mechanic_ids: set[str] = set()
     for (source_batch, _), result in zip(batches, batch_results, strict=True):
         batch_ids = [segment["id"] for segment in source_batch]
         batch_id_set = set(batch_ids)
         result_ids = list(result)
         invalid_ids = list(result.invalid_placeholder_ids)
+        invalid_mechanic_batch_ids = list(result.invalid_mechanic_ids)
         if (
             list(result.returned_ids) != batch_ids
             or len(invalid_ids) != len(set(invalid_ids))
+            or len(invalid_mechanic_batch_ids) != len(set(invalid_mechanic_batch_ids))
             or not set(result_ids).issubset(batch_id_set)
             or not set(invalid_ids).issubset(batch_id_set)
+            or not set(invalid_mechanic_batch_ids).issubset(batch_id_set)
             or set(result_ids).intersection(invalid_ids)
-            or set(result_ids).union(invalid_ids) != batch_id_set
+            or set(result_ids).intersection(invalid_mechanic_batch_ids)
+            or set(invalid_ids).intersection(invalid_mechanic_batch_ids)
+            or set(result_ids).union(invalid_ids, invalid_mechanic_batch_ids) != batch_id_set
         ):
             raise ValueError("Patch translation batch has an invalid segment result partition.")
         for segment_id, text in result.items():
@@ -1263,8 +1294,11 @@ async def _request_openai_batches(
         if invalid_placeholder_ids.intersection(invalid_ids):
             raise ValueError("Patch translation batches reported duplicate invalid ids.")
         invalid_placeholder_ids.update(invalid_ids)
+        if invalid_mechanic_ids.intersection(invalid_mechanic_batch_ids):
+            raise ValueError("Patch translation batches reported duplicate invalid mechanic ids.")
+        invalid_mechanic_ids.update(invalid_mechanic_batch_ids)
 
-    if set(initial_translations).union(invalid_placeholder_ids) != expected_id_set:
+    if set(initial_translations).union(invalid_placeholder_ids, invalid_mechanic_ids) != expected_id_set:
         raise ValueError("Patch translation batch merge is missing source ids.")
 
     source_by_id = {segment["id"]: segment["text"] for segment in source_segments}
@@ -1289,7 +1323,7 @@ async def _request_openai_batches(
         return restored_by_id, invalid_fact_ids
 
     _, invalid_fact_ids = restore_all(initial_translations)
-    correction_id_set = invalid_placeholder_ids.union(invalid_fact_ids)
+    correction_id_set = invalid_placeholder_ids.union(invalid_mechanic_ids, invalid_fact_ids)
     correction_ids = [segment_id for segment_id in expected_ids if segment_id in correction_id_set]
     if correction_ids:
         corrected = await _request_openai_with_budget(

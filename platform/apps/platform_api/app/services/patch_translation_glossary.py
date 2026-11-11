@@ -11,6 +11,7 @@ CanonicalGlossary = dict[str, tuple[str, ...]]
 # hero/item/ability names or property-specific combinations.
 CANONICAL_GLOSSARY: CanonicalGlossary = {
     "Weapon Damage": ("Урон от оружия",),
+    "Gun Damage": ("Урон от оружия",),
     "Bullet Damage": ("Урон от пуль",),
     "Spirit Damage": ("Спиритический урон",),
     "Melee Damage": ("Урон в ближнем бою",),

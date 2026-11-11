@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
+from typing import Any
+from unittest.mock import patch as mock_patch
 
 from apps.platform_api.app.services import patch_translation as translation
 from apps.platform_api.app.services import patch_translation_runtime as runtime
+from python_packages.platform_infra.config import PlatformSettings
 
 
 class PatchTranslationRealRegressionTests(unittest.TestCase):
@@ -70,6 +74,7 @@ class PatchTranslationRealRegressionTests(unittest.TestCase):
 
     def test_latest_patch_regression_concepts_are_covered_by_glossary(self) -> None:
         expected = {
+            "Gun Damage": "Урон от оружия",
             "Move Speed": "Скорость передвижения",
             "Sprint Speed": "Скорость бега",
             "Fire Rate": "Скорострельность",
@@ -88,6 +93,83 @@ class PatchTranslationRealRegressionTests(unittest.TestCase):
 
         for source, target in expected.items():
             self.assertEqual(translation.CANONICAL_GLOSSARY[source], (target,))
+
+        self.assertEqual(
+            translation.CANONICAL_GLOSSARY["Gun Damage"],
+            translation.CANONICAL_GLOSSARY["Weapon Damage"],
+        )
+
+        patch = {
+            "sections": [{
+                "kind": "hero",
+                "title": "Abrams",
+                "hero_name": "Abrams",
+                "changes": ["Base gun damage increased by 5%."],
+                "abilities": [],
+            }],
+        }
+        catalog = {
+            "heroes": {
+                "hero_atlas": {
+                    "class_name": "hero_atlas",
+                    "name": "Abrams",
+                    "abilities": {},
+                }
+            },
+            "items": {},
+            "ranks": {},
+        }
+        prepared, entity_maps, fact_maps = runtime._prepare_segments(patch, catalog)
+        source_segments = runtime.extract_translation_segments(patch)
+        segment_id = source_segments[0]["id"]
+        self.assertIn("Base gun damage increased by", prepared[0]["text"])
+        self.assertNotIn("Gun Damage", entity_maps[segment_id].values())
+        self.assertEqual(fact_maps[segment_id], {"[[FACT_0000]]": "5%"})
+
+        async def translate_with_glossary_alias() -> dict[str, str]:
+            calls = 0
+
+            async def provider_stub(**kwargs: Any) -> runtime._OpenAITranslationBatch:
+                nonlocal calls
+                calls += 1
+                self.assertEqual(
+                    kwargs["glossary"]["Gun Damage"],
+                    ["Урон от оружия"],
+                )
+                self.assertEqual(kwargs["segments"][0]["id"], segment_id)
+                if calls == 1:
+                    self.assertTrue(kwargs["collect_placeholder_failures"])
+                    return runtime._OpenAITranslationBatch(
+                        {},
+                        returned_ids=[segment_id],
+                        invalid_placeholder_ids=[],
+                        invalid_mechanic_ids=[segment_id],
+                    )
+                self.assertEqual(kwargs["fact_correction_ids"], [segment_id])
+                self.assertFalse(kwargs["collect_placeholder_failures"])
+                return runtime._OpenAITranslationBatch(
+                    {segment_id: "Базовый урон от оружия увеличен на [[FACT_0000]]."},
+                    returned_ids=[segment_id],
+                    invalid_placeholder_ids=[],
+                )
+
+            with mock_patch.object(runtime, "_request_openai", side_effect=provider_stub):
+                return await runtime._request_openai_batches(
+                    patch_id="1847920302240420",
+                    source_segments=source_segments,
+                    prepared_segments=prepared,
+                    glossary=runtime._glossary_payload(translation.CANONICAL_GLOSSARY),
+                    settings=PlatformSettings(),
+                    entity_replacements=entity_maps,
+                    fact_replacements=fact_maps,
+                    call_budget=runtime._TranslationProviderCallBudget(),
+                )
+
+        restored = asyncio.run(translate_with_glossary_alias())
+        self.assertEqual(
+            restored[segment_id],
+            "Базовый урон от оружия увеличен на 5%.",
+        )
 
     def test_known_collision_set_stays_explicit_and_minimal(self) -> None:
         self.assertEqual(

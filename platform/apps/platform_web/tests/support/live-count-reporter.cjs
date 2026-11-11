@@ -8,6 +8,8 @@ const path = require("node:path");
 const MAX_TESTS = 4096;
 const MAX_REPORT_BYTES = 1024;
 const MAX_FAILURE_REPORT_BYTES = 16 * 1024;
+const MAX_FAILURE_IDENTITY_REPORT_BYTES = 16 * 1024;
+const MAX_FAILURE_IDENTITY_RECORDS = 128;
 // The guard adds three fixed metadata fields (two 64-char digests and a
 // 20-char UTC timestamp) before durable publication. Keep a little headroom
 // beyond their measured 219-byte JSON envelope while retaining the 16 KiB
@@ -24,6 +26,7 @@ const MAX_TRACKED_NEXT_SCRIPTS = 256;
 const MAX_ATTEMPTS = 32768;
 const GATE_ROOT = "/run/oldsparky-liveqa";
 const FAILURE_REPORT_FILE = "live-failures-v2.json";
+const FAILURE_IDENTITY_REPORT_FILE = "live-failure-identities-v1.json";
 const LIVE_USER_FAILURE_REPORT_FILE = "live-user-failures-v3.json";
 const PAGE_ERROR_ATTACHMENT_NAME = "live-pageerror-evidence-v1";
 const LIVE_USER_API_FAILURE_ATTACHMENT_NAME = "live-user-api-failure-v1";
@@ -264,11 +267,23 @@ function expectedPublicSkip(test) {
     && annotations[0].description.endsWith(`:${project}`);
 }
 
+function publicFailureIdentityMappingIsComplete() {
+  if (PUBLIC_TEST_IDS.size !== PUBLIC_TEST_TITLES.size) return false;
+  const ids = [...PUBLIC_TEST_IDS.values()];
+  if (new Set(ids).size !== ids.length) return false;
+  return [...PUBLIC_TEST_TITLES].every((title) => PUBLIC_TEST_IDS.has(title));
+}
+
+function publicTestTitles() {
+  return [...PUBLIC_TEST_TITLES];
+}
+
 function publicCoverageIsComplete(tests, logical) {
   if (
     tests.length !== PUBLIC_LOGICAL_TOTAL
     || logical.skip < 6
     || logical.skip > 10
+    || !publicFailureIdentityMappingIsComplete()
   ) return false;
   const seen = new Set();
   for (const test of tests) {
@@ -278,6 +293,7 @@ function publicCoverageIsComplete(tests, logical) {
     if (
       typeof test.title !== "string"
       || !PUBLIC_TEST_TITLES.has(test.title)
+      || !PUBLIC_TEST_IDS.has(test.title)
       || !PUBLIC_PROJECTS.has(project)
     ) return false;
     const key = `${project}:${test.title}`;
@@ -1247,6 +1263,112 @@ function writeBoundedFailureSummary(
   }
 }
 
+function writeBoundedFailureIdentitySummary(
+  binding,
+  suite,
+  summary,
+  { gateRoot = GATE_ROOT } = {},
+) {
+  if (!binding || !summary || !suite || typeof suite.allTests !== "function") return false;
+  const gateName = path.basename(binding.gate);
+  if (
+    path.dirname(binding.gate) !== gateRoot
+    || !PUBLIC_GATE_NAME.test(gateName)
+    || !RUN_STATUSES.has(summary.run_status)
+    || !SHA40.test(binding.source_sha || "")
+    || !SHA40.test(binding.app_sha || "")
+    || !SHA64.test(binding.marker_sha256 || "")
+  ) return false;
+  const tests = suite.allTests();
+  if (
+    !Array.isArray(tests)
+    || tests.length > MAX_TESTS
+    || !summary.logical
+    || !publicCoverageIsComplete(tests, summary.logical)
+  ) return false;
+
+  const failures = [];
+  let attempts = 0;
+  for (const test of tests) {
+    if (!test || !Array.isArray(test.results)) return false;
+    const project = typeof test.parent?.project === "function"
+      ? test.parent.project()?.name
+      : undefined;
+    const id = typeof test.title === "string" ? PUBLIC_TEST_IDS.get(test.title) : undefined;
+    if (!id || !PUBLIC_PROJECTS.has(project)) return false;
+    for (const result of test.results) {
+      attempts += 1;
+      if (attempts > MAX_ATTEMPTS) return false;
+      if (!FAILURE_ATTEMPT_STATUSES.has(result?.status)) continue;
+      failures.push({ id, project, status: result.status, attempt: attemptsForTest(test, result) });
+      if (failures.length > MAX_FAILURE_IDENTITY_RECORDS) return false;
+    }
+  }
+  if (failures.length === 0) return false;
+
+  let rootMetadata;
+  let gateMetadata;
+  let resultsMetadata;
+  try {
+    rootMetadata = fs.lstatSync(gateRoot);
+    gateMetadata = fs.lstatSync(binding.gate);
+    resultsMetadata = fs.lstatSync(path.join(binding.gate, "test-results"));
+  } catch {
+    return false;
+  }
+  if (
+    !rootMetadata.isDirectory()
+    || rootMetadata.isSymbolicLink()
+    || rootMetadata.uid !== 0
+    || (rootMetadata.mode & 0o777) !== 0o711
+    || fs.realpathSync(gateRoot) !== gateRoot
+    || !gateMetadata.isDirectory()
+    || gateMetadata.isSymbolicLink()
+    || gateMetadata.uid !== process.geteuid()
+    || (gateMetadata.mode & 0o777) !== 0o700
+    || !resultsMetadata.isDirectory()
+    || resultsMetadata.isSymbolicLink()
+    || resultsMetadata.uid !== process.geteuid()
+    || (resultsMetadata.mode & 0o777) !== 0o700
+  ) return false;
+
+  const payload = {
+    schema: 1,
+    gate: gateName,
+    source_sha: binding.source_sha,
+    app_sha: binding.app_sha,
+    marker_sha256: binding.marker_sha256,
+    run_status: summary.run_status,
+    failures,
+  };
+  const bytes = Buffer.from(`${JSON.stringify(payload)}\n`, "ascii");
+  if (bytes.length > MAX_FAILURE_IDENTITY_REPORT_BYTES) return false;
+  const output = path.join(binding.gate, "test-results", FAILURE_IDENTITY_REPORT_FILE);
+  let fd;
+  try {
+    fd = fs.openSync(
+      output,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL
+        | (fs.constants.O_NOFOLLOW ?? 0),
+      0o600,
+    );
+    const metadata = fs.fstatSync(fd);
+    if (
+      !metadata.isFile()
+      || metadata.nlink !== 1
+      || metadata.uid !== process.geteuid()
+      || (metadata.mode & 0o777) !== 0o600
+    ) return false;
+    fs.writeFileSync(fd, bytes);
+    fs.fsyncSync(fd);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
 function attemptsForTest(test, result) {
   return test.results.indexOf(result) + 1;
 }
@@ -1267,6 +1389,14 @@ class LiveCountReporter {
     const liveUserGate = binding !== null && LIVE_USER_GATE_NAME.test(path.basename(binding.gate));
     const summary = summarizeRun(this.suite, result?.status, { publicGate });
     if (publicGate && summary) {
+      try {
+        writeBoundedFailureIdentitySummary(binding, this.suite, summary, {
+          gateRoot: this.gateRoot,
+        });
+      } catch {
+        // The independent closed identity record is best effort; it never
+        // changes the count result or prevents the richer report attempt.
+      }
       try {
         writeBoundedFailureSummary(binding, this.suite, summary, {
           gateRoot: this.gateRoot,
@@ -1304,6 +1434,9 @@ module.exports.summarizeRun = summarizeRun;
 module.exports.bindingsFromEnvironment = bindingsFromEnvironment;
 module.exports.writeBoundedSummary = writeBoundedSummary;
 module.exports.writeBoundedFailureSummary = writeBoundedFailureSummary;
+module.exports.writeBoundedFailureIdentitySummary = writeBoundedFailureIdentitySummary;
+module.exports.publicFailureIdentityMappingIsComplete = publicFailureIdentityMappingIsComplete;
+module.exports.publicTestTitles = publicTestTitles;
 module.exports.writeBoundedLiveUserFailureSummary = writeBoundedLiveUserFailureSummary;
 module.exports.createPageErrorAttachment = createPageErrorAttachment;
 module.exports.createLiveUserApiFailureAttachment = createLiveUserApiFailureAttachment;

@@ -1154,8 +1154,18 @@ def _validate_runtime_source(
     ]
     if not attested_provider_recovery:
         required.append("web/tests/smoke/live-launch.spec.ts")
+    launch_spec_path = root / "web/tests/smoke/live-launch.spec.ts"
+    if not attested_provider_recovery:
+        _regular(launch_spec_path)
+    needs_patch_acceptance = (
+        not attested_provider_recovery
+        and launch_spec_path.is_file()
+        and b"../support/patch-acceptance" in launch_spec_path.read_bytes()
+    )
     if not legacy_reporter_runtime and not attested_provider_recovery:
         required.append("web/tests/support/live-count-reporter.cjs")
+    if needs_patch_acceptance:
+        required.append("web/tests/support/patch-acceptance.ts")
     for relative in required:
         path = root / relative
         _regular(path, allow_sandbox=relative == RUNTIME_SANDBOX_RELATIVE.as_posix())
@@ -1171,6 +1181,8 @@ def _validate_runtime_source(
         allowed_web_files.add("web/tests/smoke/live-launch.spec.ts")
     if not legacy_reporter_runtime and not attested_provider_recovery:
         allowed_web_files.add("web/tests/support/live-count-reporter.cjs")
+    if needs_patch_acceptance:
+        allowed_web_files.add("web/tests/support/patch-acceptance.ts")
     if not attested_provider_recovery:
         allowed_web_files.add("web/tests/support/live-engine-preflight.cjs")
     allowed_package_roots = (
@@ -1348,6 +1360,10 @@ def _validate_runtime_source(
             "web/tests/support/live-qa-origin.ts",
             "web/tests/support/live-qa-sandbox.ts",
         }
+        if b"../support/patch-acceptance" in (
+            root / "web/tests/smoke/live-launch.spec.ts"
+        ).read_bytes():
+            required_suite.add("web/tests/support/patch-acceptance.ts")
         if not legacy_reporter_runtime:
             required_suite.add("web/tests/support/live-count-reporter.cjs")
         if source_only_v3:
@@ -1364,6 +1380,11 @@ def _validate_runtime_source(
     required_runtime_files = set(RUNTIME_REQUIRED_FILES)
     if attested_provider_recovery:
         required_runtime_files.discard("web/tests/support/live-count-reporter.cjs")
+    else:
+        launch_spec_path = root / "web/tests/smoke/live-launch.spec.ts"
+        _regular(launch_spec_path)
+        if b"../support/patch-acceptance" in launch_spec_path.read_bytes():
+            required_runtime_files.add("web/tests/support/patch-acceptance.ts")
     for relative in required_runtime_files:
         _regular(root / relative, allow_sandbox=relative == RUNTIME_SANDBOX_RELATIVE.as_posix())
     for browser_root in RUNTIME_BROWSER_ROOTS:
@@ -1436,6 +1457,7 @@ def _validate_engine_root(
                 "web/tests/support/live-qa-origin.ts",
                 "web/tests/support/live-qa-sandbox.ts",
                 "web/tests/support/live-count-reporter.cjs",
+                "web/tests/support/patch-acceptance.ts",
                 "web/tests/support/live-engine-preflight.cjs",
             }
         )

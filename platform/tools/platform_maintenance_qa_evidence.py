@@ -192,9 +192,10 @@ LAUNCH_REPORT_KEYS = frozenset(
         "flaky_test_count", "skipped_test_count", "interrupted_test_count",
         "logical_counts", "attempt_counts", "tests", "class_counts",
         "route_class_counts", "status_counts", "error_class_counts",
-        "child_diagnostic",
+        "child_diagnostic", "browser_failure_metadata",
     }
 )
+LEGACY_LAUNCH_REPORT_KEYS = LAUNCH_REPORT_KEYS - {"browser_failure_metadata"}
 USER_REPORT_KEYS = frozenset(
     {
         "schema", "source_git_sha", "app_target_sha", "source_binding_sha256",
@@ -857,7 +858,7 @@ def validate_live_launch_report(
     report: dict[str, Any], expected_runner_sha: str, expected_app_target_sha: str
 ) -> None:
     if (
-        set(report) != LAUNCH_REPORT_KEYS
+        frozenset(report) not in {LAUNCH_REPORT_KEYS, LEGACY_LAUNCH_REPORT_KEYS}
         or type(report.get("schema")) is not int
         or report.get("schema") != 1
         or report.get("source_git_sha") != expected_runner_sha
@@ -873,6 +874,7 @@ def validate_live_launch_report(
         or type(report.get("child_exit_code")) is not int
         or report.get("truncated") is not False
         or report.get("tests") != []
+        or report.get("browser_failure_metadata") is not None
     ):
         _fail()
     for field in (

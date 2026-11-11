@@ -361,12 +361,24 @@ LIVE_USER_QA_OPERATION_TIMEOUT_SECONDS = 2400.0
 LIVE_LAUNCH_OPERATION_TIMEOUT_SECONDS = 300.0
 CHILD_TERMINATION_GRACE_SECONDS = 5.0
 LIVE_LAUNCH_STATUS_MAX_BYTES = 256
-LIVE_LAUNCH_STREAM_MAX_BYTES = 4096
-LIVE_LAUNCH_PROTOCOL_MAX_BYTES = 1024
+LIVE_LAUNCH_STREAM_MAX_BYTES = 20 * 1024
+LIVE_LAUNCH_PROTOCOL_MAX_BYTES = LIVE_LAUNCH_STREAM_MAX_BYTES
 LIVE_QA_DIAGNOSTIC_LINE_MAX_BYTES = 512
+LIVE_LAUNCH_FAILURE_SUMMARY_MAX_TOKEN_CHARS = 16 * 1024
 LIVE_QA_DIAGNOSTIC_BYTE_COUNT_MAX = 9_999_999_999_999_999
+LIVE_LAUNCH_FAILURE_SUMMARY_IDS = frozenset(
+    {
+        "route_root_overflow", "route_info_overflow", "route_tournaments_overflow",
+        "route_tournaments_new_overflow", "route_profile_me_overflow",
+        "route_profile_lisalexy_overflow", "chromium_sandbox", "csp_nonce_rotation",
+        "csp_negative_probes", "tournament_hub", "tournament_catalog_containment",
+        "tournament_detail_bracket", "admin_anonymous_protection", "home_steps_overflow",
+        "contact_recipient_privacy", "objective_icons", "patch_owner_sections",
+        "analytics_csp", "image_csp_hosts",
+    }
+)
 LIVE_QA_DIAGNOSTIC_RE = re.compile(
-    rb"LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=(?P<kind>none|playwright_cli_usage|"
+    rb"LIVE_QA_CHILD_DIAGNOSTIC schema=(?P<schema>1|2) kind=(?P<kind>none|playwright_cli_usage|"
     rb"node_module_missing|browser_executable_missing|browser_launch_error|"
     rb"child_timeout|cleanup_failure|failure_report_unavailable|unclassified|"
     rb"dispatch_failure|protocol_failure)"
@@ -378,7 +390,9 @@ LIVE_QA_DIAGNOSTIC_RE = re.compile(
     rb"live_identity|marker_digest|child_protocol|cleanup))? "
     rb"stdout_bytes=(?P<stdout_bytes>[0-9]{1,16}) "
     rb"stderr_bytes=(?P<stderr_bytes>[0-9]{1,16}) "
-    rb"truncated=(?P<truncated>true|false) child_exit=(?P<child_exit>[0-9]{1,3})\n"
+    rb"truncated=(?P<truncated>true|false) child_exit=(?P<child_exit>[0-9]{1,3})"
+    rb"(?: failure_reason=(?P<failure_reason>identity_summary_unavailable|private_store_unavailable) "
+    rb"failure_summary=(?P<failure_summary>[A-Za-z0-9_-]{1,16384}|none))?\n"
 )
 LIVE_QA_DISPATCH_FAILURE_CHECKS = {
     "validation": frozenset(
@@ -401,6 +415,19 @@ LIVE_QA_DISPATCH_FAILURE_CHECKS = {
 def _valid_live_qa_diagnostic(line: bytes, child_status: int) -> bool:
     match = LIVE_QA_DIAGNOSTIC_RE.fullmatch(line)
     if match is None:
+        return False
+    schema = match.group("schema")
+    reason = match.group("failure_reason")
+    summary = match.group("failure_summary")
+    if schema == b"1" and (reason is not None or summary is not None):
+        return False
+    if schema == b"2" and (
+        match.group("kind") != b"failure_report_unavailable"
+        or reason is None
+        or summary is None
+        or (summary == b"none" and reason != b"identity_summary_unavailable")
+        or (summary != b"none" and reason != b"private_store_unavailable")
+    ):
         return False
     diagnostic_child_exit = int(match.group("child_exit"))
     if diagnostic_child_exit != child_status and not (
@@ -2986,6 +3013,83 @@ def _parse_live_launch_protocol(
     return status, counts
 
 
+def _valid_browser_failure_summary(
+    diagnostic: bytes,
+    counts: dict[str, object] | None,
+    *,
+    expected_sha: str,
+    expected_app_sha: str,
+    expected_marker_sha256: str,
+) -> bool:
+    match = LIVE_QA_DIAGNOSTIC_RE.fullmatch(diagnostic)
+    if match is None or match.group("schema") != b"2":
+        return True
+    token = match.group("failure_summary")
+    if token is None:
+        return False
+    if token == b"none":
+        return match.group("failure_reason") == b"identity_summary_unavailable"
+    if counts is None or len(token) > LIVE_LAUNCH_FAILURE_SUMMARY_MAX_TOKEN_CHARS:
+        return False
+    try:
+        decoded = base64.urlsafe_b64decode(token + b"=" * ((4 - len(token) % 4) % 4))
+
+        def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            result: dict[str, object] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate summary key")
+                result[key] = value
+            return result
+
+        payload = json.loads(decoded.decode("ascii"), object_pairs_hook=unique_object)
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {
+            "schema", "gate", "source_sha", "app_sha", "marker_sha256",
+            "run_status", "failure_reason", "failures",
+        }
+        or type(payload.get("schema")) is not int
+        or payload.get("schema") != 1
+        or not isinstance(payload.get("gate"), str)
+        or re.fullmatch(r"public-live-qa\.[a-z0-9_]{8}", payload["gate"]) is None
+        or payload.get("source_sha") != expected_sha
+        or payload.get("app_sha") != expected_app_sha
+        or payload.get("marker_sha256") != expected_marker_sha256
+        or payload.get("run_status") != counts.get("run_status")
+        or payload.get("failure_reason") != "private_store_unavailable"
+        or match.group("failure_reason") != b"private_store_unavailable"
+        or not isinstance(payload.get("failures"), list)
+        or not 1 <= len(payload["failures"]) <= 128
+    ):
+        return False
+    seen: set[tuple[str, str, str, int]] = set()
+    status_counts = {"failed": 0, "interrupted": 0, "timedOut": 0}
+    for failure in payload["failures"]:
+        if (
+            not isinstance(failure, list)
+            or len(failure) != 4
+            or failure[0] not in LIVE_LAUNCH_FAILURE_SUMMARY_IDS
+            or failure[1] not in {"live-desktop", "live-mobile", "live-webkit-mobile"}
+            or failure[2] not in status_counts
+            or type(failure[3]) is not int
+            or not 1 <= failure[3] <= 32768
+        ):
+            return False
+        key = (failure[0], failure[1], failure[2], failure[3])
+        if key in seen:
+            return False
+        seen.add(key)
+        status_counts[failure[2]] += 1
+    return status_counts == {
+        "failed": counts["attempt_fail"],
+        "interrupted": counts["attempt_interrupted"],
+        "timedOut": counts["attempt_timedout"],
+    }
+
+
 def _extract_live_qa_diagnostic(output: bytes) -> tuple[bytes, bytes | None] | None:
     """Remove one exact diagnostic marker while keeping the status protocol strict."""
 
@@ -3116,6 +3220,18 @@ def _wait_for_live_launch_status(
                 expected_app_sha=expected_app_sha,
                 expected_marker_sha256=expected_marker_sha256,
             )
+        if (
+            parsed is not None
+            and child_diagnostic is not None
+            and not _valid_browser_failure_summary(
+                child_diagnostic,
+                parsed[1],
+                expected_sha=expected_sha,
+                expected_app_sha=expected_app_sha,
+                expected_marker_sha256=expected_marker_sha256,
+            )
+        ):
+            parsed = None
         if parsed is not None and child_diagnostic is not None:
             diagnostic_match = LIVE_QA_DIAGNOSTIC_RE.fullmatch(child_diagnostic)
             if diagnostic_match is not None and diagnostic_match.group("kind") == b"failure_report_unavailable":

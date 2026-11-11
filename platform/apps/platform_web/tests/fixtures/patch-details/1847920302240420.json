@@ -1670,18 +1670,7 @@
         "Base bullet damage reduced from 35 to 32",
         "Bullet damage growth per boon increased from 0.52 to 0.61"
       ],
-      "abilities": [
-        {
-          "name": "Bookwyrm",
-          "display_name": "Книжный змей",
-          "description": null,
-          "presentation_kind": "balance",
-          "stats": [],
-          "stats_pending": false,
-          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/bookworm/bookworm_dragon.png",
-          "changes": []
-        }
-      ]
+      "abilities": []
     },
     {
       "kind": "hero",

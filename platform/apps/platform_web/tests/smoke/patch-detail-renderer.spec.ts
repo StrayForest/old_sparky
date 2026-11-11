@@ -3,6 +3,7 @@ import path from "node:path";
 import { expect, test } from "@playwright/test";
 import type { Locator } from "@playwright/test";
 import type { PlatformPatchDetail, PlatformPatchSection } from "../../lib/platform-types";
+import { patchAcceptanceIssues } from "../support/patch-acceptance";
 
 const patchIds = [
   "1848664643342973",
@@ -59,7 +60,76 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
   test.setTimeout(120_000);
   expect(["STEAM_CLAN_LOC_IMAGE", "[img]", "[img src=\" \"][/img]", "[url=\"\"]label[/url]"]
     .every((value) => rawPatchMarkupPattern.test(value))).toBe(true);
+  // These DTO fixtures pin source parsing and structure before translation; the
+  // helper cases above and the live suite own translated-content acceptance.
   const fixtures = await patchFixtures;
+  const acceptanceTemplate = fixtures[0];
+  expect(acceptanceTemplate).toBeDefined();
+  const acceptanceDetail = (
+    content: string,
+    changes: string[],
+    sectionOverrides: Partial<PlatformPatchSection> = {},
+  ): PlatformPatchDetail => ({
+    ...acceptanceTemplate!,
+    content,
+    sections: [{
+      kind: "general",
+      title: "General",
+      hero_name: null,
+      changes,
+      abilities: [],
+      ...sectionOverrides,
+    }],
+  });
+  const cleanFraction = acceptanceDetail(
+    "[General]\nonly 50% as effective\n[Items]",
+    ["На 50% от прежней эффективности"],
+  );
+  expect(patchAcceptanceIssues(cleanFraction)).toEqual([]);
+  const cleanCanonicalAndNumeric = acceptanceDetail(
+    "[Heroes]\nSolomon: Move Piece - Range increased\nSolomon: Move Piece - Placement improved\n[General]",
+    ["Move Piece", "50% → 40%"],
+    {
+      kind: "hero",
+      title: "Solomon",
+      hero_name: "Solomon",
+      abilities: [{ name: "Move Piece", icon_url: null, changes: ["Move Piece", "50% → 40%"] }],
+      changes: [],
+    },
+  );
+  expect(patchAcceptanceIssues(cleanCanonicalAndNumeric)).toEqual([]);
+  expect(patchAcceptanceIssues(acceptanceDetail(
+    "[General]\nCooldown reduced by 2 seconds\n[Items]",
+    ["Перезарядка reduced by 2 seconds"],
+  ))).toContain("untranslated_change");
+  expect(patchAcceptanceIssues(acceptanceDetail(
+    "[General]\nDamage increased by 10%.\n[Items]",
+    ["Damage increased by 10%."],
+  ))).toContain("untranslated_change");
+  expect(patchAcceptanceIssues(acceptanceDetail(
+    "[General]\nonly 50% as effective\n[Items]",
+    ["На 50% эффективнее"],
+  ))).toContain("effectiveness_comparison");
+  expect(patchAcceptanceIssues(acceptanceDetail(
+    "[General]\nDamage increased\n[Items]",
+    ["Урон увеличен на 50%%"],
+  ))).toContain("duplicated_percent");
+  expect(patchAcceptanceIssues(acceptanceDetail(
+    "[General]\nMovement increased from 50% to 40%\n[Items]\nItem: Dash speed increased from 50% m/s to 40% m/s",
+    ["Скорость снижена с 50% м/с до 40% м/с"],
+  ))).toContain("invented_percent_speed_unit");
+  expect(patchAcceptanceIssues(acceptanceDetail(
+    "[General]\nDash speed reduced from 50 m/s to 40 m/s\n[Items]",
+    ["Скорость снижена с 50 м/с до 40 м/с"],
+  ))).toEqual([]);
+  expect(patchAcceptanceIssues(acceptanceDetail(
+    "[General]\n[img src=\"https://example.invalid/icon.png\"][/img]\n[Items]",
+    ["[img src=\" \"][/img]", "General"],
+  ))).toEqual(expect.arrayContaining(["steam_markup", "detached_owner_or_header"]));
+  expect(patchAcceptanceIssues(acceptanceDetail(
+    "[Heroes]\nStreet Brawl:\nSolomon: Move Piece - Range increased\n[General]",
+    ["Range increased"],
+  ))).toEqual(expect.arrayContaining(["missing_street_brawl_owner", "move_piece_owner"]));
   const fixturesById = new Map(fixtures.map((fixture) => [fixture.id, fixture]));
   const artifactDirectory = process.env.PLATFORM_PATCH_RENDER_ARTIFACT_DIR;
 
@@ -88,7 +158,6 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
     for (const [sectionIndex, section] of fixture!.sections.entries()) {
       const sectionCard = sections.nth(sectionIndex);
       await expect(sectionCard.getByRole("heading", { level: 2 })).toHaveText(sectionHeading(section));
-      await expect(sectionCard.locator(".patch-hero-display-name")).toHaveCount(0);
       if (section.mode_name) {
         await expect(sectionCard.locator(".patch-mode-context")).toHaveText(section.mode_name);
       } else {

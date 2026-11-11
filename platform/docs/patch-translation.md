@@ -25,13 +25,17 @@ one delayed automatic retry after 15 minutes when its error is a known network
 or timeout failure and its attempt count is below the fixed retry limit. Other
 failures remain durable and do not incur repeated model calls.
 
-The translation version configured in this source tree is `ru-v14`, defined in
+The translation version configured in this source tree is `ru-v15`, defined in
 `apps/platform_api/app/services/patch_translation_config.py`. It includes the
 durable DB-first state, the reviewed ambiguity handling and the immutable
 numeric/tier validation described below. It gathers typed ENTITY/FACT
 placeholder failures, numeric-fact mismatches and the reviewed effectiveness
 comparison failure across the initial batches before using the single shared
 follow-up request. That request contains only the affected stable segment IDs.
+`Gun Damage` and `Base gun damage` are explicit wording aliases for the
+canonical `Weapon Damage` concept and use its checked-in Russian glossary
+value; the application does not infer a different mechanic from the word
+“gun.”
 The four-patch regression procedure
 and its historical evidence live in
 [`archive/patch-translation-qa-2026-08-22.md`](archive/patch-translation-qa-2026-08-22.md).
@@ -137,9 +141,12 @@ The glossary intentionally does **not** contain:
 - narrow combinations such as `Cooldown Per Headshot NPC`, `Move Speed per Stack`, or `Ambush Spirit Power`;
 - a generated alias list for spelling/wording variants.
 
-There is no runtime glossary discovery, network fetch, Redis glossary cache or per-request glossary filtering. Changing glossary terminology is a normal reviewed code change.
+There is no runtime glossary discovery, network fetch, Redis glossary cache or
+per-request glossary filtering. A small number of demonstrated wording aliases
+may be explicit glossary keys that point to the same canonical Russian value.
+Changing glossary terminology is a normal reviewed code change.
 
-The entire canonical glossary is sent with every translation request because it is deliberately small. An English key is a **semantic concept anchor**, not an exact-match trigger. For example, `Move Speed` also governs semantically equivalent source wording such as `Movement Speed`, `Movespeed`, `move-speed` and similar phrasing. The model is responsible for semantic matching; the application does not maintain an alias table.
+The entire canonical glossary is sent with every translation request because it is deliberately small. An English key is a **semantic concept anchor**, not an exact-match trigger. For example, `Move Speed` also governs semantically equivalent source wording such as `Movement Speed`, `Movespeed` and `move-speed`; the demonstrated `Gun Damage` wording is explicitly mapped to `Weapon Damage` because it names the same mechanic in the source. Keep aliases narrow and evidence-based; do not add a general generated alias table.
 
 Compound wording must retain the mechanic family. For example, `Bullet, Spirit and Melee Lifesteal` represents `Bullet Lifesteal`, `Spirit Lifesteal` and `Melee Lifesteal`; it must never be reinterpreted as resistance terminology.
 

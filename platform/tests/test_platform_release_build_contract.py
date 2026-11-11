@@ -43,6 +43,7 @@ from tools import platform_configure_shared_env
 from tools import platform_build_node_cache
 from tools import platform_storage_maintenance
 from tools import platform_live_qa_guard
+from tools import platform_build_live_qa_runtime
 from tools import platform_test_catalog
 from tools import platform_release_venv_capacity as venv_capacity
 from tools import platform_validate_release_artifact as artifact_validator
@@ -775,13 +776,15 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             "tests/support/live-qa-origin.ts",
             "tests/support/live-qa-sandbox.ts",
             "tests/support/live-count-reporter.cjs",
+            "tests/support/patch-acceptance.ts",
             "tests/support/live-engine-preflight.cjs",
             "package-lock.json",
         ):
             source = REPO_ROOT / "platform/apps/platform_web" / relative
             payload = (
                 source.read_bytes()
-                if relative.startswith("tests/support/live-")
+                if relative == "tests/smoke/live-launch.spec.ts"
+                or relative.startswith("tests/support/")
                 else relative.encode("ascii")
             )
             cls._write_fixture_file(web / relative, payload)
@@ -924,8 +927,23 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             self.assertFalse((output / "web/node_modules").exists())
             self.assertIn("web/tests/smoke/live-launch.spec.ts", manifest["suite_files"])
             self.assertIn(
+                "web/tests/support/patch-acceptance.ts", manifest["suite_files"]
+            )
+            self.assertIn(
                 "web/tests/support/live-engine-preflight.cjs", manifest["suite_files"]
             )
+            self.assertIn(
+                "web/tests/support/patch-acceptance.ts", manifest["suite_files"]
+            )
+            with self.assertRaises(platform_build_live_qa_runtime.RuntimeBuildError):
+                platform_build_live_qa_runtime.validate_runtime_source_imports(
+                    web_root=platform_root / "apps/platform_web",
+                    source_files=tuple(
+                        relative
+                        for relative in platform_build_live_qa_runtime.RUNTIME_SOURCE_FILES
+                        if relative != "tests/support/patch-acceptance.ts"
+                    ),
+                )
             self.assertEqual(
                 platform_live_qa_runtime_install._validate_runtime_source(output)["version"],
                 3,

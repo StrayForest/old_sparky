@@ -55,10 +55,12 @@ LIVE_QA_CHILD_CAPTURE_TIMEOUT_SECONDS = 300.0
 LIVE_USER_BROWSER_TIMEOUT_SECONDS = 1500.0
 LIVE_QA_CHILD_CAPTURE_BYTES = 64 * 1024
 LIVE_QA_CHILD_MARKER_RE = re.compile(
-    r"LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=(none|playwright_cli_usage|"
+    r"LIVE_QA_CHILD_DIAGNOSTIC schema=(1|2) kind=(none|playwright_cli_usage|"
     r"node_module_missing|browser_executable_missing|browser_launch_error|"
     r"child_timeout|cleanup_failure|failure_report_unavailable|unclassified) stdout_bytes=([0-9]{1,16}) "
-    r"stderr_bytes=([0-9]{1,16}) truncated=(true|false) child_exit=([0-9]{1,3})\n"
+    r"stderr_bytes=([0-9]{1,16}) truncated=(true|false) child_exit=([0-9]{1,3})"
+    r"(?: failure_reason=(identity_summary_unavailable|private_store_unavailable) "
+    r"failure_summary=([A-Za-z0-9_-]{1,16384}|none))?\n"
 )
 LIVE_QA_CGROUP = Path("/sys/fs/cgroup/system.slice") / LIVE_QA_SYSTEMD_UNIT
 APPARMOR_RESTRICT_USERNS = Path(
@@ -143,10 +145,10 @@ STATE_NAME_PATTERN = re.compile(r"^live-user-qa\.[A-Za-z0-9]{6}$")
 SETUP_NAME_PATTERN = re.compile(r"^\.live-user-qa\.setup-[0-9a-f]{32}$")
 PUBLIC_GATE_NAME_PATTERN = re.compile(r"^public-live-qa\.[a-z0-9_]{8}$")
 LIVE_BROWSER_FAILURE_REPORT_NAME_PATTERN = re.compile(
-    r"^public-live-qa\.[a-z0-9_]{8}\.failure-v[12]\.json$"
+    r"^public-live-qa\.[a-z0-9_]{8}\.failure-v(?:[124])\.json$"
 )
 LIVE_BROWSER_FAILURE_TEMP_NAME_PATTERN = re.compile(
-    r"^\.public-live-qa\.[a-z0-9_]{8}\.failure-v[12]\.json\.[0-9a-f]{32}\.tmp$"
+    r"^\.public-live-qa\.[a-z0-9_]{8}\.failure-v(?:[124])\.json\.[0-9a-f]{32}\.tmp$"
 )
 LIVE_USER_FAILURE_REPORT_NAME_PATTERN = re.compile(
     r"^live-user-qa\.[A-Za-z0-9]{6}\.failure-v3\.json$"
@@ -246,8 +248,11 @@ SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 LIVE_BROWSER_COUNTS_FILE = "live-counts-v1.json"
 LIVE_BROWSER_COUNTS_MAX_BYTES = 1024
 LIVE_BROWSER_FAILURES_FILE = "live-failures-v2.json"
+LIVE_BROWSER_FAILURE_IDENTITIES_FILE = "live-failure-identities-v1.json"
 LIVE_USER_FAILURES_FILE = "live-user-failures-v3.json"
 LIVE_BROWSER_FAILURES_MAX_BYTES = 16 * 1024
+LIVE_BROWSER_FAILURE_SUMMARY_MAX_RECORDS = 128
+LIVE_BROWSER_FAILURE_SUMMARY_MAX_TOKEN_CHARS = 16 * 1024
 LIVE_BROWSER_FAILURES_STORE_MAX_FILES = 10
 LIVE_BROWSER_FAILURES_RETENTION_SECONDS = 7 * 24 * 60 * 60
 LIVE_BROWSER_PAGE_ERROR_CLASSES = frozenset(
@@ -392,9 +397,27 @@ class PinnedArchiveError(GuardError):
 class BrowserFailureReportUnavailable(GuardError):
     """Carry the already-validated public counts through a private-write failure."""
 
-    def __init__(self, count_line: str) -> None:
+    def __init__(
+        self,
+        count_line: str,
+        *,
+        failure_reason: str = "identity_summary_unavailable",
+        failure_summary_token: str | None = None,
+    ) -> None:
         super().__init__("private browser failure report could not be published")
         self.count_line = count_line
+        self.failure_reason = (
+            failure_reason
+            if failure_reason in {"identity_summary_unavailable", "private_store_unavailable"}
+            else "identity_summary_unavailable"
+        )
+        self.failure_summary_token = (
+            failure_summary_token
+            if isinstance(failure_summary_token, str)
+            and len(failure_summary_token) <= LIVE_BROWSER_FAILURE_SUMMARY_MAX_TOKEN_CHARS
+            and re.fullmatch(r"[A-Za-z0-9_-]+", failure_summary_token) is not None
+            else None
+        )
 
 
 class BrowserFailureCounts(GuardError):
@@ -2815,7 +2838,7 @@ def _assert_failure_report_name_unused(gate: Path) -> None:
         names = (
             [f"{gate.name}.failure-v3.json"]
             if STATE_NAME_PATTERN.fullmatch(gate.name)
-            else [f"{gate.name}.failure-v{version}.json" for version in (1, 2)]
+            else [f"{gate.name}.failure-v{version}.json" for version in (1, 2, 4)]
         )
         for name in names:
             try:
@@ -2873,6 +2896,9 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
     if name.endswith(".failure-v3.json"):
         schema = 3
         gate = name.removesuffix(".failure-v3.json")
+    elif name.endswith(".failure-v4.json"):
+        schema = 4
+        gate = name.removesuffix(".failure-v4.json")
     elif name.endswith(".failure-v1.json"):
         schema = 1
         gate = name.removesuffix(".failure-v1.json")
@@ -2896,13 +2922,19 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
         if schema == 3
         else bool(PUBLIC_GATE_NAME_PATTERN.fullmatch(gate))
     )
+    expected_keys = {
+        "schema", "gate", "source_sha", "app_sha", "marker_sha256",
+        "payload_manifest_sha256", "payload_tree_sha256", "observed_at",
+        "run_status", "failures",
+    }
+    if schema == 4:
+        expected_keys = {
+            "schema", "gate", "source_sha", "app_sha", "marker_sha256",
+            "observed_at", "run_status", "failure_reason", "failures",
+        }
     if (
         not isinstance(payload, dict)
-        or set(payload) != {
-            "schema", "gate", "source_sha", "app_sha", "marker_sha256",
-            "payload_manifest_sha256", "payload_tree_sha256", "observed_at",
-            "run_status", "failures",
-        }
+        or set(payload) != expected_keys
         or type(payload.get("schema")) is not int
         or payload.get("schema") != schema
         or payload.get("gate") != gate
@@ -2913,15 +2945,16 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
         or COMMIT_PATTERN.fullmatch(payload["app_sha"]) is None
         or not isinstance(payload.get("marker_sha256"), str)
         or DIGEST_PATTERN.fullmatch(payload["marker_sha256"]) is None
-        or not isinstance(payload.get("payload_manifest_sha256"), str)
-        or DIGEST_PATTERN.fullmatch(payload["payload_manifest_sha256"]) is None
-        or not isinstance(payload.get("payload_tree_sha256"), str)
-        or DIGEST_PATTERN.fullmatch(payload["payload_tree_sha256"]) is None
+        or (schema != 4 and not isinstance(payload.get("payload_manifest_sha256"), str))
+        or (schema != 4 and DIGEST_PATTERN.fullmatch(payload["payload_manifest_sha256"]) is None)
+        or (schema != 4 and not isinstance(payload.get("payload_tree_sha256"), str))
+        or (schema != 4 and DIGEST_PATTERN.fullmatch(payload["payload_tree_sha256"]) is None)
         or not isinstance(payload.get("observed_at"), str)
         or re.fullmatch(r"20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", payload["observed_at"]) is None
         or not isinstance(payload.get("run_status"), str)
         or payload.get("run_status") not in {"failed", "timedout", "interrupted"}
         or not isinstance(payload.get("failures"), list)
+        or (schema == 4 and payload.get("failure_reason") != "rich_report_unavailable")
         or (
             len(payload["failures"]) != 1
             if schema == 3
@@ -2939,6 +2972,8 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
             expected_failure_keys.update(
                 {"page_error_state", "page_errors_truncated", "page_errors"}
             )
+        elif schema == 4:
+            expected_failure_keys = {"id", "project", "status", "attempt"}
         elif schema == 3:
             expected_failure_keys.update(
                 {"api_failure_state", "api_failure"}
@@ -2964,6 +2999,8 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
         seen.add(key)
         if schema == 2:
             _validate_page_error_evidence(failure)
+        if schema == 4:
+            continue
         if schema == 3:
             expected_run_status = {
                 "failed": "failed",
@@ -3196,6 +3233,38 @@ def _failure_report_required(counts: Mapping[str, object]) -> bool:
             )
         )
     )
+
+
+def _encode_failure_summary_token(
+    gate: Path,
+    *,
+    source_sha: str,
+    app_sha: str,
+    marker_sha256: str,
+    counts: Mapping[str, object],
+    failures: list[dict[str, object]],
+) -> str | None:
+    if len(failures) > LIVE_BROWSER_FAILURE_SUMMARY_MAX_RECORDS:
+        return None
+    payload = {
+        "schema": 1,
+        "gate": gate.name,
+        "source_sha": source_sha,
+        "app_sha": app_sha,
+        "marker_sha256": marker_sha256,
+        "run_status": counts["run_status"],
+        "failure_reason": "private_store_unavailable",
+        "failures": [
+            [failure["id"], failure["project"], failure["status"], failure["attempt"]]
+            for failure in failures
+        ],
+    }
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    ).rstrip(b"=").decode("ascii")
+    if len(encoded) > LIVE_BROWSER_FAILURE_SUMMARY_MAX_TOKEN_CHARS:
+        return None
+    return encoded
 
 
 def _read_ephemeral_live_user_failure_report(
@@ -3604,6 +3673,136 @@ def _read_ephemeral_failure_report(
     return failures
 
 
+def _read_ephemeral_failure_identity_summary(
+    gate: Path,
+    *,
+    source_sha: str,
+    app_sha: str,
+    marker_sha256: str,
+    counts: Mapping[str, object],
+) -> list[dict[str, object]]:
+    """Read the reporter's independent, location-free failure identity summary."""
+    uid, gid = liveqa_identity()
+    results_path = gate / "test-results"
+    results_fd: int | None = None
+    descriptor: int | None = None
+    try:
+        results_metadata = results_path.lstat()
+        results_fd = os.open(
+            results_path,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened_results = os.fstat(results_fd)
+        path_metadata = os.stat(
+            LIVE_BROWSER_FAILURE_IDENTITIES_FILE,
+            dir_fd=results_fd,
+            follow_symlinks=False,
+        )
+        descriptor = os.open(
+            LIVE_BROWSER_FAILURE_IDENTITIES_FILE,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=results_fd,
+        )
+        opened = os.fstat(descriptor)
+        raw = os.read(descriptor, LIVE_BROWSER_FAILURES_MAX_BYTES + 1)
+        after = os.fstat(descriptor)
+        current = os.stat(
+            LIVE_BROWSER_FAILURE_IDENTITIES_FILE,
+            dir_fd=results_fd,
+            follow_symlinks=False,
+        )
+        results_after = results_path.lstat()
+    except OSError as exc:
+        raise GuardError("ephemeral browser failure identity summary is unavailable") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if results_fd is not None:
+            os.close(results_fd)
+    if (
+        stat.S_ISLNK(results_metadata.st_mode)
+        or not stat.S_ISDIR(results_metadata.st_mode)
+        or results_metadata.st_uid != uid
+        or results_metadata.st_gid != gid
+        or stat.S_IMODE(results_metadata.st_mode) != 0o700
+        or _fingerprint(results_metadata) != _fingerprint(opened_results)
+        or _fingerprint(results_after) != _fingerprint(opened_results)
+        or stat.S_ISLNK(path_metadata.st_mode)
+        or not stat.S_ISREG(path_metadata.st_mode)
+        or path_metadata.st_uid != uid
+        or path_metadata.st_gid != gid
+        or path_metadata.st_nlink != 1
+        or stat.S_IMODE(path_metadata.st_mode) != 0o600
+        or path_metadata.st_size > LIVE_BROWSER_FAILURES_MAX_BYTES
+        or len(raw) != opened.st_size
+        or len(raw) > LIVE_BROWSER_FAILURES_MAX_BYTES
+        or _fingerprint(path_metadata) != _fingerprint(opened)
+        or _fingerprint(after) != _fingerprint(opened)
+        or _fingerprint(current) != _fingerprint(opened)
+    ):
+        raise GuardError("ephemeral browser failure identity summary metadata is unsafe")
+    try:
+        payload = json.loads(
+            raw.decode("ascii"),
+            object_pairs_hook=_strict_object,
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                GuardError("ephemeral browser failure identity JSON is invalid")
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise GuardError("ephemeral browser failure identity summary is invalid") from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {
+            "schema", "gate", "source_sha", "app_sha", "marker_sha256", "run_status", "failures",
+        }
+        or type(payload.get("schema")) is not int
+        or payload.get("schema") != 1
+        or payload.get("gate") != gate.name
+        or payload.get("source_sha") != source_sha
+        or payload.get("app_sha") != app_sha
+        or payload.get("marker_sha256") != marker_sha256
+        or payload.get("run_status") != counts.get("run_status")
+        or not isinstance(payload.get("failures"), list)
+    ):
+        raise GuardError("ephemeral browser failure identity summary binding is invalid")
+    failures = payload["failures"]
+    expected_count = sum(
+        int(counts[field])
+        for field in ("attempt_fail", "attempt_interrupted", "attempt_timedout")
+    )
+    if not 1 <= len(failures) <= LIVE_BROWSER_FAILURE_SUMMARY_MAX_RECORDS or len(failures) != expected_count:
+        raise GuardError("ephemeral browser failure identity summary is incomplete")
+    status_counts = {"failed": 0, "interrupted": 0, "timedOut": 0}
+    seen: set[tuple[str, str, int]] = set()
+    for record in failures:
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"id", "project", "status", "attempt"}
+            or record.get("id") not in LIVE_BROWSER_FAILURE_DIAGNOSTIC_NAMES
+            or record.get("project") not in {"live-desktop", "live-mobile", "live-webkit-mobile"}
+            or record.get("status") not in status_counts
+            or type(record.get("attempt")) is not int
+            or not 1 <= record["attempt"] <= 32768
+        ):
+            raise GuardError("ephemeral browser failure identity record is invalid")
+        key = (str(record["id"]), str(record["project"]), record["attempt"])
+        if key in seen:
+            raise GuardError("ephemeral browser failure identity record is duplicated")
+        seen.add(key)
+        status_counts[str(record["status"])] += 1
+    if status_counts != {
+        "failed": counts["attempt_fail"],
+        "interrupted": counts["attempt_interrupted"],
+        "timedOut": counts["attempt_timedout"],
+    }:
+        raise GuardError("ephemeral browser failure identities do not match the count record")
+    return failures
+
+
 def _publish_private_browser_failure_report(
     gate: Path,
     *,
@@ -3614,35 +3813,51 @@ def _publish_private_browser_failure_report(
 ) -> None:
     if not _failure_report_required(counts):
         return
-    manifest = _read_active_failure_manifest(app_sha)
-    failures = _read_ephemeral_failure_report(
-        gate,
-        source_sha=source_sha,
-        app_sha=app_sha,
-        marker_sha256=marker_sha256,
-        counts=counts,
-        manifest=manifest,
-    )
+    identity_only = False
+    manifest: Mapping[str, object] | None = None
+    try:
+        manifest = _read_active_failure_manifest(app_sha)
+        failures = _read_ephemeral_failure_report(
+            gate,
+            source_sha=source_sha,
+            app_sha=app_sha,
+            marker_sha256=marker_sha256,
+            counts=counts,
+            manifest=manifest,
+        )
+    except GuardError:
+        failures = _read_ephemeral_failure_identity_summary(
+            gate,
+            source_sha=source_sha,
+            app_sha=app_sha,
+            marker_sha256=marker_sha256,
+            counts=counts,
+        )
+        identity_only = True
     observed_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-    payload = {
-        "schema": 2,
+    payload: dict[str, object] = {
+        "schema": 4 if identity_only else 2,
         "gate": gate.name,
         "source_sha": source_sha,
         "app_sha": app_sha,
         "marker_sha256": marker_sha256,
-        "payload_manifest_sha256": manifest["manifest_sha256"],
-        "payload_tree_sha256": manifest["payload_tree_sha256"],
         "observed_at": observed_at,
         "run_status": counts["run_status"],
         "failures": failures,
     }
+    if identity_only:
+        payload["failure_reason"] = "rich_report_unavailable"
+    else:
+        assert manifest is not None
+        payload["payload_manifest_sha256"] = manifest["manifest_sha256"]
+        payload["payload_tree_sha256"] = manifest["payload_tree_sha256"]
     encoded = (json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n").encode("ascii")
     if len(encoded) > LIVE_BROWSER_FAILURES_MAX_BYTES:
         raise GuardError("private browser failure report exceeds its size limit")
     _assert_failure_report_name_unused(gate)
     _prune_browser_failure_diagnostics(reserve_slots=1)
     directory_fd = _failure_report_store_directory(create=False)
-    final_name = f"{gate.name}.failure-v2.json"
+    final_name = f"{gate.name}.failure-v{'4' if identity_only else '2'}.json"
     temporary_name = f".{final_name}.{uuid4().hex}.tmp"
     descriptor: int | None = None
     try:
@@ -3901,7 +4116,35 @@ def public_browser_counts_line(
         except Exception as exc:
             # Preserve the public counts record and original browser exit. The
             # wrapper converts this fixed status into its closed marker kind.
-            raise BrowserFailureReportUnavailable(line) from exc
+            # The identity-only sidecar independently preserves the closed test
+            # IDs if rich report publication or the private store is unavailable.
+            failure_summary_token = None
+            failure_reason = "identity_summary_unavailable"
+            try:
+                identity_failures = _read_ephemeral_failure_identity_summary(
+                    gate,
+                    source_sha=source_sha,
+                    app_sha=app_sha,
+                    marker_sha256=marker_sha256,
+                    counts=payload,
+                )
+                failure_summary_token = _encode_failure_summary_token(
+                    gate,
+                    source_sha=source_sha,
+                    app_sha=app_sha,
+                    marker_sha256=marker_sha256,
+                    counts=payload,
+                    failures=identity_failures,
+                )
+                if failure_summary_token is not None:
+                    failure_reason = "private_store_unavailable"
+            except GuardError:
+                pass
+            raise BrowserFailureReportUnavailable(
+                line,
+                failure_reason=failure_reason,
+                failure_summary_token=failure_summary_token,
+            ) from exc
     if fail_on_failure_counts and _failure_report_required(payload):
         raise BrowserFailureCounts(line)
     return line
@@ -5311,8 +5554,8 @@ def probe_compacted_legacy_runtime_cache(runtime_path: Path) -> None:
         if (
             child_exit != 0
             or match is None
-            or match.group(1) != "none"
-            or match.group(5) != "0"
+            or match.group(2) != "none"
+            or match.group(6) != "0"
         ):
             raise GuardError("live QA compacted runtime browser probe failed")
 
@@ -7769,8 +8012,8 @@ def main(argv: Iterable[str] | None = None) -> int:
                 if matched is not None:
                     marker = (
                         "LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=cleanup_failure "
-                        f"stdout_bytes={matched.group(2)} stderr_bytes={matched.group(3)} "
-                        f"truncated={matched.group(4)} child_exit=2\n"
+                        f"stdout_bytes={matched.group(3)} stderr_bytes={matched.group(4)} "
+                        f"truncated={matched.group(5)} child_exit=2\n"
                     )
                 child_exit = 2
             print(marker, end="")
@@ -7890,6 +8133,11 @@ def main(argv: Iterable[str] | None = None) -> int:
                 )
             except BrowserFailureReportUnavailable as exc:
                 print(exc.count_line, end="")
+                print(
+                    "LIVE_BROWSER_FAILURE_SUMMARY schema=1 "
+                    f"reason={exc.failure_reason} "
+                    f"token={exc.failure_summary_token or 'none'}"
+                )
                 return LIVE_BROWSER_FAILURE_REPORT_EXIT
             except BrowserFailureCounts as exc:
                 print(exc.count_line, end="")

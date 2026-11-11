@@ -101,7 +101,7 @@ class PatchTranslationPromptInputTests(unittest.TestCase):
         )
 
     def test_prompt_cache_key_is_stable_per_translation_version(self) -> None:
-        self.assertEqual(runtime._PROMPT_CACHE_KEY, "oldsparky-patch-ru-ru-v14")
+        self.assertEqual(runtime._PROMPT_CACHE_KEY, "oldsparky-patch-ru-ru-v15")
 
     def test_prompt_locks_comparison_and_unit_regressions(self) -> None:
         source = inspect.getsource(runtime._request_openai)
@@ -112,6 +112,9 @@ class PatchTranslationPromptInputTests(unittest.TestCase):
         self.assertIn("MUST be rendered as m/s", source)
         self.assertIn("Distance, range and radius values remain m", source)
         self.assertIn("only N% as effective", source)
+        self.assertIn("Gun Damage and Base gun damage are wording variants", source)
+        self.assertIn("the authoritative English-to-Russian ", source)
+        self.assertIn("map for its listed canonical mechanics", source)
         self.assertIn("Percentage values, including speed bonuses, are dimensionless", source)
 
 

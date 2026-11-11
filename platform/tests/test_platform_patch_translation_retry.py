@@ -202,6 +202,10 @@ class PatchTranslationRetryTests(PlatformIsolatedAsyncioTestCase):
             {"id": "valid", "text": "[[ENTITY_0000]] готово за [[FACT_0000]] секунд."},
             {"id": "bad-entity", "text": "[[ENTITY_0001]] готово за [[FACT_0000]] секунд."},
             {"id": "bad-fact", "text": "[[ENTITY_0000]] готово за [[FACT_0001]] секунд."},
+            {
+                "id": "bad-mechanic",
+                "text": "Базовый gun damage увеличен на [[FACT_0000]].",
+            },
         ]
         provider_payload = {
             "output": [{
@@ -236,6 +240,7 @@ class PatchTranslationRetryTests(PlatformIsolatedAsyncioTestCase):
             {"id": "valid", "text": source_entity},
             {"id": "bad-entity", "text": source_entity},
             {"id": "bad-fact", "text": source_entity},
+            {"id": "bad-mechanic", "text": "Base gun damage increased by [[FACT_0000]]."},
         ]
         settings = PlatformSettings(
             platform_openai_api_key="test-key",
@@ -255,8 +260,9 @@ class PatchTranslationRetryTests(PlatformIsolatedAsyncioTestCase):
                 list(collected.invalid_placeholder_ids),
                 ["bad-entity", "bad-fact"],
             )
+            self.assertEqual(list(collected.invalid_mechanic_ids), ["bad-mechanic"])
 
-            malformed_rows = [provider_rows[0], provider_rows[0], provider_rows[2]]
+            malformed_rows = [provider_rows[0], provider_rows[0], provider_rows[2], provider_rows[3]]
             provider_payload["output"][0]["content"][0]["text"] = json.dumps(
                 {"segments": malformed_rows}
             )
@@ -268,6 +274,70 @@ class PatchTranslationRetryTests(PlatformIsolatedAsyncioTestCase):
                     settings=settings,
                     collect_placeholder_failures=True,
                 )
+
+        raw_source = [
+            {"id": "s000-c000", "text": "A visual issue was fixed."},
+            {"id": "s000-c001", "text": "Base gun damage increased by 5%."},
+        ]
+        prepared_source = [
+            {"id": "s000-c000", "text": "A visual issue was fixed."},
+            {"id": "s000-c001", "text": "Base gun damage increased by [[FACT_0000]]."},
+        ]
+        first_rows = [
+            {"id": "s000-c000", "text": "Исправлена визуальная ошибка."},
+            {"id": "s000-c001", "text": "Базовый gun damage увеличен на [[FACT_0000]]."},
+        ]
+        repeated_bad_row = [
+            {"id": "s000-c001", "text": "Базовый gun damage увеличен на [[FACT_0000]]."},
+        ]
+        queued_payloads = [first_rows, repeated_bad_row]
+
+        class QueueResponse:
+            def __init__(self, rows: list[dict[str, str]]) -> None:
+                self.rows = rows
+
+            @staticmethod
+            def raise_for_status() -> None:
+                return None
+
+            def json(self) -> dict[str, object]:
+                return {
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": json.dumps({"segments": self.rows}, ensure_ascii=False),
+                        }],
+                    }],
+                }
+
+        class QueueClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def post(self, *_args, **_kwargs):
+                return QueueResponse(queued_payloads.pop(0))
+
+        segment_fact = {"[[FACT_0000]]": "5%"}
+        budget = runtime._TranslationProviderCallBudget()
+        with patch.object(runtime.httpx, "AsyncClient", return_value=QueueClient()):
+            with self.assertRaisesRegex(ValueError, "Gun Damage mechanic untranslated"):
+                await runtime._request_openai_batches(
+                    patch_id="1847920302240420",
+                    source_segments=raw_source,
+                    prepared_segments=prepared_source,
+                    glossary={"Gun Damage": ["Урон от оружия"]},
+                    settings=settings,
+                    entity_replacements={"s000-c000": {}, "s000-c001": {}},
+                    fact_replacements={"s000-c000": {}, "s000-c001": segment_fact},
+                    call_budget=budget,
+                )
+        self.assertEqual(queued_payloads, [])
+        self.assertEqual(budget.provider_calls, 2)
+        self.assertEqual(budget.follow_up_kind, "fact_correction")
 
         async def request(**kwargs):
             ids = [segment["id"] for segment in kwargs["segments"]]
