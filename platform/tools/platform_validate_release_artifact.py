@@ -688,6 +688,7 @@ def _validate_liveqa_runtime(
         "web/tests/support/live-qa-origin.ts",
         "web/tests/support/live-qa-sandbox.ts",
         "web/tests/support/live-count-reporter.cjs",
+        "web/tests/support/patch-acceptance.ts",
     )
     for relative in required:
         member = by_name.get(f"{prefix}/{relative}")
@@ -703,6 +704,7 @@ def _validate_liveqa_runtime(
         "web/tests/support/live-qa-origin.ts",
         "web/tests/support/live-qa-sandbox.ts",
         "web/tests/support/live-count-reporter.cjs",
+        "web/tests/support/patch-acceptance.ts",
         "web/tests/support/live-engine-preflight.cjs",
     }
     allowed_package_roots = {

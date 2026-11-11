@@ -1048,6 +1048,14 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
                 manifest["files"][reporter_relative],
                 hashlib.sha256(reporter_source.read_bytes()).hexdigest(),
             )
+            patch_helper_relative = "web/tests/support/patch-acceptance.ts"
+            patch_helper_source = (
+                REPO_ROOT / "platform/apps/platform_web/tests/support/patch-acceptance.ts"
+            )
+            self.assertEqual(
+                manifest["files"][patch_helper_relative],
+                hashlib.sha256(patch_helper_source.read_bytes()).hexdigest(),
+            )
             self.assertEqual(manifest["tree_sha256"], diagnostic["tree_sha256"])
             self.assertEqual(
                 (output / "browsers/webkit-2311/lib/alias").read_bytes(),
@@ -1087,12 +1095,19 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             installer.CHROMIUM_SANDBOX_SHA256 = hashlib.sha256(sandbox).hexdigest()
             installer._validate_runtime_source(output)
 
-            for mutation in ("missing", "tampered", "unlisted"):
+            for mutation in (
+                "missing",
+                "tampered",
+                "unlisted",
+                "missing-patch-acceptance",
+            ):
                 with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as case_dir:
                     candidate = Path(case_dir) / "runtime"
                     shutil.copytree(output, candidate)
                     reporter = candidate / reporter_relative
-                    if mutation == "missing":
+                    if mutation == "missing-patch-acceptance":
+                        (candidate / patch_helper_relative).unlink()
+                    elif mutation == "missing":
                         reporter.unlink()
                     elif mutation == "tampered":
                         reporter.chmod(0o644)

@@ -156,6 +156,10 @@ class ArchiveBuilder:
                 REPO_ROOT
                 / "platform/apps/platform_web/tests/support/live-count-reporter.cjs"
             ).read_bytes(),
+            "web/tests/support/patch-acceptance.ts": (
+                REPO_ROOT
+                / "platform/apps/platform_web/tests/support/patch-acceptance.ts"
+            ).read_bytes(),
             "web/tests/support/live-engine-preflight.cjs": (
                 REPO_ROOT
                 / "platform/apps/platform_web/tests/support/live-engine-preflight.cjs"
@@ -832,6 +836,23 @@ class PlatformReleaseArtifactValidationTests(unittest.TestCase):
     def test_runtime_manifest_digest_rejects_content_or_digest_tampering(self) -> None:
         artifact = ArchiveBuilder(self.root / "untampered.tar.gz").write()
         manifest_name = f"{RELEASE_SLUG}/liveqa-runtime/runtime-manifest.json"
+
+        missing_helper = ArchiveBuilder(self.root / "missing-patch-helper.tar.gz")
+        helper_name = (
+            f"{RELEASE_SLUG}/liveqa-runtime/"
+            "web/tests/support/patch-acceptance.ts"
+        )
+        missing_helper.entries = [
+            (member, content)
+            for member, content in missing_helper.entries
+            if member.name != helper_name
+        ]
+        with self.assertRaisesRegex(
+            validator.ArtifactError, "missing required file: web/tests/support/patch-acceptance.ts"
+        ):
+            validator.validate_archive(
+                missing_helper.write(), release_slug=RELEASE_SLUG
+            )
 
         with tarfile.open(artifact, "r:gz") as archive:
             manifest_member = archive.extractfile(manifest_name)
