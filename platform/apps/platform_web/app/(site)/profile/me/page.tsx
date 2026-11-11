@@ -5,7 +5,7 @@ import { ProfileAccessState } from "@/components/profile/profile-access-state";
 import { ProfileEditor } from "@/components/profile/editor/profile-editor";
 import { parseProfileTab } from "@/lib/profile-model";
 import {
-  getServerProfileHeroNames,
+  getServerProfileHeroOptions,
   getServerProfileBootstrap,
 } from "@/lib/server-profile-workspace";
 import { platformSessionCookieName } from "@/lib/server-auth";
@@ -26,14 +26,14 @@ export default async function MyProfilePage({
   const hasSessionCookie = requestCookies.has(platformSessionCookieName());
 
   let workspace = null;
-  let heroNames: string[] = [];
+  let heroOptions: Array<{ name: string; imageUrl: string | null }> = [];
   let profileUnavailable = false;
 
   if (hasSessionCookie) {
     try {
-      [workspace, heroNames] = await Promise.all([
+      [workspace, heroOptions] = await Promise.all([
         getServerProfileBootstrap(cookieHeader),
-        getServerProfileHeroNames(),
+        getServerProfileHeroOptions(),
       ]);
     } catch {
       profileUnavailable = true;
@@ -52,7 +52,7 @@ export default async function MyProfilePage({
           <ProfileEditor
             captainPreference={workspace.captainPreference}
             dreamSlots={workspace.dreamSlots}
-            heroNames={heroNames}
+            heroOptions={heroOptions}
             initialTab={parseProfileTab(tab)}
             profile={workspace.profile}
             steamAuthStatus={

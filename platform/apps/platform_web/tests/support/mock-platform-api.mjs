@@ -462,7 +462,11 @@ const server = createServer((request, response) => {
     json(response, 200, {
       heroes: deadlockHeroNames.map((name) => ({
         name,
-        image_url: `/api/v1/content/game-assets/heroes/${encodeURIComponent(name)}.png`,
+        image_url: name === "Abrams"
+          ? "/assets/heroes/missing-source-for-fallback-test.png"
+          : name === "Source New Hero"
+            ? "/assets/heroes/Abrams.png"
+          : `/api/v1/content/game-assets/heroes/${encodeURIComponent(name)}.png`,
         source_available: true
       })),
       ranks: deadlockRankNames.map((name) => ({
@@ -559,6 +563,14 @@ const server = createServer((request, response) => {
         changes: ["Rift Troopers health increased"],
         abilities: []
       }, {
+        kind: "objective",
+        title: "Mid Boss",
+        hero_name: null,
+        objective_key: "mid_boss",
+        objective_icon_url: "https://assets-bucket.deadlock-api.com/assets-api-res/icons/minimap/mid_boss.png",
+        changes: ["Mid Boss health increased"],
+        abilities: []
+      }, {
         kind: "item",
         title: "Crushing Fists",
         hero_name: null,
@@ -578,8 +590,10 @@ const server = createServer((request, response) => {
         changes: ["Doorway duration reduced"],
         abilities: [{
           name: "Doorway",
+          presentation_kind: "balance",
           display_name: "Проход",
           description: "Создаёт дверь между двумя точками.",
+          stats: [{ label: "Перезарядка", value: "30 с" }],
           icon_url: "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/doorman_doorway.png",
           changes: ["Cooldown increased"]
         }]

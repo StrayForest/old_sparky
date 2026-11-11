@@ -62,6 +62,7 @@ def _hero_section(
             "hero_name": str(hero.get("name") or alias.title()),
             "hero_display_name": hero.get("display_name"),
             "hero_image_url": hero.get("hero_image_url") or hero.get("icon_url"),
+            "hero_presentation_kind": "balance",
             "hero_description": hero.get("description"),
             "hero_description_requires_translation": hero.get(
                 "description_requires_translation"
@@ -133,6 +134,26 @@ def _match_ability(
         if canonical_alias in aliases:
             aliases[patch_alias] = aliases[canonical_alias]
 
+    def replacement_target_ability(text: str, *, anywhere: bool) -> str | None:
+        pattern = (
+            r"\breplaced\s+(?:with|by)\s+"
+            if anywhere
+            else r"^\s*(?:(?:is|was)\s+|has\s+been\s+)?replaced\s+(?:with|by)\s+"
+        )
+        target_match = re.search(pattern, text, re.IGNORECASE)
+        if target_match is None:
+            return None
+        if re.search(r"\bT\d+\b", text[:target_match.start()], re.IGNORECASE):
+            return None
+        target_text = text[target_match.end():].casefold()
+        for alias in sorted(aliases, key=len, reverse=True):
+            if not target_text.startswith(alias):
+                continue
+            suffix = target_text[len(alias):]
+            if not suffix or suffix[0] in (_ENTITY_DELIMITERS + ".,!?;)]}"):
+                return aliases[alias]
+        return None
+
     for alias in sorted(aliases, key=len, reverse=True):
         if lowered == alias:
             return aliases[alias], ""
@@ -140,8 +161,13 @@ def _match_ability(
             continue
         suffix = line[len(alias):]
         if suffix and suffix[0] in _ENTITY_DELIMITERS:
-            return aliases[alias], suffix.lstrip(_ENTITY_DELIMITERS).strip()
-    return None
+            change = suffix.lstrip(_ENTITY_DELIMITERS).strip()
+            replacement_alias = replacement_target_ability(change, anywhere=False)
+            if replacement_alias is not None:
+                return replacement_alias, line.strip()
+            return aliases[alias], change
+    replacement_alias = replacement_target_ability(line, anywhere=True)
+    return (replacement_alias, line.strip()) if replacement_alias is not None else None
 
 
 def _ability_section(
@@ -167,11 +193,78 @@ def _ability_section(
             ),
             "russian_metadata_available": ability.get("russian_metadata_available"),
             "icon_url": ability.get("icon_url"),
+            "stats": ability.get("stats") or [],
+            "stats_pending": ability.get("stats_pending"),
             "changes": [],
         }
         ability_map[ability_alias] = ability_section
         section["abilities"].append(ability_section)
     return ability_section
+
+
+_ABILITY_INTRO_RE = re.compile(
+    r"\b(?:new\s+ability|newly\s+introduc\w*\s+ability|"
+    r"introduc\w*\s+(?:a\s+|the\s+)?new\s+ability|"
+    r"add(?:ed|ing)\s+(?:a\s+|the\s+)?new\s+ability|"
+    r"gain(?:s|ed|ing)?\s+(?:a\s+)?new\s+ability|"
+    r"now has\s+(?:a\s+)?new\s+ability)\b",
+    re.IGNORECASE,
+)
+_ABILITY_REPLACEMENT_RE = re.compile(
+    r"\breplaced\s+(?:with|by)\s+(?:(?:a|an|the)\s+)?"
+    r"(?:new|different|replacement)\b",
+    re.IGNORECASE,
+)
+_ABILITY_REPLACEMENT_TARGET_RE = re.compile(r"\breplaced\s+(?:with|by)\s+", re.IGNORECASE)
+
+
+def _is_ability_replacement(changes: str, ability_name: str) -> bool:
+    if _ABILITY_REPLACEMENT_RE.search(changes):
+        if re.match(r"^\s*T\d+\b", changes, re.IGNORECASE):
+            return False
+        return True
+    target_match = _ABILITY_REPLACEMENT_TARGET_RE.search(changes)
+    if target_match is None:
+        return False
+    if re.search(r"\bT\d+\b", changes[:target_match.start()], re.IGNORECASE):
+        return False
+    target = changes[target_match.end():].lstrip()
+    lowered_name = ability_name.strip().casefold()
+    if not lowered_name or not target.casefold().startswith(lowered_name):
+        return False
+    suffix = target[len(ability_name.strip()):]
+    return not suffix or suffix[0] in (_ENTITY_DELIMITERS + ".,!?;)]}")
+
+
+def _set_ability_presentation(section: dict[str, Any], *, hero_introduction: bool = False) -> None:
+    """Expose catalog prose only when this patch introduces or replaces an ability."""
+    for ability in section.get("abilities") or []:
+        changes = ability.get("changes") if isinstance(ability, dict) else None
+        joined_changes = " ".join(value for value in changes or [] if isinstance(value, str))
+        if hero_introduction:
+            presentation_kind = "introduction"
+        elif re.match(r"^\s*T\d+\b", joined_changes, re.IGNORECASE):
+            presentation_kind = "balance"
+        elif _is_ability_replacement(
+            joined_changes,
+            str(ability.get("name") or "") if isinstance(ability, dict) else "",
+        ):
+            presentation_kind = "replacement"
+        elif _ABILITY_INTRO_RE.search(joined_changes):
+            presentation_kind = "introduction"
+        else:
+            presentation_kind = "balance"
+        ability["presentation_kind"] = presentation_kind
+        if presentation_kind == "balance":
+            ability.pop("description", None)
+            ability.pop("description_requires_translation", None)
+            ability.pop("_description_source_text", None)
+            ability.pop("stats", None)
+            ability.pop("stats_pending", None)
+        else:
+            # Old cached catalogs have no readiness field. Keep their intro
+            # stats visible as pending until a fresh catalog proves readiness.
+            ability["stats_pending"] = ability.get("stats_pending") is not False
 
 
 def _announcement_hero_matches(
@@ -268,6 +361,7 @@ def _hero_catalog_is_complete(hero: dict[str, Any], section: dict[str, Any]) -> 
             isinstance(ability, dict)
             and ability.get("display_name")
             and ability.get("icon_url")
+            and ability.get("stats_pending") is False
             and (
                 ability.get("description")
                 or ability.get("description_requires_translation")
@@ -620,6 +714,7 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
     }
     for hero_alias, hero in announcement_heroes:
         _hero_key, section = _hero_section(hero_sections, hero, hero_alias)
+        section["hero_presentation_kind"] = "introduction"
         section["hero_metadata_pending"] = not _hero_metadata_is_complete(hero)
         for ability_alias in (hero.get("abilities") or {}):
             ability_section = _ability_section(section, hero, ability_alias)
@@ -639,6 +734,7 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
                     ability_section["description_requires_translation"] = True
                     ability_section["_description_source_text"] = sentence
         section["hero_catalog_pending"] = not _hero_catalog_is_complete(hero, section)
+        _set_ability_presentation(section, hero_introduction=True)
     for hero_name in pending_names:
         if hero_name.casefold() in resolved_names:
             continue
@@ -662,6 +758,7 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
                 "hero_name": hero_name,
                 "hero_display_name": hero_name,
                 "hero_image_url": None,
+                "hero_presentation_kind": "introduction",
                 "hero_description": None,
                 "hero_metadata_pending": True,
                 "hero_catalog_pending": True,
@@ -704,6 +801,14 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
         sections.append(section)
 
     for section in hero_sections.values():
+        _set_ability_presentation(
+            section,
+            hero_introduction=section.get("hero_presentation_kind") == "introduction",
+        )
+        if section.get("hero_presentation_kind") != "introduction":
+            section["hero_description"] = None
+            section["hero_metadata_pending"] = False
+            section["hero_catalog_pending"] = False
         section.pop("_ability_map", None)
         sections.append(section)
 
@@ -735,6 +840,9 @@ def finalize_patch_translation_metadata(
     pending = False
     for section in translated.get("sections") or []:
         if not isinstance(section, dict) or section.get("kind") != "hero":
+            continue
+        if section.get("hero_presentation_kind") != "introduction":
+            section["hero_metadata_pending"] = False
             continue
         if section.get("hero_description_requires_translation"):
             source_text = section.pop("_hero_description_source_text", None)

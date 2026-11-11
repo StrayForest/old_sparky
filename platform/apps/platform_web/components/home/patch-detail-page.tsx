@@ -5,7 +5,7 @@ import { useEffect, useState } from "react";
 import { useI18n } from "@/components/i18n-provider";
 import { Hero } from "@/components/layout/hero";
 import { CspImage } from "@/components/media/csp-image";
-import { deadlockHeroIconPath, deadlockHeroPlaceholderPath } from "@/lib/deadlock";
+import { DeadlockHeroImage } from "@/components/media/deadlock-hero-image";
 import { formatPatchDate, formatPatchTitle } from "@/lib/patch-format";
 import { platformApiMessage, platformApiRequest } from "@/lib/platform-api";
 import type { PlatformPatchDetail } from "@/lib/platform-types";
@@ -50,15 +50,12 @@ export function PatchDetailPage({ patchId }: { patchId: string }) {
                 <section className={`patch-section ${section.kind}-patch-section`} key={`${section.title}-${sectionIndex}`}>
                   <header className="patch-section-header">
                     {section.hero_name ? (
-                      <CspImage
+                      <DeadlockHeroImage
                         alt=""
+                        heroName={section.hero_name}
                         className="patch-hero-image"
                         height={88}
-                        onError={(event) => {
-                          event.currentTarget.onerror = null;
-                          event.currentTarget.src = deadlockHeroPlaceholderPath;
-                        }}
-                        src={section.hero_image_url || deadlockHeroIconPath(section.hero_name)}
+                        imageUrl={section.hero_image_url}
                         width={88}
                       />
                     ) : section.item_icon_url ? (
@@ -82,6 +79,8 @@ export function PatchDetailPage({ patchId }: { patchId: string }) {
                         ? t("patch.objective.urn")
                         : section.objective_key === "unstable_rift"
                           ? t("patch.objective.unstableRift")
+                          : section.objective_key === "mid_boss"
+                            ? t("patch.objective.midBoss")
                           : section.title}</h2>
                       {section.kind === "hero" && section.hero_display_name ? (
                         <span className="patch-hero-display-name">{section.hero_display_name}</span>
@@ -105,14 +104,37 @@ export function PatchDetailPage({ patchId }: { patchId: string }) {
                                 alt=""
                                 className="patch-ability-icon"
                                 height={48}
+                                onError={(event) => {
+                                  event.currentTarget.hidden = true;
+                                  event.currentTarget.nextElementSibling?.removeAttribute("hidden");
+                                }}
                                 src={ability.icon_url}
                                 width={48}
                               />
-                            ) : <span><Sparkles aria-hidden="true" size={20} /></span>}
+                            ) : null}
+                            <span hidden={Boolean(ability.icon_url)} className="patch-ability-icon-fallback"><Sparkles aria-hidden="true" size={20} /></span>
                             <h3>{ability.display_name || ability.name}</h3>
                           </header>
-                          {ability.description ? <p className="patch-ability-description">{ability.description}</p> : null}
-                          <ChangeList changes={ability.changes} />
+                          {ability.presentation_kind === "introduction" || ability.presentation_kind === "replacement" ? (
+                            <>
+                              {ability.description ? <p className="patch-ability-description">{ability.description}</p> : null}
+                              {ability.stats?.length ? (
+                                <>
+                                  <h4 className="patch-ability-stats-title">{t("patch.abilityCurrentStats")}</h4>
+                                  <dl className="patch-ability-stats">
+                                    {ability.stats.map((stat, statIndex) => (
+                                      <div key={`${stat.label}-${statIndex}`}>
+                                        <dt>{stat.label}</dt>
+                                        <dd>{stat.value}</dd>
+                                      </div>
+                                    ))}
+                                  </dl>
+                                </>
+                              ) : null}
+                              {ability.stats_pending ? <p className="patch-ability-stats-pending">{t("patch.abilityStatsPending")}</p> : null}
+                            </>
+                          ) : null}
+                          {ability.changes.length ? <ChangeList changes={ability.changes} /> : null}
                         </section>
                       ))}
                     </div>

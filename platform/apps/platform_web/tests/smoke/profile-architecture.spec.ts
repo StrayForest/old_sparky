@@ -270,6 +270,16 @@ test("atomic captain editor preserves hero picker layout and save semantics", as
   const picker = page.getByTestId("profile-dream-slot-1-hero-picker");
   await expect(picker).toBeVisible();
   await expect(page.locator(".dream-hero-picker-panel")).toHaveCount(1);
+  const newlyCataloguedHero = page.getByTestId("profile-dream-slot-1-hero-source-new-hero");
+  await expect(newlyCataloguedHero).toBeVisible();
+  await newlyCataloguedHero.locator("img").evaluate((image) => new Promise<void>((resolve, reject) => {
+    if ((image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth > 0) {
+      resolve();
+    } else {
+      image.addEventListener("load", () => resolve(), { once: true });
+      image.addEventListener("error", () => reject(new Error("New catalog hero image did not load")), { once: true });
+    }
+  }));
   const teammateGridBox = await page.locator(".teammate-grid").boundingBox();
   const pickerBox = await picker.boundingBox();
   expect(pickerBox?.width).toBeGreaterThanOrEqual(
@@ -330,4 +340,28 @@ test("atomic captain editor preserves hero picker layout and save semantics", as
         .size
     ).toBe(1);
   }
+});
+
+test("public profile loads the local hero image when its catalog source fails", async ({ page }) => {
+  let brokenCatalogSourceRequests = 0;
+  await page.route("**/assets/heroes/missing-source-for-fallback-test.png", async (route) => {
+    brokenCatalogSourceRequests += 1;
+    await route.fulfill({ status: 200, contentType: "text/html", body: "not an image" });
+  });
+  await page.goto("/profile/lisalexy");
+  const image = page.locator(".public-profile-hero img").first();
+  await image.scrollIntoViewIfNeeded();
+  await expect.poll(() => brokenCatalogSourceRequests).toBe(1);
+  await expect(image).toHaveAttribute("src", "/assets/heroes/Abrams.png");
+  await expect.poll(() => image.evaluate((element) => (element as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
+
+  const apiImageResponse = await page.request.get(new URL(
+    "/api/v1/content/game-assets/heroes/Abrams.png",
+    page.url()
+  ).toString(), { maxRedirects: 0 });
+  expect(apiImageResponse.status()).toBe(307);
+  expect(apiImageResponse.headers().location).toBe("/assets/heroes/Abrams.png");
+  const redirectedImage = await page.request.get(new URL("/assets/heroes/Abrams.png", page.url()).toString());
+  expect(redirectedImage.status()).toBe(200);
+  expect(redirectedImage.headers()["content-type"]).toMatch(/^image\/png/u);
 });

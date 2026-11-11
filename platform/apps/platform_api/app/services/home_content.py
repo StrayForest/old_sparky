@@ -6,6 +6,7 @@ from html import unescape
 from html.parser import HTMLParser
 import json
 import logging
+from pathlib import Path
 import re
 from secrets import token_urlsafe
 from typing import Any
@@ -36,8 +37,8 @@ DEADLOCK_ASSET_BASE_URL = "https://deadlock.io"
 HOME_CONTENT_KEY = "platform:home-content:v4"
 HOME_CONTENT_STALE_KEY = "platform:home-content:stale:v4"
 HOME_CONTENT_LOCK_KEY = "platform:home-content:refresh-lock:v4"
-PATCH_DETAIL_KEY_PREFIX = "platform:home-content:patch:v9:"
-PATCH_ASSET_CATALOG_KEY = "platform:home-content:patch-assets:v6"
+PATCH_DETAIL_KEY_PREFIX = "platform:home-content:patch:v10:"
+PATCH_ASSET_CATALOG_KEY = "platform:home-content:patch-assets:v7"
 PATCH_ASSET_CATALOG_STALE_KEY = "platform:home-content:patch-assets-stale:v1"
 PATCH_ASSET_PENDING_RETRY_KEY = "platform:home-content:patch-assets-pending-retry:v1"
 PATCH_SITEMAP_INDEX_KEY = "platform:seo:patch-index:v1"
@@ -83,6 +84,11 @@ OBJECTIVE_DEFINITIONS: dict[str, dict[str, Any]] = {
             "king of the hill",
         ),
     },
+    "mid_boss": {
+        "title": "Mid Boss",
+        "icon_key": "boss_marker_neutral_psd.png",
+        "aliases": ("mid boss", "mid-boss", "midboss"),
+    },
 }
 OBJECTIVE_PREFIX_ALIASES = tuple(
     sorted(
@@ -97,6 +103,9 @@ OBJECTIVE_PREFIX_ALIASES = tuple(
 )
 PATCH_SCOPE_HEADINGS = {
     "urn / king of the hill": "objective",
+    "objectives": "objective",
+    "mid boss": "objective",
+    "mid-boss": "objective",
     "general": "general",
     "items": "items",
     "heroes": "heroes",
@@ -143,7 +152,14 @@ def _plain_text(value: str, *, max_length: int) -> str:
     extractor = _TextExtractor()
     extractor.feed(unescape(value.replace("\\-", "-")))
     lines = [" ".join(line.split()) for line in "".join(extractor.parts).splitlines()]
-    return "\n".join(line for line in lines if line)[:max_length].strip()
+    normalized = "\n".join(line for line in lines if line).strip()
+    normalized = re.sub(
+        r"\{STEAM_CLAN(?:_LOC)?_IMAGE\}/(\d+)/([a-f0-9]{32,64}\.(?:avif|gif|jpe?g|png|webp))",
+        lambda match: f"{STEAM_CLAN_IMAGE_BASE_URL}/{match.group(1)}/{match.group(2)}",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    return normalized[:max_length]
 
 
 def _excerpt(value: str, *, max_length: int = 260) -> str:
@@ -195,6 +211,7 @@ def _patch_lines(content: str) -> list[str]:
         content,
     )
     expanded = re.sub(r"(?<=\S)-\s+(?=[A-Z])", "\n- ", expanded)
+    expanded = re.sub(r"\b(Mid[- ]Boss)\s*:", r"\n\1:", expanded, flags=re.IGNORECASE)
     return [
         line.strip().removeprefix("-").strip()
         for line in expanded.splitlines()
@@ -203,7 +220,20 @@ def _patch_lines(content: str) -> list[str]:
 
 
 def _change_chunks(value: str, *, max_length: int = 1000) -> list[str]:
-    remaining = value.strip()
+    remaining = re.sub(
+        r"https://clan\.fastly\.steamstatic\.com/images/\d+/"
+        r"[a-f0-9]{32,64}\.(?:avif|gif|jpe?g|png|webp)",
+        " ",
+        value,
+        flags=re.IGNORECASE,
+    ).strip()
+    if STEAM_CLAN_IMAGE_RE.fullmatch(remaining) or re.fullmatch(
+        r"https://clan\.fastly\.steamstatic\.com/images/\d+/"
+        r"[a-f0-9]{32,64}\.(?:avif|gif|jpe?g|png|webp)",
+        remaining,
+        flags=re.IGNORECASE,
+    ):
+        return []
     chunks: list[str] = []
     while len(remaining) > max_length:
         split_at = max(
@@ -676,6 +706,34 @@ def _build_asset_catalog(
     }
 
 
+def _supplemental_shop_items(payload: list[dict[str, Any]] | None) -> dict[str, dict[str, Any]]:
+    """Project released shop upgrades from the community item feed."""
+    result: dict[str, dict[str, Any]] = {}
+    for item in payload or []:
+        if not isinstance(item, dict) or item.get("type") != "upgrade" or item.get("shopable") is not True:
+            continue
+        name = _plain_text(str(item.get("name") or ""), max_length=120)
+        category = str(item.get("item_slot_type") or "").strip().casefold()
+        if not name or category not in {"weapon", "vitality", "spirit"}:
+            continue
+        try:
+            icon_url = _https_url(
+                item.get("shop_image_webp") or item.get("image_webp") or item.get("image"),
+                host_suffixes=DEADLOCK_API_ASSET_HOST_SUFFIXES,
+            )
+        except ValueError:
+            icon_url = None
+        cost = item.get("cost")
+        result[name.casefold()] = {
+            "name": name,
+            "slug": str(item.get("class_name") or "").strip() or None,
+            "category": category,
+            "cost": cost if isinstance(cost, int) and cost >= 0 else None,
+            "icon_url": icon_url,
+        }
+    return result
+
+
 def _normalize_hero_slug(value: Any) -> str:
     slug = str(value or "").strip().casefold()
     return slug.removeprefix("hero_")
@@ -726,6 +784,8 @@ def _supplemental_hero_abilities(
         )
         description = russian_description or english_description_text
         description = re.sub(r"\{[gs]:[^{}]{1,160}\}", "", description)
+        stats = _localized_ability_stats(english_ability, localized_ability)
+        stats_pending = _ability_stats_pending(english_ability, localized_ability)
         abilities[ability_name.casefold()] = {
             "id": ability.get("id"),
             "slug": ability_class,
@@ -744,9 +804,157 @@ def _supplemental_hero_abilities(
                 and str(localized_ability.get("name") or "").strip()
                 and russian_description
             ),
+            "stats": stats,
+            "stats_pending": stats_pending,
             "icon_url": icon_url,
         }
     return abilities
+
+
+_NUMERIC_STAT_VALUE_RE = re.compile(
+    r"^[+-]?\d+(?:[.,]\d+)?(?:m|s|%|hp)?(?:\s*(?:/|–|-)\s*"
+    r"[+-]?\d+(?:[.,]\d+)?(?:m|s|%|hp)?)*$",
+    re.IGNORECASE,
+)
+
+
+def _localized_ability_stats(
+    english_ability: dict[str, Any] | None,
+    localized_ability: dict[str, Any] | None,
+) -> list[dict[str, str]]:
+    english_properties = (
+        english_ability.get("properties")
+        if isinstance(english_ability, dict)
+        and isinstance(english_ability.get("properties"), dict)
+        else {}
+    )
+    localized_properties = (
+        localized_ability.get("properties")
+        if isinstance(localized_ability, dict)
+        and isinstance(localized_ability.get("properties"), dict)
+        else {}
+    )
+    stats: list[dict[str, str]] = []
+    for property_key, english_property in english_properties.items():
+        if not isinstance(english_property, dict):
+            continue
+        localized_property = localized_properties.get(property_key)
+        if not isinstance(localized_property, dict):
+            localized_property = {}
+        localized_label = str(localized_property.get("label") or "").strip()
+        if not _is_user_facing_stat_label(localized_label, property_key):
+            continue
+        value = str(localized_property.get("value") or english_property.get("value") or "").strip()
+        if not _has_nonzero_numeric_stat_value(value):
+            continue
+        postfix = str(
+            localized_property.get("postfix") or english_property.get("postfix") or ""
+        ).strip()
+        stats.append(
+            {
+                "label": localized_label,
+                "value": (
+                    value
+                    if re.search(r"(?:m|s|%|hp)$", value, re.IGNORECASE)
+                    else f"{value}{(' ' + postfix) if postfix else ''}"
+                ).strip(),
+            }
+        )
+    for tier, upgrade in enumerate(
+        (english_ability or {}).get("upgrades") or [],
+        start=1,
+    ):
+        if not isinstance(upgrade, dict):
+            continue
+        property_upgrades = upgrade.get("property_upgrades")
+        if not isinstance(property_upgrades, list):
+            continue
+        for property_upgrade in property_upgrades:
+            if not isinstance(property_upgrade, dict):
+                continue
+            property_key = str(property_upgrade.get("name") or "")
+            localized_property = localized_properties.get(property_key)
+            english_property = english_properties.get(property_key)
+            if not isinstance(localized_property, dict) or not isinstance(english_property, dict):
+                continue
+            label = str(localized_property.get("label") or "").strip()
+            bonus = str(property_upgrade.get("bonus") or "").strip()
+            if (
+                not _is_user_facing_stat_label(label, property_key)
+                or not bonus
+                or not _NUMERIC_STAT_VALUE_RE.fullmatch(bonus)
+            ):
+                continue
+            sign = "" if bonus.startswith(("+", "-")) else "+"
+            stats.append({"label": f"T{tier} · {label}", "value": f"{sign}{bonus}"})
+    return stats[:32]
+
+
+def _ability_stats_pending(
+    english_ability: dict[str, Any] | None,
+    localized_ability: dict[str, Any] | None,
+) -> bool:
+    """Report unknown/partial supported base stats without retrying non-stat abilities."""
+    if not isinstance(english_ability, dict):
+        return True
+    english_properties = english_ability.get("properties")
+    if not isinstance(english_properties, dict):
+        return True
+    localized_properties = (
+        localized_ability.get("properties")
+        if isinstance(localized_ability, dict)
+        and isinstance(localized_ability.get("properties"), dict)
+        else {}
+    )
+    for property_key, english_property in english_properties.items():
+        if not isinstance(english_property, dict):
+            continue
+        english_label = str(english_property.get("label") or "").strip()
+        if (
+            not _is_user_facing_stat_label(english_label, property_key)
+        ):
+            continue
+        english_value = str(english_property.get("value") or "").strip()
+        if not _has_nonzero_numeric_stat_value(english_value):
+            continue
+        localized_property = localized_properties.get(property_key)
+        if not isinstance(localized_property, dict):
+            return True
+        localized_label = str(localized_property.get("label") or "").strip()
+        value = str(localized_property.get("value") or english_value).strip()
+        if (
+            not _is_user_facing_stat_label(localized_label, property_key)
+            or not _has_nonzero_numeric_stat_value(value)
+        ):
+            return True
+    return False
+
+
+def _is_user_facing_stat_label(
+    label: str,
+    property_key: Any,
+) -> bool:
+    value = label.strip()
+    key = str(property_key or "").strip()
+    if not value or not any(character.isalpha() for character in value):
+        return False
+    if re.search(r"[_{}]", value):
+        return False
+    if re.search(r"[a-z][A-Z]", value):
+        return False
+    key_is_identifier = "_" in key or bool(re.search(r"[a-z][A-Z]", key))
+    if value.casefold() == key.casefold() and key_is_identifier:
+        return False
+    return True
+
+
+def _has_nonzero_numeric_stat_value(value: str) -> bool:
+    if not value or not _NUMERIC_STAT_VALUE_RE.fullmatch(value):
+        return False
+    numeric_parts = re.findall(r"[+-]?\d+(?:[.,]\d+)?", value)
+    return bool(numeric_parts) and any(
+        float(part.replace(",", ".")) != 0 for part in numeric_parts
+    )
 
 
 def _merge_hero_abilities(target: dict[str, Any], abilities: Any) -> None:
@@ -788,6 +996,8 @@ def _merge_hero_abilities(target: dict[str, Any], abilities: Any) -> None:
             "description_requires_translation",
             "russian_metadata_available",
             "icon_url",
+            "stats",
+            "stats_pending",
         ):
             if ability.get(field) not in (None, ""):
                 merged[field] = ability[field]
@@ -838,10 +1048,27 @@ async def _fetch_deadlock_asset_catalog(
         ),
         return_exceptions=True,
     )
-    if isinstance(hero_response, Exception) or isinstance(item_response, Exception):
-        raise hero_response if isinstance(hero_response, Exception) else item_response
-    hero_response.raise_for_status()
-    item_response.raise_for_status()
+    primary_hero_payload: dict[str, Any] | None = None
+    primary_item_payload: dict[str, Any] | None = None
+    for source, result, key in (
+        ("heroes", hero_response, "heroes"),
+        ("items", item_response, "items"),
+    ):
+        if isinstance(result, Exception):
+            logger.warning("deadlock_asset_refresh_failed source=legacy-%s", source)
+            continue
+        try:
+            result.raise_for_status()
+            decoded = result.json()
+            if not isinstance(decoded, dict) or not isinstance(decoded.get(key), list):
+                logger.warning("deadlock_asset_refresh_failed source=legacy-%s invalid-payload", source)
+                continue
+            if source == "heroes":
+                primary_hero_payload = decoded
+            else:
+                primary_item_payload = decoded
+        except Exception:  # noqa: BLE001
+            logger.warning("deadlock_asset_refresh_failed source=legacy-%s", source)
     rank_result, icon_result = await asyncio.gather(
         client.get(DEADLOCK_RANK_INDEX_URL),
         client.get(DEADLOCK_ICON_INDEX_URL),
@@ -921,9 +1148,19 @@ async def _fetch_deadlock_asset_catalog(
                 logger.warning("deadlock_asset_refresh_failed source=asset-items-locale invalid-payload")
         except Exception:  # noqa: BLE001
             logger.warning("deadlock_asset_refresh_failed source=asset-items-locale")
-    return _build_asset_catalog(
-        hero_response.json(),
-        item_response.json(),
+    legacy_primary_available = (
+        primary_hero_payload is not None and primary_item_payload is not None
+    )
+    if not legacy_primary_available and not (
+        supplemental_heroes is not None and supplemental_items is not None
+    ):
+        if previous_catalog is not None:
+            logger.warning("deadlock_asset_refresh_failed source=community-fallback unavailable; retaining-last-good")
+            return previous_catalog
+        raise ValueError("Deadlock hero/item catalogs are unavailable from all sources")
+    catalog = _build_asset_catalog(
+        primary_hero_payload or {"heroes": []},
+        primary_item_payload or {"items": []},
         rank_payload,
         supplemental_hero_payload=supplemental_heroes,
         supplemental_item_payload=supplemental_items,
@@ -932,6 +1169,12 @@ async def _fetch_deadlock_asset_catalog(
         icon_payload=icon_payload,
         previous_catalog=previous_catalog,
     )
+    for item_name, item in _supplemental_shop_items(supplemental_items).items():
+        catalog["items"].setdefault(item_name, item)
+    if primary_item_payload is None and previous_catalog is not None:
+        for item_name, item in (previous_catalog.get("items") or {}).items():
+            catalog["items"].setdefault(item_name, item)
+    return catalog
 
 
 async def _cached_deadlock_asset_catalog() -> dict[str, Any] | None:
@@ -974,14 +1217,23 @@ def public_deadlock_game_assets(catalog: dict[str, Any]) -> dict[str, Any]:
         if name:
             unique_heroes[name.casefold()] = name
     hero_names = sorted(unique_heroes.values(), key=str.casefold) or list(POOL_LIST)
+    heroes_by_name = {
+        str(hero.get("name") or "").casefold(): hero
+        for hero in (catalog.get("heroes") or {}).values()
+        if isinstance(hero, dict) and hero.get("name")
+    }
     ranks = catalog.get("ranks") if isinstance(catalog.get("ranks"), dict) else {}
     return {
         "heroes": [
             {
                 "name": name,
                 "draft_id": _public_draft_hero_id(name, catalog),
-                "image_url": f"/api/v1/content/game-assets/heroes/{quote(name, safe='')}.png",
-                "source_available": name.casefold() in unique_heroes,
+                "image_url": _public_hero_image_url(heroes_by_name.get(name.casefold()), name),
+                "source_available": bool(
+                    name.casefold() in unique_heroes
+                    and _public_hero_image_url(heroes_by_name.get(name.casefold()), name)
+                    != "/assets/heroes/placeholder.svg"
+                ),
             }
             for name in hero_names
         ],
@@ -1020,8 +1272,43 @@ def _public_draft_hero_id(name: str, catalog: dict[str, Any]) -> str:
 
 
 def resolve_deadlock_hero_image(catalog: dict[str, Any], hero_name: str) -> str | None:
-    hero = (catalog.get("heroes") or {}).get(hero_name.strip().casefold())
-    return str((hero or {}).get("icon_url") or "").strip() or None
+    heroes = catalog.get("heroes") or {}
+    normalized = hero_name.strip().casefold()
+    hero = heroes.get(normalized)
+    if not isinstance(hero, dict):
+        hero = next(
+            (
+                value
+                for value in heroes.values()
+                if isinstance(value, dict)
+                and str(value.get("name") or "").casefold() == normalized
+            ),
+            None,
+        )
+    return _public_hero_image_url(hero, str((hero or {}).get("name") or hero_name))
+
+
+def _public_hero_image_url(hero: dict[str, Any] | None, hero_name: str) -> str:
+    """Use the validated current asset CDN, then a bundled legacy image, then placeholder."""
+    if isinstance(hero, dict):
+        for candidate in (hero.get("hero_image_url"), hero.get("icon_url")):
+            try:
+                return _https_url(
+                    candidate,
+                    host_suffixes=DEADLOCK_API_ASSET_HOST_SUFFIXES,
+                )
+            except ValueError:
+                continue
+    canonical_name = "The Doorman" if hero_name.casefold() == "doorman" else hero_name
+    static_name = canonical_name.replace(" ", "_")
+    static_path = (
+        Path(__file__).resolve().parents[4]
+        / "apps/platform_web/public/assets/heroes"
+        / f"{static_name}.png"
+    )
+    if static_path.is_file():
+        return f"/assets/heroes/{static_name}.png"
+    return "/assets/heroes/placeholder.svg"
 
 
 def resolve_deadlock_rank_image(catalog: dict[str, Any], rank_name: str) -> str | None:

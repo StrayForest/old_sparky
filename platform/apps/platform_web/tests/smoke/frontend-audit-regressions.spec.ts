@@ -1133,7 +1133,7 @@ test("my profile uses the protected bootstrap request without a page auth probe"
   const page = source("app/(site)/profile/me/page.tsx");
 
   expect(page).toContain("getServerProfileBootstrap");
-  expect(page).toContain("getServerProfileHeroNames");
+  expect(page).toContain("getServerProfileHeroOptions");
   expect(page).toContain("Promise.all");
   expect(page).not.toContain("getServerCurrentUser");
 });

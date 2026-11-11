@@ -1955,32 +1955,38 @@ test("patch detail keeps objective sections, the upper cover crop, and no source
   await expect(page.locator(".patch-article-toolbar")).toHaveCount(0);
   await expect(page.getByRole("link", { name: "Открыть источник" })).toHaveCount(0);
   const patchSections = page.locator(".patch-section");
-  await expect(patchSections).toHaveCount(5);
+  await expect(patchSections).toHaveCount(6);
   await expect(patchSections.getByRole("heading", { level: 2 })).toHaveText([
     "Общие изменения",
     "Урна",
     "Нестабильный разлом",
+    "Мид-босс",
     "Crushing Fists",
     "The Doorman"
   ]);
   await expect(patchSections.nth(1)).toHaveClass(/objective-patch-section/u);
   await expect(patchSections.nth(2)).toHaveClass(/objective-patch-section/u);
-  await expect(patchSections.nth(4).getByText("Привратник", { exact: true })).toBeVisible();
-  await expect(patchSections.nth(4).getByText("Хозяин дверей и скрытых проходов.", { exact: true })).toBeVisible();
-  await expect(patchSections.nth(4).getByText("Подробности героя появятся после обновления данных.", { exact: true })).toBeVisible();
-  await expect(patchSections.nth(4).locator(".patch-hero-image")).toHaveAttribute(
+  await expect(patchSections.nth(5).getByText("Привратник", { exact: true })).toBeVisible();
+  await expect(patchSections.nth(5).getByText("Хозяин дверей и скрытых проходов.", { exact: true })).toBeVisible();
+  await expect(patchSections.nth(5).getByText("Подробности героя появятся после обновления данных.", { exact: true })).toBeVisible();
+  await expect(patchSections.nth(5).locator(".patch-hero-image")).toHaveAttribute(
     "src",
     "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/doorman.png"
   );
-  await expect(patchSections.nth(4).getByRole("heading", { name: "Проход", level: 3 })).toBeVisible();
-  await expect(patchSections.nth(4).getByText("Создаёт дверь между двумя точками.", { exact: true })).toBeVisible();
-  await expect(page.locator('[data-objective-icon="source"], [data-objective-icon="fallback"]')).toHaveCount(2);
-  await expect(page.locator(".patch-objective-image")).toHaveCount(1);
+  await expect(patchSections.nth(5).getByRole("heading", { name: "Проход", level: 3 })).toBeVisible();
+  await expect(patchSections.nth(5).getByText("Создаёт дверь между двумя точками.", { exact: true })).toHaveCount(0);
+  await expect(patchSections.nth(5).getByText("30 с", { exact: true })).toHaveCount(0);
+  await expect(patchSections.nth(5).getByText("Cooldown increased", { exact: true })).toBeVisible();
+  await expect(patchSections.nth(5).locator(".patch-ability-icon")).toHaveJSProperty("naturalWidth", 1);
+  await expect(patchSections.nth(5).locator(".patch-hero-image")).toHaveJSProperty("naturalWidth", 1);
+  await expect(page.locator('[data-objective-icon="source"], [data-objective-icon="fallback"]')).toHaveCount(3);
+  await expect(page.locator(".patch-objective-image")).toHaveCount(2);
   await expect(page.locator(".patch-objective-fallback")).toHaveCount(1);
-  await expect(page.locator(".patch-objective-image")).toHaveAttribute(
+  await expect(page.locator(".patch-objective-image").first()).toHaveAttribute(
     "src",
     /^https:\/\/assets-bucket\.deadlock-api\.com\//u
   );
+  await expect(page.locator(".patch-objective-image").first()).toHaveJSProperty("naturalWidth", 1);
   await expect(page.locator(".patch-item-image")).toHaveCount(1);
   await expect(page.locator(".patch-item-image")).toHaveCSS("padding", "0px");
   await expect(page.locator(".patch-item-image")).toHaveCSS("border-width", "0px");
@@ -1998,7 +2004,96 @@ test("patch detail keeps objective sections, the upper cover crop, and no source
   await expectNoHorizontalOverflow(page);
 });
 
-test("patch detail renders source icons for both objective sections", async ({ page }) => {
+test("patch intro and replacement details follow explicit presentation kind and broken images fall back", async ({ page }) => {
+  await page.route("https://assets-bucket.deadlock-api.com/**", async (route) => {
+    await route.fulfill({
+      body: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"),
+      contentType: "image/png",
+      status: 200
+    });
+  });
+  await page.route("**/api/v1/content/patches/1836506165584438", async (route) => {
+    const response = await route.fetch();
+    const payload = await response.json() as { sections: Array<Record<string, unknown>> };
+    const sections = payload.sections.map((section) => section.kind === "hero"
+      ? {
+          ...section,
+          abilities: (section.abilities as Array<Record<string, unknown>>).map((ability) => ({
+            ...ability,
+            presentation_kind: ability.name === "Doorway" ? "introduction" : "balance",
+            changes: [],
+            stats: [{ label: "Перезарядка", value: "30 с" }, { label: "Длительность", value: "5 с" }],
+            stats_pending: false
+          }))
+        }
+      : section);
+    await route.fulfill({ response, json: { ...payload, sections } });
+  });
+  await page.route("https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/**", async (route) => {
+    await route.fulfill({ status: 404, body: "missing" });
+  });
+
+  await page.goto("/patches/1836506165584438");
+  const ability = page.locator(".patch-ability").first();
+  await ability.scrollIntoViewIfNeeded();
+  await expect(ability.getByText("Создаёт дверь между двумя точками.", { exact: true })).toBeVisible();
+  await expect(ability.locator(".patch-ability-stats")).toContainText("Перезарядка");
+  await expect(ability.getByText("Актуальные характеристики", { exact: true })).toBeVisible();
+  await expect(ability.locator(".patch-ability-stats")).toContainText("30 с");
+  await expect(ability.locator(".patch-ability-stats")).toContainText("Длительность");
+  await expect(ability.locator(".patch-ability-stats-pending")).toHaveCount(0);
+  await expect(ability.locator(".patch-change-list")).toHaveCount(0);
+  await expect(ability.locator(".patch-ability-icon-fallback")).toBeVisible();
+});
+
+test("patch ability stats show catalog readiness only when more source values are pending", async ({ page }) => {
+  await page.route("**/api/v1/content/patches/1836506165584438", async (route) => {
+    const response = await route.fetch();
+    const payload = await response.json() as { sections: Array<Record<string, unknown>> };
+    const sections = payload.sections.map((section) => {
+      if (section.kind !== "hero") return section;
+      const sourceAbility = (section.abilities as Array<Record<string, unknown>>)[0];
+      const ability = (name: string, stats: Array<{ label: string; value: string }>, statsPending: boolean) => ({
+        ...sourceAbility,
+        name,
+        display_name: name,
+        description: `${name} description`,
+        presentation_kind: "introduction",
+        changes: [],
+        stats,
+        stats_pending: statsPending
+      });
+      return {
+        ...section,
+        abilities: [
+          ability("Ready Ability", [{ label: "Damage", value: "20" }], false),
+          ability("Partial Ability", [{ label: "Duration", value: "5 s" }], true),
+          ability("Pending Ability", [], true),
+          ability("No Numeric Stats", [], false)
+        ]
+      };
+    });
+    await route.fulfill({ response, json: { ...payload, sections } });
+  });
+
+  await page.goto("/patches/1836506165584438");
+  const abilities = page.locator(".patch-ability");
+  const ready = abilities.filter({ hasText: "Ready Ability" });
+  const partial = abilities.filter({ hasText: "Partial Ability" });
+  const pending = abilities.filter({ hasText: "Pending Ability" });
+  const noNumericStats = abilities.filter({ hasText: "No Numeric Stats" });
+
+  await expect(ready.locator(".patch-ability-stats")).toContainText("20");
+  await expect(ready.locator(".patch-ability-stats-pending")).toHaveCount(0);
+  await expect(partial.locator(".patch-ability-stats")).toContainText("5 s");
+  await expect(partial.locator(".patch-ability-stats-pending")).toHaveText("Характеристики способности ещё обновляются.");
+  await expect(pending.locator(".patch-ability-stats")).toHaveCount(0);
+  await expect(pending.locator(".patch-ability-stats-pending")).toBeVisible();
+  await expect(noNumericStats.locator(".patch-ability-stats")).toHaveCount(0);
+  await expect(noNumericStats.locator(".patch-ability-stats-pending")).toHaveCount(0);
+});
+
+test("patch detail renders source icons for Urn, Rift, and Mid Boss objectives", async ({ page }) => {
   const urnIconUrl = "https://assets-bucket.deadlock-api.com/assets-api-res/icons/minimap/soul_jar_marker_psd.png";
   const unstableRiftIconUrl = "https://assets-bucket.deadlock-api.com/assets-api-res/icons/minimap/minimap_icon_koth.png";
   await page.route("https://assets-bucket.deadlock-api.com/**", async (route) => {
@@ -2021,11 +2116,12 @@ test("patch detail renders source icons for both objective sections", async ({ p
   await page.goto("/patches/1836506165584438");
 
   const objectives = page.locator(".objective-patch-section");
-  await expect(objectives).toHaveCount(2);
+  await expect(objectives).toHaveCount(3);
   const sourceIcons = objectives.locator('.patch-objective-image[data-objective-icon="source"]');
-  await expect(sourceIcons).toHaveCount(2);
+  await expect(sourceIcons).toHaveCount(3);
   await expect(sourceIcons.nth(0)).toHaveAttribute("src", urnIconUrl);
   await expect(sourceIcons.nth(1)).toHaveAttribute("src", unstableRiftIconUrl);
+  await expect(sourceIcons.nth(2)).toHaveAttribute("src", /mid_boss\.png$/u);
   await expect(objectives.locator('.patch-objective-fallback[data-objective-icon="fallback"]')).toHaveCount(0);
   await expect.poll(async () => sourceIcons.evaluateAll((images) => images.every(
     (image) => (image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth > 0

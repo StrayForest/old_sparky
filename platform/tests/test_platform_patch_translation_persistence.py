@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -212,6 +212,82 @@ class PatchTranslationPersistenceTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(result["enqueued"], 0)
         enqueue.assert_not_called()
 
+    async def test_one_delayed_transient_failure_retry_is_enqueued_boundedly(self) -> None:
+        record = SimpleNamespace(
+            id="translation-transient",
+            status=runtime.TRANSLATION_STATUS_FAILED,
+            error_code="ReadTimeout",
+            attempts=1,
+            last_enqueued_at=datetime.now(UTC) - timedelta(minutes=20),
+            processing_started_at=None,
+        )
+        db_session = _FakeDbSession(record)
+        settings = PlatformSettings(platform_openai_model="test-model")
+        enqueue = Mock(return_value="celery-retry-task")
+        with (
+            patch.object(runtime, "get_settings", return_value=settings),
+            patch.object(runtime, "session_factory", return_value=lambda: _SessionContext(db_session)),
+            patch.object(runtime, "_enqueue_translation_task", enqueue),
+        ):
+            first = await runtime.ensure_patch_translation_records({"123": _patch_detail()})
+            second = await runtime.ensure_patch_translation_records({"123": _patch_detail()})
+
+        self.assertEqual(first["enqueued"], 1)
+        self.assertEqual(second["enqueued"], 0)
+        enqueue.assert_called_once_with(
+            "123",
+            runtime.translation_source_hash(_patch_detail()),
+            model="test-model",
+            allow_failed_retry=True,
+        )
+
+    async def test_transient_failure_before_source_load_cannot_exceed_one_retry(self) -> None:
+        record = SimpleNamespace(
+            id="translation-source-timeout",
+            status=runtime.TRANSLATION_STATUS_FAILED,
+            error_code="ReadTimeout",
+            attempts=1,
+            last_enqueued_at=datetime.now(UTC) - timedelta(minutes=20),
+            processing_started_at=None,
+        )
+        db_session = _FakeDbSession(record)
+        enqueue = Mock()
+        with (
+            patch.object(runtime, "get_settings", return_value=PlatformSettings(platform_openai_model="test-model")),
+            patch.object(runtime, "session_factory", return_value=lambda: _SessionContext(db_session)),
+            patch.object(runtime, "_enqueue_translation_task", enqueue),
+        ):
+            first_retry = await runtime.ensure_patch_translation_records({"123": _patch_detail()})
+            record.status = runtime.TRANSLATION_STATUS_FAILED
+            record.error_code = "ReadTimeout"
+            record.attempts += 1  # Worker counted a retry task that failed before translation claim.
+            record.last_enqueued_at = datetime.now(UTC) - timedelta(minutes=20)
+            exhausted = await runtime.ensure_patch_translation_records({"123": _patch_detail()})
+
+        self.assertEqual(first_retry["enqueued"], 1)
+        self.assertEqual(exhausted["enqueued"], 0)
+        self.assertEqual(enqueue.call_count, 1)
+
+    async def test_permanent_or_exhausted_failure_is_not_retried(self) -> None:
+        record = SimpleNamespace(
+            id="translation-permanent",
+            status=runtime.TRANSLATION_STATUS_FAILED,
+            error_code="ValueError",
+            attempts=1,
+            last_enqueued_at=datetime.now(UTC) - timedelta(hours=1),
+            processing_started_at=None,
+        )
+        db_session = _FakeDbSession(record)
+        enqueue = Mock()
+        with (
+            patch.object(runtime, "session_factory", return_value=lambda: _SessionContext(db_session)),
+            patch.object(runtime, "_enqueue_translation_task", enqueue),
+        ):
+            result = await runtime.ensure_patch_translation_records({"123": _patch_detail()})
+
+        self.assertEqual(result["enqueued"], 0)
+        enqueue.assert_not_called()
+
     async def test_three_completed_existing_and_one_new_patch_enqueue_one_job(self) -> None:
         patches = {
             patch_id: {**_patch_detail(), "id": patch_id}
@@ -368,6 +444,22 @@ class PatchTranslationPersistenceTests(PlatformIsolatedAsyncioTestCase):
             settings=worker.settings,
             expected_source_hash="source-hash",
         )
+
+    async def test_worker_counts_transient_source_load_failure_as_attempt(self) -> None:
+        with (
+            patch.object(worker, "get_patch_detail_source", new=AsyncMock(side_effect=TimeoutError())),
+            patch.object(worker, "mark_patch_translation_failed", new=AsyncMock(return_value=True)) as mark_failed,
+        ):
+            result = await worker._run_patch_translation("123", "source-hash")
+
+        self.assertEqual(result["status"], "failed")
+        mark_failed.assert_awaited_once_with(
+            "123",
+            "source-hash",
+            "TimeoutError",
+            consume_attempt=True,
+        )
+        self.assertIn("TimeoutError", runtime._RETRYABLE_TRANSLATION_ERRORS)
 
     async def test_changed_source_does_not_translate_an_old_queue_entry(self) -> None:
         settings = PlatformSettings(platform_openai_model="test-model")

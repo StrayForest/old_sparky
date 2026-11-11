@@ -171,8 +171,13 @@ async def refresh_home_content(
         }
         pending_hero_metadata = any(
             detail.get("hero_metadata_pending")
+            or detail.get("hero_catalog_pending")
             or any(
-                isinstance(section, dict) and section.get("hero_metadata_pending")
+                isinstance(section, dict)
+                and (
+                    section.get("hero_metadata_pending")
+                    or section.get("hero_catalog_pending")
+                )
                 for section in detail.get("sections") or []
             )
             for detail in patch_details.values()

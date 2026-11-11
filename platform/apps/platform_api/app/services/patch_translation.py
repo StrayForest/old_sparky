@@ -60,6 +60,7 @@ async def translate_patch_to_russian(
     *,
     settings: PlatformSettings | None = None,
     expected_source_hash: str | None = None,
+    allow_failed_retry: bool = False,
 ) -> dict[str, Any]:
     """Use one fact correction and at most one transient transport retry.
 
@@ -83,6 +84,7 @@ async def translate_patch_to_russian(
         catalog,
         settings=effective_settings,
         expected_source_hash=expected_source_hash,
+        allow_failed_retry=allow_failed_retry,
     )
     if result.get("ok") or result.get("error") not in _RETRYABLE_OPENAI_ERRORS:
         return result

@@ -121,6 +121,9 @@ export type PlatformPatchAbility = {
   name: string;
   display_name?: string | null;
   description?: string | null;
+  presentation_kind?: "balance" | "introduction" | "replacement";
+  stats?: Array<{ label: string; value: string }>;
+  stats_pending?: boolean;
   icon_url: string | null;
   changes: string[];
 };
@@ -136,7 +139,7 @@ export type PlatformPatchSection = {
   item_name?: string | null;
   item_category?: "weapon" | "vitality" | "spirit" | null;
   item_icon_url?: string | null;
-  objective_key?: "urn" | "unstable_rift" | null;
+  objective_key?: "urn" | "unstable_rift" | "mid_boss" | null;
   objective_icon_url?: string | null;
   changes: string[];
   abilities: PlatformPatchAbility[];

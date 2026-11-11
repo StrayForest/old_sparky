@@ -5842,6 +5842,41 @@ img.rank-icon,
   font-size: 14px;
 }
 
+.patch-ability-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin: 0 0 12px;
+  color: var(--ui-text-muted);
+  font-size: 12px;
+}
+
+.patch-ability-stats-title {
+  margin: 0 0 6px;
+  color: var(--ui-text-soft);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.patch-ability-stats div {
+  display: flex;
+  gap: 5px;
+}
+
+.patch-ability-stats dt {
+  font-weight: 600;
+}
+
+.patch-ability-stats dd {
+  margin: 0;
+}
+
+.patch-ability-stats-pending {
+  margin: 4px 0 12px;
+  color: var(--ui-text-muted);
+  font-size: 12px;
+}
+
 .patch-raw-content {
   margin: 0;
   color: #c8c0b3;

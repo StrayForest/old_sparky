@@ -190,6 +190,7 @@ export type TournamentDetail = TournamentSummary & {
 export type HeroOption = {
   name: string;
   theme: string;
+  imageUrl?: string | null;
 };
 
 export type ContactField = {

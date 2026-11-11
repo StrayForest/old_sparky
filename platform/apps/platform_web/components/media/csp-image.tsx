@@ -1,4 +1,4 @@
-import type { ImgHTMLAttributes } from "react";
+import type { ImgHTMLAttributes, Ref } from "react";
 
 export type CspImageProps = Omit<
   ImgHTMLAttributes<HTMLImageElement>,
@@ -7,6 +7,7 @@ export type CspImageProps = Omit<
   alt: string;
   fill?: boolean;
   height?: number;
+  ref?: Ref<HTMLImageElement>;
   src: string;
   width?: number;
 };
@@ -17,6 +18,7 @@ export function CspImage({
   fill = false,
   height,
   loading,
+  ref,
   src,
   width,
   ...imageProps
@@ -36,6 +38,7 @@ export function CspImage({
     fetchPriority={imageProps.fetchPriority}
     height={fill ? undefined : height}
     loading={loading ?? "lazy"}
+    ref={ref}
     src={src}
     width={fill ? undefined : width}
   />;

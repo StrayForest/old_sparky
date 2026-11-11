@@ -10,10 +10,10 @@ import {
 } from "lucide-react";
 import { DiscordIcon, SteamIcon } from "@/components/icons/brand-icons";
 import { CspImage } from "@/components/media/csp-image";
+import { DeadlockHeroImage } from "@/components/media/deadlock-hero-image";
 import { PreparedMedia } from "@/components/media/prepared-media";
 import { copyTextToClipboard } from "@/lib/clipboard";
 import {
-  deadlockHeroIconPath,
   deadlockRankIconPath,
   deadlockRankPlaceholderPath
 } from "@/lib/deadlock";
@@ -27,7 +27,7 @@ const contactCopyLabels: Record<string, string> = {
   "Регион": "Скопировать регион"
 };
 
-export function PublicProfileView({ profile }: { profile: PlayerProfile }) {
+export function PublicProfileView({ profile, heroOptions = [] }: { profile: PlayerProfile; heroOptions?: Array<{ name: string; imageUrl: string | null }> }) {
   const [copiedContact, setCopiedContact] = useState<string | null>(null);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -104,12 +104,13 @@ export function PublicProfileView({ profile }: { profile: PlayerProfile }) {
               <div className="public-profile-heroes">
                 {profile.heroes.length ? profile.heroes.slice(0, 3).map((hero) => (
                   <div className="hero-card public-profile-hero" key={hero}>
-                    <CspImage
+                    <DeadlockHeroImage
                       alt=""
                       className="hero-card-image"
                       fill
+                      heroName={hero}
+                      imageUrl={heroOptions.find((option) => option.name === hero)?.imageUrl}
                       sizes="96px"
-                      src={deadlockHeroIconPath(hero)}
                     />
                     <span>{hero}</span>
                   </div>

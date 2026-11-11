@@ -51,24 +51,24 @@ export async function getServerProfileBootstrap(
 type GameAssetsCache = {
   checkedAt: number;
   etag: string;
-  heroNames: string[];
+  heroes: Array<{ name: string; imageUrl: string | null }>;
 };
 
 const gameAssetsCheckIntervalMs = 15 * 60 * 1000;
 let gameAssetsCache: GameAssetsCache | null = null;
-let gameAssetsRequest: Promise<string[]> | null = null;
+let gameAssetsRequest: Promise<Array<{ name: string; imageUrl: string | null }>> | null = null;
 
-export async function getServerProfileHeroNames(): Promise<string[]> {
+export async function getServerProfileHeroOptions(): Promise<Array<{ name: string; imageUrl: string | null }>> {
   const now = Date.now();
   if (gameAssetsCache && now - gameAssetsCache.checkedAt < gameAssetsCheckIntervalMs) {
-    return [...gameAssetsCache.heroNames];
+    return gameAssetsCache.heroes.map((hero) => ({ ...hero }));
   }
   if (gameAssetsRequest) {
     return gameAssetsRequest;
   }
 
-  const staleHeroNames = gameAssetsCache?.heroNames;
-  gameAssetsRequest = fetchGameAssetNames(staleHeroNames);
+  const staleHeroes = gameAssetsCache?.heroes;
+  gameAssetsRequest = fetchGameAssetOptions(staleHeroes);
   const request = gameAssetsRequest;
   request.then(
     () => {
@@ -85,7 +85,7 @@ export async function getServerProfileHeroNames(): Promise<string[]> {
   return request;
 }
 
-async function fetchGameAssetNames(staleHeroNames?: string[]): Promise<string[]> {
+async function fetchGameAssetOptions(staleHeroes?: Array<{ name: string; imageUrl: string | null }>): Promise<Array<{ name: string; imageUrl: string | null }>> {
   try {
     const headers = new Headers({ accept: "application/json" });
     if (gameAssetsCache?.etag) {
@@ -98,35 +98,34 @@ async function fetchGameAssetNames(staleHeroNames?: string[]): Promise<string[]>
     });
     if (response.status === 304 && gameAssetsCache) {
       gameAssetsCache.checkedAt = Date.now();
-      return [...gameAssetsCache.heroNames];
+      return gameAssetsCache.heroes.map((hero) => ({ ...hero }));
     }
     if (!response.ok) {
-      return rememberGameAssetFallback(staleHeroNames);
+      return rememberGameAssetFallback(staleHeroes);
     }
     const payload = (await response.json()) as PlatformDeadlockGameAssets;
-    const heroNames = mergeHeroNames(
-      payload.heroes.map((hero) => hero.name),
-      deadlockHeroes
-    );
+    const known = new Map(payload.heroes.map((hero) => [hero.name, hero.image_url]));
+    const heroes = mergeHeroNames(payload.heroes.map((hero) => hero.name), deadlockHeroes)
+      .map((name) => ({ name, imageUrl: known.get(name) ?? null }));
     gameAssetsCache = {
       checkedAt: Date.now(),
       etag: response.headers.get("etag")?.trim() ?? "",
-      heroNames,
+      heroes,
     };
-    return [...heroNames];
+    return heroes.map((hero) => ({ ...hero }));
   } catch {
-    return rememberGameAssetFallback(staleHeroNames);
+    return rememberGameAssetFallback(staleHeroes);
   }
 }
 
-function rememberGameAssetFallback(staleHeroNames?: string[]): string[] {
-  const heroNames = staleHeroNames ? [...staleHeroNames] : [...deadlockHeroes];
+function rememberGameAssetFallback(staleHeroes?: Array<{ name: string; imageUrl: string | null }>): Array<{ name: string; imageUrl: string | null }> {
+  const heroes = staleHeroes ? staleHeroes.map((hero) => ({ ...hero })) : deadlockHeroes.map((name) => ({ name, imageUrl: null }));
   gameAssetsCache = {
     checkedAt: Date.now(),
     etag: gameAssetsCache?.etag ?? "",
-    heroNames,
+    heroes,
   };
-  return [...heroNames];
+  return heroes.map((hero) => ({ ...hero }));
 }
 
 function mergeHeroNames(

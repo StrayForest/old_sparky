@@ -230,7 +230,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
         self.assertTrue(all(len(change) <= 1000 for change in changes))
         self.assertEqual(" ".join(changes), content)
 
-    def test_patch_image_token_is_preserved_in_source_position(self) -> None:
+    def test_patch_image_token_is_removed_from_change_text(self) -> None:
         asset = "f6a6d5724077ee5ea7b3b3701f4af907c9517df4.png"
         content = (
             "RANKED MODE\n"
@@ -247,7 +247,6 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
             detail["sections"][0]["changes"],
             [
                 "RANKED MODE",
-                f"https://clan.fastly.steamstatic.com/images/45164767/{asset}",
                 "UPDATED RANKS & BADGES",
             ],
         )
@@ -260,7 +259,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
             max_length=30000,
         )
 
-        self.assertIn(f"{{STEAM_CLAN_IMAGE}}/45164767/{asset}", plain)
+        self.assertIn(f"https://clan.fastly.steamstatic.com/images/45164767/{asset}", plain)
         self.assertLess(plain.index("Before"), plain.index(asset))
         self.assertLess(plain.index(asset), plain.index("After"))
 
@@ -483,6 +482,198 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
 
         asset_fetch.assert_not_awaited()
 
+    async def test_catalog_policy_bump_refreshes_assets_for_unchanged_patch_ids(self) -> None:
+        patch_id = "1847920302240420"
+        stale_home = {
+            "patches": [{"id": patch_id}],
+            "videos": [],
+            "generated_at": "2026-11-10T00:00:00+00:00",
+            "patches_available": True,
+            "videos_available": True,
+        }
+        legacy_catalog = {
+            "heroes": {"apollo": {"name": "Apollo", "hero_image_url": "https://deadlock.io/old.png"}},
+            "items": {},
+            "ranks": {},
+            "objectives": {},
+        }
+        cache = _Cache(
+            {
+                home_content.HOME_CONTENT_STALE_KEY: json.dumps(stale_home),
+                home_content.PATCH_ASSET_CATALOG_STALE_KEY: json.dumps(legacy_catalog),
+            }
+        )
+        raw_detail = {
+            patch_id: {
+                "id": patch_id,
+                "title": "Halloween 2026 + Gameplay Update",
+                "content": "Apollo: Base gun damage increased by 3%",
+                "published_at": "2026-10-31T00:00:00Z",
+                "url": f"https://store.steampowered.com/news/app/1422450/view/{patch_id}",
+            }
+        }
+        fresh_catalog = {
+            "heroes": {
+                "apollo": {
+                    "name": "Apollo",
+                    "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/fencer_card.webp",
+                }
+            },
+            "items": {},
+            "ranks": {},
+            "objectives": {},
+        }
+        asset_fetch = AsyncMock(return_value=fresh_catalog)
+        with (
+            patch.object(home_content_security, "redis_client", return_value=cache),
+            patch.object(home_content_security, "get_settings", return_value=PlatformSettings(_env_file=None)),
+            patch.object(home_content, "_fetch_steam_patches", AsyncMock(return_value=(stale_home["patches"], raw_detail))),
+            patch.object(home_content, "_fetch_youtube_videos", AsyncMock(return_value=[])),
+            patch.object(home_content, "_fetch_deadlock_asset_catalog", asset_fetch),
+            patch.object(
+                home_content_security,
+                "ensure_patch_translation_records",
+                AsyncMock(return_value={"registered": 0, "enqueued": 0, "enqueue_failures": 0}),
+            ),
+        ):
+            await home_content_security.refresh_home_content(force=True, force_asset_refresh=False)
+
+        asset_fetch.assert_awaited_once()
+        self.assertEqual(asset_fetch.await_args.kwargs["previous_catalog"], legacy_catalog)
+        stored_keys = [call[0][0] for call in cache.pipeline_instance.set_calls]
+        self.assertIn(home_content.PATCH_ASSET_CATALOG_KEY, stored_keys)
+
+    async def test_unknown_intro_stats_from_stale_catalog_schedule_asset_retry(self) -> None:
+        patch_id = "stale-intro"
+        feed = {
+            "patches": [{"id": patch_id}],
+            "videos": [],
+            "generated_at": "2026-11-10T00:00:00+00:00",
+            "patches_available": True,
+            "videos_available": True,
+        }
+        stale_catalog = {
+            "heroes": {
+                "nurse harrow": {
+                    "hero_id": 87,
+                    "name": "Nurse Harrow",
+                    "slug": "nurse-harrow",
+                    "display_name": "Медсестра Харроу",
+                    "description": "Описание героя.",
+                    "hero_image_url": "https://assets-bucket.deadlock-api.com/nurse.webp",
+                    "russian_metadata_available": True,
+                    "abilities": {
+                        "leech therapy": {
+                            "id": 1,
+                            "slug": "ability_nurse_leech_therapy",
+                            "name": "Leech Therapy",
+                            "display_name": "Терапия пиявок",
+                            "description": "Вытягивает здоровье врага.",
+                            "icon_url": "https://assets-bucket.deadlock-api.com/leech.png",
+                            "russian_metadata_available": True,
+                            "stats": [],
+                        }
+                    },
+                }
+            },
+            "items": {},
+            "ranks": {},
+            "objectives": {},
+        }
+        cache = _Cache(
+            {
+                home_content.HOME_CONTENT_STALE_KEY: json.dumps(feed),
+                home_content.PATCH_ASSET_CATALOG_STALE_KEY: json.dumps(stale_catalog),
+            }
+        )
+        raw_detail = {
+            patch_id: {
+                "id": patch_id,
+                "title": "Nurse Harrow joins Deadlock",
+                "content": "Nurse Harrow, who now joins us.",
+                "published_at": "2026-11-10T00:00:00Z",
+                "url": "https://store.steampowered.com/news/app/1422450/view/stale-intro",
+            }
+        }
+        asset_fetch = AsyncMock(side_effect=RuntimeError("temporary asset outage"))
+        with (
+            patch.object(home_content_security, "redis_client", return_value=cache),
+            patch.object(home_content_security, "get_settings", return_value=PlatformSettings(_env_file=None)),
+            patch.object(home_content, "_fetch_steam_patches", AsyncMock(return_value=(feed["patches"], raw_detail))),
+            patch.object(home_content, "_fetch_youtube_videos", AsyncMock(return_value=[])),
+            patch.object(home_content, "_fetch_deadlock_asset_catalog", asset_fetch),
+            patch.object(
+                home_content_security,
+                "ensure_patch_translation_records",
+                AsyncMock(return_value={"registered": 0, "enqueued": 0, "enqueue_failures": 0}),
+            ),
+        ):
+            await home_content_security.refresh_home_content(
+                force=True,
+                force_asset_refresh=False,
+            )
+
+        asset_fetch.assert_awaited_once()
+        detail_calls = [
+            call
+            for call in cache.pipeline_instance.set_calls
+            if call[0][0] == home_content.PATCH_DETAIL_KEY_PREFIX + patch_id
+        ]
+        self.assertEqual(len(detail_calls), 1)
+        projected_detail = json.loads(detail_calls[0][0][1])
+        hero = next(section for section in projected_detail["sections"] if section["kind"] == "hero")
+        ability = hero["abilities"][0]
+        serialized_detail = PatchDetailResponse.model_validate(projected_detail)
+        serialized_hero = next(section for section in serialized_detail.sections if section.kind == "hero")
+        self.assertTrue(hero["hero_catalog_pending"])
+        self.assertIs(ability["stats_pending"], True)
+        self.assertIs(
+            serialized_hero.abilities[0].stats_pending,
+            True,
+        )
+        self.assertIn(
+            home_content.PATCH_ASSET_PENDING_RETRY_KEY,
+            [call[0][0] for call in cache.pipeline_instance.set_calls],
+        )
+
+        fresh_catalog = json.loads(json.dumps(stale_catalog))
+        fresh_catalog["heroes"]["nurse harrow"]["abilities"]["leech therapy"][
+            "stats_pending"
+        ] = False
+        fresh_catalog["heroes"]["nurse harrow"]["abilities"]["leech therapy"][
+            "stats"
+        ] = [{"label": "Задержка применения", "value": "0.2 с."}]
+        retry_cache = _Cache(
+            {
+                home_content.HOME_CONTENT_STALE_KEY: json.dumps(feed),
+                home_content.PATCH_ASSET_CATALOG_STALE_KEY: json.dumps(stale_catalog),
+                home_content.PATCH_DETAIL_KEY_PREFIX + patch_id: json.dumps(projected_detail),
+            }
+        )
+        fresh_asset_fetch = AsyncMock(return_value=fresh_catalog)
+        with (
+            patch.object(home_content_security, "redis_client", return_value=retry_cache),
+            patch.object(home_content_security, "get_settings", return_value=PlatformSettings(_env_file=None)),
+            patch.object(home_content, "_fetch_steam_patches", AsyncMock(return_value=(feed["patches"], raw_detail))),
+            patch.object(home_content, "_fetch_youtube_videos", AsyncMock(return_value=[])),
+            patch.object(home_content, "_fetch_deadlock_asset_catalog", fresh_asset_fetch),
+            patch.object(
+                home_content_security,
+                "ensure_patch_translation_records",
+                AsyncMock(return_value={"registered": 0, "enqueued": 0, "enqueue_failures": 0}),
+            ),
+        ):
+            await home_content_security.refresh_home_content(
+                force=True,
+                force_asset_refresh=False,
+            )
+
+        fresh_asset_fetch.assert_awaited_once()
+        self.assertIn(
+            (home_content.PATCH_ASSET_PENDING_RETRY_KEY,),
+            retry_cache.pipeline_instance.delete_calls,
+        )
+
     async def test_translation_only_pending_hero_does_not_schedule_asset_retry(self) -> None:
         feed = {"patches": [{"id": "1846651706683085"}]}
         cache = _Cache(
@@ -559,6 +750,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
         self.assertTrue(hero["description_requires_translation"])
         self.assertEqual(ability["description"], "English ability description.")
         self.assertTrue(ability["description_requires_translation"])
+        self.assertEqual(ability["stats"], [])
         self.assertFalse(ability["russian_metadata_available"])
 
         detail = patch_detail.structure_patch_detail(
@@ -687,10 +879,340 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
         section = detail["sections"][0]
         ability = section["abilities"][0]
         self.assertEqual(section["hero_display_name"], "Селеста")
-        self.assertEqual(section["hero_description"], "История героя")
+        self.assertIsNone(section["hero_description"])
         self.assertEqual(ability["display_name"], "Пожиратель света")
-        self.assertEqual(ability["description"], "Описание способности")
+        self.assertEqual(ability["presentation_kind"], "balance")
+        self.assertNotIn("description", ability)
         self.assertEqual(ability["changes"], ["cooldown reduced"])
+
+    def test_full_ability_replacement_retains_catalog_description_and_stats(self) -> None:
+        detail = patch_detail.structure_patch_detail(
+            {
+                "id": "replacement",
+                "title": "Patch",
+                "published_at": "2026-11-01T00:00:00Z",
+                "url": "https://store.steampowered.com/news/app/1422450/view/replacement",
+                "content": "[Heroes]\nCeleste\nLight Eater replaced with a new beam attack",
+            },
+            {
+                "heroes": {
+                    "celeste": {
+                        "name": "Celeste",
+                        "abilities": {
+                            "light eater": {
+                                "name": "Light Eater",
+                                "description": "Description of the replacement ability.",
+                                "stats": [{"label": "Damage", "value": "75"}],
+                            }
+                        },
+                    }
+                },
+                "items": {},
+                "objectives": {},
+            },
+        )
+        ability = detail["sections"][0]["abilities"][0]
+        self.assertEqual(ability["presentation_kind"], "replacement")
+        self.assertEqual(ability["description"], "Description of the replacement ability.")
+        self.assertEqual(ability["stats"], [{"label": "Damage", "value": "75"}])
+
+    def test_replacement_targets_new_catalog_ability_only_for_full_replacement(self) -> None:
+        new_ability = {
+            "name": "New Beam",
+            "description": "The new beam ability.",
+            "stats": [{"label": "Урон", "value": "75"}],
+            "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/new_beam.png",
+        }
+        old_ability = {
+            "name": "Old Light Eater",
+            "description": "Removed ability description.",
+            "stats": [{"label": "Урон", "value": "10"}],
+        }
+        replacement_phrases = (
+            "Old Light Eater replaced with New Beam",
+            "Old Light Eater has been replaced by New Beam",
+            "Old Light Eater: Replaced with New Beam",
+        )
+        catalogs = (
+            {"new beam": new_ability},
+            {"old light eater": old_ability, "new beam": new_ability},
+        )
+
+        for phrase in replacement_phrases:
+            for abilities in catalogs:
+                with self.subTest(phrase=phrase, ability_aliases=tuple(abilities)):
+                    raw = {
+                        "id": "replacement-target",
+                        "title": "Patch",
+                        "content": f"[Heroes]\nCeleste\n{phrase}",
+                    }
+                    detail = patch_detail.structure_patch_detail(
+                        raw,
+                        {
+                            "heroes": {"celeste": {"name": "Celeste", "abilities": abilities}},
+                            "items": {},
+                            "objectives": {},
+                        },
+                    )
+                    ability_rows = detail["sections"][0]["abilities"]
+                    self.assertEqual(len(ability_rows), 1)
+                    ability = ability_rows[0]
+                    self.assertEqual(ability["name"], "New Beam")
+                    self.assertEqual(ability["presentation_kind"], "replacement")
+                    self.assertEqual(ability["description"], "The new beam ability.")
+                    self.assertEqual(ability["stats"], [{"label": "Урон", "value": "75"}])
+                    self.assertIn("Old Light Eater", ability["changes"][0])
+
+        for phrase in (
+            "Old Light Eater T3 replaced with New Beam",
+            "Old Light Eater T3 bonus replaced with New Beam",
+            "Old Light Eater added targeting reticle",
+        ):
+            with self.subTest(balance_phrase=phrase):
+                detail = patch_detail.structure_patch_detail(
+                    {
+                        "id": "balance-target",
+                        "title": "Patch",
+                        "content": f"[Heroes]\nCeleste\n{phrase}",
+                    },
+                    {
+                        "heroes": {
+                            "celeste": {
+                                "name": "Celeste",
+                                "abilities": {
+                                    "old light eater": old_ability,
+                                    "new beam": new_ability,
+                                },
+                            }
+                        },
+                        "items": {},
+                        "objectives": {},
+                    },
+                )
+                ability_rows = detail["sections"][0]["abilities"]
+                self.assertEqual(len(ability_rows), 1)
+                ability = ability_rows[0]
+                self.assertEqual(ability["name"], "Old Light Eater")
+                self.assertEqual(ability["presentation_kind"], "balance")
+                self.assertNotIn("description", ability)
+                self.assertNotIn("stats", ability)
+
+    def test_ability_feature_additions_and_tier_replacements_remain_balance(self) -> None:
+        detail = patch_detail.structure_patch_detail(
+            {
+                "id": "mirage-balance",
+                "title": "Patch",
+                "content": (
+                    "[Heroes]\nMirage\n"
+                    "Traveler: Added a targeting reticle under your cursor on the minimap.\n"
+                    "Traveler T3 replaced bonus with +5% damage."
+                ),
+            },
+            {
+                "heroes": {
+                    "mirage": {
+                        "name": "Mirage",
+                        "abilities": {
+                            "traveler": {
+                                "name": "Traveler",
+                                "description": "Catalog description.",
+                                "stats": [{"label": "Damage", "value": "5%"}],
+                            }
+                        },
+                    }
+                },
+                "items": {},
+                "objectives": {},
+            },
+        )
+
+        ability = detail["sections"][0]["abilities"][0]
+        self.assertEqual(ability["presentation_kind"], "balance")
+        self.assertNotIn("description", ability)
+        self.assertNotIn("stats", ability)
+
+    def test_ability_stats_require_localized_user_facing_labels(self) -> None:
+        stats = home_content._localized_ability_stats(
+            {
+                "properties": {
+                    "Damage": {"label": "Damage", "value": "40"},
+                    "AbilityPostCastDuration": {"label": "AbilityPostCastDuration", "value": "2s"},
+                    "AbilityChargesConditionally": {"label": "AbilityChargesConditionally", "value": "3"},
+                },
+                "upgrades": [],
+            },
+            {
+                "properties": {
+                    "Damage": {"label": "Урон", "value": "40"},
+                    "AbilityPostCastDuration": {"value": "2s"},
+                    "AbilityChargesConditionally": {"value": "3"},
+                },
+            },
+        )
+
+        self.assertEqual(stats, [{"label": "Урон", "value": "40"}])
+
+    def test_ability_stats_readiness_tracks_unknown_partial_complete_and_empty(self) -> None:
+        english = {
+            "properties": {
+                "AbilityCooldown": {"label": "Cooldown", "value": "30", "postfix": "s"},
+                "AbilityCastDelay": {"label": "Cast Delay", "value": "0.2", "postfix": "s"},
+            }
+        }
+        cooldown_only = {
+            "properties": {
+                "AbilityCooldown": {"label": "Перезарядка", "value": "30", "postfix": " с."},
+            }
+        }
+        complete = {
+            "properties": {
+                **cooldown_only["properties"],
+                "AbilityCastDelay": {"label": "Задержка применения", "value": "0.2", "postfix": " с."},
+            }
+        }
+
+        self.assertTrue(home_content._ability_stats_pending(None, None))
+        self.assertTrue(home_content._ability_stats_pending({"properties": None}, complete))
+        self.assertFalse(home_content._ability_stats_pending({"properties": {}}, {}))
+        self.assertTrue(home_content._ability_stats_pending(english, cooldown_only))
+        self.assertEqual(
+            home_content._localized_ability_stats(english, cooldown_only),
+            [{"label": "Перезарядка", "value": "30 с."}],
+        )
+        self.assertFalse(home_content._ability_stats_pending(english, complete))
+        self.assertFalse(
+            home_content._ability_stats_pending(
+                {"properties": {"Radius": {"label": "Radius", "value": "6.5m"}}},
+                {"properties": {"Radius": {"label": "Радиус", "value": "6.5m"}}},
+            )
+        )
+        self.assertEqual(
+            home_content._localized_ability_stats(english, complete),
+            [
+                {"label": "Перезарядка", "value": "30 с."},
+                {"label": "Задержка применения", "value": "0.2 с."},
+            ],
+        )
+        self.assertEqual(
+            home_content._localized_ability_stats(
+                {"properties": {"DamagePerSecond": {"label": "Damage Per Second", "value": "125"}}},
+                {"properties": {"DamagePerSecond": {"label": "DPS", "value": "125"}}},
+            ),
+            [{"label": "DPS", "value": "125"}],
+        )
+
+    def test_introduction_includes_source_backed_localized_ability_stats(self) -> None:
+        catalog = home_content._build_asset_catalog(
+            {"heroes": []},
+            {"items": []},
+            supplemental_hero_payload=[
+                {
+                    "id": 87,
+                    "class_name": "hero_nurse",
+                    "name": "Nurse Harrow",
+                    "player_selectable": True,
+                    "development_state": "release",
+                    "disabled": False,
+                    "items": {"signature1": "ability_nurse_leech_therapy"},
+                    "images": {
+                        "icon_hero_card_webp": (
+                            "https://assets-bucket.deadlock-api.com/"
+                            "assets-api-res/images/heroes/nurse_card.webp"
+                        )
+                    },
+                }
+            ],
+            supplemental_item_payload=[
+                {
+                    "id": 1,
+                    "class_name": "ability_nurse_leech_therapy",
+                    "type": "ability",
+                    "name": "Leech Therapy",
+                    "image": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/nurse/leech.png",
+                    "description": {"desc": "Drains enemy health."},
+                    "upgrades": [
+                        {"property_upgrades": [{"name": "AbilityCooldown", "bonus": "-10"}]}
+                    ],
+                    "properties": {
+                        "AbilityCastDelay": {
+                            "label": "Cast Delay",
+                            "value": "0.2",
+                            "postfix": "s",
+                        },
+                        "AbilityCooldown": {
+                            "label": "Cooldown",
+                            "value": "30",
+                            "postfix": "s",
+                        },
+                        "AbilityCastRange": {
+                            "label": "Cast Range",
+                            "value": "0",
+                            "postfix": "m",
+                        },
+                        "Radius": {
+                            "label": "Radius",
+                            "value": "6.5m",
+                            "postfix": "m",
+                        },
+                        "AbilityUnitTargetLimit": {"value": "1"},
+                    },
+                }
+            ],
+            localized_supplemental_hero_payload=[
+                {"id": 87, "class_name": "hero_nurse", "name": "Медсестра Харроу"}
+            ],
+            localized_supplemental_item_payload=[
+                {
+                    "id": 1,
+                    "class_name": "ability_nurse_leech_therapy",
+                    "name": "Терапия пиявок",
+                    "description": {"desc": "Вытягивает здоровье врага."},
+                    "properties": {
+                        "AbilityCastDelay": {
+                            "label": "Задержка применения",
+                            "value": "0.2",
+                            "postfix": " с.",
+                        },
+                        "AbilityCooldown": {
+                            "label": "Перезарядка",
+                            "value": "30",
+                            "postfix": " с.",
+                        },
+                        "AbilityCastRange": {
+                            "label": "Дальность применения",
+                            "value": "0",
+                            "postfix": " м",
+                        },
+                        "Radius": {
+                            "label": "Радиус",
+                            "value": "6.5m",
+                            "postfix": " м",
+                        },
+                    },
+                }
+            ],
+        )
+        detail = patch_detail.structure_patch_detail(
+            {
+                "id": "nurse-intro",
+                "title": "Shh... This Won't Hurt a Bit.",
+                "content": "Nurse Harrow's release is here.",
+            },
+            catalog,
+        )
+        nurse = next(section for section in detail["sections"] if section["kind"] == "hero")
+        ability = nurse["abilities"][0]
+        self.assertEqual(ability["presentation_kind"], "introduction")
+        self.assertEqual(ability["description"], "Вытягивает здоровье врага.")
+        self.assertEqual(
+            ability["stats"],
+            [
+                {"label": "Задержка применения", "value": "0.2 с."},
+                {"label": "Перезарядка", "value": "30 с."},
+                {"label": "Радиус", "value": "6.5m"},
+                {"label": "T1 · Перезарядка", "value": "-10"},
+            ],
+        )
 
     def test_unstructured_hero_announcement_gets_full_ability_roster(self) -> None:
         detail = patch_detail.structure_patch_detail(
@@ -732,10 +1254,12 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(section["hero_name"], "Apollo")
         self.assertEqual(section["hero_display_name"], "Аполлон")
         self.assertEqual(section["hero_image_url"], "https://deadlock.io/assets/apollo.png")
+        self.assertEqual(section["hero_presentation_kind"], "introduction")
         self.assertEqual(
             [ability["name"] for ability in section["abilities"]],
             ["Flawless Advance", "Riposte"],
         )
+        self.assertTrue(all(ability["presentation_kind"] == "introduction" for ability in section["abilities"]))
         self.assertTrue(all(not ability["changes"] for ability in section["abilities"]))
 
     async def test_live_home_hero_announcements_use_current_localized_catalog_and_translation(self) -> None:
@@ -818,6 +1342,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
                         "type": "ability",
                         "name": ability_name,
                         "image": ability_image,
+                        "properties": {},
                     }
                 )
                 russian_items.append(
@@ -832,6 +1357,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
                             else {"desc": f"<p>Описание: {localized_ability}.</p>"}
                         ),
                         "image": ability_image,
+                        "properties": {},
                     }
                 )
             english_heroes.append(
@@ -1165,6 +1691,96 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(validated.sections[1].objective_key, "urn")
         self.assertEqual(validated.sections[2].objective_key, "unstable_rift")
 
+    def test_mid_boss_changes_get_objective_identity_and_catalog_image(self) -> None:
+        icon_url = (
+            "https://assets-bucket.deadlock-api.com/"
+            "assets-api-res/icons/minimap/boss_marker_neutral_psd.png"
+        )
+        catalog = home_content._build_asset_catalog(
+            {"heroes": []},
+            {"items": []},
+            icon_payload={"minimap": {"boss_marker_neutral_psd.png": icon_url}},
+        )
+        detail = patch_detail.structure_patch_detail(
+            {
+                "id": "mid-boss",
+                "title": "Patch",
+                "published_at": "2026-11-01T00:00:00Z",
+                "url": "https://store.steampowered.com/news/app/1422450/view/mid-boss",
+                "content": "[Objectives]\nMid Boss respawn time increased from 6m to 7m",
+            },
+            catalog,
+        )
+
+        section = next(
+            section
+            for section in detail["sections"]
+            if section.get("objective_key") == "mid_boss"
+        )
+        self.assertEqual(section["title"], "Mid Boss")
+        self.assertEqual(section["objective_icon_url"], icon_url)
+        self.assertEqual(
+            section["changes"], ["Mid Boss respawn time increased from 6m to 7m"]
+        )
+        validated = PatchDetailResponse.model_validate(detail)
+        self.assertEqual(validated.sections[0].objective_key, "mid_boss")
+
+    def test_halloween_inline_mid_boss_heading_and_steam_image_are_not_general_changes(self) -> None:
+        image = "{STEAM_CLAN_LOC_IMAGE}/45164767/6073862c8be5bfb374b9d02531bd64d50c1db8c5.png"
+        content = home_content._plain_text(
+            f"Gameplay Update General: map timings changed. {image} Mid-Boss: respawn time increased from 6m to 7m",
+            max_length=30000,
+        )
+        detail = patch_detail.structure_patch_detail(
+            {"id": "1847920302240420", "title": "Halloween 2026 + Gameplay Update", "content": content},
+            {"heroes": {}, "items": {}, "objectives": {}},
+        )
+
+        mid_boss = next(
+            section for section in detail["sections"] if section.get("objective_key") == "mid_boss"
+        )
+        self.assertEqual(
+            mid_boss["changes"], ["Mid-Boss: respawn time increased from 6m to 7m"]
+        )
+        segments = patch_translation.extract_translation_segments(detail)
+        self.assertFalse(any("clan.fastly.steamstatic.com" in segment["text"] for segment in segments))
+
+    def test_public_hero_images_prefer_validated_cdn_over_stale_deadlock_io_url(self) -> None:
+        image_url = (
+            "https://assets-bucket.deadlock-api.com/"
+            "assets-api-res/images/heroes/fencer_card.webp"
+        )
+        catalog = {
+            "heroes": {
+                "apollo": {
+                    "name": "Apollo",
+                    "slug": "hero_fencer",
+                    "icon_url": "https://deadlock.io/assets/game/heroes/fencer_card_psd.png",
+                    "hero_image_url": image_url,
+                }
+            },
+            "ranks": {},
+        }
+
+        public_asset = home_content.public_deadlock_game_assets(catalog)["heroes"][0]
+        self.assertEqual(public_asset["image_url"], image_url)
+        self.assertTrue(public_asset["source_available"])
+        self.assertEqual(home_content.resolve_deadlock_hero_image(catalog, "Apollo"), image_url)
+
+        broken_only_catalog = {
+            "heroes": {
+                "apollo": {
+                    "name": "Apollo",
+                    "icon_url": catalog["heroes"]["apollo"]["icon_url"],
+                }
+            },
+            "ranks": {},
+        }
+        self.assertEqual(
+            home_content.public_deadlock_game_assets(broken_only_catalog)["heroes"][0]["image_url"],
+            "/assets/heroes/Apollo.png",
+        )
+
     def test_objective_aliases_are_exact_and_require_prefix_boundaries(self) -> None:
         urn_aliases = (
             "spirit urn",
@@ -1383,16 +1999,20 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
             previous_catalog=previous_catalog,
         )
 
-        self.assertEqual(catalog["objectives"], previous_catalog["objectives"])
+        self.assertEqual(
+            {key: value for key, value in catalog["objectives"].items() if key != "mid_boss"},
+            previous_catalog["objectives"],
+        )
+        self.assertIsNone(catalog["objectives"]["mid_boss"]["icon_url"])
         self.assertEqual(client.get.await_count, 8)
 
     def test_public_content_cache_versions_keep_home_contract_stable(self) -> None:
         self.assertEqual(home_content.HOME_CONTENT_KEY, "platform:home-content:v4")
         self.assertEqual(home_content.HOME_CONTENT_STALE_KEY, "platform:home-content:stale:v4")
-        self.assertEqual(home_content.PATCH_DETAIL_KEY_PREFIX, "platform:home-content:patch:v9:")
+        self.assertEqual(home_content.PATCH_DETAIL_KEY_PREFIX, "platform:home-content:patch:v10:")
         self.assertEqual(
             home_content.PATCH_ASSET_CATALOG_KEY,
-            "platform:home-content:patch-assets:v6",
+            "platform:home-content:patch-assets:v7",
         )
         self.assertEqual(
             home_content.PATCH_ASSET_CATALOG_STALE_KEY,
@@ -1659,6 +2279,99 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
         )
 
         self.assertEqual(catalog["heroes"]["baba"]["id"], 88)
+
+    async def test_invalid_legacy_asset_json_falls_back_to_current_community_catalog(self) -> None:
+        invalid_response = Mock()
+        invalid_response.raise_for_status = Mock(return_value=None)
+        invalid_response.json = Mock(side_effect=ValueError("HTML response"))
+        image_base = "https://assets-bucket.deadlock-api.com/assets-api-res/images"
+        english_hero = {
+            "id": 87,
+            "class_name": "hero_nurse_harrow",
+            "name": "Nurse Harrow",
+            "player_selectable": True,
+            "development_state": "release",
+            "disabled": False,
+            "items": {"signature1": "ability_nurse_leech_therapy"},
+            "images": {"icon_hero_card_webp": f"{image_base}/heroes/nurse_card.webp"},
+            "description": {"lore": "A healer."},
+        }
+        localized_hero = {
+            "id": 87,
+            "class_name": "hero_nurse_harrow",
+            "name": "Медсестра Харроу",
+            "description": {"lore": "Целительница."},
+        }
+        english_ability = {
+            "id": 25001,
+            "class_name": "ability_nurse_leech_therapy",
+            "type": "ability",
+            "name": "Leech Therapy",
+            "description": {"desc": "Drains health from the target."},
+            "image": f"{image_base}/abilities/nurse_harrow/leech_therapy.png",
+            "properties": {
+                "Damage": {"label": "Damage", "value": "40"},
+                "AbilityPostCastDuration": {
+                    "label": "AbilityPostCastDuration",
+                    "value": "2s",
+                },
+            },
+            "upgrades": [],
+        }
+        localized_ability = {
+            "id": 25001,
+            "class_name": "ability_nurse_leech_therapy",
+            "name": "Терапия пиявок",
+            "description": {"desc": "Вытягивает здоровье цели."},
+            "properties": {
+                "Damage": {"label": "Урон", "value": "40"},
+                "AbilityPostCastDuration": {"value": "2s"},
+            },
+        }
+        shop_item = {
+            "id": 7654,
+            "class_name": "upgrade_high_velocity_rounds",
+            "type": "upgrade",
+            "name": "High-Velocity Rounds",
+            "shopable": True,
+            "item_slot_type": "weapon",
+            "cost": 800,
+            "shop_image_webp": f"{image_base}/items/high_velocity_rounds.webp",
+        }
+        client = Mock()
+        client.get = AsyncMock(
+            side_effect=[
+                invalid_response,
+                invalid_response,
+                _Response(json_payload=[english_hero]),
+                _Response(json_payload=[english_ability, shop_item]),
+                _Response(json_payload=[localized_hero]),
+                _Response(json_payload=[localized_ability]),
+                _Response(json_payload=[]),
+                _Response(json_payload={}),
+            ]
+        )
+
+        catalog = await home_content._fetch_deadlock_asset_catalog(client)
+
+        nurse = catalog["heroes"]["nurse harrow"]
+        self.assertEqual(nurse["hero_image_url"], f"{image_base}/heroes/nurse_card.webp")
+        self.assertEqual(nurse["abilities"]["leech therapy"]["display_name"], "Терапия пиявок")
+        self.assertEqual(
+            nurse["abilities"]["leech therapy"]["stats"],
+            [{"label": "Урон", "value": "40"}],
+        )
+        self.assertEqual(
+            catalog["items"]["high-velocity rounds"],
+            {
+                "name": "High-Velocity Rounds",
+                "slug": "upgrade_high_velocity_rounds",
+                "category": "weapon",
+                "cost": 800,
+                "icon_url": f"{image_base}/items/high_velocity_rounds.webp",
+            },
+        )
+        self.assertEqual(client.get.await_count, 8)
 
     def test_asset_catalog_supports_both_doorman_names(self) -> None:
         catalog = home_content._build_asset_catalog(

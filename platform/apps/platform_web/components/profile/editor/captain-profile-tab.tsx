@@ -4,6 +4,7 @@ import { Fragment, useEffect, useRef, useState } from "react";
 import { ChevronDown, Crown } from "lucide-react";
 import { useI18n } from "@/components/i18n-provider";
 import { CspImage } from "@/components/media/csp-image";
+import { DeadlockHeroImage } from "@/components/media/deadlock-hero-image";
 import {
   cloneDreamSlot,
   dreamSlotEqual,
@@ -17,8 +18,6 @@ import {
   type SaveState,
 } from "@/components/profile/editor/profile-editor-shared";
 import {
-  deadlockHeroIconPath,
-  deadlockHeroPlaceholderPath,
   toggleHeroSelection,
 } from "@/lib/deadlock";
 import { updateCaptainProfile } from "@/lib/profile-api";
@@ -230,15 +229,12 @@ export function CaptainProfileTab({
                 key={hero.name}
                 onClick={() => toggleSlotHero(slot, hero.name)}
               >
-                <CspImage
+                <DeadlockHeroImage
                   alt=""
                   fill
-                  onError={(event) => {
-                    event.currentTarget.onerror = null;
-                    event.currentTarget.src = deadlockHeroPlaceholderPath;
-                  }}
+                  heroName={hero.name}
+                  imageUrl={hero.imageUrl}
                   sizes="120px"
-                  src={deadlockHeroIconPath(hero.name)}
                 />
                 <span>{hero.name}</span>
               </button>
@@ -336,16 +332,12 @@ export function CaptainProfileTab({
                       ) : (
                         slot.desired_heroes.map((hero) => (
                           <div className="dream-selected-hero" key={hero}>
-                            <CspImage
+                            <DeadlockHeroImage
                               alt=""
                               fill
-                              onError={(event) => {
-                                event.currentTarget.onerror = null;
-                                event.currentTarget.src =
-                                  deadlockHeroPlaceholderPath;
-                              }}
+                              heroName={hero}
+                              imageUrl={heroOptions.find((option) => option.name === hero)?.imageUrl}
                               sizes="78px"
-                              src={deadlockHeroIconPath(hero)}
                             />
                             <span>{hero}</span>
                           </div>

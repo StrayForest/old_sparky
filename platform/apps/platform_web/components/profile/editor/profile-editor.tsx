@@ -29,14 +29,14 @@ export function ProfileEditor({
   profile,
   captainPreference,
   dreamSlots,
-  heroNames,
+  heroOptions: catalogHeroOptions,
   steamAuthStatus,
 }: {
   initialTab?: ProfileTabId;
   profile: PlayerProfile;
   captainPreference: CaptainPreference;
   dreamSlots: PlatformDeadlockDreamSlot[];
-  heroNames: string[];
+  heroOptions: Array<{ name: string; imageUrl: string | null }>;
   steamAuthStatus?: "error" | "success";
 }) {
   const { refreshUser, status, user } = useAuth();
@@ -58,11 +58,12 @@ export function ProfileEditor({
   }, [refreshUser, status, user?.has_password, user?.id]);
 
   const heroOptions = useMemo(() => {
-    const merged = [...heroNames, ...profile.heroes];
+    const merged = [...catalogHeroOptions.map((hero) => hero.name), ...profile.heroes];
+    const imageByName = new Map(catalogHeroOptions.map((hero) => [hero.name, hero.imageUrl]));
     return merged
       .filter((hero, index) => hero && merged.indexOf(hero) === index)
-      .map((name) => ({ name, theme: "h-blue" }));
-  }, [heroNames, profile.heroes]);
+      .map((name) => ({ name, theme: "h-blue", imageUrl: imageByName.get(name) ?? null }));
+  }, [catalogHeroOptions, profile.heroes]);
 
   const completionPercent = calculateProfileCompletion(
     summaryProfile,

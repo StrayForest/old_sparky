@@ -2,7 +2,7 @@
 
 - Status: Active / DB-first implementation deployed
 - Owner: Platform maintainers
-- Last reviewed: 2026-10-21
+- Last reviewed: 2026-11-11
 
 This document owns the contract for automatic Russian translation of Deadlock patch-note changes.
 
@@ -20,8 +20,10 @@ unique identity and row lock prevent repeated home refreshes, startup refreshes
 or patch-detail cache-miss refreshes from creating duplicate tasks. A user read
 never starts OpenAI translation. If a task cannot find its registered database
 record, it fails closed and the condition is logged for diagnosis. Failed
-translations are retained as failed state rather than silently requeued on
-every refresh.
+translations are not requeued on every refresh. One failed record may receive
+one delayed automatic retry after 15 minutes when its error is a known network
+or timeout failure and its attempt count is below the fixed retry limit. Other
+failures remain durable and do not incur repeated model calls.
 
 The deployed translation version is `ru-v10`, defined in
 `apps/platform_api/app/services/patch_translation_config.py`. It includes the
@@ -32,11 +34,41 @@ and its historical evidence live in
 
 ## Scope
 
-Only patch **change text** is translated by the translation subsystem. Structural and entity labels keep their canonical English identity; the patch API may also provide separate Russian display labels and catalog-authored descriptions for hero sections and abilities.
+The original Steam `content` field remains English source text. The translated
+patch `sections` carry Russian change lines. Ability balance sections expose
+the ability image/name and translated changes; they omit generic catalog
+descriptions and stats. New-hero and new-ability introductions, plus full
+ability replacements, expose the catalog/announcement description and
+source-backed numeric stats. Stats come from the latest game-data catalog, not
+a historical launch snapshot, so the client labels them as current values.
+Each ability carries `presentation_kind` with
+`balance`, `introduction` or `replacement`; the client displays description
+and stats only for the latter two kinds. Intro stats use `{label, value}` rows
+from the English/Russian game-data catalog, retaining only labeled numeric
+damage, cooldown, duration, range/radius, healing, resistance, speed and related
+properties or numeric upgrade bonuses. Only localized user-facing labels are
+published; missing translated labels or source values stay absent. Introduced
+and fully replaced abilities also carry `stats_pending`: `true` means supported
+numeric source properties are unknown or only partly localized, `false` means
+they are complete or the valid source property bag contains no supported
+numeric stats, and a missing/null value means readiness is unknown (including
+older cached catalog projections). Any available localized rows remain visible
+while pending. Only these introduction/replacement states participate in the
+existing five-minute asset-catalog retry; balance updates do not request
+catalog retries for hidden metadata. A valid ability with no supported numeric
+properties does not retry indefinitely.
+Structural and entity labels keep their canonical English identity, with
+separate localized display labels where the catalog provides them.
 
-The current hero and ability catalog comes from the community Deadlock API's per-patch game-data endpoints (`/v1/assets/heroes` and `/v1/assets/items`), which expose the latest known client build and accept a `language=russian` parameter. Old Sparky joins the English and Russian payloads by stable hero ID and ability class name. The existing deadlock.io game-data feed remains a fallback source. These are community-parsed game files, not a Valve-operated API; Steam's announcement feed remains the source for patch prose. The API selects Russian values when present and English values otherwise, strips HTML and inline game tokens from descriptions, and constructs image URLs only from validated relative `/assets/` paths or the fixed Deadlock API asset CDN host. Catalog HTML is never rendered.
+Mid Boss changes receive the `mid_boss` objective identity and the verified
+neutral boss marker image when the source icon catalog provides it. Steam image
+tokens are resolved to safe source URLs for display but are removed from
+change text and translation input. Embedded `Mid-Boss:` headings are split
+before objective grouping.
 
-When a new Steam announcement appears, the normal home-content refresh fetches the catalog in the same bounded refresh. The worker's existing `home-content-refresh` schedule checks the Steam feed every 5 minutes. It avoids downloading asset bundles when nothing changed, and retries cached hero announcements with genuinely incomplete catalog fields at most once per 5 minutes, under the existing Redis lock. Catalog-pending state is separate from Russian-translation-pending state, so a source-known English fallback does not trigger repeated asset downloads. This lets game data arrive without code changes; an announcement can precede its asset source, in which case the UI reports metadata as pending. Missing Russian descriptions use English game text when available, otherwise the matching Steam ability span, and register those `description` fields directly with the existing DB-first translation pipeline. Detection is bounded by the 5-minute schedule; upstream publication delay remains outside the service's control.
+The current hero, ability and shop-item catalog combines the community Deadlock API's per-patch game-data endpoints (`/v1/assets/heroes` and `/v1/assets/items`) with the legacy deadlock.io index when it returns valid JSON. The community endpoints expose the latest known client build and accept a `language=russian` parameter. Old Sparky joins English and Russian payloads by stable hero ID, ability class name and shop item name. Shop entries are projected from released `type=upgrade` records with a recognized `item_slot_type` and validated image URL. If either legacy endpoint is unavailable, redirected or non-JSON, valid community hero and item data supplies the catalog; if all sources fail, the last-good catalog is retained. These are community-parsed game files, not a Valve-operated API; Steam's announcement feed remains the source for patch prose. The API selects Russian values when present and English values otherwise, strips HTML and inline game tokens from descriptions, and constructs image URLs only from validated relative `/assets/` paths or the fixed Deadlock API asset CDN host. Public hero image projections prefer that validated CDN image, then a bundled static image that exists, then the placeholder; the obsolete deadlock.io card URLs are never treated as healthy merely because they return an HTTP response. Catalog HTML is never rendered.
+
+When a new Steam announcement appears, the normal home-content refresh fetches the catalog in the same bounded refresh and reparses the four displayed patch details under the current detail-cache namespace. The worker's existing `home-content-refresh` schedule checks the Steam feed every 5 minutes. It avoids downloading asset bundles when nothing changed, and retries cached hero introductions with genuinely incomplete required metadata or unknown/partial supported stats at most once per 5 minutes, under the existing Redis lock. Catalog-pending state is separate from Russian-translation-pending state, so an intentionally hidden balance description does not trigger asset retries. An announcement can precede its game-data source; the UI reports required intro metadata and incomplete current stats as pending while the bounded schedule checks again. Missing Russian intro descriptions use English game text when available, otherwise the matching Steam ability span, and register only those fields with the DB-first translation pipeline. Detection is bounded by the 5-minute schedule; upstream publication delay remains outside the service's control.
 
 The translation subsystem must not translate structural/entity labels such as:
 
@@ -123,18 +155,25 @@ For prose, prefer Valve terminology and natural constructions. The model may inf
 
 ## Runtime flow
 
-1. Home-content or patch-detail refresh discovers Steam patch details and registers the exact source version in PostgreSQL.
+1. Home-content or patch-detail refresh discovers Steam patch details, reparses all four displayed details under the current parser/catalog, and registers each exact source version in PostgreSQL.
 2. Only a newly registered `pending` version is published to the low-priority translation queue; the database identity prevents repeated tasks.
 3. Worker loads the structured English patch and Deadlock entity catalog, then verifies that the source hash still matches the queued version.
-4. Only change strings are extracted.
+4. Change strings and descriptions required by introduction/replacement presentation are extracted; balance-only catalog descriptions and all image URLs are excluded.
 5. Numeric/tier facts and non-ambiguous protected entity names are placeholder-protected.
 6. Read-only segment context, the ambiguity list and the checked-in canonical glossary are attached to the OpenAI request.
-7. The model semantically maps English wording variants to canonical glossary concepts and disambiguates the three item/mechanic collisions from context.
-8. The model returns the same segment IDs in the same order without dropping source clauses.
-9. Placeholders are restored and Russian numeric/unit notation is normalized.
-10. Numeric values and tiers are compared against the English source.
-11. Successful translations are committed to PostgreSQL first, then written to Redis under `PATCH_TRANSLATION_VERSION` and served by the patch API.
-12. A Redis miss falls back to PostgreSQL; a missing database translation does not invoke OpenAI from the user request.
+7. The model returns every requested stable segment ID in source order; PostgreSQL is updated only after the full response validates.
+8. Placeholders are restored and Russian numeric/unit notation is normalized.
+9. Numeric values and tiers are compared against the English source.
+10. Successful translations are committed to PostgreSQL first, then written to Redis under `PATCH_TRANSLATION_VERSION` and served by the patch API.
+11. A Redis miss falls back to PostgreSQL; a missing database translation does not invoke OpenAI from the user request.
+
+An automatic retry of a failed translation task is limited to one delayed retry
+for known network/timeout errors, guarded by the same source hash and row lock.
+The runtime makes one translation request and may make one bounded numeric-fact
+correction request if immutable fact validation fails. The warm-up's
+`max_openai_calls` setting and `translation_calls` report count cache-miss patch
+translations; they are not a count of provider HTTP requests. Validation
+failures are not retried in a loop.
 
 ## Parser and catalog cache changes
 
@@ -166,8 +205,15 @@ Likewise, do not grow the item/mechanic ambiguity list speculatively. Add an ent
 For translation changes, use at least the four newest patches available in production as a regression set. Compare:
 
 - the English source change;
-- Old Sparky's generated Russian change;
+- Old Sparky's generated Russian `sections` change (the source `content` field remains English);
 - Valve's Russian Steam wording where the same concept/change is available.
+
+Also verify balance abilities omit catalog prose/stats, introductions and
+replacements include only catalog-backed descriptions/stats, image URLs are
+not translation segments, new heroes retain image/name metadata, and each
+objective change remains grouped with its identity/image. Reparse the exact
+four displayed patch IDs from their source details after a parser namespace
+change; a source-only parser test does not repair cached patch structures.
 
 Pay particular attention to movement speed, cooldown, spirit power/scaling, bullet/spirit/melee resistance, bullet/spirit/melee lifesteal, range/radius, duration and common upgrade wording.
 
@@ -177,9 +223,10 @@ Structural production checks are fail-fast, but the post-deploy workflow is a
 controlled cache warm-up rather than read-only QA: a cache miss acquires a
 Redis lock, may call OpenAI and writes the translation cache. The workflow is
 named `Platform patch translation warm-up`, requires an explicit maximum number
-of cache-miss/OpenAI calls (four by default), and reports the mutation budget in
-its result. It must not run in a polling loop or be described as a pure QA
-check. A read-only check must fail on cache miss instead of invoking the
+of cache-miss patch translations (four by default), and reports that patch
+translation budget in its result. A translation may make one additional bounded
+fact-correction request. It must not run in a polling loop or be described as a
+pure QA check. A read-only check must fail on cache miss instead of invoking the
 translator.
 
 Manual/diagnostic comparison is still required when changing prompt/glossary behavior because numeric correctness alone cannot detect terminology mistakes, item/mechanic ambiguity, prose truncation or awkward Russian phrasing.

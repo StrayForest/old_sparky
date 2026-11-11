@@ -70,6 +70,13 @@ TRANSLATION_STATUS_SKIPPED = "skipped"
 TRANSLATION_STATUS_SUPERSEDED = "superseded"
 TRANSLATION_ENQUEUE_RETRY_SECONDS = 15 * 60
 TRANSLATION_PROCESSING_TIMEOUT_SECONDS = 15 * 60
+TRANSLATION_AUTOMATIC_RETRY_LIMIT = 1
+TRANSLATION_AUTOMATIC_RETRY_DELAY_SECONDS = 15 * 60
+_RETRYABLE_TRANSLATION_ERRORS = frozenset({
+    "ConnectError", "ConnectTimeout", "NetworkError", "PoolTimeout", "TimeoutError",
+    "ReadError", "ReadTimeout", "RemoteProtocolError", "WriteError", "WriteTimeout",
+    "WorkerTimeout",
+})
 PATCH_TRANSLATION_FACT_CORRECTION_ATTEMPTS = 1
 
 
@@ -461,6 +468,7 @@ async def _set_translation_failure(
     error_code: str,
     status: str = TRANSLATION_STATUS_FAILED,
     settings: PlatformSettings | None = None,
+    increment_attempts: bool = False,
 ) -> bool:
     if not source_hash:
         return False
@@ -482,6 +490,8 @@ async def _set_translation_failure(
         record.status = status
         record.error_code = error_code[:80]
         record.processing_started_at = None
+        if increment_attempts:
+            record.attempts = int(record.attempts or 0) + 1
         await db_session.commit()
     return True
 
@@ -492,12 +502,14 @@ async def mark_patch_translation_failed(
     error_code: str,
     *,
     settings: PlatformSettings | None = None,
+    consume_attempt: bool = False,
 ) -> bool:
     return await _set_translation_failure(
         patch_id=patch_id,
         source_hash=source_hash,
         error_code=error_code,
         settings=settings,
+        increment_attempts=consume_attempt,
     )
 
 
@@ -561,16 +573,17 @@ def _enqueue_translation_task(
     source_hash: str,
     *,
     model: str,
+    allow_failed_retry: bool = False,
 ) -> str:
     from apps.platform_worker.worker import patch_translation
 
     task_id = "patch-translation-" + hashlib.sha256(
-        f"{PATCH_TRANSLATION_VERSION}:{PATCH_TRANSLATION_LOCALE}:{model}:{patch_id}:{source_hash}".encode(
+        f"{PATCH_TRANSLATION_VERSION}:{PATCH_TRANSLATION_LOCALE}:{model}:{patch_id}:{source_hash}:{int(allow_failed_retry)}".encode(
             "utf-8"
         )
     ).hexdigest()
     task = patch_translation.apply_async(
-        args=[patch_id, source_hash],
+        args=[patch_id, source_hash, allow_failed_retry],
         task_id=task_id,
     )
     return str(task.id)
@@ -652,27 +665,42 @@ async def ensure_patch_translation_records(
                 if started_at is None or now - started_at >= timedelta(
                     seconds=TRANSLATION_PROCESSING_TIMEOUT_SECONDS
                 ):
-                    record.status = TRANSLATION_STATUS_PENDING
+                    record.status = TRANSLATION_STATUS_FAILED
+                    record.error_code = (
+                        "WorkerTimeout"
+                        if int(getattr(record, "attempts", 0) or 0)
+                        <= TRANSLATION_AUTOMATIC_RETRY_LIMIT
+                        else "attempts_exhausted"
+                    )
                     record.processing_started_at = None
+            allow_failed_retry = bool(
+                record.status == TRANSLATION_STATUS_FAILED
+                and getattr(record, "error_code", None) in _RETRYABLE_TRANSLATION_ERRORS
+                and int(getattr(record, "attempts", 0) or 0) == TRANSLATION_AUTOMATIC_RETRY_LIMIT
+                and record.last_enqueued_at is not None
+                and now - record.last_enqueued_at >= timedelta(
+                    seconds=TRANSLATION_AUTOMATIC_RETRY_DELAY_SECONDS
+                )
+            )
             if record.status != TRANSLATION_STATUS_PENDING:
-                continue
+                if not allow_failed_retry:
+                    continue
             if record.last_enqueued_at is not None and now - record.last_enqueued_at < timedelta(
                 seconds=TRANSLATION_ENQUEUE_RETRY_SECONDS
             ):
                 continue
             record.last_enqueued_at = now
-            enqueue_candidates.append((str(record.id), patch_id, source_hash))
+            enqueue_candidates.append((str(record.id), patch_id, source_hash, allow_failed_retry))
         await db_session.commit()
 
     enqueued = 0
     enqueue_failures = 0
-    for record_id, patch_id, source_hash in enqueue_candidates:
+    for record_id, patch_id, source_hash, allow_failed_retry in enqueue_candidates:
         try:
-            _enqueue_translation_task(
-                patch_id,
-                source_hash,
-                model=settings.platform_openai_model,
-            )
+            enqueue_kwargs: dict[str, Any] = {"model": settings.platform_openai_model}
+            if allow_failed_retry:
+                enqueue_kwargs["allow_failed_retry"] = True
+            _enqueue_translation_task(patch_id, source_hash, **enqueue_kwargs)
         except Exception:
             enqueue_failures += 1
             logger.exception(

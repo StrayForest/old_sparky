@@ -62,10 +62,18 @@ class DeadlockGameAssetsResponse(BaseModel):
     ranks: list[DeadlockGameAssetResponse] = Field(default_factory=list, max_length=32)
 
 
+class PatchAbilityStatResponse(BaseModel):
+    label: str = Field(min_length=1, max_length=120)
+    value: str = Field(min_length=1, max_length=80)
+
+
 class PatchAbilityResponse(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     display_name: str | None = Field(default=None, max_length=120)
     description: str | None = Field(default=None, max_length=2400)
+    presentation_kind: Literal["balance", "introduction", "replacement"] = "balance"
+    stats: list[PatchAbilityStatResponse] = Field(default_factory=list, max_length=32)
+    stats_pending: bool = False
     icon_url: str | None = Field(default=None, max_length=1000)
     changes: list[str] = Field(default_factory=list, max_length=100)
 
@@ -76,12 +84,13 @@ class PatchSectionResponse(BaseModel):
     hero_name: str | None = Field(default=None, max_length=80)
     hero_display_name: str | None = Field(default=None, max_length=120)
     hero_image_url: str | None = Field(default=None, max_length=1000)
+    hero_presentation_kind: Literal["balance", "introduction"] | None = None
     hero_description: str | None = Field(default=None, max_length=8000)
     hero_metadata_pending: bool = False
     item_name: str | None = Field(default=None, max_length=120)
     item_category: Literal["weapon", "vitality", "spirit"] | None = None
     item_icon_url: str | None = Field(default=None, max_length=1000)
-    objective_key: Literal["urn", "unstable_rift"] | None = None
+    objective_key: Literal["urn", "unstable_rift", "mid_boss"] | None = None
     objective_icon_url: str | None = Field(default=None, max_length=1000)
     changes: list[str] = Field(default_factory=list, max_length=500)
     abilities: list[PatchAbilityResponse] = Field(default_factory=list, max_length=20)

@@ -319,9 +319,16 @@ async def _record_patch_translation_failure(
     patch_id: str,
     source_hash: str | None,
     error_code: str,
+    *,
+    consume_attempt: bool = False,
 ) -> None:
     try:
-        await mark_patch_translation_failed(patch_id, source_hash, error_code)
+        await mark_patch_translation_failed(
+            patch_id,
+            source_hash,
+            error_code,
+            consume_attempt=consume_attempt,
+        )
     except Exception:
         logger.exception(
             "patch_translation_failure_record_failed patch_id=%s source_hash=%s",
@@ -333,6 +340,7 @@ async def _record_patch_translation_failure(
 async def _run_patch_translation(
     patch_id: str,
     source_hash: str | None = None,
+    allow_failed_retry: bool = False,
 ) -> dict[str, Any]:
     try:
         source = await get_patch_detail_source(patch_id)
@@ -341,6 +349,7 @@ async def _run_patch_translation(
             patch_id,
             source_hash,
             type(error).__name__,
+            consume_attempt=True,
         )
         logger.warning(
             "patch_translation_source_load_failed patch_id=%s error=%s",
@@ -358,6 +367,7 @@ async def _run_patch_translation(
             patch_id,
             source_hash,
             "source_not_found",
+            consume_attempt=True,
         )
         return {
             "ok": False,
@@ -366,12 +376,32 @@ async def _run_patch_translation(
         }
     try:
         catalog = await get_deadlock_asset_catalog()
-        return await translate_patch_to_russian(
-            source,
-            catalog,
-            settings=settings,
-            expected_source_hash=source_hash,
+    except Exception as error:  # noqa: BLE001
+        await _record_patch_translation_failure(
+            patch_id,
+            source_hash,
+            type(error).__name__,
+            consume_attempt=True,
         )
+        logger.warning(
+            "patch_translation_catalog_load_failed patch_id=%s error=%s",
+            patch_id,
+            type(error).__name__,
+        )
+        return {
+            "ok": False,
+            "status": "failed",
+            "patch_id": patch_id,
+            "error": type(error).__name__,
+        }
+    try:
+        translation_kwargs: dict[str, Any] = {
+            "settings": settings,
+            "expected_source_hash": source_hash,
+        }
+        if allow_failed_retry:
+            translation_kwargs["allow_failed_retry"] = True
+        return await translate_patch_to_russian(source, catalog, **translation_kwargs)
     except Exception as error:  # noqa: BLE001
         await _record_patch_translation_failure(
             patch_id,
@@ -400,8 +430,11 @@ async def _run_patch_translation(
 def patch_translation(
     patch_id: str,
     source_hash: str | None = None,
+    allow_failed_retry: bool = False,
 ) -> dict[str, Any]:
-    return _run_on_worker_loop(_run_patch_translation(patch_id, source_hash))
+    return _run_on_worker_loop(
+        _run_patch_translation(patch_id, source_hash, allow_failed_retry)
+    )
 
 
 async def _run_auth_lifecycle_cleanup() -> dict[str, int]:

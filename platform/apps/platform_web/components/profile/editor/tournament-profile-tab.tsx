@@ -3,6 +3,7 @@
 import { useRef, useState } from "react";
 import { Sword } from "lucide-react";
 import { CspImage } from "@/components/media/csp-image";
+import { DeadlockHeroImage } from "@/components/media/deadlock-hero-image";
 import {
   captainPreferenceOptions,
   cloneTournamentProfile,
@@ -16,8 +17,6 @@ import {
   type SaveState,
 } from "@/components/profile/editor/profile-editor-shared";
 import {
-  deadlockHeroIconPath,
-  deadlockHeroPlaceholderPath,
   deadlockRankIconPath,
   deadlockRankPlaceholderPath,
   rankOptions,
@@ -243,16 +242,13 @@ export function TournamentProfileTab({
                       disabled={saveState === "saving" || unavailable}
                       onClick={() => toggleHero(hero.name)}
                     >
-                      <CspImage
+                      <DeadlockHeroImage
                         alt=""
                         className="hero-card-image"
                         fill
-                        onError={(event) => {
-                          event.currentTarget.onerror = null;
-                          event.currentTarget.src = deadlockHeroPlaceholderPath;
-                        }}
+                        heroName={hero.name}
+                        imageUrl={hero.imageUrl}
                         sizes="160px"
-                        src={deadlockHeroIconPath(hero.name)}
                       />
                       <span>{hero.name}</span>
                     </button>
