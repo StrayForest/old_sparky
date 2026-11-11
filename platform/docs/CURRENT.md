@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-11-10
+- Last reviewed: 2026-11-11
 
 Read this page for live pins, pending release work, open QA gates and hard
 operational limits. Product contracts, procedures and detailed run evidence
@@ -11,22 +11,35 @@ belong in the linked owner documents below.
 ## Live and pending state
 
 - Production app and runner source S are
-  `f7c9238a6e0c930146189ffcf084a6ad9f367614` (release
-  `gha-42875219963-1-f7c9238a6e0c`); previous app A is
-  `645a5ee0d14b98e4784be2dbf276f64961c9eb66`. Active host-tools C is
+  `1e6cae6f55290dffa94a2c7ee93e3f24a0d1ad27` (release
+  `gha-42973869793-1-1e6cae6f5529`); previous app A is
+  `d5d1206d6188ee4059e3b2f2b3cca5da2778e042` (release
+  `gha-42965076258-1-d5d1206d6188`). Active host-tools C remains
   `3159dd2abf5ac5dbb8ad75a34362d5abc9fb55e9`; previous C2
   `c92dce69ed204d39b16884e62fad2b61addaa996` remains preserved. Exact-SHA
-  Security `42868249915/1`, AUTO `42870765131/1` and its automatic production
-  child `42875219963/1` completed successfully. The source-bound backup
-  `42871039003/1` passed restore and Alembic verification. Maintenance
-  `42877571389/1` deleted one stale release, created and verified the latest
-  backup archive, and retained exactly one pair; its disk checks passed.
-  Post-maintenance FULL readiness
-  passed for app/verifier S and C (SHA-256
-  `7e18c2dee8e3177f3c1630937a012252bfa954b7233548e9e5bc9b448224be48`): health
-  checks are 200, all 15 pinned C tools verified, locks are clear and no
-  release marker, diagnostic plan or pending systemd job remains. No fixture
-  is active; obtain fresh canonical FULL readiness before new production work.
+  Security `42971531963/1`, source-bound restore-verified backup
+  `42973472610/1`, AUTO `42973218853/1`, and its automatic production child
+  `42973869793/1` completed successfully. The backup receipt confirms restore
+  and Alembic verification and one retained pair. Draft Cloudflare publish
+  `42973219047/1` also completed successfully from S. Production deployment
+  and live smoke passed.
+- The immutable LiveQA runtime for S is installed at
+  `/root/.oldsparky/liveqa/releases/1e6cae6f55290dffa94a2c7ee93e3f24a0d1ad27/runtime`
+  (manifest v3); the release-operation marker is absent. The canonical public
+  browser suite passed on that generation: 54 checks total, 44 passed, 10
+  expected skips, and no failures, flaky, interrupted or timed-out checks.
+  Four skips were tournament views skipped because production had no
+  tournaments; populated tournament list, detail and bracket views were not
+  exercised. The other six were approved public-mode skips. Cleanup confirmed
+  no remaining QA gate, runner process or active QA service.
+- Public patch and asset QA passed on S. All four current patch pages return
+  Russian localized content. The two balance patches show no ability
+  descriptions or stat rows; Nurse has four ability introductions with
+  descriptions and 67 sourced stat rows; Halloween retains 38 shop-item groups
+  and includes Mid Boss with its game icon. The public hero catalog and Draft
+  roster both contain the same 44 heroes, including Deadman Danny, Nurse
+  Harrow, Rat King, Solomon and Violet. All 44 hero images and 141 unique patch
+  images returned image content and decoded successfully.
 - SSR composite `42862469594/1` measured on app A
   `645a5ee0d14b98e4784be2dbf276f64961c9eb66`, runner source S
   `154be3f847007accd83f077f3079b3f3ccf85813` and host-tools C2. Its unprofiled
