@@ -640,7 +640,6 @@ const translations: Record<string, string> = {
     "patch.abilityCurrentStats": "Актуальные характеристики",
     "patch.objective.urn": "Урна",
     "patch.objective.unstableRift": "Нестабильный разлом",
-    "patch.objective.midBoss": "Мид-босс",
     "info.title": "Информация",
     "info.subtitle": "Как пользоваться платформой, правила турниров и ответы на частые вопросы.",
     "info.sectionsLabel": "Разделы страницы",

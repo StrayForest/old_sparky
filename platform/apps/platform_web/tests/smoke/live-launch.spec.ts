@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 import LiveCountReporter from "../support/live-count-reporter.cjs";
 import { assertLiveQaChromiumSandbox } from "../support/live-qa-sandbox";
+import type { PlatformPatchDetail, PlatformPatchSection } from "../../lib/platform-types";
 
 type BrowserEvidence = {
   consoleCspErrors: string[];
@@ -84,6 +85,54 @@ async function currentIndexedPatchId(
     throw new Error("Live patch index entry has an invalid id.");
   }
   return patchId;
+}
+
+async function currentIndexedPatchIds(
+  request: import("@playwright/test").APIRequestContext,
+): Promise<string[]> {
+  const response = await request.get("/api/v1/content/patch-index");
+  expect(response.ok()).toBe(true);
+  const payload: unknown = await response.json();
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+    throw new Error("Live patch index response is not an object.");
+  }
+  const patches = (payload as Record<string, unknown>).patches;
+  if (!Array.isArray(patches)) {
+    throw new Error("Live patch index has no patch list.");
+  }
+  const ids = patches.slice(0, 4).map((entry) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      throw new Error("Live patch index entry is not an object.");
+    }
+    const id = (entry as Record<string, unknown>).id;
+    if (typeof id !== "string" || !/^\d{1,32}$/u.test(id)) {
+      throw new Error("Live patch index entry has an invalid id.");
+    }
+    return id;
+  });
+  return ids;
+}
+
+function sectionHeading(section: PlatformPatchSection): string {
+  if (section.objective_key === "urn") return "Урна";
+  if (section.objective_key === "unstable_rift") return "Нестабильный разлом";
+  if (section.objective_key === "mid_boss") return "Mid Boss";
+  return section.title;
+}
+
+function hasOwnerPrefix(change: string): boolean {
+  return /^(?:Nurse|Медсестра|Mid Boss|Средний босс|Items|Heroes|Предметы|Герои)\s*:/iu.test(change.trim());
+}
+
+function hasRawPatchMarkup(change: string): boolean {
+  return /STEAM_CLAN_LOC_IMAGE|clan\.fastly\.steamstatic\.com|\[\s*\/?\s*img\b|\[\s*url\b/iu.test(change);
+}
+
+function expectCleanPatchChanges(changes: string[]): void {
+  for (const change of changes) {
+    expect(hasOwnerPrefix(change)).toBe(false);
+    expect(hasRawPatchMarkup(change)).toBe(false);
+  }
 }
 
 test.beforeEach(async ({ page, browserName }) => {
@@ -617,6 +666,140 @@ test("live current patch route and objective source icons remain available", asy
       fullPage: true,
       path: testInfo.outputPath("production-current-patch.png")
     });
+  }
+});
+
+test("live four current patch DTOs render owner-scoped hero and ability changes", async ({ page, request }) => {
+  const patchIds = await currentIndexedPatchIds(request);
+  expect(patchIds).toHaveLength(4);
+  expect(new Set(patchIds).size).toBe(4);
+
+  for (const patchId of patchIds) {
+    const detailResponsePromise = page.waitForResponse((response) => (
+      new URL(response.url()).pathname === `/api/v1/content/patches/${patchId}`
+    ));
+    await page.goto(`/patches/${patchId}`);
+    const detailResponse = await detailResponsePromise;
+    expect(detailResponse.ok()).toBe(true);
+    const patch = await detailResponse.json() as PlatformPatchDetail;
+    expect(patch.id).toBe(patchId);
+    await expect(page.locator(".patch-article")).toBeVisible();
+    const renderedSections = page.locator(".patch-section");
+    await expect(renderedSections).toHaveCount(patch.sections.length);
+
+    for (const [sectionIndex, section] of patch.sections.entries()) {
+      const renderedSection = renderedSections.nth(sectionIndex);
+      await expect(renderedSection.getByRole("heading", { level: 2 }))
+        .toHaveText(sectionHeading(section));
+      await expect(renderedSection.locator(".patch-hero-display-name")).toHaveCount(0);
+      if (section.kind === "hero" && section.hero_presentation_kind !== "introduction") {
+        await expect(renderedSection.locator(".patch-hero-description")).toHaveCount(0);
+      }
+
+      const sectionRows = renderedSection.locator(":scope > .patch-change-list > li");
+      await expect(sectionRows).toHaveCount(section.changes.length);
+      expectCleanPatchChanges(section.changes);
+      await expect(sectionRows).toHaveText(section.changes);
+
+      const abilityCards = renderedSection.locator(".patch-ability");
+      await expect(abilityCards).toHaveCount(section.abilities.length);
+      for (const [abilityIndex, ability] of section.abilities.entries()) {
+        const renderedAbility = abilityCards.nth(abilityIndex);
+        await expect(renderedAbility.getByRole("heading", { level: 3 }))
+          .toHaveText(ability.display_name || ability.name);
+        const iconCount = await renderedAbility.locator(".patch-ability-icon").count();
+        const fallbackCount = await renderedAbility.locator(".patch-ability-icon-fallback").count();
+        expect(iconCount + fallbackCount).toBe(1);
+
+        const abilityRows = renderedAbility.locator(":scope > .patch-change-list > li");
+        await expect(abilityRows).toHaveCount(ability.changes.length);
+        expectCleanPatchChanges(ability.changes);
+        await expect(abilityRows).toHaveText(ability.changes);
+
+        if (ability.presentation_kind !== "introduction" && ability.presentation_kind !== "replacement") {
+          expect(ability.description ?? "").toBe("");
+          expect(ability.stats ?? []).toHaveLength(0);
+          expect(ability.stats_pending ?? false).toBe(false);
+          await expect(renderedAbility.locator(".patch-ability-description, .patch-ability-stats"))
+            .toHaveCount(0);
+        }
+      }
+    }
+
+    const celesteIndex = patch.sections.findIndex((section) => (
+      section.kind === "hero"
+      && `${section.hero_name ?? ""} ${section.title}`.toLowerCase().includes("celeste")
+    ));
+    if (celesteIndex >= 0) {
+      const celesteSection = renderedSections.nth(celesteIndex);
+      await expect(celesteSection.getByRole("heading", { level: 2 })).toHaveText("Celeste");
+      await expect(celesteSection.getByText("СЕЛЕСТА", { exact: true })).toHaveCount(0);
+      await celesteSection.locator(".patch-ability-icon").first().scrollIntoViewIfNeeded();
+      await expect.poll(() => celesteSection.locator(".patch-ability-icon").first().evaluate((image) => (
+        (image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth > 0
+      ))).toBe(true);
+    }
+
+    const nurseIndex = patch.sections.findIndex((section) => (
+      section.kind === "hero"
+      && `${section.hero_name ?? ""} ${section.title}`.toLowerCase().includes("nurse")
+    ));
+    if (nurseIndex >= 0) {
+      const nurseSection = renderedSections.nth(nurseIndex);
+      const nurse = patch.sections[nurseIndex];
+      expect(nurse).toBeDefined();
+      if (patchId === "1847920302240420") {
+        await expect(nurseSection.locator(".patch-hero-image")).toHaveAttribute("src", /.+/u);
+        await expect(nurseSection.locator(".patch-ability")).toHaveCount(4);
+        await expect(page.locator(".general-patch-section")
+          .getByText(/(?:Nurse|Медсестра)\s*:/iu)).toHaveCount(0);
+        const abilityNames = nurse!.abilities.map((ability) => ability.display_name || ability.name);
+        expect(abilityNames).toEqual(expect.arrayContaining([
+          expect.stringMatching(/Wretched Vapors|Гнусные пары/i),
+          expect.stringMatching(/Healing Needles|Лечебные иглы/i),
+        ]));
+        const generalRows = page.locator(".general-patch-section > .patch-change-list > li");
+        for (const ability of nurse!.abilities) {
+          for (const change of ability.changes) {
+            await expect(generalRows.getByText(change, { exact: true })).toHaveCount(0);
+          }
+        }
+        await nurseSection.locator(".patch-ability-icon").first().scrollIntoViewIfNeeded();
+        await expect.poll(() => nurseSection.locator(".patch-ability-icon").first().evaluate((image) => (
+          (image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth > 0
+        ))).toBe(true);
+      } else if (patchId === "1846651706696737") {
+        await expect(nurseSection.locator(".patch-hero-image")).toHaveAttribute("src", /.+/u);
+        expect(nurse!.abilities).toHaveLength(4);
+        expect(nurse!.abilities.every((ability) => ability.presentation_kind === "introduction")).toBe(true);
+        expect(nurse!.abilities.every((ability) => Boolean(ability.description?.trim()))).toBe(true);
+        expect(nurse!.abilities.reduce((sum, ability) => sum + (ability.stats?.length ?? 0), 0)).toBe(67);
+        expect(nurse!.abilities.some((ability) => ability.stats_pending)).toBe(false);
+        await expect(page.locator(".general-patch-section")
+          .getByText(/(?:Nurse|Медсестра)\s*:/iu)).toHaveCount(0);
+      }
+      for (const ability of nurse!.abilities) {
+        for (const change of ability.changes) {
+          await expect(nurseSection.getByText(change, { exact: true })).toHaveCount(1);
+        }
+      }
+    }
+
+    const midBossIndex = patch.sections.findIndex((section) => section.objective_key === "mid_boss");
+    if (midBossIndex >= 0) {
+      const midBossSection = renderedSections.nth(midBossIndex);
+      await expect(midBossSection.getByRole("heading", { level: 2 })).toHaveText("Mid Boss");
+      const midBossImage = midBossSection.locator(".patch-objective-image");
+      await midBossImage.scrollIntoViewIfNeeded();
+      await expect.poll(() => midBossImage.evaluate((image) => (
+        (image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth > 0
+      ))).toBe(true);
+      for (const change of patch.sections[midBossIndex].changes) {
+        expect(hasOwnerPrefix(change)).toBe(false);
+      }
+    }
+
+    await expectNoHorizontalOverflow(page);
   }
 });
 

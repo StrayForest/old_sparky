@@ -1960,13 +1960,14 @@ test("patch detail keeps objective sections, the upper cover crop, and no source
     "Общие изменения",
     "Урна",
     "Нестабильный разлом",
-    "Мид-босс",
+    "Mid Boss",
     "Crushing Fists",
     "The Doorman"
   ]);
   await expect(patchSections.nth(1)).toHaveClass(/objective-patch-section/u);
   await expect(patchSections.nth(2)).toHaveClass(/objective-patch-section/u);
-  await expect(patchSections.nth(5).getByText("Привратник", { exact: true })).toBeVisible();
+  await expect(patchSections.nth(5).getByText("Привратник", { exact: true })).toHaveCount(0);
+  await expect(patchSections.nth(5).getByRole("heading", { level: 2, name: "The Doorman" })).toBeVisible();
   await expect(patchSections.nth(5).getByText("Хозяин дверей и скрытых проходов.", { exact: true })).toBeVisible();
   await expect(patchSections.nth(5).getByText("Подробности героя появятся после обновления данных.", { exact: true })).toBeVisible();
   await expect(patchSections.nth(5).locator(".patch-hero-image")).toHaveAttribute(
@@ -1978,6 +1979,8 @@ test("patch detail keeps objective sections, the upper cover crop, and no source
   await expect(patchSections.nth(5).getByText("30 с", { exact: true })).toHaveCount(0);
   await expect(patchSections.nth(5).getByText("Cooldown increased", { exact: true })).toBeVisible();
   await expect(patchSections.nth(5).locator(".patch-ability-icon")).toHaveJSProperty("naturalWidth", 1);
+  await expect(patchSections.nth(5).locator(".patch-ability-icon")).toHaveCount(1);
+  await expect(patchSections.nth(5).locator(".patch-ability-icon-fallback")).toHaveCount(0);
   await expect(patchSections.nth(5).locator(".patch-hero-image")).toHaveJSProperty("naturalWidth", 1);
   await expect(page.locator('[data-objective-icon="source"], [data-objective-icon="fallback"]')).toHaveCount(3);
   await expect(page.locator(".patch-objective-image")).toHaveCount(2);

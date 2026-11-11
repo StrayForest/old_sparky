@@ -36,13 +36,21 @@ def term_pattern(term: str) -> str:
 
 
 def catalog_protected_terms(catalog: dict[str, Any]) -> list[str]:
-    terms: set[str] = {"Urn", "Unstable Rift"}
+    terms: set[str] = {"Urn", "Unstable Rift", "Mid Boss"}
     for hero in (catalog.get("heroes") or {}).values():
         if not isinstance(hero, dict):
             continue
         name = str(hero.get("name") or "").strip()
         if name:
             terms.add(name)
+        # The community asset catalog's hero class name is a stable source
+        # alias (for example ``hero_nurse`` in patch notes that shorten Nurse
+        # Harrow to ``Nurse``). Keep those source identities in English when
+        # they occur inside translated change prose.
+        class_name = str(hero.get("class_name") or "").strip().casefold()
+        alias_match = re.fullmatch(r"hero_([a-z0-9]+(?:_[a-z0-9]+)*)", class_name)
+        if alias_match is not None:
+            terms.add(alias_match.group(1).replace("_", " "))
         for ability in (hero.get("abilities") or {}).values():
             if isinstance(ability, dict):
                 name = str(ability.get("name") or "").strip()

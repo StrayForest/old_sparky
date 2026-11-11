@@ -7454,7 +7454,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertIn('artifact_run.get("head_branch") != "dev"', verifier)
         self.assertIn("platform-live-launch-sanitized", verifier)
         self.assertIn("platform-live-user-qa", verifier)
-        self.assertIn("total != 54", verifier)
+        self.assertIn("total != 57", verifier)
         self.assertIn('counts["attempt_total"] != 1', verifier)
         proof_step = workflow.index("Verify exact live QA artifacts before timer activation")
         ssh_step = workflow.index("Validate production SSH inputs")

@@ -37,7 +37,7 @@ DEADLOCK_ASSET_BASE_URL = "https://deadlock.io"
 HOME_CONTENT_KEY = "platform:home-content:v4"
 HOME_CONTENT_STALE_KEY = "platform:home-content:stale:v4"
 HOME_CONTENT_LOCK_KEY = "platform:home-content:refresh-lock:v4"
-PATCH_DETAIL_KEY_PREFIX = "platform:home-content:patch:v10:"
+PATCH_DETAIL_KEY_PREFIX = "platform:home-content:patch:v11:"
 PATCH_ASSET_CATALOG_KEY = "platform:home-content:patch-assets:v7"
 PATCH_ASSET_CATALOG_STALE_KEY = "platform:home-content:patch-assets-stale:v1"
 PATCH_ASSET_PENDING_RETRY_KEY = "platform:home-content:patch-assets-pending-retry:v1"
@@ -149,8 +149,13 @@ class _TextExtractor(HTMLParser):
 
 
 def _plain_text(value: str, *, max_length: int) -> str:
+    # Steam News commonly returns BBCode (including inline scope labels such
+    # as ``[b]Heroes:[/b]``) rather than HTML. Normalize its structural tags
+    # before HTML extraction so headings do not become part of the preceding
+    # change and disappear from the patch parser's section state.
+    value = _normalize_steam_bbcode(value.replace("\\-", "-"))
     extractor = _TextExtractor()
-    extractor.feed(unescape(value.replace("\\-", "-")))
+    extractor.feed(unescape(value))
     lines = [" ".join(line.split()) for line in "".join(extractor.parts).splitlines()]
     normalized = "\n".join(line for line in lines if line).strip()
     normalized = re.sub(
@@ -160,6 +165,54 @@ def _plain_text(value: str, *, max_length: int) -> str:
         flags=re.IGNORECASE,
     )
     return normalized[:max_length]
+
+
+_STEAM_BBCODE_SCOPE_RE = re.compile(
+    r"\[b\]\s*(?P<scope>general|items|heroes|objectives)\s*:?\s*\[/b\]",
+    re.IGNORECASE,
+)
+_STEAM_BBCODE_BLOCK_RE = re.compile(
+    r"\[/?(?:p|h[1-6]|list|olist|ul|ol)\s*\]",
+    re.IGNORECASE,
+)
+_STEAM_BBCODE_IMAGE_RE = re.compile(
+    r"\[img(?:\s+src\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\]\s]+))?\s*\]"
+    r".*?\[/img\]",
+    re.IGNORECASE | re.DOTALL,
+)
+_STEAM_BBCODE_URL_RE = re.compile(
+    r"\[url(?:=[^\]]*)?\](?P<text>.*?)\[/url\]",
+    re.IGNORECASE | re.DOTALL,
+)
+_STEAM_BBCODE_GAMEPLAY_HEADING_RE = re.compile(
+    r"\[h[1-6]\]\s*\[b\]\s*Gameplay Update\s*\[/b\]\s*\[/h[1-6]\]",
+    re.IGNORECASE,
+)
+_STEAM_BBCODE_FORMAT_RE = re.compile(
+    r"\[/?(?:b|i|u|s|strike|spoiler|quote)\s*\]",
+    re.IGNORECASE,
+)
+
+
+def _normalize_steam_bbcode(value: str) -> str:
+    # Inline artwork is decorative content; catalog-backed hero/item/objective
+    # images are projected separately, so do not let raw image tokens become
+    # visible change rows or translation input.
+    value = _STEAM_BBCODE_IMAGE_RE.sub("\n", value)
+    # Match HTML anchor behavior: retain visible anchor text and discard the
+    # BBCode URL wrapper rather than exposing link markup to patch changes.
+    value = _STEAM_BBCODE_URL_RE.sub(lambda match: match.group("text"), value)
+    # This h3 is a document label, not a patch change. Scope headers below are
+    # converted to parser markers; discard this enclosing section label.
+    value = _STEAM_BBCODE_GAMEPLAY_HEADING_RE.sub("\n", value)
+    value = _STEAM_BBCODE_SCOPE_RE.sub(
+        lambda match: f"\n[{match.group('scope').title()}]\n",
+        value,
+    )
+    value = re.sub(r"\[\*\]", "\n- ", value, flags=re.IGNORECASE)
+    value = _STEAM_BBCODE_BLOCK_RE.sub("\n", value)
+    value = _STEAM_BBCODE_FORMAT_RE.sub("", value)
+    return value
 
 
 def _excerpt(value: str, *, max_length: int = 260) -> str:
@@ -313,9 +366,15 @@ def _strip_named_change_prefix(change: str, name: str) -> str:
 
 def _patch_scope_heading(line: str) -> str | None:
     normalized = " ".join(line.split()).casefold()
-    if len(normalized) < 2 or normalized[0] != "[" or normalized[-1] != "]":
+    if len(normalized) >= 2 and normalized[0] == "[" and normalized[-1] == "]":
+        label = normalized[1:-1].strip()
+    elif normalized.endswith(":"):
+        label = normalized[:-1].strip()
+    elif normalized in PATCH_SCOPE_HEADINGS:
+        label = normalized
+    else:
         return None
-    return PATCH_SCOPE_HEADINGS.get(normalized[1:-1].strip())
+    return PATCH_SCOPE_HEADINGS.get(label)
 
 
 def _has_whole_token_anchor(line: str, alias: str) -> bool:

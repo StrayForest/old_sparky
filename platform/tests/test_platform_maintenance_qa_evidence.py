@@ -48,17 +48,17 @@ def _canonical_workflow_report(
         marker = "maintenance-contract"
         marker_digest = hashlib.sha256(marker.encode("ascii")).hexdigest()
         failed_counts = count_status != "passed"
-        logical_pass = 46 if failed_counts else 47
-        attempt_pass = 46 if failed_counts else 47
+        logical_pass = 49 if failed_counts else 50
+        attempt_pass = 49 if failed_counts else 50
         count_line = (
-            f"LIVE_BROWSER_COUNTS schema=1 run_status={count_status} logical_total=54 logical_pass={logical_pass} "
+            f"LIVE_BROWSER_COUNTS schema=1 run_status={count_status} logical_total=57 logical_pass={logical_pass} "
             f"logical_fail={1 if failed_counts else 0} logical_expected_fail=0 logical_flaky=0 logical_skip=7 "
-            f"logical_interrupted=0 attempt_total=54 attempt_pass={attempt_pass} attempt_fail={1 if failed_counts else 0} "
+            f"logical_interrupted=0 attempt_total=57 attempt_pass={attempt_pass} attempt_fail={1 if failed_counts else 0} "
             f"attempt_skip=7 attempt_interrupted=0 attempt_timedout=0 source_sha={runner_sha} "
             f"app_sha={app_target_sha} marker_sha256={marker_digest}\n"
         )
         if invalid_counts:
-            count_line = count_line.replace("logical_total=54", "logical_total=53")
+            count_line = count_line.replace("logical_total=57", "logical_total=56")
         status_stage = "complete" if launch_status == "passed" else "browser_qa"
         status_check = "none" if launch_status == "passed" else "browser_qa"
         status_line = (

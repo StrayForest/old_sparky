@@ -39,7 +39,7 @@ const SHA40 = /^[0-9a-f]{40}$/u;
 const SHA64 = /^[0-9a-f]{64}$/u;
 const PUBLIC_GATE_NAME = /^public-live-qa\.[a-z0-9_]{8}$/u;
 const LIVE_USER_GATE_NAME = /^live-user-qa\.[A-Za-z0-9]{6}$/u;
-const PUBLIC_LOGICAL_TOTAL = 54;
+const PUBLIC_LOGICAL_TOTAL = 57;
 const EXPECTED_PUBLIC_SKIP_TYPE = "public-live-qa-expected-skip";
 const PUBLIC_PROJECTS = new Set([
   "live-desktop",
@@ -63,6 +63,7 @@ const PUBLIC_TEST_IDS = new Map([
   ["live home uses text-only tournament steps without overflow", "home_steps_overflow"],
   ["live public contact surfaces do not publish the support recipient", "contact_recipient_privacy"],
   ["live current patch route and objective source icons remain available", "objective_icons"],
+  ["live four current patch DTOs render owner-scoped hero and ability changes", "patch_owner_sections"],
   ["live Cloudflare Analytics is conditionally observed without widening CSP", "analytics_csp"],
   ["live image currentSrc inventory stays inside the exact CSP hosts", "image_csp_hosts"],
 ]);
@@ -210,6 +211,7 @@ const PUBLIC_TEST_TITLES = new Set([
   "live home uses text-only tournament steps without overflow",
   "live public contact surfaces do not publish the support recipient",
   "live current patch route and objective source icons remain available",
+  "live four current patch DTOs render owner-scoped hero and ability changes",
   "live Cloudflare Analytics is conditionally observed without widening CSP",
   "live image currentSrc inventory stays inside the exact CSP hosts",
 ]);
@@ -1106,14 +1108,33 @@ function boundedFailureReportBytes(payload) {
       bytes = Buffer.from(`${JSON.stringify(payload)}\n`, "ascii");
     }
   }
-  // If the report still exceeds the cap, remove event details from later
-  // records while preserving every test identity, status, and source location.
+  // If bounded events are not enough, retain each failed test identity,
+  // project, status and attempt while dropping later optional source locations
+  // as an all-null tuple accepted by the closed consumer contract.
   for (const failure of [...payload.failures].reverse()) {
     if (bytes.length <= MAX_EPHEMERAL_FAILURE_REPORT_BYTES) break;
-    if (failure.page_errors.length > 0) {
+    if (failure.source_file !== null || failure.source_line !== null || failure.source_column !== null) {
+      failure.source_file = null;
+      failure.source_line = null;
+      failure.source_column = null;
+      failure.source_kind = "unavailable";
+      bytes = Buffer.from(`${JSON.stringify(payload)}\n`, "ascii");
+    }
+  }
+  // Keep at least one event globally for durable diagnostics. Earlier passes
+  // reduce each attempt to one event; this pass removes later events only if
+  // source compaction still leaves the report over the cap.
+  let retainedPageErrorEvents = payload.failures.reduce(
+    (total, failure) => total + failure.page_errors.length,
+    0,
+  );
+  for (const failure of [...payload.failures].reverse()) {
+    if (bytes.length <= MAX_EPHEMERAL_FAILURE_REPORT_BYTES) break;
+    if (failure.page_errors.length > 0 && retainedPageErrorEvents > 1) {
       failure.page_errors.pop();
+      retainedPageErrorEvents -= 1;
       failure.page_errors_truncated = true;
-      failure.page_error_state = "unavailable";
+      if (failure.page_errors.length === 0) failure.page_error_state = "unavailable";
       bytes = Buffer.from(`${JSON.stringify(payload)}\n`, "ascii");
     }
   }

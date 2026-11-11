@@ -133,6 +133,7 @@ export type PlatformPatchSection = {
   title: string;
   hero_name: string | null;
   hero_display_name?: string | null;
+  hero_presentation_kind?: "balance" | "introduction" | null;
   hero_image_url?: string | null;
   hero_description?: string | null;
   hero_metadata_pending?: boolean;

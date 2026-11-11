@@ -1,7 +1,7 @@
 "use client";
 
 import { Landmark, Package, Sparkles, Target } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useI18n } from "@/components/i18n-provider";
 import { Hero } from "@/components/layout/hero";
 import { CspImage } from "@/components/media/csp-image";
@@ -80,15 +80,12 @@ export function PatchDetailPage({ patchId }: { patchId: string }) {
                         : section.objective_key === "unstable_rift"
                           ? t("patch.objective.unstableRift")
                           : section.objective_key === "mid_boss"
-                            ? t("patch.objective.midBoss")
+                            ? "Mid Boss"
                           : section.title}</h2>
-                      {section.kind === "hero" && section.hero_display_name ? (
-                        <span className="patch-hero-display-name">{section.hero_display_name}</span>
-                      ) : null}
-                      {section.kind === "hero" && section.hero_description ? (
+                      {section.kind === "hero" && section.hero_presentation_kind === "introduction" && section.hero_description ? (
                         <p className="patch-hero-description">{section.hero_description}</p>
                       ) : null}
-                      {section.kind === "hero" && section.hero_metadata_pending ? (
+                      {section.kind === "hero" && section.hero_presentation_kind === "introduction" && section.hero_metadata_pending ? (
                         <p className="patch-hero-description">{t("patch.heroMetadataPending")}</p>
                       ) : null}
                     </div>
@@ -99,20 +96,7 @@ export function PatchDetailPage({ patchId }: { patchId: string }) {
                       {section.abilities.map((ability) => (
                         <section className="patch-ability" key={ability.name}>
                           <header>
-                            {ability.icon_url ? (
-                              <CspImage
-                                alt=""
-                                className="patch-ability-icon"
-                                height={48}
-                                onError={(event) => {
-                                  event.currentTarget.hidden = true;
-                                  event.currentTarget.nextElementSibling?.removeAttribute("hidden");
-                                }}
-                                src={ability.icon_url}
-                                width={48}
-                              />
-                            ) : null}
-                            <span hidden={Boolean(ability.icon_url)} className="patch-ability-icon-fallback"><Sparkles aria-hidden="true" size={20} /></span>
+                            <PatchAbilityIcon iconUrl={ability.icon_url} />
                             <h3>{ability.display_name || ability.name}</h3>
                           </header>
                           {ability.presentation_kind === "introduction" || ability.presentation_kind === "replacement" ? (
@@ -147,6 +131,34 @@ export function PatchDetailPage({ patchId }: { patchId: string }) {
         ) : null}
       </main>
     </>
+  );
+}
+
+function PatchAbilityIcon({ iconUrl }: { iconUrl: string | null }) {
+  const imageRef = useRef<HTMLImageElement>(null);
+  const [failedSource, setFailedSource] = useState<string | null>(null);
+  const failed = Boolean(iconUrl && failedSource === iconUrl);
+
+  useEffect(() => {
+    const image = imageRef.current;
+    if (iconUrl && image?.complete && image.naturalWidth === 0 && image.currentSrc) {
+      setFailedSource(iconUrl);
+    }
+  }, [iconUrl]);
+
+  if (!iconUrl || failed) {
+    return <span className="patch-ability-icon-fallback" aria-hidden="true"><Sparkles size={20} /></span>;
+  }
+  return (
+    <CspImage
+      alt=""
+      className="patch-ability-icon"
+      height={48}
+      onError={() => setFailedSource(iconUrl)}
+      ref={imageRef}
+      src={iconUrl}
+      width={48}
+    />
   );
 }
 

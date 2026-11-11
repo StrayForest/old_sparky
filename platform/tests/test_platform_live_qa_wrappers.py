@@ -267,6 +267,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                   "live home uses text-only tournament steps without overflow",
                   "live public contact surfaces do not publish the support recipient",
                   "live current patch route and objective source icons remain available",
+                  "live four current patch DTOs render owner-scoped hero and ability changes",
                   "live Cloudflare Analytics is conditionally observed without widening CSP",
                   "live image currentSrc inventory stays inside the exact CSP hosts",
                 ];
@@ -298,7 +299,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                   for (const title of titles) {
                     const key = `${title}|${project}`;
                     const skipDescription = skips.get(key);
-                    const failed = title === "live image currentSrc inventory stays inside the exact CSP hosts"
+                    const failed = title === "live four current patch DTOs render owner-scoped hero and ability changes"
                       && project === "live-webkit-mobile";
                     const status = skipDescription ? "skipped" : failed ? "failed" : "passed";
                     const result = {
@@ -388,10 +389,11 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             self.assertEqual(failures_path.lstat().st_mode & 0o777, 0o600)
             count_payload = json.loads(counts_path.read_text(encoding="ascii"))
             failure_payload = json.loads(failures_path.read_text(encoding="ascii"))
-            self.assertEqual(count_payload["logical_total"], 54)
-            self.assertEqual(count_payload["logical_pass"], 47)
+            self.assertEqual(count_payload["logical_total"], 57)
+            self.assertEqual(count_payload["logical_pass"], 50)
             self.assertEqual(count_payload["logical_fail"], 1)
             self.assertEqual(count_payload["logical_skip"], 6)
+            self.assertEqual(failure_payload["failures"][0]["id"], "patch_owner_sections")
             self.assertEqual(failure_payload["failures"][0]["source_file"], "tests/support/live-qa-sandbox.ts")
             self.assertEqual(failure_payload["failures"][0]["source_line"], 2)
             self.assertEqual(failure_payload["failures"][0]["source_kind"], "assertion")
@@ -666,16 +668,16 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 self.assertEqual(
                     (stress_result.returncode, stress_result.stdout, stress_result.stderr),
                     (0, "", ""),
-                    "the reporter emits a bounded all-54 interrupted-attempt report; "
+                    "the reporter emits a bounded all-57 interrupted-attempt report; "
                     f"counts_exists={max_counts_path.exists()} "
                     f"failure_report_exists={max_failures_path.exists()}",
                 )
                 max_ephemeral = json.loads(max_failures_path.read_text(encoding="ascii"))
-                self.assertEqual(len(max_ephemeral["failures"]), 54)
+                self.assertEqual(len(max_ephemeral["failures"]), 57)
                 self.assertLessEqual(max_failures_path.stat().st_size, 16 * 1024 - 256)
                 self.assertEqual(
                     json.loads(max_counts_path.read_text(encoding="ascii"))["attempt_interrupted"],
-                    54,
+                    57,
                 )
                 platform_live_qa_guard.prepare_public_browser_failure_diagnostics(
                     max_gate,
@@ -695,16 +697,29 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 max_private_bytes = max_private_report.read_bytes()
                 max_private_payload = json.loads(max_private_bytes)
                 self.assertLessEqual(len(max_private_bytes), 16 * 1024)
-                self.assertEqual(len(max_private_payload["failures"]), 54)
+                self.assertEqual(len(max_private_payload["failures"]), 57)
                 self.assertTrue(all(
                     item["status"] == "interrupted"
-                    and item["source_file"] == "tests/support/live-qa-sandbox.ts"
+                    and (
+                        (
+                            item["source_file"] == "tests/support/live-qa-sandbox.ts"
+                            and item["source_line"] == 2
+                            and item["source_column"] == 3
+                            and item["source_kind"] == "assertion"
+                        )
+                        or (
+                            item["source_file"] is None
+                            and item["source_line"] is None
+                            and item["source_column"] is None
+                            and item["source_kind"] == "unavailable"
+                        )
+                    )
                     for item in max_private_payload["failures"]
                 ))
                 self.assertEqual(
                     len({(item["id"], item["project"], item["attempt"])
                          for item in max_private_payload["failures"]}),
-                    54,
+                    57,
                 )
                 durable_events = [
                     event
@@ -734,9 +749,9 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 success_counts = dict(count_payload)
                 success_counts.update(
                     run_status="passed",
-                    logical_pass=48,
+                    logical_pass=51,
                     logical_fail=0,
-                    attempt_pass=48,
+                    attempt_pass=51,
                     attempt_fail=0,
                 )
                 success_failure_payload = dict(failure_payload)
@@ -2228,8 +2243,12 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         route_cases = re.findall(r'^  \{ path: "[^"]+", text:', browser_spec, re.MULTILINE)
         explicit_tests = re.findall(r"^test\(", browser_spec, re.MULTILINE)
         browser_projects = re.findall(r'^      name: "live-[a-z-]+",$', browser_config, re.MULTILINE)
-        self.assertEqual((len(route_cases) + len(explicit_tests), len(browser_projects)), (18, 3))
-        self.assertEqual((len(route_cases) + len(explicit_tests)) * len(browser_projects), 54)
+        self.assertEqual((len(route_cases) + len(explicit_tests), len(browser_projects)), (19, 3))
+        self.assertEqual((len(route_cases) + len(explicit_tests)) * len(browser_projects), 57)
+        self.assertIn(
+            'test("live four current patch DTOs render owner-scoped hero and ability changes"',
+            browser_spec,
+        )
         self.assertEqual(browser_spec.count('type: "public-live-qa-expected-skip"'), 6)
         self.assertIn("PROD_SSH_HOST", source)
         self.assertIn("ssh " + "\\", source)
@@ -2305,16 +2324,16 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             self.assertEqual(preflight_result.stderr, "")
 
             failed_counts_line = (
-                "LIVE_BROWSER_COUNTS schema=1 run_status=failed logical_total=54 logical_pass=47 "
+                "LIVE_BROWSER_COUNTS schema=1 run_status=failed logical_total=57 logical_pass=50 "
                 "logical_fail=1 logical_expected_fail=0 logical_flaky=0 logical_skip=6 "
-                "logical_interrupted=0 attempt_total=54 attempt_pass=47 attempt_fail=1 "
+                "logical_interrupted=0 attempt_total=57 attempt_pass=50 attempt_fail=1 "
                 "attempt_skip=6 attempt_interrupted=0 attempt_timedout=0 "
                 f"source_sha={'a' * 40} app_sha={'b' * 40} marker_sha256={'c' * 64}"
             )
             passing_counts_line = failed_counts_line.replace(
-                "run_status=failed logical_total=54 logical_pass=47 logical_fail=1",
-                "run_status=passed logical_total=54 logical_pass=48 logical_fail=0",
-            ).replace("attempt_pass=47 attempt_fail=1", "attempt_pass=48 attempt_fail=0")
+                "run_status=failed logical_total=57 logical_pass=50 logical_fail=1",
+                "run_status=passed logical_total=57 logical_pass=51 logical_fail=0",
+            ).replace("attempt_pass=50 attempt_fail=1", "attempt_pass=51 attempt_fail=0")
             count_tail = browser_wrapper[browser_wrapper.index("count_status=0\nCOUNT_DIAGNOSTIC_ARGS=()"):]
             def run_count_tail(
                 status: int,
@@ -3112,15 +3131,15 @@ class LiveQaWrapperContractTests(unittest.TestCase):
 
         count_fields = {
             "run_status": "passed",
-            "logical_total": 54,
-            "logical_pass": 44,
+            "logical_total": 57,
+            "logical_pass": 47,
             "logical_fail": 0,
             "logical_expected_fail": 0,
             "logical_flaky": 0,
             "logical_skip": 10,
             "logical_interrupted": 0,
-            "attempt_total": 54,
-            "attempt_pass": 44,
+            "attempt_total": 57,
+            "attempt_pass": 47,
             "attempt_fail": 0,
             "attempt_skip": 10,
             "attempt_interrupted": 0,
@@ -3149,10 +3168,10 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertEqual(passed_report["status"], "passed")
         self.assertTrue(passed_report["success"])
         self.assertEqual(passed_report["failure_reason"], "none")
-        self.assertEqual(passed_report["test_count"], 44)
-        self.assertEqual(passed_report["logical_counts"]["logical_total"], 54)
+        self.assertEqual(passed_report["test_count"], 47)
+        self.assertEqual(passed_report["logical_counts"]["logical_total"], 57)
         self.assertEqual(passed_report["logical_counts"]["logical_skip"], 10)
-        self.assertEqual(passed_report["attempt_counts"]["attempt_pass"], 44)
+        self.assertEqual(passed_report["attempt_counts"]["attempt_pass"], 47)
         self.assertEqual(passed_report["tests"], [])
         self.assertEqual(passed_report["stage"], "complete")
         self.assertEqual(passed_report["check_id"], "none")
@@ -3194,11 +3213,11 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             **count_fields,
             "logical_pass": 0,
             "logical_expected_fail": 1,
-            "logical_skip": 53,
-            "attempt_total": 54,
+            "logical_skip": 56,
+            "attempt_total": 57,
             "attempt_pass": 0,
             "attempt_fail": 1,
-            "attempt_skip": 53,
+            "attempt_skip": 56,
         }
         no_pass_counts_line = (
             "LIVE_BROWSER_COUNTS schema=1 "
@@ -3221,7 +3240,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertFalse(no_pass_report["success"])
         self.assertEqual(no_pass_report["logical_counts"]["logical_pass"], 0)
         self.assertEqual(no_pass_report["logical_counts"]["logical_expected_fail"], 1)
-        self.assertEqual(no_pass_report["logical_counts"]["logical_skip"], 53)
+        self.assertEqual(no_pass_report["logical_counts"]["logical_skip"], 56)
         self.assertEqual(no_pass_report["test_count"], 1)
         self.assertEqual(no_pass_report["failure_reason"], "coverage_incomplete")
         failed_report = sanitize_status((failed_status + "\n").encode(), 1)

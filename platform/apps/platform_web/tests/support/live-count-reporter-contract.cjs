@@ -96,6 +96,7 @@ const publicTitles = [
   "live home uses text-only tournament steps without overflow",
   "live public contact surfaces do not publish the support recipient",
   "live current patch route and objective source icons remain available",
+  "live four current patch DTOs render owner-scoped hero and ability changes",
   "live Cloudflare Analytics is conditionally observed without widening CSP",
   "live image currentSrc inventory stays inside the exact CSP hosts",
 ];
@@ -1257,9 +1258,9 @@ try {
     "utf8",
   );
   const maxSourceLocation = {
-    file: sizeFixture.helper,
+    file: "tests/support/live-qa-sandbox.ts",
     line: 10_000,
-    column: 10_000,
+    column: 3,
   };
   const requiredSkips = new Set(
     publicTests
@@ -1305,25 +1306,33 @@ try {
     "failed",
     { publicGate: true },
   );
-  assert.equal(fullFailureSummary.attempts.interrupted, 54);
+  assert.equal(fullFailureSummary.attempts.interrupted, 57);
   assert.equal(fullFailureSummary.logical.skip, 6);
   assert.equal(withRootOwnedGate(sizeFixture.gateRoot, () => writeBoundedFailureSummary(
     sizeFixture.binding,
     { allTests: () => maxFailedAttempts },
     fullFailureSummary,
     { gateRoot: sizeFixture.gateRoot, sourceRoot: sizeFixture.sourceRoot },
-  )), true, "all 54 validated failed attempts survive the bounded report");
+  )), true, "all 57 validated failed attempts survive the bounded report");
   const maximumReportBytes = fs.readFileSync(
     path.join(sizeFixture.results, "live-failures-v2.json"),
   );
   const maximumReport = JSON.parse(maximumReportBytes.toString("ascii"));
   assert.ok(maximumReportBytes.length <= 16 * 1024);
   assert.ok(maximumReportBytes.length <= 16 * 1024 - 256);
-  assert.equal(maximumReport.failures.length, 54);
+  assert.equal(maximumReport.failures.length, 57);
   assert.ok(maximumReport.failures.every((failure) => failure.status === "interrupted"));
   assert.ok(maximumReport.failures.every((failure) => (
-    failure.source_line === 10_000 && failure.source_column === 10_000
+    (failure.source_file === "tests/support/live-qa-sandbox.ts"
+      && failure.source_line === 10_000
+      && failure.source_column === 3
+      && failure.source_kind === "assertion")
+    || (failure.source_file === null
+      && failure.source_line === null
+      && failure.source_column === null
+      && failure.source_kind === "unavailable")
   )));
+  assert.ok(maximumReport.failures.some((failure) => failure.source_file === null));
   assert.ok(maximumReport.failures.every((failure) => failure.page_errors_truncated));
   assert.ok(maximumReport.failures.some((failure) => failure.page_errors.length === 0));
   assert.ok(maximumReport.failures.some((failure) => failure.page_errors.some((event) => (
@@ -1345,6 +1354,18 @@ try {
     )
   )));
   assert.ok(maximumReport.failures.every((failure) => failure.id && failure.project && failure.status));
+  const failureIdentities = maximumReport.failures.map((failure) => (
+    `${failure.id}:${failure.project}:${failure.attempt}`
+  ));
+  assert.equal(new Set(failureIdentities).size, 57, "every failed attempt has a unique test/project/attempt identity");
+  assert.deepEqual(
+    maximumReport.failures
+      .filter((failure) => failure.id === "patch_owner_sections")
+      .map((failure) => failure.project)
+      .sort(),
+    ["live-desktop", "live-mobile", "live-webkit-mobile"],
+    "the new patch owner scenario survives compaction in all three projects",
+  );
 } finally {
   fs.rmSync(failureRoot, { recursive: true, force: true });
 }

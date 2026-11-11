@@ -1,0 +1,367 @@
+{
+  "id": "1846651706696737",
+  "title": "Shh... This Won't Hurt a Bit.",
+  "published_at": "2026-10-20T20:59:53Z",
+  "url": "",
+  "content": "",
+  "hero_metadata_pending": false,
+  "sections": [
+    {
+      "kind": "general",
+      "title": "Общие изменения",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "It's hard to know if that chill in the air is from the approaching fall breeze, or from the withering glare of Nurse Harrow, who now joins us on the streets of Manhattan. To some, her practices may seem unorthodox, her patients at the Marble Hill Possession Ward cannot say that the results aren't effective. With Leech Therapy, she throws a jar full of leeches that attach to oncoming enemies, draining their health and energy, before crawling back to deliver their haul. Cracking open one of her vials, she releases her Wretched Vapors, possessing her allies with a powerful boost of effectiveness - though subjects should be warned of the side effects when the vapors wear off. To efficiently keep her teammates fighting their best, she loads her syringe full of Healing Needles to inject medicine directly into their veins. And when her patience runs out, she opens her bag to release all the Lurking Terrors captured inside, making her adversaries run for cover. - \"Trust me, I know best.\"",
+        "With Nurse Harrow joining us today, that marks the end of our City Never Sleeps releases. We want to thank everyone for participating in voting once again, and hope you've been enjoying all the new delights that NYC has to offer.",
+        "City Never Sleeps Voting Stats:",
+        "Big Turnout: Over 110 Million votes were cast over the course of the event.",
+        "Narrow Victory: The closest contest was Baba vs Solomon, decided by a nearly 0.5% difference in votes.",
+        "Oracle: Only 847 players voted in every round, and only voted for that round's eventual winner.",
+        "Unlucky: 36,236 players voted in every round, and never once picked that round's winner.",
+        "Dedication: 22,194 players exclusively voted for Nurse Harrow. One player cast exactly 1000 votes for her.",
+        "Highly Effective: Nurse Harrow voters consistently proved to have a higher win rate over all other hero voters."
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "hero",
+      "title": "Nurse Harrow",
+      "hero_name": "Nurse Harrow",
+      "hero_display_name": "Сестра Хэрроу",
+      "hero_presentation_kind": "introduction",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_card.webp",
+      "hero_description": "Высокоуважаемая сестра Хэрроу, на которой держится всё отделение для одержимых в Марбл-Хил, посвятила свою жизнь борьбе с ужасами сверхъестественного. Сочетая в себе заботу, строгость и отстранённый прагматизм, она заслужила среди пациентов славу как святой, так и жестокой мадмуазели. Вероятно, одно другому не мешает.\nИ хотя любой здравомыслящий человек задался бы вопросом, как и зачем Хэрроу хранит боль своих подопечных в медицинском саквояже, никто не станет оспаривать результативность её методов, какими бы жестокими они ни были...",
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [],
+      "abilities": [
+        {
+          "name": "Leech Therapy",
+          "display_name": "Гирудотерапия",
+          "description": "Сестра Хэрроу бросает банку с пиявками, которые присасываются к врагам, нанося\nпостепенный спиритический урон и уменьшая длительность положительных эффектов.",
+          "presentation_kind": "introduction",
+          "stats": [
+            {
+              "label": "Перезарядка",
+              "value": "30 с."
+            },
+            {
+              "label": "Длительность",
+              "value": "5 с."
+            },
+            {
+              "label": "Задержка применения",
+              "value": "0.1 с."
+            },
+            {
+              "label": "радиус",
+              "value": "6.5m"
+            },
+            {
+              "label": "Урон в секунду",
+              "value": "23.0"
+            },
+            {
+              "label": "Уменьшение длительности полож. эффектов в сек.",
+              "value": "0.65 сек."
+            },
+            {
+              "label": "Дальность передвижения пиявок",
+              "value": "8m"
+            },
+            {
+              "label": "Восстановление здоровья за пиявку",
+              "value": "0.6"
+            },
+            {
+              "label": "Скорострельность за пиявку",
+              "value": "5 %"
+            },
+            {
+              "label": "Макс. число пиявок",
+              "value": "10"
+            },
+            {
+              "label": "T1 · Высасывание выносливости",
+              "value": "+0.3"
+            },
+            {
+              "label": "T2 · Перезарядка",
+              "value": "-10"
+            },
+            {
+              "label": "T2 · Спиритическая мощь за пиявку",
+              "value": "+4"
+            },
+            {
+              "label": "T3 · Макс. число пиявок",
+              "value": "+8"
+            },
+            {
+              "label": "T3 · Урон в секунду",
+              "value": "+0.3"
+            },
+            {
+              "label": "T3 · радиус",
+              "value": "+1m"
+            }
+          ],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/nurse/leech.png",
+          "changes": []
+        },
+        {
+          "name": "Wretched Vapors",
+          "display_name": "Гнусные пары",
+          "description": "Сестра Хэрроу разбивает флакон, окутывая себя или союзника эфирным паром, который вызывает горячку, а затем шок.\nПризрачная горячка: увеличивает скорость всех действий и временно притупляет весь получаемый урон, создавая зловещих призраков.\nПризрачный шок: когда пары рассеиваются, скорость всех действий замедляется, а все уцелевшие призраки наносят свой отложенный урон вместе с дополнительным.\nПолучаемое лечение в первую очередь изгоняет призраков, предотвращая их урон.",
+          "presentation_kind": "introduction",
+          "stats": [
+            {
+              "label": "Перезарядка",
+              "value": "40 с."
+            },
+            {
+              "label": "Длительность",
+              "value": "4 с."
+            },
+            {
+              "label": "Дальность применения",
+              "value": "13m"
+            },
+            {
+              "label": "Задержка применения",
+              "value": "0.2 с."
+            },
+            {
+              "label": "Интервал зарядов",
+              "value": "-1.0 с."
+            },
+            {
+              "label": "Отложенный урон",
+              "value": "100 %"
+            },
+            {
+              "label": "Дополнительный получаемый урон",
+              "value": "30 %"
+            },
+            {
+              "label": "Скорость в горячке",
+              "value": "25 %"
+            },
+            {
+              "label": "Длительность шока",
+              "value": "4 сек."
+            },
+            {
+              "label": "Замедление при шоке",
+              "value": "20 %"
+            },
+            {
+              "label": "T1 · Перезарядка",
+              "value": "-15"
+            },
+            {
+              "label": "T1 · Дальность применения",
+              "value": "+7m"
+            },
+            {
+              "label": "T2 · Длительность",
+              "value": "+1"
+            },
+            {
+              "label": "T2 · Получаемое лечение",
+              "value": "+20"
+            },
+            {
+              "label": "T3 · Скорость в горячке",
+              "value": "+20"
+            }
+          ],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/nurse/nurse_vapors.png",
+          "changes": []
+        },
+        {
+          "name": "Healing Needles",
+          "display_name": "Лечебные иглы",
+          "description": "Сестра Хэрроу заряжает оружие полной обоймой шприцев, которые лечат союзников. Нанесение урона восполняет заряды, а каждая собранная пиявка постепенно восстанавливает их.\nПри перезарядке лечащих шприцов расходуется заряд умения.\nНеиспользованные шприцы возвращаются в виде части заряда. Повторное применение умения меняет обойму на обычную.",
+          "presentation_kind": "introduction",
+          "stats": [
+            {
+              "label": "Задержка применения",
+              "value": "0.1 с."
+            },
+            {
+              "label": "Заряды",
+              "value": "1"
+            },
+            {
+              "label": "Интервал зарядов",
+              "value": "-1.0 с."
+            },
+            {
+              "label": "Восстановление зарядов за пиявку",
+              "value": "0.15 %/сек."
+            },
+            {
+              "label": "Накопление зарядов",
+              "value": "100 %"
+            },
+            {
+              "label": "Лечение за выстрел",
+              "value": "22"
+            },
+            {
+              "label": "Бонус к лечению за попадание в голову",
+              "value": "15 %"
+            },
+            {
+              "label": "Длительность накопления",
+              "value": "5 сек."
+            },
+            {
+              "label": "T1 · Заряды",
+              "value": "+1"
+            },
+            {
+              "label": "T2 · Выносливость за выстрел",
+              "value": "+0.6"
+            },
+            {
+              "label": "T2 · Лечение за выстрел",
+              "value": "+16"
+            },
+            {
+              "label": "T3 · Лечение за выстрел",
+              "value": "+0.4"
+            },
+            {
+              "label": "T3 · к длительности положительных эффектов за выстрел",
+              "value": "+6"
+            }
+          ],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/nurse/needle.png",
+          "changes": []
+        },
+        {
+          "name": "Lurking Terrors",
+          "display_name": "Затаённые ужасы",
+          "description": "Сестра Хэрроу открывает саквояж и демонстрирует скрытые в нём кошмары, нанося врагам перед собой\nпостепенный спиритический урон. Враги, которые смотрят на неё, накапливают ужас и не могут использовать умения, требующие выносливости или передвижения. Когда ужас достигает максимального значения, они убегают в страхе.\nКаждая подобранная пиявка увеличивает длительность страха.\nВраги, которые смотрят в другую сторону, получают 50% урона, если на них не действует страх.",
+          "presentation_kind": "introduction",
+          "stats": [
+            {
+              "label": "Перезарядка",
+              "value": "200.0 с."
+            },
+            {
+              "label": "Дальность применения",
+              "value": "35m"
+            },
+            {
+              "label": "Задержка применения",
+              "value": "1.3 с."
+            },
+            {
+              "label": "Длительность применения",
+              "value": "7.0 с."
+            },
+            {
+              "label": "Интервал зарядов",
+              "value": "-1.0 с."
+            },
+            {
+              "label": "Угол зоны применения",
+              "value": "180 °"
+            },
+            {
+              "label": "Урон в секунду",
+              "value": "60"
+            },
+            {
+              "label": "Длительность страха",
+              "value": "2.2 сек."
+            },
+            {
+              "label": "Время накопления страха",
+              "value": "1.75 сек."
+            },
+            {
+              "label": "Время затухания страха",
+              "value": "10.0 сек."
+            },
+            {
+              "label": "Угол взгляда",
+              "value": "80 °"
+            },
+            {
+              "label": "Задержка блокировки выносливости",
+              "value": "0.3 сек."
+            },
+            {
+              "label": "Ускорение в воздухе",
+              "value": "-50 %"
+            },
+            {
+              "label": "Длительность страха за пиявку",
+              "value": "0.1 сек."
+            },
+            {
+              "label": "Скорость передвижения",
+              "value": "30 %"
+            },
+            {
+              "label": "Скорострельность",
+              "value": "30 %"
+            },
+            {
+              "label": "T1 · Перезарядка",
+              "value": "-50"
+            },
+            {
+              "label": "T2 · Скорость передвижения",
+              "value": "+20"
+            },
+            {
+              "label": "T2 · Скорострельность",
+              "value": "+20"
+            },
+            {
+              "label": "T2 · Урон в секунду",
+              "value": "+30"
+            },
+            {
+              "label": "T3 · Сопр. урону при подготовке",
+              "value": "+50"
+            },
+            {
+              "label": "T3 · Длительность применения",
+              "value": "+3.0"
+            },
+            {
+              "label": "T3 · Урон в секунду",
+              "value": "+0.5"
+            }
+          ],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/nurse/medicine_bag.png",
+          "changes": []
+        }
+      ]
+    }
+  ]
+}

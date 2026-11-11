@@ -1,0 +1,380 @@
+{
+  "id": "1848664643339845",
+  "title": "Minor Update - 11-04-2026",
+  "published_at": "2026-11-05T05:02:30Z",
+  "url": "",
+  "content": "",
+  "hero_metadata_pending": false,
+  "sections": [
+    {
+      "kind": "item",
+      "title": "Healbane",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Healbane",
+      "item_category": "vitality",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/vitality/healbane.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Stacks now diminish 20% more aggressively (at 2 stacks 57.8%->54.7%, at 4 stacks 82.2% to 72%)"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "hero",
+      "title": "Apollo",
+      "hero_name": "Apollo",
+      "hero_display_name": "Аполлон",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/fencer_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [],
+      "abilities": [
+        {
+          "name": "Riposte",
+          "display_name": "Рипост",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/fencer/fencer_riposte.png",
+          "changes": [
+            "Pommel Hit now also disarms the enemy",
+            "Pummel hit now ends any preexisting parry on the target",
+            "T2 increased from +0.6s duration to +0.7s"
+          ]
+        },
+        {
+          "name": "Itani Lo Sahn",
+          "display_name": "Итани Ло Сан",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/fencer/fencer_ult.png",
+          "changes": [
+            "T3 bonus damage increased from +50% to +60%"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Baba",
+      "hero_name": "Baba",
+      "hero_display_name": "Буся",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/baba_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Spirit Resistance scaling reduced from 0.7 to 0.5",
+        "Melee damage per boon reduced by 10%"
+      ],
+      "abilities": [
+        {
+          "name": "Baba's Brew",
+          "display_name": "Бусин отвар",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/baba/teapot_brew.png",
+          "changes": [
+            "Cooldown increased from 27s to 28s",
+            "Burn DPS spirit scaling reduced from 0.15 to 0.13",
+            "Cycle time increased from 1.5s to 1.6s"
+          ]
+        },
+        {
+          "name": "Granny Long Legs",
+          "display_name": "Длинноногая бабуся",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/baba/strafing_run.png",
+          "changes": [
+            "Melee Resist reduced from 30% to 25%",
+            "Debuff Resist reduced from 30% to 25%"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Celeste",
+      "hero_name": "Celeste",
+      "hero_display_name": "Селеста",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/unicorn_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [],
+      "abilities": [
+        {
+          "name": "Dazzling Trick",
+          "display_name": "Ослепительный трюк",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/unicorn/unicorn_shield.png",
+          "changes": [
+            "T3 silence duration reduced from +1.25s to +0.75s"
+          ]
+        },
+        {
+          "name": "Radiant Daggers",
+          "display_name": "Лучезарные кинжалы",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/unicorn/unicorn_luminousflux.png",
+          "changes": [
+            "Cast range reduced from 30m to 25m (moved to T2)",
+            "Spirit Amp per Stack reduced from +7% to +6% (moved to T3)"
+          ]
+        },
+        {
+          "name": "Shining Wonder",
+          "display_name": "Сияющее чудо",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/unicorn/unicorn_orb.png",
+          "changes": [
+            "Slow reduced from -32% Movement to -28%",
+            "Cooldown increased from 160s to 170s",
+            "Bounce range reduced from 15.5m to 15m",
+            "T1 move speed slow reduced from -16% to -14%",
+            "T2 bonus damage reduced from +90 to +80"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Deadman Danny",
+      "hero_name": "Deadman Danny",
+      "hero_display_name": "Дохлый Дэнни",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/deadpack_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [],
+      "abilities": [
+        {
+          "name": "Close The Deal",
+          "display_name": "Закрыть сделку",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/deadpack/deadpack_flight.png",
+          "changes": [
+            "Bonus damage to under half health targets reduced from +75% to +55%"
+          ]
+        },
+        {
+          "name": "Strix Salvo",
+          "display_name": "Стригийский залп",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/deadpack/deadpack_salvo.png",
+          "changes": [
+            "Spirit scaling reduced by 8%"
+          ]
+        },
+        {
+          "name": "Chimera Mk1",
+          "display_name": "Химера М1",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/deadpack/deadpack_chimera.png",
+          "changes": [
+            "T2 reduced from 150 Heal On Hit to 125",
+            "T2 heal spirit scaling reduced from 2.0 to 1.7"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Mo & Krill",
+      "hero_name": "Mo & Krill",
+      "hero_display_name": "Мо и Мелкий",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/digger_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [],
+      "abilities": [
+        {
+          "name": "Scorn",
+          "display_name": "Презрение",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/grappler/grappler_regen.png",
+          "changes": [
+            "Heal from heroes increased from 1.2x to 1.3x"
+          ]
+        },
+        {
+          "name": "Burrow",
+          "display_name": "Зарывание",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/grappler/grappler_spin.png",
+          "changes": [
+            "Damage radius increased by +0.5m"
+          ]
+        },
+        {
+          "name": "Sand Blast",
+          "display_name": "Песочная волна",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/grappler/grappler_throw_sand.png",
+          "changes": [
+            "T2 slow from -24% Slow and -26% Dash distance to -28% for both"
+          ]
+        },
+        {
+          "name": "Combo",
+          "display_name": "Комбо",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/grappler/grappler_combo.png",
+          "changes": [
+            "Health per kill increased from 40 to 50"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Nurse Harrow",
+      "hero_name": "Nurse Harrow",
+      "hero_display_name": "Сестра Хэрроу",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Bullet damage increased by 8%"
+      ],
+      "abilities": [
+        {
+          "name": "Lurking Terrors",
+          "display_name": "Затаённые ужасы",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/nurse/medicine_bag.png",
+          "changes": [
+            "Vertical angle increased from 50% to 65%",
+            "Fear buildup time reduced from 2s to 1.75s"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Rat King",
+      "hero_name": "Rat King",
+      "hero_display_name": "Крысиный король",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/ratking_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Bullet damage increased from 5.7 to 5.8",
+        "Ammo increased from 24 to 26"
+      ],
+      "abilities": [
+        {
+          "name": "Scrap Grenade",
+          "display_name": "Хлам-граната",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/ratking/ratking_grenade.png",
+          "changes": [
+            "Meleeing the grenade fuse time extension reduced from 0.4s to 0.25s"
+          ]
+        },
+        {
+          "name": "Rule, Ratannia!",
+          "display_name": "Правь, Крысания!",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/ratking/ratking_flag.png",
+          "changes": [
+            "Move Speed increased from +3m to +4m",
+            "T1 now also reduces cooldown by -25s"
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -749,7 +749,7 @@ jobs:
               and marker[0] == "passed"
               and count_values is not None
               and count_values["run_status"] == "passed"
-              and count_values["logical_total"] == 54
+              and count_values["logical_total"] == 57
               and 6 <= count_values["logical_skip"] <= 10
               and count_values["logical_pass"] == count_values["logical_total"] - count_values["logical_skip"]
               and count_values["logical_fail"] == 0
@@ -923,7 +923,7 @@ jobs:
               or set(attempts) != set(attempt_fields)
               or any(type(logical.get(key)) is not int or logical[key] < 0 for key in logical_fields)
               or any(type(attempts.get(key)) is not int or attempts[key] < 0 for key in attempt_fields)
-              or logical["logical_total"] != 54
+              or logical["logical_total"] != 57
               or not 6 <= logical["logical_skip"] <= 10
               or logical["logical_pass"] != logical["logical_total"] - logical["logical_skip"]
               or logical["logical_total"] - logical["logical_skip"] != report.get("test_count")

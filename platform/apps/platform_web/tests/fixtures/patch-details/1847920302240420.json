@@ -1,0 +1,2294 @@
+{
+  "id": "1847920302240420",
+  "title": "Halloween 2026 + Gameplay Update",
+  "published_at": "2026-10-30T20:51:49Z",
+  "url": "",
+  "content": "",
+  "hero_metadata_pending": false,
+  "sections": [
+    {
+      "kind": "general",
+      "title": "Общие изменения",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "As Halloween draws near, the residents of The Cursed Apple have put out some decorations to celebrate their favorite holiday. The Hideout gains a spooky new look, our heroes don masks, and NYC is now littered with pumpkins and curious Halloween Cauldrons that grant willing trick-or-treaters delicious candy.",
+        "New this year",
+        "Halloween Cauldrons:",
+        "As you walk down the streets of Manhattan during a match, you'll come across bubbling cauldrons boasting a tempting display of treats. With a Heavy Melee, break the cauldron to pick up a piece of Candy and stash it in your pocket for later. When you're feeling a bit snacky, you can consume the candy to grant yourself a boost of energy with the temporary Sugar Rush buff. - Who said candy is bad for you?",
+        "The Halloween festivities are available in-game now through November 2nd, 2026. Happy Haunting!",
+        "------------------------------",
+        "Breakables growth values reduced by 10%",
+        "Fixed some boxes taking longer to respawn if another box's or powerup's pickup was left on the ground",
+        "Haunts base bounty and growth increased by 10%",
+        "Haunts HP and Damage output increased by 10%",
+        "Haunted Souls secure rate is now 25% slower",
+        "Haunted Souls secure rate is now up to 50% faster than baseline based on how far behind you are in Net Worth compared to the enemy team's average (max rate at a 20% Net Worth gap)",
+        "Comeback gold from non-hero sources increased from a max of 26% to 30% (when behind by ~20% Net Worth)",
+        "The bonus NPC souls multiplier when behind now also increases tick souls for the 2 poorest players",
+        "Healing Snacks heal increased from 10% Max HP to 14%",
+        "Steam Vents now increase stamina regeneration by 150%",
+        "Move slow to air drag ratio increased from 0.35 to 0.5",
+        "Move speed in tunnels reduced from +70% to +50%",
+        "Haunts",
+        "Past Dues: Now channels their special attack, creating a build-up aura on the ground that applies sleep slowly to Heroes standing within it over time. Killing the channeling creature destroys the aura.",
+        "Fixed some bugs with Walker stomp logic",
+        "Latest 6 heroes are no longer categorized as \"new\" anymore. This means they have normal hero unlocking requirements for ranked and can now be banned."
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "objective",
+      "title": "Mid Boss",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": "mid_boss",
+      "objective_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/icons/minimap/boss_marker_neutral_psd.png",
+      "changes": [
+        "Adjusted the terrain layout where the midboss is, the area is a little bigger now and has more cover",
+        "Health increased by 20%",
+        "Health gained per minute increased by 20%",
+        "Resistance reductions are now only 50% as effective against the Mid-Boss",
+        "Roar now happens at 25% HP instead of 50%",
+        "Bounty reduced from 3000 (+50/min) to 1500 (+25/min)",
+        "The Rejuvenator now drops as 3 crystals placed evenly around the Mid-Boss pit (random positions), instead of 1 crystal in the center",
+        "Each Rejuvenator crystal breaks in 1 heavy melee and grants the team 1 Rejuvenator (total per Mid-Boss kill unchanged at 3)",
+        "The full heal for breaking a Rejuvenator now applies to each crystal (previously only on the first hit)",
+        "Rejuvenator crystals now give a bounty to the player that breaks them (500 +9/min)",
+        "Rejuvenator crystal drop time increased from 6s to 7.5s"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "High-Velocity Rounds",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "High-Velocity Rounds",
+      "item_category": "weapon",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/weapon/high_velocity_rounds.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Bullet Velocity reduced from 60% to 45% (upgrades unaffected)"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Express Shot",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Express Shot",
+      "item_category": "weapon",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/weapon/express_shot.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Secondary Fire Weapon Damage and growth reduced by 5%"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Hunter's Aura",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Hunter's Aura",
+      "item_category": "weapon",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/weapon/hunters_aura.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "No longer affects or counts enemies outside of line of sight or through walls"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Point Blank",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Point Blank",
+      "item_category": "weapon",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/weapon/point_blank.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Slow duration increased from 2s to 2.5s"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Shadow Weave",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Shadow Weave",
+      "item_category": "weapon",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/weapon/shadow_weave.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "No longer has Ambush Fire Rate or Melee Damage",
+        "Now has +50% Ambush Weapon Damage",
+        "Ambush bonuses now build up over 6s of being stealthed before reaching full power (invis progress UI pulses when it is charged up)",
+        "Abilities used to break stealth now benefit from the Ambush bonus on their own damage (previously the bonus was applied after the ability had already gone off)"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Toxic Bullets",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Toxic Bullets",
+      "item_category": "weapon",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/weapon/toxic_bullets.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Anti Heal increased from 35% to 40%"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Armor Piercer",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Armor Piercer",
+      "item_category": "weapon",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/weapon/armor_piercing_rounds.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Chance increased from 55% to 60%"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Crippling Headshot",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Crippling Headshot",
+      "item_category": "weapon",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/weapon/crippling_headshot.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Anti-Heal increased from -35% to -40%"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Glass Cannon",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Glass Cannon",
+      "item_category": "weapon",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/weapon/glass_cannon.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Weapon Damage increased from 80% to 85%"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Spiritual Overflow",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Spiritual Overflow",
+      "item_category": "weapon",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/weapon/spiritual_overflow.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Spirit power increased from 6 to 8 (from component changes)"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Rebuttal",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Rebuttal",
+      "item_category": "vitality",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/vitality/rebuttal.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Parry Cooldown reduction reduced from -1.75s to -1.25s"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Battle Vest",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Battle Vest",
+      "item_category": "vitality",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/vitality/battle_vest.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Weapon Damage increased from 18% to 22%"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Bullet Lifesteal",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Bullet Lifesteal",
+      "item_category": "vitality",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/vitality/bullet_lifesteal.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Weapon Damage increased from 6% to 10%",
+        "Bullet Lifesteal increased from 13% to 15%"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Healbane",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Healbane",
+      "item_category": "vitality",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/vitality/healbane.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Multiple sources now stack on the enemy with diminishing returns (previously didn't stack)",
+        "Heal on Hero Kill reduced from 275 to 170 + 3/Boon"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Healing Booster",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Healing Booster",
+      "item_category": "vitality",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/vitality/healing_booster.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "No longer builds from Extra Regen",
+        "No longer grants +3 Health Regen",
+        "Out of Combat Regen increased from +1 to +2"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Return Fire",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Return Fire",
+      "item_category": "vitality",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/vitality/return_fire.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Now returns the damage you take from Haze's Fixation",
+        "Fixed the shop tooltip not listing the 10% Bullet Resistance"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Spirit Lifesteal",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Spirit Lifesteal",
+      "item_category": "vitality",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/vitality/spirit_lifesteal.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Spirit Power increased from 6 to 8",
+        "Spirit Lifesteal increased from 13% to 15%"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Spirit Shielding",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Spirit Shielding",
+      "item_category": "vitality",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/vitality/spirit_shielding.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Spirit Resist reduced from 18% to 15%"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Bullet Resilience",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Bullet Resilience",
+      "item_category": "vitality",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/vitality/bullet_resilience.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Bullet Resistance increased from 30% to 35%",
+        "Out of Combat Regen increased from 3 to 5"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Fury Trance",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Fury Trance",
+      "item_category": "vitality",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/vitality/fury_trance.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Active Move Speed increased from +1m to +1.5m",
+        "Bullet Lifesteal increased from 14% to 15%",
+        "Weapon Damage increased from 6% to 10%"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Healing Nova",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Healing Nova",
+      "item_category": "vitality",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/vitality/healing_nova.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Now scales with Spirit Power (1.1) instead of Boons (6)"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Metal Skin",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Metal Skin",
+      "item_category": "vitality",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/vitality/metal_skin.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Now increases your gravity by 20% while active"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Divine Barrier",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Divine Barrier",
+      "item_category": "vitality",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/vitality/divine_barrier.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Cooldown increased from 45s to 55s"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Infuser",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Infuser",
+      "item_category": "vitality",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/vitality/infuser.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Active Lifesteal increased from 70% to 75%",
+        "Spirit Lifesteal increased from 13% to 15%",
+        "Spirit power increased from 6 to 8"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Juggernaut",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Juggernaut",
+      "item_category": "vitality",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/vitality/juggernaut.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Health Regen increased from +8 to +15"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Leech",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Leech",
+      "item_category": "vitality",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/vitality/leech.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Bullet Lifesteal increased from 28% to 30%",
+        "Spirit Lifesteal increased from 28% to 30%"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Spellbreaker",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Spellbreaker",
+      "item_category": "vitality",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/vitality/spellbreaker.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "When the item procs, it continues to reduce any other spirit damage that happens as a result in that damage stack (for example, getting hit by charged shot that procs tankbuster now both get reduced)"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Vampiric Burst",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Vampiric Burst",
+      "item_category": "vitality",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/vitality/vampiric_burst.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Active Lifesteal increased from 70% to 75%",
+        "Bullet Lifesteal increased from 13% to 15%",
+        "Weapon Damage increased from 6% to 10%"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Golden Goose Egg",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Golden Goose Egg",
+      "item_category": "spirit",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/spirit/goose_egg.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Damage Penalty reduced from -15% to -12%"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Mystic Slow",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Mystic Slow",
+      "item_category": "spirit",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/spirit/mystic_slow.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Dash Distance slow increased from -10% to -12%"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Spirit Sap",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Spirit Sap",
+      "item_category": "spirit",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/spirit/spirit_sap.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Cooldown increased from 18s to 22s",
+        "Cast range reduced from 40m to 35m"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Decay",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Decay",
+      "item_category": "spirit",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/spirit/decay.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Incoming Heal reduction increased from -50% to -55%"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Radiant Regeneration",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Radiant Regeneration",
+      "item_category": "spirit",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/spirit/radiant_regeneration.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Regen on Spirit Damage scaling reduced from 0.35 to 0.25",
+        "Heal on Ability Cast now only triggers when you are in combat (like Spellslinger)",
+        "Heal on Ability Cast reduced from 65 to 40",
+        "Heal on Ability Cast boon scaling reduced from 1.7 to 1.4"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Silence Wave",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Silence Wave",
+      "item_category": "spirit",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/spirit/silence_glyph.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Bonus Health increased from +50 to +90"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Torment Pulse",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Torment Pulse",
+      "item_category": "spirit",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/spirit/torment_pulse.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Melee Resistance increased from 18% to 22%"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Echo Shard",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Echo Shard",
+      "item_category": "spirit",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/spirit/echo_shard.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Post cast time reduced from 0.5s to 0.2s"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Focus Lens",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Focus Lens",
+      "item_category": "spirit",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/spirit/focus_lens.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Cooldown reduced from 45s to 40s",
+        "Fixed damage dealt to a barrier not counting toward the repeated damage"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "item",
+      "title": "Lightning Scroll",
+      "hero_name": null,
+      "hero_display_name": null,
+      "hero_presentation_kind": null,
+      "hero_image_url": null,
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": "Lightning Scroll",
+      "item_category": "spirit",
+      "item_icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/items/spirit/lightning_scroll.webp",
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Damage now scales with Spirit Power (0.35)",
+        "Dash Distance slow increased from -10% to -12%"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "hero",
+      "title": "Abrams",
+      "hero_name": "Abrams",
+      "hero_display_name": "Абрамс",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/bull_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Base gun damage increased by 5%"
+      ],
+      "abilities": [
+        {
+          "name": "Siphon Life",
+          "display_name": "Переливание жизни",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/bull_drain.png",
+          "changes": [
+            "T3 increased from +18 DPS to +22"
+          ]
+        },
+        {
+          "name": "Shoulder Charge",
+          "display_name": "Плечом вперёд",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/bull_charge.png",
+          "changes": [
+            "Fixed enemies being held in place longer if you don't hit a wall"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Apollo",
+      "hero_name": "Apollo",
+      "hero_display_name": "Аполлон",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/fencer_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [],
+      "abilities": [
+        {
+          "name": "Riposte",
+          "display_name": "Рипост",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/fencer/fencer_riposte.png",
+          "changes": [
+            "Pommel Hit changed from a stun to an immobilize and parry disable",
+            "Pommel Hit disable duration increased from 0.8s to 1.5s",
+            "T2 disable duration increased from +0.4s to +0.6s",
+            "Fixed the counterattack dash sometimes missing its target or launching Apollo away when the target moves, rounds a corner, or is displaced",
+            "Fixed the counterattack dash missing when Apollo is right on top of the target"
+          ]
+        },
+        {
+          "name": "Flawless Advance",
+          "display_name": "Безупречное наступление",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/fencer/fencer_lungingstab.png",
+          "changes": [
+            "Being stunned or put to sleep during the ability now refunds that stab and keeps your remaining recasts instead of putting it on cooldown"
+          ]
+        },
+        {
+          "name": "Itani Lo Sahn",
+          "display_name": "Итани Ло Сан",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/fencer/fencer_ult.png",
+          "changes": [
+            "No longer interrupted by Sleep"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Baba",
+      "hero_name": "Baba",
+      "hero_display_name": "Буся",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/baba_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Spirit Resist scaling reduced from 0.1 to 0.07"
+      ],
+      "abilities": [
+        {
+          "name": "Threadsap",
+          "display_name": "Истощающая нить",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/baba/threadsap.png",
+          "changes": [
+            "Spirit Steal duration reduced from 22s to 16s",
+            "When a victim cleanses the Threadsap debuff, the matching spirit Baba gained is also removed"
+          ]
+        },
+        {
+          "name": "Granny Long Legs",
+          "display_name": "Длинноногая бабуся",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/baba/strafing_run.png",
+          "changes": [
+            "Light Melee knockback distance reduced from 10m to 8m",
+            "Heavy Melee cooldown reduced from 1.4s to 1.2s (default is 1.0s)",
+            "Heavy Melee slow duration reduced from 4s to 2s",
+            "Heavy melee stomp now only hits the closest Rejuvenator in range"
+          ]
+        },
+        {
+          "name": "Baba's Brew",
+          "display_name": "Бусин отвар",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/baba/teapot_brew.png",
+          "changes": [
+            "No longer has an initial brew time",
+            "Brew order is now random each time she casts it",
+            "Cycle time between each type of brew increased from 1s to 1.5s",
+            "UI indicator color now matches the current brew",
+            "Silence duration reduced from 3s to 2.75s"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Billy",
+      "hero_name": "Billy",
+      "hero_display_name": "Билли",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/punkgoat_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [],
+      "abilities": [
+        {
+          "name": "Rising Ram",
+          "display_name": "Рогатый таран",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/punkgoat/goat_risingram.png",
+          "changes": [
+            "T3 increased from +10% Max Health for 16s to +15% for 20s"
+          ]
+        },
+        {
+          "name": "Blasted",
+          "display_name": "В стельку",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/punkgoat/goat_blasted.png",
+          "changes": [
+            "Cooldown reduced from 27s to 25s"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Calico",
+      "hero_name": "Calico",
+      "hero_display_name": "Калико",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nano_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [],
+      "abilities": [
+        {
+          "name": "Leaping Slash",
+          "display_name": "Рассекающий рывок",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/nano/nano_dash.png",
+          "changes": [
+            "T3 increased from +60 Damage to +90"
+          ]
+        },
+        {
+          "name": "Ava",
+          "display_name": "Ава",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/nano/nano_catform.png",
+          "changes": [
+            "T3 increased from 6s duration to 8s"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Celeste",
+      "hero_name": "Celeste",
+      "hero_display_name": "Селеста",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/unicorn_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [],
+      "abilities": [
+        {
+          "name": "Shining Wonder",
+          "display_name": "Сияющее чудо",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/unicorn/unicorn_orb.png",
+          "changes": [
+            "Damage reduced from 140 to 125"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Deadman Danny",
+      "hero_name": "Deadman Danny",
+      "hero_display_name": "Дохлый Дэнни",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/deadpack_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [],
+      "abilities": [
+        {
+          "name": "Chimera Mk1",
+          "display_name": "Химера М1",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/deadpack/deadpack_chimera.png",
+          "changes": [
+            "Jetpack can no longer be used while cursed",
+            "Fixed bug causing it to not deal damage when held through a Close The Deal",
+            "Items and abilities that pull to the ground now work more reliably against Danny",
+            "Slows now reduce the jetpack's in-air impulse more effectively, and even more if movement abilities are silenced",
+            "Cooldown reduction per boon reduced from -0.4s to -0.25s",
+            "Cooldown refund on hit from T3 reduced from 50% to 30%"
+          ]
+        },
+        {
+          "name": "Close The Deal",
+          "display_name": "Закрыть сделку",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/deadpack/deadpack_flight.png",
+          "changes": [
+            "Fixed some incorrect behavior when used at the top of the belltower"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "The Doorman",
+      "hero_name": "The Doorman",
+      "hero_display_name": "Швейцар",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/doorman_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [],
+      "abilities": [
+        {
+          "name": "Luggage Cart",
+          "display_name": "Багажная тележка",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/doorman/doorman_luggagetrolley.png",
+          "changes": [
+            "T2 increased from +75 Damage on Wall Impact to +90",
+            "T3 increased from -15s Cooldown to -18s"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Drifter",
+      "hero_name": "Drifter",
+      "hero_display_name": "Скиталец",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/drifter_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Base gun damage increased by 3%"
+      ],
+      "abilities": [
+        {
+          "name": "Bloodscent",
+          "display_name": "Запах крови",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/drifter/drifter_thehunger.png",
+          "changes": [
+            "T3 increased from +11% Amplified Damage to +12%"
+          ]
+        },
+        {
+          "name": "Eternal Night",
+          "display_name": "Вечная ночь",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/drifter/darkness.png",
+          "changes": [
+            "T3 increased from +2.5s Duration to +2.75s"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Graves",
+      "hero_name": "Graves",
+      "hero_display_name": "Грейвс",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/necro_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Move speed reduced from 7 to 6.7",
+        "Bullet damage per boon reduced by 4%"
+      ],
+      "abilities": [
+        {
+          "name": "Grasping Hands",
+          "display_name": "Хватка смерти",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/necro/necro_hands.png",
+          "changes": [
+            "Can now be more easily double jumped over",
+            "Deploy time increased from 0.6s to 0.8s"
+          ]
+        },
+        {
+          "name": "Borrowed Decree",
+          "display_name": "Загробный договор",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/necro/necro_gravestone.png",
+          "changes": [
+            "T2 no longer has -0.3s Time To Spawn",
+            "T3 now also provides -0.3s Time To Spawn"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Grey Talon",
+      "hero_name": "Grey Talon",
+      "hero_display_name": "Серый Коготь",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/archer_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [],
+      "abilities": [
+        {
+          "name": "Charged Shot",
+          "display_name": "Заряженный выстрел",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/archer/archer_charged_shot.png",
+          "changes": [
+            "T2 now also has -2s Charge Delay",
+            "T3 no longer has -3s Charge Delay",
+            "T3 now also lets the shot bounce once off a wall (can't hit a target more than once)"
+          ]
+        },
+        {
+          "name": "Guided Owl",
+          "display_name": "Управляемая сова",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/archer/archer_guided_arrow.png",
+          "changes": [
+            "Now launches in the exact direction you're aiming, including steep downward angles (previously always launched at least 45° upward)"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Infernus",
+      "hero_name": "Infernus",
+      "hero_display_name": "Инфернус",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/inferno_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [],
+      "abilities": [
+        {
+          "name": "Napalm",
+          "display_name": "Напалм",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/inferno_molotov.png",
+          "changes": [
+            "T2 lifesteal increased from 15% to 20%"
+          ]
+        },
+        {
+          "name": "Concussive Combustion",
+          "display_name": "Сотрясающий взрыв",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/inferno_bomb.png",
+          "changes": [
+            "T3 now increases spirit scaling by 0.4"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Haze",
+      "hero_name": "Haze",
+      "hero_display_name": "Пелена",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/haze_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [],
+      "abilities": [
+        {
+          "name": "Smoke Bomb",
+          "display_name": "Дымовая шашка",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/haze/haze_smoke_bomb.png",
+          "changes": [
+            "Fixed T3 dispelling debuffs that can't be dispelled (like the Specter Crash from Nurse's Wretched Vapors)"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Kelvin",
+      "hero_name": "Kelvin",
+      "hero_display_name": "Кельвин",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/kelvin_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [],
+      "abilities": [
+        {
+          "name": "Frozen Shelter",
+          "display_name": "Ледяное укрытие",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/kelvin/frozen_shelter.png",
+          "changes": [
+            "Cooldown increased from 185s to 190s",
+            "T1 increased from -20s Cooldown to -30s",
+            "T2 now also reduces enemy fire rate by -20%",
+            "T3 regen increased from +65 to +75"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Lady Geist",
+      "hero_name": "Lady Geist",
+      "hero_display_name": "Леди Гайст",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/spectre_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [],
+      "abilities": [
+        {
+          "name": "Essence Bomb",
+          "display_name": "Бомба квинтэссенции",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/spectre/blood_bomb.png",
+          "changes": [
+            "spirit scaling increased from 1.22 to 1.35"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Lash",
+      "hero_name": "Lash",
+      "hero_display_name": "Хлыст",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/lash_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [],
+      "abilities": [
+        {
+          "name": "Grapple",
+          "display_name": "Сцепка",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/lash/lash_lash.png",
+          "changes": [
+            "T3 now also increases Jump Velocity by +4m"
+          ]
+        },
+        {
+          "name": "Death Slam",
+          "display_name": "Смертельный бросок",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/lash/lash_counter_lash.png",
+          "changes": [
+            "Targeting indicator changed from a cone to a cylinder to more accurately match the ability's range (visual change only)"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "McGinnis",
+      "hero_name": "McGinnis",
+      "hero_display_name": "Макгиннис",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/engineer_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [],
+      "abilities": [
+        {
+          "name": "Mini Turret",
+          "display_name": "Мини-турель",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/engineer_turret.png",
+          "changes": [
+            "Damage vs troopers increased from 50% to 65%",
+            "Health per boon increased from 9 to 10"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Mirage",
+      "hero_name": "Mirage",
+      "hero_display_name": "Мираж",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/mirage_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [],
+      "abilities": [
+        {
+          "name": "Traveler",
+          "display_name": "Путник",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/mirage/mirage_teleport.png",
+          "changes": [
+            "Channel time increased from 2s to 3s",
+            "Onterrupt/cancel cooldown increased from 4s to 5s",
+            "Now gets interrupted if you are Stunned/Immobilized/Slept or have slowing hex on you",
+            "Now grants the old T2 barrier in the base ability (with no scaling)",
+            "The minimap now moves to the center of the screen and is enlarged while targeting",
+            "Added a targeting reticle under your cursor on the minimap that your allies can see, so they can tell where you're thinking of going before you click",
+            "Your destination is now marked on your and your allies' minimaps until you arrive, and stays there briefly after landing",
+            "T2 changed from \"400 Barrier that scales with spirit\" to \"-65s Cooldown\"",
+            "T3 changed from \"-90s Cooldown\" to \"Cannot be interrupted by damage\"",
+            "T3 now also adds barrier spirit scaling (0.8)"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Mo & Krill",
+      "hero_name": "Mo & Krill",
+      "hero_display_name": "Мо и Мелкий",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/digger_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Spirit per boon reduced from 1.1 to 0.6",
+        "Spirit damage on all abilities reduced by 10% (base values and growth/upgrades)",
+        "Bullet damage per boon increased by 4%"
+      ],
+      "abilities": []
+    },
+    {
+      "kind": "hero",
+      "title": "Nurse Harrow",
+      "hero_name": "Nurse Harrow",
+      "hero_display_name": "Сестра Хэрроу",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Base gun damage reduced by 10%"
+      ],
+      "abilities": [
+        {
+          "name": "Leech Therapy",
+          "display_name": "Гирудотерапия",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/nurse/leech.png",
+          "changes": [
+            "Fixed enemies being unable to see the glow on the hunting leeches",
+            "Fixed leeches attaching to targets while the game is paused",
+            "Fed leeches duration on the ground changed from a fixed 180s to 120s + 3s/min",
+            "Leeches on the ground are now removed on round reset"
+          ]
+        },
+        {
+          "name": "Wretched Vapors",
+          "display_name": "Гнусные пары",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/nurse/nurse_vapors.png",
+          "changes": [
+            "T3 increased from +15% Rush Speed to +20%"
+          ]
+        },
+        {
+          "name": "Healing Needles",
+          "display_name": "Лечебные иглы",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/nurse/needle.png",
+          "changes": [
+            "Heal Per Shot reduced from 25 to 22",
+            "T2 Heal Per Shot reduced from +20 to +16",
+            "Spirit scaling increased from 0.2 to 0.24"
+          ]
+        },
+        {
+          "name": "Lurking Terrors",
+          "display_name": "Затаённые ужасы",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/nurse/medicine_bag.png",
+          "changes": [
+            "Fear buildup time increased from 1.3s to 2s",
+            "Enemies no longer build fear when Nurse is more than 50 degrees above or below their view",
+            "T3 changed from \"Immune to damage while channeling\" to \"Takes 50% Reduced Damage while channeling\"",
+            "Duration reduced from 7s to 5s",
+            "T3 reduced from +3s Duration to +2s"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Paige",
+      "hero_name": "Paige",
+      "hero_display_name": "Пейдж",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/bookworm_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Base bullet damage reduced from 35 to 32",
+        "Bullet damage growth per boon increased from 0.52 to 0.61"
+      ],
+      "abilities": [
+        {
+          "name": "Bookwyrm",
+          "display_name": "Книжный змей",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/bookworm/bookworm_dragon.png",
+          "changes": [
+            "T2 Trail Duration reduced from +2s to +1s"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Paradox",
+      "hero_name": "Paradox",
+      "hero_display_name": "Парадокс",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/chrono_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [],
+      "abilities": [
+        {
+          "name": "Paradoxical Swap",
+          "display_name": "Парадоксальная перестановка",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/chrono/chrono_swap.png",
+          "changes": [
+            "Cooldown reduced from 110s to 95s"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Rat King",
+      "hero_name": "Rat King",
+      "hero_display_name": "Крысиный король",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/ratking_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Base bullet damage reduced by 5%",
+        "Bullet damage growth reduced by 20%"
+      ],
+      "abilities": [
+        {
+          "name": "Scrap Grenade",
+          "display_name": "Хлам-граната",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/ratking/ratking_grenade.png",
+          "changes": [
+            "Damage reduced from 70 to 60",
+            "T2 damage reduced from +70 to +60",
+            "T3 damage reduced from 300 to 275",
+            "Fuse timers increased by 0.1s (first bounce from 0.8s to 0.9s, later bounces from 0.7s to 0.8s, T3 final explosion from 1.5s to 1.6s)",
+            "Meleeing the grenade now gives it at least 0.4s before it explodes (if less than 0.4s was left on its fuse, the fuse is extended to 0.4s)",
+            "Radius reduced from 8m to 6m",
+            "Large explosion radius reduced from 14m to 10m"
+          ]
+        },
+        {
+          "name": "Rule, Ratannia!",
+          "display_name": "Правь, Крысания!",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/ratking/ratking_flag.png",
+          "changes": [
+            "Knockup duration reduced by 50%",
+            "Cooldown increased from 160s to 180s",
+            "Now goes on cooldown when stunned/slept before placing it. In that case, the flag is placed in that position but without any of the initial impact effects (damage/knockup)",
+            "Radius reduced from 20m to 16m",
+            "T2 Radius reduced from +8m to +6m",
+            "Duration reduced from 12s to 9s"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Seven",
+      "hero_name": "Seven",
+      "hero_display_name": "Семь",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/gigawatt_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [],
+      "abilities": [
+        {
+          "name": "Static Charge",
+          "display_name": "Статический заряд",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/giga_static.png",
+          "changes": [
+            "T3 stun duration increased from 0.9s to 1.1s"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Shiv",
+      "hero_name": "Shiv",
+      "hero_display_name": "Заточка",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/shiv_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Alt Fire damage per boon reduced by 5%",
+        "Fixed the Alt Fire last-shot sound only playing when you had 1 bullet left"
+      ],
+      "abilities": [
+        {
+          "name": "Serrated Knives",
+          "display_name": "Зазубренные ножи",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/shiv/shiv_toss.png",
+          "changes": [
+            "Rage damage increased from 3.5% Current Health to 4%",
+            "T3 now also increases rage damage spirit scaling by +0.01"
+          ]
+        },
+        {
+          "name": "Bloodletting",
+          "display_name": "Кровопускание",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/shiv/shiv_bloodletting.png",
+          "changes": [
+            "Fixed damage ticks playing audio"
+          ]
+        },
+        {
+          "name": "Killing Blow",
+          "display_name": "Добивающий удар",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/shiv/shiv_killing_blow.png",
+          "changes": [
+            "Recast duration reduced from 16s to 12s"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Silver",
+      "hero_name": "Silver",
+      "hero_display_name": "Сильвер",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/werewolf_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Base health regen increased from 2.5 to 3",
+        "Go For The Throat - Now counts weapon damage from Point Blank and Opening Rounds"
+      ],
+      "abilities": [
+        {
+          "name": "Entangling Bola",
+          "display_name": "Опутывающая бола",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/werewolf/werewolf_bola.png",
+          "changes": [
+            "Fixed Unstoppable flying targets being made to fall",
+            "Fixed not grounding Grey Talon during his Rain of Arrows"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Solomon",
+      "hero_name": "Solomon",
+      "hero_display_name": "Соломон",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/chessmaster_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Gun now deals -20% headshot damage",
+        "Base bullet damage reduced from 30 to 25",
+        "Polished slide animations, added new ability and item aim poses, and adjusted run-to-stop timing",
+        "Move Piece - Range to grab pieces increased from 50m to 65m",
+        "Move Piece",
+        "Improved placement: pieces no longer fall through geometry or end up under the map, land closer to where you aim, and can now be placed closer to walls and in hallways"
+      ],
+      "abilities": [
+        {
+          "name": "Setup Bishop",
+          "display_name": "Поставить слона",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/chess/chessmaster_bishop.png",
+          "changes": [
+            "Square height reduced from 4m to 1m",
+            "On Square spirit scaling increased from 0.64 to 0.85",
+            "T1 increased from +15% slow to +25%",
+            "T3 Spirit Resist reduction is now applied on impact instead of by squares",
+            "T3 increased from -2.5% to -5% Spirit Resist per stack (max reduction unchanged)"
+          ]
+        },
+        {
+          "name": "Rook Battery",
+          "display_name": "Ладейная батарея",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/chess/chessmaster_rook.png",
+          "changes": [
+            "Damage scaling reduced from 1.3 to 0.9",
+            "T3 reduced from -12s cooldown to -10s"
+          ]
+        },
+        {
+          "name": "Develop Queen",
+          "display_name": "Развить ферзя",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/chess/chessmaster_queen.png",
+          "changes": [
+            "Cooldown increased from 210s to 240s",
+            "Damage scaling increased from 1.4 to 1.6",
+            "Delay for stun tiles increased from 1s to 1.2s",
+            "Improved warning effects on the stun tiles to make it clear its just those tiles rather than the full area",
+            "Fixed hitting things outside of the intended square volumes",
+            "Base ability now has the checkmate behavior for heroes under 100 Health (scales +5/boon)",
+            "T2 now increases checkmate threshold by 150"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Venator",
+      "hero_name": "Venator",
+      "hero_display_name": "Венатор",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/priest_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [],
+      "abilities": [
+        {
+          "name": "Ira Domini",
+          "display_name": "Гнев Божий",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/priest/priest_crossbow.png",
+          "changes": [
+            "Blessed stake damage reduced from 115 to 95",
+            "Blessed stake damage boon scaling increased from 3 to 3.6"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Victor",
+      "hero_name": "Victor",
+      "hero_display_name": "Виктор",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/frank_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [],
+      "abilities": [
+        {
+          "name": "Aura of Suffering",
+          "display_name": "Аура страдания",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/frank/frank_aura_of_suffering.png",
+          "changes": [
+            "T3 increased from +15% Damage to +16%"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Violet",
+      "hero_name": "Violet",
+      "hero_display_name": "Виолетта",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/artist_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Some moderate performance improvements (still more to do here)"
+      ],
+      "abilities": [
+        {
+          "name": "Still Life",
+          "display_name": "Портрет с натуры",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/artist/artist_portrait.png",
+          "changes": [
+            "Stun duration reduced from 1.0s to 0.9s",
+            "Line of sight is now required when the channel ends, even during the grace period",
+            "Now shows a text bar to the victim",
+            "Sketches now grant +2% healing amp from Nurse Harrow, Kelvin, Ivy, Dynamo, Paige, and Rem instead",
+            "Sketches changed to give Spirit Power instead of Weapon Damage for Grey Talon, Infernus and Mina",
+            "T1 health regen is now only granted while drawing (still refreshes for 4s on pickup)",
+            "T1 health regen scaling reduced from 0.25 to 0.15",
+            "T3 stun duration increased from +0.35s to +0.45s"
+          ]
+        },
+        {
+          "name": "Abstract Landscape",
+          "display_name": "Абстрактный пейзаж",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/artist/artist_landscape.png",
+          "changes": [
+            "Cooldown increased from 165s to 180s",
+            "Duration spirit scaling reduced from 0.04 to 0.01",
+            "Now ends early if Violet dies",
+            "Cooldown between times you can be affected by it increased from 0.5s to 0.75s",
+            "T3 no longer has \"Ink is no longer destroyed\"",
+            "Duration reduced from 6s to 5s",
+            "T3 reduced from +4s to +3s"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Viscous",
+      "hero_name": "Viscous",
+      "hero_display_name": "Вязкус",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/viscous_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [
+        "Alt fire damage growth per boon increased by 5%"
+      ],
+      "abilities": [
+        {
+          "name": "Splatter",
+          "display_name": "Брызги",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/viscous/viscous_goo_ball.png",
+          "changes": [
+            "T1 increased from +36 Damage to +45 Damage"
+          ]
+        },
+        {
+          "name": "Goo Ball",
+          "display_name": "Шар из слизи",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/viscous/viscous_goo_sphere.png",
+          "changes": [
+            "Fixed being able to heavy melee or activate Ethereal Shift during the cast delay",
+            "Fixed the direction indicator not appearing"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Warden",
+      "hero_name": "Warden",
+      "hero_display_name": "Дозорный",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/warden_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [],
+      "abilities": [
+        {
+          "name": "Alchemical Flask",
+          "display_name": "Алхимическая колба",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/warden/warden_crowd_control.png",
+          "changes": [
+            "Now travels 40% faster (overall cast range unchanged)",
+            "Weapon Damage reduction increased from -25% to -30%"
+          ]
+        },
+        {
+          "name": "Willpower",
+          "display_name": "Сила воли",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/warden/warden_high_alert.png",
+          "changes": [
+            "Speed bonus increased from +15% to +20%"
+          ]
+        },
+        {
+          "name": "Last Stand",
+          "display_name": "Последний бой",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/warden/warden_riot_protocol.png",
+          "changes": [
+            "T2 increased from +40.5 DPS to +50",
+            "T2 cooldown reduction increased from -30s to -40s"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Wraith",
+      "hero_name": "Wraith",
+      "hero_display_name": "Тень",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/wraith_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [],
+      "abilities": [
+        {
+          "name": "Card Trick",
+          "display_name": "Карточный трюк",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/wraith_card_trick.png",
+          "changes": [
+            "Heal reduced from 60 to 45"
+          ]
+        },
+        {
+          "name": "Project Mind",
+          "display_name": "Проекция разума",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/wraith_teleport.png",
+          "changes": [
+            "Cooldown increased from 46s to 50s",
+            "Initial cast time for projectile increased from 0.75s to 1s"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "hero",
+      "title": "Yamato",
+      "hero_name": "Yamato",
+      "hero_display_name": "Ямато",
+      "hero_presentation_kind": "balance",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/yamato_card.webp",
+      "hero_description": null,
+      "hero_metadata_pending": false,
+      "item_name": null,
+      "item_category": null,
+      "item_icon_url": null,
+      "objective_key": null,
+      "objective_icon_url": null,
+      "changes": [],
+      "abilities": [
+        {
+          "name": "Power Slash",
+          "display_name": "Мощное рассечение",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/yamato/yamato_power_slash.png",
+          "changes": [
+            "Spirit scaling increased by 6% (base and T3)"
+          ]
+        },
+        {
+          "name": "Flying Slash",
+          "display_name": "Рассечение в полёте",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/yamato/yamato_flying_strike.png",
+          "changes": [
+            "Cast Range reduced from 26m to 23m",
+            "Enemy targets are now marked with an overhead symbol as soon as the grapple is cast, instead of only when the hook lands",
+            "T3 Cast Range reduced from +15m to +8m"
+          ]
+        },
+        {
+          "name": "Shadow Transformation",
+          "display_name": "Превращение в тень",
+          "description": null,
+          "presentation_kind": "balance",
+          "stats": [],
+          "stats_pending": false,
+          "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/yamato/yamato_blinding_steel.png",
+          "changes": [
+            "Cooldown increased from 150s to 160s (moved to T2)",
+            "Street Brawl:"
+          ]
+        }
+      ]
+    }
+  ]
+}

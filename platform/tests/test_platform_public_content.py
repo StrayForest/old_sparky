@@ -1740,10 +1740,174 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
             section for section in detail["sections"] if section.get("objective_key") == "mid_boss"
         )
         self.assertEqual(
-            mid_boss["changes"], ["Mid-Boss: respawn time increased from 6m to 7m"]
+            mid_boss["changes"], ["Respawn time increased from 6m to 7m"]
         )
         segments = patch_translation.extract_translation_segments(detail)
         self.assertFalse(any("clan.fastly.steamstatic.com" in segment["text"] for segment in segments))
+
+    def test_halloween_bbcode_sections_and_nurse_alias_route_changes_to_entities(self) -> None:
+        icon = "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_card.webp"
+        nurse = {
+            "hero_id": 87,
+            "class_name": "hero_nurse",
+            "name": "Nurse Harrow",
+            "slug": "nurse-harrow",
+            "display_name": "Сестра Харроу",
+            "hero_image_url": icon,
+            "abilities": {
+                name.casefold(): {
+                    "name": name,
+                    "display_name": display_name,
+                    "icon_url": f"https://assets-bucket.deadlock-api.com/{name.casefold().replace(' ', '-')}.png",
+                }
+                for name, display_name in (
+                    ("Wretched Vapors", "Зловонные испарения"),
+                    ("Healing Needles", "Лечебные иглы"),
+                    ("Lurking Terrors", "Затаённые ужасы"),
+                )
+            },
+        }
+        doorman = {
+            "hero_id": 69,
+            "class_name": "hero_doorman",
+            "name": "The Doorman",
+            "slug": "the-doorman",
+            "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/doorman_card.webp",
+            "abilities": {
+                "luggage cart": {
+                    "name": "Luggage Cart",
+                    "icon_url": "https://assets-bucket.deadlock-api.com/luggage-cart.png",
+                }
+            },
+        }
+        source = (
+            "[h3][b]Gameplay Update[/b][/h3]"
+            "[p][img src=\"{STEAM_CLAN_LOC_IMAGE}/45164767/6073862c8be5bfb374b9d02531bd64d50c1db8c5.png\"][/img][/p]"
+            "[p][b]General:[/b] Map timings changed. - Mid-Boss: Health increased by 20% around the Mid Boss "
+            "- Mid-Boss: Health regeneration increased by 20% "
+            "\n- Haunts - Past Dues: Now channels their special attack, creating a build-up aura on the ground that applies sleep slowly to Heroes standing within it over time. Killing the channeling creature destroys the aura.\n"
+            "\n- Fixed some bugs with Walker stomp logic\n"
+            "\n- Latest 6 heroes are no longer categorized as \"new\" anymore. This means they have normal hero unlocking requirements for ranked and can now be banned.\n"
+            "[b]Items:[/b] - High-Velocity Rounds: Bullet Velocity reduced from 60% to 45% "
+            "[b]Heroes:[/b] - Nurse: Wretched Vapors - T3 increased from +15% Rush Speed to +20% "
+            "- Nurse: Healing Needles - Heal Per Shot reduced from 25 to 22 "
+            "- Nurse: Healing Needles - T2 Heal Per Shot reduced from +20 to +16 "
+            "- Nurse: Healing Needles - Spirit scaling increased from 0.2 to 0.24 "
+            "- Nurse Harrow: Lurking Terrors - Duration reduced from 7s to 5s "
+            "- Doorman: Luggage Cart - T2 increased from +75 Damage on Wall Impact to +90 "
+            "- Doorman: Luggage Cart - T3 cooldown reduced by 3s[/p]"
+        )
+        plain = home_content._plain_text(source, max_length=30000)
+        self.assertNotIn("[img", plain.casefold())
+        self.assertNotIn("steam_clan_loc_image", plain.casefold())
+        self.assertNotIn("clan.fastly.steamstatic.com", plain.casefold())
+        link_plain = home_content._plain_text(
+            "[p][url=https://www.playdeadlock.com/cityneversleeps]City Never Sleeps[/url][/p]",
+            max_length=30000,
+        )
+        self.assertEqual(link_plain, "City Never Sleeps")
+        detail = patch_detail.structure_patch_detail(
+            {
+                "id": "1847920302240420",
+                "title": "Halloween 2026 + Gameplay Update",
+                "published_at": "2026-10-31T00:00:00Z",
+                "url": "https://store.steampowered.com/news/app/1422450/view/1847920302240420",
+                "content": plain,
+            },
+            {
+                "heroes": {"nurse harrow": nurse, "the doorman": doorman},
+                "items": {
+                    "high-velocity rounds": {
+                        "name": "High-Velocity Rounds",
+                        "category": "weapon",
+                        "icon_url": "https://assets-bucket.deadlock-api.com/high-velocity.png",
+                    }
+                },
+                "objectives": {
+                    "mid_boss": {
+                        "icon_url": "https://assets-bucket.deadlock-api.com/mid-boss.png"
+                    }
+                },
+            },
+        )
+
+        general = next(section for section in detail["sections"] if section["kind"] == "general")
+        item = next(section for section in detail["sections"] if section["kind"] == "item")
+        mid_boss = next(section for section in detail["sections"] if section["kind"] == "objective")
+        nurse_section = next(section for section in detail["sections"] if section.get("hero_name") == "Nurse Harrow")
+        doorman_section = next(section for section in detail["sections"] if section.get("hero_name") == "The Doorman")
+        abilities = {ability["name"]: ability for ability in nurse_section["abilities"]}
+
+        self.assertFalse(any("Nurse" in change or "Healing Needles" in change for change in general["changes"]))
+        self.assertFalse(any("High-Velocity Rounds" in change or "Items:" in change for change in general["changes"]))
+        self.assertFalse(any("Heroes:" in change or "General:" in change for change in general["changes"]))
+        self.assertFalse(any(change.strip() == "Gameplay Update" for change in general["changes"]))
+        self.assertEqual(
+            general["changes"],
+            [
+                "Map timings changed.",
+                "Haunts",
+                "Past Dues: Now channels their special attack, creating a build-up aura on the ground that applies sleep slowly to Heroes standing within it over time. Killing the channeling creature destroys the aura.",
+                "Fixed some bugs with Walker stomp logic",
+                'Latest 6 heroes are no longer categorized as "new" anymore. This means they have normal hero unlocking requirements for ranked and can now be banned.',
+            ],
+        )
+        ability_change_text = "\n".join(
+            change
+            for section in detail["sections"]
+            for ability in section.get("abilities") or []
+            for change in ability.get("changes") or []
+        )
+        self.assertNotIn("Past Dues", ability_change_text)
+        self.assertNotIn("Walker stomp", ability_change_text)
+        self.assertNotIn("hero unlocking requirements", ability_change_text)
+        self.assertEqual(item["title"], "High-Velocity Rounds")
+        self.assertEqual(item["changes"], ["Bullet Velocity reduced from 60% to 45%"])
+        self.assertEqual(
+            mid_boss["changes"],
+            ["Health increased by 20% around the Mid Boss", "Health regeneration increased by 20%"],
+        )
+        self.assertTrue(all("Mid Boss:" not in change and "Mid-Boss:" not in change for change in mid_boss["changes"]))
+        self.assertEqual(nurse_section["title"], "Nurse Harrow")
+        self.assertEqual(nurse_section["hero_image_url"], icon)
+        self.assertEqual(len(abilities["Wretched Vapors"]["changes"]), 1)
+        self.assertEqual(len(abilities["Healing Needles"]["changes"]), 3)
+        self.assertEqual(abilities["Lurking Terrors"]["changes"], ["Duration reduced from 7s to 5s"])
+        self.assertEqual(doorman_section["title"], "The Doorman")
+        self.assertEqual(doorman_section["abilities"][0]["name"], "Luggage Cart")
+        self.assertEqual(len(doorman_section["abilities"][0]["changes"]), 2)
+        self.assertFalse(any(any(name in change for name in ("Doorman", "Luggage Cart")) for change in general["changes"]))
+        protected_terms = patch_translation._catalog_protected_terms(
+            {"heroes": {"nurse harrow": nurse, "the doorman": doorman}}
+        )
+        self.assertIn("Nurse Harrow", protected_terms)
+        self.assertIn("nurse", protected_terms)
+        self.assertIn("The Doorman", protected_terms)
+        self.assertIn("doorman", protected_terms)
+        self.assertIn("Mid Boss", protected_terms)
+        source_names = "Nurse Harrow moved; Mid Boss changed; Nurse improved."
+        prepared_names, name_placeholders = patch_translation.protect_entities(
+            source_names,
+            protected_terms,
+        )
+        translated_names = prepared_names.replace("moved", "двигалась")
+        patch_translation._validate_translation(prepared_names, translated_names)
+        restored_names = patch_translation.restore_placeholders(
+            translated_names,
+            name_placeholders,
+        )
+        self.assertEqual(
+            restored_names,
+            "Nurse Harrow двигалась; Mid Boss changed; Nurse improved.",
+        )
+        segments = patch_translation.extract_translation_segments(detail)
+        self.assertFalse(
+            any(
+                marker in segment["text"].casefold()
+                for segment in segments
+                for marker in ("[img", "steam_clan_loc_image", "clan.fastly.steamstatic.com")
+            )
+        )
 
     def test_public_hero_images_prefer_validated_cdn_over_stale_deadlock_io_url(self) -> None:
         image_url = (
@@ -2009,7 +2173,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
     def test_public_content_cache_versions_keep_home_contract_stable(self) -> None:
         self.assertEqual(home_content.HOME_CONTENT_KEY, "platform:home-content:v4")
         self.assertEqual(home_content.HOME_CONTENT_STALE_KEY, "platform:home-content:stale:v4")
-        self.assertEqual(home_content.PATCH_DETAIL_KEY_PREFIX, "platform:home-content:patch:v10:")
+        self.assertEqual(home_content.PATCH_DETAIL_KEY_PREFIX, "platform:home-content:patch:v11:")
         self.assertEqual(
             home_content.PATCH_ASSET_CATALOG_KEY,
             "platform:home-content:patch-assets:v7",

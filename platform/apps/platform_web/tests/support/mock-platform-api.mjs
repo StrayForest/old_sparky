@@ -584,6 +584,7 @@ const server = createServer((request, response) => {
         title: "The Doorman",
         hero_name: "The Doorman",
         hero_display_name: "Привратник",
+        hero_presentation_kind: "introduction",
         hero_image_url: "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/doorman.png",
         hero_description: "Хозяин дверей и скрытых проходов.",
         hero_metadata_pending: true,

@@ -61,10 +61,26 @@ Structural and entity labels keep their canonical English identity, with
 separate localized display labels where the catalog provides them.
 
 Mid Boss changes receive the `mid_boss` objective identity and the verified
-neutral boss marker image when the source icon catalog provides it. Steam image
-tokens are resolved to safe source URLs for display but are removed from
-change text and translation input. Embedded `Mid-Boss:` headings are split
-before objective grouping.
+neutral boss marker image when the source icon catalog provides it. Decorative
+Steam image markup is removed from patch prose and translation input; section
+art comes from the validated game-data catalog. Steam `[url]` wrappers retain
+their visible anchor text without exposing the BBCode wrapper. Embedded
+`Mid-Boss:` headings are split before objective grouping, and both `Mid Boss:`
+and `Mid-Boss:` are removed from the displayed change after ownership is
+assigned.
+
+Patch parsing and acceptance are source-to-entity checks, not section-count
+checks. For each announcement, compare the source changes with the resulting
+DTO and confirm every change is represented exactly once under its source
+owner: general, hero, ability, item or objective. Resolve source aliases such
+as a short hero name to the canonical catalog entity, including when scope
+headings and changes are inline BBCode in one paragraph. Do not merge adjacent
+source groups into a single change, leave a group heading in change text, drop
+an unmatched line, or route an entity change into General. Structural titles
+and entity labels use canonical English names; localized display labels may
+appear only as separate subtitles when the UI explicitly requests them.
+Translated-text counts and section totals alone do not establish that this
+contract holds.
 
 The current hero, ability and shop-item catalog combines the community Deadlock API's per-patch game-data endpoints (`/v1/assets/heroes` and `/v1/assets/items`) with the legacy deadlock.io index when it returns valid JSON. The community endpoints expose the latest known client build and accept a `language=russian` parameter. Old Sparky joins English and Russian payloads by stable hero ID, ability class name and shop item name. Shop entries are projected from released `type=upgrade` records with a recognized `item_slot_type` and validated image URL. If either legacy endpoint is unavailable, redirected or non-JSON, valid community hero and item data supplies the catalog; if all sources fail, the last-good catalog is retained. These are community-parsed game files, not a Valve-operated API; Steam's announcement feed remains the source for patch prose. The API selects Russian values when present and English values otherwise, strips HTML and inline game tokens from descriptions, and constructs image URLs only from validated relative `/assets/` paths or the fixed Deadlock API asset CDN host. Public hero image projections prefer that validated CDN image, then a bundled static image that exists, then the placeholder; the obsolete deadlock.io card URLs are never treated as healthy merely because they return an HTTP response. Catalog HTML is never rendered.
 

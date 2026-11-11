@@ -35,17 +35,53 @@ def _patch_lines(content: str) -> list[str]:
 def _match_named_line(
     line: str,
     catalog: dict[str, Any],
+    *,
+    allow_hero_class_aliases: bool = False,
 ) -> tuple[str, str] | None:
     lowered = line.casefold()
-    for alias in sorted(catalog, key=len, reverse=True):
+    line_aliases = {str(alias).casefold(): str(alias) for alias in catalog}
+    if allow_hero_class_aliases:
+        class_aliases: dict[str, set[str]] = {}
+        for catalog_alias, hero in catalog.items():
+            if not isinstance(hero, dict):
+                continue
+            class_name = str(hero.get("class_name") or "").strip().casefold()
+            match = re.fullmatch(r"hero_([a-z0-9]+(?:_[a-z0-9]+)*)", class_name)
+            if match is None:
+                continue
+            short_alias = match.group(1).replace("_", " ")
+            class_aliases.setdefault(short_alias, set()).add(str(catalog_alias))
+        for alias, canonical_aliases in class_aliases.items():
+            # Use only catalog-provided class identifiers, and only when they
+            # resolve to a single hero. Ambiguous short labels are not owners.
+            if len(canonical_aliases) == 1:
+                canonical_alias = next(iter(canonical_aliases))
+                if alias not in line_aliases or line_aliases[alias] == canonical_alias:
+                    line_aliases[alias] = canonical_alias
+
+    for alias in sorted(line_aliases, key=len, reverse=True):
         if lowered == alias:
-            return alias, ""
+            return line_aliases[alias], ""
         if not lowered.startswith(alias):
             continue
         suffix = line[len(alias):]
         if suffix and suffix[0] in _ENTITY_DELIMITERS:
-            return alias, suffix.lstrip(_ENTITY_DELIMITERS).strip()
+            return line_aliases[alias], suffix.lstrip(_ENTITY_DELIMITERS).strip()
     return None
+
+
+def _match_hero_line(
+    line: str,
+    catalog: dict[str, Any],
+) -> tuple[str, str] | None:
+    return _match_named_line(line, catalog, allow_hero_class_aliases=True)
+
+
+def _strip_objective_owner_prefix(line: str, alias: str) -> str:
+    suffix = line[len(alias):] if line[:len(alias)].casefold() == alias.casefold() else line
+    if suffix == line or not suffix or suffix[0] not in ":–—-":
+        return line.strip()
+    return base._strip_named_change_prefix(line, alias)
 
 
 def _hero_section(
@@ -291,7 +327,7 @@ def _announcement_hero_matches(
 
     matches: dict[str, tuple[str, dict[str, Any]]] = {}
     for candidate in candidates:
-        match = _match_named_line(candidate, hero_catalog)
+        match = _match_hero_line(candidate, hero_catalog)
         if match is None:
             continue
         alias, remainder = match
@@ -465,7 +501,7 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
             continue
 
         if current_scope == "heroes":
-            hero_match = _match_named_line(line, hero_catalog)
+            hero_match = _match_hero_line(line, hero_catalog)
             if hero_match is not None:
                 hero_alias, remainder = hero_match
                 hero = hero_catalog[hero_alias]
@@ -551,7 +587,7 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
             # catalogued hero prefixes into their hero section while preserving
             # unlabelled general changes. A bare follow-up line is consumed only
             # when the immediately preceding hero line was an ability heading.
-            hero_match = _match_named_line(line, hero_catalog)
+            hero_match = _match_hero_line(line, hero_catalog)
             if hero_match is not None:
                 hero_alias, remainder = hero_match
                 hero = hero_catalog[hero_alias]
@@ -605,8 +641,9 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
                         current_general_ability_pending = not ability_change
                         continue
 
-            general_changes.extend(base._change_chunks(line))
-            continue
+            if base._objective_prefix_match(line) is None:
+                general_changes.extend(base._change_chunks(line))
+                continue
 
         objective_key: str | None = None
         objective_change = line
@@ -645,6 +682,12 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
                     "abilities": [],
                 },
             )
+            objective_prefix = base._objective_prefix_match(objective_change)
+            if objective_prefix is not None:
+                objective_change = _strip_objective_owner_prefix(
+                    objective_change,
+                    objective_prefix[1],
+                )
             section["changes"].extend(base._change_chunks(objective_change))
             continue
 
@@ -663,7 +706,7 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
                 section["changes"].extend(base._change_chunks(remainder))
             continue
 
-        hero_match = _match_named_line(line, hero_catalog)
+        hero_match = _match_hero_line(line, hero_catalog)
         if hero_match is not None:
             hero_alias, remainder = hero_match
             hero = hero_catalog[hero_alias]

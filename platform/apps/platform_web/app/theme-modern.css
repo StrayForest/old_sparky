@@ -1912,14 +1912,6 @@ a.tournament-card:focus-visible {
   color: var(--ui-primary-bright);
 }
 
-.patch-hero-display-name {
-  color: var(--ui-primary-bright);
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: normal;
-  text-transform: none;
-}
-
 .patch-hero-description,
 .patch-ability-description {
   margin: 4px 0 0;

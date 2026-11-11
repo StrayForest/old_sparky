@@ -282,6 +282,7 @@ LIVE_BROWSER_FAILURE_DIAGNOSTIC_NAMES = frozenset(
         "home_steps_overflow",
         "contact_recipient_privacy",
         "objective_icons",
+        "patch_owner_sections",
         "analytics_csp",
         "image_csp_hosts",
     }
