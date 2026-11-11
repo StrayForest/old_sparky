@@ -117,6 +117,10 @@ async def refresh_home_content(
                 asset_catalog is None
                 or has_new_patch
                 or explicit_asset_refresh
+                or (
+                    not base._asset_catalog_has_current_hero_image_candidates(asset_catalog)
+                    and not asset_retry_blocked
+                )
                 or (cached_hero_pending and not asset_retry_blocked)
             )
             if refresh_asset_catalog:
@@ -181,6 +185,14 @@ async def refresh_home_content(
                 for section in detail.get("sections") or []
             )
             for detail in patch_details.values()
+        )
+        resolved_asset_catalog = (
+            asset_result
+            if isinstance(asset_result, dict)
+            else previous_asset_catalog
+        )
+        pending_hero_metadata = pending_hero_metadata or not (
+            base._asset_catalog_has_current_hero_image_candidates(resolved_asset_catalog)
         )
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         async with cache.pipeline(transaction=True) as pipeline:
@@ -273,7 +285,13 @@ async def get_deadlock_asset_catalog() -> dict[str, Any]:
     """Return the cached catalog, refreshing it only through hardened I/O."""
 
     catalog = await base._cached_deadlock_asset_catalog()
-    if catalog is None:
-        await refresh_home_content(force=True)
+    if not base._asset_catalog_has_current_hero_image_candidates(catalog):
+        cache = redis_client()
+        try:
+            retry_blocked = bool(await cache.get(base.PATCH_ASSET_PENDING_RETRY_KEY))
+        finally:
+            await cache.aclose()
+        if not retry_blocked:
+            await refresh_home_content(force=True, force_asset_refresh=True)
         catalog = await base._cached_deadlock_asset_catalog()
     return catalog or {"heroes": {}, "items": {}, "ranks": {}, "objectives": {}}

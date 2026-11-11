@@ -5,16 +5,21 @@ import { deadlockHeroIconPath, deadlockHeroPlaceholderPath } from "@/lib/deadloc
 type DeadlockHeroImageProps = Omit<CspImageProps, "src"> & {
   heroName: string;
   imageUrl?: string | null;
+  imageCandidates?: string[] | null;
 };
 
-export function DeadlockHeroImage({ heroName, imageUrl, onError, ...props }: DeadlockHeroImageProps) {
-  const candidates = useMemo(() => [
-    imageUrl,
-    `/assets/heroes/${encodeURIComponent(heroName.replaceAll(" ", "_"))}.png`,
-    deadlockHeroIconPath(heroName),
-    deadlockHeroPlaceholderPath,
-  ].filter((candidate, index, all): candidate is string => Boolean(candidate) && all.indexOf(candidate) === index), [heroName, imageUrl]);
-  const sourceIdentity = `${heroName}\0${imageUrl ?? ""}`;
+export function DeadlockHeroImage({ heroName, imageUrl, imageCandidates, onError, onLoad, ...props }: DeadlockHeroImageProps) {
+  const candidates = useMemo(() => {
+    const remoteCandidates = Array.isArray(imageCandidates) ? imageCandidates.slice(0, 4) : [];
+    return [
+      ...remoteCandidates,
+      imageUrl,
+      `/assets/heroes/${encodeURIComponent(heroName.replaceAll(" ", "_"))}.png`,
+      ...(remoteCandidates.length ? [] : [deadlockHeroIconPath(heroName)]),
+      deadlockHeroPlaceholderPath,
+    ].filter((candidate, index, all): candidate is string => Boolean(candidate) && all.indexOf(candidate) === index);
+  }, [heroName, imageCandidates, imageUrl]);
+  const sourceIdentity = `${heroName}\0${imageUrl ?? ""}\0${candidates.join("\0")}`;
   const [selection, setSelection] = useState({ sourceIdentity, index: 0 });
   const candidateIndex = selection.sourceIdentity === sourceIdentity ? selection.index : 0;
   const imageRef = useRef<HTMLImageElement | null>(null);
@@ -41,6 +46,7 @@ export function DeadlockHeroImage({ heroName, imageUrl, onError, ...props }: Dea
   }, [candidates, sourceIdentity]);
 
   useEffect(() => {
+    if (imageRef.current) imageRef.current.style.visibility = "";
     const image = imageRef.current;
     if (
       image?.complete
@@ -60,7 +66,14 @@ export function DeadlockHeroImage({ heroName, imageUrl, onError, ...props }: Dea
       ref={imageRef}
       onError={(event) => {
         advanceAfterFailure(event.currentTarget);
+        if (candidates.indexOf(event.currentTarget.getAttribute("src") ?? "") >= candidates.length - 1) {
+          event.currentTarget.style.visibility = "hidden";
+        }
         onError?.(event);
+      }}
+      onLoad={(event) => {
+        event.currentTarget.style.visibility = "";
+        onLoad?.(event);
       }}
       src={src}
     />

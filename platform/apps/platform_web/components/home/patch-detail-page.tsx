@@ -55,6 +55,7 @@ export function PatchDetailPage({ patchId }: { patchId: string }) {
                         heroName={section.hero_name}
                         className="patch-hero-image"
                         height={88}
+                        imageCandidates={section.hero_image_candidates}
                         imageUrl={section.hero_image_url}
                         width={88}
                       />

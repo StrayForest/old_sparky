@@ -31,7 +31,8 @@
         "Dedication: 22,194 players exclusively voted for Nurse Harrow. One player cast exactly 1000 votes for her.",
         "Highly Effective: Nurse Harrow voters consistently proved to have a higher win rate over all other hero voters."
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "hero",
@@ -361,6 +362,12 @@
           "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/nurse/medicine_bag.png",
           "changes": []
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_sm.png"
       ]
     }
   ]

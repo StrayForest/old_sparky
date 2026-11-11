@@ -363,16 +363,37 @@ function normalizeClientHeroRoster(value) {
     seenIds.add(id);
     seenNames.add(nameKey);
     const fallback = HERO_BY_ID.get(id);
+    const image = safeDraftHeroImage(candidate.image, fallback?.image, name);
+    const imageCandidates = uniqueDraftHeroImages([
+      image,
+      ...safeDraftHeroImageCandidates(candidate.imageCandidates),
+    ]).slice(0, 4);
     heroes.push({
       id,
       name,
-      image: safeDraftHeroImage(candidate.image, fallback?.image, name)
+      image: imageCandidates[0] || image,
+      imageCandidates,
     });
   }
   return heroes.length ? heroes : null;
 }
 
 function safeDraftHeroImage(value, fallback, name) {
+  return normalizeSafeDraftHeroImage(value)
+    || normalizeSafeDraftHeroImage(fallback)
+    || `/api/v1/content/game-assets/heroes/${encodeURIComponent(name)}.png`;
+}
+
+function safeDraftHeroImageCandidates(value) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 4).map(normalizeSafeDraftHeroImage).filter(Boolean);
+}
+
+function uniqueDraftHeroImages(candidates) {
+  return candidates.filter((candidate, index) => candidate && candidates.indexOf(candidate) === index);
+}
+
+function normalizeSafeDraftHeroImage(value) {
   if (typeof value === "string") {
     try {
       const url = new URL(value, location.origin);
@@ -386,10 +407,10 @@ function safeDraftHeroImage(value, fallback, name) {
         ? url.pathname
         : url.href;
     } catch {
-      // Invalid source URLs fall back to a same-origin game-asset image.
+      // Ignore invalid source image URLs.
     }
   }
-  return fallback || `/api/v1/content/game-assets/heroes/${encodeURIComponent(name)}.png`;
+  return null;
 }
 
 function renderLoadingRoom() {
@@ -570,7 +591,7 @@ function renderMobileTeam(side) {
 function renderMiniHero(heroId, kind = "pick") {
   const hero = findRoomHero(heroId);
   if (!hero) return "";
-  return `<div class="mini-hero mini-hero--${kind}" title="${escapeAttr(hero.name)}"><img src="${escapeAttr(hero.image)}" alt="" width="54" height="54" loading="lazy" /><span class="sr-only">${escapeHtml(hero.name)}</span></div>`;
+  return `<div class="mini-hero mini-hero--${kind}" title="${escapeAttr(hero.name)}"><img ${draftHeroImageAttributes(hero)} src="${escapeAttr(hero.image)}" alt="" width="54" height="54" loading="lazy" /><span class="sr-only">${escapeHtml(hero.name)}</span></div>`;
 }
 
 function renderEmptySlot(kind = "pick") {
@@ -593,7 +614,7 @@ function renderHeroCard(hero, canAct) {
       ${disabled ? "disabled" : ""}
       aria-label="${escapeAttr(hero.name)}${stateLabel ? ` — ${stateLabel}` : ""}"
     >
-      <img src="${escapeAttr(hero.image)}" alt="" width="192" height="224" loading="lazy" decoding="async" />
+      <img ${draftHeroImageAttributes(hero)} src="${escapeAttr(hero.image)}" alt="" width="192" height="224" loading="lazy" decoding="async" />
       ${stateLabel ? `<span class="hero-state ${state}">${stateLabel}</span>` : ""}
       <span class="hero-name">${escapeHtml(hero.name)}</span>
     </button>
@@ -609,6 +630,20 @@ function heroUsageState(heroId) {
 
 function currentRoomHeroes() {
   return normalizeClientHeroRoster(room?.heroes) || heroCatalog;
+}
+
+function draftHeroImageAttributes(hero) {
+  const staticHero = `/assets/heroes/${encodeURIComponent(hero.name.replaceAll(" ", "_"))}.png`;
+  const apiHero = `/api/v1/content/game-assets/heroes/${encodeURIComponent(hero.name)}.png`;
+  const remoteCandidates = Array.isArray(hero.imageCandidates) ? hero.imageCandidates.slice(0, 4) : [];
+  const candidates = uniqueDraftHeroImages([
+    hero.image,
+    ...remoteCandidates,
+    staticHero,
+    ...(remoteCandidates.length ? [] : [apiHero]),
+    "/assets/heroes/placeholder.svg",
+  ]);
+  return `data-draft-hero-candidates="${escapeAttr(JSON.stringify(candidates))}"`;
 }
 
 function findRoomHero(heroId) {
@@ -668,7 +703,7 @@ function renderActionBar(selectedHero, step, canAct, variant = "default") {
   return `
     <div class="action-bar action-bar--${variant}">
       <div class="selected-summary">
-        ${selectedHero ? `<img src="${escapeAttr(selectedHero.image)}" alt="" width="46" height="46" /><div><strong>${escapeHtml(selectedHero.name)}</strong><br /><span>${step?.action === "ban" ? "Будет забанен" : "Будет выбран"}</span></div>` : `<span>${escapeHtml(unavailableReason)}</span>`}
+        ${selectedHero ? `<img ${draftHeroImageAttributes(selectedHero)} src="${escapeAttr(selectedHero.image)}" alt="" width="46" height="46" /><div><strong>${escapeHtml(selectedHero.name)}</strong><br /><span>${step?.action === "ban" ? "Будет забанен" : "Будет выбран"}</span></div>` : `<span>${escapeHtml(unavailableReason)}</span>`}
       </div>
       <button id="${variant === "mobile-side" ? "confirm-action-mobile" : "confirm-action"}" data-confirm-action class="confirm-button" type="button" aria-label="${escapeAttr(selectedHero ? `${action} ${selectedHero.name}` : unavailableReason)}" ${!selectedHero || !canAct ? "disabled" : ""}>${buttonLabel}</button>
     </div>
@@ -937,10 +972,23 @@ function renderNotFound() {
 }
 
 function attachImageFallbacks() {
-  app.querySelectorAll("img").forEach((image) => {
+  app.querySelectorAll("img[data-draft-hero-candidates]").forEach((image) => {
     image.addEventListener("error", () => {
+      let candidates = [];
+      try {
+        candidates = JSON.parse(image.dataset.draftHeroCandidates || "[]");
+      } catch {
+        candidates = [];
+      }
+      const source = image.getAttribute("src") || "";
+      const sourceIndex = candidates.indexOf(source);
+      const nextIndex = sourceIndex + 1;
+      if (sourceIndex >= 0 && nextIndex < candidates.length) {
+        image.setAttribute("src", candidates[nextIndex]);
+        return;
+      }
       image.style.visibility = "hidden";
-    }, { once: true });
+    });
   });
 }
 

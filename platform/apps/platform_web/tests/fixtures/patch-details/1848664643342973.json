@@ -49,7 +49,8 @@
         "To show up on a hero-specific leaderboard, you must play at least 15 Ranked matches with that hero within the last 30 days. Ranking is based on your current badge progress and your recent win/loss performance on that hero.",
         "Beta Season 2 begins today, we'll see you there!"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     }
   ]
 }

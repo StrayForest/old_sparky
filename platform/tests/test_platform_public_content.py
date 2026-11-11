@@ -542,6 +542,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
         cache = _Cache(
             {
                 home_content.HOME_CONTENT_STALE_KEY: json.dumps(stale_home),
+                home_content.PATCH_ASSET_CATALOG_KEY: json.dumps(legacy_catalog),
                 home_content.PATCH_ASSET_CATALOG_STALE_KEY: json.dumps(legacy_catalog),
             }
         )
@@ -559,11 +560,16 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
                 "apollo": {
                     "name": "Apollo",
                     "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/fencer_card.webp",
+                    "hero_image_candidates": [
+                        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/fencer_card.webp"
+                    ],
                 }
             },
             "items": {},
             "ranks": {},
             "objectives": {},
+            "hero_image_candidates_version": home_content.HERO_IMAGE_CANDIDATES_VERSION,
+            "hero_image_candidates_pending": False,
         }
         asset_fetch = AsyncMock(return_value=fresh_catalog)
         with (
@@ -585,6 +591,26 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
         stored_keys = [call[0][0] for call in cache.pipeline_instance.set_calls]
         self.assertIn(home_content.PATCH_ASSET_CATALOG_KEY, stored_keys)
         self.assertIn(home_content.PATCH_ASSET_CATALOG_STALE_KEY, stored_keys)
+        self.assertIn(
+            (home_content.PATCH_ASSET_PENDING_RETRY_KEY,),
+            cache.pipeline_instance.delete_calls,
+        )
+
+        route_cache = _Cache(
+            {
+                home_content.PATCH_ASSET_CATALOG_KEY: json.dumps(legacy_catalog),
+                home_content.PATCH_ASSET_CATALOG_STALE_KEY: json.dumps(legacy_catalog),
+            }
+        )
+        cached_catalog_reads = AsyncMock(side_effect=[legacy_catalog, fresh_catalog])
+        with (
+            patch.object(home_content_security, "redis_client", return_value=route_cache),
+            patch.object(home_content_security, "refresh_home_content", AsyncMock()) as refresh,
+            patch.object(home_content, "_cached_deadlock_asset_catalog", cached_catalog_reads),
+        ):
+            refreshed_catalog = await home_content_security.get_deadlock_asset_catalog()
+        refresh.assert_awaited_once_with(force=True, force_asset_refresh=True)
+        self.assertIs(refreshed_catalog, fresh_catalog)
 
     async def test_unknown_intro_stats_from_stale_catalog_schedule_asset_retry(self) -> None:
         patch_id = "stale-intro"
@@ -678,8 +704,25 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
             home_content.PATCH_ASSET_PENDING_RETRY_KEY,
             [call[0][0] for call in cache.pipeline_instance.set_calls],
         )
+        self.assertFalse(
+            any(
+                call[0][0] in {
+                    home_content.PATCH_ASSET_CATALOG_KEY,
+                    home_content.PATCH_ASSET_CATALOG_STALE_KEY,
+                }
+                for call in cache.pipeline_instance.set_calls
+            ),
+            "failed candidate refresh must leave the last-good catalog untouched",
+        )
 
         fresh_catalog = json.loads(json.dumps(stale_catalog))
+        fresh_catalog["hero_image_candidates_version"] = (
+            home_content.HERO_IMAGE_CANDIDATES_VERSION
+        )
+        fresh_catalog["hero_image_candidates_pending"] = False
+        fresh_catalog["heroes"]["nurse harrow"]["hero_image_candidates"] = [
+            "https://assets-bucket.deadlock-api.com/nurse.webp"
+        ]
         fresh_catalog["heroes"]["nurse harrow"]["abilities"]["leech therapy"][
             "stats_pending"
         ] = False
@@ -1296,7 +1339,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
         section = next(item for item in detail["sections"] if item["kind"] == "hero")
         self.assertEqual(section["hero_name"], "Apollo")
         self.assertEqual(section["hero_display_name"], "Аполлон")
-        self.assertEqual(section["hero_image_url"], "https://deadlock.io/assets/apollo.png")
+        self.assertEqual(section["hero_image_url"], "/assets/heroes/Apollo.png")
         self.assertEqual(section["hero_presentation_kind"], "introduction")
         self.assertEqual(
             [ability["name"] for ability in section["abilities"]],
@@ -1987,6 +2030,12 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
                     "slug": "hero_fencer",
                     "icon_url": "https://deadlock.io/assets/game/heroes/fencer_card_psd.png",
                     "hero_image_url": image_url,
+                    "hero_image_candidates": [
+                        image_url,
+                        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/fencer_portrait.webp",
+                        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/fencer_card.webp?bad=1",
+                        "https://evil.example/assets-api-res/images/heroes/evil.png",
+                    ],
                 }
             },
             "ranks": {},
@@ -1994,8 +2043,32 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
 
         public_asset = home_content.public_deadlock_game_assets(catalog)["heroes"][0]
         self.assertEqual(public_asset["image_url"], image_url)
+        self.assertEqual(
+            public_asset["image_candidates"],
+            [
+                image_url,
+                "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/fencer_portrait.webp",
+            ],
+        )
         self.assertTrue(public_asset["source_available"])
         self.assertEqual(home_content.resolve_deadlock_hero_image(catalog, "Apollo"), image_url)
+        response = DeadlockGameAssetsResponse.model_validate(
+            home_content.public_deadlock_game_assets(catalog)
+        )
+        self.assertEqual(response.heroes[0].image_candidates, public_asset["image_candidates"])
+        with self.assertRaises(ValidationError):
+            DeadlockGameAssetsResponse.model_validate(
+                {
+                    "heroes": [
+                        {
+                            "name": "Apollo",
+                            "image_url": image_url,
+                            "image_candidates": [image_url, image_url],
+                        }
+                    ],
+                    "ranks": [],
+                }
+            )
 
         broken_only_catalog = {
             "heroes": {
@@ -2009,6 +2082,10 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(
             home_content.public_deadlock_game_assets(broken_only_catalog)["heroes"][0]["image_url"],
             "/assets/heroes/Apollo.png",
+        )
+        self.assertEqual(
+            home_content.public_deadlock_game_assets(broken_only_catalog)["heroes"][0]["image_candidates"],
+            [],
         )
 
     def test_objective_aliases_are_exact_and_require_prefix_boundaries(self) -> None:
@@ -2142,7 +2219,10 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
                 "hero_name": "Celeste",
                 "mode_name": "Street Brawl",
                 "hero_display_name": "Селеста",
-                "hero_image_url": "https://deadlock.io/assets/celeste.png",
+                "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/celeste_card.webp",
+                "hero_image_candidates": [
+                    "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/celeste_card.webp"
+                ],
                 "hero_description": "История героя",
                 "abilities": [
                     {
@@ -2156,6 +2236,10 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
         )
         self.assertEqual(hero.mode_name, "Street Brawl")
         self.assertEqual(hero.hero_display_name, "Селеста")
+        self.assertEqual(
+            hero.hero_image_candidates,
+            ["https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/celeste_card.webp"],
+        )
         self.assertEqual(hero.abilities[0].display_name, "Пожиратель света")
 
     def test_objective_icon_catalog_uses_exact_allowlisted_minimap_keys(self) -> None:
@@ -2242,7 +2326,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
     def test_public_content_cache_versions_keep_home_contract_stable(self) -> None:
         self.assertEqual(home_content.HOME_CONTENT_KEY, "platform:home-content:v4")
         self.assertEqual(home_content.HOME_CONTENT_STALE_KEY, "platform:home-content:stale:v4")
-        self.assertEqual(home_content.PATCH_DETAIL_KEY_PREFIX, "platform:home-content:patch:v15:")
+        self.assertEqual(home_content.PATCH_DETAIL_KEY_PREFIX, "platform:home-content:patch:v16:")
         self.assertEqual(
             home_content.PATCH_ASSET_CATALOG_KEY,
             "platform:home-content:patch-assets:v9",
@@ -2750,7 +2834,12 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
             "development_state": "release",
             "disabled": False,
             "items": {"signature1": "ability_nurse_leech_therapy"},
-            "images": {"icon_hero_card_webp": f"{image_base}/heroes/nurse_card.webp"},
+            "images": {
+                "icon_hero_card_webp": f"{image_base}/heroes/nurse_card.webp",
+                "icon_hero_card": f"{image_base}/heroes/nurse_card.png",
+                "icon_image_small_webp": f"{image_base}/heroes/nurse_small.webp",
+                "icon_image_small": f"{image_base}/heroes/nurse_small.png",
+            },
             "description": {"lore": "A healer."},
         }
         localized_hero = {
@@ -2809,10 +2898,38 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
             ]
         )
 
-        catalog = await home_content._fetch_deadlock_asset_catalog(client)
+        previous_catalog = {
+            "heroes": {
+                "nurse harrow": {
+                    "name": "Nurse Harrow",
+                    "hero_image_url": f"{image_base}/heroes/nurse_previous.webp",
+                    "icon_url": f"{image_base}/heroes/nurse_distinct.png",
+                    "abilities": {},
+                }
+            },
+            "items": {},
+            "ranks": {},
+            "objectives": {},
+        }
+        catalog = await home_content._fetch_deadlock_asset_catalog(
+            client,
+            previous_catalog=previous_catalog,
+        )
 
         nurse = catalog["heroes"]["nurse harrow"]
-        self.assertEqual(nurse["hero_image_url"], f"{image_base}/heroes/nurse_card.webp")
+        self.assertEqual(nurse["hero_image_url"], f"{image_base}/heroes/nurse_previous.webp")
+        self.assertTrue(
+            home_content._asset_catalog_has_current_hero_image_candidates(catalog)
+        )
+        self.assertEqual(
+            nurse["hero_image_candidates"],
+            [
+                f"{image_base}/heroes/nurse_previous.webp",
+                f"{image_base}/heroes/nurse_distinct.png",
+                f"{image_base}/heroes/nurse_card.webp",
+                f"{image_base}/heroes/nurse_card.png",
+            ],
+        )
         self.assertEqual(nurse["abilities"]["leech therapy"]["display_name"], "Терапия пиявок")
         self.assertEqual(
             nurse["abilities"]["leech therapy"]["stats"],
@@ -2829,6 +2946,23 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
             },
         )
         self.assertEqual(client.get.await_count, 8)
+
+        detail = patch_detail.structure_patch_detail(
+            {
+                "id": "candidate-projection",
+                "title": "Nurse Harrow joins Deadlock",
+                "content": "Nurse Harrow: Leech Therapy cooldown reduced.",
+                "published_at": "2026-11-10T00:00:00Z",
+                "url": "https://store.steampowered.com/news/app/1422450/view/candidate-projection",
+            },
+            catalog,
+        )
+        nurse_section = next(
+            section for section in detail["sections"] if section.get("hero_name") == "Nurse Harrow"
+        )
+        self.assertEqual(nurse_section["hero_image_candidates"], nurse["hero_image_candidates"])
+        self.assertEqual(nurse_section["hero_image_url"], nurse["hero_image_url"])
+        PatchDetailResponse.model_validate(detail)
 
     def test_asset_catalog_supports_both_doorman_names(self) -> None:
         catalog = home_content._build_asset_catalog(

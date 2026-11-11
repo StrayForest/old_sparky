@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import { expect, test } from "@playwright/test";
 import type { Page } from "@playwright/test";
 import {
@@ -364,4 +366,56 @@ test("public profile loads the local hero image when its catalog source fails", 
   const redirectedImage = await page.request.get(new URL("/assets/heroes/Abrams.png", page.url()).toString());
   expect(redirectedImage.status()).toBe(200);
   expect(redirectedImage.headers()["content-type"]).toMatch(/^image\/png/u);
+});
+
+test("Draft hero image advances from a failed valid CDN source to a decoded alternative", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "The focused Draft image failure path runs once on desktop.");
+  const draftPublic = path.resolve(process.cwd(), "../platform_draft/public");
+  const [indexHtml, appScript, coreScript, heroesScript, styles, alternatePng] = await Promise.all([
+    readFile(path.join(draftPublic, "index.html"), "utf8"),
+    readFile(path.join(draftPublic, "app.js"), "utf8"),
+    readFile(path.join(draftPublic, "draft-core.js"), "utf8"),
+    readFile(path.join(draftPublic, "heroes.js"), "utf8"),
+    readFile(path.join(draftPublic, "styles.css"), "utf8"),
+    readFile(path.join(process.cwd(), "public", "assets", "heroes", "Abrams.png")),
+  ]);
+  const primaryUrl = "https://cdn.old-sparky.com/draft/heroes/v1/future-hero.webp";
+  const alternateUrl = "https://cdn.old-sparky.com/draft/heroes/v1/future-hero-alt.webp";
+  let primaryRequests = 0;
+  let alternateRequests = 0;
+
+  await page.route("https://pagead2.googlesyndication.com/**", (route) => route.abort());
+  await page.route("**/draft", (route) => route.fulfill({ status: 200, contentType: "text/html", body: indexHtml }));
+  await page.route("http://127.0.0.1:3100/draft/app.js", (route) => route.fulfill({ status: 200, contentType: "text/javascript", body: appScript }));
+  await page.route("http://127.0.0.1:3100/draft/draft-core.js", (route) => route.fulfill({ status: 200, contentType: "text/javascript", body: coreScript }));
+  await page.route("http://127.0.0.1:3100/draft/heroes.js", (route) => route.fulfill({ status: 200, contentType: "text/javascript", body: heroesScript }));
+  await page.route("http://127.0.0.1:3100/draft/styles.css", (route) => route.fulfill({ status: 200, contentType: "text/css", body: styles }));
+  await page.route("http://127.0.0.1:3100/draft/api/heroes", (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({ heroes: [{
+      id: "future-hero",
+      name: "Future Hero",
+      image: primaryUrl,
+      imageCandidates: [primaryUrl, alternateUrl],
+    }] }),
+  }));
+  await page.route(primaryUrl, async (route) => {
+    primaryRequests += 1;
+    await route.fulfill({ status: 404, contentType: "text/plain", body: "missing primary image" });
+  });
+  await page.route(alternateUrl, async (route) => {
+    alternateRequests += 1;
+    await route.fulfill({ status: 200, contentType: "image/png", body: alternatePng });
+  });
+
+  await page.goto("/draft");
+  await expect(page.getByRole("heading", { name: "Драфты" })).toBeVisible();
+  await page.getByRole("button", { name: "Соло" }).click();
+  await page.getByRole("button", { name: "Начать соло-драфт" }).click();
+  const image = page.locator(".hero-card img").first();
+  await expect(image).toHaveAttribute("src", alternateUrl);
+  await expect.poll(() => image.evaluate((element) => (element as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
+  expect(primaryRequests).toBe(1);
+  expect(alternateRequests).toBe(1);
 });

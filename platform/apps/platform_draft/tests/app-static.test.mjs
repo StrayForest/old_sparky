@@ -111,3 +111,22 @@ test("solo and online screens use the refreshed or room-pinned hero roster", () 
   assert.match(appSource, /applyLocalTimeout\(room, currentRoomHeroes\(\)\.map/u);
   assert.match(workerSource, /heroes: normalizeHeroRoster\(room\.heroRoster\) \|\| fallbackHeroRoster\(\)/u);
 });
+
+test("hero images preserve ordered alternatives and stop after the placeholder", () => {
+  const miniHeroSource = appSource.slice(appSource.indexOf("function renderMiniHero("), appSource.indexOf("function renderEmptySlot("));
+  const heroCardSource = appSource.slice(appSource.indexOf("function renderHeroCard("), appSource.indexOf("function heroUsageState("));
+  const selectedSummarySource = appSource.slice(appSource.indexOf("function renderActionBar("), appSource.indexOf("function renderCompletedActions("));
+  const fallbackSource = appSource.slice(appSource.indexOf("function draftHeroImageAttributes("), appSource.indexOf("function findRoomHero("));
+  const imageHandlerSource = appSource.slice(appSource.indexOf("function attachImageFallbacks("), appSource.indexOf("function navigate("));
+
+  assert.match(miniHeroSource, /draftHeroImageAttributes\(hero\)/u);
+  assert.match(heroCardSource, /draftHeroImageAttributes\(hero\)/u);
+  assert.match(selectedSummarySource, /draftHeroImageAttributes\(selectedHero\)/u);
+  assert.match(fallbackSource, /\.\.\.remoteCandidates/u);
+  assert.match(fallbackSource, /remoteCandidates\.length \? \[\] : \[apiHero\]/u);
+  assert.match(fallbackSource, /\/assets\/heroes\/placeholder\.svg/u);
+  assert.match(imageHandlerSource, /img\[data-draft-hero-candidates\]/u);
+  assert.match(imageHandlerSource, /sourceIndex >= 0 && nextIndex < candidates\.length/u);
+  assert.match(imageHandlerSource, /image\.style\.visibility = "hidden"/u);
+  assert.doesNotMatch(imageHandlerSource, /\{\s*once:\s*true\s*\}/u);
+});

@@ -707,10 +707,16 @@ function normalizeGameAssetRoster(value) {
     seenIds.add(id);
     seenNames.add(nameKey);
     const fallback = HERO_BY_ID.get(id);
+    const image = safeHeroImage(candidate.image_url, fallback?.image, name);
+    const imageCandidates = uniqueHeroImageCandidates([
+      image,
+      ...safeHeroImageCandidates(candidate.image_candidates),
+    ]).slice(0, 4);
     heroes.push({
       id,
       name,
-      image: safeHeroImage(candidate.image_url, fallback?.image, name),
+      image: imageCandidates[0] || image,
+      imageCandidates,
     });
     if (heroes.length >= MAX_HEROES) break;
   }
@@ -729,10 +735,16 @@ function normalizeHeroRoster(value) {
     if (!id || candidate.id !== id || seenIds.has(id)) return null;
     seenIds.add(id);
     const fallback = HERO_BY_ID.get(id);
+    const image = safeHeroImage(candidate.image, fallback?.image, name);
+    const imageCandidates = uniqueHeroImageCandidates([
+      image,
+      ...safeHeroImageCandidates(candidate.imageCandidates),
+    ]).slice(0, 4);
     heroes.push({
       id,
       name,
-      image: safeHeroImage(candidate.image, fallback?.image, name),
+      image: imageCandidates[0] || image,
+      imageCandidates,
     });
   }
   return heroes;
@@ -751,6 +763,21 @@ function sourceHeroId(candidate, name) {
 }
 
 function safeHeroImage(value, fallback, name) {
+  return safeHeroImageCandidate(value)
+    || safeHeroImageCandidate(fallback)
+    || `/api/v1/content/game-assets/heroes/${encodeURIComponent(name)}.png`;
+}
+
+function safeHeroImageCandidates(value) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 4).map(safeHeroImageCandidate).filter(Boolean);
+}
+
+function uniqueHeroImageCandidates(candidates) {
+  return candidates.filter((candidate, index) => candidate && candidates.indexOf(candidate) === index);
+}
+
+function safeHeroImageCandidate(value) {
   if (typeof value === "string") {
     try {
       const url = new URL(value, "https://old-sparky.com");
@@ -764,11 +791,10 @@ function safeHeroImage(value, fallback, name) {
         ? url.pathname
         : url.href;
     } catch {
-      // Ignore invalid source image URLs and use the same-origin fallback.
+      // Ignore invalid source image URLs.
     }
   }
-  if (typeof fallback === "string" && fallback) return fallback;
-  return `/api/v1/content/game-assets/heroes/${encodeURIComponent(name)}.png`;
+  return null;
 }
 
 function fallbackHeroRoster() {

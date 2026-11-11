@@ -109,6 +109,7 @@ export type PlatformDeadlockGameAsset = {
   name: string;
   draft_id?: string | null;
   image_url: string;
+  image_candidates?: string[];
   source_available: boolean;
 };
 
@@ -136,6 +137,7 @@ export type PlatformPatchSection = {
   hero_presentation_kind?: "balance" | "introduction" | null;
   mode_name?: string | null;
   hero_image_url?: string | null;
+  hero_image_candidates?: string[];
   hero_description?: string | null;
   hero_metadata_pending?: boolean;
   item_name?: string | null;

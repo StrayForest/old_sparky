@@ -114,6 +114,14 @@ async def _publish_patch_refresh(
                     encoded_catalog,
                     ex=base.PATCH_ASSET_CATALOG_STALE_TTL_SECONDS,
                 )
+                if base._asset_catalog_has_current_hero_image_candidates(catalog):
+                    pipeline.delete(base.PATCH_ASSET_PENDING_RETRY_KEY)
+                else:
+                    pipeline.set(
+                        base.PATCH_ASSET_PENDING_RETRY_KEY,
+                        "pending",
+                        ex=base.PATCH_ASSET_PENDING_RETRY_SECONDS,
+                    )
             for patch_id, raw_detail in details.items():
                 structured = structure_patch_detail(raw_detail, catalog)
                 structured_details[patch_id] = structured
@@ -148,9 +156,26 @@ async def _refresh_patch_cache_after_miss() -> None:
         timeout = httpx.Timeout(settings.platform_external_content_timeout_seconds)
         async with _BoundedPatchRefreshClient(timeout=timeout) as client:
             _, details = await base._fetch_steam_patches(client)
-            publish_catalog = catalog is None
-            if catalog is None:
-                catalog = await base._fetch_deadlock_asset_catalog(client)
+            publish_catalog = not base._asset_catalog_has_current_hero_image_candidates(
+                catalog
+            )
+            if publish_catalog:
+                cache = redis_client()
+                try:
+                    retry_blocked = bool(
+                        await cache.get(base.PATCH_ASSET_PENDING_RETRY_KEY)
+                    )
+                finally:
+                    await cache.aclose()
+                if retry_blocked:
+                    publish_catalog = False
+                    if catalog is None:
+                        raise RuntimeError("Hero image catalog refresh is in backoff.")
+                else:
+                    catalog = await base._fetch_deadlock_asset_catalog(
+                        client,
+                        previous_catalog=catalog,
+                    )
         await _publish_patch_refresh(
             details,
             catalog,

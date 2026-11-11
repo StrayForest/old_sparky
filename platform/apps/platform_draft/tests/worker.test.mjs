@@ -140,7 +140,13 @@ test("game-assets roster is cached, falls back to the last source, and is pinned
         {
           draft_id: "hero_future",
           name: "Future Hero",
-          image_url: "/api/v1/content/game-assets/heroes/Future%20Hero.png"
+          image_url: "https://cdn.old-sparky.com/draft/heroes/v1/future-hero.webp",
+          image_candidates: [
+            "https://cdn.old-sparky.com/draft/heroes/v1/future-hero.webp",
+            "https://cdn.old-sparky.com/draft/heroes/v1/future-hero-alt.webp",
+            "https://cdn.old-sparky.com/draft/heroes/v1/future-hero-alt.webp",
+            "https://untrusted.example/future-hero.webp"
+          ]
         },
         {
           draft_id: "hero_future",
@@ -171,6 +177,15 @@ test("game-assets roster is cached, falls back to the last source, and is pinned
       { id: "baba", name: "Baba" },
       { id: "hero_future", name: "Future Hero" }
     ]);
+    assert.deepEqual(roster.heroes[1], {
+      id: "hero_future",
+      name: "Future Hero",
+      image: "https://cdn.old-sparky.com/draft/heroes/v1/future-hero.webp",
+      imageCandidates: [
+        "https://cdn.old-sparky.com/draft/heroes/v1/future-hero.webp",
+        "https://cdn.old-sparky.com/draft/heroes/v1/future-hero-alt.webp"
+      ]
+    });
     assert.equal(fetchCount, 1);
     assert.equal(lastFetchOptions.redirect, "manual");
 
@@ -232,6 +247,7 @@ test("room snapshot validates actions and timeout picks against its pinned roste
     { id: "baba", name: "Baba", image: "/api/v1/content/game-assets/heroes/Baba.png" },
     { id: "hero_future", name: "Future Hero", image: "/api/v1/content/game-assets/heroes/Future%20Hero.png" }
   ];
+  const normalizedHeroes = heroes.map((hero) => ({ ...hero, imageCandidates: [hero.image] }));
   await draft.create(new Request("https://draft-room.internal/create", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -262,19 +278,19 @@ test("room snapshot validates actions and timeout picks against its pinned roste
 
   await draft.webSocketMessage(host, JSON.stringify({ type: "action", expectedVersion: room.version, heroId: "abrams" }));
   assert.equal(host.messages.at(-1).error, "Неизвестный герой");
-  assert.deepEqual(host.messages.at(-1).room.heroes, heroes);
+  assert.deepEqual(host.messages.at(-1).room.heroes, normalizedHeroes);
 
   await draft.webSocketMessage(host, JSON.stringify({ type: "action", expectedVersion: room.version, heroId: "baba" }));
   room = await environment.storage.get("room");
   assert.deepEqual(room.picks.A, ["baba"]);
-  assert.deepEqual(host.messages.at(-1).room.heroes, heroes);
+  assert.deepEqual(host.messages.at(-1).room.heroes, normalizedHeroes);
 
   room.turnDeadlineAt = Date.now() - 1;
   await environment.storage.put("room", room);
   await draft.webSocketMessage(host, JSON.stringify({ type: "deadline", expectedVersion: room.version }));
   room = await environment.storage.get("room");
   assert.deepEqual(room.picks.B, ["hero_future"]);
-  assert.deepEqual(host.messages.at(-1).room.heroes, heroes);
+  assert.deepEqual(host.messages.at(-1).room.heroes, normalizedHeroes);
 });
 
 test("room creation rejects an indefinite timer", async () => {

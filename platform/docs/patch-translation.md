@@ -96,7 +96,7 @@ attached to its owning hero even when it is not one of that hero's four
 signature slots. Translated-text counts and section totals alone do not
 establish that this contract holds.
 
-The current hero, ability and shop-item catalog combines the community Deadlock API's per-patch game-data endpoints (`/v1/assets/heroes` and `/v1/assets/items`) with the legacy deadlock.io index when it returns valid JSON. The community endpoints expose the latest known client build and accept a `language=russian` parameter. Old Sparky joins English and Russian payloads by stable hero ID, ability class name and shop item name. Shop entries are projected from released `type=upgrade` records with a recognized `item_slot_type` and validated image URL. If either legacy endpoint is unavailable, redirected or non-JSON, valid community hero and item data supplies the catalog; if all sources fail, the last-good catalog is retained. These are community-parsed game files, not a Valve-operated API; Steam's announcement feed remains the source for patch prose. The API selects Russian values when present and English values otherwise, strips HTML and inline game tokens from descriptions, and constructs image URLs only from validated relative `/assets/` paths or the fixed Deadlock API asset CDN host. Public hero image projections prefer that validated CDN image, then a bundled static image that exists, then the placeholder; the obsolete deadlock.io card URLs are never treated as healthy merely because they return an HTTP response. Catalog HTML is never rendered.
+The current hero, ability and shop-item catalog combines the community Deadlock API's per-patch game-data endpoints (`/v1/assets/heroes` and `/v1/assets/items`) with the legacy deadlock.io index when it returns valid JSON. The community endpoints expose the latest known client build and accept a `language=russian` parameter. Old Sparky joins English and Russian payloads by stable hero ID, ability class name and shop item name. Shop entries are projected from released `type=upgrade` records with a recognized `item_slot_type` and validated image URL. If either legacy endpoint is unavailable, redirected or non-JSON, valid community hero and item data supplies the catalog; if all sources fail, the last-good catalog is retained. These are community-parsed game files, not a Valve-operated API; Steam's announcement feed remains the source for patch prose. The API selects Russian values when present and English values otherwise, strips HTML and inline game tokens from descriptions, and constructs image URLs only from validated relative `/assets/` paths or the fixed Deadlock API asset CDN host. Hero entries may expose ordered `image_candidates` and patch hero sections may expose `hero_image_candidates`; the singular image URL mirrors the first candidate when the list is nonempty. Lists contain at most four distinct, validated remote URLs. Valid existing/prior candidates are retained before current community variants, whose order is card WebP, card PNG, small WebP, then small PNG. These are variants from the same approved asset host, not independent providers. Invalid and legacy deadlock.io/SteamDB image URLs are excluded. The UI tries each candidate once, then a bundled image that exists, then the placeholder; when an explicit list is present it does not retry the same API image after candidate exhaustion. Catalog HTML is never rendered.
 
 When a new Steam announcement appears, the normal home-content refresh fetches the catalog in the same bounded refresh and reparses the four displayed patch details under the current detail-cache namespace. The worker's existing `home-content-refresh` schedule checks the Steam feed every 5 minutes. It avoids downloading asset bundles when nothing changed, and retries cached hero introductions with genuinely incomplete required metadata or unknown/partial supported stats at most once per 5 minutes, under the existing Redis lock. Catalog-pending state is separate from Russian-translation-pending state, so an intentionally hidden balance description does not trigger asset retries. An announcement can precede its game-data source; the UI reports required intro metadata and incomplete current stats as pending while the bounded schedule checks again. Missing Russian intro descriptions use English game text when available, otherwise the matching Steam ability span, and register only those fields with the DB-first translation pipeline. Detection is bounded by the 5-minute schedule; upstream publication delay remains outside the service's control.
 
@@ -225,12 +225,11 @@ For prose, prefer Valve terminology and natural constructions. The model may inf
 10. Successful translations are committed to PostgreSQL first, then written to Redis under `PATCH_TRANSLATION_VERSION` and served by the patch API.
 11. A Redis miss falls back to PostgreSQL; a missing database translation does not invoke OpenAI from the user request.
 
-Patch source/cache projection generations are versioned independently from
-translation state. The active patch detail prefix is `v15`; the current and
-last-good asset-catalog keys are `v9` and `v3`. These namespaces force patch
-details and the assembled catalog to be rebuilt with the current auxiliary
-ability ownership projection. Old keys remain untouched; no Redis flush or
-database reset is part of the refresh.
+Patch source and catalog cache generations are independent of translation
+state. Their keys and freshness markers are owned by service constants and
+schema fields; do not duplicate transient key versions in runbooks. A cache
+projection repair leaves older values untouched and uses the normal bounded
+refresh. No Redis flush or database reset is part of the refresh.
 
 An automatic retry of a failed translation task is limited to one delayed retry
 for known network/timeout errors, guarded by the same source hash and row lock.
@@ -267,31 +266,36 @@ Validation failures are not retried in a loop.
 
 ## Parser and catalog cache changes
 
-When patch parsing or source normalization changes extracted sections, bump the
-detail cache namespace so new reads cannot reuse stale structure. When the
-assembled game-asset catalog projection changes, bump both its current and
-last-good cache namespaces, even if Steam patch IDs are unchanged. The
-namespaces configured in this source tree are detail v14, current asset
-catalog v8 and last-good asset catalog v2. A v14 detail-cache miss ignores
-older detail namespaces without reading, reparsing, promoting or deleting
-their entries. Catalog readers use v8, then v2, and do not read older catalog
-namespaces. The base `home_content.refresh_home_content`, the guarded
+When patch parsing or source normalization changes extracted sections, update
+the detail-cache contract so new reads cannot reuse stale structure. Catalog
+readiness is tracked by the `hero_image_candidates_version` marker: a warm
+catalog without the marker is incomplete and schedules the normal bounded
+refresh, while the last-good catalog remains available if the source is down.
+The guarded home/game-assets refresh sets its existing pending-retry marker
+when the projection is still incomplete, so repeated reads cannot trigger
+unbounded source requests. Do not rewrite or delete older cache values to
+repair them. Cache keys and
+freshness markers are defined by the service constants; readers and writers
+must use those shared definitions rather than duplicating key strings. The
+base `home_content.refresh_home_content`, the guarded
 `home_content_security.refresh_home_content`, and the bounded
 `patch_detail_security._refresh_patch_cache_after_miss` path publish a rebuilt
-catalog to both v8 and v2 in one cache pipeline. The platform worker reaches
-catalog to both v8 and v2 in one cache pipeline. The worker task
+catalog to both the current and last-good keys in one cache pipeline. The
+platform worker reaches the base refresh through
+`patch_detail.get_patch_detail`; the worker task
 `platform.home_content_refresh` and public `/home` route call
 `home_content_runtime.refresh_home_content`, which uses the guarded home
 refresh. Public `/game-assets` uses the guarded catalog reader. Public patch
 detail reads use `patch_detail_security.get_patch_detail`; a detail-cache miss
 uses the bounded patch-miss path. The base catalog reader is also used by
 `patch_detail.get_patch_detail` and rebuilds through the base home refresh.
-Thus an old warm catalog cannot suppress rebuilding the new projection after
-a namespace bump. Existing older cache entries remain untouched. The
-patch-miss refresh uses bounded negative/global gates to fetch the current
-full Steam feed with `maxlength=0`, publishes current details under v14, and
-registers translations keyed by the newly extracted source hashes. The full
-HTTP response remains subject to the 8 MiB byte cap, and each normalized
+Thus an old warm catalog cannot suppress rebuilding a projection that lacks
+its required readiness marker. Existing older cache entries remain untouched.
+The patch-miss refresh uses bounded negative/global gates to fetch the current
+full Steam feed with `maxlength=0`, publishes current details under the
+configured detail namespace, and registers translations keyed by the newly
+extracted source hashes. The full HTTP response remains subject to the 8 MiB
+byte cap, and each normalized
 article remains capped at 30,000 characters. A cold catalog may defer one
 bounded refresh through that same full-feed path; it must not fan out a
 full-history reprocess. Existing translation rows are not automatically valid

@@ -59,7 +59,7 @@ async def _await_refresh_tasks(
 class _Pipeline:
     def __init__(self, cache: "_Cache") -> None:
         self.cache = cache
-        self.pending: list[tuple[str, str]] = []
+        self.pending: list[tuple[str, str | None]] = []
 
     async def __aenter__(self):
         return self
@@ -71,9 +71,16 @@ class _Pipeline:
         self.pending.append((key, value))
         return self
 
+    def delete(self, key: str):
+        self.pending.append((key, None))
+        return self
+
     async def execute(self) -> list[bool]:
         for key, value in self.pending:
-            self.cache.values[key] = value
+            if value is None:
+                self.cache.values.pop(key, None)
+            else:
+                self.cache.values[key] = value
         return [True] * len(self.pending)
 
 
@@ -231,10 +238,10 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
             },
         )
         expected_renderer_fixture_digests = {
-            "1846651706696737": "ce37f05e3cd820d976b67b54ab8f45ef3e977fbfb49427b108980bb933487da6",
-            "1847920302240420": "59684991847b42d9e2509adc0df936c1cf0a0b2a6f8e8d7ecf8f5772803b3eee",
-            "1848664643339845": "6db61a6999f445547ef006c081b9940b1a760ec7c32711ce919a898bed838fab",
-            "1848664643342973": "aaa141e4ce47a51de440bee9acde15fe757a61cf30be452448239d54a966eb13",
+            "1846651706696737": "7a238716e178175b455b6aed62d33c84f69ea600de252783da50c334b3a786d7",
+            "1847920302240420": "28a058b28803db0021736ee0209775a3ef0635259e26ad124207db82b29302f8",
+            "1848664643339845": "35cd23b9343e5ec76a26aa0709d18ebbef4a9dd581b2faa3c14b0b8a548416af",
+            "1848664643342973": "7e17f338f1e74c96a537ba100e59aafab2c6c4f73ac9abd6a678a9828507315d",
         }
         self.assertEqual(provenance["renderer_fixtures"], expected_renderer_fixture_digests)
         self.assertEqual(
@@ -283,6 +290,20 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
                     "catalog_class_name": "ability_chessmaster_movechesspiece",
                     "display_name": "Ход фигурой",
                 },
+                {
+                    "patch_ids": [
+                        "1846651706696737",
+                        "1847920302240420",
+                        "1848664643339845",
+                        "1848664643342973",
+                    ],
+                    "path": "sections[kind=hero].hero_image_candidates",
+                    "hero_sections": 47,
+                    "remote_candidate_urls": 188,
+                    "max_candidates": 4,
+                    "primary_first_and_deduplicated": True,
+                    "source": "actual bounded catalog fetch and public patch detail projection",
+                },
             ],
         )
         expected_ids = {
@@ -314,7 +335,7 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
                 },
                 old_catalog,
             )
-            for version in range(6, 15):
+            for version in range(6, 16):
                 old_values[f"platform:home-content:patch:v{version}:{patch_id}"] = json.dumps(
                     compact_detail
                 )
@@ -500,6 +521,7 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
                         "hero_presentation_kind",
                         "mode_name",
                         "hero_image_url",
+                        "hero_image_candidates",
                         "hero_description",
                         "hero_description_requires_translation",
                         "hero_description_russian_metadata_available",

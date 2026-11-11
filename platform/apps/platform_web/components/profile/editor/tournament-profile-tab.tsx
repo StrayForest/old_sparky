@@ -247,6 +247,7 @@ export function TournamentProfileTab({
                         className="hero-card-image"
                         fill
                         heroName={hero.name}
+                        imageCandidates={hero.imageCandidates}
                         imageUrl={hero.imageUrl}
                         sizes="160px"
                       />

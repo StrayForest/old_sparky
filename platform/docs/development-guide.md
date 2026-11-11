@@ -182,7 +182,9 @@ is not the CI or release reproducibility contract.
 ## Change workflow
 
 1. Read `CURRENT.md` and identify the owner layer/document.
-2. Define behavior, permissions, data impact, rollback and focused tests.
+2. Map every user-visible requirement to its owning surface and acceptance
+   evidence. Define behavior, permissions, data impact, rollback and focused
+   tests.
 3. Keep routes thin; place workflow rules in domain/services and persistence in models/repositories.
 4. For schema work, use an expand migration compatible with the previous release. Never edit an applied migration. The historical `20260901_0051` catalog migration is retried through `tools/platform_tournament_list_read_model_recovery.py` before the exact production `upgrade head` command; revision `20260913_0053` validates and repairs databases that already recorded 0051/0052.
 5. Add regression coverage before broad gates. For async UI mutations, cover duplicate-submit, stale-response and editable-draft races when applicable; permission-sensitive UI must consume backend capabilities rather than infer access from visibility or presentation state.

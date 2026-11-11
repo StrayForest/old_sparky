@@ -43,7 +43,8 @@
         "Fixed some bugs with Walker stomp logic",
         "Latest 6 heroes are no longer categorized as \"new\" anymore. This means they have normal hero unlocking requirements for ranked and can now be banned."
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "objective",
@@ -72,7 +73,8 @@
         "Rejuvenator crystals now give a bounty to the player that breaks them (500 +9/min)",
         "Rejuvenator crystal drop time increased from 6s to 7.5s"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -91,7 +93,8 @@
       "changes": [
         "Bullet Velocity reduced from 60% to 45% (upgrades unaffected)"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -110,7 +113,8 @@
       "changes": [
         "Secondary Fire Weapon Damage and growth reduced by 5%"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -129,7 +133,8 @@
       "changes": [
         "No longer affects or counts enemies outside of line of sight or through walls"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -148,7 +153,8 @@
       "changes": [
         "Slow duration increased from 2s to 2.5s"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -170,7 +176,8 @@
         "Ambush bonuses now build up over 6s of being stealthed before reaching full power (invis progress UI pulses when it is charged up)",
         "Abilities used to break stealth now benefit from the Ambush bonus on their own damage (previously the bonus was applied after the ability had already gone off)"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -189,7 +196,8 @@
       "changes": [
         "Anti Heal increased from 35% to 40%"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -208,7 +216,8 @@
       "changes": [
         "Chance increased from 55% to 60%"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -227,7 +236,8 @@
       "changes": [
         "Anti-Heal increased from -35% to -40%"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -246,7 +256,8 @@
       "changes": [
         "Weapon Damage increased from 80% to 85%"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -265,7 +276,8 @@
       "changes": [
         "Spirit power increased from 6 to 8 (from component changes)"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -284,7 +296,8 @@
       "changes": [
         "Parry Cooldown reduction reduced from -1.75s to -1.25s"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -303,7 +316,8 @@
       "changes": [
         "Weapon Damage increased from 18% to 22%"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -323,7 +337,8 @@
         "Weapon Damage increased from 6% to 10%",
         "Bullet Lifesteal increased from 13% to 15%"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -343,7 +358,8 @@
         "Multiple sources now stack on the enemy with diminishing returns (previously didn't stack)",
         "Heal on Hero Kill reduced from 275 to 170 + 3/Boon"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -364,7 +380,8 @@
         "No longer grants +3 Health Regen",
         "Out of Combat Regen increased from +1 to +2"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -384,7 +401,8 @@
         "Now returns the damage you take from Haze's Fixation",
         "Fixed the shop tooltip not listing the 10% Bullet Resistance"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -404,7 +422,8 @@
         "Spirit Power increased from 6 to 8",
         "Spirit Lifesteal increased from 13% to 15%"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -423,7 +442,8 @@
       "changes": [
         "Spirit Resist reduced from 18% to 15%"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -443,7 +463,8 @@
         "Bullet Resistance increased from 30% to 35%",
         "Out of Combat Regen increased from 3 to 5"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -464,7 +485,8 @@
         "Bullet Lifesteal increased from 14% to 15%",
         "Weapon Damage increased from 6% to 10%"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -483,7 +505,8 @@
       "changes": [
         "Now scales with Spirit Power (1.1) instead of Boons (6)"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -502,7 +525,8 @@
       "changes": [
         "Now increases your gravity by 20% while active"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -521,7 +545,8 @@
       "changes": [
         "Cooldown increased from 45s to 55s"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -542,7 +567,8 @@
         "Spirit Lifesteal increased from 13% to 15%",
         "Spirit power increased from 6 to 8"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -561,7 +587,8 @@
       "changes": [
         "Health Regen increased from +8 to +15"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -581,7 +608,8 @@
         "Bullet Lifesteal increased from 28% to 30%",
         "Spirit Lifesteal increased from 28% to 30%"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -600,7 +628,8 @@
       "changes": [
         "When the item procs, it continues to reduce any other spirit damage that happens as a result in that damage stack (for example, getting hit by charged shot that procs tankbuster now both get reduced)"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -621,7 +650,8 @@
         "Bullet Lifesteal increased from 13% to 15%",
         "Weapon Damage increased from 6% to 10%"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -640,7 +670,8 @@
       "changes": [
         "Damage Penalty reduced from -15% to -12%"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -659,7 +690,8 @@
       "changes": [
         "Dash Distance slow increased from -10% to -12%"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -679,7 +711,8 @@
         "Cooldown increased from 18s to 22s",
         "Cast range reduced from 40m to 35m"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -698,7 +731,8 @@
       "changes": [
         "Incoming Heal reduction increased from -50% to -55%"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -720,7 +754,8 @@
         "Heal on Ability Cast reduced from 65 to 40",
         "Heal on Ability Cast boon scaling reduced from 1.7 to 1.4"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -739,7 +774,8 @@
       "changes": [
         "Bonus Health increased from +50 to +90"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -758,7 +794,8 @@
       "changes": [
         "Melee Resistance increased from 18% to 22%"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -777,7 +814,8 @@
       "changes": [
         "Post cast time reduced from 0.5s to 0.2s"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -797,7 +835,8 @@
         "Cooldown reduced from 45s to 40s",
         "Fixed damage dealt to a barrier not counting toward the repeated damage"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "item",
@@ -817,7 +856,8 @@
         "Damage now scales with Spirit Power (0.35)",
         "Dash Distance slow increased from -10% to -12%"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "hero",
@@ -861,6 +901,12 @@
             "Fixed enemies being held in place longer if you don't hit a wall"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/bull_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/bull_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/bull_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/bull_sm.png"
       ]
     },
     {
@@ -919,6 +965,12 @@
             "No longer interrupted by Sleep"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/fencer_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/fencer_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/fencer_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/fencer_sm.png"
       ]
     },
     {
@@ -983,6 +1035,12 @@
             "Silence duration reduced from 3s to 2.75s"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/baba_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/baba_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/baba_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/baba_sm.png"
       ]
     },
     {
@@ -1025,6 +1083,12 @@
             "Cooldown reduced from 27s to 25s"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/punkgoat_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/punkgoat_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/punkgoat_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/punkgoat_sm.png"
       ]
     },
     {
@@ -1067,6 +1131,12 @@
             "T3 increased from 6s duration to 8s"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nano_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nano_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nano_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nano_sm.png"
       ]
     },
     {
@@ -1097,6 +1167,12 @@
             "Damage reduced from 140 to 125"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/unicorn_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/unicorn_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/unicorn_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/unicorn_sm.png"
       ]
     },
     {
@@ -1142,6 +1218,12 @@
             "Fixed some incorrect behavior when used at the top of the belltower"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/deadpack_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/deadpack_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/deadpack_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/deadpack_sm.png"
       ]
     },
     {
@@ -1173,6 +1255,12 @@
             "T3 increased from -15s Cooldown to -18s"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/doorman_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/doorman_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/doorman_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/doorman_sm.png"
       ]
     },
     {
@@ -1217,6 +1305,12 @@
             "T3 increased from +2.5s Duration to +2.75s"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/drifter_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/drifter_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/drifter_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/drifter_sm.png"
       ]
     },
     {
@@ -1264,6 +1358,12 @@
             "T3 now also provides -0.3s Time To Spawn"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/necro_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/necro_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/necro_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/necro_sm.png"
       ]
     },
     {
@@ -1308,6 +1408,12 @@
             "Now launches in the exact direction you're aiming, including steep downward angles (previously always launched at least 45° upward)"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/archer_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/archer_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/archer_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/archer_sm.png"
       ]
     },
     {
@@ -1350,6 +1456,12 @@
             "T3 now increases spirit scaling by 0.4"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/inferno_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/inferno_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/inferno_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/inferno_sm.png"
       ]
     },
     {
@@ -1380,6 +1492,12 @@
             "Fixed T3 dispelling debuffs that can't be dispelled (like the Specter Crash from Nurse's Wretched Vapors)"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/haze_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/haze_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/haze_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/haze_sm.png"
       ]
     },
     {
@@ -1413,6 +1531,12 @@
             "T3 regen increased from +65 to +75"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/kelvin_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/kelvin_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/kelvin_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/kelvin_sm.png"
       ]
     },
     {
@@ -1443,6 +1567,12 @@
             "spirit scaling increased from 1.22 to 1.35"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/spectre_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/spectre_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/spectre_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/spectre_sm.png"
       ]
     },
     {
@@ -1485,6 +1615,12 @@
             "Targeting indicator changed from a cone to a cylinder to more accurately match the ability's range (visual change only)"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/lash_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/lash_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/lash_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/lash_sm.png"
       ]
     },
     {
@@ -1516,6 +1652,12 @@
             "Health per boon increased from 9 to 10"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/engineer_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/engineer_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/engineer_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/engineer_sm.png"
       ]
     },
     {
@@ -1555,6 +1697,12 @@
             "T3 now also adds barrier spirit scaling (0.8)"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/mirage_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/mirage_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/mirage_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/mirage_sm.png"
       ]
     },
     {
@@ -1576,7 +1724,13 @@
         "Spirit damage on all abilities reduced by 10% (base values and growth/upgrades)",
         "Bullet damage per boon increased by 4%"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/digger_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/digger_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/digger_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/digger_sm.png"
+      ]
     },
     {
       "kind": "hero",
@@ -1650,6 +1804,12 @@
             "T3 changed from \"Immune to damage while channeling\" to \"Takes 50% Reduced Damage while channeling\""
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_sm.png"
       ]
     },
     {
@@ -1670,7 +1830,13 @@
         "Base bullet damage reduced from 35 to 32",
         "Bullet damage growth per boon increased from 0.52 to 0.61"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/bookworm_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/bookworm_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/bookworm_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/bookworm_sm.png"
+      ]
     },
     {
       "kind": "hero",
@@ -1700,6 +1866,12 @@
             "Cooldown reduced from 110s to 95s"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/chrono_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/chrono_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/chrono_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/chrono_sm.png"
       ]
     },
     {
@@ -1751,6 +1923,12 @@
             "Now goes on cooldown when stunned/slept before placing it. In that case, the flag is placed in that position but without any of the initial impact effects (damage/knockup)"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/ratking_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/ratking_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/ratking_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/ratking_sm.png"
       ]
     },
     {
@@ -1781,6 +1959,12 @@
             "T3 stun duration increased from 0.9s to 1.1s"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/gigawatt_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/gigawatt_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/gigawatt_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/gigawatt_sm.png"
       ]
     },
     {
@@ -1839,6 +2023,12 @@
             "Recast duration reduced from 16s to 12s"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/shiv_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/shiv_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/shiv_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/shiv_sm.png"
       ]
     },
     {
@@ -1884,6 +2074,12 @@
             "Now counts weapon damage from Point Blank and Opening Rounds"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/werewolf_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/werewolf_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/werewolf_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/werewolf_sm.png"
       ]
     },
     {
@@ -1966,6 +2162,12 @@
             "Improved placement: pieces no longer fall through geometry or end up under the map, land closer to where you aim, and can now be placed closer to walls and in hallways"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/chessmaster_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/chessmaster_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/chessmaster_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/chessmaster_sm.png"
       ]
     },
     {
@@ -1997,6 +2199,12 @@
             "Blessed stake damage boon scaling increased from 3 to 3.6"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/priest_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/priest_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/priest_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/priest_sm.png"
       ]
     },
     {
@@ -2027,6 +2235,12 @@
             "T3 increased from +15% Damage to +16%"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/frank_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/frank_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/frank_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/frank_sm.png"
       ]
     },
     {
@@ -2082,6 +2296,12 @@
             "T3 no longer has \"Ink is no longer destroyed\""
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/artist_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/artist_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/artist_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/artist_sm.png"
       ]
     },
     {
@@ -2127,6 +2347,12 @@
             "Fixed the direction indicator not appearing"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/viscous_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/viscous_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/viscous_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/viscous_sm.png"
       ]
     },
     {
@@ -2183,6 +2409,12 @@
             "T2 cooldown reduction increased from -30s to -40s"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/warden_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/warden_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/warden_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/warden_sm.png"
       ]
     },
     {
@@ -2226,6 +2458,12 @@
             "Initial cast time for projectile increased from 0.75s to 1s"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/wraith_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/wraith_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/wraith_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/wraith_sm.png"
       ]
     },
     {
@@ -2282,6 +2520,12 @@
             "Cooldown increased from 150s to 160s (moved to T2)"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/yamato_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/yamato_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/yamato_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/yamato_sm.png"
       ]
     },
     {
@@ -2314,7 +2558,13 @@
           ]
         }
       ],
-      "mode_name": "Street Brawl"
+      "mode_name": "Street Brawl",
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/deadpack_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/deadpack_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/deadpack_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/deadpack_sm.png"
+      ]
     },
     {
       "kind": "hero",
@@ -2358,7 +2608,13 @@
           ]
         }
       ],
-      "mode_name": "Street Brawl"
+      "mode_name": "Street Brawl",
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_sm.png"
+      ]
     },
     {
       "kind": "hero",
@@ -2389,7 +2645,13 @@
           ]
         }
       ],
-      "mode_name": "Street Brawl"
+      "mode_name": "Street Brawl",
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/bookworm_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/bookworm_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/bookworm_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/bookworm_sm.png"
+      ]
     },
     {
       "kind": "hero",
@@ -2435,7 +2697,13 @@
           ]
         }
       ],
-      "mode_name": "Street Brawl"
+      "mode_name": "Street Brawl",
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/ratking_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/ratking_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/ratking_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/ratking_sm.png"
+      ]
     },
     {
       "kind": "hero",
@@ -2467,7 +2735,13 @@
           ]
         }
       ],
-      "mode_name": "Street Brawl"
+      "mode_name": "Street Brawl",
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/artist_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/artist_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/artist_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/artist_sm.png"
+      ]
     }
   ]
 }

@@ -233,6 +233,7 @@ export function CaptainProfileTab({
                   alt=""
                   fill
                   heroName={hero.name}
+                  imageCandidates={hero.imageCandidates}
                   imageUrl={hero.imageUrl}
                   sizes="120px"
                 />
@@ -336,6 +337,7 @@ export function CaptainProfileTab({
                               alt=""
                               fill
                               heroName={hero}
+                              imageCandidates={heroOptions.find((option) => option.name === hero)?.imageCandidates}
                               imageUrl={heroOptions.find((option) => option.name === hero)?.imageUrl}
                               sizes="78px"
                             />

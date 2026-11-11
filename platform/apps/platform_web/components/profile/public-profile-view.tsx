@@ -27,7 +27,7 @@ const contactCopyLabels: Record<string, string> = {
   "Регион": "Скопировать регион"
 };
 
-export function PublicProfileView({ profile, heroOptions = [] }: { profile: PlayerProfile; heroOptions?: Array<{ name: string; imageUrl: string | null }> }) {
+export function PublicProfileView({ heroOptions = [], profile }: { profile: PlayerProfile; heroOptions?: Array<{ name: string; imageUrl: string | null; imageCandidates?: string[] }> }) {
   const [copiedContact, setCopiedContact] = useState<string | null>(null);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -110,6 +110,7 @@ export function PublicProfileView({ profile, heroOptions = [] }: { profile: Play
                       fill
                       heroName={hero}
                       imageUrl={heroOptions.find((option) => option.name === hero)?.imageUrl}
+                      imageCandidates={heroOptions.find((option) => option.name === hero)?.imageCandidates}
                       sizes="96px"
                     />
                     <span>{hero}</span>

@@ -83,13 +83,27 @@
       "path": "sections[hero=Solomon].abilities[Move Piece].display_name",
       "catalog_class_name": "ability_chessmaster_movechesspiece",
       "display_name": "Ход фигурой"
+    },
+    {
+      "patch_ids": [
+        "1846651706696737",
+        "1847920302240420",
+        "1848664643339845",
+        "1848664643342973"
+      ],
+      "path": "sections[kind=hero].hero_image_candidates",
+      "hero_sections": 47,
+      "remote_candidate_urls": 188,
+      "max_candidates": 4,
+      "primary_first_and_deduplicated": true,
+      "source": "actual bounded catalog fetch and public patch detail projection"
     }
   ],
   "renderer_fixtures": {
-    "1846651706696737": "ce37f05e3cd820d976b67b54ab8f45ef3e977fbfb49427b108980bb933487da6",
-    "1847920302240420": "59684991847b42d9e2509adc0df936c1cf0a0b2a6f8e8d7ecf8f5772803b3eee",
-    "1848664643339845": "6db61a6999f445547ef006c081b9940b1a760ec7c32711ce919a898bed838fab",
-    "1848664643342973": "aaa141e4ce47a51de440bee9acde15fe757a61cf30be452448239d54a966eb13"
+    "1846651706696737": "7a238716e178175b455b6aed62d33c84f69ea600de252783da50c334b3a786d7",
+    "1847920302240420": "28a058b28803db0021736ee0209775a3ef0635259e26ad124207db82b29302f8",
+    "1848664643339845": "35cd23b9343e5ec76a26aa0709d18ebbef4a9dd581b2faa3c14b0b8a548416af",
+    "1848664643342973": "7e17f338f1e74c96a537ba100e59aafab2c6c4f73ac9abd6a678a9828507315d"
   },
   "schema": 1,
   "source_news_fixture": {

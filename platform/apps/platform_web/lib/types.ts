@@ -191,6 +191,7 @@ export type HeroOption = {
   name: string;
   theme: string;
   imageUrl?: string | null;
+  imageCandidates?: string[];
 };
 
 export type ContactField = {

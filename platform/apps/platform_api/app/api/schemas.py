@@ -54,7 +54,16 @@ class DeadlockGameAssetResponse(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     draft_id: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
     image_url: str = Field(min_length=1, max_length=1000)
+    image_candidates: list[str] = Field(default_factory=list, max_length=4)
     source_available: bool = True
+
+    @model_validator(mode="after")
+    def validate_image_candidates(self) -> "DeadlockGameAssetResponse":
+        if self.image_candidates and self.image_url != self.image_candidates[0]:
+            raise ValueError("Hero image_url must match the first image candidate.")
+        if len(set(self.image_candidates)) != len(self.image_candidates):
+            raise ValueError("Hero image candidates must be unique.")
+        return self
 
 
 class DeadlockGameAssetsResponse(BaseModel):
@@ -84,6 +93,7 @@ class PatchSectionResponse(BaseModel):
     hero_name: str | None = Field(default=None, max_length=80)
     hero_display_name: str | None = Field(default=None, max_length=120)
     hero_image_url: str | None = Field(default=None, max_length=1000)
+    hero_image_candidates: list[str] = Field(default_factory=list, max_length=4)
     hero_presentation_kind: Literal["balance", "introduction"] | None = None
     mode_name: str | None = Field(default=None, max_length=80)
     hero_description: str | None = Field(default=None, max_length=8000)
@@ -101,6 +111,10 @@ class PatchSectionResponse(BaseModel):
         if self.kind == "hero":
             if self.hero_name is None:
                 raise ValueError("Hero patch sections require hero_name.")
+            if self.hero_image_candidates and self.hero_image_url != self.hero_image_candidates[0]:
+                raise ValueError("Hero image URL must match the first candidate.")
+            if len(set(self.hero_image_candidates)) != len(self.hero_image_candidates):
+                raise ValueError("Hero image candidates must be unique.")
             if any(
                 value is not None
                 for value in (
@@ -126,6 +140,7 @@ class PatchSectionResponse(BaseModel):
                     self.hero_name,
                     self.hero_display_name,
                     self.hero_image_url,
+                    self.hero_image_candidates or None,
                     self.hero_description,
                     self.objective_key,
                     self.objective_icon_url,
@@ -143,6 +158,7 @@ class PatchSectionResponse(BaseModel):
                     self.hero_name,
                     self.hero_display_name,
                     self.hero_image_url,
+                    self.hero_image_candidates or None,
                     self.hero_description,
                     self.item_name,
                     self.item_category,
@@ -158,6 +174,7 @@ class PatchSectionResponse(BaseModel):
                 self.hero_name,
                 self.hero_display_name,
                 self.hero_image_url,
+                self.hero_image_candidates or None,
                 self.hero_description,
                 self.item_name,
                 self.item_category,

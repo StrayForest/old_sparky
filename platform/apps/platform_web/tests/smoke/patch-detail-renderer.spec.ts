@@ -132,6 +132,11 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
   ))).toEqual(expect.arrayContaining(["missing_street_brawl_owner", "move_piece_owner"]));
   const fixturesById = new Map(fixtures.map((fixture) => [fixture.id, fixture]));
   const artifactDirectory = process.env.PLATFORM_PATCH_RENDER_ARTIFACT_DIR;
+  const alternateNurseImage = "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse-card-alternate.png";
+  const missingNurseImage = "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse-card-missing.webp";
+  const alternateImageBytes = await readFile(path.join(process.cwd(), "public", "assets", "heroes", "Abrams.png"));
+  let missingNurseImageRequests = 0;
+  let alternateNurseImageRequests = 0;
 
   await page.route("**/api/v1/content/patches/*", async (route) => {
     const requestId = new URL(route.request().url()).pathname.split("/").at(-1);
@@ -140,7 +145,29 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
       await route.continue();
       return;
     }
-    await route.fulfill({ status: 200, contentType: "application/json", json: fixture });
+    const renderedFixture = requestId === nurseIntroductionPatchId
+      ? {
+        ...fixture,
+        sections: fixture.sections.map((section) => (
+          section.kind === "hero" && section.hero_name === "Nurse Harrow"
+            ? {
+              ...section,
+              hero_image_url: missingNurseImage,
+              hero_image_candidates: [missingNurseImage, alternateNurseImage],
+            }
+            : section
+        )),
+      }
+      : fixture;
+    await route.fulfill({ status: 200, contentType: "application/json", json: renderedFixture });
+  });
+  await page.route(missingNurseImage, async (route) => {
+    missingNurseImageRequests += 1;
+    await route.fulfill({ status: 404, contentType: "text/plain", body: "missing primary image" });
+  });
+  await page.route(alternateNurseImage, async (route) => {
+    alternateNurseImageRequests += 1;
+    await route.fulfill({ status: 200, contentType: "image/png", body: alternateImageBytes });
   });
 
   let capturedCeleste = false;
@@ -305,6 +332,9 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
         await expect.poll(() => nurseCard.locator(".patch-hero-image").evaluate((image) => (
           (image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth > 0
         ))).toBe(true);
+        await expect(nurseCard.locator(".patch-hero-image")).toHaveAttribute("src", alternateNurseImage);
+        expect(missingNurseImageRequests).toBe(1);
+        expect(alternateNurseImageRequests).toBe(1);
         expect(nurse.abilities.every((ability) => ability.presentation_kind === "introduction")).toBe(true);
         expect(nurse.abilities.every((ability) => Boolean(ability.description?.trim()))).toBe(true);
         expect(nurse.abilities.reduce((sum, ability) => sum + (ability.stats?.length ?? 0), 0)).toBe(67);

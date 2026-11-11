@@ -10,7 +10,7 @@ from pathlib import Path
 import re
 from secrets import token_urlsafe
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 from xml.etree import ElementTree
 
 import httpx
@@ -37,7 +37,7 @@ DEADLOCK_ASSET_BASE_URL = "https://deadlock.io"
 HOME_CONTENT_KEY = "platform:home-content:v4"
 HOME_CONTENT_STALE_KEY = "platform:home-content:stale:v4"
 HOME_CONTENT_LOCK_KEY = "platform:home-content:refresh-lock:v4"
-PATCH_DETAIL_KEY_PREFIX = "platform:home-content:patch:v15:"
+PATCH_DETAIL_KEY_PREFIX = "platform:home-content:patch:v16:"
 PATCH_ASSET_CATALOG_KEY = "platform:home-content:patch-assets:v9"
 PATCH_ASSET_CATALOG_STALE_KEY = "platform:home-content:patch-assets-stale:v3"
 PATCH_ASSET_PENDING_RETRY_KEY = "platform:home-content:patch-assets-pending-retry:v1"
@@ -46,6 +46,8 @@ PATCH_DETAIL_TTL_SECONDS = 30 * 24 * 60 * 60
 PATCH_ASSET_CATALOG_TTL_SECONDS = 6 * 60 * 60
 PATCH_ASSET_CATALOG_STALE_TTL_SECONDS = 30 * 24 * 60 * 60
 PATCH_ASSET_PENDING_RETRY_SECONDS = 5 * 60
+HERO_IMAGE_CANDIDATES_VERSION = 1
+MAX_HERO_IMAGE_CANDIDATES = 4
 REFRESH_LOCK_SECONDS = 30
 HOME_PATCH_LIMIT = 4
 HOME_VIDEO_LIMIT = 4
@@ -265,6 +267,114 @@ def _https_url(
     if hosts is not None and host not in hosts:
         raise ValueError("External content URL host is not allowed.")
     return normalized[:1000]
+
+
+def _validated_hero_image_url(value: Any) -> str | None:
+    """Accept only bounded raster URLs on the known Deadlock image CDN."""
+    try:
+        normalized = _https_url(value, hosts=("assets-bucket.deadlock-api.com",))
+    except ValueError:
+        return None
+    parsed = urlparse(normalized)
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    decoded_path = unquote(parsed.path)
+    if (
+        parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.query
+        or parsed.fragment
+        or not decoded_path.startswith("/")
+        or any(part in {".", ".."} for part in decoded_path.split("/"))
+        or any(character in decoded_path for character in ("\\", "\x00"))
+        or not parsed.path.lower().endswith((".png", ".webp", ".jpg", ".jpeg", ".avif"))
+    ):
+        return None
+    return normalized
+
+
+def _hero_image_candidates(
+    hero: dict[str, Any] | None,
+    *,
+    supplemental_images: dict[str, Any] | None = None,
+    previous_candidates: list[Any] | None = None,
+) -> list[str]:
+    """Return the current source first, then distinct known alternates, capped at four."""
+    source_values: list[Any] = []
+    if isinstance(hero, dict):
+        source_values.extend((hero.get("hero_image_url"), hero.get("icon_url")))
+    source_values.extend(previous_candidates or [])
+    if isinstance(hero, dict):
+        previous = hero.get("hero_image_candidates")
+        if isinstance(previous, list):
+            source_values.extend(previous)
+    images = supplemental_images if isinstance(supplemental_images, dict) else {}
+    source_values.extend(
+        images.get(key)
+        for key in (
+            "icon_hero_card_webp",
+            "icon_hero_card",
+            "icon_image_small_webp",
+            "icon_image_small",
+        )
+    )
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in source_values:
+        candidate = _validated_hero_image_url(value)
+        if candidate is None or candidate in seen:
+            continue
+        seen.add(candidate)
+        result.append(candidate)
+        if len(result) == MAX_HERO_IMAGE_CANDIDATES:
+            break
+    return result
+
+
+def _asset_catalog_has_current_hero_image_candidates(catalog: Any) -> bool:
+    return (
+        isinstance(catalog, dict)
+        and type(catalog.get("hero_image_candidates_version")) is int
+        and catalog.get("hero_image_candidates_version") == HERO_IMAGE_CANDIDATES_VERSION
+        and not catalog.get("hero_image_candidates_pending")
+    )
+
+
+def _previous_hero_image_candidates(
+    previous_heroes: dict[str, Any],
+    *,
+    hero_name: str,
+    hero_slug: str,
+    hero_id: Any,
+) -> list[Any]:
+    canonical_name = hero_name.casefold()
+    previous_hero = next(
+        (
+            value
+            for value in previous_heroes.values()
+            if isinstance(value, dict)
+            and (
+                str(value.get("name") or "").casefold() == canonical_name
+                or _normalize_hero_slug(value.get("slug")) == hero_slug
+                or (
+                    hero_id is not None
+                    and str(value.get("id") or value.get("hero_id") or "")
+                    == str(hero_id)
+                )
+            )
+        ),
+        None,
+    )
+    if not isinstance(previous_hero, dict):
+        return []
+    candidates = [previous_hero.get("hero_image_url"), previous_hero.get("icon_url")]
+    previous_list = previous_hero.get("hero_image_candidates")
+    if isinstance(previous_list, list):
+        candidates.extend(previous_list)
+    return candidates
 
 
 def _patch_lines(content: str) -> list[str]:
@@ -492,6 +602,11 @@ def _build_asset_catalog(
     heroes: dict[str, Any] = {}
     primary_heroes_by_slug: dict[str, dict[str, Any]] = {}
     primary_heroes_by_id: dict[str, dict[str, Any]] = {}
+    previous_heroes = (
+        previous_catalog.get("heroes")
+        if isinstance(previous_catalog, dict) and isinstance(previous_catalog.get("heroes"), dict)
+        else {}
+    )
     for hero in hero_payload.get("heroes") or []:
         display_name = str((hero.get("displayName") or {}).get("english") or "").strip()
         if not display_name:
@@ -545,6 +660,7 @@ def _build_asset_catalog(
             ),
             "abilities": abilities,
         }
+        hero_value["hero_image_candidates"] = _hero_image_candidates(hero_value)
         heroes[display_name.lower()] = hero_value
         source_slug = _normalize_hero_slug(hero.get("slug"))
         if source_slug:
@@ -617,12 +733,27 @@ def _build_asset_catalog(
                 else None
             )
         )
+        images = hero.get("images") if isinstance(hero.get("images"), dict) else {}
+        previous_candidates = _previous_hero_image_candidates(
+            previous_heroes,
+            hero_name=canonical_name,
+            hero_slug=source_slug,
+            hero_id=source_id,
+        )
         if existing is not None:
             if isinstance(hero.get("id"), int) and hero["id"] > 0:
                 existing.setdefault("id", hero["id"])
             if class_name:
                 existing.setdefault("class_name", class_name)
                 existing.setdefault("source", "deadlock-api")
+            image_candidates = _hero_image_candidates(
+                existing,
+                supplemental_images=images,
+                previous_candidates=previous_candidates,
+            )
+            existing["hero_image_candidates"] = image_candidates
+            if image_candidates:
+                existing["hero_image_url"] = image_candidates[0]
             if isinstance(localized_hero, dict):
                 localized_description = localized_hero.get("description")
                 russian_lore = _plain_text(
@@ -636,14 +767,6 @@ def _build_asset_catalog(
                 )
                 lore = russian_lore or english_lore
                 localized_name = str(localized_hero.get("name") or "").strip()
-                images = hero.get("images") if isinstance(hero.get("images"), dict) else {}
-                try:
-                    image_url = _https_url(
-                        images.get("icon_hero_card_webp") or images.get("icon_hero_card"),
-                        host_suffixes=DEADLOCK_API_ASSET_HOST_SUFFIXES,
-                    )
-                except ValueError:
-                    image_url = None
                 if localized_name:
                     existing["display_name"] = localized_name
                 if lore:
@@ -651,8 +774,6 @@ def _build_asset_catalog(
                     existing["description_requires_translation"] = bool(
                         english_lore and not russian_lore
                     )
-                if image_url:
-                    existing["hero_image_url"] = image_url
                 existing["hero_id"] = hero.get("id")
                 existing["russian_metadata_available"] = bool(localized_name and russian_lore)
             _merge_hero_abilities(
@@ -675,17 +796,6 @@ def _build_asset_catalog(
             supplemental_hero_class_names=supplemental_hero_class_names,
         )
         images = hero.get("images") if isinstance(hero.get("images"), dict) else {}
-        icon_url = None
-        for image_key in ("icon_hero_card_webp", "icon_hero_card", "icon_image_small_webp", "icon_image_small"):
-            try:
-                icon_url = _https_url(
-                    images.get(image_key),
-                    host_suffixes=DEADLOCK_API_ASSET_HOST_SUFFIXES,
-                )
-            except ValueError:
-                continue
-            if icon_url:
-                break
         localized_description = (
             localized_hero.get("description") if isinstance(localized_hero, dict) else None
         )
@@ -715,20 +825,28 @@ def _build_asset_catalog(
             "russian_metadata_available": bool(localized_name and russian_lore),
             "slug": source_slug,
             "source": "deadlock-api",
-            "icon_url": icon_url,
-            "hero_image_url": icon_url,
+            "icon_url": None,
+            "hero_image_url": None,
             "abilities": abilities,
         }
+        hero_value["hero_image_candidates"] = _hero_image_candidates(
+            hero_value,
+            supplemental_images=images,
+            previous_candidates=_previous_hero_image_candidates(
+                previous_heroes,
+                hero_name=canonical_name,
+                hero_slug=source_slug,
+                hero_id=hero_id,
+            ),
+        )
+        if hero_value["hero_image_candidates"]:
+            hero_value["hero_image_url"] = hero_value["hero_image_candidates"][0]
+            hero_value["icon_url"] = hero_value["hero_image_candidates"][0]
         heroes[canonical_key] = hero_value
         if canonical_key in {"doorman", "the doorman"}:
             heroes["doorman"] = hero_value
             heroes["the doorman"] = hero_value
 
-    previous_heroes = (
-        previous_catalog.get("heroes")
-        if isinstance(previous_catalog, dict) and isinstance(previous_catalog.get("heroes"), dict)
-        else {}
-    )
     for previous_key, previous_hero in (
         previous_heroes.items() if not supplemental_sources_available else ()
     ):
@@ -794,11 +912,22 @@ def _build_asset_catalog(
             "tier": tier,
             "icon_url": safe_image_url,
         }
+    hero_candidates_pending = not supplemental_sources_available or any(
+        isinstance(hero, dict)
+        and hero.get("source") == "deadlock-api"
+        and not hero.get("hero_image_candidates")
+        and _bundled_hero_image_path(str(hero.get("name") or "")) is None
+        for hero in {id(value): value for value in heroes.values()}.values()
+    )
     return {
         "heroes": heroes,
         "items": items,
         "ranks": ranks,
         "objectives": _objective_catalog(icon_payload, previous_catalog),
+        "hero_image_candidates_version": (
+            HERO_IMAGE_CANDIDATES_VERSION if supplemental_sources_available else None
+        ),
+        "hero_image_candidates_pending": bool(hero_candidates_pending),
     }
 
 
@@ -1400,6 +1529,9 @@ def public_deadlock_game_assets(catalog: dict[str, Any]) -> dict[str, Any]:
                 "name": name,
                 "draft_id": _public_draft_hero_id(name, catalog),
                 "image_url": _public_hero_image_url(heroes_by_name.get(name.casefold()), name),
+                "image_candidates": _hero_image_candidates(
+                    heroes_by_name.get(name.casefold())
+                ),
                 "source_available": bool(
                     name.casefold() in unique_heroes
                     and _public_hero_image_url(heroes_by_name.get(name.casefold()), name)
@@ -1462,14 +1594,16 @@ def resolve_deadlock_hero_image(catalog: dict[str, Any], hero_name: str) -> str 
 def _public_hero_image_url(hero: dict[str, Any] | None, hero_name: str) -> str:
     """Use the validated current asset CDN, then a bundled legacy image, then placeholder."""
     if isinstance(hero, dict):
-        for candidate in (hero.get("hero_image_url"), hero.get("icon_url")):
-            try:
-                return _https_url(
-                    candidate,
-                    host_suffixes=DEADLOCK_API_ASSET_HOST_SUFFIXES,
-                )
-            except ValueError:
-                continue
+        candidates = _hero_image_candidates(hero)
+        if candidates:
+            return candidates[0]
+    bundled = _bundled_hero_image_path(hero_name)
+    if bundled is not None:
+        return f"/assets/heroes/{bundled.name}"
+    return "/assets/heroes/placeholder.svg"
+
+
+def _bundled_hero_image_path(hero_name: str) -> Path | None:
     canonical_name = "The Doorman" if hero_name.casefold() == "doorman" else hero_name
     static_name = canonical_name.replace(" ", "_")
     static_path = (
@@ -1477,9 +1611,7 @@ def _public_hero_image_url(hero: dict[str, Any] | None, hero_name: str) -> str:
         / "apps/platform_web/public/assets/heroes"
         / f"{static_name}.png"
     )
-    if static_path.is_file():
-        return f"/assets/heroes/{static_name}.png"
-    return "/assets/heroes/placeholder.svg"
+    return static_path if static_path.is_file() else None
 
 
 def resolve_deadlock_rank_image(catalog: dict[str, Any], rank_name: str) -> str | None:
@@ -1547,7 +1679,11 @@ def _structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dic
                     "title": str(hero.get("name") or matched_hero_alias.title()),
                     "hero_name": str(hero.get("name") or matched_hero_alias.title()),
                     "hero_display_name": hero.get("display_name"),
-                    "hero_image_url": hero.get("hero_image_url") or hero.get("icon_url"),
+                    "hero_image_url": _public_hero_image_url(
+                        hero,
+                        str(hero.get("name") or matched_hero_alias.title()),
+                    ),
+                    "hero_image_candidates": _hero_image_candidates(hero),
                     "hero_description": hero.get("description"),
                     "changes": [],
                     "abilities": [],

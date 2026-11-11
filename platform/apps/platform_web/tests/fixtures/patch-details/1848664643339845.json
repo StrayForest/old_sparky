@@ -23,7 +23,8 @@
       "changes": [
         "Stacks now diminish 20% more aggressively (at 2 stacks 57.8%->54.7%, at 4 stacks 82.2% to 72%)"
       ],
-      "abilities": []
+      "abilities": [],
+      "hero_image_candidates": []
     },
     {
       "kind": "hero",
@@ -67,6 +68,12 @@
             "T3 bonus damage increased from +50% to +60%"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/fencer_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/fencer_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/fencer_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/fencer_sm.png"
       ]
     },
     {
@@ -115,6 +122,12 @@
             "Debuff Resist reduced from 30% to 25%"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/baba_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/baba_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/baba_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/baba_sm.png"
       ]
     },
     {
@@ -174,6 +187,12 @@
             "T2 bonus damage reduced from +90 to +80"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/unicorn_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/unicorn_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/unicorn_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/unicorn_sm.png"
       ]
     },
     {
@@ -229,6 +248,12 @@
             "T2 heal spirit scaling reduced from 2.0 to 1.7"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/deadpack_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/deadpack_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/deadpack_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/deadpack_sm.png"
       ]
     },
     {
@@ -295,6 +320,12 @@
             "Health per kill increased from 40 to 50"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/digger_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/digger_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/digger_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/digger_sm.png"
       ]
     },
     {
@@ -328,6 +359,12 @@
             "Fear buildup time reduced from 2s to 1.75s"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_sm.png"
       ]
     },
     {
@@ -374,6 +411,12 @@
             "T1 now also reduces cooldown by -25s"
           ]
         }
+      ],
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/ratking_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/ratking_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/ratking_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/ratking_sm.png"
       ]
     }
   ]

@@ -51,14 +51,20 @@ export async function getServerProfileBootstrap(
 type GameAssetsCache = {
   checkedAt: number;
   etag: string;
-  heroes: Array<{ name: string; imageUrl: string | null }>;
+  heroes: ProfileHeroOption[];
+};
+
+type ProfileHeroOption = {
+  name: string;
+  imageUrl: string | null;
+  imageCandidates?: string[];
 };
 
 const gameAssetsCheckIntervalMs = 15 * 60 * 1000;
 let gameAssetsCache: GameAssetsCache | null = null;
-let gameAssetsRequest: Promise<Array<{ name: string; imageUrl: string | null }>> | null = null;
+let gameAssetsRequest: Promise<ProfileHeroOption[]> | null = null;
 
-export async function getServerProfileHeroOptions(): Promise<Array<{ name: string; imageUrl: string | null }>> {
+export async function getServerProfileHeroOptions(): Promise<ProfileHeroOption[]> {
   const now = Date.now();
   if (gameAssetsCache && now - gameAssetsCache.checkedAt < gameAssetsCheckIntervalMs) {
     return gameAssetsCache.heroes.map((hero) => ({ ...hero }));
@@ -85,7 +91,7 @@ export async function getServerProfileHeroOptions(): Promise<Array<{ name: strin
   return request;
 }
 
-async function fetchGameAssetOptions(staleHeroes?: Array<{ name: string; imageUrl: string | null }>): Promise<Array<{ name: string; imageUrl: string | null }>> {
+async function fetchGameAssetOptions(staleHeroes?: ProfileHeroOption[]): Promise<ProfileHeroOption[]> {
   try {
     const headers = new Headers({ accept: "application/json" });
     if (gameAssetsCache?.etag) {
@@ -104,9 +110,16 @@ async function fetchGameAssetOptions(staleHeroes?: Array<{ name: string; imageUr
       return rememberGameAssetFallback(staleHeroes);
     }
     const payload = (await response.json()) as PlatformDeadlockGameAssets;
-    const known = new Map(payload.heroes.map((hero) => [hero.name, hero.image_url]));
+    const known = new Map(payload.heroes.map((hero) => [hero.name, hero]));
     const heroes = mergeHeroNames(payload.heroes.map((hero) => hero.name), deadlockHeroes)
-      .map((name) => ({ name, imageUrl: known.get(name) ?? null }));
+      .map((name) => {
+        const hero = known.get(name);
+        return {
+          name,
+          imageUrl: hero?.image_url ?? null,
+          imageCandidates: hero?.image_candidates?.filter((candidate): candidate is string => typeof candidate === "string")
+        };
+      });
     gameAssetsCache = {
       checkedAt: Date.now(),
       etag: response.headers.get("etag")?.trim() ?? "",
@@ -118,7 +131,7 @@ async function fetchGameAssetOptions(staleHeroes?: Array<{ name: string; imageUr
   }
 }
 
-function rememberGameAssetFallback(staleHeroes?: Array<{ name: string; imageUrl: string | null }>): Array<{ name: string; imageUrl: string | null }> {
+function rememberGameAssetFallback(staleHeroes?: ProfileHeroOption[]): ProfileHeroOption[] {
   const heroes = staleHeroes ? staleHeroes.map((hero) => ({ ...hero })) : deadlockHeroes.map((name) => ({ name, imageUrl: null }));
   gameAssetsCache = {
     checkedAt: Date.now(),
