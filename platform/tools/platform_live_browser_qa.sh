@@ -297,12 +297,20 @@ COUNT_DIAGNOSTIC_ARGS=()
 if (( TRUSTED_MODE == 1 )); then
   COUNT_DIAGNOSTIC_ARGS+=(--persist-failure-report --fail-on-failure-counts)
 fi
+# The trusted launch supervisor reserves FD 3 for the bounded count/status
+# protocol. A direct public-runner invocation has no such channel, and its
+# dynamically assigned QA lock may itself occupy FD 3; keep the lock open and
+# publish the same closed count record on stdout in either case.
+COUNT_REPORT_FD=3
+if [[ "${PLATFORM_LIVE_QA_LOCK_FD:-}" == "3" ]] || ! { : >&3; } 2>/dev/null; then
+  COUNT_REPORT_FD=1
+fi
 if "${GUARD[@]}" emit-public-browser-counts \
   --gate "$BROWSER_GATE" \
   --source-sha "$LIVE_QA_RUNNER_SHA" \
   --app-sha "$LIVE_QA_TARGET_SHA" \
   --marker-sha256 "$LIVE_QA_MARKER_SHA256" \
-  "${COUNT_DIAGNOSTIC_ARGS[@]}" >&3; then
+  "${COUNT_DIAGNOSTIC_ARGS[@]}" >&"$COUNT_REPORT_FD"; then
   count_status=0
 else
   count_status=$?

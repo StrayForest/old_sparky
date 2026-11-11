@@ -2316,7 +2316,14 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 "run_status=passed logical_total=54 logical_pass=48 logical_fail=0",
             ).replace("attempt_pass=47 attempt_fail=1", "attempt_pass=48 attempt_fail=0")
             count_tail = browser_wrapper[browser_wrapper.index("count_status=0\nCOUNT_DIAGNOSTIC_ARGS=()"):]
-            def run_count_tail(status: int, count_line: str, *, browser_exit: int = 0, preflight: bool = False):
+            def run_count_tail(
+                status: int,
+                count_line: str,
+                *,
+                browser_exit: int = 0,
+                preflight: bool = False,
+                fd3_mode: str = "report",
+            ):
                 fake_guard = fixture / f"guard-{status}-{browser_exit}-{int(preflight)}"
                 fake_guard.write_text(
                     "#!/bin/sh\n"
@@ -2346,7 +2353,13 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                         "diagnostic_truncated=false",
                         f"diagnostic_child_exit={browser_exit}",
                         f"GUARD=({shlex.quote(str(fake_guard))})",
-                        "exec 3>\"$COUNT_OUTPUT\"",
+                        *(
+                            ["exec 3>\"$COUNT_OUTPUT\"", "PLATFORM_LIVE_QA_LOCK_FD=3"]
+                            if fd3_mode == "lock"
+                            else ["PLATFORM_LIVE_QA_LOCK_FD=4"]
+                            if fd3_mode == "closed"
+                            else ["exec 3>\"$COUNT_OUTPUT\""]
+                        ),
                         *(preflight_block.splitlines() if preflight else []),
                         count_tail,
                     )
@@ -2373,6 +2386,20 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             self.assertNotIn("LIVE_BROWSER_QA_SUCCESS", persisted_failure.stdout)
             self.assertNotIn("failure_report_unavailable", persisted_failure.stdout)
             self.assertEqual(persisted_counts.read_text(encoding="ascii"), failed_counts_line + "\n")
+
+            direct_lock_fd, lock_fd_output = run_count_tail(
+                0, passing_counts_line, fd3_mode="lock"
+            )
+            self.assertEqual(direct_lock_fd.returncode, 0)
+            self.assertIn(passing_counts_line + "\n", direct_lock_fd.stdout)
+            self.assertEqual(lock_fd_output.read_text(encoding="ascii"), "")
+
+            direct_closed_fd, _unused_count_file = run_count_tail(
+                0, passing_counts_line, fd3_mode="closed"
+            )
+            self.assertEqual(direct_closed_fd.returncode, 0)
+            self.assertIn(passing_counts_line + "\n", direct_closed_fd.stdout)
+            self.assertNotIn("Bad file descriptor", direct_closed_fd.stderr)
 
             unavailable_failure, unavailable_counts = run_count_tail(42, failed_counts_line)
             self.assertEqual(unavailable_failure.returncode, 1)

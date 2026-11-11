@@ -618,9 +618,12 @@ async function getHeroRoster(env) {
     try {
       const response = await fetch(endpoint, {
         headers: { accept: "application/json" },
-        redirect: "error",
+        redirect: "manual",
         signal: AbortSignal.timeout(2500),
       });
+      if (response.status >= 300 && response.status < 400) {
+        throw new Error("hero catalog redirect refused");
+      }
       if (!response.ok) throw new Error("hero catalog unavailable");
       const payload = await readBoundedJson(response, 1_048_576);
       const heroes = normalizeGameAssetRoster(payload?.heroes);

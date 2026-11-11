@@ -31,6 +31,13 @@ The browser reads immutable optimized hero thumbnails from:
 
 Generate/upload those objects with `platform/tools/sync_draft_hero_assets.py` before first production publication.
 
+The Worker refreshes the selectable roster from the public
+`/api/v1/content/game-assets` endpoint and caches it for five minutes. It only
+accepts the configured HTTPS origin and path, requests with manual redirect
+handling, and rejects redirects before reading a response body. If the source
+is unavailable, it uses the bundled roster; newly created rooms pin the roster
+they received, while existing room rosters stay unchanged.
+
 ## Advertising
 
 The static page uses the existing AdSense publisher `ca-pub-7185165276065459`, matching the root `ads.txt`. Ad placement is kept outside the hero grid/action controls. If explicit ad-unit slots are later preferred over Auto Ads, configure them without changing room/runtime state.

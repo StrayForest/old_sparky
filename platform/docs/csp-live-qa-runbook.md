@@ -328,6 +328,12 @@ PLAYWRIGHT_LIVE_BASE_URL=https://old-sparky.com \
 platform/tools/platform_live_browser_qa.sh public
 ```
 
+The browser runner reserves FD 3 only when invoked by the trusted launch
+supervisor for its bounded count/status protocol. A direct public-runner call
+keeps its dynamically assigned QA lock descriptor untouched and writes the
+same sanitized count record to stdout; redirect stdout and stderr together if
+retaining a local run log.
+
 The supervisor consumes the already-installed, root-owned immutable runtime
 under `/root/.oldsparky/liveqa/releases/<source-commit>/runtime`. The release
 builder obtains the pinned official Node 26 executable, lock-installed

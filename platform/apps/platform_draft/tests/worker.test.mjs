@@ -125,8 +125,10 @@ test("game-assets roster is cached, falls back to the last source, and is pinned
   const originalNow = Date.now;
   const startedAt = originalNow();
   let fetchCount = 0;
-  globalThis.fetch = async (input) => {
+  let lastFetchOptions = null;
+  globalThis.fetch = async (input, options) => {
     fetchCount += 1;
+    lastFetchOptions = options;
     assert.equal(new URL(input).href, "https://old-sparky.com/api/v1/content/game-assets");
     return new Response(JSON.stringify({
       heroes: [
@@ -170,6 +172,7 @@ test("game-assets roster is cached, falls back to the last source, and is pinned
       { id: "hero_future", name: "Future Hero" }
     ]);
     assert.equal(fetchCount, 1);
+    assert.equal(lastFetchOptions.redirect, "manual");
 
     const created = await createRoom(
       { presetId: "standard", timerSeconds: 30 },
@@ -196,6 +199,26 @@ test("game-assets roster is cached, falls back to the last source, and is pinned
     );
     assert.equal(nextRoom.response.status, 201);
     assert.deepEqual(environment.created[1].heroRoster, roster.heroes);
+
+    Date.now = () => startedAt + 10 * 60 * 1000 + 2;
+    fetchCount = 0;
+    globalThis.fetch = async (input, options) => {
+      fetchCount += 1;
+      lastFetchOptions = options;
+      assert.equal(new URL(input).href, "https://old-sparky.com/api/v1/content/game-assets");
+      return new Response(null, {
+        status: 302,
+        headers: { location: "https://untrusted.example/catalog" }
+      });
+    };
+    const redirectResponse = await worker.fetch(
+      new Request("https://old-sparky.com/draft/api/heroes"),
+      environment.env
+    );
+    const redirectRoster = await redirectResponse.json();
+    assert.deepEqual(redirectRoster.heroes, roster.heroes);
+    assert.equal(fetchCount, 1);
+    assert.equal(lastFetchOptions.redirect, "manual");
   } finally {
     globalThis.fetch = originalFetch;
     Date.now = originalNow;
