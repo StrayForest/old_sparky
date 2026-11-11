@@ -37,6 +37,7 @@ from apps.platform_api.app.services.patch_translation_glossary import (
     get_translation_glossary,
 )
 from apps.platform_api.app.services.patch_translation_terms import (
+    ProtectedFactPlaceholderError,
     catalog_protected_terms,
     fact_fingerprint,
     localize_russian_notation,
@@ -1122,6 +1123,24 @@ async def _request_openai_with_budget(
                 glossary=glossary,
                 settings=settings,
                 fact_correction_ids=fact_correction_ids,
+            )
+    except ProtectedFactPlaceholderError:
+        if (
+            follow_up_kind is not None
+            or not call_budget.claim_follow_up("protected_fact_retry")
+        ):
+            raise
+        correction_ids = [str(segment["id"]) for segment in segments]
+        timeout_seconds = call_budget.begin_call(
+            follow_up_kind="protected_fact_retry"
+        )
+        async with asyncio.timeout(timeout_seconds):
+            return await _request_openai(
+                patch_id=patch_id,
+                segments=segments,
+                glossary=glossary,
+                settings=settings,
+                fact_correction_ids=correction_ids,
             )
     except Exception as error:
         if (

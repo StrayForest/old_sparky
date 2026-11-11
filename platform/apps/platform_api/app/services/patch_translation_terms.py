@@ -19,6 +19,10 @@ FACT_TOKEN_RE = re.compile(
 _DECIMAL_RE = re.compile(r"(?<![A-Za-z0-9])([+-]?\d+)\.(\d+)")
 
 
+class ProtectedFactPlaceholderError(ValueError):
+    """A model response changed an immutable numeric or tier placeholder."""
+
+
 def term_pattern(term: str) -> str:
     pieces = [
         re.escape(piece)
@@ -135,7 +139,9 @@ def validate_prepared_translation(source: str, translated: str) -> None:
     if Counter(FACT_PLACEHOLDER_RE.findall(source)) != Counter(
         FACT_PLACEHOLDER_RE.findall(translated)
     ):
-        raise ValueError("OpenAI changed a protected numeric/tier placeholder.")
+        raise ProtectedFactPlaceholderError(
+            "OpenAI changed a protected numeric/tier placeholder."
+        )
 
 
 def localize_russian_notation(text: str) -> str:

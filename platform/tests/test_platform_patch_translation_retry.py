@@ -162,6 +162,60 @@ class PatchTranslationRetryTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(budget.provider_calls, 3)
         self.assertEqual(budget.follow_up_kind, "fact_correction")
 
+    async def test_protected_numeric_placeholder_failure_gets_one_corrective_retry(self) -> None:
+        source = [{"id": "s000-c000", "text": "Cooldown is 10 seconds."}]
+        protected_text, fact_map = translation.protect_facts(source[0]["text"])
+        prepared = [{"id": "s000-c000", "text": protected_text}]
+        with self.assertRaises(runtime.ProtectedFactPlaceholderError):
+            runtime.validate_prepared_translation(
+                prepared[0]["text"], "Cooldown is [[FACT_0001]] seconds."
+            )
+        error = runtime.ProtectedFactPlaceholderError(
+            "OpenAI changed a protected numeric/tier placeholder."
+        )
+        request = AsyncMock(
+            side_effect=[error, {"s000-c000": "Перезарядка — [[FACT_0000]] секунд."}]
+        )
+        budget = runtime._TranslationProviderCallBudget()
+
+        with patch.object(runtime, "_request_openai", request):
+            translated = await runtime._request_openai_with_fact_correction(
+                patch_id="1847920302240420",
+                source_segments=source,
+                prepared_segments=prepared,
+                glossary={},
+                settings=PlatformSettings(),
+                entity_replacements={},
+                fact_replacements={"s000-c000": fact_map},
+                call_budget=budget,
+            )
+
+        self.assertEqual(translated, {"s000-c000": "Перезарядка — 10 секунд."})
+        self.assertEqual(request.await_count, 2)
+        self.assertEqual(request.await_args.kwargs["fact_correction_ids"], ["s000-c000"])
+        self.assertEqual(budget.provider_calls, 2)
+        self.assertEqual(budget.follow_up_kind, "protected_fact_retry")
+
+        shared_budget = runtime._TranslationProviderCallBudget()
+        shared_budget.begin_call()
+        shared_budget.begin_call(follow_up_kind="fact_correction")
+        blocked_request = AsyncMock(side_effect=error)
+        with (
+            patch.object(runtime, "_request_openai", blocked_request),
+            self.assertRaises(runtime.ProtectedFactPlaceholderError),
+        ):
+            await runtime._request_openai_with_budget(
+                call_budget=shared_budget,
+                patch_id="1847920302240420",
+                segments=prepared,
+                glossary={},
+                settings=PlatformSettings(),
+                fact_correction_ids=None,
+            )
+        self.assertEqual(blocked_request.await_count, 1)
+        self.assertEqual(shared_budget.follow_up_kind, "fact_correction")
+        self.assertEqual(shared_budget.provider_calls, 3)
+
     async def test_transient_retry_and_fact_correction_compete_for_same_slot(self) -> None:
         source_text = "Next Tuesday, October 20th at 2pm PDT."
         protected_text, fact_map = translation.protect_facts(source_text)
@@ -216,65 +270,85 @@ class PatchTranslationRetryTests(PlatformIsolatedAsyncioTestCase):
             for index in range(150)
         ]
         patch_detail = _patch_with_segments(source)
-        cache = SimpleNamespace(
-            set=AsyncMock(return_value=True),
-            eval=AsyncMock(return_value=1),
-            aclose=AsyncMock(),
-        )
-        first_batch_calls = 0
-        sibling_started = asyncio.Event()
-        sibling_cancelled = False
-
-        async def request(**kwargs):
-            nonlocal first_batch_calls, sibling_cancelled
-            ids = [segment["id"] for segment in kwargs["segments"]]
-            if ids[0] == "s000-c000":
-                first_batch_calls += 1
-                if first_batch_calls == 1:
-                    await asyncio.wait_for(sibling_started.wait(), timeout=1)
-                raise httpx.ReadTimeout("bounded test timeout")
-            sibling_started.set()
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                sibling_cancelled = True
-                raise
-
         settings = PlatformSettings(
             platform_openai_api_key="test-key",
             platform_openai_model="test-model",
         )
-        with (
-            patch.object(runtime, "get_cached_patch_translation", new=AsyncMock(return_value=None)),
-            patch.object(runtime, "redis_client", return_value=cache),
-            patch.object(
-                runtime,
-                "_claim_translation",
-                new=AsyncMock(return_value=(runtime.TRANSLATION_STATUS_PROCESSING, None)),
-            ) as claim,
-            patch.object(runtime, "get_translation_glossary", new=AsyncMock(return_value={})),
-            patch.object(runtime, "_request_openai", side_effect=request) as provider,
-            patch.object(runtime, "_persist_translation_completion", new=AsyncMock()) as persist,
-            patch.object(runtime, "_write_translation_cache", new=AsyncMock()) as cache_write,
-            patch.object(runtime, "_set_translation_failure", new=AsyncMock()) as mark_failed,
-        ):
-            result = await runtime.translate_patch_to_russian(
-                patch_detail,
-                {},
-                settings=settings,
-            )
 
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["status"], runtime.TRANSLATION_STATUS_FAILED)
-        self.assertEqual(first_batch_calls, 2)
-        self.assertEqual(provider.await_count, 3)
-        self.assertTrue(sibling_cancelled)
-        claim.assert_awaited_once()
-        persist.assert_not_awaited()
-        cache_write.assert_not_awaited()
-        mark_failed.assert_awaited_once()
-        cache.eval.assert_awaited_once()
-        cache.aclose.assert_awaited_once()
+        async def assert_atomic_failure(error: Exception) -> None:
+            cache = SimpleNamespace(
+                set=AsyncMock(return_value=True),
+                eval=AsyncMock(return_value=1),
+                aclose=AsyncMock(),
+            )
+            first_batch_calls = 0
+            sibling_started = asyncio.Event()
+            sibling_cancelled = False
+
+            async def request(**kwargs):
+                nonlocal first_batch_calls, sibling_cancelled
+                ids = [segment["id"] for segment in kwargs["segments"]]
+                if ids[0] == "s000-c000":
+                    first_batch_calls += 1
+                    if first_batch_calls == 1:
+                        await asyncio.wait_for(sibling_started.wait(), timeout=1)
+                    raise error
+                sibling_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    sibling_cancelled = True
+                    raise
+
+            with (
+                patch.object(
+                    runtime,
+                    "get_cached_patch_translation",
+                    new=AsyncMock(return_value=None),
+                ),
+                patch.object(runtime, "redis_client", return_value=cache),
+                patch.object(
+                    runtime,
+                    "_claim_translation",
+                    new=AsyncMock(
+                        return_value=(runtime.TRANSLATION_STATUS_PROCESSING, None)
+                    ),
+                ) as claim,
+                patch.object(
+                    runtime, "get_translation_glossary", new=AsyncMock(return_value={})
+                ),
+                patch.object(runtime, "_request_openai", side_effect=request) as provider,
+                patch.object(
+                    runtime, "_persist_translation_completion", new=AsyncMock()
+                ) as persist,
+                patch.object(runtime, "_write_translation_cache", new=AsyncMock()) as cache_write,
+                patch.object(runtime, "_set_translation_failure", new=AsyncMock()) as mark_failed,
+            ):
+                result = await runtime.translate_patch_to_russian(
+                    patch_detail,
+                    {},
+                    settings=settings,
+                )
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], runtime.TRANSLATION_STATUS_FAILED)
+            self.assertEqual(result["error"], type(error).__name__)
+            self.assertEqual(first_batch_calls, 2)
+            self.assertEqual(provider.await_count, 3)
+            self.assertTrue(sibling_cancelled)
+            claim.assert_awaited_once()
+            persist.assert_not_awaited()
+            cache_write.assert_not_awaited()
+            mark_failed.assert_awaited_once()
+            cache.eval.assert_awaited_once()
+            cache.aclose.assert_awaited_once()
+
+        await assert_atomic_failure(
+            runtime.ProtectedFactPlaceholderError(
+                "OpenAI changed a protected numeric/tier placeholder."
+            )
+        )
+        await assert_atomic_failure(httpx.ReadTimeout("bounded test timeout"))
 
     async def test_fact_mismatch_gets_one_correction_and_accepts_preserved_facts(
         self,
