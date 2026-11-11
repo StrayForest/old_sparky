@@ -50,6 +50,7 @@ MAX_RELEASE_JSON_BYTES = 64 * 1024
 # validating an artifact and must not import the live-QA runtime bootstrap just
 # to share one size constant.
 MAX_LIVE_QA_RUNTIME_MANIFEST_BYTES = 256 * 1024
+MAX_LIVE_QA_LAUNCH_SPEC_BYTES = 512 * 1024
 MAX_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_MEMBER_BYTES = 512 * 1024 * 1024
 MAX_EXPANDED_BYTES = 4 * 1024 * 1024 * 1024
@@ -688,12 +689,32 @@ def _validate_liveqa_runtime(
         "web/tests/support/live-qa-origin.ts",
         "web/tests/support/live-qa-sandbox.ts",
         "web/tests/support/live-count-reporter.cjs",
-        "web/tests/support/patch-acceptance.ts",
     )
     for relative in required:
         member = by_name.get(f"{prefix}/{relative}")
         if member is None or not member.isfile():
             raise ArtifactError(f"liveqa-runtime is missing required file: {relative}")
+    launch_spec_name = f"{prefix}/web/tests/smoke/live-launch.spec.ts"
+    launch_spec_member = by_name[launch_spec_name]
+    if launch_spec_member.size > MAX_LIVE_QA_LAUNCH_SPEC_BYTES:
+        raise ArtifactError("liveqa-runtime launch spec is too large")
+    launch_spec_file = archive.extractfile(launch_spec_member)
+    if launch_spec_file is None:
+        raise ArtifactError("liveqa-runtime launch spec is unavailable")
+    with launch_spec_file:
+        launch_spec = launch_spec_file.read(MAX_LIVE_QA_LAUNCH_SPEC_BYTES + 1)
+    if len(launch_spec) != launch_spec_member.size:
+        raise ArtifactError("liveqa-runtime launch spec is truncated")
+    requires_patch_acceptance = b"../support/patch-acceptance" in launch_spec
+    if requires_patch_acceptance:
+        helper_member = by_name.get(
+            f"{prefix}/web/tests/support/patch-acceptance.ts"
+        )
+        if helper_member is None or not helper_member.isfile():
+            raise ArtifactError(
+                "liveqa-runtime is missing required file: "
+                "web/tests/support/patch-acceptance.ts"
+            )
     runtime_prefix = f"{prefix}/"
     allowed_top = {"node", "web", "browsers", "runtime-manifest.json"}
     allowed_web_files = {

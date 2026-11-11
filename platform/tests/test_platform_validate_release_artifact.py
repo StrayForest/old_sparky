@@ -148,7 +148,11 @@ class ArchiveBuilder:
             "node/bin/node": b"node\n",
             "web/package-lock.json": b"{}\n",
             "web/playwright.live.config.ts": b"export default {};\n",
-            "web/tests/smoke/live-launch.spec.ts": b"test('launch', () => {});\n",
+            "web/tests/smoke/live-launch.spec.ts": (
+                b'import { patchAcceptanceIssues } from "../support/patch-acceptance";\n'
+                b"void patchAcceptanceIssues;\n"
+                b"test('launch', () => {});\n"
+            ),
             "web/tests/smoke/live-user-journey.spec.ts": b"test('live', () => {});\n",
             "web/tests/support/live-qa-origin.ts": b"export {};\n",
             "web/tests/support/live-qa-sandbox.ts": b"export {};\n",
@@ -837,11 +841,42 @@ class PlatformReleaseArtifactValidationTests(unittest.TestCase):
         artifact = ArchiveBuilder(self.root / "untampered.tar.gz").write()
         manifest_name = f"{RELEASE_SLUG}/liveqa-runtime/runtime-manifest.json"
 
-        missing_helper = ArchiveBuilder(self.root / "missing-patch-helper.tar.gz")
+        historical_importless = ArchiveBuilder(
+            self.root / "historical-importless.tar.gz"
+        )
+        launch_spec_name = (
+            f"{RELEASE_SLUG}/liveqa-runtime/web/tests/smoke/live-launch.spec.ts"
+        )
         helper_name = (
             f"{RELEASE_SLUG}/liveqa-runtime/"
             "web/tests/support/patch-acceptance.ts"
         )
+        historical_launch_spec = b"test('historical launch', () => {});\n"
+        historical_importless.entries = [
+            (member, content)
+            for member, content in historical_importless.entries
+            if member.name != helper_name
+        ]
+        for member, _content in historical_importless.entries:
+            if member.name == launch_spec_name:
+                member.size = len(historical_launch_spec)
+        historical_importless.entries = [
+            (
+                member,
+                historical_launch_spec
+                if member.name == launch_spec_name
+                else content,
+            )
+            for member, content in historical_importless.entries
+        ]
+        historical_artifact = historical_importless.write()
+        accepted_historical = validator.validate_archive(
+            historical_artifact,
+            release_slug=RELEASE_SLUG,
+        )
+        self.assertEqual(accepted_historical["release_slug"], RELEASE_SLUG)
+
+        missing_helper = ArchiveBuilder(self.root / "missing-patch-helper.tar.gz")
         missing_helper.entries = [
             (member, content)
             for member, content in missing_helper.entries

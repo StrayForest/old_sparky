@@ -474,15 +474,48 @@ if browser_counts="$("${GUARD[@]}" emit-public-browser-counts \
   --source-sha "$LIVE_QA_RUNNER_SHA" \
   --app-sha "$SOURCE_COMMIT" \
   --marker-sha256 "$LIVE_QA_MARKER_SHA256" \
-  "${COUNT_DIAGNOSTIC_ARGS[@]}")"; then
+  "${COUNT_DIAGNOSTIC_ARGS[@]}"; emit_status=$?; printf '\034'; exit "$emit_status")"; then
   count_status=0
 else
   count_status=$?
+fi
+if [[ "$browser_counts" == *$'\034' ]]; then
+  browser_counts="${browser_counts%$'\034'}"
+  if [[ "$browser_counts" == *$'\n' ]]; then
+    browser_counts="${browser_counts%$'\n'}"
+  else
+    browser_counts=""
+    count_status=1
+  fi
+else
+  browser_counts=""
+  count_status=1
 fi
 if (( count_status == 42 )); then
   diagnostic_valid=1
   diagnostic_kind=failure_report_unavailable
   diagnostic_child_exit="$browser_status"
+  if [[ "$browser_counts" == *$'\n'* ]]; then
+    failure_summary_line="${browser_counts#*$'\n'}"
+    browser_counts="${browser_counts%%$'\n'*}"
+    summary_shape_valid=0
+    if [[ "$failure_summary_line" =~ ^LIVE_BROWSER_FAILURE_SUMMARY\ schema=1\ reason=identity_summary_unavailable\ token=none$ ]] \
+      || { [[ "$failure_summary_line" =~ ^LIVE_BROWSER_FAILURE_SUMMARY\ schema=1\ reason=private_store_unavailable\ token=[A-Za-z0-9_-]+$ ]] \
+        && [[ ! "$failure_summary_line" =~ token=none$ ]]; }; then
+      if (( ${#failure_summary_line} <= 16640 )); then
+        summary_shape_valid=1
+      fi
+    fi
+    if (( summary_shape_valid == 1 )); then
+      : # The bounded summary is intentionally consumed and never forwarded.
+    else
+      browser_counts=""
+      count_status=1
+    fi
+  else
+    browser_counts=""
+    count_status=1
+  fi
 elif (( count_status == 43 && browser_status == 0 )); then
   # Persisted failure counts are a QA failure even if the child returned zero.
   browser_status=1

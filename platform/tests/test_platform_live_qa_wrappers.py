@@ -4659,10 +4659,21 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         match = platform_live_qa_guard.LIVE_QA_CHILD_MARKER_RE.fullmatch(marker)
         self.assertIsNotNone(match)
         assert match is not None
-        self.assertEqual(match.group(1), "unclassified")
-        self.assertEqual(int(match.group(2)), 70000 + len(secret))
-        self.assertEqual(int(match.group(3)), 70000 + len(late_error))
-        self.assertEqual(match.group(4), "true")
+        marker_fields = dict(
+            field.split("=", 1)
+            for field in marker.rstrip("\n").split()[1:]
+        )
+        self.assertEqual(
+            marker_fields,
+            {
+                "schema": "1",
+                "kind": "unclassified",
+                "stdout_bytes": str(70000 + len(secret)),
+                "stderr_bytes": str(70000 + len(late_error)),
+                "truncated": "true",
+                "child_exit": "2",
+            },
+        )
         self.assertNotIn(secret.decode("ascii"), marker)
         wide_count = (
             "LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=unclassified "
@@ -4672,8 +4683,12 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         wide_match = platform_live_qa_guard.LIVE_QA_CHILD_MARKER_RE.fullmatch(wide_count)
         self.assertIsNotNone(wide_match)
         assert wide_match is not None
-        self.assertEqual(int(wide_match.group(2)), 123456789)
-        self.assertEqual(int(wide_match.group(3)), 987654321)
+        wide_fields = dict(
+            field.split("=", 1)
+            for field in wide_count.rstrip("\n").split()[1:]
+        )
+        self.assertEqual(wide_fields["stdout_bytes"], "123456789")
+        self.assertEqual(wide_fields["stderr_bytes"], "987654321")
 
     def test_qa_child_capture_timeout_reaps_the_child_group(self) -> None:
         status, marker = platform_live_qa_guard._capture_qa_child(
@@ -5810,13 +5825,17 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 f"source_sha={'a' * 40} app_sha={'b' * 40} marker_sha256={'c' * 64}"
             )
 
-            def run_user_count_tail(count_status: int, child_status: int) -> tuple[subprocess.CompletedProcess[str], str]:
+            def run_user_count_tail(
+                count_status: int,
+                child_status: int,
+                guard_output: str | None = None,
+            ) -> tuple[subprocess.CompletedProcess[str], str]:
                 fake_guard = fixture / f"count-guard-{count_status}-{child_status}"
                 trace = fixture / f"count-args-{count_status}-{child_status}"
                 fake_guard.write_text(
                     "#!/bin/sh\n"
                     'if [ "$1" = emit-public-browser-counts ]; then\n'
-                    '  printf "%s\\n" "$FAKE_COUNT_LINE"\n'
+                    '  printf "%s" "$FAKE_COUNT_OUTPUT"\n'
                     '  printf "%s\\n" "$*" > "$FAKE_COUNT_TRACE"\n'
                     '  exit "$FAKE_COUNT_STATUS"\n'
                     "fi\nexit 2\n",
@@ -5845,7 +5864,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     ],
                     env={
                         **os.environ,
-                        "FAKE_COUNT_LINE": line,
+                        "FAKE_COUNT_OUTPUT": guard_output if guard_output is not None else line + "\n",
                         "FAKE_COUNT_STATUS": str(count_status),
                         "FAKE_COUNT_TRACE": str(trace),
                     },
@@ -5864,10 +5883,49 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             self.assertIn("LIVE_BROWSER_COUNTS schema=1", persisted_failure.stdout)
             self.assertNotIn("LIVE_QA_CHILD_DIAGNOSTIC", persisted_failure.stdout)
             self.assertIn("--persist-failure-report --fail-on-failure-counts", count_args)
-            unavailable, _count_args = run_user_count_tail(42, 7)
+            summary_line = (
+                "LIVE_BROWSER_FAILURE_SUMMARY schema=1 "
+                "reason=identity_summary_unavailable token=none\n"
+            )
+            unavailable, _count_args = run_user_count_tail(
+                42, 7, line + "\n" + summary_line
+            )
             self.assertEqual(unavailable.returncode, 7)
             self.assertIn("kind=failure_report_unavailable", unavailable.stdout)
             self.assertIn("child_exit=7", unavailable.stdout)
+            self.assertIn(line + "\n", unavailable.stdout)
+            self.assertNotIn("LIVE_BROWSER_FAILURE_SUMMARY", unavailable.stdout)
+
+            private_store_summary = (
+                "LIVE_BROWSER_FAILURE_SUMMARY schema=1 "
+                "reason=private_store_unavailable token=YWJj\n"
+            )
+            private_store_unavailable, _count_args = run_user_count_tail(
+                42, 7, line + "\n" + private_store_summary
+            )
+            self.assertEqual(private_store_unavailable.returncode, 7)
+            self.assertIn(line + "\n", private_store_unavailable.stdout)
+            self.assertNotIn("LIVE_BROWSER_FAILURE_SUMMARY", private_store_unavailable.stdout)
+            self.assertNotIn("YWJj", private_store_unavailable.stdout)
+
+            malformed_status_42_outputs = (
+                line + "\n",
+                line + "\nLIVE_BROWSER_FAILURE_SUMMARY schema=2 reason=identity_summary_unavailable token=none\n",
+                line + "\nLIVE_BROWSER_FAILURE_SUMMARY schema=1 reason=identity_summary_unavailable token=token123\n",
+                line + "\nLIVE_BROWSER_FAILURE_SUMMARY schema=1 reason=private_store_unavailable token=none\n",
+                line + "\n" + summary_line + line + "\n",
+                line + "\n" + summary_line + "unexpected extra output\n",
+                line + "\n" + summary_line + "\n",
+            )
+            for malformed_output in malformed_status_42_outputs:
+                with self.subTest(malformed_output=malformed_output[-80:]):
+                    malformed, _count_args = run_user_count_tail(
+                        42, 7, malformed_output
+                    )
+                    self.assertEqual(malformed.returncode, 7)
+                    self.assertIn("kind=failure_report_unavailable", malformed.stdout)
+                    self.assertNotIn(line + "\n", malformed.stdout)
+                    self.assertNotIn("LIVE_BROWSER_FAILURE_SUMMARY", malformed.stdout)
         self.assertEqual(
             dispatcher.splitlines()[0],
             "#!/usr/bin/env -S /usr/bin/python3.12 -I -B",
@@ -6722,12 +6780,9 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             )
             self.assertEqual(unavailable_schema2_run.returncode, 0, unavailable_schema2_run.stderr)
             unavailable_schema2_report = json.loads(report.read_text(encoding="utf-8"))
-            self.assertEqual(unavailable_schema2_report["status"], "failed")
-            self.assertEqual(unavailable_schema2_report["child_diagnostic"]["schema"], 2)
-            self.assertEqual(
-                unavailable_schema2_report["child_diagnostic"]["kind"],
-                "failure_report_unavailable",
-            )
+            self.assertEqual(unavailable_schema2_report["status"], "error")
+            self.assertIsNone(unavailable_schema2_report["child_diagnostic"])
+
             invalid_failure_unavailable = unavailable.replace(
                 "kind=failure_report_unavailable", "kind=unclassified"
             )
