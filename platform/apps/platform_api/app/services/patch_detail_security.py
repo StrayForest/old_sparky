@@ -27,14 +27,6 @@ PATCH_MISS_REFRESH_GATE_KEY = "platform:home-content:patch-miss-refresh:v1"
 PATCH_MISS_NEGATIVE_TTL_SECONDS = 5 * 60
 PATCH_MISS_REFRESH_GATE_SECONDS = 60
 PATCH_MISS_RESPONSE_MAX_BYTES = base.STEAM_NEWS_RESPONSE_MAX_BYTES
-# v11 cached compact Steam blurbs have already lost paragraph and scope markup.
-# Leave them out of this reprocessing list so the miss refresh refetches the full article.
-LEGACY_PATCH_DETAIL_KEY_PREFIXES = (
-    "platform:home-content:patch:v8:",
-    "platform:home-content:patch:v7:",
-    "platform:home-content:patch:v6:",
-)
-LEGACY_PATCH_REFRESH_GATE_KEY_PREFIX = "platform:home-content:patch-legacy-refresh:v1:"
 
 _BACKGROUND_REFRESH_TASKS: set[asyncio.Task[None]] = set()
 
@@ -161,140 +153,40 @@ async def _refresh_patch_cache_after_miss() -> None:
         )
 
 
-async def _reprocess_legacy_patch(
-    patch_id: str,
-    raw_detail: dict[str, Any],
-    catalog: dict[str, Any],
-    *,
-    publish_catalog: bool = False,
-) -> dict[str, Any]:
-    """Rebuild one still-cached patch with the current parser and asset catalog."""
-
-    structured = structure_patch_detail(raw_detail, catalog)
-    cache = redis_client()
-    try:
-        async with cache.pipeline(transaction=True) as pipeline:
-            if publish_catalog:
-                pipeline.set(
-                    base.PATCH_ASSET_CATALOG_KEY,
-                    json.dumps(catalog, ensure_ascii=False, separators=(",", ":")),
-                    ex=base.PATCH_ASSET_CATALOG_TTL_SECONDS,
-                )
-            pipeline.set(
-                base.PATCH_DETAIL_KEY_PREFIX + patch_id,
-                json.dumps(structured, ensure_ascii=False, separators=(",", ":")),
-                ex=base.PATCH_DETAIL_TTL_SECONDS,
-            )
-            await pipeline.execute()
-    finally:
-        await cache.aclose()
-
-    try:
-        registration = await ensure_patch_translation_records({patch_id: structured})
-        if registration["enqueue_failures"]:
-            logger.error(
-                "patch_legacy_translation_registration_degraded patch_id=%s registered=%s enqueued=%s failures=%s",
-                patch_id,
-                registration["registered"],
-                registration["enqueued"],
-                registration["enqueue_failures"],
-            )
-    except Exception:
-        logger.exception("patch_legacy_translation_registration_failed patch_id=%s", patch_id)
-    return structured
-
-
-async def _refresh_legacy_patch_after_miss(
-    patch_id: str,
-    raw_detail: dict[str, Any],
-) -> None:
-    """Fetch the current catalog, then migrate a specific legacy cached ID."""
-
-    try:
-        catalog = await _cached_asset_catalog()
-        publish_catalog = catalog is None
-        if catalog is None:
-            settings = get_settings()
-            timeout = httpx.Timeout(settings.platform_external_content_timeout_seconds)
-            async with _BoundedPatchRefreshClient(timeout=timeout) as client:
-                catalog = await base._fetch_deadlock_asset_catalog(client)
-        await _reprocess_legacy_patch(
-            patch_id,
-            raw_detail,
-            catalog,
-            publish_catalog=publish_catalog,
-        )
-    except Exception as error:  # noqa: BLE001
-        logger.warning(
-            "patch_legacy_background_refresh_failed patch_id=%s error=%s",
-            patch_id,
-            type(error).__name__,
-        )
-
-
 async def _cached_patch_source(patch_id: str) -> dict[str, Any] | None:
     if not patch_id.isdigit() or len(patch_id) > 32:
         return None
 
     cache = redis_client()
     schedule_refresh = False
-    schedule_legacy_refresh = False
-    legacy_detail: dict[str, Any] | None = None
     try:
         cached = _decode_mapping(await cache.get(base.PATCH_DETAIL_KEY_PREFIX + patch_id))
         if cached is not None:
             return cached
 
-        for prefix in LEGACY_PATCH_DETAIL_KEY_PREFIXES:
-            legacy_detail = _decode_mapping(await cache.get(prefix + patch_id))
-            if legacy_detail is not None:
-                break
+        negative_key = PATCH_MISS_NEGATIVE_KEY_PREFIX + patch_id
+        if await cache.get(negative_key):
+            return None
 
-        if legacy_detail is not None:
-            schedule_legacy_refresh = bool(
+        first_negative = bool(
+            await cache.set(
+                negative_key,
+                "1",
+                nx=True,
+                ex=PATCH_MISS_NEGATIVE_TTL_SECONDS,
+            )
+        )
+        if first_negative:
+            schedule_refresh = bool(
                 await cache.set(
-                    LEGACY_PATCH_REFRESH_GATE_KEY_PREFIX + patch_id,
+                    PATCH_MISS_REFRESH_GATE_KEY,
                     "1",
                     nx=True,
                     ex=PATCH_MISS_REFRESH_GATE_SECONDS,
                 )
             )
-        else:
-            negative_key = PATCH_MISS_NEGATIVE_KEY_PREFIX + patch_id
-            if await cache.get(negative_key):
-                return None
-
-            first_negative = bool(
-                await cache.set(
-                    negative_key,
-                    "1",
-                    nx=True,
-                    ex=PATCH_MISS_NEGATIVE_TTL_SECONDS,
-                )
-            )
-            if first_negative:
-                schedule_refresh = bool(
-                    await cache.set(
-                        PATCH_MISS_REFRESH_GATE_KEY,
-                        "1",
-                        nx=True,
-                        ex=PATCH_MISS_REFRESH_GATE_SECONDS,
-                    )
-                )
     finally:
         await cache.aclose()
-
-    if legacy_detail is not None:
-        catalog = await _cached_asset_catalog()
-        if catalog is not None:
-            return await _reprocess_legacy_patch(patch_id, legacy_detail, catalog)
-        if schedule_legacy_refresh:
-            _track_background_refresh(
-                asyncio.create_task(
-                    _refresh_legacy_patch_after_miss(patch_id, legacy_detail)
-                )
-            )
-        return None
 
     if schedule_refresh:
         _track_background_refresh(asyncio.create_task(_refresh_patch_cache_after_miss()))

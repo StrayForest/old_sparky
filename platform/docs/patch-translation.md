@@ -203,14 +203,16 @@ failures are not retried in a loop.
 
 ## Parser and catalog cache changes
 
-When patch parsing or the game-asset catalog changes extracted segments, bump the relevant detail/catalog cache
-namespace so new reads cannot reuse stale structure. Preserve an exact-ID repair path for already-cached raw patch
-details: on a new-namespace miss, reparse that cached source with the current parser/catalog and publish under the
-new key, including a translation record keyed by the new source hash. A cold catalog may defer one bounded refresh
-for that exact patch ID; it must not fan out a full-history reprocess. A parser fix for future refreshes alone does
-not repair existing cached details, and existing translation rows are not automatically valid for changed segments.
-Hero display metadata follows the same catalog refresh and exact-ID patch-cache repair path; the English source
-content and canonical patch labels remain intact.
+When patch parsing, source normalization or the game-asset catalog changes extracted segments, bump the detail
+cache namespace so new reads cannot reuse stale structure. Pre-v12 detail entries came from Steam's compact
+`maxlength=30000` response and are not valid raw-source repair inputs. A v12 cache miss does not read, reparse,
+promote or delete any older detail entry. It uses the bounded negative/global refresh gates to fetch the current
+full Steam feed with `maxlength=0`, publishes the current details under v12, and registers translations keyed by
+the new source hashes. The full HTTP response remains subject to the 8 MiB byte cap, and each normalized article
+remains capped at 30,000 characters. A cold catalog may defer one bounded refresh through that same full-feed path;
+it must not fan out a full-history reprocess. Existing translation rows are not automatically valid for changed
+segments. Hero display metadata follows the current catalog refresh, while the English source content and canonical
+patch labels remain intact.
 
 A translation-version bump intentionally invalidates previous translation result cache entries when the translation contract or canonical glossary changes.
 

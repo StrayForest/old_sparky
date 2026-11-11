@@ -72,8 +72,10 @@ class _Cache:
     def __init__(self, values: dict[str, str] | None = None) -> None:
         self.values = values or {}
         self.set_calls: list[tuple[str, str, dict]] = []
+        self.get_calls: list[str] = []
 
     async def get(self, key: str) -> str | None:
+        self.get_calls.append(key)
         return self.values.get(key)
 
     async def set(self, key: str, value: str, **kwargs) -> bool:
@@ -171,10 +173,20 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
             {**source_metadata, "content": compact_content}, catalog
         )
         compact_source_hash = translation_source_hash(compact_detail)
+        old_prefixes = (
+            "platform:home-content:patch:v6:",
+            "platform:home-content:patch:v7:",
+            "platform:home-content:patch:v8:",
+            "platform:home-content:patch:v9:",
+            "platform:home-content:patch:v10:",
+            "platform:home-content:patch:v11:",
+        )
+        old_values = {
+            prefix + patch_id: json.dumps(compact_detail) for prefix in old_prefixes
+        }
         cache = _Cache(
             {
-                # The deployed d6 cache stores this compact v11 projection.
-                "platform:home-content:patch:v11:" + patch_id: json.dumps(compact_detail),
+                **old_values,
                 home_content.PATCH_ASSET_CATALOG_KEY: json.dumps(catalog),
             }
         )
@@ -253,7 +265,9 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
         )
         cached_key = home_content.PATCH_DETAIL_KEY_PREFIX + patch_id
         self.assertIn(cached_key, cache.values)
-        self.assertIn("platform:home-content:patch:v11:" + patch_id, cache.values)
+        for old_key, old_value in old_values.items():
+            self.assertEqual(cache.values[old_key], old_value)
+            self.assertNotIn(old_key, cache.get_calls)
         updated_detail = json.loads(cache.values[cached_key])
         updated_source_hash = translation_source_hash(updated_detail)
         self.assertNotEqual(updated_source_hash, compact_source_hash)
@@ -371,105 +385,66 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(result, translated)
         translate.assert_awaited_once_with(detail)
 
-    async def test_legacy_patch_id_reprocesses_cached_source_without_latest_steam_feed(self) -> None:
-        patch_id = "987654321"
-        old_detail = {
-            "id": patch_id,
-            "title": "Historical Patch",
-            "content": """[General]
-Baba: Threadsap - Cooldown increased from 26s to 28s
-""",
-            "sections": [
-                {
-                    "kind": "general",
-                    "title": "Общие изменения",
-                    "changes": ["Baba: Threadsap - Cooldown increased from 26s to 28s"],
-                    "abilities": [],
-                }
-            ],
-        }
-        old_source_hash = translation_source_hash(old_detail)
-        catalog = {
-            "heroes": {
-                "baba": {
-                    "id": 88,
-                    "name": "Baba",
-                    "slug": "hero_baba",
-                    "abilities": {
-                        "threadsap": {"id": 8801, "name": "Threadsap"},
-                    },
-                }
-            },
-            "items": {},
-            "objectives": {},
-        }
-        legacy_key = patch_detail_security.LEGACY_PATCH_DETAIL_KEY_PREFIXES[0] + patch_id
-        cache = _Cache(
-            {
-                legacy_key: json.dumps(old_detail),
-                home_content.PATCH_ASSET_CATALOG_STALE_KEY: json.dumps(catalog),
-            }
+    async def test_legacy_compact_patch_with_warm_catalog_schedules_full_refresh(self) -> None:
+        prefixes = (
+            "platform:home-content:patch:v6:",
+            "platform:home-content:patch:v7:",
+            "platform:home-content:patch:v8:",
+            "platform:home-content:patch:v9:",
+            "platform:home-content:patch:v10:",
+            "platform:home-content:patch:v11:",
         )
+        catalog = {"heroes": {}, "items": {}, "ranks": {}, "objectives": {}}
+        for index, prefix in enumerate(prefixes):
+            with self.subTest(prefix=prefix):
+                patch_id = str(987654330 + index)
+                legacy_key = prefix + patch_id
+                legacy_detail = {"id": patch_id, "content": "General: compact old content"}
+                cache = _Cache(
+                    {
+                        legacy_key: json.dumps(legacy_detail),
+                        home_content.PATCH_ASSET_CATALOG_KEY: json.dumps(catalog),
+                    }
+                )
+                tasks, registered, refresh_patch = _capture_refresh_tasks()
+                with (
+                    patch.object(patch_detail_security, "redis_client", return_value=cache),
+                    refresh_patch,
+                    patch.object(
+                        patch_detail_security,
+                        "_refresh_patch_cache_after_miss",
+                        AsyncMock(),
+                    ) as refresh_full,
+                ):
+                    results = await asyncio.gather(
+                        patch_detail_security._cached_patch_source(patch_id),
+                        patch_detail_security._cached_patch_source(patch_id),
+                    )
+                    await asyncio.wait_for(
+                        registered.wait(), timeout=_REFRESH_OBSERVER_TIMEOUT_SECONDS
+                    )
+                    await _await_refresh_tasks(tasks)
+
+                self.assertEqual(results, [None, None])
+                self.assertEqual(len(tasks), 1)
+                refresh_full.assert_awaited_once()
+                self.assertEqual(cache.values[legacy_key], json.dumps(legacy_detail))
+                self.assertNotIn(legacy_key, cache.get_calls)
+
+    async def test_legacy_compact_patch_with_cold_catalog_schedules_full_refresh(self) -> None:
+        patch_id = "987654322"
+        legacy_key = "platform:home-content:patch:v6:" + patch_id
+        legacy_detail = {"id": patch_id, "content": "General: compact old content"}
+        cache = _Cache({legacy_key: json.dumps(legacy_detail)})
+        tasks, registered, refresh_patch = _capture_refresh_tasks()
         with (
             patch.object(patch_detail_security, "redis_client", return_value=cache),
-            patch.object(
-                patch_detail_security,
-                "ensure_patch_translation_records",
-                AsyncMock(return_value={"registered": 1, "enqueued": 1, "enqueue_failures": 0}),
-            ) as register,
-            patch.object(
-                patch_detail_security,
-                "_refresh_legacy_patch_after_miss",
-                AsyncMock(),
-            ) as legacy_refresh,
+            refresh_patch,
             patch.object(
                 patch_detail_security,
                 "_refresh_patch_cache_after_miss",
                 AsyncMock(),
-            ) as steam_refresh,
-        ):
-            result = await patch_detail_security._cached_patch_source(patch_id)
-
-        self.assertIsNotNone(result)
-        assert result is not None
-        self.assertEqual(result["id"], patch_id)
-        self.assertEqual(result["sections"][0]["kind"], "hero")
-        self.assertEqual(result["sections"][0]["hero_name"], "Baba")
-        self.assertEqual(
-            result["sections"][0]["abilities"][0]["changes"],
-            ["Cooldown increased from 26s to 28s"],
-        )
-        self.assertNotEqual(old_source_hash, translation_source_hash(result))
-        self.assertIn(home_content.PATCH_DETAIL_KEY_PREFIX + patch_id, cache.values)
-        self.assertNotIn(home_content.PATCH_ASSET_CATALOG_KEY, cache.values)
-        register.assert_awaited_once()
-        self.assertIn(patch_id, register.await_args.args[0])
-        legacy_refresh.assert_not_awaited()
-        steam_refresh.assert_not_awaited()
-
-    async def test_legacy_patch_with_cold_catalog_schedules_exact_id_reprocessing(self) -> None:
-        patch_id = "987654322"
-        old_detail = {"id": patch_id, "content": "Baba: Threadsap - Cooldown increased"}
-        cache = _Cache(
-            {
-                patch_detail_security.LEGACY_PATCH_DETAIL_KEY_PREFIXES[0] + patch_id:
-                    json.dumps(old_detail)
-            }
-        )
-        tasks, registered, refresh_patch = _capture_refresh_tasks()
-        with (
-            patch.object(patch_detail_security, "redis_client", return_value=cache),
-            patch.object(
-                patch_detail_security,
-                "_cached_asset_catalog",
-                AsyncMock(return_value=None),
-            ),
-            patch.object(
-                patch_detail_security,
-                "_refresh_legacy_patch_after_miss",
-                AsyncMock(),
-            ) as refresh_legacy,
-            refresh_patch,
+            ) as refresh_full,
         ):
             results = await asyncio.gather(
                 patch_detail_security._cached_patch_source(patch_id),
@@ -480,11 +455,9 @@ Baba: Threadsap - Cooldown increased from 26s to 28s
 
         self.assertEqual(results, [None, None])
         self.assertEqual(len(tasks), 1)
-        refresh_legacy.assert_awaited_once_with(patch_id, old_detail)
-        self.assertIn(
-            patch_detail_security.LEGACY_PATCH_REFRESH_GATE_KEY_PREFIX + patch_id,
-            cache.values,
-        )
+        refresh_full.assert_awaited_once()
+        self.assertEqual(cache.values[legacy_key], json.dumps(legacy_detail))
+        self.assertNotIn(legacy_key, cache.get_calls)
 
     async def test_patch_miss_refresh_registers_translations_after_cache_publish(self) -> None:
         raw_detail = {
