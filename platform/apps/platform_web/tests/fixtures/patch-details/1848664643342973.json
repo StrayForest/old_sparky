@@ -28,7 +28,6 @@
         "Global Rank Redistribution",
         "After monitoring the Ranked playerbase throughout this first season, and accommodating for the recent influx of new players in the game, we will be running a global redistribution at the start of this new season. This means that some players may see their rank actually increase rather than decrease at the start of the new season despite the soft reset.",
         "To summarize, both of these rank adjustments are being made as a two-step operation. The first is taking everyone's existing ranks and redistributing the curve as described above. Second is taking the new post-redistribution numbers and applying the soft reset of ranks by about -1 badge on average. The final result of this is going to be different for everyone, some may gain ranks despite the soft reset and others may get moved down slightly more.",
-        "----",
         "Rule changes to Ranked for Beta Season 2",
         "We are making a few changes to the way the Ranked system works for Beta Season 2 based on how things played out in Beta Season 1, as well as all of the useful feedback we've heard from the community.",
         "Rank Loss Protection (Shields):",
@@ -45,14 +44,9 @@
         "We still feel strongly that it is very important that players in Ranked have deep knowledge and confidence piloting a hero they are using for the sake of all players involved, however we also recognize that there is room for improvement in how we measure this. Unlocking a hero in Ranked now uses a point system, rather than only progressing based on wins. Unlocking a hero now requires 35 points, you will gain 2 points for a win and 1 point for a loss. With the previous 15 win system (assuming 50% WR), it would have required an equivalent of 45 points (15 wins = 30 points, 15 losses = 15 points, 30+15=45).",
         "Ranked Leaderboards:",
         "We've reworked the backend to how leaderboards work to fix numerous bugs.",
-        "[/*]",
         "Each Ranked season now has its own leaderboard.",
-        "[/*]",
         "To show up on a leaderboard, you must play at least 50 Ranked matches in that season within the last 30 days. Ranking is based on your current badge progress.",
-        "[/*]",
         "To show up on a hero-specific leaderboard, you must play at least 15 Ranked matches with that hero within the last 30 days. Ranking is based on your current badge progress and your recent win/loss performance on that hero.",
-        "[/*]",
-        "----",
         "Beta Season 2 begins today, we'll see you there!"
       ],
       "abilities": []

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
 import logging
+import math
 import re
 from secrets import token_urlsafe
+import time
 from typing import Any
 
 import httpx
@@ -14,10 +17,17 @@ from sqlalchemy import select, update
 from sqlalchemy.dialects import postgresql
 
 from apps.platform_api.app.services.patch_translation_config import (
+    PATCH_TRANSLATION_BATCH_CHAR_TARGET,
+    PATCH_TRANSLATION_BATCH_CONCURRENCY,
+    PATCH_TRANSLATION_BATCH_SEGMENT_TARGET,
     OPENAI_RESPONSES_URL,
     PATCH_TRANSLATION_CACHE_TTL_SECONDS,
+    PATCH_TRANSLATION_INITIAL_BATCH_LIMIT,
     PATCH_TRANSLATION_LOCALE,
     PATCH_TRANSLATION_LOCK_TTL_SECONDS,
+    PATCH_TRANSLATION_MAX_PROVIDER_CALLS,
+    PATCH_TRANSLATION_PROVIDER_CALL_TIMEOUT_SECONDS,
+    PATCH_TRANSLATION_PROVIDER_DEADLINE_SECONDS,
     PATCH_TRANSLATION_TASK_NAME,
     PATCH_TRANSLATION_VERSION,
 )
@@ -78,6 +88,63 @@ _RETRYABLE_TRANSLATION_ERRORS = frozenset({
     "WorkerTimeout",
 })
 PATCH_TRANSLATION_FACT_CORRECTION_ATTEMPTS = 1
+_RETRYABLE_OPENAI_ERRORS = frozenset({
+    "ConnectError", "ConnectTimeout", "NetworkError", "PoolTimeout", "TimeoutError",
+    "ReadError", "ReadTimeout", "RemoteProtocolError", "WriteError", "WriteTimeout",
+})
+
+
+class _ProviderCallBudgetExceeded(RuntimeError):
+    """The task's shared provider-request or follow-up allowance is exhausted."""
+
+
+class _TranslationProviderCallBudget:
+    """Share one bounded call count, follow-up slot and monotonic deadline."""
+
+    def __init__(
+        self,
+        *,
+        deadline_seconds: float = PATCH_TRANSLATION_PROVIDER_DEADLINE_SECONDS,
+        max_calls: int = PATCH_TRANSLATION_MAX_PROVIDER_CALLS,
+        call_timeout_seconds: float = PATCH_TRANSLATION_PROVIDER_CALL_TIMEOUT_SECONDS,
+    ) -> None:
+        self.started_at = time.monotonic()
+        self.deadline_at = self.started_at + deadline_seconds
+        self.max_calls = max_calls
+        self.call_timeout_seconds = call_timeout_seconds
+        self.provider_calls = 0
+        self.follow_up_kind: str | None = None
+        self.follow_up_call_started = False
+
+    def remaining_seconds(self) -> float:
+        return max(self.deadline_at - time.monotonic(), 0.0)
+
+    def ensure_time_remaining(self) -> None:
+        if self.remaining_seconds() <= 0:
+            raise TimeoutError("Patch translation provider deadline expired.")
+
+    def claim_follow_up(self, kind: str) -> bool:
+        if self.follow_up_kind is not None:
+            return False
+        self.follow_up_kind = kind
+        return True
+
+    def begin_call(self, *, follow_up_kind: str | None = None) -> float:
+        remaining = self.remaining_seconds()
+        if remaining <= 0:
+            raise TimeoutError("Patch translation provider deadline expired.")
+        if self.provider_calls >= self.max_calls:
+            raise _ProviderCallBudgetExceeded("Patch translation provider call limit reached.")
+        if follow_up_kind is not None:
+            if self.follow_up_kind is None:
+                self.follow_up_kind = follow_up_kind
+            elif self.follow_up_kind != follow_up_kind or self.follow_up_call_started:
+                raise _ProviderCallBudgetExceeded(
+                    "Patch translation follow-up request was already used."
+                )
+            self.follow_up_call_started = True
+        self.provider_calls += 1
+        return min(self.call_timeout_seconds, remaining)
 
 
 def _iter_changes(patch: dict[str, Any]):
@@ -961,6 +1028,183 @@ async def _request_openai(
     return translated
 
 
+def _plan_translation_batches(
+    source_segments: list[dict[str, str]],
+    prepared_segments: list[dict[str, Any]],
+) -> list[tuple[list[dict[str, str]], list[dict[str, Any]]]]:
+    """Balance source-ordered chunks without changing or dropping stable IDs."""
+
+    source_ids = [str(segment.get("id") or "") for segment in source_segments]
+    prepared_by_id = {str(segment.get("id") or ""): segment for segment in prepared_segments}
+    if (
+        not source_ids
+        or len(source_ids) != len(set(source_ids))
+        or len(prepared_by_id) != len(prepared_segments)
+        or set(source_ids) != set(prepared_by_id)
+    ):
+        raise ValueError("Patch translation segment identity is invalid.")
+
+    source_char_counts = [len(str(segment.get("text") or "")) for segment in source_segments]
+    total_source_chars = sum(source_char_counts)
+
+    segment_count = len(source_segments)
+    batch_count = min(
+        segment_count,
+        PATCH_TRANSLATION_INITIAL_BATCH_LIMIT,
+        max(
+            1,
+            math.ceil(segment_count / PATCH_TRANSLATION_BATCH_SEGMENT_TARGET),
+            math.ceil(total_source_chars / PATCH_TRANSLATION_BATCH_CHAR_TARGET),
+        ),
+    )
+    if batch_count == 1:
+        return [(source_segments, [prepared_by_id[segment_id] for segment_id in source_ids])]
+
+    prefix_chars = [0]
+    for char_count in source_char_counts:
+        prefix_chars.append(prefix_chars[-1] + char_count)
+
+    target_count = segment_count / batch_count
+    target_chars = max(total_source_chars / batch_count, 1.0)
+    source_ranges: list[tuple[int, int]] = []
+    start = 0
+    for batches_remaining in range(batch_count, 1, -1):
+        last_end = segment_count - (batches_remaining - 1)
+        best_end: int | None = None
+        best_score: tuple[float, float, int] | None = None
+        for end in range(start + 1, last_end + 1):
+            count = end - start
+            chars = prefix_chars[end] - prefix_chars[start]
+            score = (
+                ((count - target_count) / max(target_count, 1.0)) ** 2
+                + ((chars - target_chars) / target_chars) ** 2,
+                abs(count - target_count),
+                end,
+            )
+            if best_score is None or score < best_score:
+                best_end = end
+                best_score = score
+        if best_end is None:
+            raise ValueError("Patch translation source cannot be partitioned safely.")
+        source_ranges.append((start, best_end))
+        start = best_end
+    source_ranges.append((start, segment_count))
+
+    batches: list[tuple[list[dict[str, str]], list[dict[str, Any]]]] = []
+    for batch_start, batch_end in source_ranges:
+        source_batch = source_segments[batch_start:batch_end]
+        prepared_batch = [prepared_by_id[segment["id"]] for segment in source_batch]
+        batches.append((source_batch, prepared_batch))
+    flattened_ids = [segment["id"] for source_batch, _ in batches for segment in source_batch]
+    if flattened_ids != source_ids:
+        raise ValueError("Patch translation batch plan changed source order.")
+    return batches
+
+
+async def _request_openai_with_budget(
+    *,
+    call_budget: _TranslationProviderCallBudget,
+    patch_id: str,
+    segments: list[dict[str, Any]],
+    glossary: dict[str, list[str]],
+    settings: PlatformSettings,
+    fact_correction_ids: list[str] | None,
+) -> dict[str, str]:
+    """Issue one provider request and use the single follow-up slot for retry or correction."""
+
+    follow_up_kind = "fact_correction" if fact_correction_ids else None
+    timeout_seconds = call_budget.begin_call(follow_up_kind=follow_up_kind)
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            return await _request_openai(
+                patch_id=patch_id,
+                segments=segments,
+                glossary=glossary,
+                settings=settings,
+                fact_correction_ids=fact_correction_ids,
+            )
+    except Exception as error:
+        if (
+            follow_up_kind is not None
+            or type(error).__name__ not in _RETRYABLE_OPENAI_ERRORS
+            or not call_budget.claim_follow_up("transient_retry")
+        ):
+            raise
+
+        remaining = call_budget.remaining_seconds()
+        if remaining <= 0:
+            raise TimeoutError("Patch translation provider deadline expired.") from error
+        await asyncio.sleep(min(1.0, remaining))
+        timeout_seconds = call_budget.begin_call(follow_up_kind="transient_retry")
+        async with asyncio.timeout(timeout_seconds):
+            return await _request_openai(
+                patch_id=patch_id,
+                segments=segments,
+                glossary=glossary,
+                settings=settings,
+                fact_correction_ids=fact_correction_ids,
+            )
+
+
+async def _request_openai_batches(
+    *,
+    patch_id: str,
+    source_segments: list[dict[str, str]],
+    prepared_segments: list[dict[str, Any]],
+    glossary: dict[str, list[str]],
+    settings: PlatformSettings,
+    entity_replacements: dict[str, dict[str, str]],
+    fact_replacements: dict[str, dict[str, str]],
+    call_budget: _TranslationProviderCallBudget,
+) -> dict[str, str]:
+    batches = _plan_translation_batches(source_segments, prepared_segments)
+    if not batches:
+        return {}
+    semaphore = asyncio.Semaphore(PATCH_TRANSLATION_BATCH_CONCURRENCY)
+
+    async def translate_batch(
+        source_batch: list[dict[str, str]],
+        prepared_batch: list[dict[str, Any]],
+    ) -> dict[str, str]:
+        async with semaphore:
+            return await _request_openai_with_fact_correction(
+                patch_id=patch_id,
+                source_segments=source_batch,
+                prepared_segments=prepared_batch,
+                glossary=glossary,
+                settings=settings,
+                entity_replacements=entity_replacements,
+                fact_replacements=fact_replacements,
+                call_budget=call_budget,
+            )
+
+    tasks = [
+        asyncio.create_task(translate_batch(source_batch, prepared_batch))
+        for source_batch, prepared_batch in batches
+    ]
+    try:
+        batch_results = await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+    expected_ids = [segment["id"] for segment in source_segments]
+    expected_id_set = set(expected_ids)
+    merged: dict[str, str] = {}
+    for result in batch_results:
+        for segment_id, text in result.items():
+            if segment_id not in expected_id_set or segment_id in merged:
+                raise ValueError("Patch translation batch merge contains unexpected or duplicate ids.")
+            merged[segment_id] = text
+    if set(merged) != set(expected_ids):
+        raise ValueError("Patch translation batch merge is missing source ids.")
+    call_budget.ensure_time_remaining()
+    return {segment_id: merged[segment_id] for segment_id in expected_ids}
+
+
 async def _request_openai_with_fact_correction(
     *,
     patch_id: str,
@@ -970,9 +1214,11 @@ async def _request_openai_with_fact_correction(
     settings: PlatformSettings,
     entity_replacements: dict[str, dict[str, str]],
     fact_replacements: dict[str, dict[str, str]],
+    call_budget: _TranslationProviderCallBudget | None = None,
 ) -> dict[str, str]:
     """Allow one bounded correction, then require the original fact fingerprint."""
 
+    call_budget = call_budget or _TranslationProviderCallBudget()
     correction_ids: list[str] | None = None
     translated_prepared: dict[str, str] | None = None
     source_by_id = {segment["id"]: segment["text"] for segment in source_segments}
@@ -987,11 +1233,12 @@ async def _request_openai_with_fact_correction(
                 if segment["id"] in correction_ids
             ]
         )
-        corrected_segments = await _request_openai(
+        corrected_segments = await _request_openai_with_budget(
             patch_id=patch_id,
             segments=request_segments,
             glossary=glossary,
             settings=settings,
+            call_budget=call_budget,
             fact_correction_ids=correction_ids,
         )
         if translated_prepared is None:
@@ -1175,6 +1422,7 @@ async def translate_patch_to_russian(
     allow_failed_retry: bool = False,
 ) -> dict[str, Any]:
     settings = settings or get_settings()
+    provider_call_budget = _TranslationProviderCallBudget()
     patch_id = str(patch.get("id") or "").strip()
     segments = extract_translation_segments(patch)
     source_hash = _source_hash(segments)
@@ -1343,7 +1591,7 @@ async def translate_patch_to_russian(
         )
         glossary = await get_translation_glossary(settings)
         full_glossary = _glossary_payload(glossary)
-        translated = await _request_openai_with_fact_correction(
+        translated = await _request_openai_batches(
             patch_id=patch_id,
             source_segments=segments,
             prepared_segments=prepared,
@@ -1351,6 +1599,7 @@ async def translate_patch_to_russian(
             settings=settings,
             entity_replacements=entity_replacements,
             fact_replacements=fact_replacements,
+            call_budget=provider_call_budget,
         )
 
         translated_at = datetime.now(UTC)

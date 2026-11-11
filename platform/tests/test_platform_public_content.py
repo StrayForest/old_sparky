@@ -1826,6 +1826,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
             "[p][b]General:[/b] Map timings changed. - Mid-Boss: Health increased by 20% around the Mid Boss "
             "- Mid-Boss: Health regeneration increased by 20% "
             "\n- Haunts - Past Dues: Now channels their special attack, creating a build-up aura on the ground that applies sleep slowly to Heroes standing within it over time. Killing the channeling creature destroys the aura.\n"
+            "------\n"
             "\n- Fixed some bugs with Walker stomp logic\n"
             "\n- Latest 6 heroes are no longer categorized as \"new\" anymore. This means they have normal hero unlocking requirements for ranked and can now be banned.\n"
             "[b]Items:[/b] - High-Velocity Rounds: Bullet Velocity reduced from 60% to 45% "
@@ -1839,8 +1840,30 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
         )
         plain = home_content._plain_text(source, max_length=30000)
         self.assertNotIn("[img", plain.casefold())
+        self.assertNotIn("[/*]", plain.casefold())
+        self.assertNotRegex(plain, r"(?m)^-{2,}$")
         self.assertNotIn("steam_clan_loc_image", plain.casefold())
         self.assertNotIn("clan.fastly.steamstatic.com", plain.casefold())
+        list_plain = home_content._plain_text(
+            "[b]General:[/b][list]"
+            "[*][p]Damage reduced from -25 to -20.[/p][/*]"
+            "[*][p]Cooldown reduced from -12s to -10s.[/p][/*]"
+            "[/list]\n------\n",
+            max_length=30000,
+        )
+        self.assertNotIn("[/*]", list_plain.casefold())
+        self.assertNotRegex(list_plain, r"(?m)^-{2,}$")
+        list_detail = patch_detail.structure_patch_detail(
+            {"id": "list-separator-regression", "title": "List regression", "content": list_plain},
+            {"heroes": {}, "items": {}, "objectives": {}},
+        )
+        self.assertEqual(
+            list_detail["sections"][0]["changes"],
+            [
+                "Damage reduced from -25 to -20.",
+                "Cooldown reduced from -12s to -10s.",
+            ],
+        )
         link_plain = home_content._plain_text(
             "[p][url=https://www.playdeadlock.com/cityneversleeps]City Never Sleeps[/url][/p]",
             max_length=30000,
@@ -2213,7 +2236,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
     def test_public_content_cache_versions_keep_home_contract_stable(self) -> None:
         self.assertEqual(home_content.HOME_CONTENT_KEY, "platform:home-content:v4")
         self.assertEqual(home_content.HOME_CONTENT_STALE_KEY, "platform:home-content:stale:v4")
-        self.assertEqual(home_content.PATCH_DETAIL_KEY_PREFIX, "platform:home-content:patch:v12:")
+        self.assertEqual(home_content.PATCH_DETAIL_KEY_PREFIX, "platform:home-content:patch:v13:")
         self.assertEqual(
             home_content.PATCH_ASSET_CATALOG_KEY,
             "platform:home-content:patch-assets:v7",

@@ -37,7 +37,7 @@ DEADLOCK_ASSET_BASE_URL = "https://deadlock.io"
 HOME_CONTENT_KEY = "platform:home-content:v4"
 HOME_CONTENT_STALE_KEY = "platform:home-content:stale:v4"
 HOME_CONTENT_LOCK_KEY = "platform:home-content:refresh-lock:v4"
-PATCH_DETAIL_KEY_PREFIX = "platform:home-content:patch:v12:"
+PATCH_DETAIL_KEY_PREFIX = "platform:home-content:patch:v13:"
 PATCH_ASSET_CATALOG_KEY = "platform:home-content:patch-assets:v7"
 PATCH_ASSET_CATALOG_STALE_KEY = "platform:home-content:patch-assets-stale:v1"
 PATCH_ASSET_PENDING_RETRY_KEY = "platform:home-content:patch-assets-pending-retry:v1"
@@ -158,7 +158,11 @@ def _plain_text(value: str, *, max_length: int) -> str:
     extractor = _TextExtractor()
     extractor.feed(unescape(value))
     lines = [" ".join(line.split()) for line in "".join(extractor.parts).splitlines()]
-    normalized = "\n".join(line for line in lines if line).strip()
+    normalized = "\n".join(
+        line
+        for line in lines
+        if line and not _STEAM_DECORATIVE_SEPARATOR_LINE_RE.fullmatch(line)
+    ).strip()
     normalized = re.sub(
         r"\{STEAM_CLAN(?:_LOC)?_IMAGE\}/(\d+)/([a-f0-9]{32,64}\.(?:avif|gif|jpe?g|png|webp))",
         lambda match: f"{STEAM_CLAN_IMAGE_BASE_URL}/{match.group(1)}/{match.group(2)}",
@@ -193,6 +197,8 @@ _STEAM_BBCODE_FORMAT_RE = re.compile(
     r"\[/?(?:b|i|u|s|strike|spoiler|quote)\s*\]",
     re.IGNORECASE,
 )
+_STEAM_BBCODE_LIST_ITEM_CLOSE_RE = re.compile(r"\[[ \t]*/[ \t]*\*[ \t]*\]", re.IGNORECASE)
+_STEAM_DECORATIVE_SEPARATOR_LINE_RE = re.compile(r"-{2,}")
 
 
 def _normalize_steam_bbcode(value: str) -> str:
@@ -211,6 +217,9 @@ def _normalize_steam_bbcode(value: str) -> str:
         value,
     )
     value = re.sub(r"\[\*\]", "\n- ", value, flags=re.IGNORECASE)
+    # Valve uses [/*] to close list items in some patch bodies. Treat it as
+    # structure so it cannot become a user-visible or translatable change row.
+    value = _STEAM_BBCODE_LIST_ITEM_CLOSE_RE.sub("\n", value)
     value = _STEAM_BBCODE_BLOCK_RE.sub("\n", value)
     value = _STEAM_BBCODE_FORMAT_RE.sub("", value)
     return value

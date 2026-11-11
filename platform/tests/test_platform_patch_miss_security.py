@@ -180,6 +180,7 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
             "platform:home-content:patch:v9:",
             "platform:home-content:patch:v10:",
             "platform:home-content:patch:v11:",
+            "platform:home-content:patch:v12:",
         )
         old_values = {
             prefix + patch_id: json.dumps(compact_detail) for prefix in old_prefixes
@@ -393,6 +394,7 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
             "platform:home-content:patch:v9:",
             "platform:home-content:patch:v10:",
             "platform:home-content:patch:v11:",
+            "platform:home-content:patch:v12:",
         )
         catalog = {"heroes": {}, "items": {}, "ranks": {}, "objectives": {}}
         for index, prefix in enumerate(prefixes):

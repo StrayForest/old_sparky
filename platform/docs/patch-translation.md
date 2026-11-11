@@ -6,7 +6,7 @@
 
 This document owns the contract for automatic Russian translation of Deadlock patch-note changes.
 
-## Current implementation — 2026-09-01
+## Current implementation — 2026-11-11
 
 Translation state is durable in the PostgreSQL `platform.patch_translations`
 table. A record is identified by the patch ID, the hash of the extracted
@@ -25,7 +25,7 @@ one delayed automatic retry after 15 minutes when its error is a known network
 or timeout failure and its attempt count is below the fixed retry limit. Other
 failures remain durable and do not incur repeated model calls.
 
-The deployed translation version is `ru-v10`, defined in
+The deployed translation version is `ru-v11`, defined in
 `apps/platform_api/app/services/patch_translation_config.py`. It includes the
 durable DB-first state, the reviewed ambiguity handling and the immutable
 numeric/tier validation described below. The four-patch regression procedure
@@ -111,9 +111,11 @@ returning full content, while a nonzero limit may return a generated blurb that
 loses BBCode and paragraph boundaries before parsing. The decoded response is
 bounded at 8 MiB in both the home refresh and patch-detail miss refresh; each
 announcement's normalized text remains capped at 30,000 characters. Parser
-changes must bump the patch-detail cache namespace and register translations
-under the hash of the newly extracted segments, so old flattened source cannot
-be reused as current detail or translation input.
+`[/*]` list-item closers and separator-only hyphen lines are structural markup,
+not change text, and are removed before parsing or translation. Parser changes
+must bump the patch-detail cache namespace and register translations under the
+hash of newly extracted segments, so old normalized source cannot be reused as
+current detail or translation input.
 
 The translation glossary is a **small checked-in canonical glossary owned by Old Sparky**. It is curated from Valve/Steam Russian Deadlock terminology and contains only important reusable gameplay mechanics: movement, damage, resistances, lifesteal, cooldowns, duration, range/radius, control durations and similar core concepts.
 
@@ -195,24 +197,39 @@ For prose, prefer Valve terminology and natural constructions. The model may inf
 
 An automatic retry of a failed translation task is limited to one delayed retry
 for known network/timeout errors, guarded by the same source hash and row lock.
-The runtime makes one translation request and may make one bounded numeric-fact
-correction request if immutable fact validation fails. The warm-up's
-`max_openai_calls` setting and `translation_calls` report count cache-miss patch
-translations; they are not a count of provider HTTP requests. Validation
-failures are not retried in a loop.
+One task may issue up to three source-ordered initial provider requests. The
+planner balances batches toward 100 segments and 6,500 source characters; these
+are partition targets, not truncation limits. It preserves each segment ID and
+all extracted text. The 30,000-character cap applies to normalized Steam
+article content; required catalog-backed introduction and replacement
+descriptions may add translated text beyond the article body and are not
+subject to a new aggregate cap. Across all batches, one shared follow-up request
+may be used either for a transient provider retry or a numeric-fact correction.
+The task therefore makes at most four provider calls and does not persist
+partial batch results. At most two requests run at once within a task. The
+worker's default concurrency is two, so one worker process can have at most
+four translation requests in flight; configured worker concurrency sets the
+aggregate bound. A 120-second monotonic task deadline bounds provider work; each call is limited to the
+smaller of 75 seconds or the remaining task time. The delayed durable retry
+remains a separate queue attempt, and the existing maximum of two durable
+attempts is unchanged.
+
+The warm-up's `max_openai_calls` setting and `translation_calls` report count
+cache-miss patch translations; they are not a count of provider HTTP requests.
+Validation failures are not retried in a loop.
 
 ## Parser and catalog cache changes
 
 When patch parsing, source normalization or the game-asset catalog changes extracted segments, bump the detail
-cache namespace so new reads cannot reuse stale structure. Pre-v12 detail entries came from Steam's compact
-`maxlength=30000` response and are not valid raw-source repair inputs. A v12 cache miss does not read, reparse,
-promote or delete any older detail entry. It uses the bounded negative/global refresh gates to fetch the current
-full Steam feed with `maxlength=0`, publishes the current details under v12, and registers translations keyed by
-the new source hashes. The full HTTP response remains subject to the 8 MiB byte cap, and each normalized article
-remains capped at 30,000 characters. A cold catalog may defer one bounded refresh through that same full-feed path;
-it must not fan out a full-history reprocess. Existing translation rows are not automatically valid for changed
-segments. Hero display metadata follows the current catalog refresh, while the English source content and canonical
-patch labels remain intact.
+cache namespace so new reads cannot reuse stale structure. Detail entries before v13 were parsed before the current
+Steam list-closer and separator normalization. A v13 cache miss ignores older detail namespaces without reading,
+reparsing, promoting or deleting their entries. It uses the bounded negative/global refresh gates to fetch the
+current full Steam feed with `maxlength=0`, publishes current details under v13, and registers translations keyed
+by the newly extracted source hashes. The full HTTP response remains subject to the 8 MiB byte cap, and each
+normalized article remains capped at 30,000 characters. A cold catalog may defer one bounded refresh through that
+same full-feed path; it must not fan out a full-history reprocess. Existing translation rows are not automatically
+valid for changed segments. Hero display metadata follows the current catalog refresh, while English source content
+and canonical patch labels remain intact.
 
 A translation-version bump intentionally invalidates previous translation result cache entries when the translation contract or canonical glossary changes.
 

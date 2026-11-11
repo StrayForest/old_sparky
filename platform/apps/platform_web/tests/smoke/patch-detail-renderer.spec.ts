@@ -13,7 +13,8 @@ const patchIds = [
 const nursePatchId = "1847920302240420";
 const nurseIntroductionPatchId = "1846651706696737";
 const sourceOwnerPrefixPattern = /^(?:Nurse|Медсестра|Mid Boss|Средний босс|Items|Heroes|Предметы|Герои)\s*:/iu;
-const rawPatchMarkupPattern = /STEAM_CLAN_LOC_IMAGE|clan\.fastly\.steamstatic\.com|\[\s*\/?\s*img\b|\[\s*url\b/iu;
+const rawPatchMarkupPattern = /STEAM_CLAN_LOC_IMAGE|clan\.fastly\.steamstatic\.com|\[\s*\/?\s*img\b|\[\s*url\b|\[\s*\/\s*\*\s*\]/iu;
+const separatorOnlyChangePattern = /^-{2,}$/u;
 const patchFixtures = Promise.all(patchIds.map(async (id) => (
   JSON.parse(await readFile(path.join(process.cwd(), "tests", "fixtures", "patch-details", `${id}.json`), "utf8")) as PlatformPatchDetail
 )));
@@ -30,6 +31,7 @@ async function expectChangeRows(rows: Locator, changes: string[]) {
   for (const [index, change] of changes.entries()) {
     expect(sourceOwnerPrefixPattern.test(change.trim())).toBe(false);
     expect(rawPatchMarkupPattern.test(change)).toBe(false);
+    expect(separatorOnlyChangePattern.test(change.trim())).toBe(false);
     const row = rows.nth(index);
     await expect(row).toHaveText(change);
   }

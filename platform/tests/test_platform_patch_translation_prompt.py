@@ -98,7 +98,7 @@ class PatchTranslationPromptInputTests(unittest.TestCase):
         )
 
     def test_prompt_cache_key_is_stable_per_translation_version(self) -> None:
-        self.assertEqual(runtime._PROMPT_CACHE_KEY, "oldsparky-patch-ru-ru-v10")
+        self.assertEqual(runtime._PROMPT_CACHE_KEY, "oldsparky-patch-ru-ru-v11")
 
     def test_ru_v10_prompt_locks_collision_and_scaling_regressions(self) -> None:
         source = inspect.getsource(runtime._request_openai)

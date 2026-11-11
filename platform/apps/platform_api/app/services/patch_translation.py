@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 from apps.platform_api.app.services.patch_translation_config import (
     PATCH_TRANSLATION_LOCALE,
+    PATCH_TRANSLATION_PROVIDER_CALL_TIMEOUT_SECONDS,
     PATCH_TRANSLATION_TASK_NAME,
     PATCH_TRANSLATION_VERSION,
 )
@@ -38,22 +38,6 @@ from apps.platform_api.app.services.patch_translation_terms import (
 from python_packages.platform_infra.config import PlatformSettings, get_settings
 
 
-_OPENAI_MIN_TIMEOUT_SECONDS = 75.0
-_RETRYABLE_OPENAI_ERRORS = frozenset(
-    {
-        "ConnectError",
-        "ConnectTimeout",
-        "NetworkError",
-        "PoolTimeout",
-        "ReadError",
-        "ReadTimeout",
-        "RemoteProtocolError",
-        "WriteError",
-        "WriteTimeout",
-    }
-)
-
-
 async def translate_patch_to_russian(
     patch: dict[str, Any],
     catalog: dict[str, Any],
@@ -62,40 +46,20 @@ async def translate_patch_to_russian(
     expected_source_hash: str | None = None,
     allow_failed_retry: bool = False,
 ) -> dict[str, Any]:
-    """Use one fact correction and at most one transient transport retry.
-
-    The runtime can make at most two provider requests (initial plus one fact
-    correction). This wrapper can repeat that runtime invocation once after a
-    transient transport error, bounding one task to at most four provider
-    requests.
-    """
+    """Use the runtime's shared batch, correction, retry and deadline budget."""
 
     settings = settings or get_settings()
     effective_settings = settings.model_copy(
         update={
-            "platform_openai_timeout_seconds": max(
-                _OPENAI_MIN_TIMEOUT_SECONDS,
-                settings.platform_openai_timeout_seconds,
-            )
+            "platform_openai_timeout_seconds": PATCH_TRANSLATION_PROVIDER_CALL_TIMEOUT_SECONDS,
         }
     )
-    result = await _translate_patch_to_russian(
-        patch,
-        catalog,
-        settings=effective_settings,
-        expected_source_hash=expected_source_hash,
-        allow_failed_retry=allow_failed_retry,
-    )
-    if result.get("ok") or result.get("error") not in _RETRYABLE_OPENAI_ERRORS:
-        return result
-
-    await asyncio.sleep(1.0)
     return await _translate_patch_to_russian(
         patch,
         catalog,
         settings=effective_settings,
         expected_source_hash=expected_source_hash,
-        allow_failed_retry=True,
+        allow_failed_retry=allow_failed_retry,
     )
 
 
