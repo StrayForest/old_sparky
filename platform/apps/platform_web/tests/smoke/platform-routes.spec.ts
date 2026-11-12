@@ -3470,6 +3470,7 @@ test("auth forms call platform auth endpoints and preserve web sessions", async 
 test("auth forms mount Turnstile only when the API requires it", async ({ page }) => {
   const loginPayloads: Array<Record<string, unknown>> = [];
   const csrfTokenRequests = await trackCsrfTokenRequests(page);
+  const loginResponseGate: { release?: () => void } = {};
 
   await page.route("**/api/v1/auth/security-config", async (route) => {
     await route.fulfill({
@@ -3516,22 +3517,26 @@ test("auth forms mount Turnstile only when the API requires it", async ({ page }
       });
       return;
     }
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({
-        user: {
-          id: "u_turnstile",
-          email: "turnstile@example.test",
-          display_name: "Turnstile Player",
-          status: "active",
-          created_at: "2026-05-20T00:00:00Z",
-          roles: ["authenticated_user", "player"],
-          can_create_public_tournaments: false,
-          has_password: true
-        },
-        expires_at: "2026-05-21T00:00:00Z"
-      })
+    await new Promise<void>((resolve) => {
+      loginResponseGate.release = () => {
+        void route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            user: {
+              id: "u_turnstile",
+              email: "turnstile@example.test",
+              display_name: "Turnstile Player",
+              status: "active",
+              created_at: "2026-05-20T00:00:00Z",
+              roles: ["authenticated_user", "player"],
+              can_create_public_tournaments: false,
+              has_password: true
+            },
+            expires_at: "2026-05-21T00:00:00Z"
+          })
+        }).then(() => resolve());
+      };
     });
   });
 
@@ -3542,6 +3547,19 @@ test("auth forms mount Turnstile only when the API requires it", async ({ page }
 
   await page.goto("/auth/login");
   await expect(page.locator(".auth-turnstile")).toHaveCount(0);
+  await page.evaluate(() => {
+    const probeWindow = window as Window & { authErrorObserved?: boolean };
+    probeWindow.authErrorObserved = false;
+    new MutationObserver((records) => {
+      for (const record of records) {
+        for (const node of record.addedNodes) {
+          if (node instanceof Element && (node.matches(".auth-error") || node.querySelector(".auth-error"))) {
+            probeWindow.authErrorObserved = true;
+          }
+        }
+      }
+    }).observe(document.body, { childList: true, subtree: true });
+  });
   await page.getByLabel("Email").fill("turnstile@example.test");
   await page.getByLabel("Пароль").fill("long-password");
   const submitButton = page.getByRole("button", { name: "Войти", exact: true });
@@ -3554,6 +3572,11 @@ test("auth forms mount Turnstile only when the API requires it", async ({ page }
   await expect(page.getByLabel("Email")).toBeDisabled();
   await expect(page.getByLabel("Пароль")).toBeDisabled();
   await expect(page.locator(".auth-error")).toHaveCount(0);
+  await expect.poll(() => loginPayloads.length).toBe(2);
+  await expect(page.locator(".auth-error")).toHaveCount(0);
+  expect(await page.evaluate(() => (window as Window & { authErrorObserved?: boolean }).authErrorObserved)).toBe(false);
+  expect(loginResponseGate.release).toBeDefined();
+  loginResponseGate.release?.();
   await expect(page).toHaveURL(/\/$/u);
 
   expect(loginPayloads).toHaveLength(2);
@@ -3612,10 +3635,24 @@ test("automatic Turnstile continuation stops after server rejects the token", as
   });
 
   await page.goto("/auth/login");
+  await page.evaluate(() => {
+    const probeWindow = window as Window & { authErrorObserved?: boolean };
+    probeWindow.authErrorObserved = false;
+    new MutationObserver((records) => {
+      for (const record of records) {
+        for (const node of record.addedNodes) {
+          if (node instanceof Element && (node.matches(".auth-error") || node.querySelector(".auth-error"))) {
+            probeWindow.authErrorObserved = true;
+          }
+        }
+      }
+    }).observe(document.body, { childList: true, subtree: true });
+  });
   await page.getByLabel("Email").fill("rejected@example.test");
   await page.getByLabel("Пароль").fill("long-password");
   await page.getByRole("button", { name: "Войти", exact: true }).click();
-  await expect(page.locator(".auth-error")).toContainText("Проверка безопасности не пройдена");
+  await expect(page.locator(".auth-error")).toHaveCount(0);
+  expect(await page.evaluate(() => (window as Window & { authErrorObserved?: boolean }).authErrorObserved)).toBe(false);
   await expect(page.locator(".auth-turnstile")).toHaveCount(1);
   await expect(page.getByRole("button", { name: "Войти", exact: true })).toBeDisabled();
   await expect(page.getByLabel("Email")).toBeDisabled();
@@ -3628,6 +3665,7 @@ test("automatic Turnstile continuation stops after server rejects the token", as
     (window as Window & { __deliverFreshTurnstileToken?: () => void }).__deliverFreshTurnstileToken?.();
   });
   await expect.poll(() => loginPayloads.length).toBe(3);
+  await expect(page.locator(".auth-error")).toContainText("Проверка безопасности не пройдена");
   await expect(page.getByRole("button", { name: "Войти", exact: true })).toBeDisabled();
   expect(loginPayloads[2]).toEqual({
     email: "rejected@example.test",

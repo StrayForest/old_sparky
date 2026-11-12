@@ -1,6 +1,21 @@
 "use client";
 
-import { Landmark, Package, Sparkles, Target } from "lucide-react";
+import {
+  Activity,
+  CircleHelp,
+  Clock3,
+  Gauge,
+  Hash,
+  Heart,
+  Landmark,
+  Package,
+  Percent,
+  RotateCcw,
+  Ruler,
+  Target,
+  TrendingUp,
+  X,
+} from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "@/components/i18n-provider";
 import { Hero } from "@/components/layout/hero";
@@ -8,7 +23,7 @@ import { CspImage } from "@/components/media/csp-image";
 import { DeadlockHeroImage } from "@/components/media/deadlock-hero-image";
 import { formatPatchDate, formatPatchTitle } from "@/lib/patch-format";
 import { platformApiMessage, platformApiRequest } from "@/lib/platform-api";
-import type { PlatformPatchDetail } from "@/lib/platform-types";
+import type { PlatformPatchAbility, PlatformPatchAbilityStat, PlatformPatchDetail } from "@/lib/platform-types";
 
 const steamPatchImagePattern = /^https:\/\/clan\.fastly\.steamstatic\.com\/images\/\d+\/[a-f0-9]{32,64}\.(?:avif|gif|jpe?g|png|webp)$/i;
 
@@ -47,7 +62,10 @@ export function PatchDetailPage({ patchId }: { patchId: string }) {
             <div className="patch-article-cover" aria-hidden="true" />
             <div className="patch-sections">
               {patch.sections.map((section, sectionIndex) => (
-                <section className={`patch-section ${section.kind}-patch-section`} key={`${section.title}-${sectionIndex}`}>
+                <section
+                  className={`patch-section ${section.kind}-patch-section`}
+                  key={`${section.title}-${sectionIndex}`}
+                >
                   <header className="patch-section-header">
                     {section.hero_name ? (
                       <DeadlockHeroImage
@@ -96,7 +114,7 @@ export function PatchDetailPage({ patchId }: { patchId: string }) {
                   </header>
                   {section.changes.length ? <ChangeList changes={section.changes} /> : null}
                   {section.abilities.length ? (
-                    <div className="patch-abilities">
+                    <div className={`patch-abilities${hasAbilityDetails(section.abilities) ? " patch-abilities-detail" : ""}`}>
                       {section.abilities.map((ability) => (
                         <section className="patch-ability" key={ability.name}>
                           <header>
@@ -106,20 +124,7 @@ export function PatchDetailPage({ patchId }: { patchId: string }) {
                           {ability.presentation_kind === "introduction" || ability.presentation_kind === "replacement" ? (
                             <>
                               {ability.description ? <p className="patch-ability-description">{ability.description}</p> : null}
-                              {ability.stats?.length ? (
-                                <>
-                                  <h4 className="patch-ability-stats-title">{t("patch.abilityCurrentStats")}</h4>
-                                  <dl className="patch-ability-stats">
-                                    {ability.stats.map((stat, statIndex) => (
-                                      <div key={`${stat.label}-${statIndex}`}>
-                                        <dt>{stat.label}</dt>
-                                        <dd>{stat.value}</dd>
-                                      </div>
-                                    ))}
-                                  </dl>
-                                </>
-                              ) : null}
-                              {ability.stats_pending ? <p className="patch-ability-stats-pending">{t("patch.abilityStatsPending")}</p> : null}
+                              <PatchAbilityStats ability={ability} />
                             </>
                           ) : null}
                           {ability.changes.length ? <ChangeList changes={ability.changes} /> : null}
@@ -138,6 +143,103 @@ export function PatchDetailPage({ patchId }: { patchId: string }) {
   );
 }
 
+function hasAbilityDetails(abilities: PlatformPatchAbility[]): boolean {
+  return abilities.some((ability) => (
+    ability.presentation_kind === "introduction" || ability.presentation_kind === "replacement"
+  ));
+}
+
+function PatchAbilityStats({ ability }: { ability: PlatformPatchAbility }) {
+  const { t } = useI18n();
+  const stats = ability.stats ?? [];
+  if (!stats.length && !ability.stats_pending) return null;
+
+  const hasSemanticMetadata = stats.some((stat) => (
+    stat.identity !== undefined
+    || stat.type !== undefined
+    || stat.unit !== undefined
+    || stat.tier !== undefined
+    || stat.upgrade_type !== undefined
+  ));
+  const baseStats = stats.filter((stat) => stat.tier == null);
+  const tierGroups = new Map<number, PlatformPatchAbilityStat[]>();
+  for (const stat of stats) {
+    if (stat.tier == null) continue;
+    const group = tierGroups.get(stat.tier) ?? [];
+    group.push(stat);
+    tierGroups.set(stat.tier, group);
+  }
+
+  return (
+    <>
+      {baseStats.length ? (
+        <>
+          <h4 className="patch-ability-stats-title">
+            {t(hasSemanticMetadata ? "patch.abilityBaseStats" : "patch.abilityCurrentStats")}
+          </h4>
+          <dl className="patch-ability-stats" data-stat-layout="base">
+            {baseStats.map((stat, statIndex) => (
+              <PatchAbilityStatRow key={patchStatKey(stat, statIndex)} stat={stat} />
+            ))}
+          </dl>
+        </>
+      ) : null}
+      {tierGroups.size ? (
+        <section className="patch-ability-upgrades" aria-label={t("patch.abilityUpgrades")}>
+          <h4 className="patch-ability-stats-title">{t("patch.abilityUpgrades")}</h4>
+          <div className="patch-ability-tier-rail">
+            {[...tierGroups.entries()].map(([tier, tierStats]) => (
+              <section className="patch-ability-tier" data-tier={tier} key={tier}>
+                <h5>{t("patch.abilityTier", { tier })}</h5>
+                <dl className="patch-ability-stats" data-stat-layout="tier">
+                  {tierStats.map((stat, statIndex) => (
+                    <PatchAbilityStatRow key={patchStatKey(stat, statIndex)} stat={stat} />
+                  ))}
+                </dl>
+              </section>
+            ))}
+          </div>
+        </section>
+      ) : null}
+      {ability.stats_pending ? <p className="patch-ability-stats-pending">{t("patch.abilityStatsPending")}</p> : null}
+    </>
+  );
+}
+
+function PatchAbilityStatRow({ stat }: { stat: PlatformPatchAbilityStat }) {
+  const StatIcon = stat.type ? patchStatIcons[stat.type] ?? CircleHelp : CircleHelp;
+  return (
+    <div
+      className="patch-ability-stat"
+      data-stat-type={stat.type ?? "unknown"}
+      data-stat-unit={stat.unit ?? "unknown"}
+      data-stat-tier={stat.tier ?? "base"}
+      data-has-scaling={stat.scaling ? "true" : "false"}
+      data-stat-identity={stat.identity ?? undefined}
+    >
+      <dt><StatIcon aria-hidden="true" size={16} /><span>{stat.label}</span></dt>
+      <dd>{stat.value}</dd>
+    </div>
+  );
+}
+
+function patchStatKey(stat: PlatformPatchAbilityStat, index: number): string {
+  return `${stat.identity ?? stat.label}:${stat.tier ?? "base"}:${index}`;
+}
+
+const patchStatIcons = {
+  duration: Clock3,
+  distance: Ruler,
+  percent: Percent,
+  rate: Activity,
+  count: Hash,
+  healing: Heart,
+  restoration: RotateCcw,
+  scalar: Gauge,
+  scale: TrendingUp,
+  scale_multiplier: X,
+};
+
 function PatchAbilityIcon({ iconUrl }: { iconUrl: string | null }) {
   const imageRef = useRef<HTMLImageElement>(null);
   const [failedSource, setFailedSource] = useState<string | null>(null);
@@ -151,7 +253,7 @@ function PatchAbilityIcon({ iconUrl }: { iconUrl: string | null }) {
   }, [iconUrl]);
 
   if (!iconUrl || failed) {
-    return <span className="patch-ability-icon-fallback" aria-hidden="true"><Sparkles size={20} /></span>;
+    return <span className="patch-ability-icon-fallback" aria-hidden="true"><CircleHelp size={20} /></span>;
   }
   return (
     <CspImage

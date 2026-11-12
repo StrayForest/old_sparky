@@ -77,8 +77,16 @@ async def _cached_asset_catalog() -> dict[str, Any] | None:
     try:
         catalog = _decode_mapping(await cache.get(base.PATCH_ASSET_CATALOG_KEY))
         if catalog is not None:
+            catalog["_ability_stat_contract_current"] = (
+                base._asset_catalog_has_current_ability_stat_contract(catalog)
+            )
             return catalog
-        return _decode_mapping(await cache.get(base.PATCH_ASSET_CATALOG_STALE_KEY))
+        catalog = _decode_mapping(await cache.get(base.PATCH_ASSET_CATALOG_STALE_KEY))
+        if catalog is not None:
+            catalog["_ability_stat_contract_current"] = (
+                base._asset_catalog_has_current_ability_stat_contract(catalog)
+            )
+        return catalog
     finally:
         await cache.aclose()
 
@@ -114,14 +122,6 @@ async def _publish_patch_refresh(
                     encoded_catalog,
                     ex=base.PATCH_ASSET_CATALOG_STALE_TTL_SECONDS,
                 )
-                if base._asset_catalog_has_current_hero_image_candidates(catalog):
-                    pipeline.delete(base.PATCH_ASSET_PENDING_RETRY_KEY)
-                else:
-                    pipeline.set(
-                        base.PATCH_ASSET_PENDING_RETRY_KEY,
-                        "pending",
-                        ex=base.PATCH_ASSET_PENDING_RETRY_SECONDS,
-                    )
             for patch_id, raw_detail in details.items():
                 structured = structure_patch_detail(raw_detail, catalog)
                 structured_details[patch_id] = structured
@@ -130,6 +130,24 @@ async def _publish_patch_refresh(
                     json.dumps(structured, ensure_ascii=False, separators=(",", ":")),
                     ex=base.PATCH_DETAIL_TTL_SECONDS,
                 )
+            pending_stats = any(
+                isinstance(section, dict)
+                and any(
+                    isinstance(ability, dict) and ability.get("stats_pending")
+                    for ability in section.get("abilities") or []
+                )
+                for detail in structured_details.values()
+                for section in detail.get("sections") or []
+            )
+            if publish_catalog:
+                if base._asset_catalog_is_ready(catalog) and not pending_stats:
+                    pipeline.delete(base.PATCH_ASSET_PENDING_RETRY_KEY)
+                else:
+                    pipeline.set(
+                        base.PATCH_ASSET_PENDING_RETRY_KEY,
+                        "pending",
+                        ex=base.PATCH_ASSET_PENDING_RETRY_SECONDS,
+                    )
             await pipeline.execute()
     finally:
         await cache.aclose()
@@ -156,9 +174,7 @@ async def _refresh_patch_cache_after_miss() -> None:
         timeout = httpx.Timeout(settings.platform_external_content_timeout_seconds)
         async with _BoundedPatchRefreshClient(timeout=timeout) as client:
             _, details = await base._fetch_steam_patches(client)
-            publish_catalog = not base._asset_catalog_has_current_hero_image_candidates(
-                catalog
-            )
+            publish_catalog = not base._asset_catalog_is_ready(catalog)
             if publish_catalog:
                 cache = redis_client()
                 try:
@@ -170,7 +186,7 @@ async def _refresh_patch_cache_after_miss() -> None:
                 if retry_blocked:
                     publish_catalog = False
                     if catalog is None:
-                        raise RuntimeError("Hero image catalog refresh is in backoff.")
+                        raise RuntimeError("Asset catalog refresh is in backoff.")
                 else:
                     catalog = await base._fetch_deadlock_asset_catalog(
                         client,

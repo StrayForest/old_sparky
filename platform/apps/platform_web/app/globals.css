@@ -5816,6 +5816,10 @@ img.rank-icon,
   margin-top: 16px;
 }
 
+.patch-abilities-detail {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .patch-ability {
   padding: 14px;
   background: rgba(8,12,11,.9);
@@ -5851,32 +5855,113 @@ img.rank-icon,
 }
 
 .patch-ability-stats {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px 14px;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
   margin: 0 0 12px;
-  color: var(--ui-text-muted);
-  font-size: 12px;
 }
 
 .patch-ability-stats-title {
-  margin: 0 0 6px;
+  margin: 16px 0 8px;
   color: var(--ui-text-soft);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
 }
 
-.patch-ability-stats div {
+.patch-ability-stat {
+  display: grid;
+  min-width: 0;
+  align-content: start;
+  gap: 8px;
+  padding: 10px;
+  background: rgba(8, 14, 27, .72);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--ui-radius-sm);
+}
+
+.patch-ability-stat dt {
   display: flex;
-  gap: 5px;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 8px;
+  color: var(--ui-text-soft);
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.35;
+  overflow-wrap: normal;
+  hyphens: none;
 }
 
-.patch-ability-stats dt {
-  font-weight: 600;
+.patch-ability-stat dt span {
+  min-width: 0;
 }
 
-.patch-ability-stats dd {
+.patch-ability-stat dt svg {
+  flex: 0 0 16px;
+  margin-top: 1px;
+  color: var(--ui-secondary);
+}
+
+.patch-ability-stat dd {
+  min-width: 0;
   margin: 0;
+  color: var(--ui-text);
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1.35;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.patch-ability-tier-rail {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.patch-ability-tier {
+  min-width: 0;
+  padding: 12px;
+  background: rgba(8, 14, 27, .58);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--ui-radius-sm);
+}
+
+.patch-ability-tier h5 {
+  margin: 0 0 8px;
+  color: var(--ui-primary-bright);
+  font-size: 12px;
+  font-weight: 750;
+  letter-spacing: .08em;
+}
+
+.patch-ability-tier .patch-ability-stats {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  margin: 0;
+}
+
+.patch-ability-tier .patch-ability-stat {
+  grid-template-columns: minmax(0, 1fr) max-content;
+  align-items: start;
+  gap: 8px;
+  padding: 0 0 8px;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--border-soft);
+  border-radius: 0;
+}
+
+.patch-ability-tier .patch-ability-stat:last-child {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.patch-ability-tier .patch-ability-stat dd {
+  text-align: right;
 }
 
 .patch-ability-stats-pending {
@@ -6244,6 +6329,21 @@ img.rank-icon,
 }
 
 @media (max-width: 820px) {
+  .hero-patch-section .patch-section-header {
+    display: grid;
+    grid-template-columns: 70px minmax(0, 1fr);
+    align-items: center;
+    gap: 10px 14px;
+  }
+
+  .hero-patch-section .patch-section-header > div {
+    display: contents;
+  }
+
+  .hero-patch-section .patch-hero-description {
+    grid-column: 1 / -1;
+  }
+
   .nav {
     justify-content: flex-start;
     overflow-x: auto;
@@ -6276,6 +6376,82 @@ img.rank-icon,
     padding: 16px;
   }
 
+  .patch-ability-stats[data-stat-layout="base"] {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+    border-top: 1px solid var(--border-soft);
+  }
+
+  .patch-ability-stats[data-stat-layout="base"] .patch-ability-stat {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 40%);
+    align-items: center;
+    gap: 10px;
+    padding: 9px 2px;
+    background: transparent;
+    border: 0;
+    border-bottom: 1px solid var(--border-soft);
+    border-radius: 0;
+  }
+
+  .patch-ability-stats[data-stat-layout="base"] .patch-ability-stat dd {
+    text-align: right;
+  }
+
+  .patch-ability-stats[data-stat-layout="base"] .patch-ability-stat[data-stat-type="healing"][data-stat-unit="health"][data-has-scaling="true"] {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .patch-ability-stats[data-stat-layout="base"] .patch-ability-stat[data-stat-type="healing"][data-stat-unit="health"][data-has-scaling="true"] dd {
+    text-align: left;
+  }
+
+  .patch-ability-tier-rail {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+    margin-left: 5px;
+  }
+
+  .patch-ability-tier {
+    position: relative;
+    padding: 0 0 14px 19px;
+    background: transparent;
+    border: 0;
+    border-left: 1px solid rgba(167, 139, 250, .38);
+    border-radius: 0;
+  }
+
+  .patch-ability-tier:last-child {
+    padding-bottom: 0;
+    border-left-color: transparent;
+  }
+
+  .patch-ability-tier::before {
+    position: absolute;
+    top: 2px;
+    left: -5px;
+    width: 8px;
+    height: 8px;
+    content: "";
+    background: var(--ui-surface-strong);
+    border: 2px solid var(--ui-primary-bright);
+    border-radius: 50%;
+  }
+
+  .patch-ability-tier h5 {
+    margin: 0 0 5px;
+  }
+
+  .patch-ability-tier .patch-ability-stat {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 6px 0;
+    border-bottom: 0;
+  }
+
+  .patch-ability-tier .patch-ability-stat dd {
+    justify-self: end;
+    text-align: right;
+  }
+
   .info-anchor-nav {
     grid-template-columns: repeat(2, 1fr);
   }
@@ -6286,6 +6462,22 @@ img.rank-icon,
 
   .info-anchor-nav a:nth-child(-n+2) {
     border-bottom: 1px solid var(--border-soft);
+  }
+}
+
+@media (max-width: 360px) {
+  .patch-ability-stats[data-stat-layout="base"] .patch-ability-stat {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .patch-ability-stats[data-stat-layout="base"] .patch-ability-stat dd,
+  .patch-ability-tier .patch-ability-stat dd {
+    justify-self: end;
+    text-align: right;
+  }
+
+  .patch-ability-tier .patch-ability-stat {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 

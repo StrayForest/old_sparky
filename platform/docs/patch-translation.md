@@ -53,11 +53,25 @@ source-backed numeric stats. Stats come from the latest game-data catalog, not
 a historical launch snapshot, so the client labels them as current values.
 Each ability carries `presentation_kind` with
 `balance`, `introduction` or `replacement`; the client displays description
-and stats only for the latter two kinds. Intro stats use `{label, value}` rows
-from the English/Russian game-data catalog, retaining only labeled numeric
-damage, cooldown, duration, range/radius, healing, resistance, speed and related
-properties or numeric upgrade bonuses. Only localized user-facing labels are
-published; missing translated labels or source values stay absent. Introduced
+and stats only for the latter two kinds. Intro stats retain a localized
+`{label, value}` plus normalized `identity`, `type`, `unit`, optional `tier`,
+optional `scaling`, and `upgrade_type` metadata. Identity comes from the stable
+catalog property key. Explicit source postfixes determine units; a small
+reviewed property-semantics map fills units only where the source omits them.
+The map follows stable source property names and display metadata, including
+stamina restored per shot. Scaling coefficients stay distinct from base-value
+deltas. `EMultiplyBase` bonuses are percent deltas, while `EMultiplyScale`
+bonuses are direct scale factors; explicit upgrade operations are preserved.
+Scaling function and coefficients remain in metadata; only source-identified
+additive scaling is composed into the displayed value. Scaling values use
+localized source labels where available. The `Charge Rate` property keeps its
+rate meaning in Russian as `Скорость накопления зарядов`.
+Unknown explicit operations are omitted and keep intro stats pending rather
+than being presented as flat additions. Negative absolute durations, delays
+and ranges are omitted, while signed upgrade deltas remain valid. Source
+disable values are omitted without making a complete ability pending. Only
+localized user-facing labels and numeric source values are published; missing
+translated labels or source values stay absent. Introduced
 and fully replaced abilities also carry `stats_pending`: `true` means supported
 numeric source properties are unknown or only partly localized, `false` means
 they are complete or the valid source property bag contains no supported
@@ -98,7 +112,7 @@ establish that this contract holds.
 
 The current hero, ability and shop-item catalog combines the community Deadlock API's per-patch game-data endpoints (`/v1/assets/heroes` and `/v1/assets/items`) with the legacy deadlock.io index when it returns valid JSON. The community endpoints expose the latest known client build and accept a `language=russian` parameter. Old Sparky joins English and Russian payloads by stable hero ID, ability class name and shop item name. Shop entries are projected from released `type=upgrade` records with a recognized `item_slot_type` and validated image URL. If either legacy endpoint is unavailable, redirected or non-JSON, valid community hero and item data supplies the catalog; if all sources fail, the last-good catalog is retained. These are community-parsed game files, not a Valve-operated API; Steam's announcement feed remains the source for patch prose. The API selects Russian values when present and English values otherwise, strips HTML and inline game tokens from descriptions, and constructs image URLs only from validated relative `/assets/` paths or the fixed Deadlock API asset CDN host. Hero entries may expose ordered `image_candidates` and patch hero sections may expose `hero_image_candidates`; the singular image URL mirrors the first candidate when the list is nonempty. Lists contain at most four distinct, validated remote URLs. Valid existing/prior candidates are retained before current community variants, whose order is card WebP, card PNG, small WebP, then small PNG. These are variants from the same approved asset host, not independent providers. Invalid and legacy deadlock.io/SteamDB image URLs are excluded. The UI tries each candidate once, then a bundled image that exists, then the placeholder; when an explicit list is present it does not retry the same API image after candidate exhaustion. Catalog HTML is never rendered.
 
-When a new Steam announcement appears, the normal home-content refresh fetches the catalog in the same bounded refresh and reparses the four displayed patch details under the current detail-cache namespace. The worker's existing `home-content-refresh` schedule checks the Steam feed every 5 minutes. It avoids downloading asset bundles when nothing changed, and retries cached hero introductions with genuinely incomplete required metadata or unknown/partial supported stats at most once per 5 minutes, under the existing Redis lock. Catalog-pending state is separate from Russian-translation-pending state, so an intentionally hidden balance description does not trigger asset retries. An announcement can precede its game-data source; the UI reports required intro metadata and incomplete current stats as pending while the bounded schedule checks again. Missing Russian intro descriptions use English game text when available, otherwise the matching Steam ability span, and register only those fields with the DB-first translation pipeline. Detection is bounded by the 5-minute schedule; upstream publication delay remains outside the service's control.
+When a new Steam announcement appears, the normal home-content refresh fetches the catalog in the same bounded refresh and reparses the four displayed patch details under the current detail-cache namespace. The worker's existing `home-content-refresh` schedule checks the Steam feed every 5 minutes. It avoids downloading asset bundles when nothing changed, and retries cached hero introductions with genuinely incomplete required metadata or unknown/partial supported stats at most once per 5 minutes, under the existing Redis lock. The asset catalog carries an ability-stat contract version; a warm cache without the current version is treated as stale even when its hero-image metadata is complete, so its detail projections are reparsed under the new contract without flushing Redis. Catalog-pending state is separate from Russian-translation-pending state, so an intentionally hidden balance description does not trigger asset retries. An announcement can precede its game-data source; the UI reports required intro metadata and incomplete current stats as pending while the bounded schedule checks again. Missing Russian intro descriptions use English game text when available, otherwise the matching Steam ability span, and register only those fields with the DB-first translation pipeline. Detection is bounded by the 5-minute schedule; upstream publication delay remains outside the service's control.
 
 The translation subsystem must not translate structural/entity labels such as:
 

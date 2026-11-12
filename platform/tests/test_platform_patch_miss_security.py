@@ -238,10 +238,10 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
             },
         )
         expected_renderer_fixture_digests = {
-            "1846651706696737": "7a238716e178175b455b6aed62d33c84f69ea600de252783da50c334b3a786d7",
-            "1847920302240420": "28a058b28803db0021736ee0209775a3ef0635259e26ad124207db82b29302f8",
-            "1848664643339845": "35cd23b9343e5ec76a26aa0709d18ebbef4a9dd581b2faa3c14b0b8a548416af",
-            "1848664643342973": "7e17f338f1e74c96a537ba100e59aafab2c6c4f73ac9abd6a678a9828507315d",
+            "1846651706696737": "8aeec0abe2aa1202925a08423efe63127a00f8737ce3659c5a92e07036ef405d",
+            "1847920302240420": "c58d77584ff0983b6e41d082d2e17c4002be2d4f71e13e306987cdf3bc30d6e8",
+            "1848664643339845": "afb1cda19188f788167ac1b505e163041e4f7a88dec2359c6419a307dff60624",
+            "1848664643342973": "9553eed7ff08365300dca069c57453598adfe9a97bc19f9de324a1d118e32490",
         }
         self.assertEqual(provenance["renderer_fixtures"], expected_renderer_fixture_digests)
         self.assertEqual(
@@ -251,15 +251,18 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
                     "patch_id": "1846651706696737",
                     "path": "sections[].abilities[].stats",
                     "ability_cards": 4,
-                    "stat_rows": 67,
-                    "unchanged_verified": [
+                    "stat_rows": 64,
+                    "validated": [
                         "owners",
                         "ability names",
                         "descriptions",
                         "images",
                         "row counts",
                         "stats_pending",
+                        "source-backed stat identity, type, unit, scaling, tier and upgrade operation",
+                        "Charge Rate localized as a rate and formula spacing",
                     ],
+                    "source_semantics": "raw catalog properties and upgrade operations; raw source descriptions verify percent and multiplier encoding",
                 },
                 {
                     "patch_id": "1847920302240420",
@@ -321,7 +324,33 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
             {"heroes_english", "heroes_russian", "items_english", "items_russian", "icons"},
         )
         patch_ids = sorted(expected_ids, key=int)
-        old_catalog = {"heroes": {}, "items": {}, "ranks": {}, "objectives": {}}
+        old_catalog = {
+            "heroes": {
+                "nurse harrow": {
+                    "id": 87,
+                    "hero_id": 87,
+                    "slug": "nurse",
+                    "source": "deadlock-api",
+                    "name": "Nurse Harrow",
+                    "hero_image_url": "https://assets-bucket.deadlock-api.com/nurse.webp",
+                    "hero_image_candidates": ["https://assets-bucket.deadlock-api.com/nurse.webp"],
+                    "abilities": {
+                        "healing needles": {
+                            "name": "Healing Needles",
+                            "stats": [{"label": "Лечение за выстрел", "value": "22"}],
+                            "stats_pending": False,
+                        }
+                    },
+                }
+            },
+            "items": {},
+            "ranks": {},
+            "objectives": {},
+            "hero_image_candidates_version": home_content.HERO_IMAGE_CANDIDATES_VERSION,
+            "hero_image_candidates_pending": False,
+        }
+        self.assertTrue(home_content._asset_catalog_has_current_hero_image_candidates(old_catalog))
+        self.assertFalse(home_content._asset_catalog_is_ready(old_catalog))
         old_values = {}
         for source_item in source_fixture["items"]:
             patch_id = str(source_item["gid"])
@@ -335,7 +364,7 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
                 },
                 old_catalog,
             )
-            for version in range(6, 16):
+            for version in range(6, 17):
                 old_values[f"platform:home-content:patch:v{version}:{patch_id}"] = json.dumps(
                     compact_detail
                 )
@@ -345,7 +374,14 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
             "platform:home-content:patch-assets-stale:v1": json.dumps(old_catalog),
             "platform:home-content:patch-assets-stale:v2": json.dumps(old_catalog),
         }
-        cache = _Cache({**old_values, **old_catalog_keys})
+        cache = _Cache(
+            {
+                **old_values,
+                **old_catalog_keys,
+                home_content.PATCH_ASSET_CATALOG_KEY: json.dumps(old_catalog),
+                home_content.PATCH_ASSET_CATALOG_STALE_KEY: json.dumps(old_catalog),
+            }
+        )
         requests: list[httpx.Request] = []
         steam_response_sizes: list[int] = []
         source_feed = json.dumps(
@@ -478,6 +514,10 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
         current_catalog = json.loads(cache.values[home_content.PATCH_ASSET_CATALOG_KEY])
         stale_catalog = json.loads(cache.values[home_content.PATCH_ASSET_CATALOG_STALE_KEY])
         self.assertEqual(current_catalog, stale_catalog)
+        self.assertEqual(
+            current_catalog["ability_stat_contract_version"],
+            home_content.ABILITY_STAT_CONTRACT_VERSION,
+        )
         self.assertEqual(len(requests), 9)
         self.assertEqual(
             current_catalog["objectives"]["mid_boss"]["icon_url"],
@@ -563,6 +603,20 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
             cached_key = home_content.PATCH_DETAIL_KEY_PREFIX + patch_id
             self.assertIn(cached_key, cache.values)
             updated_detail = json.loads(cache.values[cached_key])
+            for section in updated_detail["sections"]:
+                if section.get("kind") != "hero":
+                    continue
+                for ability in section.get("abilities") or []:
+                    if ability.get("presentation_kind") == "balance":
+                        self.assertNotIn("description", ability)
+                        self.assertNotIn("stats", ability)
+                    else:
+                        for stat in ability.get("stats") or []:
+                            self.assertTrue(stat.get("identity"))
+                            self.assertTrue(stat.get("type"))
+                            self.assertTrue(stat.get("unit"))
+                            if stat.get("tier") is not None:
+                                self.assertGreaterEqual(stat["tier"], 1)
             self.assertEqual(
                 translation_source_hash(registered_patches[patch_id]),
                 translation_source_hash(updated_detail),
@@ -742,11 +796,84 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
                 )
                 self.assertEqual(
                     sum(len(ability.get("stats") or []) for ability in nurse_intro["abilities"]),
-                    67,
+                    64,
                 )
                 self.assertFalse(
                     any(ability.get("stats_pending") for ability in nurse_intro["abilities"])
                 )
+                healing_needles = next(
+                    ability
+                    for ability in nurse_intro["abilities"]
+                    if ability.get("name") == "Healing Needles"
+                )
+                raw_healing_needles = next(
+                    item
+                    for item in catalog_inputs["items_english"]
+                    if item.get("class_name") == "ability_nurse_healing_needles"
+                )
+                raw_heal_regen = raw_healing_needles["properties"]["HealRegen"]
+                self.assertEqual(raw_heal_regen["value"], "22")
+                self.assertEqual(raw_heal_regen["scale_function"]["stat_scale"], 0.24)
+                self.assertEqual(raw_heal_regen["scale_function"]["specific_stat_scale_type"], "ETechPower")
+                stats = healing_needles["stats"]
+                base_heal = next(stat for stat in stats if stat.get("identity") == "heal_regen" and stat.get("tier") is None)
+                self.assertEqual(base_heal["value"], "22 + 0,24 × Спиритическая мощь")
+                self.assertEqual(base_heal["scaling"], {"stat": "ETechPower", "coefficient": "0.24", "function": "scale_function_healing_spirit_scale", "display": "additive", "label": "Спиритическая мощь"})
+                self.assertEqual((base_heal["type"], base_heal["unit"]), ("healing", "health"))
+                heal_scale = next(stat for stat in stats if stat.get("identity") == "heal_regen" and stat.get("tier") == 3)
+                self.assertEqual((heal_scale["type"], heal_scale["unit"], heal_scale["upgrade_type"]), ("scale", "coefficient", "add_to_scale"))
+                self.assertEqual(heal_scale["scaling"], {"stat": "ETechPower", "coefficient": "0.4", "function": "upgrade_add_to_scale", "display": "additive", "label": "Спиритическая мощь"})
+                self.assertIn("масштабирование", heal_scale["label"])
+                buff_extension = next(stat for stat in stats if stat.get("identity") == "buff_extend_percent_per_shot")
+                self.assertEqual((buff_extension["value"], buff_extension["type"], buff_extension["unit"]), ("+6 %", "percent", "percent"))
+                stamina_bonus = next(stat for stat in stats if stat.get("identity") == "stamina_restore_per_hit" and stat.get("tier") == 2)
+                self.assertEqual((stamina_bonus["value"], stamina_bonus["type"], stamina_bonus["unit"]), ("+0,6", "restoration", "stamina"))
+                self.assertFalse(any(stat.get("identity") == "ability_cooldown_between_charge" for stat in stats))
+                self.assertTrue(any(stat.get("value") == "0,15 %/с" for stat in stats))
+                raw_charge_rate_en = raw_healing_needles["properties"]["ChargeGenPctScale"]
+                raw_healing_needles_ru = next(
+                    item
+                    for item in catalog_inputs["items_russian"]
+                    if item.get("class_name") == "ability_nurse_healing_needles"
+                )
+                raw_charge_rate_ru = raw_healing_needles_ru["properties"]["ChargeGenPctScale"]
+                self.assertEqual(raw_charge_rate_en["label"], "Charge Rate")
+                self.assertEqual(raw_charge_rate_en["postfix"], "%")
+                self.assertEqual(raw_charge_rate_ru["label"], "Накопление зарядов")
+                charge_rate = next(stat for stat in stats if stat.get("identity") == "charge_gen_pct_scale")
+                self.assertEqual((charge_rate["label"], charge_rate["value"], charge_rate["type"], charge_rate["unit"]), ("Скорость накопления зарядов", "100 %", "percent", "percent"))
+                for key, expected_value in (
+                    ("AbilityCastDelay", "0.1"),
+                    ("AbilityCharges", "1"),
+                    ("BuildUpDuration", "5"),
+                    ("HeadshotHealBonusPercent", "15"),
+                ):
+                    self.assertEqual(raw_healing_needles["properties"][key]["value"], expected_value)
+                self.assertTrue(any(stat.get("identity") == "ability_cast_delay" and stat.get("value") == "0,1 с" for stat in stats))
+                self.assertTrue(any(stat.get("identity") == "ability_charges" and stat.get("value") == "1" for stat in stats))
+                self.assertTrue(any(stat.get("identity") == "build_up_duration" and stat.get("value") == "5 с" for stat in stats))
+                self.assertTrue(any(stat.get("identity") == "headshot_heal_bonus_percent" and stat.get("value") == "15 %" for stat in stats))
+                rutger_en = next(item for item in catalog_inputs["items_english"] if item.get("class_name") == "rutger_rocket")
+                rutger_ru = next(item for item in catalog_inputs["items_russian"] if item.get("class_name") == "rutger_rocket")
+                self.assertEqual(rutger_en["upgrades"][2]["property_upgrades"][0], {"bonus": -7.5, "name": "AbilityCooldown"})
+                rutger_stats = home_content._localized_ability_stats(rutger_en, rutger_ru)
+                self.assertTrue(any(stat.get("identity") == "ability_cooldown" and stat.get("tier") == 3 and stat.get("value") == "-7,5 с" for stat in rutger_stats))
+                baba_en = next(item for item in catalog_inputs["items_english"] if item.get("class_name") == "ability_baba_hexing_brew")
+                baba_ru = next(item for item in catalog_inputs["items_russian"] if item.get("class_name") == "ability_baba_hexing_brew")
+                self.assertIn("+33.33% Brew Effectiveness", baba_en["description"]["t3_desc"])
+                baba_t3 = baba_en["upgrades"][2]["property_upgrades"]
+                self.assertTrue(any(prop.get("upgrade_type") == "EMultiplyBase" and prop.get("bonus") == "33.33" for prop in baba_t3))
+                self.assertTrue(any(prop.get("upgrade_type") == "EMultiplyScale" and prop.get("bonus") == 1.3333 and prop.get("scale_stat_filter") == "ETechPower" for prop in baba_t3))
+                baba_stats = home_content._localized_ability_stats(baba_en, baba_ru)
+                self.assertTrue(any(stat.get("identity") == "damage_per_second" and stat.get("tier") == 3 and stat.get("value") == "+33,33 %" and stat.get("unit") == "percent" and stat.get("upgrade_type") == "multiply_base" for stat in baba_stats))
+                self.assertTrue(any(stat.get("identity") == "damage_per_second" and stat.get("tier") == 3 and stat.get("value") == "×1,3333" and stat.get("unit") == "multiplier" and stat.get("upgrade_type") == "multiply_scale" and stat.get("scaling", {}).get("stat") == "ETechPower" for stat in baba_stats))
+                ground_en = next(item for item in catalog_inputs["items_english"] if item.get("class_name") == "citadel_ability_lash_down_strike")
+                ground_ru = next(item for item in catalog_inputs["items_russian"] if item.get("class_name") == "citadel_ability_lash_down_strike")
+                self.assertIn("Damage Per Meter", ground_en["description"]["t3_desc"])
+                self.assertIn("+120%", ground_en["description"]["t3_desc"])
+                self.assertTrue(any(prop.get("name") == "StompDamagePerMeterPrimary" and prop.get("bonus") == "120" and prop.get("upgrade_type") == "EMultiplyBase" for prop in ground_en["upgrades"][2]["property_upgrades"]))
+                ground_stats = home_content._localized_ability_stats(ground_en, ground_ru)
+                self.assertTrue(any(stat.get("identity") == "stomp_damage_per_meter_primary" and stat.get("tier") == 3 and stat.get("value") == "+120 %" and stat.get("upgrade_type") == "multiply_base" for stat in ground_stats))
             self.assertEqual(
                 updated_detail["content"],
                 home_content._plain_text(

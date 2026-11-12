@@ -45,15 +45,18 @@
       "ability_cards": 4,
       "patch_id": "1846651706696737",
       "path": "sections[].abilities[].stats",
-      "stat_rows": 67,
-      "unchanged_verified": [
+      "stat_rows": 64,
+      "validated": [
         "owners",
         "ability names",
         "descriptions",
         "images",
         "row counts",
-        "stats_pending"
-      ]
+        "stats_pending",
+        "source-backed stat identity, type, unit, scaling, tier and upgrade operation",
+        "Charge Rate localized as a rate and formula spacing"
+      ],
+      "source_semantics": "raw catalog properties and upgrade operations; raw source descriptions verify percent and multiplier encoding"
     },
     {
       "patch_id": "1847920302240420",
@@ -100,10 +103,10 @@
     }
   ],
   "renderer_fixtures": {
-    "1846651706696737": "7a238716e178175b455b6aed62d33c84f69ea600de252783da50c334b3a786d7",
-    "1847920302240420": "28a058b28803db0021736ee0209775a3ef0635259e26ad124207db82b29302f8",
-    "1848664643339845": "35cd23b9343e5ec76a26aa0709d18ebbef4a9dd581b2faa3c14b0b8a548416af",
-    "1848664643342973": "7e17f338f1e74c96a537ba100e59aafab2c6c4f73ac9abd6a678a9828507315d"
+    "1846651706696737": "8aeec0abe2aa1202925a08423efe63127a00f8737ce3659c5a92e07036ef405d",
+    "1847920302240420": "c58d77584ff0983b6e41d082d2e17c4002be2d4f71e13e306987cdf3bc30d6e8",
+    "1848664643339845": "afb1cda19188f788167ac1b505e163041e4f7a88dec2359c6419a307dff60624",
+    "1848664643342973": "9553eed7ff08365300dca069c57453598adfe9a97bc19f9de324a1d118e32490"
   },
   "schema": 1,
   "source_news_fixture": {

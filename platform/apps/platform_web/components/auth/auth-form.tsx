@@ -35,6 +35,7 @@ type CredentialSubmission = {
   password: string;
   displayName: string;
 };
+type SubmitCredentials = (credentials: CredentialSubmission, token: string | null) => Promise<void>;
 
 export function AuthForm({ mode, returnTo, steamAuthError = false, googleAuthError = false }: AuthFormProps) {
   const { clearUser, setUser } = useAuth();
@@ -62,6 +63,7 @@ export function AuthForm({ mode, returnTo, steamAuthError = false, googleAuthErr
   const turnstileAction: TurnstileAction = mode;
   const [turnstileChallengeRequired, setTurnstileChallengeRequired] = useState(false);
   const pendingChallengeSubmission = useRef<CredentialSubmission | null>(null);
+  const submitCredentialsRef = useRef<SubmitCredentials | null>(null);
   const authFormActive = useRef(true);
   const lastSubmittedTurnstileToken = useRef<string | null>(null);
   const rejectedTokenRetryUsed = useRef(false);
@@ -94,6 +96,10 @@ export function AuthForm({ mode, returnTo, steamAuthError = false, googleAuthErr
   }, [turnstileMode, turnstileSiteKey]);
 
   useEffect(() => {
+    submitCredentialsRef.current = submitCredentials;
+  }, [submitCredentials]);
+
+  useEffect(() => {
     const pendingSubmission = pendingChallengeSubmission.current;
     if (
       !turnstileToken
@@ -112,9 +118,9 @@ export function AuthForm({ mode, returnTo, steamAuthError = false, googleAuthErr
     lastSubmittedTurnstileToken.current = turnstileToken;
     pendingChallengeSubmission.current = null;
     startTransition(async () => {
-      await submitCredentials(pendingSubmission, turnstileToken);
+      await submitCredentialsRef.current?.(pendingSubmission, turnstileToken);
     });
-  }, [startTransition, submitCredentials, t, turnstileToken]);
+  }, [startTransition, t, turnstileToken]);
 
   async function submitCredentials(credentials: CredentialSubmission, token: string | null) {
     try {
@@ -160,13 +166,23 @@ export function AuthForm({ mode, returnTo, steamAuthError = false, googleAuthErr
       }
       const requiresHumanVerification = isHumanVerificationRequired(error);
       const rejectedTurnstileToken = isHumanVerificationRejected(error);
-      setErrorMessage(requiresHumanVerification ? "" : authErrorMessage(error, false, isRegister, t));
+      const canRetryRejectedToken = Boolean(
+        turnstileSiteKey
+        && token
+        && rejectedTurnstileToken
+        && !rejectedTokenRetryUsed.current
+      );
+      setErrorMessage(
+        requiresHumanVerification || canRetryRejectedToken
+          ? ""
+          : authErrorMessage(error, false, isRegister, t)
+      );
       if (turnstileSiteKey) {
         if (requiresHumanVerification) {
           pendingChallengeSubmission.current = credentials;
           setTurnstileChallengeRequired(true);
           rejectedTokenRetryUsed.current = false;
-        } else if (token && rejectedTurnstileToken && !rejectedTokenRetryUsed.current) {
+        } else if (canRetryRejectedToken) {
           // Keep the submitted intent for one fresh, server-validated token.
           // Repeated rejection stops automatic retries and requires an
           // explicit user submit after the next challenge succeeds.

@@ -414,8 +414,8 @@ its own sequential one-worker contour and explicit desktop/mobile projects in
 Do not infer viewport ownership from a test name or silently add an exclusion;
 update the owning config and its contract test when the matrix changes.
 
-Raw SSR metadata in `apps/platform_web/tests/smoke/platform-routes.spec.ts` comes from full-document `page.goto()` responses.
-SPA flows check client URLs and hydrated DOM, preserving project/auth/fixture coverage without a second raw request.
+The `platform-routes.spec.ts` suite owns raw SSR (`page.goto()`), SPA URL/DOM,
+and password-login Turnstile coverage: pending login stays alert-free; rejected retries keep actionable errors visible.
 
 ## Local and GitHub verification
 

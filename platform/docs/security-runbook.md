@@ -2,7 +2,7 @@
 
 - Status: Active how-to and policy
 - Owner: Security and production operator
-- Last reviewed: 2026-09-04
+- Last reviewed: 2026-11-12
 
 ## Security invariants
 
@@ -18,6 +18,9 @@
 - A successful Turnstile check creates a fixed-term, opaque browser trust grant
   backed by Redis. It is shared by password login, registration and
   password-reset request flows; the one-time Turnstile token is never reused.
+- A rejected one-time token may trigger one automatic fresh-token retry.
+  Pending challenge and login states stay neutral; report a Turnstile error
+  only when the retry or another terminal auth request fails.
 - Steam OpenID and optional Google OAuth login/registration use provider-bound,
   single-use callback state and independent rate limits. They do not require a
   second Turnstile check after the ordinary auth form.

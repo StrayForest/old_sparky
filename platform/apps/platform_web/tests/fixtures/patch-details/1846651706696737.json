@@ -2,17 +2,18 @@
   "id": "1846651706696737",
   "title": "Shh... This Won't Hurt a Bit.",
   "published_at": "2026-10-20T20:59:53Z",
-  "url": "",
-  "content": "",
-  "hero_metadata_pending": false,
+  "url": "https://steamstore-a.akamaihd.net/news/externalpost/steam_community_announcements/1846651706696737",
+  "content": "It's hard to know if that chill in the air is from the approaching fall breeze, or from the withering glare of Nurse Harrow, who now joins us on the streets of Manhattan. To some, her practices may seem unorthodox, her patients at the Marble Hill Possession Ward cannot say that the results aren't effective. With Leech Therapy, she throws a jar full of leeches that attach to oncoming enemies, draining their health and energy, before crawling back to deliver their haul. Cracking open one of her vials, she releases her Wretched Vapors, possessing her allies with a powerful boost of effectiveness - though subjects should be warned of the side effects when the vapors wear off. To efficiently keep her teammates fighting their best, she loads her syringe full of Healing Needles to inject medicine directly into their veins. And when her patience runs out, she opens her bag to release all the Lurking Terrors captured inside, making her adversaries run for cover. - \"Trust me, I know best.\"\nWith Nurse Harrow joining us today, that marks the end of our City Never Sleeps releases. We want to thank everyone for participating in voting once again, and hope you've been enjoying all the new delights that NYC has to offer.\nCity Never Sleeps Voting Stats:\n- Big Turnout: Over 110 Million votes were cast over the course of the event.\n- Narrow Victory: The closest contest was Baba vs Solomon, decided by a nearly 0.5% difference in votes.\n- Oracle: Only 847 players voted in every round, and only voted for that round's eventual winner.\n- Unlucky: 36,236 players voted in every round, and never once picked that round's winner.\n- Dedication: 22,194 players exclusively voted for Nurse Harrow. One player cast exactly 1000 votes for her.\n- Highly Effective: Nurse Harrow voters consistently proved to have a higher win rate over all other hero voters.",
   "sections": [
     {
       "kind": "general",
       "title": "Общие изменения",
       "hero_name": null,
       "hero_display_name": null,
-      "hero_presentation_kind": null,
       "hero_image_url": null,
+      "hero_image_candidates": [],
+      "hero_presentation_kind": null,
+      "mode_name": null,
       "hero_description": null,
       "hero_metadata_pending": false,
       "item_name": null,
@@ -31,16 +32,22 @@
         "Dedication: 22,194 players exclusively voted for Nurse Harrow. One player cast exactly 1000 votes for her.",
         "Highly Effective: Nurse Harrow voters consistently proved to have a higher win rate over all other hero voters."
       ],
-      "abilities": [],
-      "hero_image_candidates": []
+      "abilities": []
     },
     {
       "kind": "hero",
       "title": "Nurse Harrow",
       "hero_name": "Nurse Harrow",
       "hero_display_name": "Сестра Хэрроу",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/nurse.webp",
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/nurse.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_sm.webp"
+      ],
       "hero_presentation_kind": "introduction",
-      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_card.webp",
+      "mode_name": null,
       "hero_description": "Высокоуважаемая сестра Хэрроу, на которой держится всё отделение для одержимых в Марбл-Хил, посвятила свою жизнь борьбе с ужасами сверхъестественного. Сочетая в себе заботу, строгость и отстранённый прагматизм, она заслужила среди пациентов славу как святой, так и жестокой мадмуазели. Вероятно, одно другому не мешает.\nИ хотя любой здравомыслящий человек задался бы вопросом, как и зачем Хэрроу хранит боль своих подопечных в медицинском саквояже, никто не станет оспаривать результативность её методов, какими бы жестокими они ни были...",
       "hero_metadata_pending": false,
       "item_name": null,
@@ -58,67 +65,177 @@
           "stats": [
             {
               "label": "Задержка применения",
-              "value": "0.1 с."
+              "value": "0,1 с",
+              "identity": "ability_cast_delay",
+              "type": "duration",
+              "unit": "seconds",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Перезарядка",
-              "value": "30 с."
+              "value": "30 с",
+              "identity": "ability_cooldown",
+              "type": "duration",
+              "unit": "seconds",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Длительность",
-              "value": "5 с."
+              "value": "5 с",
+              "identity": "ability_duration",
+              "type": "duration",
+              "unit": "seconds",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Урон в секунду",
-              "value": "23.0"
+              "value": "23,0",
+              "identity": "d_p_s",
+              "type": "scalar",
+              "unit": "source_unspecified",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Скорострельность за пиявку",
-              "value": "5 %"
+              "value": "5 %",
+              "identity": "fire_rate_per_leech_pickup",
+              "type": "percent",
+              "unit": "percent",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Дальность передвижения пиявок",
-              "value": "8m"
+              "value": "8 м",
+              "identity": "leech_crawl_radius",
+              "type": "distance",
+              "unit": "meters",
+              "tier": null,
+              "scaling": {
+                "stat": "ELevelUpBoons",
+                "coefficient": "1.3",
+                "function": "scale_function_multi_stats"
+              },
+              "upgrade_type": null
             },
             {
               "label": "Уменьшение длительности полож. эффектов в сек.",
-              "value": "0.65 сек."
+              "value": "0,65 с",
+              "identity": "leech_eat_duration_per_second",
+              "type": "duration",
+              "unit": "seconds",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Макс. число пиявок",
-              "value": "10"
+              "value": "10",
+              "identity": "max_leech_bonus_stacks",
+              "type": "scalar",
+              "unit": "source_unspecified",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "радиус",
-              "value": "6.5m"
+              "value": "6,5 м",
+              "identity": "radius",
+              "type": "distance",
+              "unit": "meters",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Восстановление здоровья за пиявку",
-              "value": "0.6"
+              "value": "0,6",
+              "identity": "regen_per_leech_pickup",
+              "type": "scalar",
+              "unit": "source_unspecified",
+              "tier": null,
+              "scaling": {
+                "stat": "ELevelUpBoons",
+                "coefficient": "0.13",
+                "function": "scale_function_single_stat"
+              },
+              "upgrade_type": null
             },
             {
-              "label": "T1 · Высасывание выносливости",
-              "value": "+0.3"
+              "label": "Высасывание выносливости",
+              "value": "+0,3 /сек.",
+              "identity": "leech_stamina_drain",
+              "type": "scalar",
+              "unit": "source_unspecified",
+              "tier": 1,
+              "scaling": null,
+              "upgrade_type": "add"
             },
             {
-              "label": "T2 · Перезарядка",
-              "value": "-10"
+              "label": "Перезарядка",
+              "value": "-10 с",
+              "identity": "ability_cooldown",
+              "type": "duration",
+              "unit": "seconds",
+              "tier": 2,
+              "scaling": null,
+              "upgrade_type": "add"
             },
             {
-              "label": "T2 · Спиритическая мощь за пиявку",
-              "value": "+4"
+              "label": "Спиритическая мощь за пиявку",
+              "value": "+4",
+              "identity": "spirit_power_per_leech_stack",
+              "type": "scalar",
+              "unit": "source_unspecified",
+              "tier": 2,
+              "scaling": null,
+              "upgrade_type": "add"
             },
             {
-              "label": "T3 · Макс. число пиявок",
-              "value": "+8"
+              "label": "Макс. число пиявок",
+              "value": "+8",
+              "identity": "max_leech_bonus_stacks",
+              "type": "scalar",
+              "unit": "source_unspecified",
+              "tier": 3,
+              "scaling": null,
+              "upgrade_type": "add"
             },
             {
-              "label": "T3 · Урон в секунду",
-              "value": "+0.3"
+              "label": "Урон в секунду · масштабирование (Спиритическая мощь)",
+              "value": "+0,3",
+              "identity": "d_p_s",
+              "type": "scale",
+              "unit": "coefficient",
+              "tier": 3,
+              "scaling": {
+                "stat": "ETechPower",
+                "coefficient": "0.3",
+                "function": "upgrade_add_to_scale",
+                "display": "additive",
+                "label": "Спиритическая мощь"
+              },
+              "upgrade_type": "add_to_scale"
             },
             {
-              "label": "T3 · радиус",
-              "value": "+1m"
+              "label": "радиус",
+              "value": "+1 м",
+              "identity": "radius",
+              "type": "distance",
+              "unit": "meters",
+              "tier": 3,
+              "scaling": null,
+              "upgrade_type": "add"
             }
           ],
           "stats_pending": false,
@@ -133,63 +250,151 @@
           "stats": [
             {
               "label": "Задержка применения",
-              "value": "0.2 с."
+              "value": "0,2 с",
+              "identity": "ability_cast_delay",
+              "type": "duration",
+              "unit": "seconds",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Дальность применения",
-              "value": "13m"
+              "value": "13 м",
+              "identity": "ability_cast_range",
+              "type": "distance",
+              "unit": "meters",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Перезарядка",
-              "value": "40 с."
-            },
-            {
-              "label": "Интервал зарядов",
-              "value": "-1.0 с."
+              "value": "40 с",
+              "identity": "ability_cooldown",
+              "type": "duration",
+              "unit": "seconds",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Длительность",
-              "value": "4 с."
+              "value": "4 с",
+              "identity": "ability_duration",
+              "type": "duration",
+              "unit": "seconds",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Длительность шока",
-              "value": "4 сек."
+              "value": "4 с",
+              "identity": "crash_duration",
+              "type": "duration",
+              "unit": "seconds",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Замедление при шоке",
-              "value": "20 %"
+              "value": "20 %",
+              "identity": "crash_time_scale_penalty_percent",
+              "type": "percent",
+              "unit": "percent",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Дополнительный получаемый урон",
-              "value": "30 %"
+              "value": "30 %",
+              "identity": "deferred_damage_bonus_percent",
+              "type": "percent",
+              "unit": "percent",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Отложенный урон",
-              "value": "100 %"
+              "value": "100 %",
+              "identity": "deferred_damage_percent",
+              "type": "percent",
+              "unit": "percent",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Скорость в горячке",
-              "value": "25 %"
+              "value": "25 %",
+              "identity": "rush_time_scale_bonus_percent",
+              "type": "percent",
+              "unit": "percent",
+              "tier": null,
+              "scaling": {
+                "stat": "ETechPower",
+                "coefficient": "0.06",
+                "function": "scale_function_single_stat"
+              },
+              "upgrade_type": null
             },
             {
-              "label": "T1 · Перезарядка",
-              "value": "-15"
+              "label": "Перезарядка",
+              "value": "-15 с",
+              "identity": "ability_cooldown",
+              "type": "duration",
+              "unit": "seconds",
+              "tier": 1,
+              "scaling": null,
+              "upgrade_type": "add"
             },
             {
-              "label": "T1 · Дальность применения",
-              "value": "+7m"
+              "label": "Дальность применения",
+              "value": "+7 м",
+              "identity": "ability_cast_range",
+              "type": "distance",
+              "unit": "meters",
+              "tier": 1,
+              "scaling": null,
+              "upgrade_type": "add"
             },
             {
-              "label": "T2 · Длительность",
-              "value": "+1"
+              "label": "Длительность",
+              "value": "+1 с",
+              "identity": "ability_duration",
+              "type": "duration",
+              "unit": "seconds",
+              "tier": 2,
+              "scaling": null,
+              "upgrade_type": "add"
             },
             {
-              "label": "T2 · Получаемое лечение",
-              "value": "+20"
+              "label": "Получаемое лечение",
+              "value": "+20 %",
+              "identity": "healing_effectiveness_percent",
+              "type": "percent",
+              "unit": "percent",
+              "tier": 2,
+              "scaling": null,
+              "upgrade_type": "add"
             },
             {
-              "label": "T3 · Скорость в горячке",
-              "value": "+20"
+              "label": "Скорость в горячке",
+              "value": "+20 %",
+              "identity": "rush_time_scale_bonus_percent",
+              "type": "percent",
+              "unit": "percent",
+              "tier": 3,
+              "scaling": {
+                "stat": "ETechPower",
+                "coefficient": "0.06",
+                "function": "scale_function_single_stat"
+              },
+              "upgrade_type": "add"
             }
           ],
           "stats_pending": false,
@@ -204,55 +409,144 @@
           "stats": [
             {
               "label": "Задержка применения",
-              "value": "0.1 с."
+              "value": "0,1 с",
+              "identity": "ability_cast_delay",
+              "type": "duration",
+              "unit": "seconds",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Заряды",
-              "value": "1"
-            },
-            {
-              "label": "Интервал зарядов",
-              "value": "-1.0 с."
+              "value": "1",
+              "identity": "ability_charges",
+              "type": "count",
+              "unit": "count",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Длительность накопления",
-              "value": "5 сек."
+              "value": "5 с",
+              "identity": "build_up_duration",
+              "type": "duration",
+              "unit": "seconds",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
-              "label": "Накопление зарядов",
-              "value": "100 %"
+              "label": "Скорость накопления зарядов",
+              "value": "100 %",
+              "identity": "charge_gen_pct_scale",
+              "type": "percent",
+              "unit": "percent",
+              "tier": null,
+              "scaling": {
+                "stat": "ETechCooldown",
+                "coefficient": "-1.0",
+                "function": "scale_function_single_stat"
+              },
+              "upgrade_type": null
             },
             {
               "label": "Восстановление зарядов за пиявку",
-              "value": "0.15 %/сек."
+              "value": "0,15 %/с",
+              "identity": "charge_percent_per_second_per_leech",
+              "type": "rate",
+              "unit": "percent_per_second",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Бонус к лечению за попадание в голову",
-              "value": "15 %"
+              "value": "15 %",
+              "identity": "headshot_heal_bonus_percent",
+              "type": "percent",
+              "unit": "percent",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Лечение за выстрел",
-              "value": "22"
+              "value": "22 + 0,24 × Спиритическая мощь",
+              "identity": "heal_regen",
+              "type": "healing",
+              "unit": "health",
+              "tier": null,
+              "scaling": {
+                "stat": "ETechPower",
+                "coefficient": "0.24",
+                "function": "scale_function_healing_spirit_scale",
+                "display": "additive",
+                "label": "Спиритическая мощь"
+              },
+              "upgrade_type": null
             },
             {
-              "label": "T1 · Заряды",
-              "value": "+1"
+              "label": "Заряды",
+              "value": "+1",
+              "identity": "ability_charges",
+              "type": "count",
+              "unit": "count",
+              "tier": 1,
+              "scaling": null,
+              "upgrade_type": "add"
             },
             {
-              "label": "T2 · Выносливость за выстрел",
-              "value": "+0.6"
+              "label": "Выносливость за выстрел",
+              "value": "+0,6",
+              "identity": "stamina_restore_per_hit",
+              "type": "restoration",
+              "unit": "stamina",
+              "tier": 2,
+              "scaling": null,
+              "upgrade_type": "add"
             },
             {
-              "label": "T2 · Лечение за выстрел",
-              "value": "+16"
+              "label": "Лечение за выстрел",
+              "value": "+16",
+              "identity": "heal_regen",
+              "type": "healing",
+              "unit": "health",
+              "tier": 2,
+              "scaling": {
+                "stat": "ETechPower",
+                "coefficient": "0.24",
+                "function": "scale_function_healing_spirit_scale",
+                "display": "additive"
+              },
+              "upgrade_type": "add"
             },
             {
-              "label": "T3 · Лечение за выстрел",
-              "value": "+0.4"
+              "label": "Лечение за выстрел · масштабирование (Спиритическая мощь)",
+              "value": "+0,4",
+              "identity": "heal_regen",
+              "type": "scale",
+              "unit": "coefficient",
+              "tier": 3,
+              "scaling": {
+                "stat": "ETechPower",
+                "coefficient": "0.4",
+                "function": "upgrade_add_to_scale",
+                "display": "additive",
+                "label": "Спиритическая мощь"
+              },
+              "upgrade_type": "add_to_scale"
             },
             {
-              "label": "T3 · к длительности положительных эффектов за выстрел",
-              "value": "+6"
+              "label": "к длительности положительных эффектов за выстрел",
+              "value": "+6 %",
+              "identity": "buff_extend_percent_per_shot",
+              "type": "percent",
+              "unit": "percent",
+              "tier": 3,
+              "scaling": null,
+              "upgrade_type": "add"
             }
           ],
           "stats_pending": false,
@@ -267,108 +561,237 @@
           "stats": [
             {
               "label": "Задержка применения",
-              "value": "1.3 с."
+              "value": "1,3 с",
+              "identity": "ability_cast_delay",
+              "type": "duration",
+              "unit": "seconds",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Дальность применения",
-              "value": "35m"
+              "value": "35 м",
+              "identity": "ability_cast_range",
+              "type": "distance",
+              "unit": "meters",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Длительность применения",
-              "value": "7.0 с."
+              "value": "7,0 с",
+              "identity": "ability_channel_time",
+              "type": "duration",
+              "unit": "seconds",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Перезарядка",
-              "value": "200.0 с."
-            },
-            {
-              "label": "Интервал зарядов",
-              "value": "-1.0 с."
+              "value": "200,0 с",
+              "identity": "ability_cooldown",
+              "type": "duration",
+              "unit": "seconds",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Ускорение в воздухе",
-              "value": "-50 %"
+              "value": "-50 %",
+              "identity": "air_control_accel_percent",
+              "type": "percent",
+              "unit": "percent",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Время затухания страха",
-              "value": "10.0 сек."
+              "value": "10,0 с",
+              "identity": "buildup_decay_time",
+              "type": "duration",
+              "unit": "seconds",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Угол взгляда",
-              "value": "80 °"
+              "value": "80 °",
+              "identity": "buildup_look_angle",
+              "type": "scalar",
+              "unit": "source_unspecified",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Время накопления страха",
-              "value": "1.75 сек."
+              "value": "1,75 с",
+              "identity": "buildup_time",
+              "type": "duration",
+              "unit": "seconds",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Угол зоны применения",
-              "value": "180 °"
+              "value": "180 °",
+              "identity": "cone_angle",
+              "type": "scalar",
+              "unit": "source_unspecified",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Урон в секунду",
-              "value": "60"
+              "value": "60",
+              "identity": "d_p_s",
+              "type": "scalar",
+              "unit": "source_unspecified",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Длительность страха",
-              "value": "2.2 сек."
+              "value": "2,2 с",
+              "identity": "debuff_duration",
+              "type": "duration",
+              "unit": "seconds",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Длительность страха за пиявку",
-              "value": "0.1 сек."
+              "value": "0,1 с",
+              "identity": "fear_duration_per_leech_stack",
+              "type": "duration",
+              "unit": "seconds",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Скорострельность",
-              "value": "30 %"
+              "value": "30 %",
+              "identity": "fire_rate_slow",
+              "type": "percent",
+              "unit": "percent",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Задержка блокировки выносливости",
-              "value": "0.3 сек."
+              "value": "0,3 с",
+              "identity": "gaze_linger_duration",
+              "type": "duration",
+              "unit": "seconds",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
               "label": "Скорость передвижения",
-              "value": "30 %"
+              "value": "30 %",
+              "identity": "slow_percent",
+              "type": "percent",
+              "unit": "percent",
+              "tier": null,
+              "scaling": null,
+              "upgrade_type": null
             },
             {
-              "label": "T1 · Перезарядка",
-              "value": "-50"
+              "label": "Перезарядка",
+              "value": "-50 с",
+              "identity": "ability_cooldown",
+              "type": "duration",
+              "unit": "seconds",
+              "tier": 1,
+              "scaling": null,
+              "upgrade_type": "add"
             },
             {
-              "label": "T2 · Скорость передвижения",
-              "value": "+20"
+              "label": "Скорость передвижения",
+              "value": "+20 %",
+              "identity": "slow_percent",
+              "type": "percent",
+              "unit": "percent",
+              "tier": 2,
+              "scaling": null,
+              "upgrade_type": "add"
             },
             {
-              "label": "T2 · Скорострельность",
-              "value": "+20"
+              "label": "Скорострельность",
+              "value": "+20 %",
+              "identity": "fire_rate_slow",
+              "type": "percent",
+              "unit": "percent",
+              "tier": 2,
+              "scaling": null,
+              "upgrade_type": "add"
             },
             {
-              "label": "T2 · Урон в секунду",
-              "value": "+30"
+              "label": "Урон в секунду",
+              "value": "+30",
+              "identity": "d_p_s",
+              "type": "scalar",
+              "unit": "source_unspecified",
+              "tier": 2,
+              "scaling": null,
+              "upgrade_type": "add"
             },
             {
-              "label": "T3 · Сопр. урону при подготовке",
-              "value": "+50"
+              "label": "Сопр. урону при подготовке",
+              "value": "+50 %",
+              "identity": "damage_resist_pct_while_channeling",
+              "type": "percent",
+              "unit": "percent",
+              "tier": 3,
+              "scaling": null,
+              "upgrade_type": "add"
             },
             {
-              "label": "T3 · Длительность применения",
-              "value": "+3.0"
+              "label": "Длительность применения",
+              "value": "+3,0 с",
+              "identity": "ability_channel_time",
+              "type": "duration",
+              "unit": "seconds",
+              "tier": 3,
+              "scaling": null,
+              "upgrade_type": "add"
             },
             {
-              "label": "T3 · Урон в секунду",
-              "value": "+0.5"
+              "label": "Урон в секунду · масштабирование (Спиритическая мощь)",
+              "value": "+0,5",
+              "identity": "d_p_s",
+              "type": "scale",
+              "unit": "coefficient",
+              "tier": 3,
+              "scaling": {
+                "stat": "ETechPower",
+                "coefficient": "0.5",
+                "function": "upgrade_add_to_scale",
+                "display": "additive",
+                "label": "Спиритическая мощь"
+              },
+              "upgrade_type": "add_to_scale"
             }
           ],
           "stats_pending": false,
           "icon_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/nurse/medicine_bag.png",
           "changes": []
         }
-      ],
-      "hero_image_candidates": [
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_card.webp",
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_card.png",
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_sm.webp",
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_sm.png"
       ]
     }
-  ]
+  ],
+  "hero_metadata_pending": false
 }

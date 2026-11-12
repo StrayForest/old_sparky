@@ -145,6 +145,7 @@ class PatchSitemapProjectionTests(PlatformIsolatedAsyncioTestCase):
             "objectives": {},
             "hero_image_candidates_version": home_content.HERO_IMAGE_CANDIDATES_VERSION,
             "hero_image_candidates_pending": False,
+            "ability_stat_contract_version": home_content.ABILITY_STAT_CONTRACT_VERSION,
         }
         cache = _Cache()
         events: list[str] = []

@@ -570,6 +570,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
             "objectives": {},
             "hero_image_candidates_version": home_content.HERO_IMAGE_CANDIDATES_VERSION,
             "hero_image_candidates_pending": False,
+            "ability_stat_contract_version": home_content.ABILITY_STAT_CONTRACT_VERSION,
         }
         asset_fetch = AsyncMock(return_value=fresh_catalog)
         with (
@@ -587,7 +588,10 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
             await home_content_security.refresh_home_content(force=True, force_asset_refresh=False)
 
         asset_fetch.assert_awaited_once()
-        self.assertEqual(asset_fetch.await_args.kwargs["previous_catalog"], legacy_catalog)
+        self.assertEqual(
+            asset_fetch.await_args.kwargs["previous_catalog"],
+            {**legacy_catalog, "_ability_stat_contract_current": False},
+        )
         stored_keys = [call[0][0] for call in cache.pipeline_instance.set_calls]
         self.assertIn(home_content.PATCH_ASSET_CATALOG_KEY, stored_keys)
         self.assertIn(home_content.PATCH_ASSET_CATALOG_STALE_KEY, stored_keys)
@@ -720,6 +724,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
             home_content.HERO_IMAGE_CANDIDATES_VERSION
         )
         fresh_catalog["hero_image_candidates_pending"] = False
+        fresh_catalog["ability_stat_contract_version"] = home_content.ABILITY_STAT_CONTRACT_VERSION
         fresh_catalog["heroes"]["nurse harrow"]["hero_image_candidates"] = [
             "https://assets-bucket.deadlock-api.com/nurse.webp"
         ]
@@ -728,7 +733,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
         ] = False
         fresh_catalog["heroes"]["nurse harrow"]["abilities"]["leech therapy"][
             "stats"
-        ] = [{"label": "Задержка применения", "value": "0.2 с."}]
+        ] = [{"label": "Задержка применения", "value": "0,2 с", "identity": "ability_cast_delay", "type": "duration", "unit": "seconds", "tier": None, "scaling": None, "upgrade_type": None}]
         retry_cache = _Cache(
             {
                 home_content.HOME_CONTENT_STALE_KEY: json.dumps(feed),
@@ -1136,9 +1141,42 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
             },
         )
 
-        self.assertEqual(stats, [{"label": "Урон", "value": "40"}])
+        self.assertEqual(len(stats), 1)
+        self.assertEqual((stats[0]["label"], stats[0]["value"]), ("Урон", "40"))
+        self.assertEqual(stats[0]["identity"], "damage")
+        self.assertEqual((stats[0]["type"], stats[0]["unit"]), ("scalar", "source_unspecified"))
 
     def test_ability_stats_readiness_tracks_unknown_partial_complete_and_empty(self) -> None:
+        legacy_warm_catalog = {
+            "hero_image_candidates_version": home_content.HERO_IMAGE_CANDIDATES_VERSION,
+            "hero_image_candidates_pending": False,
+            "heroes": {"nurse harrow": {"abilities": {"healing needles": {"stats": [{"label": "Лечение за выстрел", "value": "22"}], "stats_pending": False}}}},
+        }
+        self.assertTrue(home_content._asset_catalog_has_current_hero_image_candidates(legacy_warm_catalog))
+        self.assertFalse(home_content._asset_catalog_is_ready(legacy_warm_catalog))
+        legacy_intro = {
+            "abilities": [
+                {
+                    "name": "Healing Needles",
+                    "stats": [{"label": "Лечение за выстрел", "value": "22"}],
+                    "stats_pending": False,
+                    "changes": [],
+                }
+            ]
+        }
+        patch_detail._set_ability_presentation(
+            legacy_intro,
+            hero_introduction=True,
+            stat_contract_verified=False,
+        )
+        self.assertEqual(legacy_intro["abilities"][0]["stats"], [])
+        self.assertTrue(legacy_intro["abilities"][0]["stats_pending"])
+        current_catalog = {
+            **legacy_warm_catalog,
+            "ability_stat_contract_version": home_content.ABILITY_STAT_CONTRACT_VERSION,
+            "heroes": {"nurse harrow": {"abilities": {"healing needles": {"stats": [{"label": "Лечение за выстрел", "value": "22", "identity": "heal_regen", "type": "healing", "unit": "health", "tier": None, "scaling": None, "upgrade_type": None}], "stats_pending": False}}}},
+        }
+        self.assertTrue(home_content._asset_catalog_is_ready(current_catalog))
         english = {
             "properties": {
                 "AbilityCooldown": {"label": "Cooldown", "value": "30", "postfix": "s"},
@@ -1162,8 +1200,11 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
         self.assertFalse(home_content._ability_stats_pending({"properties": {}}, {}))
         self.assertTrue(home_content._ability_stats_pending(english, cooldown_only))
         self.assertEqual(
-            home_content._localized_ability_stats(english, cooldown_only),
-            [{"label": "Перезарядка", "value": "30 с."}],
+            [
+                (item["label"], item["value"], item["identity"], item["type"], item["unit"])
+                for item in home_content._localized_ability_stats(english, cooldown_only)
+            ],
+            [("Перезарядка", "30 с", "ability_cooldown", "duration", "seconds")],
         )
         self.assertFalse(home_content._ability_stats_pending(english, complete))
         self.assertFalse(
@@ -1173,10 +1214,13 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
             )
         )
         self.assertEqual(
-            home_content._localized_ability_stats(english, complete),
             [
-                {"label": "Перезарядка", "value": "30 с."},
-                {"label": "Задержка применения", "value": "0.2 с."},
+                (item["label"], item["value"], item["identity"], item["type"], item["unit"])
+                for item in home_content._localized_ability_stats(english, complete)
+            ],
+            [
+                ("Перезарядка", "30 с", "ability_cooldown", "duration", "seconds"),
+                ("Задержка применения", "0,2 с", "ability_cast_delay", "duration", "seconds"),
             ],
         )
         self.assertEqual(
@@ -1184,7 +1228,76 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
                 {"properties": {"DamagePerSecond": {"label": "Damage Per Second", "value": "125"}}},
                 {"properties": {"DamagePerSecond": {"label": "DPS", "value": "125"}}},
             ),
-            [{"label": "DPS", "value": "125"}],
+            [
+                {
+                    "label": "DPS",
+                    "value": "125",
+                    "identity": "damage_per_second",
+                    "type": "scalar",
+                    "unit": "source_unspecified",
+                    "tier": None,
+                    "scaling": None,
+                    "upgrade_type": None,
+                }
+            ],
+        )
+        english = {
+            "properties": {
+                "AbilityCooldownBetweenCharge": {
+                    "label": "Charge Delay",
+                    "value": "-1",
+                    "postfix": "s",
+                    "disable_value": "-2",
+                },
+                "AbilityCooldown": {
+                    "label": "Cooldown",
+                    "value": "30",
+                    "postfix": "s",
+                },
+                "CastDelay": {"label": "Cast Delay", "value": "0.1", "postfix": "s"},
+            },
+            "upgrades": [
+                {"property_upgrades": [{"name": "AbilityCooldown", "bonus": "-7.5", "upgrade_type": "EAdd"}]}
+            ],
+        }
+        localized = {
+            "properties": {
+                "AbilityCooldownBetweenCharge": {"label": "Интервал зарядов", "value": "-1", "postfix": " с."},
+                "AbilityCooldown": {"label": "Перезарядка", "value": "30", "postfix": " с."},
+                "CastDelay": {"label": "Задержка применения", "value": "0.1", "postfix": " с."},
+            }
+        }
+        stats = home_content._localized_ability_stats(english, localized)
+        self.assertEqual(len(stats), 3)
+        self.assertFalse(any(stat["identity"] == "ability_cooldown_between_charge" for stat in stats))
+        upgrade = stats[-1]
+        self.assertEqual(upgrade["value"], "-7,5 с")
+        self.assertEqual((upgrade["type"], upgrade["unit"], upgrade["tier"]), ("duration", "seconds", 1))
+        self.assertEqual(upgrade["upgrade_type"], "add")
+        self.assertFalse(home_content._ability_stats_pending(english, localized))
+        cast_delay = next(stat for stat in stats if stat["identity"] == "cast_delay")
+        self.assertEqual(cast_delay["value"], "0,1 с")
+        rate_stats = home_content._localized_ability_stats(
+            {"properties": {"ChargePercentPerSecondPerLeech": {"label": "Charge Per Leech", "value": "0.15", "postfix": "%/s"}}},
+            {"properties": {"ChargePercentPerSecondPerLeech": {"label": "Заряд за пиявку", "value": "0.15", "postfix": "%/сек"}}},
+        )
+        self.assertEqual(rate_stats[0]["value"], "0,15 %/с")
+        self.assertEqual((rate_stats[0]["type"], rate_stats[0]["unit"]), ("rate", "percent_per_second"))
+        english = {
+            "properties": {"DamagePerSecond": {"value": "10", "label": "Damage Per Second"}},
+            "upgrades": [
+                {"property_upgrades": [{"name": "DamagePerSecond", "bonus": "1.2", "upgrade_type": "EUnknownFutureOp"}]}
+            ],
+        }
+        localized = {
+            "properties": {"DamagePerSecond": {"value": "10", "label": "Урон в секунду"}}
+        }
+        self.assertTrue(home_content._ability_stats_pending(english, localized))
+        self.assertFalse(
+            any(
+                stat.get("tier") == 1
+                for stat in home_content._localized_ability_stats(english, localized)
+            )
         )
 
     def test_introduction_includes_source_backed_localized_ability_stats(self) -> None:
@@ -1293,10 +1406,10 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(
             ability["stats"],
             [
-                {"label": "Задержка применения", "value": "0.2 с."},
-                {"label": "Перезарядка", "value": "30 с."},
-                {"label": "Радиус", "value": "6.5m"},
-                {"label": "T1 · Перезарядка", "value": "-10"},
+                {"label": "Задержка применения", "value": "0,2 с", "identity": "ability_cast_delay", "type": "duration", "unit": "seconds", "tier": None, "scaling": None, "upgrade_type": None},
+                {"label": "Перезарядка", "value": "30 с", "identity": "ability_cooldown", "type": "duration", "unit": "seconds", "tier": None, "scaling": None, "upgrade_type": None},
+                {"label": "Радиус", "value": "6,5 м", "identity": "radius", "type": "distance", "unit": "meters", "tier": None, "scaling": None, "upgrade_type": None},
+                {"label": "Перезарядка", "value": "-10 с", "identity": "ability_cooldown", "type": "duration", "unit": "seconds", "tier": 1, "scaling": None, "upgrade_type": "add"},
             ],
         )
 
@@ -2326,7 +2439,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
     def test_public_content_cache_versions_keep_home_contract_stable(self) -> None:
         self.assertEqual(home_content.HOME_CONTENT_KEY, "platform:home-content:v4")
         self.assertEqual(home_content.HOME_CONTENT_STALE_KEY, "platform:home-content:stale:v4")
-        self.assertEqual(home_content.PATCH_DETAIL_KEY_PREFIX, "platform:home-content:patch:v16:")
+        self.assertEqual(home_content.PATCH_DETAIL_KEY_PREFIX, "platform:home-content:patch:v17:")
         self.assertEqual(
             home_content.PATCH_ASSET_CATALOG_KEY,
             "platform:home-content:patch-assets:v9",
@@ -2933,7 +3046,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(nurse["abilities"]["leech therapy"]["display_name"], "Терапия пиявок")
         self.assertEqual(
             nurse["abilities"]["leech therapy"]["stats"],
-            [{"label": "Урон", "value": "40"}],
+            [{"label": "Урон", "value": "40", "identity": "damage", "type": "scalar", "unit": "source_unspecified", "tier": None, "scaling": None, "upgrade_type": None}],
         )
         self.assertEqual(
             catalog["items"]["high-velocity rounds"],

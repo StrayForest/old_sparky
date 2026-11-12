@@ -2,17 +2,18 @@
   "id": "1848664643339845",
   "title": "Minor Update - 11-04-2026",
   "published_at": "2026-11-05T05:02:30Z",
-  "url": "",
-  "content": "",
-  "hero_metadata_pending": false,
+  "url": "https://steamstore-a.akamaihd.net/news/externalpost/steam_community_announcements/1848664643339845",
+  "content": "- Healbane: Stacks now diminish 20% more aggressively (at 2 stacks 57.8%->54.7%, at 4 stacks 82.2% to 72%)\n- Apollo: Riposte - Pommel Hit now also disarms the enemy\n- Apollo: Riposte - Pummel hit now ends any preexisting parry on the target\n- Apollo: Riposte - T2 increased from +0.6s duration to +0.7s\n- Apollo: Itani Lo Sahn - T3 bonus damage increased from +50% to +60%\n- Baba: Spirit Resistance scaling reduced from 0.7 to 0.5\n- Baba: Melee damage per boon reduced by 10%\n- Baba: Baba's Brew - Cooldown increased from 27s to 28s\n- Baba: Baba's Brew - Burn DPS spirit scaling reduced from 0.15 to 0.13\n- Baba: Baba's Brew - Cycle time increased from 1.5s to 1.6s\n- Baba: Granny Long Legs - Melee Resist reduced from 30% to 25%\n- Baba: Granny Long Legs - Debuff Resist reduced from 30% to 25%\n- Celeste: Dazzling Trick - T3 silence duration reduced from +1.25s to +0.75s\n- Celeste: Radiant Daggers - Cast range reduced from 30m to 25m (moved to T2)\n- Celeste: Radiant Daggers - Spirit Amp per Stack reduced from +7% to +6% (moved to T3)\n- Celeste: Shining Wonder - Slow reduced from -32% Movement to -28%\n- Celeste: Shining Wonder - Cooldown increased from 160s to 170s\n- Celeste: Shining Wonder - Bounce range reduced from 15.5m to 15m\n- Celeste: Shining Wonder - T1 move speed slow reduced from -16% to -14%\n- Celeste: Shining Wonder - T2 bonus damage reduced from +90 to +80\n- Deadman Danny: Close The Deal - Bonus damage to under half health targets reduced from +75% to +55%\n- Deadman Danny: Strix Salvo - Spirit scaling reduced by 8%\n- Deadman Danny: Chimera Mk1 - T2 reduced from 150 Heal On Hit to 125\n- Deadman Danny: Chimera Mk1 - T2 heal spirit scaling reduced from 2.0 to 1.7\n- Mo & Krill: Scorn - Heal from heroes increased from 1.2x to 1.3x\n- Mo & Krill: Burrow - Damage radius increased by +0.5m\n- Mo & Krill: Sand Blast - T2 slow from -24% Slow and -26% Dash distance to -28% for both\n- Mo & Krill: Combo - Health per kill increased from 40 to 50\n- Nurse Harrow: Bullet damage increased by 8%\n- Nurse Harrow: Lurking Terrors - Vertical angle increased from 50% to 65%\n- Nurse Harrow: Lurking Terrors - Fear buildup time reduced from 2s to 1.75s\n- Rat King: Bullet damage increased from 5.7 to 5.8\n- Rat King: Ammo increased from 24 to 26\n- Rat King: Scrap Grenade - Meleeing the grenade fuse time extension reduced from 0.4s to 0.25s\n- Rat King: Rule, Ratannia! - Move Speed increased from +3m to +4m\n- Rat King: Rule, Ratannia! - T1 now also reduces cooldown by -25s",
   "sections": [
     {
       "kind": "item",
       "title": "Healbane",
       "hero_name": null,
       "hero_display_name": null,
-      "hero_presentation_kind": null,
       "hero_image_url": null,
+      "hero_image_candidates": [],
+      "hero_presentation_kind": null,
+      "mode_name": null,
       "hero_description": null,
       "hero_metadata_pending": false,
       "item_name": "Healbane",
@@ -23,16 +24,22 @@
       "changes": [
         "Stacks now diminish 20% more aggressively (at 2 stacks 57.8%->54.7%, at 4 stacks 82.2% to 72%)"
       ],
-      "abilities": [],
-      "hero_image_candidates": []
+      "abilities": []
     },
     {
       "kind": "hero",
       "title": "Apollo",
       "hero_name": "Apollo",
       "hero_display_name": "Аполлон",
-      "hero_presentation_kind": "balance",
       "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/fencer_card.webp",
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/fencer_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/fencer_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/fencer_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/fencer_sm.png"
+      ],
+      "hero_presentation_kind": "balance",
+      "mode_name": null,
       "hero_description": null,
       "hero_metadata_pending": false,
       "item_name": null,
@@ -68,12 +75,6 @@
             "T3 bonus damage increased from +50% to +60%"
           ]
         }
-      ],
-      "hero_image_candidates": [
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/fencer_card.webp",
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/fencer_card.png",
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/fencer_sm.webp",
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/fencer_sm.png"
       ]
     },
     {
@@ -81,8 +82,15 @@
       "title": "Baba",
       "hero_name": "Baba",
       "hero_display_name": "Буся",
-      "hero_presentation_kind": "balance",
       "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/baba_card.webp",
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/baba_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/baba_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/baba_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/baba_sm.png"
+      ],
+      "hero_presentation_kind": "balance",
+      "mode_name": null,
       "hero_description": null,
       "hero_metadata_pending": false,
       "item_name": null,
@@ -122,12 +130,6 @@
             "Debuff Resist reduced from 30% to 25%"
           ]
         }
-      ],
-      "hero_image_candidates": [
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/baba_card.webp",
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/baba_card.png",
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/baba_sm.webp",
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/baba_sm.png"
       ]
     },
     {
@@ -135,8 +137,15 @@
       "title": "Celeste",
       "hero_name": "Celeste",
       "hero_display_name": "Селеста",
-      "hero_presentation_kind": "balance",
       "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/unicorn_card.webp",
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/unicorn_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/unicorn_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/unicorn_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/unicorn_sm.png"
+      ],
+      "hero_presentation_kind": "balance",
+      "mode_name": null,
       "hero_description": null,
       "hero_metadata_pending": false,
       "item_name": null,
@@ -187,12 +196,6 @@
             "T2 bonus damage reduced from +90 to +80"
           ]
         }
-      ],
-      "hero_image_candidates": [
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/unicorn_card.webp",
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/unicorn_card.png",
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/unicorn_sm.webp",
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/unicorn_sm.png"
       ]
     },
     {
@@ -200,8 +203,15 @@
       "title": "Deadman Danny",
       "hero_name": "Deadman Danny",
       "hero_display_name": "Дохлый Дэнни",
-      "hero_presentation_kind": "balance",
       "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/deadpack_card.webp",
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/deadpack_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/deadpack_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/deadpack_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/deadpack_sm.png"
+      ],
+      "hero_presentation_kind": "balance",
+      "mode_name": null,
       "hero_description": null,
       "hero_metadata_pending": false,
       "item_name": null,
@@ -248,12 +258,6 @@
             "T2 heal spirit scaling reduced from 2.0 to 1.7"
           ]
         }
-      ],
-      "hero_image_candidates": [
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/deadpack_card.webp",
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/deadpack_card.png",
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/deadpack_sm.webp",
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/deadpack_sm.png"
       ]
     },
     {
@@ -261,8 +265,15 @@
       "title": "Mo & Krill",
       "hero_name": "Mo & Krill",
       "hero_display_name": "Мо и Мелкий",
-      "hero_presentation_kind": "balance",
       "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/digger_card.webp",
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/digger_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/digger_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/digger_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/digger_sm.png"
+      ],
+      "hero_presentation_kind": "balance",
+      "mode_name": null,
       "hero_description": null,
       "hero_metadata_pending": false,
       "item_name": null,
@@ -320,12 +331,6 @@
             "Health per kill increased from 40 to 50"
           ]
         }
-      ],
-      "hero_image_candidates": [
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/digger_card.webp",
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/digger_card.png",
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/digger_sm.webp",
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/digger_sm.png"
       ]
     },
     {
@@ -333,8 +338,15 @@
       "title": "Nurse Harrow",
       "hero_name": "Nurse Harrow",
       "hero_display_name": "Сестра Хэрроу",
+      "hero_image_url": "https://assets-bucket.deadlock-api.com/nurse.webp",
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/nurse.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_sm.webp"
+      ],
       "hero_presentation_kind": "balance",
-      "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_card.webp",
+      "mode_name": null,
       "hero_description": null,
       "hero_metadata_pending": false,
       "item_name": null,
@@ -359,12 +371,6 @@
             "Fear buildup time reduced from 2s to 1.75s"
           ]
         }
-      ],
-      "hero_image_candidates": [
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_card.webp",
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_card.png",
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_sm.webp",
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse_sm.png"
       ]
     },
     {
@@ -372,8 +378,15 @@
       "title": "Rat King",
       "hero_name": "Rat King",
       "hero_display_name": "Крысиный король",
-      "hero_presentation_kind": "balance",
       "hero_image_url": "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/ratking_card.webp",
+      "hero_image_candidates": [
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/ratking_card.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/ratking_card.png",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/ratking_sm.webp",
+        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/ratking_sm.png"
+      ],
+      "hero_presentation_kind": "balance",
+      "mode_name": null,
       "hero_description": null,
       "hero_metadata_pending": false,
       "item_name": null,
@@ -411,13 +424,8 @@
             "T1 now also reduces cooldown by -25s"
           ]
         }
-      ],
-      "hero_image_candidates": [
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/ratking_card.webp",
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/ratking_card.png",
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/ratking_sm.webp",
-        "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/ratking_sm.png"
       ]
     }
-  ]
+  ],
+  "hero_metadata_pending": false
 }

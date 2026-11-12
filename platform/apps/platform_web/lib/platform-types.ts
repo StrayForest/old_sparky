@@ -118,12 +118,61 @@ export type PlatformDeadlockGameAssets = {
   ranks: PlatformDeadlockGameAsset[];
 };
 
+export type PlatformPatchAbilityStatType =
+  | "duration"
+  | "distance"
+  | "percent"
+  | "rate"
+  | "count"
+  | "healing"
+  | "restoration"
+  | "scalar"
+  | "scale"
+  | "scale_multiplier";
+
+export type PlatformPatchAbilityStatUnit =
+  | "seconds"
+  | "meters"
+  | "percent"
+  | "percent_per_second"
+  | "count"
+  | "health"
+  | "stamina"
+  | "coefficient"
+  | "multiplier"
+  | "source_unspecified";
+
+export type PlatformPatchAbilityUpgradeType =
+  | "add"
+  | "add_to_base"
+  | "add_to_scale"
+  | "multiply"
+  | "multiply_base"
+  | "multiply_scale";
+
+export type PlatformPatchAbilityStat = {
+  label: string;
+  value: string;
+  identity?: string | null;
+  type?: PlatformPatchAbilityStatType | null;
+  unit?: PlatformPatchAbilityStatUnit | null;
+  tier?: number | null;
+  scaling?: {
+    stat: string;
+    coefficient: string;
+    function: string;
+    display?: string;
+    label?: string;
+  } | null;
+  upgrade_type?: PlatformPatchAbilityUpgradeType | null;
+};
+
 export type PlatformPatchAbility = {
   name: string;
   display_name?: string | null;
   description?: string | null;
   presentation_kind?: "balance" | "introduction" | "replacement";
-  stats?: Array<{ label: string; value: string }>;
+  stats?: PlatformPatchAbilityStat[];
   stats_pending?: boolean;
   icon_url: string | null;
   changes: string[];

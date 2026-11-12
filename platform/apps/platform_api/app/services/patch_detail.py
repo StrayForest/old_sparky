@@ -284,7 +284,12 @@ def _is_ability_replacement(changes: str, ability_name: str) -> bool:
     return not suffix or suffix[0] in (_ENTITY_DELIMITERS + ".,!?;)]}")
 
 
-def _set_ability_presentation(section: dict[str, Any], *, hero_introduction: bool = False) -> None:
+def _set_ability_presentation(
+    section: dict[str, Any],
+    *,
+    hero_introduction: bool = False,
+    stat_contract_verified: bool = True,
+) -> None:
     """Expose catalog prose only when this patch introduces or replaces an ability."""
     for ability in section.get("abilities") or []:
         changes = ability.get("changes") if isinstance(ability, dict) else None
@@ -310,8 +315,11 @@ def _set_ability_presentation(section: dict[str, Any], *, hero_introduction: boo
             ability.pop("stats", None)
             ability.pop("stats_pending", None)
         else:
-            # Old cached catalogs have no readiness field. Keep their intro
-            # stats visible as pending until a fresh catalog proves readiness.
+            # Do not publish old label/value-only rows as if their meaning were known.
+            if not stat_contract_verified:
+                ability["stats"] = []
+                ability["stats_pending"] = True
+                continue
             ability["stats_pending"] = ability.get("stats_pending") is not False
 
 
@@ -494,6 +502,7 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
         if isinstance(catalog.get("objectives"), dict)
         else {}
     )
+    stat_contract_verified = catalog.get("_ability_stat_contract_current", True) is not False
 
     hero_sections: dict[str, dict[str, Any]] = {}
     item_sections: dict[str, dict[str, Any]] = {}
@@ -825,7 +834,11 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
                     ability_section["description_requires_translation"] = True
                     ability_section["_description_source_text"] = sentence
         section["hero_catalog_pending"] = not _hero_catalog_is_complete(hero, section)
-        _set_ability_presentation(section, hero_introduction=True)
+        _set_ability_presentation(
+            section,
+            hero_introduction=True,
+            stat_contract_verified=stat_contract_verified,
+        )
     for hero_name in pending_names:
         if hero_name.casefold() in resolved_names:
             continue
@@ -896,6 +909,7 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
         _set_ability_presentation(
             section,
             hero_introduction=section.get("hero_presentation_kind") == "introduction",
+            stat_contract_verified=stat_contract_verified,
         )
         if section.get("hero_presentation_kind") != "introduction":
             section["hero_description"] = None

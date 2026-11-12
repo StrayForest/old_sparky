@@ -74,6 +74,12 @@ class DeadlockGameAssetsResponse(BaseModel):
 class PatchAbilityStatResponse(BaseModel):
     label: str = Field(min_length=1, max_length=120)
     value: str = Field(min_length=1, max_length=80)
+    identity: str | None = Field(default=None, max_length=120)
+    type: str | None = Field(default=None, max_length=32)
+    unit: str | None = Field(default=None, max_length=32)
+    tier: int | None = Field(default=None, ge=1, le=32)
+    scaling: dict[str, str] | None = None
+    upgrade_type: str | None = Field(default=None, max_length=32)
 
 
 class PatchAbilityResponse(BaseModel):

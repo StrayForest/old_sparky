@@ -37,7 +37,7 @@ DEADLOCK_ASSET_BASE_URL = "https://deadlock.io"
 HOME_CONTENT_KEY = "platform:home-content:v4"
 HOME_CONTENT_STALE_KEY = "platform:home-content:stale:v4"
 HOME_CONTENT_LOCK_KEY = "platform:home-content:refresh-lock:v4"
-PATCH_DETAIL_KEY_PREFIX = "platform:home-content:patch:v16:"
+PATCH_DETAIL_KEY_PREFIX = "platform:home-content:patch:v17:"
 PATCH_ASSET_CATALOG_KEY = "platform:home-content:patch-assets:v9"
 PATCH_ASSET_CATALOG_STALE_KEY = "platform:home-content:patch-assets-stale:v3"
 PATCH_ASSET_PENDING_RETRY_KEY = "platform:home-content:patch-assets-pending-retry:v1"
@@ -47,6 +47,7 @@ PATCH_ASSET_CATALOG_TTL_SECONDS = 6 * 60 * 60
 PATCH_ASSET_CATALOG_STALE_TTL_SECONDS = 30 * 24 * 60 * 60
 PATCH_ASSET_PENDING_RETRY_SECONDS = 5 * 60
 HERO_IMAGE_CANDIDATES_VERSION = 1
+ABILITY_STAT_CONTRACT_VERSION = 1
 MAX_HERO_IMAGE_CANDIDATES = 4
 REFRESH_LOCK_SECONDS = 30
 HOME_PATCH_LIMIT = 4
@@ -340,6 +341,21 @@ def _asset_catalog_has_current_hero_image_candidates(catalog: Any) -> bool:
         and type(catalog.get("hero_image_candidates_version")) is int
         and catalog.get("hero_image_candidates_version") == HERO_IMAGE_CANDIDATES_VERSION
         and not catalog.get("hero_image_candidates_pending")
+    )
+
+
+def _asset_catalog_has_current_ability_stat_contract(catalog: Any) -> bool:
+    return (
+        isinstance(catalog, dict)
+        and type(catalog.get("ability_stat_contract_version")) is int
+        and catalog.get("ability_stat_contract_version") == ABILITY_STAT_CONTRACT_VERSION
+    )
+
+
+def _asset_catalog_is_ready(catalog: Any) -> bool:
+    return (
+        _asset_catalog_has_current_hero_image_candidates(catalog)
+        and _asset_catalog_has_current_ability_stat_contract(catalog)
     )
 
 
@@ -928,6 +944,7 @@ def _build_asset_catalog(
             HERO_IMAGE_CANDIDATES_VERSION if supplemental_sources_available else None
         ),
         "hero_image_candidates_pending": bool(hero_candidates_pending),
+        "ability_stat_contract_version": ABILITY_STAT_CONTRACT_VERSION,
     }
 
 
@@ -1116,11 +1133,176 @@ _NUMERIC_STAT_VALUE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_NONNEGATIVE_BASE_STAT_KEYS = frozenset(
+    {
+        "AbilityCastDelay",
+        "AbilityChannelTime",
+        "AbilityCooldown",
+        "AbilityCooldownBetweenCharge",
+        "AbilityDuration",
+        "AbilityPostCastDuration",
+        "AbilityCastRange",
+        "CastRange",
+        "Range",
+        "Radius",
+    }
+)
+_SOURCE_PROPERTY_SEMANTICS: dict[str, tuple[str, str]] = {
+    # These game-data properties omit their postfix despite encoding a unit.
+    "BuffExtendPercentPerShot": ("percent", "percent"),
+    "HealRegen": ("health", "healing"),
+    "StaminaRestorePerHit": ("stamina", "restoration"),
+}
+_LOCALIZED_SOURCE_PROPERTY_LABELS = {
+    # The Russian catalog drops the rate meaning from this explicit English
+    # "Charge Rate" label and calls it charge accumulation instead.
+    "ChargeGenPctScale": "Скорость накопления зарядов",
+}
+_SCALE_STAT_PROPERTY_KEYS = {
+    "ETechPower": "TechPower",
+    "ETechCooldown": "AbilityCooldown",
+    "ETechRange": "AbilityCastRange",
+    "ETechDuration": "AbilityDuration",
+}
+
+
+def _ability_stat_contract(
+    property_key: Any,
+    property_value: dict[str, Any],
+    *,
+    tier: int | None = None,
+    upgrade: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Keep catalog stat identity and dimensional meaning beside display text."""
+    key = str(property_key or "").strip()
+    identity = re.sub(r"(?<!^)(?=[A-Z])", "_", key).lower().replace("-", "_")
+    postfix = str(property_value.get("postfix") or "").strip()
+    postfix_folded = postfix.casefold().replace(" ", "")
+    if not postfix and key in _SOURCE_PROPERTY_SEMANTICS:
+        unit, stat_type = _SOURCE_PROPERTY_SEMANTICS[key]
+    elif "%/s" in postfix_folded or "%/сек" in postfix_folded:
+        unit, stat_type = "percent_per_second", "rate"
+    elif postfix_folded in {"s", "sec", "secs", "second", "seconds", "с.", "сек", "сек."}:
+        unit, stat_type = "seconds", "duration"
+    elif postfix_folded in {"m", "meter", "meters", "м"}:
+        unit, stat_type = "meters", "distance"
+    elif "%" in postfix_folded:
+        unit, stat_type = "percent", "percent"
+    elif "charge" in key.casefold() or key in {"AbilityCharges", "AbilityChargesInitial"}:
+        unit, stat_type = "count", "count"
+    else:
+        unit, stat_type = "source_unspecified", "scalar"
+
+    scale_function = property_value.get("scale_function")
+    scaling: dict[str, str] | None = None
+    if isinstance(scale_function, dict):
+        scale_stat = str(scale_function.get("specific_stat_scale_type") or "").strip()
+        coefficient = str(scale_function.get("stat_scale") or "").strip()
+        if scale_stat and coefficient and _NUMERIC_STAT_VALUE_RE.fullmatch(coefficient):
+            function_name = str(scale_function.get("class_name") or "").strip()
+            scaling = {
+                "stat": scale_stat,
+                "coefficient": coefficient,
+                "function": function_name,
+            }
+            if function_name == "scale_function_healing_spirit_scale":
+                scaling["display"] = "additive"
+
+    upgrade_type: str | None = None
+    if upgrade is not None:
+        source_upgrade_type = str(upgrade.get("upgrade_type") or "").strip()
+        upgrade_type_map = {
+            "EAdd": "add",
+            "EAddToBase": "add_to_base",
+            "EAddToScale": "add_to_scale",
+            "EMultiply": "multiply",
+            "EMultiplyBase": "multiply_base",
+            "EMultiplyScale": "multiply_scale",
+        }
+        upgrade_type = upgrade_type_map.get(source_upgrade_type) if source_upgrade_type else "add"
+        if upgrade_type == "add_to_scale":
+            scale_stat = str(upgrade.get("scale_stat_filter") or "").strip()
+            coefficient = str(upgrade.get("bonus") or "").strip()
+            if scale_stat and _NUMERIC_STAT_VALUE_RE.fullmatch(coefficient):
+                scaling = {
+                    "stat": scale_stat,
+                    "coefficient": coefficient,
+                    "function": "upgrade_add_to_scale",
+                    "display": "additive",
+                }
+            stat_type, unit = "scale", "coefficient"
+        elif upgrade_type == "multiply_scale":
+            scale_stat = str(upgrade.get("scale_stat_filter") or "").strip()
+            coefficient = str(upgrade.get("bonus") or "").strip()
+            if scale_stat and _NUMERIC_STAT_VALUE_RE.fullmatch(coefficient):
+                scaling = {
+                    "stat": scale_stat,
+                    "coefficient": coefficient,
+                    "function": "upgrade_multiply_scale",
+                }
+            stat_type, unit = "scale_multiplier", "multiplier"
+        elif upgrade_type == "multiply_base":
+            # This operation's source bonus is a percent increase (33.33 means
+            # +33.33%), unlike EMultiplyScale's direct factor (1.3333 means ×1.3333).
+            stat_type, unit = "percent", "percent"
+        elif source_upgrade_type and upgrade_type is None:
+            # Unknown operations cannot safely be presented as additive deltas.
+            stat_type, unit = "unsupported", "unknown"
+    return {
+        "identity": identity,
+        "type": stat_type,
+        "unit": unit,
+        "tier": tier,
+        "scaling": scaling,
+        "upgrade_type": upgrade_type,
+    }
+
+
+def _is_valid_base_stat_value(property_key: Any, value: str, property_value: dict[str, Any]) -> bool:
+    if not _has_nonzero_numeric_stat_value(value):
+        return False
+    key = str(property_key or "").strip()
+    if key in _NONNEGATIVE_BASE_STAT_KEYS:
+        numbers = re.findall(r"[+-]?\d+(?:[.,]\d+)?", value)
+        if any(float(number.replace(",", ".")) < 0 for number in numbers):
+            return False
+    # Source disable_value is a sentinel for omission, not a playable stat.
+    disable_value = str(property_value.get("disable_value") or "").strip()
+    return not (disable_value and value == disable_value)
+
+
+def _format_ability_stat_value(value: str, contract: dict[str, Any], postfix: str) -> str:
+    rendered = re.sub(r"(?<=\d)[.](?=\d)", ",", value.strip())
+    unit = contract.get("unit")
+    suffix_patterns = {
+        "seconds": r"\s*(?:s|с\.?|сек\.?)$",
+        "meters": r"\s*(?:m|м)$",
+        "percent": r"\s*%$",
+        "percent_per_second": r"\s*%\s*/\s*(?:s|сек\.?|с\.?)$",
+    }
+    if unit in suffix_patterns:
+        rendered = re.sub(suffix_patterns[unit], "", rendered, flags=re.IGNORECASE).strip()
+        return f"{rendered} { {'seconds': 'с', 'meters': 'м', 'percent': '%', 'percent_per_second': '%/с'}[unit] }"
+    if postfix:
+        suffix = postfix.strip()
+        if suffix.casefold() in {"s", "с.", "с", "сек.", "сек"}:
+            suffix = "с"
+        elif suffix.casefold() in {"m", "м"}:
+            suffix = "м"
+        elif suffix.casefold() == "%/s" or suffix.casefold() == "%/сек.":
+            suffix = "%/с"
+        elif suffix == "%":
+            suffix = "%"
+        if suffix.startswith("%"):
+            return f"{rendered} {suffix}"
+        return f"{rendered} {suffix}"
+    return rendered
+
 
 def _localized_ability_stats(
     english_ability: dict[str, Any] | None,
     localized_ability: dict[str, Any] | None,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     english_properties = (
         english_ability.get("properties")
         if isinstance(english_ability, dict)
@@ -1133,30 +1315,41 @@ def _localized_ability_stats(
         and isinstance(localized_ability.get("properties"), dict)
         else {}
     )
-    stats: list[dict[str, str]] = []
+    stats: list[dict[str, Any]] = []
     for property_key, english_property in english_properties.items():
         if not isinstance(english_property, dict):
             continue
         localized_property = localized_properties.get(property_key)
         if not isinstance(localized_property, dict):
             localized_property = {}
-        localized_label = str(localized_property.get("label") or "").strip()
+        localized_label = _LOCALIZED_SOURCE_PROPERTY_LABELS.get(
+            str(property_key), str(localized_property.get("label") or "").strip()
+        )
         if not _is_user_facing_stat_label(localized_label, property_key):
             continue
         value = str(localized_property.get("value") or english_property.get("value") or "").strip()
-        if not _has_nonzero_numeric_stat_value(value):
+        if not _is_valid_base_stat_value(property_key, value, english_property):
             continue
         postfix = str(
             localized_property.get("postfix") or english_property.get("postfix") or ""
         ).strip()
+        contract = _ability_stat_contract(property_key, english_property)
+        if contract["scaling"] and contract["scaling"].get("display") == "additive":
+            scale = contract["scaling"]
+            scale_property = localized_properties.get(_SCALE_STAT_PROPERTY_KEYS.get(scale["stat"], ""))
+            scale_label = (
+                str(scale_property.get("label") or "").strip()
+                if isinstance(scale_property, dict)
+                else ""
+            )
+            if scale_label:
+                scale["label"] = scale_label
+                value = f"{value} + {scale['coefficient']} × {scale_label}"
         stats.append(
             {
                 "label": localized_label,
-                "value": (
-                    value
-                    if re.search(r"(?:m|s|%|hp)$", value, re.IGNORECASE)
-                    else f"{value}{(' ' + postfix) if postfix else ''}"
-                ).strip(),
+                "value": _format_ability_stat_value(value, contract, postfix),
+                **contract,
             }
         )
     for tier, upgrade in enumerate(
@@ -1176,16 +1369,62 @@ def _localized_ability_stats(
             english_property = english_properties.get(property_key)
             if not isinstance(localized_property, dict) or not isinstance(english_property, dict):
                 continue
-            label = str(localized_property.get("label") or "").strip()
-            bonus = str(property_upgrade.get("bonus") or "").strip()
+            label = _LOCALIZED_SOURCE_PROPERTY_LABELS.get(
+                property_key, str(localized_property.get("label") or "").strip()
+            )
+            raw_bonus = str(property_upgrade.get("bonus") or "").strip()
+            if not _NUMERIC_STAT_VALUE_RE.fullmatch(raw_bonus):
+                continue
+            bonus = raw_bonus
+            contract = _ability_stat_contract(
+                property_key,
+                english_property,
+                tier=tier,
+                upgrade=property_upgrade,
+            )
+            if property_upgrade.get("upgrade_type") and contract["upgrade_type"] is None:
+                continue
+            if contract["type"] in {"scale", "scale_multiplier"} and contract["scaling"]:
+                scale_property = localized_properties.get(
+                    _SCALE_STAT_PROPERTY_KEYS.get(contract["scaling"]["stat"], "")
+                )
+                scale_label = (
+                    str(scale_property.get("label") or "").strip()
+                    if isinstance(scale_property, dict)
+                    else ""
+                )
+                if scale_label:
+                    contract["scaling"]["label"] = scale_label
+            postfix = str(localized_property.get("postfix") or english_property.get("postfix") or "").strip()
+            if contract["upgrade_type"] == "multiply_base":
+                bonus = _format_ability_stat_value(bonus, contract, "%")
+            elif contract["upgrade_type"] == "multiply_scale":
+                bonus = _format_ability_stat_value(f"×{bonus}", contract, "")
+            else:
+                bonus = _format_ability_stat_value(bonus, contract, postfix)
             if (
                 not _is_user_facing_stat_label(label, property_key)
                 or not bonus
-                or not _NUMERIC_STAT_VALUE_RE.fullmatch(bonus)
             ):
                 continue
-            sign = "" if bonus.startswith(("+", "-")) else "+"
-            stats.append({"label": f"T{tier} · {label}", "value": f"{sign}{bonus}"})
+            is_multiplier = contract["upgrade_type"] == "multiply_scale"
+            sign = "" if is_multiplier or bonus.startswith(("+", "-")) else "+"
+            display_label = (
+                f"{label} · масштабирование ({contract['scaling'].get('label')})"
+                if contract["type"] in {"scale", "scale_multiplier"}
+                and contract["scaling"]
+                and contract["scaling"].get("label")
+                else f"{label} · коэффициент масштабирования"
+                if contract["type"] in {"scale", "scale_multiplier"}
+                else label
+            )
+            stats.append(
+                {
+                    "label": display_label,
+                    "value": f"{sign}{bonus}",
+                    **contract,
+                }
+            )
     return stats[:32]
 
 
@@ -1214,7 +1453,7 @@ def _ability_stats_pending(
         ):
             continue
         english_value = str(english_property.get("value") or "").strip()
-        if not _has_nonzero_numeric_stat_value(english_value):
+        if not _is_valid_base_stat_value(property_key, english_value, english_property):
             continue
         localized_property = localized_properties.get(property_key)
         if not isinstance(localized_property, dict):
@@ -1226,6 +1465,44 @@ def _ability_stats_pending(
             or not _has_nonzero_numeric_stat_value(value)
         ):
             return True
+    source_upgrades = english_ability.get("upgrades")
+    if not isinstance(source_upgrades, list):
+        source_upgrades = []
+    for tier_upgrade in source_upgrades:
+        if not isinstance(tier_upgrade, dict):
+            continue
+        property_upgrades = tier_upgrade.get("property_upgrades")
+        if not isinstance(property_upgrades, list):
+            property_upgrades = []
+        for property_upgrade in property_upgrades:
+            if not isinstance(property_upgrade, dict):
+                continue
+            property_key = str(property_upgrade.get("name") or "")
+            english_property = english_properties.get(property_key)
+            bonus = str(property_upgrade.get("bonus") or "").strip()
+            if not isinstance(english_property, dict) or not _NUMERIC_STAT_VALUE_RE.fullmatch(bonus):
+                continue
+            if not _is_user_facing_stat_label(
+                str(english_property.get("label") or ""),
+                property_key,
+            ):
+                continue
+            contract = _ability_stat_contract(
+                property_key,
+                english_property,
+                tier=1,
+                upgrade=property_upgrade,
+            )
+            localized_property = localized_properties.get(property_key)
+            if (
+                contract["upgrade_type"] is None
+                or not isinstance(localized_property, dict)
+                or not _is_user_facing_stat_label(
+                    str(localized_property.get("label") or ""),
+                    property_key,
+                )
+            ):
+                return True
     return False
 
 

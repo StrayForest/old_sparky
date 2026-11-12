@@ -89,6 +89,13 @@ async def refresh_home_content(
             base.PATCH_ASSET_CATALOG_STALE_KEY,
         )
         previous_asset_catalog = asset_catalog or stale_asset_catalog
+        if isinstance(previous_asset_catalog, dict):
+            previous_asset_catalog = dict(previous_asset_catalog)
+            previous_asset_catalog["_ability_stat_contract_current"] = (
+                base._asset_catalog_has_current_ability_stat_contract(
+                    previous_asset_catalog
+                )
+            )
         cached_hero_pending = await _cached_home_has_pending_hero_catalog(cache, stale)
         asset_retry_blocked = bool(
             await cache.get(base.PATCH_ASSET_PENDING_RETRY_KEY)
@@ -118,7 +125,7 @@ async def refresh_home_content(
                 or has_new_patch
                 or explicit_asset_refresh
                 or (
-                    not base._asset_catalog_has_current_hero_image_candidates(asset_catalog)
+                    not base._asset_catalog_is_ready(asset_catalog)
                     and not asset_retry_blocked
                 )
                 or (cached_hero_pending and not asset_retry_blocked)
@@ -191,8 +198,17 @@ async def refresh_home_content(
             if isinstance(asset_result, dict)
             else previous_asset_catalog
         )
-        pending_hero_metadata = pending_hero_metadata or not (
-            base._asset_catalog_has_current_hero_image_candidates(resolved_asset_catalog)
+        pending_hero_metadata = pending_hero_metadata or any(
+            isinstance(section, dict)
+            and any(
+                isinstance(ability, dict) and ability.get("stats_pending")
+                for ability in section.get("abilities") or []
+            )
+            for detail in patch_details.values()
+            for section in detail.get("sections") or []
+        )
+        pending_hero_metadata = pending_hero_metadata or not base._asset_catalog_is_ready(
+            resolved_asset_catalog
         )
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         async with cache.pipeline(transaction=True) as pipeline:
@@ -207,7 +223,7 @@ async def refresh_home_content(
                 ex=settings.platform_home_content_stale_seconds,
             )
             if (
-                (asset_catalog is None or has_new_patch or force)
+                (asset_catalog is None or has_new_patch or refresh_asset_catalog)
                 and not isinstance(asset_result, Exception)
             ):
                 encoded_asset_catalog = json.dumps(
@@ -285,7 +301,7 @@ async def get_deadlock_asset_catalog() -> dict[str, Any]:
     """Return the cached catalog, refreshing it only through hardened I/O."""
 
     catalog = await base._cached_deadlock_asset_catalog()
-    if not base._asset_catalog_has_current_hero_image_candidates(catalog):
+    if not base._asset_catalog_is_ready(catalog):
         cache = redis_client()
         try:
             retry_blocked = bool(await cache.get(base.PATCH_ASSET_PENDING_RETRY_KEY))

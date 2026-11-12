@@ -2,7 +2,7 @@ import { mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { expect, test } from "@playwright/test";
 import type { Locator } from "@playwright/test";
-import type { PlatformPatchDetail, PlatformPatchSection } from "../../lib/platform-types";
+import type { PlatformPatchAbilityStat, PlatformPatchDetail, PlatformPatchSection } from "../../lib/platform-types";
 import { patchAcceptanceIssues } from "../support/patch-acceptance";
 
 const patchIds = [
@@ -45,7 +45,7 @@ async function expectNoHorizontalOverflow(page: import("@playwright/test").Page)
   expect(overflow).toBeLessThanOrEqual(2);
 }
 
-async function saveMobileCardScreenshot(
+async function savePatchCardScreenshot(
   locator: Locator,
   filename: string,
   artifactDirectory: string | undefined,
@@ -53,6 +53,43 @@ async function saveMobileCardScreenshot(
   if (!artifactDirectory) return;
   await mkdir(artifactDirectory, { recursive: true, mode: 0o700 });
   await locator.screenshot({ path: path.join(artifactDirectory, filename) });
+}
+
+async function expectSemanticStatRows(rows: Locator, stats: PlatformPatchAbilityStat[]) {
+  await expect(rows.locator(":scope > .patch-ability-stat")).toHaveCount(stats.length);
+  for (const [index, stat] of stats.entries()) {
+    const row = rows.locator(":scope > .patch-ability-stat").nth(index);
+    await expect(row).toHaveAttribute("data-stat-type", stat.type ?? "unknown");
+    await expect(row).toHaveAttribute("data-stat-unit", stat.unit ?? "unknown");
+    await expect(row).toHaveAttribute("data-stat-tier", String(stat.tier ?? "base"));
+    await expect(row).toHaveAttribute("data-has-scaling", stat.scaling ? "true" : "false");
+    if (stat.identity) await expect(row).toHaveAttribute("data-stat-identity", stat.identity);
+    await expect(row.locator("dt > span")).toHaveText(stat.label);
+    await expect(row.locator("dd")).toHaveText(stat.value);
+    await expect(row.locator("dt svg")).toHaveCount(1);
+  }
+}
+
+async function expectStatLabelsKeepWords(locator: Locator) {
+  const splitWords = await locator.locator(".patch-ability-stat dt span").evaluateAll((labels) => (
+    labels.flatMap((label) => {
+      const textNode = label.firstChild;
+      if (!textNode || textNode.nodeType !== Node.TEXT_NODE) return [];
+      const text = textNode.textContent ?? "";
+      const broken: string[] = [];
+      for (const match of text.matchAll(/\S+/gu)) {
+        const word = match[0];
+        const start = match.index;
+        if (start === undefined) continue;
+        const range = document.createRange();
+        range.setStart(textNode, start);
+        range.setEnd(textNode, start + word.length);
+        if (range.getClientRects().length > 1) broken.push(word);
+      }
+      return broken;
+    })
+  ));
+  expect(splitWords).toEqual([]);
 }
 
 test("four parsed patch DTOs render correct hero and ability ownership at mobile and desktop widths", async ({ page }, testInfo) => {
@@ -137,6 +174,7 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
   const alternateImageBytes = await readFile(path.join(process.cwd(), "public", "assets", "heroes", "Abrams.png"));
   let missingNurseImageRequests = 0;
   let alternateNurseImageRequests = 0;
+  let focusHealingNeedlesScreenshot = false;
 
   await page.route("**/api/v1/content/patches/*", async (route) => {
     const requestId = new URL(route.request().url()).pathname.split("/").at(-1);
@@ -145,7 +183,17 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
       await route.continue();
       return;
     }
-    const renderedFixture = requestId === nurseIntroductionPatchId
+    const renderedFixture = requestId === nurseIntroductionPatchId && focusHealingNeedlesScreenshot
+      ? {
+        ...fixture,
+        sections: fixture.sections
+          .filter((section) => section.kind === "hero" && section.hero_name === "Nurse Harrow")
+          .map((section) => ({
+            ...section,
+            abilities: section.abilities.filter((ability) => ability.name === "Healing Needles"),
+          })),
+      }
+      : requestId === nurseIntroductionPatchId
       ? {
         ...fixture,
         sections: fixture.sections.map((section) => (
@@ -279,7 +327,7 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
       await expect.poll(() => celeste.locator(".patch-ability-icon").first().evaluate((image) => (
         (image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth > 0
       ))).toBe(true);
-      await saveMobileCardScreenshot(
+      await savePatchCardScreenshot(
         celeste.locator(".patch-ability").first(),
         "patch-render-celeste-ability-mobile.png",
         artifactDirectory,
@@ -322,7 +370,7 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
         await expect.poll(() => nurseCard.locator(".patch-ability-icon").first().evaluate((image) => (
           (image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth > 0
         ))).toBe(true);
-        await saveMobileCardScreenshot(nurseCard, "patch-render-nurse-card-mobile.png", artifactDirectory);
+        await savePatchCardScreenshot(nurseCard, "patch-render-nurse-card-mobile.png", artifactDirectory);
         capturedNurse = true;
       } else if (patchId === nurseIntroductionPatchId) {
         expect(nurse.abilities).toHaveLength(4);
@@ -337,9 +385,60 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
         expect(alternateNurseImageRequests).toBe(1);
         expect(nurse.abilities.every((ability) => ability.presentation_kind === "introduction")).toBe(true);
         expect(nurse.abilities.every((ability) => Boolean(ability.description?.trim()))).toBe(true);
-        expect(nurse.abilities.reduce((sum, ability) => sum + (ability.stats?.length ?? 0), 0)).toBe(67);
         expect(nurse.abilities.some((ability) => ability.stats_pending)).toBe(false);
-        await saveMobileCardScreenshot(nurseCard, "patch-render-nurse-intro-mobile.png", artifactDirectory);
+        for (const [abilityIndex, sourceAbility] of nurse.abilities.entries()) {
+          const statRows = sourceAbility.stats ?? [];
+          expect(statRows.every((stat) => (
+            Boolean(stat.identity)
+            && Boolean(stat.type)
+            && Boolean(stat.unit)
+            && stat.tier !== undefined
+          ))).toBe(true);
+          const abilityCard = nurseCard.locator(".patch-ability").nth(abilityIndex);
+          const sourceBaseStats = statRows.filter((stat) => stat.tier == null);
+          await expectSemanticStatRows(
+            abilityCard.locator('dl[data-stat-layout="base"]'),
+            sourceBaseStats,
+          );
+          const sourceTiers = new Map<number, PlatformPatchAbilityStat[]>();
+          for (const stat of statRows) {
+            if (stat.tier == null) continue;
+            const tierStats = sourceTiers.get(stat.tier) ?? [];
+            tierStats.push(stat);
+            sourceTiers.set(stat.tier, tierStats);
+          }
+          const renderedTiers = abilityCard.locator(".patch-ability-tier");
+          await expect(renderedTiers).toHaveCount(sourceTiers.size);
+          for (const [tier, tierStats] of sourceTiers) {
+            const sourceTierCard = abilityCard.locator(`.patch-ability-tier[data-tier="${tier}"]`);
+            await expect(sourceTierCard.locator("h5")).toHaveText(`T${tier}`);
+            await expectSemanticStatRows(sourceTierCard.locator('dl[data-stat-layout="tier"]'), tierStats);
+          }
+          const abilityIcon = abilityCard.locator(".patch-ability-icon");
+          await abilityIcon.scrollIntoViewIfNeeded();
+          await expect.poll(() => abilityIcon.evaluate((image) => (
+            (image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth > 0
+          ))).toBe(true);
+        }
+        const needleIndex = nurse.abilities.findIndex((ability) => ability.name === "Healing Needles");
+        expect(needleIndex).toBeGreaterThanOrEqual(0);
+        const needle = nurse.abilities[needleIndex];
+        const needleStats = needle?.stats ?? [];
+        const baseHealing = needleStats.find((stat) => stat.identity === "heal_regen" && stat.tier == null);
+        expect(baseHealing?.scaling?.coefficient).toBe("0.24");
+        expect(baseHealing?.value).toMatch(/22.*0,24.*Спиритическая мощь/u);
+        expect(needleStats.some((stat) => /-1(?:[,.]0)?\s*(?:с\.|сек\.?)/iu.test(stat.value))).toBe(false);
+        expect(needleStats.filter((stat) => stat.tier === 1)).toHaveLength(1);
+        expect(needleStats.filter((stat) => stat.tier === 2)).toHaveLength(2);
+        expect(needleStats.filter((stat) => stat.tier === 3)).toHaveLength(2);
+        const tierThreeScale = needleStats.find((stat) => stat.tier === 3 && stat.unit === "coefficient");
+        expect(tierThreeScale?.identity).toBe("heal_regen");
+        expect(tierThreeScale?.upgrade_type).toBe("add_to_scale");
+        expect(tierThreeScale?.value).toBe("+0,4");
+        const needleCard = nurseCard.locator(".patch-ability").nth(needleIndex);
+        await expect(needleCard.getByRole("heading", { level: 3 })).toHaveText("Лечебные иглы");
+        await savePatchCardScreenshot(needleCard, "patch-render-healing-needles-mobile.png", artifactDirectory);
+        await savePatchCardScreenshot(nurseCard, "patch-render-nurse-intro-mobile.png", artifactDirectory);
       }
     }
 
@@ -352,7 +451,7 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
       await expect.poll(() => midBossIcon.evaluate((image) => (
         (image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth > 0
       ))).toBe(true);
-      await saveMobileCardScreenshot(midBoss, "patch-render-mid-boss-mobile.png", artifactDirectory);
+      await savePatchCardScreenshot(midBoss, "patch-render-mid-boss-mobile.png", artifactDirectory);
       capturedMidBoss = true;
     }
 
@@ -372,6 +471,63 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
     expect(desktopArticle).not.toBeNull();
     expect(desktopArticle!.x).toBeGreaterThanOrEqual(desktopMain!.x - 1);
     expect(desktopArticle!.x + desktopArticle!.width).toBeLessThanOrEqual(desktopMain!.x + desktopMain!.width + 1);
+  }
+
+  if (artifactDirectory) {
+    focusHealingNeedlesScreenshot = true;
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto(`/patches/${nurseIntroductionPatchId}`);
+    const focusedNurse = page.locator(".patch-section").first();
+    const focusedAbility = focusedNurse.locator(".patch-ability").first();
+    await expect(focusedNurse.getByRole("heading", { level: 2 })).toHaveText("Nurse Harrow");
+    await expect(focusedAbility.getByRole("heading", { level: 3 })).toHaveText("Лечебные иглы");
+    for (const image of [focusedNurse.locator(".patch-hero-image"), focusedAbility.locator(".patch-ability-icon")]) {
+      await image.scrollIntoViewIfNeeded();
+      await expect.poll(() => image.evaluate((element) => (
+        (element as HTMLImageElement).complete && (element as HTMLImageElement).naturalWidth > 0
+      ))).toBe(true);
+    }
+    await expectNoHorizontalOverflow(page);
+    const mobileHeader = await focusedNurse.locator(".patch-section-header").boundingBox();
+    const mobileBiography = await focusedNurse.locator(".patch-hero-description").boundingBox();
+    expect(mobileHeader).not.toBeNull();
+    expect(mobileBiography).not.toBeNull();
+    expect(mobileBiography!.width).toBeGreaterThan(mobileHeader!.width * 0.9);
+    const mobileColumns = await focusedAbility.locator('dl[data-stat-layout="base"]').evaluate((element) => (
+      getComputedStyle(element).gridTemplateColumns.split(" ").length
+    ));
+    const mobileTierColumns = await focusedAbility.locator(".patch-ability-tier-rail").evaluate((element) => (
+      getComputedStyle(element).gridTemplateColumns.split(" ").length
+    ));
+    expect(mobileColumns).toBe(1);
+    expect(mobileTierColumns).toBe(1);
+    const longTierLabel = focusedAbility.locator('.patch-ability-tier[data-tier="3"] .patch-ability-stat').last().locator("dt");
+    const longTierRowLocator = longTierLabel.locator("xpath=..");
+    const longTierRow = await longTierRowLocator.boundingBox();
+    const longTierLabelBox = await longTierLabel.boundingBox();
+    const longTierValue = await longTierRowLocator.locator("dd").boundingBox();
+    expect(longTierRow).not.toBeNull();
+    expect(longTierLabelBox).not.toBeNull();
+    expect(longTierValue).not.toBeNull();
+    expect(longTierLabelBox!.width).toBeGreaterThan(longTierRow!.width * 0.9);
+    expect(longTierValue!.y).toBeGreaterThanOrEqual(longTierLabelBox!.y + longTierLabelBox!.height - 1);
+    await expectStatLabelsKeepWords(focusedAbility);
+    await savePatchCardScreenshot(focusedNurse, "healing-needles-mobile.png", artifactDirectory);
+
+    await page.setViewportSize({ width: 320, height: 800 });
+    await expectNoHorizontalOverflow(page);
+    await expectStatLabelsKeepWords(focusedAbility);
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await expectNoHorizontalOverflow(page);
+    const desktopColumns = await focusedAbility.locator('dl[data-stat-layout="base"]').evaluate((element) => (
+      getComputedStyle(element).gridTemplateColumns.split(" ").length
+    ));
+    const desktopTierColumns = await focusedAbility.locator(".patch-ability-tier-rail").evaluate((element) => (
+      getComputedStyle(element).gridTemplateColumns.split(" ").length
+    ));
+    expect(desktopColumns).toBe(4);
+    expect(desktopTierColumns).toBe(3);
+    await savePatchCardScreenshot(focusedNurse, "healing-needles-desktop.png", artifactDirectory);
   }
 
   expect(capturedCeleste).toBe(true);
