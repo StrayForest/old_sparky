@@ -1053,8 +1053,38 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
     ):
         if expression not in production:
             issues.append(f"production deploy job must require {expression}")
-    if "continue-on-error" in production or (build and "continue-on-error" in build):
+    production_deploy_step = next(
+        (
+            step
+            for step in _workflow_step_blocks(production)
+            if re.search(
+                r"^      - name:\s*Run production preflight or deployment\s*$",
+                step,
+                re.MULTILINE,
+            )
+        ),
+        "",
+    )
+    if (
+        (build and "continue-on-error" in build)
+        or not production_deploy_step
+        or "continue-on-error" in production_deploy_step
+    ):
         issues.append("production candidate/build jobs must propagate failures")
+    optional_receipts = {
+        "Create exact actual-deployment mode receipt",
+        "Upload exact actual-deployment mode receipt",
+    }
+    for step in _workflow_step_blocks(production):
+        name_match = re.search(r"^      - name:\s*(.*?)\s*$", step, re.MULTILINE)
+        if name_match is None:
+            continue
+        name = name_match.group(1)
+        if name in optional_receipts:
+            if "continue-on-error: true" not in step:
+                issues.append(f"{name} must remain best-effort after a successful deploy")
+        elif "continue-on-error" in step:
+            issues.append(f"production step must propagate failure: {name}")
 
     exact_artifact_name = "platform-release-artifact-${{ github.run_id }}-${{ github.run_attempt }}"
     if exact_artifact_name not in production:

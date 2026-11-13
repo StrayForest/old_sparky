@@ -7,14 +7,49 @@ on:
         description: "Type RUN-LIVE-USER-QA to run the destructive automated production contour"
         required: true
         type: string
+      expected_target_sha:
+        description: "Exact deployed source SHA expected for this UserQA run"
+        required: true
+        type: string
+      sequence_run_id:
+        description: "Internal exact sequencer run ID for an automatic QA child"
+        required: false
+        default: ""
+        type: string
+      sequence_run_attempt:
+        description: "Internal sequencer attempt for an automatic QA child"
+        required: false
+        default: ""
+        type: string
+      sequence_deploy_run_id:
+        description: "Internal source deployment run ID for an automatic QA child"
+        required: false
+        default: ""
+        type: string
+      sequence_deploy_run_attempt:
+        description: "Internal source deployment attempt for an automatic QA child"
+        required: false
+        default: ""
+        type: string
+      sequence_source_sha:
+        description: "Internal sequencer source SHA for an automatic QA child"
+        required: false
+        default: ""
+        type: string
+      sequence_public_run_id:
+        description: "Internal exact public QA run ID for an automatic UserQA child"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   actions: read
   contents: read
 
 concurrency:
-  group: platform-live-user-qa
+  group: ${{ inputs.sequence_run_id != '' && format('platform-live-qa-sequenced-child-{0}-{1}', inputs.sequence_run_id, github.run_id) || 'platform-live-qa' }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
   validate-live-user-inputs:
@@ -27,9 +62,18 @@ jobs:
     permissions:
       actions: read
       contents: read
+      statuses: read
     env:
       QA_CONFIRMATION: ${{ inputs.confirmation }}
       TARGET_SHA: ${{ github.sha }}
+      EXPECTED_TARGET_SHA: ${{ inputs.expected_target_sha }}
+      SEQUENCE_RUN_ID: ${{ inputs.sequence_run_id }}
+      SEQUENCE_RUN_ATTEMPT: ${{ inputs.sequence_run_attempt }}
+      SEQUENCE_DEPLOY_RUN_ID: ${{ inputs.sequence_deploy_run_id }}
+      SEQUENCE_DEPLOY_RUN_ATTEMPT: ${{ inputs.sequence_deploy_run_attempt }}
+      SEQUENCE_SOURCE_SHA: ${{ inputs.sequence_source_sha }}
+      SEQUENCE_PUBLIC_RUN_ID: ${{ inputs.sequence_public_run_id }}
+      SEQUENCE_CHILD_ROLE: user-qa
     steps:
       - name: Require exact dev live-user QA dispatch
         shell: bash
@@ -40,6 +84,8 @@ jobs:
           test "$TARGET_SHA" = "$GITHUB_SHA"
           test "$QA_CONFIRMATION" = "RUN-LIVE-USER-QA"
           [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$EXPECTED_TARGET_SHA" = "$TARGET_SHA" || { echo "UserQA ref does not match the exact deployed source." >&2; exit 1; }
+          [[ "$EXPECTED_TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "UserQA expected source SHA is malformed." >&2; exit 1; }
       - name: Checkout reviewed live-user QA source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -54,6 +100,14 @@ jobs:
           /usr/bin/python3 platform/tools/platform_workflow_input_guard.py confirmation \
             --value "$QA_CONFIRMATION" --expected "RUN-LIVE-USER-QA"
           /usr/bin/python3 platform/tools/platform_workflow_input_guard.py sha --value "$TARGET_SHA"
+      - name: Authenticate exact sequencer-issued UserQA receipt
+        if: ${{ inputs.sequence_run_id != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 platform/tools/platform_live_qa_sequence.py validate-child
       - name: Resolve authenticated app source binding
         id: resolve-source-binding
         shell: bash

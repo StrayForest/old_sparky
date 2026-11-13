@@ -1,4 +1,4 @@
-import { expect, test, type Browser, type BrowserContext, type Page } from "@playwright/test";
+import { expect, test, type BrowserContext, type Page } from "@playwright/test";
 import { lstatSync, readFileSync } from "node:fs";
 
 const API_ORIGIN = "http://127.0.0.1:3199";

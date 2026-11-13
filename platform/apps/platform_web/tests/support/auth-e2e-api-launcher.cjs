@@ -1,5 +1,7 @@
 "use strict";
 
+/* eslint @typescript-eslint/no-require-imports: "off" -- This process launcher is CommonJS. */
+
 const { spawn } = require("node:child_process");
 const path = require("node:path");
 const { apiChildEnv } = require("./auth-e2e-child-env.cjs");

@@ -4580,6 +4580,7 @@ jobs:
           timeout --foreground 300s scp -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$RELEASE_CHECKSUM" "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
 
       - name: Run production preflight or deployment
+        id: production_deploy
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -4688,6 +4689,26 @@ jobs:
               exit 1
             fi
           fi
+          if [[ "$ssh_rc" = 0 && "$public_line" == 'RELEASE_DEPLOY schema=1 status=passed class=deployment '* ]]; then
+            /usr/bin/python3 - "$public_line" "$TARGET_SHA" "$GITHUB_OUTPUT" <<'PY'
+          import re
+          import sys
+
+          line, target, output_path = sys.argv[1:]
+          match = re.fullmatch(
+              r"RELEASE_DEPLOY schema=1 status=passed class=deployment"
+              r"(?: phase=(?:artifact|provenance|preflight|candidate|readiness) reason=[a-z_]+)?"
+              r" release_slug=(gha-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}-[0-9a-f]{12})"
+              r" source_sha=([0-9a-f]{40})",
+              line,
+          )
+          if match is None or match.group(2) != target:
+              raise SystemExit("passed deployment marker did not bind the exact target SHA")
+          with open(output_path, "a", encoding="ascii") as output:
+              output.write(f"deployed_release_slug={match.group(1)}\n")
+              output.write(f"deployed_source_sha={match.group(2)}\n")
+          PY
+          fi
           printf '%s\n' "$public_line"
           exit "$ssh_rc"
 
@@ -4753,6 +4774,70 @@ jobs:
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
           curl --fail-with-body --silent --show-error --request POST --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" --data "{\"state\":\"success\",\"context\":\"platform-production-deploy\",\"description\":\"Production deployment and live smoke passed\",\"target_url\":\"${run_url}\"}"
+
+      - name: Create exact actual-deployment mode receipt
+        id: actual_deploy_receipt
+        if: ${{ success() && steps.production_deploy.outputs.deployed_source_sha != '' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          DEPLOYED_SOURCE_SHA: ${{ steps.production_deploy.outputs.deployed_source_sha }}
+          DEPLOYED_RELEASE_SLUG: ${{ steps.production_deploy.outputs.deployed_release_slug }}
+          WORKFLOW_MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          umask 077
+          /usr/bin/python3 - "$RUNNER_TEMP/actual-deployment-receipt.json" \
+            "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+            "$GITHUB_SHA" "$WORKFLOW_MODE" "$DEPLOYED_SOURCE_SHA" "$DEPLOYED_RELEASE_SLUG" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+
+          output, repository, run_id, attempt, runner_sha, mode, source_sha, slug = sys.argv[1:]
+          if (
+              repository != "StrayForest/old_sparky"
+              or mode not in {"deploy", "recovery-deploy", "baseline-reconcile"}
+              or not re.fullmatch(r"[1-9][0-9]{0,31}", run_id)
+              or not re.fullmatch(r"[1-9][0-9]{0,31}", attempt)
+              or not re.fullmatch(r"[0-9a-f]{40}", runner_sha)
+              or source_sha != runner_sha
+              or not re.fullmatch(r"gha-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}-[0-9a-f]{12}", slug)
+              or not slug.endswith(f"-{source_sha[:12]}")
+          ):
+              raise SystemExit("actual deployment receipt identity is invalid")
+          receipt = {
+              "schema": 1,
+              "kind": "platform-actual-deployment-mode",
+              "repository": repository,
+              "workflow_path": ".github/workflows/platform-production-deploy.yml",
+              "run_id": run_id,
+              "run_attempt": attempt,
+              "runner_sha": runner_sha,
+              "mode": mode,
+              "source_sha": source_sha,
+              "release_slug": slug,
+          }
+          raw = (json.dumps(receipt, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+          path = Path(output)
+          descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+          with os.fdopen(descriptor, "wb") as stream:
+              stream.write(raw)
+              stream.flush()
+              os.fsync(stream.fileno())
+          PY
+
+      - name: Upload exact actual-deployment mode receipt
+        if: ${{ steps.actual_deploy_receipt.outcome == 'success' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-actual-deployment-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/actual-deployment-receipt.json
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Mark production deployment failed
         if: ${{ failure() }}

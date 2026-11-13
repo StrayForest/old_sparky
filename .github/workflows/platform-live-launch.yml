@@ -17,10 +17,44 @@ on:
         required: false
         default: ""
         type: string
+      expected_target_sha:
+        description: "Exact deployed source SHA expected for this live launch"
+        required: true
+        type: string
+      sequence_run_id:
+        description: "Internal exact sequencer run ID for an automatic QA child"
+        required: false
+        default: ""
+        type: string
+      sequence_run_attempt:
+        description: "Internal sequencer attempt for an automatic QA child"
+        required: false
+        default: ""
+        type: string
+      sequence_deploy_run_id:
+        description: "Internal source deployment run ID for an automatic QA child"
+        required: false
+        default: ""
+        type: string
+      sequence_deploy_run_attempt:
+        description: "Internal source deployment attempt for an automatic QA child"
+        required: false
+        default: ""
+        type: string
+      sequence_source_sha:
+        description: "Internal sequencer source SHA for an automatic QA child"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   actions: read
   contents: read
+
+concurrency:
+  group: ${{ inputs.sequence_run_id != '' && format('platform-live-qa-sequenced-child-{0}-{1}', inputs.sequence_run_id, github.run_id) || 'platform-live-qa' }}
+  cancel-in-progress: false
+  queue: max
 
 jobs:
   validate-live-inputs:
@@ -33,11 +67,19 @@ jobs:
     permissions:
       actions: read
       contents: read
+      statuses: read
     env:
       LIVE_BASE_URL: ${{ inputs.base_url }}
       LIVE_PROVISION: ${{ inputs.provision }}
       LIVE_MARKER: ${{ inputs.marker }}
       TARGET_SHA: ${{ github.sha }}
+      EXPECTED_TARGET_SHA: ${{ inputs.expected_target_sha }}
+      SEQUENCE_RUN_ID: ${{ inputs.sequence_run_id }}
+      SEQUENCE_RUN_ATTEMPT: ${{ inputs.sequence_run_attempt }}
+      SEQUENCE_DEPLOY_RUN_ID: ${{ inputs.sequence_deploy_run_id }}
+      SEQUENCE_DEPLOY_RUN_ATTEMPT: ${{ inputs.sequence_deploy_run_attempt }}
+      SEQUENCE_SOURCE_SHA: ${{ inputs.sequence_source_sha }}
+      SEQUENCE_CHILD_ROLE: public
     steps:
       - name: Reject invalid live-launch dispatch before mode branch
         shell: bash
@@ -48,6 +90,8 @@ jobs:
           test "$LIVE_BASE_URL" = "https://old-sparky.com" || { echo "Live launch requires the canonical origin." >&2; exit 1; }
           case "$LIVE_PROVISION" in true|false) ;; *) echo "Live provision mode is invalid." >&2; exit 1 ;; esac
           [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "Live launch requires an exact target SHA." >&2; exit 1; }
+          test "$EXPECTED_TARGET_SHA" = "$TARGET_SHA" || { echo "Live launch ref does not match the exact deployed source." >&2; exit 1; }
+          [[ "$EXPECTED_TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "Live launch expected source SHA is malformed." >&2; exit 1; }
       - name: Checkout live-launch validator
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -59,6 +103,14 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+      - name: Authenticate exact sequencer-issued child receipt
+        if: ${{ inputs.sequence_run_id != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 platform/tools/platform_live_qa_sequence.py validate-child
       - name: Resolve authenticated app source binding
         id: resolve-source-binding
         shell: bash

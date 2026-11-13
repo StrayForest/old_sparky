@@ -122,27 +122,36 @@ regression; never weaken the policy merely to silence telemetry.
 
 ## Live CSP QA and mailbox boundary
 
-The production gate deliberately has two non-overlapping contours. A root
-supervisor creates exactly 14 ephemeral browser sessions with a maximum
-one-hour TTL, then hands only their `0600` per-run file to a dedicated non-root,
-sandboxed Playwright runner for tournament/roster/bracket behavior. The
-database stores only token digests; the plaintext file is reclaimed by root and
-destroyed after exact-ID cleanup. This contour never calls auth
-lifecycle or Turnstile flows and cannot be cited as auth evidence; it only
-reads the session/CSRF endpoints and logs out the short-lived fixtures during
-teardown.
+Required auth lifecycle coverage runs in the exact-source `web-hermetic` gate
+with `npm run test:auth-lifecycle-e2e`. It drives the browser auth UI against
+the real API and isolated test database, captures email through a local
+test-only mail transport, and injects Siteverify responses only through the
+test harness while executing the application verifier's hostname and action
+checks. It does not use production mail credentials or accounts, disable
+Turnstile, or simulate a live Cloudflare challenge. The public post-deploy
+browser suite remains a separate contour: a root supervisor creates exactly
+14 ephemeral browser sessions with a maximum one-hour TTL, then hands only
+their `0600` per-run file to a dedicated non-root, sandboxed Playwright runner
+for tournament/roster/bracket behavior. The database stores only token digests.
+That suite does not exercise auth lifecycle or Turnstile and cannot substitute
+for the auth CI suite. Authenticated UserQA runs only after the public suite
+passes; it owns exact-ID cleanup and the final absence proof before root
+reclaims the plaintext session file.
 
-Only after that cleanup is proven does an operator use ordinary non-WebDriver
-Chrome on a normal end-user network for registration, verification, login,
-logout, password reset/change and the real production Turnstile. Cloudflare
-documents that Selenium/Playwright are detected as bots and production outcomes
-are unpredictable, while dummy keys are restricted to testing environments:
+Human-driven production Chrome QA is optional diagnostic evidence when
+investigating a live browser or Cloudflare issue; it is not required release
+acceptance. A passing automated fixture does not prove real production
+challenge behavior. Cloudflare documents that Selenium/Playwright may be
+detected as bots and production outcomes are unpredictable, while dummy keys
+are restricted to testing environments:
 [Turnstile testing](https://developers.cloudflare.com/turnstile/troubleshooting/testing/).
-CDP attachment, WebDriver, Xvfb, dummy keys, a protection bypass and Turnstile
-token copying/reuse are forbidden.
+When performing this optional diagnostic, CDP attachment, WebDriver, Xvfb,
+dummy keys, a protection bypass and Turnstile token copying/reuse remain
+forbidden.
 
-The root-only manual operator tool obtains email/password values from the
-`0600` bundle and reveals them only on an interactive root TTY. The Resend
+For an optional production diagnostic, the root-only manual operator tool
+obtains email/password values from the `0600` bundle and reveals them only on
+an interactive root TTY. The Resend
 sent-copy helper contract is `platform_live_qa_mailbox_helper.py code
 email-verification|password-reset`; it derives the sole allowed recipient from
 that same bundle, so no email, password or code appears in process arguments.
@@ -154,22 +163,24 @@ no-more-than-four-hour-old `created_at` lower bound. It reads
 paginated, fixed HTTPS list/retrieve requests to the official sent-email API.
 The current key can read sent content and therefore has broader access than a
 send-only application key. Keep that capability root-only and time-bounded;
-after final QA, rotate the application to `sending_access` and retain no
-read-capable QA key unless a separate root-only operational gate still owns it.
+after the optional diagnostic, rotate the application to `sending_access` and
+retain no read-capable QA key.
 
 The helper does not connect to the database, read OTP rows or invoke a shell;
 it ignores a process-environment API key and stores nothing. Failure output is
 generic; recipient, message ID/body, API key and OTP must never enter argv,
-stderr, journals, QA reports or application logs. The manual attestation must
-validate the exact audit sequence, clean only the resolved manual user/session
-IDs and prove no marker residue remains. Each CSP release requires a fresh
-marker, both contours and both exact cleanups. Because these reviewed
-tools run as root to maintain the exact-ID secret boundary, they are not a
-filesystem sandbox; the source commit and production origin are part of the
-gate.
+stderr, journals, QA reports or application logs. The optional manual
+attestation validates the exact audit sequence, cleans only the resolved manual
+user/session IDs and proves no marker residue remains. Each CSP release
+requires the exact-source auth lifecycle CI gate, a passing public browser
+workflow, and authenticated UserQA with its exact cleanup and absence proof. A manual diagnostic
+does not replace or block those required gates. Because these reviewed tools
+run as root to maintain the exact-ID secret boundary, they are not a filesystem
+sandbox; the source commit and production origin remain part of the diagnostic
+boundary.
 
-An interrupted or rejected human run uses only `abort-and-cleanup`. It never
-counts as acceptance evidence, but can consume an expired, otherwise unchanged
+An interrupted or rejected optional human run uses only `abort-and-cleanup`. It
+never counts as acceptance evidence, but can consume an expired, otherwise unchanged
 root-only state to remove zero users or the one exact derived account. It
 refuses ambiguous tournament, participant or media scope and requires a fresh
 marker for the next attempt.

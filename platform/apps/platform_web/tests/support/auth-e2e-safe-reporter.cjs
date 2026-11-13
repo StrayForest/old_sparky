@@ -22,12 +22,17 @@ function failedStage(steps) {
 
 class AuthE2ESafeReporter {
   onBegin(_config, suite) {
-    const names = suite.allTests().map((test) => test.title);
-    if (names.length !== EXPECTED_TESTS.size || names.some((name) => !EXPECTED_TESTS.has(name))) {
-      process.stdout.write("AUTH_E2E status=invalid-suite\n");
+    const tests = suite.allTests();
+    const exact = tests.filter((test) => {
+      const source = test.location.file.replaceAll("\\", "/");
+      return EXPECTED_TESTS.has(test.titlePath().at(-1) ?? "")
+        && source.endsWith("/tests/smoke/auth-lifecycle-e2e.spec.ts");
+    });
+    if (tests.length !== EXPECTED_TESTS.size || exact.length !== EXPECTED_TESTS.size) {
+      process.stdout.write(`AUTH_E2E status=invalid-suite tests=${tests.length} exact=${exact.length}\n`);
       throw new Error("Auth E2E suite identity is invalid.");
     }
-    this.total = names.length;
+    this.total = tests.length;
     this.passed = 0;
     this.failed = 0;
   }

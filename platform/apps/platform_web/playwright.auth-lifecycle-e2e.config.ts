@@ -22,7 +22,7 @@ const standaloneServer = [
 
 export default defineConfig({
   testDir: "./tests/smoke",
-  testMatch: "auth-lifecycle-e2e.spec.ts",
+  testMatch: "**/auth-lifecycle-e2e.spec.ts",
   outputDir,
   timeout: 45_000,
   expect: { timeout: 10_000 },

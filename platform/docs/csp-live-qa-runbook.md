@@ -148,17 +148,19 @@ ownership and report limiter are in the [security runbook](security-runbook.md).
 
 ## CSP live-user gates
 
-Each production release requires two independent contours, in this order:
+Each release requires exact-source `npm run test:auth-lifecycle-e2e`, public
+tournament/roster/bracket QA, then authenticated UserQA. They are distinct:
+public QA does not exercise auth or Turnstile. See the [auth E2E reference](auth-lifecycle-e2e.md)
+for fixture/privacy details. Use a fresh marker, avoid overlap, and run optional
+human diagnostics only after UserQA proves cleanup and absence.
 
-1. an automated tournament/roster/bracket journey using short-lived QA
-   sessions and no authentication route or Turnstile;
-2. after its exact-ID cleanup succeeds, a human auth lifecycle and production
-   Turnstile check in ordinary Chrome.
-
-Neither contour substitutes for the other. Use a fresh `liveqa-*` marker for
-each release. Do not run the contours concurrently or start the manual contour
-until the automated inventory, users, sessions, tournament and media have all
-been confirmed absent.
+The sequence passes only after both child workflows and UserQA exact cleanup
+and absence succeed. If UserQA fails after provisioning—including source
+advance, dispatch outage or interruption—retain the roster and sanitized
+failure evidence; do not claim success, reprovision or reuse its marker.
+Recover through [stale-bundle recovery](liveqa-stale-bundle-recovery.md) once its
+age precondition holds, otherwise use canonical exact-state recovery below.
+Start another run only after cleanup and absence are proven.
 
 The credential-bearing journey never runs a candidate checkout or unverified mailbox helper. The source-only `liveqa-runtime` manifest v3 adds confined declared `engine_links` to the v2 keys (no `source_sha`); its engine-tree digest uses the typed, domain-separated `oldsparky-liveqa-engine-v2` encoding for regular-file digests and exact symlink targets. The provider manifest v2 binds `source_sha`, carries the same link map and installs candidate-owned bytes under `provider-runtime`; prior complete v1 generations remain immutable at `runtime` and may serve only when their exact engine map and package-lock digest match. Activation checks Node 26.3.1, package lock, required Playwright packages, browser roots, Chromium sandbox and the exact file/link maps under the release lock, then records the provider generation in the digest-bound payload before switching active. Missing, stale or incompatible providers fail closed; no environment or candidate-checkout path is trusted. Provider hashing stays bounded by signed member limits; release bootstrap validates the full archive before omitting only the wheelhouse and standalone web bundle from its temporary control tree. For missing-provider recovery, see the [provider recovery runbook](liveqa-provider-recovery.md).
 
@@ -204,15 +206,23 @@ never refresh it from a checkout. The dispatcher checks the fixed
 before invoking the trusted supervisor. Never bypass that check or copy a
 helper from an unrelated checkout.
 
-The canonical automated journey dispatch is:
+An explicit UserQA rerun is operator-triggered only after the public suite has
+passed. Normal deployment dispatches the public suite and UserQA automatically.
+For a direct rerun, `expected_target_sha` is the current `dev` commit that the
+workflow runner will check out. The workflow separately authenticates the
+active deployed app source and its QA runtime; in a docs-only/no-op state those
+SHAs can differ.
 
 ```bash
+EXPECTED_TARGET_SHA="$(gh api repos/StrayForest/old_sparky/commits/dev --jq .sha)"
 gh workflow run platform-live-user-qa.yml \
   --ref dev \
-  -f confirmation=RUN-LIVE-USER-QA
+  -f confirmation=RUN-LIVE-USER-QA \
+  -f expected_target_sha="$EXPECTED_TARGET_SHA"
 ```
 
-Dispatch only after confirming the exact deployed `dev` SHA; no fixture is created until release lock, active SHA, host supervisor/helper, bundle and browser preflight checks pass.
+No fixture is created until release lock, active SHA, host supervisor/helper,
+bundle and browser preflight checks pass.
 The fixed desktop journey uses a 1,500-second child cap for its 600-second Playwright test plus separate 600-second teardown (300 seconds planning reserve); systemd stays capped at 30 minutes.
 The complete public `live-launch.spec.ts` suite uses a separate 1,500-second inner capture cap only for the exact fixed, target-bound browser command; engine preflight, project subsets and other browser-child paths retain the 300-second cap. The 1,500-second capture sits below the existing 1,800-second systemd `RuntimeMaxSec`. These are bounded operational budgets, not Playwright-recommended values or a guarantee of passing. Playwright applies a per-test timeout and separate teardown allowance, and tests run sequentially unless parallel execution is enabled ([timeout semantics](https://playwright.dev/docs/test-timeouts), [parallel execution](https://playwright.dev/docs/test-parallel)).
 The remote operation cap is 2,400 seconds, providing a 900-second planning budget beyond the child capture, within the 2,700-second workflow job. The job leaves 300 seconds for bounded handoff/report steps; pre-helper checks and setup consume time inside the remote cap. External setup/network time is not guaranteed, other action limits are unchanged, and timeout/cleanup uncertainty fails closed.
@@ -246,11 +256,13 @@ roster. Any remaining old scope fails closed and must be recovered before a
 retry.
 
 ```bash
+EXPECTED_TARGET_SHA="$(gh api repos/StrayForest/old_sparky/commits/dev --jq .sha)"
 gh workflow run platform-live-launch.yml \
   --ref dev \
   -f base_url=https://old-sparky.com \
   -f provision=true \
-  -f marker=liveqa-csp-rotate-<unique>
+  -f marker=liveqa-csp-rotate-<unique> \
+  -f expected_target_sha="$EXPECTED_TARGET_SHA"
 ```
 
 The dedicated `oldsparky-liveqa` system account has `/nonexistent` as its home,
@@ -309,8 +321,8 @@ The bundle is an exact v1 object:
 ```
 
 `roster_accounts` must contain exactly 13 unique preverified entries of the
-shown shape. The top-level `email` and `password` are reserved for the later
-manual auth contour; provisioning does not pre-create that account. The bundle
+shown shape. The top-level `email` and `password` are reserved for an optional
+human auth diagnostic; provisioning does not pre-create that account. The bundle
 directory, bundle and helper must be root-owned regular non-symlink paths with
 modes `0700`, `0600` and `0500` respectively; their ancestors must remain
 root-controlled and not group/world writable. The mailbox boundary rejects a
@@ -430,17 +442,16 @@ platform/tools/platform_live_browser_qa.sh recover \
   /run/oldsparky-liveqa/public-live-qa.<exact-suffix>
 ```
 
-### Manual auth and production Turnstile contour
+### Optional production auth and Turnstile diagnostic
 
-Run this only after the automated cleanup has succeeded. Use an ordinary,
-visible, non-WebDriver Chrome profile on a normal end-user network; do not use
-CDP/remote debugging, Playwright/Selenium, Xvfb or a personal browser profile.
-Create a fresh disposable unsynchronized profile, turn password saving and
-autofill off, and do not open DevTools, export network data, or copy credentials
-through the clipboard.
-Cloudflare documents that Selenium/Playwright are detected as automation and
-that production challenge outcomes are unpredictable; its dummy sitekeys are
-only for testing environments and cannot constitute production evidence. See
+This is optional, never a gate; run only after both production workflows and
+UserQA cleanup pass. The [auth E2E reference](auth-lifecycle-e2e.md) explains why
+the fixture cannot prove production Cloudflare scoring. Use ordinary Chrome,
+not WebDriver/CDP, Playwright/Selenium, Xvfb or a personal profile. Use a fresh
+disposable unsynchronized profile; disable password saving/autofill and avoid
+DevTools, network exports and clipboard credentials. Cloudflare warns automation
+is detected, outcomes are unpredictable, and dummy sitekeys are for testing.
+See
 [Turnstile testing](https://developers.cloudflare.com/turnstile/troubleshooting/testing/)
 and [client-side error codes](https://developers.cloudflare.com/turnstile/troubleshooting/client-side-errors/error-codes/).
 
@@ -531,31 +542,26 @@ marker-wide deletion. A missing step, unexpected account/tournament/media,
 failed Turnstile, audit mismatch or cleanup failure blocks progression. Use
 the reviewed shell interface rather than invoking its internal Python module.
 
-For enforcement, provision a different unique `liveqa-*` marker and repeat the
-automated contour, its verified cleanup, and the manual contour. Bundle
-replacement fails closed unless the previous marker and all previous exact IDs
-are absent. Never reuse a stale bundle or marker. This root-run QA is not a
-filesystem sandbox: use only the reviewed source commit against the exact
-configured production origin. See the
+Run an optional diagnostic only after automated auth, public QA and UserQA
+cleanup pass. Bundle replacement requires absence of the previous marker and
+all exact IDs; never reuse stale state. Root-run QA is not a filesystem
+sandbox: use reviewed source against the configured production origin. See
 [security runbook](security-runbook.md#live-csp-qa-and-mailbox-boundary) for
 the full boundary.
 
-After the enforcement live QA and its verified exact cleanup have completed,
-retire the obsolete root-only bundle, manual state/inventory files and installed
-mailbox helper. Remove only those exact paths after proving no disposable
-user/tournament/media/session residue remains; never leave retired credentials
-on disk and never commit or log their contents.
+After public QA and UserQA cleanup/absence pass, remove the exact root-only
+bundle and mailbox helper. If a human diagnostic ran, also remove its manual
+state/inventory after exact absence proof. Never retain, commit or log retired
+credentials.
 
 ## Post-deploy gate
 
-- Alembic current equals head;
-- API, worker, web and Nginx active with no new warning-or-higher journal;
-- home, auth, API, Next static, local assets and 404 security policy pass;
-- automated tournament/bracket and exact cleanup pass;
-- manual production Turnstile/auth lifecycle and its exact cleanup pass;
-- support and changed product paths pass live checks;
-- CDN/R2 assets and cache behavior remain valid;
-- disk, memory, queue, DB pool and backup freshness remain in budget;
+- Alembic is at head; API, worker, web and Nginx are active without new
+  warning-or-higher journal entries; home/auth/API/Next static/assets/404 checks pass.
+- Exact-source `web-hermetic` auth suite passes; public QA then authenticated
+  UserQA pass with exact cleanup/absence proof.
+- Support/product paths pass; CDN/R2 and cache behavior are valid; disk, memory,
+  queue, DB pool and backup freshness remain in budget.
 - `current` resolves to the new release and `previous` to the rollback release.
 
 Update only the current state in the roadmap. Store detailed output in private

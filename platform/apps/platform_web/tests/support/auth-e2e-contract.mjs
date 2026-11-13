@@ -23,6 +23,7 @@ const childEnvSource = read("platform/apps/platform_web/tests/support/auth-e2e-c
 
 const require = createRequire(import.meta.url);
 const { apiChildEnv, nextChildEnv } = require("./auth-e2e-child-env.cjs");
+const AuthE2ESafeReporter = require("./auth-e2e-safe-reporter.cjs");
 const parentOnly = {
   PATH: process.env.PATH || "/usr/bin:/bin",
   CI: "true",
@@ -92,7 +93,7 @@ assert.match(nextLauncher, /nextChildEnv\(\)/u);
 assert.match(nextLauncher, /env,\s*stdio:\s*"ignore"/u);
 assert.doesNotMatch(nextLauncher, /\.\.\.process\.env/u);
 
-assert.match(config, /testMatch:\s*"auth-lifecycle-e2e\.spec\.ts"/u);
+assert.match(config, /testMatch:\s*"\*\*\/auth-lifecycle-e2e\.spec\.ts"/u);
 assert.match(config, /retries:\s*0/u);
 assert.match(config, /trace:\s*"off"/u);
 assert.match(config, /video:\s*"off"/u);
@@ -104,11 +105,64 @@ assert.match(genericConfig, /sharedIgnoredSpecs\s*=\s*\[[\s\S]*?"auth-lifecycle-
 assert.match(genericConfig, /testIgnore:\s*sharedIgnoredSpecs/u);
 assert.match(liveConfig, /testIgnore:\s*\["auth-lifecycle-e2e\.spec\.ts"\]/u);
 assert.match(reporter, /const EXPECTED_TESTS = new Set\(\[/u);
+assert.match(reporter, /test\.titlePath\(\)\.at\(-1\)/u);
+assert.match(reporter, /status=invalid-suite tests=\$\{tests\.length\} exact=\$\{exact\.length\}/u);
 assert.match(reporter, /AUTH_E2E status=\$\{status\} tests=/u);
 assert.match(reporter, /AUTH_E2E_FAILURE test=auth-lifecycle stage=\$\{stage\} category=\$\{category\} source=\$\{source\}/u);
 assert.match(reporter, /const EXPECTED_STEPS = new Set\(\[/u);
 assert.match(reporter, /function failedStage\(steps\)/u);
 assert.doesNotMatch(reporter, /error\.message|result\.errors|attachments/u);
+
+const expectedAuthTitle = "auth lifecycle uses the real API, local mail capture, and strict verification";
+const authSpecPath = path.join(webRoot, "tests/smoke/auth-lifecycle-e2e.spec.ts");
+function playwrightTestCase({ title = expectedAuthTitle, file = authSpecPath, line = 177 } = {}) {
+  return {
+    titlePath: () => ["", "chromium", "tests/smoke/auth-lifecycle-e2e.spec.ts", title],
+    location: { file, line }
+  };
+}
+function captureReporterOutput(callback) {
+  const originalWrite = process.stdout.write;
+  let output = "";
+  process.stdout.write = (chunk) => {
+    output += String(chunk);
+    return true;
+  };
+  try {
+    callback();
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  return output;
+}
+const recognizedReporter = new AuthE2ESafeReporter();
+assert.doesNotThrow(() => recognizedReporter.onBegin({}, {
+  allTests: () => [playwrightTestCase()]
+}));
+for (const [cases, expectedCounts] of [
+  [[playwrightTestCase({ title: "unexpected title" })], "tests=1 exact=0"],
+  [[playwrightTestCase({ file: path.join(webRoot, "tests/smoke/other.spec.ts") })], "tests=1 exact=0"],
+  [[playwrightTestCase(), playwrightTestCase()], "tests=2 exact=2"],
+  [[], "tests=0 exact=0"]
+]) {
+  const output = captureReporterOutput(() => {
+    assert.throws(
+      () => new AuthE2ESafeReporter().onBegin({}, { allTests: () => cases }),
+      /Auth E2E suite identity is invalid/u
+    );
+  });
+  assert.equal(output, `AUTH_E2E status=invalid-suite ${expectedCounts}\n`);
+  assert.doesNotMatch(output, /unexpected title|other\.spec|auth lifecycle uses/u);
+}
+const skippedOutput = captureReporterOutput(() => {
+  const skippedReporter = new AuthE2ESafeReporter();
+  const skippedCase = playwrightTestCase();
+  skippedReporter.onBegin({}, { allTests: () => [skippedCase] });
+  skippedReporter.onTestEnd(skippedCase, { status: "skipped", steps: [] });
+  skippedReporter.onEnd({ status: "passed" });
+});
+assert.match(skippedOutput, /AUTH_E2E_FAILURE test=auth-lifecycle stage=unattributed category=setup/u);
+assert.match(skippedOutput, /AUTH_E2E status=failed tests=1 passed=0 failed=1/u);
 
 assert.match(server, /os\.environ\.get\("GITHUB_ACTIONS"\) == "true"/u);
 assert.match(server, /database_url\.path\.lstrip\("\/"\) == "platformdb_test"/u);
