@@ -10,35 +10,60 @@ belong in the linked owner documents below.
 
 ## Live and pending state
 
-- Production app and installed LiveQA payload source is
-  `126d4114542369af9d999e219563fa1d53b09568`; the previous app is the initial
-  rollback source `cb1a75114aac0f4fb0ee6cc407011f90c6e76f31`. Active
-  host-tools pin C3 is `625bbaa11023ffaf059dfa03a34a4850b02d4f93`. Exact-SHA
-  Security `43401840198`, source-bound restore-verified backup `43404066694`,
-  AUTO `43403887168`, and automatic production child `43404454746` completed
-  successfully. The child activated the app once; post-deploy readiness and
-  health passed with an operations receipt/checkpoint. Deployment preflight
-  verified Alembic `current` against `heads` at `20261112_0055`; no migration
-  downgrade occurred. The app change added no schema, dependency, or
-  host-tools-pin change.
-- Public browser launch remains uncredited. Canonical launches
-  `43405943415` and `43408704800` both timed out with exit 124 and no case
-  counts. Both orphan gates were recovered with the trusted exact-path
-  recovery command; those recoveries preserved the provisioned bundle and its
-  13 generated roster entries. A later supported direct public run used the
-  same deployed source, but its terminal result was not retained. Its systemd
-  unit lasted about 300 seconds, and the gate and runtime mount aliases were
-  cleaned. With no durable count receipt, do not claim that run passed or
-  failed. Automated
-  user QA has not started; human Chrome authentication and Turnstile QA remain
-  for the user.
-- The 13 generated roster entries remain pending canonical cleanup. The
-  recovery bundle's recorded `created_at` is `2026-11-13T10:02:41Z`; its
-  four-hour eligibility time is after `2026-11-13T14:02:41Z`. Fresh-bundle
-  cleanup currently refuses, so no inventory was fabricated. The main manual
-  account was not pre-created, and the control identity is excluded. A
-  separate public-QA timeout change is not deployed and does not change the
-  active C3 pin.
+- Production runs application source
+  `9a3d203c8b8d3bb09226e010e559516657d21034` in release
+  `gha-43426930984-1-9a3d203c8b8d`; `previous` is the initial rollback source
+  `cb1a75114aac0f4fb0ee6cc407011f90c6e76f31` in release
+  `gha-43367073524-1-cb1a75114aac`. The earlier
+  `126d4114542369af9d999e219563fa1d53b09568` release was rolled back to this
+  initial source before the corrected deployment. Preserve `cb1a...` as the
+  rollback target.
+- Host-tools C4 source `64cae2a4c8235df1ba5c044446cd2f497f4abdca` is active,
+  verified installed and self-tested; C3
+  `625bbaa11023ffaf059dfa03a34a4850b02d4f93` remains retained. C3 and C4
+  preserve the same 15 helper files and capability set, with 17 total bundle
+  files. C4 changes only the host-tools dispatcher timeout from 300 to 2,400
+  seconds and the derived capability hash. The application guard allows 1,500
+  seconds only for the strict canonical public command.
+- PR 360 source `9a3d203c8b8d3bb09226e010e559516657d21034` passed exact-SHA
+  Security `43422580427/1`, post-provision preflight `43426001349/1`,
+  source-bound restore-verified backup `43426481223/1`, AUTO `43424193707`, and
+  automatic production child `43426930984/1`. The child succeeded. Required
+  post-deploy strict preflight, origin/SNI checks and public smokes passed.
+  Fresh readiness confirms current `9a3d...`, previous `cb1a...`, selected C4
+  and retained C3. Runtime schema is unchanged. The source-bound readiness
+  receipt is retained in the operations checkpoint.
+- The previous 13-account roster was recovered after its age threshold by the
+  active M immutable payload under both canonical locks. Exact cleanup and
+  absence proof passed; receipt:
+  `/root/.oldsparky/reports/liveqa-recover-bundle.2PxPsM/`.
+- Public workflow `43439319991` remains a successful exact-source run. After
+  fresh canonical provisioning, public workflow `43449584614` also passed
+  against source M: 57 logical cases and attempts, 47 passed and 10 skipped,
+  with zero failures, timeouts, flaky, interrupted or expected-failure cases,
+  zero retries, and process/child exit 0.
+- The first automated UserQA workflow `43440684487` failed with browser child
+  exit 1; the journey cause remains unknown and receives no pass credit. Its
+  report-publication blocker was an unrelated Nov 11 diagnostics directory;
+  operations preserved it outside retention through a reviewed, locked helper.
+  This repaired the report-store precondition but does not explain the browser
+  failure. Fresh exact-source UserQA `43450827101` passed its complete coverage:
+  1 journey, 1 attempt, 0 skipped, failed, flaky, timed-out, interrupted or
+  expected-failure cases, child exit 0. Its sanitized report is
+  `/root/.codex/checkpoints/oldsparky-liveqa-candidate-public-20261113/userqa-retry-sanitized/live-user-qa-report.json`.
+  The wrapper's exact cleanup and
+  absence proof passed before state removal. Final guard checks under both
+  locks found zero automated/manual recovery states, public gates, QA
+  processes or diagnostic entries. Final readiness is ready: current M,
+  previous `cb1a`, C4 active/C3 retained, API/web 200, locks free, no pending
+  jobs, and consistency passed. The root-only receipt is
+  `/root/.codex/checkpoints/oldsparky-liveqa-candidate-public-20261113/post-userqa-cleanup/readiness.json`.
+- Automated public and UserQA gates are closed. Human Chrome authentication
+  and Turnstile QA remain deferred for the user. The manual helper remains
+  blocked until the fixed production checkout is reconciled to the active
+  source with retained work preserved and its provenance guard passes.
+- Historical timeout and uncredited-run detail is in the
+  [closeout audit](archive/simplification-performance-audit-2026-11-13.md).
 - The 11-cell production matrix is complete, but cell 9 failed its stress
   contract with unknown capacity attribution; no server capacity ceiling is
   certified. Cell 7's client/origin request join remains unresolved. A recent
@@ -55,15 +80,12 @@ belong in the linked owner documents below.
 
 ## Open QA and cleanup gates
 
-- Resolve the public browser launch timeout and obtain a source-bound case-count
-  receipt before crediting public QA. The two canonical timeout results and
-  the incomplete direct run are recorded above; use the [CSP and live-QA
-  runbook](csp-live-qa-runbook.md) for the trusted launch and recovery paths.
-  Keep the pending roster cleanup on the canonical recovery-bundle path and
-  wait until its recorded eligibility time; do not create substitute inventory.
-- Complete automated user QA and the later human Chrome authentication and
-  Turnstile checks. The separate timeout change is not deployed and does not
-  change QA evidence for the active source.
+- The user completes human Chrome authentication and production Turnstile QA
+  after the automated cleanup recorded above. Before that phase, reconcile the
+  fixed production checkout to the exact active source while preserving
+  retained local work, then require the owner runbook's checkout-provenance
+  guard to pass. The current checkout is not yet approved for the manual
+  helper; do not run `prepare` until the source check succeeds.
 - The completed external HTTP matrix is not whole-site functional coverage.
   Cell 9's attribution failure and cell 7's unresolved client/origin join are
   not closed by the separate SSR diagnostics. No cause or server capacity
