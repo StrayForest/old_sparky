@@ -10,112 +10,67 @@ belong in the linked owner documents below.
 
 ## Live and pending state
 
-- Production app and runner source is
-  `cb1a75114aac0f4fb0ee6cc407011f90c6e76f31` (release
-  `gha-43367073524-1-cb1a75114aac`); previous app is
-  `79b3b95ede586da84c3d49138bf88888f866c6b3` (release
-  `gha-43176891484-1-79b3b95ede58`). Active host-tools C3 is
-  `625bbaa11023ffaf059dfa03a34a4850b02d4f93`. Exact-SHA Security
-  `43365424621/1`, source-bound restore-verified backup `43366747281/1`, AUTO
-  `43366680112/1`, and automatic production child `43367073524/1` completed
-  successfully. The app source was reverted to the previous production visual
-  design, then published through the standard production chain. Strict release
-  preflight and origin/SNI plus public-edge smoke passed. API, worker, web and
-  Nginx are active; the database remains at Alembic head `20261112_0055` with
-  no downgrade. The removed public `/api/v1/appearance` endpoint returns HTTP
-  404. The site and tournament page return HTTP 200.
-- The retained immutable LiveQA runtime still targets the previous production
-  source `79b3b95ede586da84c3d49138bf88888f866c6b3` at
-  `/root/.oldsparky/liveqa/releases/79b3b95ede586da84c3d49138bf88888f866c6b3/runtime`;
-  its prior public browser and DTO results remain historical evidence for that
-  source, not QA for the current appearance release. The release-operation
-  marker is absent. No LiveQA runtime was changed for this app-only release.
-- Read-only storage diagnostics `43368405441/1` confirmed the current cb1a and
-  previous 79b3 releases, unlocked release lock, active API/worker/web
-  services, verified backup state, and 10,503,340,032 bytes free (73.0% used).
-  The guarded maintenance workflow `43368589822/1` completed successfully for
-  cb1a. Its fresh backup passed restore and Alembic verification (37 tables);
-  the locked retention sweep removed one unprotected production release while
-  preserving current, previous and the shared-venv origin. One verified backup
-  pair remains. No LiveQA runtime or transient browser/build/screenshot
-  artifacts were removed. The maintenance service exited successfully, with
-  10,629,095,424 bytes free (73% used) afterward. Current/previous pointers,
-  API/web readiness and absence of a pending release operation were rechecked.
-- SSR composite `42862469594/1` measured on app A
-  `645a5ee0d14b98e4784be2dbf276f64961c9eb66`, runner source S
-  `154be3f847007accd83f077f3079b3f3ccf85813` and host-tools C2. Its unprofiled
-  120-second capacity phase completed with 3,911/3,911 HTTP 200 responses.
-  API service CPU was 83.797 CPU-seconds over 120.009 seconds and Web service
-  CPU was 88.967 CPU-seconds over 120.028 seconds. The separate 20-second
-  profile phase completed its HTTP window, but the public report remained
-  incomplete because its profile-row projection rejected a valid signed Web
-  end lag. A bounded, exact-window journal recovery independently validated
-  two API cProfile rows, one Web V8 profile and all three ON service-CPU rows;
-  the Web end lag was -12 ms, within the intended ±250 ms contract. This
-  recovered attribution does not rewrite the workflow report or grant capacity,
-  SLO or performance credit. The dispatcher now accepts the signed lag. Treat
-  cProfile/V8 results as profiled attribution, not an unprofiled benchmark or
-  a capacity ceiling; traced ORM and serialization shares are prioritization
-  signals, not route-causal shares or guaranteed gains. The private analysis
-  report retains the detailed breakdown.
-- Earlier SSR diagnostics `42808854934/1` and `42824003998/1` remain incomplete
-  and zero-credit; the latter's abort `42825813580/1` and exact fixture cleanup
-  `42826290267/1` completed. These results are not upgraded by the recovered
-  profile from `42862469594/1`. Use the
-  [SSR capacity diagnostic runbook](ssr-capacity-diagnostic-runbook.md) for
-  phase acceptance and cleanup requirements.
-- Cell 9, `read-mix-concurrency-ramp-v1`, completed as run `41937909055/1` on
-  runner S and app A, both `7c6034efe3878c3413090ca1bcdb5be6e93154e8`, with
-  host-tools C `0de51aca4b4d04a80a2f0d392003cc258d8f1400`; exact cleanup
-  passed. All eight stages observed 40/40 active Ready Checks and passed the
-  state guard, with minimum deadline headroom of about 2,424 seconds. All
-  170,000 HTTP actions succeeded (160,000 HTTP 200 and 10,000 conditional
-  304), with no errors, retries or drops. The stress contract failed, and its
-  sole failed evaluator check was `capacity_ramp_evidence`; per-stage logical
-  p95/p99 budgets failed at all eight stages. Aggregate logical p95/p99 were
-  209.4/331.2 seconds against 12/20-second limits; HTTP p95/p99 were
-  886/1,135 ms. Capacity attribution is unknown (`runner_window_incomplete`):
-  all offered ramp tasks started late, none were
-  dropped, and this run certifies no server capacity ceiling. See the
-  [performance matrix](../performance/README.md#current-11-profile-production-matrix).
-- Cells 1–8 and 10–11 completed on the previous P4/C baseline. Their contract
-  outcomes and cleanup status remain in the matrix table. The corrected SSR
-  capacity diagnostic is separate evidence, not a matrix cell; use the
-  [SSR capacity diagnostic runbook](ssr-capacity-diagnostic-runbook.md) for
-  its acceptance and cleanup contract. Do not switch app or host-tools
-  profiles during an active cell.
+- Production app and installed LiveQA payload source is
+  `126d4114542369af9d999e219563fa1d53b09568`; the previous app is the initial
+  rollback source `cb1a75114aac0f4fb0ee6cc407011f90c6e76f31`. Active
+  host-tools pin C3 is `625bbaa11023ffaf059dfa03a34a4850b02d4f93`. Exact-SHA
+  Security `43401840198`, source-bound restore-verified backup `43404066694`,
+  AUTO `43403887168`, and automatic production child `43404454746` completed
+  successfully. The child activated the app once; post-deploy readiness and
+  health passed with an operations receipt/checkpoint. Deployment preflight
+  verified Alembic `current` against `heads` at `20261112_0055`; no migration
+  downgrade occurred. The app change added no schema, dependency, or
+  host-tools-pin change.
+- Public browser launch remains uncredited. Canonical launches
+  `43405943415` and `43408704800` both timed out with exit 124 and no case
+  counts. Both orphan gates were recovered with the trusted exact-path
+  recovery command; those recoveries preserved the provisioned bundle and its
+  13 generated roster entries. A later supported direct public run used the
+  same deployed source, but its terminal result was not retained. Its systemd
+  unit lasted about 300 seconds, and the gate and runtime mount aliases were
+  cleaned. With no durable count receipt, do not claim that run passed or
+  failed. Automated
+  user QA has not started; human Chrome authentication and Turnstile QA remain
+  for the user.
+- The 13 generated roster entries remain pending canonical cleanup. The
+  recovery bundle's recorded `created_at` is `2026-11-13T10:02:41Z`; its
+  four-hour eligibility time is after `2026-11-13T14:02:41Z`. Fresh-bundle
+  cleanup currently refuses, so no inventory was fabricated. The main manual
+  account was not pre-created, and the control identity is excluded. A
+  separate public-QA timeout change is not deployed and does not change the
+  active C3 pin.
+- The 11-cell production matrix is complete, but cell 9 failed its stress
+  contract with unknown capacity attribution; no server capacity ceiling is
+  certified. Cell 7's client/origin request join remains unresolved. A recent
+  SSR composite recovered bounded profile attribution, but its workflow report
+  remains incomplete and receives no capacity or SLO credit. Another SSR
+  diagnostic has one unexplained ON response disconnect. These findings do not
+  establish a production capacity limit or a root cause. Use the
+  [performance matrix](../performance/README.md#current-11-profile-production-matrix)
+  and [SSR diagnostic runbook](ssr-capacity-diagnostic-runbook.md) for scoped
+  evidence and procedures; no matrix rerun is pending.
 - Production backup, deployment and source-binding rules remain owned by the
   [deployment runbook](deployment-runbook.md) and
   [backup and restore runbook](backup-restore-runbook.md).
 
 ## Open QA and cleanup gates
 
-- All 11 matrix cells have run with authoritative cleanup. Cell 9 passed its
-  state guard but failed the stress contract; its capacity attribution is
-  unknown and no server ceiling is certified. No matrix rerun is pending. Do
-  not repeat completed cells or describe this external HTTP matrix as whole-site
-  functional coverage. See the
-  [matrix procedure and scope](../performance/README.md#current-11-profile-production-matrix).
-- Cell 7's authenticated-page diagnostic still has unresolved client/origin
-  reconciliation: the repeat had 19,971/20,000 successes, 28 status-0 and one
-  status-502 failure, while Nginx recorded 19,990 HTML requests, all 200.
-  There is no client-request join, so the transport cause remains unknown.
-- SSR diagnostic `42849326329/1` on app A
-  `645a5ee0d14b98e4784be2dbf276f64961c9eb66` had 31/32 successful ON
-  responses and one `remote_disconnect` at response headers; its separate OFF
-  probe completed 32/32 HTTP 200. The bounded Nginx projection found no error
-  entry in the failure second, but has no request-ID join. The cause remains
-  unknown; neither the 19.5–25 second OFF-to-ON idle interval nor a 30-second
-  downstream keepalive setting proves that a reused connection expired.
-- The older SSR composite diagnostic `42081912538/1` on app `9a73f635` stopped
-  after 70.385 seconds of its 120-second capacity phase. Four body-receive
-  `incomplete_response` failures observed HTTP 200 before the response body
-  ended; its cause and any server capacity ceiling remain unproven. The later
-  corrected run `42788095845/1` does not retroactively explain or validate
-  that older result. The separate CPU-only diagnostic `42085780534/1` also
-  remains unclassified because its parent report has no phase data or failure
-  code. Keep these older runs at zero credit and follow the owner runbook before
-  any further production profile.
+- Resolve the public browser launch timeout and obtain a source-bound case-count
+  receipt before crediting public QA. The two canonical timeout results and
+  the incomplete direct run are recorded above; use the [CSP and live-QA
+  runbook](csp-live-qa-runbook.md) for the trusted launch and recovery paths.
+  Keep the pending roster cleanup on the canonical recovery-bundle path and
+  wait until its recorded eligibility time; do not create substitute inventory.
+- Complete automated user QA and the later human Chrome authentication and
+  Turnstile checks. The separate timeout change is not deployed and does not
+  change QA evidence for the active source.
+- The completed external HTTP matrix is not whole-site functional coverage.
+  Cell 9's attribution failure and cell 7's unresolved client/origin join are
+  not closed by the separate SSR diagnostics. No cause or server capacity
+  ceiling is established. Do not rerun completed cells; use the owner
+  [performance matrix](../performance/README.md#current-11-profile-production-matrix)
+  and [SSR diagnostic runbook](ssr-capacity-diagnostic-runbook.md) for any
+  separately authorized follow-up.
 
 ## Hard operational limits
 
