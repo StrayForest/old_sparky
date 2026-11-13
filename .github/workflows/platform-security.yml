@@ -1037,11 +1037,74 @@ jobs:
     needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
     if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime') && contains(fromJSON(needs.classifier.outputs.expected_gates), 'web-hermetic') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: platformdb_test
+          POSTGRES_USER: platform_user
+          POSTGRES_PASSWORD: platform_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U platform_user -d platformdb_test"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      PLATFORM_AUTH_E2E: "1"
+      PLATFORM_ENV_FILE: /dev/null
+      PLATFORM_ENVIRONMENT: test
+      PLATFORM_DATABASE_URL: postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test
+      PLATFORM_DB_SCHEMA: platform
+      PLATFORM_SECRET_KEY: ci-only-auth-e2e-secret-key-with-more-than-32-chars
+      PLATFORM_REDIS_URL: redis://127.0.0.1:6379/15
+      PLATFORM_CELERY_BROKER_URL: redis://127.0.0.1:6379/13
+      PLATFORM_CELERY_RESULT_BACKEND: redis://127.0.0.1:6379/14
+      PLATFORM_WEB_ORIGIN: http://127.0.0.1:3100
+      PLATFORM_API_HOST: 127.0.0.1
+      PLATFORM_API_PORT: "3199"
+      PLATFORM_PUBLIC_REGISTRATION_ENABLED: "true"
+      PLATFORM_EMAIL_VERIFICATION_REQUIRED: "true"
+      PLATFORM_TURNSTILE_MODE: always
+      PLATFORM_TURNSTILE_SITE_KEY: auth-e2e-public-site-key
+      PLATFORM_TURNSTILE_SECRET_KEY: auth-e2e-not-a-provider-secret
+      PLATFORM_TURNSTILE_EXPECTED_HOSTNAME: 127.0.0.1
+      PLATFORM_AUTH_GENERIC_RESPONSE_MIN_SECONDS: "0"
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: platform/requirements-ci.lock.txt
+
+      - name: Install canonical hash-locked Python CI environment
+        run: platform/tools/platform_install_ci_python.sh
+
+      - name: Migrate isolated auth E2E database
+        run: >-
+          cd platform &&
+          .venv_platform/bin/python -m alembic upgrade head
+
+      - name: Require empty isolated auth E2E database and Redis services
+        run: >-
+          cd platform &&
+          .venv_platform/bin/python -I -B
+          tests/support/auth_lifecycle_e2e_server.py --preflight
 
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:

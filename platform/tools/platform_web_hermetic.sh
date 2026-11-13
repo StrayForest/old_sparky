@@ -33,6 +33,18 @@ trap 'exit 143' TERM
 trap 'exit 129' HUP
 
 cd "$WEB_ROOT"
+# The auth lifecycle portion requires the exact GitHub service-container
+# targets and the CI-only settings fixture. Refuse before Next build/browser
+# provisioning when those safe, isolated services are unavailable.
+if [[ ! -x "$TOOLS_DIR/../.venv_platform/bin/python" ]]; then
+  echo "AUTH_E2E_PREFLIGHT status=blocked reason=ci_python_runtime_missing" >&2
+  exit 2
+fi
+if ! "$TOOLS_DIR/../.venv_platform/bin/python" \
+  "$TOOLS_DIR/../tests/support/auth_lifecycle_e2e_server.py" --preflight; then
+  echo "AUTH_E2E_PREFLIGHT status=blocked reason=isolated_services_unavailable" >&2
+  exit 2
+fi
 # Fail before an expensive build when another task owns one of the fixed local
 # ports this contour uses. Cleanup remains scoped to the unique run ID above.
 "$TOOLS_DIR/platform_node.sh" \
@@ -46,6 +58,8 @@ cd "$WEB_ROOT"
 # browser, server, API or database.
 "$TOOLS_DIR/platform_node.sh" \
   "$WEB_ROOT/tests/support/live-count-reporter-contract.cjs"
+"$TOOLS_DIR/platform_node.sh" \
+  "$WEB_ROOT/tests/support/auth-e2e-contract.mjs"
 # Both isolated Playwright contours use the same localhost API destination in
 # the standalone artifact.  The participant contour owns a fresh server on
 # this port after smoke exits; no server or database state is shared.
@@ -75,6 +89,21 @@ PLAYWRIGHT_BROWSERS_PATH="$BUILD_DIR/browsers" \
 PLAYWRIGHT_BROWSERS_PATH="$BUILD_DIR/browsers" \
 PLATFORM_WEB_HERMETIC_BUILD_DIR="$BUILD_DIR" \
   "$TOOLS_DIR/platform_web_npm.sh" run test:smoke
+
+# This privacy-closed full-stack auth contour uses the same immutable Next
+# build, plus the job's disposable PostgreSQL/Redis services and test-only
+# loopback Siteverify/SMTP fixtures. Its control token, output and captured
+# mail remain under the exact private build directory and are removed by the
+# exit trap; no browser trace/video/report is retained or uploaded.
+mkdir -m 700 "$BUILD_DIR/auth-e2e-output"
+PLATFORM_AUTH_E2E_CONTROL_FILE="$BUILD_DIR/auth-e2e-control" \
+PLATFORM_AUTH_E2E_OUTPUT_DIR="$BUILD_DIR/auth-e2e-output" \
+PLATFORM_UPLOAD_DIR="$BUILD_DIR/auth-e2e-uploads" \
+PLATFORM_MEDIA_STAGING_DIR="$BUILD_DIR/auth-e2e-media-staging" \
+PLAYWRIGHT_BROWSERS_PATH="$BUILD_DIR/browsers" \
+PLATFORM_WEB_HERMETIC_BUILD_DIR="$BUILD_DIR" \
+  "$TOOLS_DIR/platform_web_npm.sh" run test:auth-lifecycle-e2e
+
 PLAYWRIGHT_BROWSERS_PATH="$BUILD_DIR/browsers" \
 PLATFORM_WEB_HERMETIC_BUILD_DIR="$BUILD_DIR" \
   "$TOOLS_DIR/platform_web_npm.sh" run test:participant-progressive

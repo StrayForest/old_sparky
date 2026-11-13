@@ -13,6 +13,7 @@ const desktopOnlySpecs = [
   "tournament-list-concurrency.spec.ts"
 ];
 const sharedIgnoredSpecs = [
+  "auth-lifecycle-e2e.spec.ts",
   "frontend-audit-regressions.spec.ts",
   "live-launch.spec.ts",
   "live-user-journey.spec.ts",

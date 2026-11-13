@@ -1,0 +1,72 @@
+"use strict";
+
+const API_NAMES = [
+  "PATH",
+  "LANG",
+  "CI",
+  "GITHUB_ACTIONS",
+  "PLATFORM_WEB_HERMETIC_RUN_ID",
+  "PLATFORM_AUTH_E2E",
+  "PLATFORM_AUTH_E2E_CONTROL_FILE",
+  "PLATFORM_ENV_FILE",
+  "PLATFORM_ENVIRONMENT",
+  "PLATFORM_DATABASE_URL",
+  "PLATFORM_DB_SCHEMA",
+  "PLATFORM_SECRET_KEY",
+  "PLATFORM_REDIS_URL",
+  "PLATFORM_CELERY_BROKER_URL",
+  "PLATFORM_CELERY_RESULT_BACKEND",
+  "PLATFORM_WEB_ORIGIN",
+  "PLATFORM_API_HOST",
+  "PLATFORM_API_PORT",
+  "PLATFORM_PUBLIC_REGISTRATION_ENABLED",
+  "PLATFORM_EMAIL_VERIFICATION_REQUIRED",
+  "PLATFORM_TURNSTILE_MODE",
+  "PLATFORM_TURNSTILE_SITE_KEY",
+  "PLATFORM_TURNSTILE_SECRET_KEY",
+  "PLATFORM_TURNSTILE_EXPECTED_HOSTNAME",
+  "PLATFORM_AUTH_GENERIC_RESPONSE_MIN_SECONDS",
+  "PLATFORM_UPLOAD_DIR",
+  "PLATFORM_MEDIA_STAGING_DIR"
+];
+
+const REQUIRED_API_NAMES = [
+  "PLATFORM_AUTH_E2E_CONTROL_FILE",
+  "PLATFORM_DATABASE_URL",
+  "PLATFORM_DB_SCHEMA",
+  "PLATFORM_REDIS_URL",
+  "PLATFORM_CELERY_BROKER_URL",
+  "PLATFORM_CELERY_RESULT_BACKEND",
+  "PLATFORM_SECRET_KEY",
+  "PLATFORM_UPLOAD_DIR",
+  "PLATFORM_MEDIA_STAGING_DIR"
+];
+
+function apiChildEnv(source = process.env) {
+  for (const name of REQUIRED_API_NAMES) {
+    if (!source[name]) throw new Error("Auth E2E API launcher configuration is incomplete.");
+  }
+  const env = Object.fromEntries(API_NAMES.filter((name) => source[name] !== undefined)
+    .map((name) => [name, source[name]]));
+  env.PYTHONNOUSERSITE = "1";
+  env.PYTHONDONTWRITEBYTECODE = "1";
+  return env;
+}
+
+function nextChildEnv(source = process.env) {
+  const env = {
+    PATH: source.PATH || "/usr/bin:/bin",
+    HOSTNAME: "127.0.0.1",
+    PORT: "3100",
+    NODE_ENV: "production",
+    NEXT_TELEMETRY_DISABLED: "1",
+    PLATFORM_API_BASE_URL: "http://127.0.0.1:3199/api/v1",
+    PLATFORM_ADSENSE_ENABLED: "false"
+  };
+  if (source.PLATFORM_WEB_HERMETIC_RUN_ID) {
+    env.PLATFORM_WEB_HERMETIC_RUN_ID = source.PLATFORM_WEB_HERMETIC_RUN_ID;
+  }
+  return env;
+}
+
+module.exports = { apiChildEnv, nextChildEnv };
