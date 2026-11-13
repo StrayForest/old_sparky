@@ -9,45 +9,32 @@ Select the smallest relevant verification set.
 
 ## Checks
 
-- API/domain: run from `platform/` as
-  `tools/platform_run_quiet.sh "platform tests" -- .venv_platform/bin/python -m unittest discover -s tests`
-  (from repo root:
-  `cd platform && .venv_platform/bin/python -m unittest discover -s tests`).
-  Do not run `platform/.venv_platform/bin/python -m unittest discover -s platform/tests`
-  from repo root: it can collide with Python's stdlib `platform` module and
-  leave `apps.*` imports unresolved.
-- Migration: from `platform/`, run the canonical populated-database gate:
-  `tools/platform_verify.py migration`. Use the direct Alembic wrapper only
-  for a documented bootstrap or release-transaction investigation.
-- Workflow concurrency: run focused tests with independent database sessions
-  for competing starts, vote-versus-close/exclusion, publish/lock-versus-status
-  transition, worker-versus-route, and dream-slot replace-all. Assert the
-  final persisted rows and constraints, not only HTTP outcomes.
-- Migration-backed workflow guards: test upgrade from a populated compatible
-  fixture, constraint rejection, and retry/recovery after a failed or
-  interrupted concurrent unique-index build. Confirm no invalid index remains
-  before marking the revision applied.
-- Database assertions: query for duplicate active/canonical workflow rows,
-  post-close/ineligible votes, invalid dream-slot numbers and active
-  commitments after a terminal tournament state.
-- Web: run from `platform/` as
-  `tools/platform_run_quiet.sh "web build" -- tools/platform_web_npm.sh --prefix apps/platform_web run build`.
-- Release: syntax-check the release state machine. For production, follow the
-  `platform/docs/deployment-runbook.md`: publish a
-  reviewed change to `dev`, require successful exact-SHA Security, then let the
-  automatic AUTO/production-child chain select and complete the authorized
-  route; out-of-scope no-op routes do not dispatch a child. Before a normal
-  app release, the operator must provide the source-bound restore-verified
-  backup. When a host-tools pin change needs parent-bound provisioning, AUTO
-  builds and attests the tools and waits; the operator follows the runbook to
-  provision before the child, after checking the approved exact source,
-  backup, and pre-child window. Do not invoke `platform_release_deploy.sh`
-  directly or manually dispatch normal production deployment. A retained
-  migration/post-restart state is a recovery outcome, not a passing release.
-- Docs/skills-only: run `tools/platform_verify.py docs`, the verification
-  contract gate when instruction or workflow policy changed, and syntax/
-  metadata checks for edited files. Do not run app tests unless behavior
-  changed.
+- From `platform/`, use `tools/platform_verify.py impact --changed-path <repo-relative-path>`
+  to identify complete owner gates for each changed path. The impact plan is a
+  selector, not a replacement for those gates or exact-SHA CI. Unknown,
+  sensitive or mixed changes require the full route.
+- Run the canonical owner selectors from the plan: `backend` for API/domain
+  behavior, `migration` for schema/data changes, `web-quality` and
+  `web-hermetic` for web behavior, and `python-quality`, `security`, `docs`
+  and `verification-contract` when their owners are affected. Use focused
+  selectors only for local diagnosis; do not use raw test discovery or direct
+  Alembic commands in place of owner gates. Gate prerequisites and contour
+  ownership are defined in `platform/docs/test-suite-governance.md`.
+- Preserve behavior-specific coverage for workflow races, final persisted
+  constraints, populated migration upgrades/retries and release-state-machine
+  recovery. The test-suite governance document assigns these scenarios to
+  their canonical contours.
+- For production release and rollback, follow
+  `platform/docs/deployment-runbook.md`. Require successful exact-SHA Security
+  and the automatic AUTO/production-child chain. A normal app release also
+  requires the source-bound restore-verified backup. Host-tools provisioning
+  follows its owner runbook when the pin changes. Do not invoke
+  `platform_release_deploy.sh` directly or manually dispatch the normal
+  production deployment. A retained migration/post-restart state is a
+  recovery outcome, not a passing release.
+- Docs/skills-only changes use `docs`; instruction or workflow-policy changes
+  also use `verification-contract`. Do not run application gates unless
+  behavior changed.
 
 Successful checks should emit only their final status line. Read the retained
 failure log only after a non-zero exit; do not stream normal build/test output

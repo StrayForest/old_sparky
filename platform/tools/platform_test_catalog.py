@@ -696,15 +696,16 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
     "module_count": 176,
     "module_digest": "5f5168273bae9359473f971b7c853b7c517f39f21ea91cf025a2ff24eca391c4",
-    "test_count": 2411,
-    "test_id_digest": "42cb1ea8104088143b2facdd4eb38ce146e1039a98db4b681a4a418341690398",
-    "backend_test_count": 2331,
-    "backend_test_id_digest": "0eaafffd91c64ce219bd911f7d53cd2aac38bf7ba4b68dc12d2d270a160f61e3",
+    "test_count": 2413,
+    "test_id_digest": "a2a291c3b65703e827cb78dde758a389d4d4de6be2b7bbe61c8b0832bb9ea1b3",
+    "backend_test_count": 2333,
+    "backend_test_id_digest": "7dd4ccefe6d6fea8fac4b99e32d7035ffc4af1d8cc7002d7837080bf73ac37a1",
     "verification_test_count": 80,
     "verification_test_id_digest": "441f275842aceea8043797eade1732b5ae6236284f09555d21c8bb4791511d35",
     "verification_classifier_test_count": 43,
     "verification_classifier_test_id_digest": "eabb9efff7a7f577cf9182faca574282a6b2b26b4a423e45ae22d91350ea44d6",
 }
+
 # Keep each executable contour's boundary independently snapshotted.  The
 # aggregate snapshot proves total ownership, while these entries make a
 # seemingly harmless module move fail closed instead of silently changing the
@@ -722,8 +723,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-unit": {
         "module_count": 48,
         "module_digest": "97da81814d431484c5023f96dab71a84df718c6a84c13b548142621d599335f6",
-        "test_count": 359,
-        "test_id_digest": "c55135066ae2ccb334f973bb1bf491e94a8d73552c4649e9880b68a773986953",
+        "test_count": 361,
+        "test_id_digest": "a9550041c501998de7ba68ce603e93a578b340cdf576e3359026e0b7628bb689",
     },
     "backend-tool-contract": {
         "module_count": 55,

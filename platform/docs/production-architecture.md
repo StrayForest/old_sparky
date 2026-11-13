@@ -112,6 +112,16 @@ envelope; profile writes and profile creation paths invalidate the entry after
 commit. This candidate remains unmeasured against the retained production
 baseline until the reviewed A/B is run.
 
+The tournament detail and bracket server-rendered pages pass their internal
+workspace reads through a server-only, per-process FIFO admission queue. It
+allows 24 active reads, holds up to 128 pending reads for at most five seconds,
+and maps queue saturation or expiry to a typed `503`; request cancellation and
+workspace fetch behavior remain unchanged. The browser page uses the shared
+workspace API function without importing the scheduler. This bounds only
+server-rendered internal reads; it is not an authorization decision or a
+database-wide limit. The gate and client-bundle boundary are covered by the
+web-hermetic contract in [test-suite governance](test-suite-governance.md).
+
 The full account-owner `/users/me` response uses a versioned, 60-second Redis
 read-model for supplemental profile/security-display fields. The small monthly
 quota count is refreshed from PostgreSQL on each cache hit because it is

@@ -1,5 +1,13 @@
 import {
-  existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { createServer, get as httpGet } from "node:http";
 import { join, resolve } from "node:path";
@@ -44,6 +52,16 @@ import { proxy } from "../../proxy";
 
 function source(relativePath: string): string {
   return readFileSync(resolve(process.cwd(), relativePath), "utf8");
+}
+
+function javascriptChunks(directory: string): string[] {
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const path = resolve(directory, entry.name);
+    if (entry.isDirectory()) {
+      return javascriptChunks(path);
+    }
+    return entry.isFile() && entry.name.endsWith(".js") ? [path] : [];
+  });
 }
 
 function deferred<T = void>() {
@@ -212,18 +230,8 @@ test("server internal read admission diagnostics measure queued and rejected wai
   expect(observations.every(({ waitMs }) => Number.isFinite(waitMs) && waitMs >= 0)).toBe(true);
 });
 
-test("terminal server workspace responses release the permit without waiting for body cancellation", async () => {
+test("terminal workspace responses cancel upstream fetch without waiting for body cancellation", async () => {
   const originalFetch = globalThis.fetch;
-  const schedulerKey = "__oldsparkyServerInternalReadScheduler__";
-  const sharedGlobal = globalThis as typeof globalThis & Record<string, unknown>;
-  const hadOriginalScheduler = Object.hasOwn(sharedGlobal, schedulerKey);
-  const originalScheduler = sharedGlobal[schedulerKey];
-  const scheduler = new ServerInternalReadScheduler({
-    activeLimit: 1,
-    pendingLimit: 1,
-    queueDeadlineMs: 500,
-  });
-  sharedGlobal[schedulerKey] = scheduler;
   const cancellationStarted = deferred();
   let releaseNeverSettlingCancellation!: () => void;
   const neverSettlingCancellation = new Promise<void>((resolve) => {
@@ -271,8 +279,6 @@ test("terminal server workspace responses release the permit without waiting for
     if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
     await cancellationStarted.promise;
     expect(missing).toBeNull();
-    expect(scheduler.activeCount).toBe(0);
-    expect(scheduler.pendingCount).toBe(0);
     expect(fetchSignals[0]?.aborted).toBe(true);
     expect(callerController.signal.aborted).toBe(false);
 
@@ -285,21 +291,11 @@ test("terminal server workspace responses release the permit without waiting for
     } satisfies Partial<PlatformApiError>);
     expect(fetchSignals[1]?.aborted).toBe(true);
     expect(fetchCount).toBe(2);
-    expect(scheduler.activeCount).toBe(0);
-    expect(scheduler.pendingCount).toBe(0);
   } finally {
     if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
     releaseNeverSettlingCancellation();
     globalThis.fetch = originalFetch;
-    try {
-      if (firstRequest) await firstRequest;
-    } finally {
-      if (hadOriginalScheduler) {
-        sharedGlobal[schedulerKey] = originalScheduler;
-      } else {
-        delete sharedGlobal[schedulerKey];
-      }
-    }
+    if (firstRequest) await firstRequest;
   }
 });
 
@@ -948,10 +944,13 @@ test("CPU memory and GC sampling is bounded to the exact diagnostic phase", () =
 test("tournament workspace timing wraps the existing opt-in SSR fetch", () => {
   const detailPage = source("app/(site)/tournaments/[slug]/page.tsx");
   const api = source("lib/platform-api.ts");
+  const serverWorkspace = source("lib/server-tournament-workspace.ts");
+  const bracketPage = source("app/(site)/tournaments/[slug]/bracket/page.tsx");
+  const clientDetail = source("components/tournaments/tournament-detail-client-page.tsx");
   const auth = source("lib/server-auth.ts");
   const authResponse = source("lib/server-auth-http-response.ts");
   const scheduler = source("lib/server-internal-read-scheduler.ts");
-  const workspaceCalls = detailPage.match(/\bgetTournamentWorkspace\s*\(/gu) ?? [];
+  const workspaceCalls = detailPage.match(/\bgetServerTournamentWorkspace\s*\(/gu) ?? [];
 
   // The true/false branches each contain one source call, but only one branch
   // executes. The disabled path does not allocate a measurement callback.
@@ -964,21 +963,27 @@ test("tournament workspace timing wraps the existing opt-in SSR fetch", () => {
   expect(detailPage).toContain("workspaceHeaders[name] = value;");
   expect(detailPage).toContain('? measureSsrStage("tournament_workspace", () =>');
   expect(detailPage).toContain("const workspace = await (ssrTraceSampled");
-  expect(detailPage).toContain(': getTournamentWorkspace(slug, workspaceHeaders, workspaceOptions));');
+  expect(detailPage).toContain(': getServerTournamentWorkspace(slug, workspaceHeaders, workspaceOptions));');
   expect(detailPage).toContain('recordSsrPoint("tournament_detail_data_ready")');
   expect(detailPage.indexOf('recordSsrPoint("tournament_detail_data_ready")'))
     .toBeGreaterThan(detailPage.indexOf("initialTournament = workspace.tournament"));
   expect(detailPage).toContain("const workspace = await (ssrTraceSampled");
   expect(detailPage).toContain("? measureSsrStage(");
-  expect(detailPage).toContain(": getTournamentWorkspace(slug, workspaceHeaders, workspaceOptions));");
-  expect(api).toContain("typeof window === \"undefined\"");
-  expect(api).toContain("runWithServerInternalRead(");
+  expect(detailPage).toContain(": getServerTournamentWorkspace(slug, workspaceHeaders, workspaceOptions));");
+  expect(bracketPage).toContain("getServerTournamentWorkspace(slug, requestHeaders,");
+  expect(clientDetail).toContain("getTournamentWorkspace(requestSlug, {},");
+  expect(clientDetail).not.toContain("server-tournament-workspace");
+  expect(serverWorkspace.startsWith('import "server-only";')).toBe(true);
+  expect(serverWorkspace).toContain("runWithServerInternalRead(");
+  expect(serverWorkspace).toContain("options.ssrDiagnostics?.admissionObserver");
+  expect(serverWorkspace).toContain("ServerInternalReadQueueError");
+  expect(serverWorkspace).toContain('{ code: "server_read_capacity" }');
+  expect(api).not.toContain("server-internal-read-scheduler");
+  expect(api).not.toContain("ServerInternalReadQueueError");
+  expect(api).not.toContain("ServerInternalReadAdmissionObserver");
   expect(api).toContain('measureStage("workspace_http_fetch", fetchWorkspace)');
   expect(api).toContain('"workspace_body_parse"');
   expect(api).toContain('measureStage("workspace_projection", projectWorkspace)');
-  expect(api).toContain("options.ssrDiagnostics?.admissionObserver");
-  expect(api).toContain("ServerInternalReadQueueError");
-  expect(api).toContain('{ code: "server_read_capacity" }');
   expect(auth.match(/runWithServerInternalRead\(/gu)).toHaveLength(2);
   expect(auth.match(/getServerRequestCorrelationHeaders\(\)/gu)).toHaveLength(2);
   expect(auth).toContain("await cancelServerAuthBody(response)");
@@ -1006,6 +1011,25 @@ test("tournament workspace timing wraps the existing opt-in SSR fetch", () => {
   expect(source("lib/server-ssr-observability.ts")).toContain(
     '"internal_read_admission_wait"',
   );
+});
+
+test("server internal read scheduler stays out of browser chunks", () => {
+  const chunksDirectory = resolve(process.cwd(), ".next/static/chunks");
+  expect(existsSync(chunksDirectory)).toBe(true);
+  const chunkPaths = javascriptChunks(chunksDirectory);
+  expect(chunkPaths.length).toBeGreaterThan(0);
+  const chunks = chunkPaths
+    .map((path) => readFileSync(path, "utf8"))
+    .join("\n");
+
+  for (const marker of [
+    "ServerInternalReadScheduler",
+    "ServerInternalReadQueueError",
+    "The server read queue is full.",
+    "The server read queue deadline expired.",
+  ]) {
+    expect(chunks).not.toContain(marker);
+  }
 });
 
 test("workspace API error diagnostics emit only bounded status and correlation fields", () => {
@@ -1175,9 +1199,11 @@ test("notFound-capable segments keep an intentional no-segment-loading contract"
 
 test("tournament detail resolves missing slugs before committing the client shell", () => {
   const detailPage = source("app/(site)/tournaments/[slug]/page.tsx");
+  const serverWorkspace = source("lib/server-tournament-workspace.ts");
   const workspaceAccess = source("../platform_api/app/services/tournament_workspace_access.py");
 
-  expect(detailPage).toContain("getTournamentWorkspace");
+  expect(detailPage).toContain("getServerTournamentWorkspace");
+  expect(serverWorkspace.startsWith('import "server-only";')).toBe(true);
   expect(detailPage).toContain("const cookieHeader = (await cookies()).toString()");
   expect(detailPage).toContain("if (!workspace)");
   expect(detailPage).toContain("notFound()");

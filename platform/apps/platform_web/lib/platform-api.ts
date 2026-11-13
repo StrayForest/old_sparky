@@ -1,10 +1,5 @@
 import { notifyPlatformUnauthorized } from "@/lib/auth-session-signal";
 import { deadlockHeroes } from "@/lib/deadlock";
-import {
-  runWithServerInternalRead,
-  ServerInternalReadQueueError
-} from "@/lib/server-internal-read-scheduler";
-import type { ServerInternalReadAdmissionObserver } from "@/lib/server-internal-read-scheduler";
 import { cancelServerFetchResponse } from "@/lib/server-fetch-response";
 import {
   normalizeVisibility,
@@ -115,7 +110,6 @@ type ApiTournamentWorkspace = {
 
 type SsrWorkspaceDiagnostics = {
   measureStage: <T>(stage: string, operation: () => Promise<T>) => Promise<T>;
-  admissionObserver?: ServerInternalReadAdmissionObserver;
 };
 
 type ApiTeamMember = {
@@ -698,6 +692,20 @@ type TournamentPageRequestOptions = {
   revalidateSeconds?: number;
 };
 
+export type TournamentWorkspaceRequestOptions = {
+  participantsLimit?: number;
+  workspaceView?: "detail" | "bracket" | "bracket_summary";
+  includeCurrentUser?: boolean;
+  inviteCode?: string;
+  signal?: AbortSignal;
+  ssrDiagnostics?: SsrWorkspaceDiagnostics;
+};
+
+export type TournamentWorkspace = {
+  tournament: TournamentDetail;
+  currentUser: PlatformUser | null;
+};
+
 const tournamentInviteCodePattern = /^[A-Z0-9]{10,24}$/u;
 
 export function normalizeTournamentInviteCode(value: unknown): string | undefined {
@@ -799,15 +807,8 @@ function headerInteger(headers: Headers, name: string): number | null {
 export async function getTournamentWorkspace(
   slug: string,
   requestHeaders: HeadersInit = {},
-  options: {
-    participantsLimit?: number;
-    workspaceView?: "detail" | "bracket" | "bracket_summary";
-    includeCurrentUser?: boolean;
-    inviteCode?: string;
-    signal?: AbortSignal;
-    ssrDiagnostics?: SsrWorkspaceDiagnostics;
-  } = {}
-): Promise<{ tournament: TournamentDetail; currentUser: PlatformUser | null } | null> {
+  options: TournamentWorkspaceRequestOptions = {}
+): Promise<TournamentWorkspace | null> {
   const serverRequest = typeof window === "undefined";
   const serverFetchController = serverRequest ? new AbortController() : null;
   const fetchSignal = serverFetchController
@@ -904,25 +905,7 @@ export async function getTournamentWorkspace(
       : projectWorkspace();
   };
 
-  try {
-    return serverRequest
-      ? await runWithServerInternalRead(
-        loadWorkspace,
-        options.signal,
-        options.ssrDiagnostics?.admissionObserver,
-      )
-      : await loadWorkspace();
-  } catch (error) {
-    if (error instanceof ServerInternalReadQueueError) {
-      throw new PlatformApiError(
-        "Server read capacity is temporarily unavailable.",
-        503,
-        null,
-        { code: "server_read_capacity" }
-      );
-    }
-    throw error;
-  }
+  return loadWorkspace();
 }
 
 async function cancelResponseBody(response: Response): Promise<void> {

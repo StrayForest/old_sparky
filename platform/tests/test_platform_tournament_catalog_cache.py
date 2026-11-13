@@ -92,6 +92,23 @@ class TournamentCatalogCacheTests(PlatformIsolatedAsyncioTestCase):
         self.assertIsNone(entry)
         self.assertFalse(client.closed)
 
+    async def test_malformed_cached_entry_is_a_miss(self) -> None:
+        key = self._key()
+        store = {
+            key: (
+                b'{"v":1,"items":{"unexpected":"shape"},"limit":9,'
+                b'"has_more":false,"next_cursor":null}'
+            )
+        }
+        client = _FakeRedis(store)
+        with (
+            patch.object(catalog_cache, "_cache_enabled", return_value=True),
+            patch.object(catalog_cache, "redis_client", return_value=client),
+        ):
+            entry = await catalog_cache.get_public_tournament_list_cache(key)
+
+        self.assertIsNone(entry)
+
 
 if __name__ == "__main__":
     unittest.main()

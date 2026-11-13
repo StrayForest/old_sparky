@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Res
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import (
     Select,
     String,
@@ -3460,17 +3460,40 @@ def _set_tournament_list_headers(
     response.headers["Access-Control-Expose-Headers"] = PAGINATION_EXPOSE_HEADERS
 
 
+def _tournament_list_response(
+    body: bytes,
+    *,
+    limit: int,
+    has_more: bool,
+    next_cursor: str | None,
+) -> Response:
+    """Return the already validated catalogue DTOs as their canonical JSON."""
+
+    response = Response(content=body, media_type="application/json")
+    _set_tournament_list_headers(
+        response,
+        limit=limit,
+        has_more=has_more,
+        next_cursor=next_cursor,
+    )
+    return response
+
+
+_TOURNAMENT_CARD_LIST_ADAPTER = TypeAdapter(list[TournamentCardResponse])
+
+
 def _tournament_list_body(items: Sequence[TournamentCardResponse]) -> bytes:
-    return (
-        "["
-        + ",".join(item.model_dump_json() for item in items)
-        + "]"
-    ).encode("utf-8")
+    return _TOURNAMENT_CARD_LIST_ADAPTER.dump_json(
+        items,
+        by_alias=True,
+        exclude_unset=False,
+        exclude_defaults=False,
+        exclude_none=False,
+    )
 
 
 @router.get("", response_model=list[TournamentCardResponse])
 async def list_tournaments(
-    response: Response,
     search: str | None = Query(default=None, max_length=120),
     rank: list[str] = Query(default_factory=list),
     open_registration: bool = Query(default=False),
@@ -3488,7 +3511,7 @@ async def list_tournaments(
     ),
     cursor: str | None = Query(default=None, max_length=2048),
     db_session: AsyncSession = Depends(get_lazy_db_session),
-) -> list[TournamentCardResponse] | Response:
+) -> Response:
     cache_key = public_tournament_list_cache_key(
         search=search,
         rank=rank,
@@ -3501,14 +3524,12 @@ async def list_tournaments(
     )
     cached = await get_public_tournament_list_cache(cache_key)
     if cached is not None:
-        cached_response = Response(content=cached.body, media_type="application/json")
-        _set_tournament_list_headers(
-            cached_response,
+        return _tournament_list_response(
+            cached.body,
             limit=cached.limit,
             has_more=cached.has_more,
             next_cursor=cached.next_cursor,
         )
-        return cached_response
 
     await checkout_db_connection(db_session)
     projection = TournamentListReadModel
@@ -3630,13 +3651,12 @@ async def list_tournaments(
         has_more=has_more,
         next_cursor=next_cursor,
     )
-    _set_tournament_list_headers(
-        response,
+    return _tournament_list_response(
+        body,
         limit=limit,
         has_more=has_more,
         next_cursor=next_cursor,
     )
-    return serialized
 
 
 @router.get("/mine", response_model=list[TournamentCardResponse])

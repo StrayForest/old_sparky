@@ -5,7 +5,8 @@ import { ArrowLeft } from "lucide-react";
 import { BracketBoard } from "@/components/bracket/bracket-board";
 import { Hero } from "@/components/layout/hero";
 import { HistoryBackLink } from "@/components/layout/history-back-link";
-import { getTournamentWorkspace, normalizeTournamentInviteCode, PlatformApiError } from "@/lib/platform-api";
+import { normalizeTournamentInviteCode, PlatformApiError } from "@/lib/platform-api";
+import { getServerTournamentWorkspace } from "@/lib/server-tournament-workspace";
 
 export const metadata: Metadata = {
   title: "Сетка турнира"
@@ -24,9 +25,9 @@ export default async function TournamentBracketPage({
   const cookieHeader = (await cookies()).toString();
   const requestHeaders: HeadersInit = cookieHeader ? { cookie: cookieHeader } : {};
 
-  let workspace: Awaited<ReturnType<typeof getTournamentWorkspace>>;
+  let workspace: Awaited<ReturnType<typeof getServerTournamentWorkspace>>;
   try {
-    workspace = await getTournamentWorkspace(slug, requestHeaders, {
+    workspace = await getServerTournamentWorkspace(slug, requestHeaders, {
       participantsLimit: 0,
       workspaceView: "bracket",
       includeCurrentUser: false,
