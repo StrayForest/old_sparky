@@ -150,7 +150,9 @@ assert.match(reporter, /AUTH_E2E_FAILURE test=auth-lifecycle stage=\$\{stage\} c
 assert.match(reporter, /const EXPECTED_STEPS = new Set\(\[/u);
 assert.match(reporter, /function failedStage\(steps\)/u);
 assert.doesNotMatch(reporter, /process\.stdout\.write\([^\n]*error\.message/u);
-assert.doesNotMatch(reporter, /error\.stack|result\.errors|attachments/u);
+assert.match(reporter, /function safeFailureLine\(result\)/u);
+assert.doesNotMatch(reporter, /error\.stack|attachments/u);
+assert.doesNotMatch(reporter, /process\.stdout\.write\([^\n]*error\.message/u);
 
 const authTitle = "auth lifecycle uses the real API, local mail capture, and strict verification";
 const authSpecPath = path.join(webRoot, "tests/smoke/auth-lifecycle-e2e.spec.ts");
@@ -194,7 +196,8 @@ function exerciseReporter({
       reporterInstance.onTestEnd(attempt.test, {
         status: attempt.status,
         retry: attempt.retry,
-        steps: []
+        steps: attempt.steps ?? [],
+        errors: attempt.errors ?? []
       });
     }
     if (serverOutput) {
@@ -249,6 +252,24 @@ const skippedAttempt = exerciseReporter({
 });
 assert.deepEqual(skippedAttempt.end, { status: "failed" });
 assert.match(skippedAttempt.output, /AUTH_E2E status=failed tests=1 .*failed=1/u);
+const secretAssertionFailure = exerciseReporter({
+  attempts: [{
+    test: expectedCase(),
+    status: "failed",
+    retry: 0,
+    steps: [{ title: "01-registration-verification-code", error: { name: "Error" } }],
+    errors: [{
+      message: "password=secret-value token=secret-token",
+      location: { file: authSpecPath, line: 198, column: 7 }
+    }]
+  }]
+});
+assert.deepEqual(secretAssertionFailure.end, { status: "failed" });
+assert.match(
+  secretAssertionFailure.output,
+  /AUTH_E2E_FAILURE test=auth-lifecycle stage=01-registration-verification-code category=assertion source=tests\/smoke\/auth-lifecycle-e2e\.spec\.ts#01-registration-verification-code line=198/u
+);
+assert.doesNotMatch(secretAssertionFailure.output, /secret-value|secret-token|password=|token=/u);
 const retriedAttempt = exerciseReporter({
   attempts: [{ test: expectedCase(), status: "passed", retry: 1 }]
 });

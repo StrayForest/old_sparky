@@ -151,6 +151,20 @@ function failedStage(steps) {
   return null;
 }
 
+function safeFailureLine(result) {
+  for (const error of result.errors ?? []) {
+    const file = typeof error?.location?.file === "string" ? error.location.file : "";
+    const absolute = path.isAbsolute(file) ? path.normalize(file) : path.resolve(process.cwd(), file);
+    const source = path.relative(process.cwd(), absolute).replaceAll("\\", "/");
+    const line = error?.location?.line;
+    if (source === "tests/smoke/auth-lifecycle-e2e.spec.ts"
+        && Number.isInteger(line) && line > 0 && line <= 100000) {
+      return String(line);
+    }
+  }
+  return "unknown";
+}
+
 class AuthE2ESafeReporter {
   constructor() {
     this.discoveryRequested = process.env.PLATFORM_AUTH_E2E_DISCOVERY_ONLY === "1";
@@ -287,7 +301,7 @@ class AuthE2ESafeReporter {
         ? "tests/smoke/auth-lifecycle-e2e.spec.ts#test"
         : `tests/smoke/auth-lifecycle-e2e.spec.ts#${stage}`;
       process.stdout.write(
-        `AUTH_E2E_FAILURE test=auth-lifecycle stage=${stage} category=${category} source=${source} line=${test.location.line}\n`
+        `AUTH_E2E_FAILURE test=auth-lifecycle stage=${stage} category=${category} source=${source} line=${safeFailureLine(result)}\n`
       );
     }
   }
