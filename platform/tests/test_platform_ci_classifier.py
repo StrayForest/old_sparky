@@ -1291,8 +1291,57 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn("|| 'Platform production deploy'", production)
         self.assertIn('is_baseline_candidate = display_title.startswith("platform-baseline-runtime-v1:")', finalizer)
         self.assertIn('raise SystemExit("workflow-dispatch run mode is unavailable; no status will be published")', finalizer)
-        self.assertIn('required = {', finalizer)
-        self.assertIn('"Trusted dev immutable release runtime"', finalizer)
+        finalizer_workflow = yaml.safe_load(finalizer)
+        status_step = finalizer_workflow["jobs"]["finalize-status"]["steps"][0]
+        status_blocks = _workflow_python_blocks(
+            STATUS_FINALIZER_WORKFLOW,
+            status_step["name"],
+        )
+        inventory_block = next(
+            block for block in status_blocks if "required_success = {" in block
+        )
+        inventory_assignments = {
+            target.id: ast.literal_eval(statement.value)
+            for statement in ast.walk(ast.parse(inventory_block))
+            if isinstance(statement, ast.Assign)
+            for target in statement.targets
+            if isinstance(target, ast.Name)
+            and target.id in {"required_success", "required_skipped"}
+        }
+        self.assertEqual(
+            inventory_assignments.get("required_success"),
+            {
+                "CI route classifier",
+                "Authenticate internal baseline runtime proof",
+                "Exact-source host-tools pin preflight",
+                "Conditional release runtime fixture",
+                "Trusted dev immutable release runtime",
+                "status-start",
+                "status-final",
+                "Dispatch exact baseline proof finalizer",
+            },
+        )
+        self.assertEqual(
+            inventory_assignments.get("required_skipped"),
+            {
+                "Backend DB-free contours",
+                "Backend PostgreSQL and Redis integration",
+                "Backend privileged ephemeral contour",
+                "Backend aggregate",
+                "Python quality",
+                "Security gates",
+                "web-quality",
+                "Web hermetic",
+                "Documentation consistency",
+                "Migration scenarios",
+                "Verification contract",
+            },
+        )
+        self.assertIn("for name in required_success:", inventory_block)
+        self.assertIn("for name in required_skipped:", inventory_block)
+        self.assertIn('matches[0].get("status") != "completed"', inventory_block)
+        self.assertIn('matches[0].get("conclusion") != "success"', inventory_block)
+        self.assertIn('matches[0].get("conclusion") != "skipped"', inventory_block)
         self.assertIn('"success", "failure", "cancelled", "skipped", "timed_out"', finalizer)
         self.assertIn('if status_context == "platform-baseline-runtime" and conclusion == "success":', finalizer)
         self.assertNotIn('context = "platform-security-build"\n                  if is_baseline_candidate', finalizer)

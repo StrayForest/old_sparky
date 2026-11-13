@@ -329,24 +329,35 @@ jobs:
               rows = job_payload.get("jobs") if isinstance(job_payload, dict) else None
               if not isinstance(rows, list) or len(rows) >= 100 or job_payload.get("total_count") != len(rows):
                   raise SystemExit("internal baseline job evidence is incomplete")
-              required = {
+              required_success = {
+                  "CI route classifier",
                   "Authenticate internal baseline runtime proof",
+                  "Exact-source host-tools pin preflight",
+                  "Conditional release runtime fixture",
+                  "Trusted dev immutable release runtime",
+                  "status-start",
+                  "status-final",
+                  "Dispatch exact baseline proof finalizer",
+              }
+              required_skipped = {
                   "Backend DB-free contours", "Backend PostgreSQL and Redis integration",
                   "Backend privileged ephemeral contour", "Backend aggregate", "Python quality",
                   "Security gates", "web-quality", "Web hermetic", "Documentation consistency",
-                  "Migration scenarios", "Verification contract", "Conditional release runtime fixture",
-                  "Trusted dev immutable release runtime", "status-start", "status-final",
-                  "Dispatch exact baseline proof finalizer",
+                  "Migration scenarios", "Verification contract",
               }
               grouped = {}
               for item in rows:
                   if not isinstance(item, dict) or not isinstance(item.get("name"), str):
                       raise SystemExit("internal baseline job identity is malformed")
                   grouped.setdefault(item["name"], []).append(item)
-              for name in required:
+              for name in required_success:
                   matches = grouped.get(name, [])
                   if len(matches) != 1 or matches[0].get("status") != "completed" or matches[0].get("conclusion") != "success":
                       raise SystemExit("internal baseline required gate is absent, duplicated, or unsuccessful")
+              for name in required_skipped:
+                  matches = grouped.get(name, [])
+                  if len(matches) != 1 or matches[0].get("status") != "completed" or matches[0].get("conclusion") != "skipped":
+                      raise SystemExit("internal baseline skipped gate is absent, duplicated, or unexpected")
 
           with output_path.open("a", encoding="utf-8") as output:
               output.write(f"context={status_context}\n")
