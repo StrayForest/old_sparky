@@ -1199,9 +1199,11 @@ test("notFound-capable segments keep an intentional no-segment-loading contract"
 
 test("tournament detail resolves missing slugs before committing the client shell", () => {
   const detailPage = source("app/(site)/tournaments/[slug]/page.tsx");
+  const serverWorkspace = source("lib/server-tournament-workspace.ts");
   const workspaceAccess = source("../platform_api/app/services/tournament_workspace_access.py");
 
-  expect(detailPage).toContain("getTournamentWorkspace");
+  expect(detailPage).toContain("getServerTournamentWorkspace");
+  expect(serverWorkspace.startsWith('import "server-only";')).toBe(true);
   expect(detailPage).toContain("const cookieHeader = (await cookies()).toString()");
   expect(detailPage).toContain("if (!workspace)");
   expect(detailPage).toContain("notFound()");

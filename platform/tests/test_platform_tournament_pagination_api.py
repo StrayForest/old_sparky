@@ -31,7 +31,6 @@ from apps.platform_api.app.api.schemas import (
     MediaDescriptorResponse,
     MediaVariantResponse,
 )
-from apps.platform_api.app.services import tournament_catalog_cache
 from apps.platform_api.app.services.tournament_catalog_cache import (
     PublicTournamentListCacheEntry,
 )
