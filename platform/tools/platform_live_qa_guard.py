@@ -52,6 +52,7 @@ RUN_GATE_ROOT = Path("/run/oldsparky-liveqa")
 LIVE_QA_SYSTEMD_UNIT = "oldsparky-liveqa-browser.service"
 LIVE_QA_RUNTIME_PROBE_TIMEOUT_SECONDS = 45.0
 LIVE_QA_CHILD_CAPTURE_TIMEOUT_SECONDS = 300.0
+PUBLIC_BROWSER_QA_TIMEOUT_SECONDS = 1500.0
 LIVE_USER_BROWSER_TIMEOUT_SECONDS = 1500.0
 LIVE_QA_CHILD_CAPTURE_BYTES = 64 * 1024
 LIVE_QA_CHILD_MARKER_RE = re.compile(
@@ -7609,7 +7610,11 @@ def _capture_qa_child(
     timeout_limit = (
         LIVE_USER_BROWSER_TIMEOUT_SECONDS
         if live_user_browser
-        else LIVE_QA_CHILD_CAPTURE_TIMEOUT_SECONDS
+        else (
+            PUBLIC_BROWSER_QA_TIMEOUT_SECONDS
+            if _is_fixed_public_live_browser_command(command)
+            else LIVE_QA_CHILD_CAPTURE_TIMEOUT_SECONDS
+        )
     )
     if (
         not command
@@ -7885,6 +7890,166 @@ def _is_fixed_live_user_browser_command(command: list[str]) -> bool:
     )
 
 
+def _is_fixed_public_live_browser_command(command: list[str]) -> bool:
+    if not _is_fixed_live_browser_command(command):
+        return False
+    try:
+        expected_uid, expected_gid = liveqa_identity()
+    except (GuardError, OSError):
+        return False
+    separator = command.index("--")
+    before = command[:separator]
+    tail = command[separator + 3 :]
+    env: dict[str, str] = {}
+    env_end = 0
+    while env_end < len(tail) and "=" in tail[env_end]:
+        key, value = tail[env_end].split("=", 1)
+        env[key] = value
+        env_end += 1
+    if len(env) != env_end or env_end + 5 != len(tail):
+        return False
+    if set(env) != {
+        "CHROME_DEVEL_SANDBOX",
+        "HOME",
+        "LANG",
+        "NODE_PATH",
+        "PATH",
+        "PLATFORM_LIVE_EXPECTED_ORIGIN",
+        "PLATFORM_LIVE_USER_QA_UID",
+        "PLATFORM_QA_BROWSER_GATE_DIR",
+        "PLATFORM_LIVE_QA_RUNNER_SHA",
+        "PLATFORM_LIVE_QA_TARGET_SHA",
+        "PLATFORM_LIVE_QA_MARKER_SHA256",
+        "PLAYWRIGHT_BROWSERS_PATH",
+        "PLAYWRIGHT_LIVE_BASE_URL",
+        "TMPDIR",
+        "XDG_CACHE_HOME",
+    }:
+        return False
+    node, cli, subcommand, config, spec = tail[env_end:]
+    node_suffix = "/node/bin/node"
+    cli_suffix = "/web/node_modules/@playwright/test/cli.js"
+    if (
+        not node.endswith(node_suffix)
+        or not cli.endswith(cli_suffix)
+        or subcommand != "test"
+        or not config.startswith("--config=")
+    ):
+        return False
+    engine_root = node.removesuffix(node_suffix)
+    config_path = config.removeprefix("--config=")
+    config_suffix = "/web/playwright.live.config.ts"
+    if not config_path.endswith(config_suffix):
+        return False
+    suite_root = config_path.removesuffix(config_suffix)
+    gate = env["PLATFORM_QA_BROWSER_GATE_DIR"]
+    if (
+        re.fullmatch(r"/run/oldsparky-liveqa/public-live-qa\.[a-z0-9_]{8}", gate) is None
+        or env["HOME"] != gate + "/home"
+        or env["TMPDIR"] != gate + "/tmp"
+        or env["XDG_CACHE_HOME"] != gate + "/home/.cache"
+        or env["LANG"] != "C.UTF-8"
+        or env["PLATFORM_LIVE_EXPECTED_ORIGIN"] != "https://old-sparky.com"
+        or env["PLAYWRIGHT_LIVE_BASE_URL"] != "https://old-sparky.com"
+        or re.fullmatch(r"[1-9][0-9]{0,8}", env["PLATFORM_LIVE_USER_QA_UID"]) is None
+        or re.fullmatch(r"[0-9a-f]{40}", env["PLATFORM_LIVE_QA_RUNNER_SHA"]) is None
+        or re.fullmatch(r"[0-9a-f]{40}", env["PLATFORM_LIVE_QA_TARGET_SHA"]) is None
+        or re.fullmatch(r"[0-9a-f]{64}", env["PLATFORM_LIVE_QA_MARKER_SHA256"]) is None
+    ):
+        return False
+    if (
+        not suite_root
+        or cli != engine_root + cli_suffix
+        or spec != suite_root + "/web/tests/smoke/live-launch.spec.ts"
+        or not any(item == f"--working-directory={suite_root}/web" for item in before)
+        or env.get("NODE_PATH") != engine_root + "/web/node_modules"
+        or env.get("PATH") != engine_root + "/node/bin:/usr/bin:/bin"
+        or env.get("PLAYWRIGHT_BROWSERS_PATH") != engine_root + "/browsers"
+        or env.get("CHROME_DEVEL_SANDBOX")
+        != engine_root + "/" + CHROMIUM_SANDBOX_RELATIVE.as_posix()
+        or any(
+            name in env
+            for name in (
+                "PLATFORM_LIVE_USER_QA",
+                "PLATFORM_LIVE_USER_QA_INVENTORY",
+                "PLATFORM_LIVE_USER_QA_MARKER",
+                "PLATFORM_LIVE_USER_QA_SESSIONS",
+            )
+        )
+    ):
+        return False
+    uid_args = [item for item in before if item.startswith("--uid=")]
+    gid_args = [item for item in before if item.startswith("--gid=")]
+    working_directory_args = [
+        item for item in before if item.startswith("--working-directory=")
+    ]
+    if (
+        len(uid_args) != 1
+        or len(gid_args) != 1
+        or len(working_directory_args) != 1
+        or re.fullmatch(r"--uid=[1-9][0-9]{0,8}", uid_args[0]) is None
+        or re.fullmatch(r"--gid=[1-9][0-9]{0,8}", gid_args[0]) is None
+        or uid_args[0] != f"--uid={expected_uid}"
+        or gid_args[0] != f"--gid={expected_gid}"
+        or uid_args[0] != f"--uid={env['PLATFORM_LIVE_USER_QA_UID']}"
+        or working_directory_args[0] != f"--working-directory={suite_root}/web"
+    ):
+        return False
+    bind_paths = [
+        item.removeprefix("--property=BindReadOnlyPaths=")
+        for item in before
+        if item.startswith("--property=BindReadOnlyPaths=")
+    ]
+    if suite_root == engine_root:
+        runtime_match = RUNTIME_NAME_PATTERN.fullmatch(Path(suite_root).name)
+        if bind_paths or runtime_match is None or runtime_match.group(1) != env["PLATFORM_LIVE_QA_TARGET_SHA"]:
+            return False
+        expected_bind_args: list[str] = []
+    else:
+        suite_match = re.fullmatch(
+            r"/var/lib/oldsparky-liveqa/runtime-suite-([0-9a-f]{40})-([a-z0-9_]{8})",
+            suite_root,
+        )
+        engine_match = re.fullmatch(
+            r"/var/lib/oldsparky-liveqa/runtime-engine-([0-9a-f]{40})-([a-z0-9_]{8})",
+            engine_root,
+        )
+        if (
+            suite_match is None
+            or engine_match is None
+            or suite_match.group(1) != env["PLATFORM_LIVE_QA_TARGET_SHA"]
+            or suite_match.group(2) != engine_match.group(2)
+            or bind_paths != [f"{suite_root}:{suite_root}", f"{engine_root}:{engine_root}"]
+        ):
+            return False
+        expected_bind_args = [
+            f"--property=BindReadOnlyPaths={suite_root}:{suite_root}",
+            f"--property=BindReadOnlyPaths={engine_root}:{engine_root}",
+        ]
+    expected_before = [
+        "/usr/bin/systemd-run",
+        "--no-ask-password",
+        "--quiet",
+        "--wait",
+        "--collect",
+        "--pipe",
+        "--service-type=exec",
+        "--expand-environment=no",
+        f"--unit={LIVE_QA_SYSTEMD_UNIT}",
+        uid_args[0],
+        gid_args[0],
+        working_directory_args[0],
+        "--property=KillMode=control-group",
+        "--property=Restart=no",
+        "--property=RuntimeMaxSec=30min",
+        "--property=SendSIGKILL=yes",
+        "--property=TimeoutStopSec=5s",
+        "--property=UMask=0077",
+        *expected_bind_args,
+    ]
+    return before == expected_before
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Guard production live QA execution.")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -7998,12 +8163,17 @@ def main(argv: Iterable[str] | None = None) -> int:
             if not _is_fixed_live_browser_command(command):
                 raise GuardError("QA browser child command is not the fixed systemd scope")
             live_user_browser = _is_fixed_live_user_browser_command(command)
+            public_browser = _is_fixed_public_live_browser_command(command)
             child_exit, marker = _capture_qa_child(
                 command,
                 timeout_seconds=(
                     LIVE_USER_BROWSER_TIMEOUT_SECONDS
                     if live_user_browser
-                    else LIVE_QA_CHILD_CAPTURE_TIMEOUT_SECONDS
+                    else (
+                        PUBLIC_BROWSER_QA_TIMEOUT_SECONDS
+                        if public_browser
+                        else LIVE_QA_CHILD_CAPTURE_TIMEOUT_SECONDS
+                    )
                 ),
                 live_user_browser=live_user_browser,
             )
