@@ -51,11 +51,29 @@ TEST_TOKENS = frozenset(
     }
 )
 STARTUP_STAGE = "startup"
+STARTUP_STAGES = frozenset(
+    {
+        "environment",
+        "smtp-capture",
+        "application-import",
+        "settings-validation",
+        "service-isolation",
+        "app-creation",
+        "route-registration",
+        "control-file",
+        "uvicorn-startup",
+        "preflight",
+        "startup",
+    }
+)
 
 
 def _startup_stage(stage: str) -> None:
     global STARTUP_STAGE
+    if stage not in STARTUP_STAGES:
+        raise RuntimeError("unknown auth E2E startup stage")
     STARTUP_STAGE = stage
+    print(f"AUTH_E2E_API_PROGRESS stage={stage}", file=sys.stderr, flush=True)
 
 
 def _startup_failure_category(error: Exception) -> str:

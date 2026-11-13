@@ -5,6 +5,10 @@
 const { spawn } = require("node:child_process");
 const path = require("node:path");
 const { apiChildEnv } = require("./auth-e2e-child-env.cjs");
+const {
+  createPythonDiagnosticParser,
+  shouldReportEarlyExit
+} = require("./auth-e2e-python-diagnostics.cjs");
 
 const webRoot = path.resolve(__dirname, "../..");
 const platformRoot = path.resolve(webRoot, "../..");
@@ -24,31 +28,7 @@ const child = spawn(python, ["-I", "-B", server], {
   env,
   stdio: ["ignore", "ignore", "pipe"]
 });
-const safeStartupStages = new Set([
-  "environment",
-  "smtp-capture",
-  "application-import",
-  "settings-validation",
-  "service-isolation",
-  "app-creation",
-  "route-registration",
-  "control-file",
-  "uvicorn-startup",
-  "preflight",
-  "startup"
-]);
-const safeStartupCategories = new Set([
-  "module-missing",
-  "module-import",
-  "permission",
-  "path-missing",
-  "os-error",
-  "value-error",
-  "type-error",
-  "name-error",
-  "guard-or-runtime",
-  "unexpected"
-]);
+const diagnostics = createPythonDiagnosticParser(platformRoot);
 let stderrBuffer = "";
 child.stderr.on("data", (chunk) => {
   stderrBuffer += chunk.toString("utf8");
@@ -57,15 +37,13 @@ child.stderr.on("data", (chunk) => {
   while (newline >= 0) {
     const line = stderrBuffer.slice(0, newline).replace(/\r$/u, "");
     stderrBuffer = stderrBuffer.slice(newline + 1);
-    const match = /^AUTH_E2E_API_STARTUP status=failed stage=([a-z-]+) category=([a-z-]+)$/u
-      .exec(line);
-    if (match && safeStartupStages.has(match[1]) && safeStartupCategories.has(match[2])) {
-      process.stderr.write(`${line}\n`);
-    }
+    const safeOutput = diagnostics.consume(line + "\n");
+    if (safeOutput) process.stderr.write(safeOutput);
     newline = stderrBuffer.indexOf("\n");
   }
 });
 let stopping = false;
+let spawnFailed = false;
 const stop = (signal) => {
   if (stopping) return;
   stopping = true;
@@ -79,12 +57,17 @@ const stop = (signal) => {
 process.on("SIGTERM", () => stop("SIGTERM"));
 process.on("SIGINT", () => stop("SIGINT"));
 child.on("error", () => {
+  spawnFailed = true;
+  process.stderr.write(
+    "AUTH_E2E_API_EXIT status=spawn-error stage=launch exception=none "
+    + "source=none line=0 code=none signal=none\n"
+  );
   process.stderr.write("AUTH_E2E_API_LAUNCH status=failed\n");
   process.exitCode = 1;
 });
-child.on("exit", (code) => {
-  if (!stopping || (code !== 0 && code !== null)) {
-    process.stderr.write("AUTH_E2E_API_LAUNCH status=failed\n");
-    process.exitCode = 1;
-  }
+child.on("close", (code, signal) => {
+  if (!shouldReportEarlyExit({ stopping, spawnFailed })) return;
+  process.stderr.write(diagnostics.exit({ code, signal }));
+  process.stderr.write("AUTH_E2E_API_LAUNCH status=failed\n");
+  process.exitCode = 1;
 });

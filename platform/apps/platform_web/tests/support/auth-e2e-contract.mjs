@@ -20,10 +20,13 @@ const spec = read("platform/apps/platform_web/tests/smoke/auth-lifecycle-e2e.spe
 const server = read("platform/tests/support/auth_lifecycle_e2e_server.py");
 const hermetic = read("platform/tools/platform_web_hermetic.sh");
 const childEnvSource = read("platform/apps/platform_web/tests/support/auth-e2e-child-env.cjs");
+const diagnosticsSource = read("platform/apps/platform_web/tests/support/auth-e2e-python-diagnostics.cjs");
 
 const require = createRequire(import.meta.url);
 const { apiChildEnv, nextChildEnv } = require("./auth-e2e-child-env.cjs");
 const AuthE2ESafeReporter = require("./auth-e2e-safe-reporter.cjs");
+const { createPythonDiagnosticParser, shouldReportEarlyExit } =
+  require("./auth-e2e-python-diagnostics.cjs");
 const parentOnly = {
   PATH: process.env.PATH || "/usr/bin:/bin",
   CI: "true",
@@ -87,14 +90,21 @@ assert.equal(childEnvSource.includes("const API_NAMES = ["), true);
 assert.match(apiLauncher, /apiChildEnv\(\)/u);
 assert.match(nextLauncher, /nextChildEnv\(\)/u);
 assert.match(apiLauncher, /env,\s*stdio:\s*\["ignore",\s*"ignore",\s*"pipe"\]/u);
-assert.match(apiLauncher, /safeStartupStages\.has\(match\[1\]\)/u);
-assert.match(apiLauncher, /safeStartupCategories\.has\(match\[2\]\)/u);
+assert.match(apiLauncher, /createPythonDiagnosticParser\(platformRoot\)/u);
+assert.match(diagnosticsSource, /SAFE_STAGES\.has\(progress\[1\]\)/u);
+assert.match(diagnosticsSource, /SAFE_CATEGORIES\.has\(startup\[2\]\)/u);
 assert.match(server, /AUTH_E2E_API_STARTUP status=failed stage=\{STARTUP_STAGE\}/u);
 assert.match(server, /f"category=\{category\}"/u);
 assert.match(server, /endpoint\.__annotations__\["request"\]\s*=\s*Request/u);
 assert.match(server, /endpoint\.__annotations__\["return"\]\s*=\s*JSONResponse/u);
 assert.match(server, /_startup_stage\("route-registration"\)/u);
 assert.match(server, /if str\(PLATFORM_ROOT\) not in sys\.path:/u);
+assert.match(server, /AUTH_E2E_API_PROGRESS stage=\{stage\}/u);
+assert.match(apiLauncher, /createPythonDiagnosticParser\(platformRoot\)/u);
+assert.match(apiLauncher, /shouldReportEarlyExit\(\{ stopping, spawnFailed \}\)/u);
+assert.match(apiLauncher, /child\.on\("close"/u);
+assert.match(diagnosticsSource, /AUTH_E2E_API_EXIT status=early stage=/u);
+assert.doesNotMatch(diagnosticsSource, /process\.stderr\.write\(chunk|console\.(?:log|error)\(line/u);
 assert.match(apiLauncher, /apiChildEnv\(\)/u);
 assert.doesNotMatch(apiLauncher, /env\s*:\s*\{\s*\.\.\.process\.env/u);
 assert.match(nextLauncher, /nextChildEnv\(\)/u);
@@ -143,7 +153,8 @@ function exerciseReporter({
   cases = [expectedCase()],
   attempts = [],
   serverOutput,
-  globalError = false
+  globalError = false,
+  globalErrorMessage = "Timed out waiting for config.webServer."
 }) {
   const originalArgv = process.argv;
   const originalCwd = process.cwd();
@@ -175,10 +186,13 @@ function exerciseReporter({
         steps: []
       });
     }
-    if (serverOutput) reporterInstance.onStdErr(serverOutput);
+    if (serverOutput) {
+      const chunks = Array.isArray(serverOutput) ? serverOutput : [serverOutput];
+      for (const chunk of chunks) reporterInstance.onStdErr(chunk);
+    }
     if (globalError) {
       reporterInstance.onError({
-        message: "Timed out waiting for config.webServer.",
+        message: globalErrorMessage,
         location: { file: "/outside/source.ts", line: 9 }
       });
     }
@@ -241,12 +255,75 @@ const namedServerError = exerciseReporter({
 assert.deepEqual(namedServerError.end, { status: "failed" });
 assert.match(namedServerError.output, /AUTH_E2E_SETUP_ERROR category=webserver-setup component=next source=unknown line=0/u);
 const apiStartupError = exerciseReporter({
-  serverOutput: "AUTH_E2E_API_STARTUP status=failed stage=route-registration category=name-error\n",
+  serverOutput: [
+    "\u001b[2m[auth-e2e-api] \u001b[0mAUTH_E2E_API_PROGRESS stage=application-",
+    "import\n[auth-e2e-api] AUTH_E2E_API_STARTUP status=failed stage=route-registration category=name-error\n"
+  ],
   globalError: true
 });
 assert.deepEqual(apiStartupError.end, { status: "failed" });
+assert.match(apiStartupError.output, /AUTH_E2E_API_PROGRESS stage=application-import/u);
 assert.match(apiStartupError.output, /AUTH_E2E_API_STARTUP stage=route-registration category=name-error/u);
 assert.match(apiStartupError.output, /AUTH_E2E_SETUP_ERROR category=webserver-setup component=api source=unknown line=0/u);
+assert.doesNotMatch(apiStartupError.output, /\u001b|auth-e2e-api/u);
+
+const apiExitReporter = exerciseReporter({
+  serverOutput: "[auth-e2e-api] AUTH_E2E_API_PROGRESS stage=route-registration\n"
+    + "[auth-e2e-api] AUTH_E2E_API_EXIT status=early stage=route-registration "
+    + "exception=NameError source=apps/platform_api/app/main.py line=432 code=1 signal=none\n",
+  globalError: true,
+  globalErrorMessage: "config.webServer did not become ready. secret=do-not-project"
+});
+assert.deepEqual(apiExitReporter.end, { status: "failed" });
+assert.match(apiExitReporter.output, /AUTH_E2E_API_PROGRESS stage=route-registration/u);
+assert.match(apiExitReporter.output, /AUTH_E2E_API_EXIT status=early stage=route-registration exception=NameError source=apps\/platform_api\/app\/main\.py line=432 code=1 signal=none/u);
+assert.doesNotMatch(apiExitReporter.output, /do-not-project|secret=/u);
+
+const webServerBranches = [
+  ["http://127.0.0.1:3199 is already used, config.webServer", "api", "already-in-use", "none"],
+  ["Process from config.webServer was not able to start. Exit code: 17 secret-value=do-not-project", "unknown", "spawn-exit", "17"],
+  ["Process from config.webServer exited early.", "unknown", "early-exit", "none"],
+  ["Timed out waiting 45000ms from config.webServer.", "unknown", "timeout", "none"],
+  ["config.webServer failed token=do-not-project", "unknown", "unknown", "none"]
+];
+for (const [message, component, branch, exit] of webServerBranches) {
+  const outcome = exerciseReporter({ globalError: true, globalErrorMessage: message });
+  assert.deepEqual(outcome.end, { status: "failed" });
+  assert.match(
+    outcome.output,
+    new RegExp("AUTH_E2E_WEB_SERVER component=" + component + " branch=" + branch + " exit=" + exit, "u")
+  );
+  assert.doesNotMatch(outcome.output, /secret-value|do-not-project/u);
+}
+
+const pythonDiagnostics = createPythonDiagnosticParser(platformRoot);
+const secretTraceback = [
+  "AUTH_E2E_API_PROGRESS stage=application-import",
+  "Traceback (most recent call last):",
+  "  File \"" + path.join(platformRoot, "apps/platform_api/app/main.py") + "\", line 432, in create_app",
+  "    raise NameError('password=secret-traceback-value')",
+  "NameError: password=secret-exception-value token=secret-token-value",
+  ""
+].join("\n");
+const projectedTraceback = pythonDiagnostics.consume(secretTraceback)
+  + pythonDiagnostics.exit({ code: 1, signal: null });
+assert.match(projectedTraceback, /AUTH_E2E_API_PROGRESS stage=application-import/u);
+assert.match(projectedTraceback, /AUTH_E2E_API_EXIT status=early stage=application-import exception=NameError source=apps\/platform_api\/app\/main\.py line=432 code=1 signal=none/u);
+assert.doesNotMatch(projectedTraceback, /secret-traceback-value|secret-exception-value|secret-token-value|password=|token=/u);
+
+const externalDiagnostics = createPythonDiagnosticParser(platformRoot);
+externalDiagnostics.consume([
+  "Traceback (most recent call last):",
+  "  File \"/private/runtime/path.py\", line 44, in run",
+  "SystemExit: 0",
+  ""
+].join("\n"));
+const earlyZeroExit = externalDiagnostics.exit({ code: 0, signal: null });
+assert.match(earlyZeroExit, /status=early .*exception=SystemExit source=dependency line=44 code=0/u);
+assert.equal(shouldReportEarlyExit({ stopping: false, spawnFailed: false }), true);
+assert.equal(shouldReportEarlyExit({ stopping: true, spawnFailed: false }), false);
+assert.equal(shouldReportEarlyExit({ stopping: false, spawnFailed: true }), false);
+assert.equal(shouldReportEarlyExit({ stopping: false, spawnFailed: false }), true);
 
 assert.match(server, /os\.environ\.get\("GITHUB_ACTIONS"\) == "true"/u);
 assert.match(server, /database_url\.path\.lstrip\("\/"\) == "platformdb_test"/u);

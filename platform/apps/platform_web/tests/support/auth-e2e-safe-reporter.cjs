@@ -28,6 +28,34 @@ const API_STARTUP_PATTERN = new RegExp(
     + "|value-error|type-error|name-error|guard-or-runtime|unexpected)$",
   "mu"
 );
+const API_PROGRESS_PATTERN = /^AUTH_E2E_API_PROGRESS stage=([a-z-]+)$/mu;
+const SAFE_API_STAGES = new Set([
+  "environment",
+  "smtp-capture",
+  "application-import",
+  "settings-validation",
+  "service-isolation",
+  "app-creation",
+  "route-registration",
+  "control-file",
+  "uvicorn-startup",
+  "preflight",
+  "startup"
+]);
+const API_EXIT_PATTERN = new RegExp(
+  "^AUTH_E2E_API_EXIT status=(early|spawn-error) stage=("
+    + "launch|environment|smtp-capture|application-import|settings-validation|service-isolation"
+    + "|app-creation|route-registration|control-file|uvicorn-startup|preflight|startup"
+    + ") exception=(NameError|ModuleNotFoundError|ImportError|RuntimeError|ValueError|TypeError"
+    + "|OSError|PermissionError|FileNotFoundError|AttributeError|AssertionError|SystemExit"
+    + "|TimeoutError|ConnectionError|Exception|ExceptionGroup|other|none)"
+    + " source=(tests/support/[A-Za-z0-9_./-]+|apps/platform_api/[A-Za-z0-9_./-]+"
+    + "|python_packages/platform_infra/[A-Za-z0-9_./-]+"
+    + "|python_packages/platform_domain/[A-Za-z0-9_./-]+|dependency|none|unknown)"
+    + " line=([0-9]{1,6}) code=(none|[0-9]{1,3})"
+    + " signal=(none|SIGTERM|SIGKILL|SIGINT|SIGHUP|other)$",
+  "mu"
+);
 
 function errorCategory(error) {
   const message = typeof error?.message === "string" ? error.message : "";
@@ -68,6 +96,44 @@ function serverComponent(error, observedFailure, observedOutput) {
   return "unknown";
 }
 
+function webServerFailure(error) {
+  const message = typeof error?.message === "string" ? error.message : "";
+  if (/is already used|already listening/iu.test(message)) {
+    return { branch: "already-in-use", exitCode: "none" };
+  }
+  const exit = /Process from config\.webServer was not able to start\. Exit code: ([0-9]{1,3})/u
+    .exec(message);
+  if (exit) {
+    const code = Number(exit[1]);
+    return { branch: "spawn-exit", exitCode: code <= 255 ? String(code) : "none" };
+  }
+  if (/Process from config\.webServer exited early/iu.test(message)) {
+    const earlyExit = /Exit code: ([0-9]{1,3})/u.exec(message);
+    const code = earlyExit ? Number(earlyExit[1]) : null;
+    return {
+      branch: "early-exit",
+      exitCode: code !== null && code <= 255 ? String(code) : "none"
+    };
+  }
+  if (/timed out|timeout/iu.test(message)) {
+    return { branch: "timeout", exitCode: "none" };
+  }
+  return { branch: "unknown", exitCode: "none" };
+}
+
+function safeApiSource(source) {
+  if (["dependency", "none", "unknown"].includes(source)) return source;
+  const parts = source.split("/");
+  if (parts.some((part) => part === "." || part === "..")) return "unknown";
+  if (source.startsWith("tests/support/")
+      || source.startsWith("apps/platform_api/")
+      || source.startsWith("python_packages/platform_infra/")
+      || source.startsWith("python_packages/platform_domain/")) {
+    return source;
+  }
+  return "unknown";
+}
+
 function isExpectedTest(test) {
   const file = typeof test?.location?.file === "string" ? test.location.file : "";
   const absolute = path.isAbsolute(file) ? path.normalize(file) : path.resolve(process.cwd(), file);
@@ -93,6 +159,7 @@ class AuthE2ESafeReporter {
     this.reportedGlobalErrors = 0;
     this.observedServerFailure = "unknown";
     this.observedServerOutputComponent = "unknown";
+    this.serverStderrBuffer = "";
     this.globalError = false;
     this.executedBegins = 0;
     this.executedAttempts = 0;
@@ -134,6 +201,13 @@ class AuthE2ESafeReporter {
     const component = category === "webserver-setup"
       ? serverComponent(error, this.observedServerFailure, this.observedServerOutputComponent)
       : "none";
+    if (category === "webserver-setup") {
+      const failure = webServerFailure(error);
+      process.stdout.write(
+        "AUTH_E2E_WEB_SERVER component=" + component
+        + " branch=" + failure.branch + " exit=" + failure.exitCode + "\n"
+      );
+    }
     process.stdout.write(
       `AUTH_E2E_SETUP_ERROR category=${category} component=${component} source=${source} line=${line}\n`
     );
@@ -141,23 +215,54 @@ class AuthE2ESafeReporter {
 
   onStdErr(chunk) {
     const value = String(chunk);
-    const apiStartup = API_STARTUP_PATTERN.exec(value);
+    const buffered = this.serverStderrBuffer + value;
+    const lines = buffered.split("\n");
+    this.serverStderrBuffer = lines.pop() ?? "";
+    if (this.serverStderrBuffer.length > 1024) {
+      this.serverStderrBuffer = this.serverStderrBuffer.slice(-1024);
+    }
+    const normalized = lines.map((line) => line
+      .replace(/\u001b\[[0-9;]*m/gu, "")
+      .replace(/^\[auth-e2e-api\]\s*/u, ""));
+    const safeValue = normalized.join("\n");
+    const progress = API_PROGRESS_PATTERN.exec(safeValue);
+    if (progress && SAFE_API_STAGES.has(progress[1])) {
+      this.observedServerFailure = "api";
+      this.observedServerOutputComponent = "api";
+      process.stdout.write("AUTH_E2E_API_PROGRESS stage=" + progress[1] + "\n");
+    }
+    const apiStartup = API_STARTUP_PATTERN.exec(safeValue);
     if (apiStartup) {
       this.observedServerFailure = "api";
       this.observedServerOutputComponent = "api";
-      if (this.reportedApiStartup) return;
-      this.reportedApiStartup = true;
-      process.stdout.write(`AUTH_E2E_API_STARTUP stage=${apiStartup[1]} category=${apiStartup[2]}\n`);
-    } else if (/AUTH_E2E_API_LAUNCH status=(?:missing-config|failed)/u.test(value)) {
+      if (!this.reportedApiStartup) {
+        this.reportedApiStartup = true;
+        process.stdout.write(
+          "AUTH_E2E_API_STARTUP stage=" + apiStartup[1] + " category=" + apiStartup[2] + "\n"
+        );
+      }
+    } else if (/AUTH_E2E_API_LAUNCH status=(?:missing-config|failed)/u.test(safeValue)) {
       this.observedServerFailure = "api";
       this.observedServerOutputComponent = "api";
-    } else if (/AUTH_E2E_NEXT_LAUNCH status=(?:missing-config|failed)/u.test(value)) {
+    } else if (/AUTH_E2E_NEXT_LAUNCH status=(?:missing-config|failed)/u.test(safeValue)) {
       this.observedServerFailure = "next";
       this.observedServerOutputComponent = "next";
     } else if (/\[auth-e2e-api\]/u.test(value)) {
       this.observedServerOutputComponent = "api";
     } else if (/\[auth-e2e-next\]/u.test(value)) {
       this.observedServerOutputComponent = "next";
+    }
+    const apiExit = API_EXIT_PATTERN.exec(safeValue);
+    if (apiExit) {
+      this.observedServerFailure = "api";
+      this.observedServerOutputComponent = "api";
+      const rawCode = apiExit[6] === "none" ? "none" : Number(apiExit[6]);
+      const code = rawCode === "none" || rawCode <= 255 ? String(rawCode) : "none";
+      process.stdout.write(
+        "AUTH_E2E_API_EXIT status=" + apiExit[1] + " stage=" + apiExit[2]
+        + " exception=" + apiExit[3] + " source=" + safeApiSource(apiExit[4])
+        + " line=" + apiExit[5] + " code=" + code + " signal=" + apiExit[7] + "\n"
+      );
     }
   }
 
