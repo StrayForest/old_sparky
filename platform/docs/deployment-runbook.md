@@ -34,12 +34,16 @@ to `dev`. The chain is:
 3. The auto-deploy gate downloads the classifier artifact from that exact
    security run, validates its schema, digest, target SHA and non-fallback
    route, then consumes its `deployable` bit: a deployable `full` route
-   proceeds while a valid full CI-only route completes as a no-op. Recovery-bootstrap-only or
-   strict docs-only routes stay non-deployable; the automatic chain may send either to
-   `baseline-reconcile` to authenticate the active baseline and full baseline-to-target range.
-   Reconcile is a verified no-op for an allowed cumulative no-op; app releases require a
-   deployable full cumulative route with every canonical gate, no fallback, and exact-target
-   runtime proof. Every deployable full `dev` push runs the exact-source
+   proceeds. A candidate-packaging incremental route remains non-deployable
+   and enters `baseline-reconcile`; that child authenticates the active baseline
+   and full baseline-to-target range. Reconcile is a verified no-op only for
+   an allowed cumulative no-op. If the cumulative range contains app changes,
+   it must classify as a deployable full route with every canonical gate and
+   no fallback; the ordinary source-bound backup remains required, and any
+   exact-target runtime proof required by the cumulative route must pass.
+   Recovery-bootstrap-only or strict docs-only routes also use
+   `baseline-reconcile`, with the documented no-backup no-op restriction.
+   Every deployable full `dev` push runs the exact-source
    release-runtime fixture; the full `platform_build_release.sh` build runs
    once in the production child after proofs. Security runs that builder only
    for sensitive/fallback routes and authenticated baseline-runtime proof.
@@ -56,8 +60,12 @@ to `dev`. The chain is:
    successful deploy attempt has its exact bot-authored marker.
    Before child dispatch, the guard revalidates the exact Security run/attempt/source and requires complete, terminal, source-bound pages from that attempt's [workflow-jobs endpoint](https://docs.github.com/en/rest/actions/workflow-jobs), with valid start/completion times. The backup run must have the exact Security ID/attempt/SHA title, start after that Security run began, and preserve its own creation→workflow→job timestamp order. The backup workflow independently waits for Security success and rechecks current `dev` before staging or SSH; it then proves the successful restore-verified receipt. Missing, malformed or incomplete Security or backup jobs abort. `updated_at` remains only a consistency upper bound; event `workflow_run.completed_at` is never a fallback.
 4. The automatic chain dispatches `mode=deploy` for deployable full routes and
-   `mode=baseline-reconcile` for validated recovery-bootstrap-only or docs-only
-   routes; never dispatch either mode manually. Auto may skip backup only for closed, non-fallback docs-only or recovery-bootstrap routes and marks the child `no_backup_noop_only`; the child proves cumulative no-op before build.
+   `mode=baseline-reconcile` for validated candidate-packaging, recovery-bootstrap-only,
+   or docs-only incremental routes; never dispatch either mode manually. Auto
+   may skip backup only for closed, non-fallback docs-only or recovery-bootstrap
+   routes and marks the child `no_backup_noop_only`; candidate-packaging keeps
+   the source-bound backup gate. The child authenticates the cumulative route
+   before deciding whether it is a no-op or an app release.
    The production workflow
    authenticates source/caller, validates the cumulative range and active
    baseline's latest bot-authored deploy marker, attempt URL and successful exact
@@ -101,7 +109,7 @@ to `dev`. The chain is:
 
 This automatic-only path authenticates exact source/caller/parent attempts, the pinned host baseline and its deployment proof, plus first-parent ancestry to `dev`.
 Classification follows event ownership (the bundled live-QA installer stays full/runtime). Bootstrap-only is a verified no-op; deployable routes require canonical gates and exact-target runtime proof when sensitive. When reconciliation needs `baseline-runtime`, Auto dispatches it on the exact target; the guard verifies every canonical gate from the exact source Security attempt, then the proof run reuses those results and must pass both runtime gates before its distinct status and receipt complete. Operators never dispatch this proof manually.
-The finalizer preserves push context. The exact root `AGENTS.md` is a non-artifact companion only when the remaining paths already form a recognized route; the manifest still binds the guide. Route selection preserves that underlying route, so recovery-bootstrap, candidate-packaging, storage and out-of-scope no-op rules remain intact. Unknown additional paths still trigger the fail-closed full fallback.
+The finalizer preserves push context. The exact root `AGENTS.md` is a non-artifact companion only when the remaining paths already form a recognized route; the manifest still binds the guide. Route selection preserves that underlying route, so recovery-bootstrap, candidate-packaging, storage and out-of-scope no-op rules remain intact. Candidate-packaging is a no-op only when the authenticated cumulative range is itself the closed packaging family; an app-bearing cumulative route follows the deployable release path. Unknown additional paths still trigger the fail-closed full fallback.
 
 Only marker-bound temporary ingress and lock files may precede comparison.
 Under both locks, the immutable supervisor checks tuple match, no pending

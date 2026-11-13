@@ -887,6 +887,118 @@ class PlatformCiClassifierTests(unittest.TestCase):
         with self.assertRaises(ClassifierError):
             validate_manifest(tampered)
 
+    def test_reviewed_skill_companions_require_an_app_source_full_route(self) -> None:
+        skill_paths = (
+            ".agents/skills/code-cleanup-after-changes/SKILL.md",
+            ".agents/skills/platform-code-change-verification/SKILL.md",
+        )
+        app_path = "platform/apps/platform_api/app/main.py"
+
+        for companions in ((skill_paths[0],), (skill_paths[1],), skill_paths):
+            with self.subTest(companions=companions):
+                manifest = classify(
+                    [app_path, *companions],
+                    event="push",
+                    target_sha=self.TARGET_SHA,
+                    branch="dev",
+                )
+                self.assertEqual(manifest["class"], "full")
+                self.assertEqual(manifest["expected_gates"], list(FULL_GATE_IDS))
+                self.assertFalse(manifest["fallback"])
+                self.assertFalse(manifest["runtime_sensitive"])
+                self.assertTrue(manifest["deployable"])
+                validate_manifest(
+                    manifest,
+                    expected_target_sha=self.TARGET_SHA,
+                    require_deployable=True,
+                )
+
+        skill_only = classify(
+            list(skill_paths),
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(skill_only["class"], "out-of-scope")
+        self.assertEqual(skill_only["expected_gates"], list(OUT_OF_SCOPE_GATE_IDS))
+        self.assertFalse(skill_only["fallback"])
+        self.assertFalse(skill_only["deployable"])
+
+        docs_only = classify(
+            ["platform/docs/deployment-runbook.md"],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(docs_only["class"], "docs-only")
+        self.assertEqual(docs_only["expected_gates"], list(DOCS_ONLY_GATE_IDS))
+        self.assertFalse(docs_only["fallback"])
+        self.assertFalse(docs_only["deployable"])
+
+        for companion_paths in (
+            skill_paths,
+            (skill_paths[0],),
+        ):
+            docs_with_skills = classify(
+                ["platform/docs/deployment-runbook.md", *companion_paths],
+                event="push",
+                target_sha=self.TARGET_SHA,
+                branch="dev",
+            )
+            self.assertEqual(docs_with_skills["class"], "full")
+            self.assertEqual(docs_with_skills["expected_gates"], list(FULL_GATE_IDS))
+            self.assertTrue(docs_with_skills["fallback"])
+            self.assertFalse(docs_with_skills["deployable"])
+
+        non_app_platform = classify(
+            ["platform/tools/platform_verify.py", *skill_paths],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(non_app_platform["class"], "full")
+        self.assertTrue(non_app_platform["fallback"])
+        self.assertFalse(non_app_platform["deployable"])
+
+        unknown_agent = classify(
+            [app_path, *skill_paths, ".agents/skills/unreviewed/SKILL.md"],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(unknown_agent["class"], "full")
+        self.assertEqual(unknown_agent["expected_gates"], list(FULL_GATE_IDS))
+        self.assertTrue(unknown_agent["fallback"])
+        self.assertFalse(unknown_agent["deployable"])
+
+        unknown_root = classify(
+            [app_path, *skill_paths, "unknown-root-config.toml"],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(unknown_root["class"], "full")
+        self.assertTrue(unknown_root["fallback"])
+        self.assertFalse(unknown_root["deployable"])
+
+        for event, branch in (
+            ("pull_request", "feature/skill-maintenance"),
+            ("push", "feature/skill-maintenance"),
+            ("workflow_dispatch", "dev"),
+        ):
+            with self.subTest(event=event, branch=branch):
+                manifest = classify(
+                    [app_path, *skill_paths],
+                    event=event,
+                    target_sha=self.TARGET_SHA,
+                    branch=branch,
+                )
+                self.assertEqual(manifest["class"], "full")
+                self.assertEqual(manifest["expected_gates"], list(FULL_GATE_IDS))
+                self.assertFalse(manifest["fallback"])
+                self.assertFalse(manifest["deployable"])
+                validate_manifest(manifest, expected_target_sha=self.TARGET_SHA)
+
     def test_out_of_scope_change_is_contract_only_and_never_deployable(self) -> None:
         manifest = classify(
             ["oldsparky_app/services/legacy.py", "README.md"],

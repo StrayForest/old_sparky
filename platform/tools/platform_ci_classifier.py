@@ -145,6 +145,12 @@ OUT_OF_SCOPE_PREFIXES = (
 )
 FULL_PREFIXES = (".github/", "platform/")
 DOCS_PREFIX = "platform/docs/"
+FULL_ROUTE_SKILL_COMPANION_FILES = frozenset(
+    {
+        ".agents/skills/code-cleanup-after-changes/SKILL.md",
+        ".agents/skills/platform-code-change-verification/SKILL.md",
+    }
+)
 
 # Trusted build-only companion packages receive the complete deterministic CI
 # suite without turning a successful ``dev`` push into a production release.
@@ -439,6 +445,28 @@ def route_files_without_root_guide(files: Sequence[str]) -> list[str]:
     return list(files)
 
 
+def route_files_with_app_skill_companions(files: Sequence[str]) -> list[str]:
+    """Ignore the two reviewed skill companions only beside an app source route."""
+
+    route_files = route_files_without_root_guide(files)
+    companions = [
+        path for path in route_files if path in FULL_ROUTE_SKILL_COMPANION_FILES
+    ]
+    if not companions:
+        return route_files
+
+    remaining = [
+        path for path in route_files if path not in FULL_ROUTE_SKILL_COMPANION_FILES
+    ]
+    if not any(path.startswith("platform/apps/") for path in remaining):
+        return route_files
+
+    route_class, _, _, fallback = _route_for_files(remaining)
+    if route_class != "full" or fallback:
+        return route_files
+    return remaining
+
+
 def _is_candidate_packaging_only(files: Sequence[str]) -> bool:
     """Return whether a path set is limited to candidate packaging/CI docs."""
 
@@ -673,7 +701,7 @@ def classify(
     # candidate-packaging, storage or docs route into an ordinary deployable
     # full route. Unknown paths in the remaining set still take the usual
     # fail-closed fallback.
-    route_files = route_files_without_root_guide(normalised)
+    route_files = route_files_with_app_skill_companions(normalised)
     route_class, expected_gates, reason, fallback = _route_for_files(route_files)
     runtime_sensitive = runtime_sensitive or fallback
     candidate_packaging_only = _is_candidate_packaging_only(route_files)

@@ -1,6 +1,6 @@
 # Platform simplification and performance audit — 2026-11-13
 
-- Status: Candidate reviewed; full exact-SHA CI and production release pending
+- Status: Application candidate CI passed; exact final-source route correction CI and production release pending
 - Owner: Platform maintainers
 - Scope: Production platform, frontend SSR/client boundary, public tournament catalog, and CI/release/backup controls
 
@@ -18,9 +18,14 @@ Database Alembic head is `20261112_0055`; the source-bound backup and
 maintenance receipts confirm restore/Alembic verification across 37 tables.
 The read-only readiness collector itself does not query Alembic state.
 
-The candidate is based on source `6bd19b64d8b4711e49da8c98ef3ce2c9727d74c6`.
-It changes no schema, runtime dependencies or host-tools pin. For the single
-authorized app deployment, preserve current `cb1a751...` as the initial
+The application candidate was reviewed from source
+`6bd19b64d8b4711e49da8c98ef3ce2c9727d74c6` and merged as
+`02a3da635ce2df26567f83df8de245d2deb428eb`. Its original exact-SHA PR CI
+passed. A narrow classifier correction is in review so the two exact
+project-change skills can accompany `platform/apps/` source without triggering
+unknown-path fallback; the final source still requires full exact-SHA CI and
+release authorization. It changes no schema, runtime dependencies or
+host-tools pin. For the single app deployment, preserve current `cb1a...` as the initial
 rollback release; require the usual exact-source restore-verified backup.
 Rollback switches application releases and does not downgrade Alembic.
 
@@ -43,9 +48,28 @@ were candidates for removal.
 | Serialize the public tournament catalog DTO list directly with one module-level Pydantic adapter | Accepted | Keeps the declared `TournamentCardResponse` schema, public DTO fields, pagination/cache headers and cold/warm body. The ASGI regression checks a fixed nested-media payload, key order, nulls, UTC timestamp, status, headers, cache parity, DB call count, OpenAPI schema and omission of private worker error detail. |
 | Move the bounded internal-read scheduler behind a server-only tournament workspace wrapper | Accepted | Detail and bracket SSR callers retain the 24-active/128-pending/5-second FIFO guard, cancellation, and typed 503 behavior. Browser callers keep the shared API function without importing the scheduler. Web-hermetic asserts scheduler markers are absent from built browser JavaScript and fails on missing build output. |
 | Route project change/cleanup skills through the canonical verification registry | Accepted | Replaces raw `unittest discover`/npm/Alembic substitution instructions with the impact planner and complete owner gates. Exact-SHA CI, production backup, AUTO/child and recovery rules remain mandatory. |
+| Recognize the two reviewed project change/cleanup skill files as companions to application source in the CI classifier | Accepted | The exception removes only those exact paths from classification when the remaining route is already full, non-fallback and contains `platform/apps/` source. It retains all full gates and event-based deployment authority; skill-only and docs-only plus skills remain non-deployable, and other `.agents/` paths retain fail-closed fallback. Focused regression cases cover these boundaries. |
 | Remove the optional Node auth transport and simplify its pinned host-tools/deploy boundary | Rejected for this release | The latest SSR C32 A/B evidence reports no pairwise performance gain. The selector also crosses the release-independent host-tools pin, service environment rendering, workflows, tests and operations guidance; removing only the app side would break a coherent rollback. See the [performance matrix](../../performance/README.md) and [host-tools pin](../../tools/platform_host_tools_pin.py). |
 | Consolidate or further parallelize CI contours, or remove/relax backup, host-tools, release-provenance, recovery or retention gates | Rejected | Independent owner gates already run concurrently. The longest measured spans are test execution, and preserving serial ownership inside each contour avoids changing test isolation and evidence boundaries. Exact-source no-op routing already skips app artifact build/deploy for non-runtime changes. No measured evidence supports additional restructuring or weakening gates. |
 | Migrate production to Docker | Deferred | The accepted [systemd versus Docker ADR](../adr/systemd-vs-docker.md) identifies no measured launch blocker and requires a separate migration/rollback decision. |
+
+### Delivery of the merged application source
+
+The classifier correction is intentionally a non-deployable
+candidate-packaging increment: it carries no app source by itself. On a trusted
+`dev` push, AUTO recognizes that exact closed route and dispatches the automatic
+`baseline-reconcile` child. Candidate-packaging routes retain the normal
+source-bound restore-verified backup. The child authenticates the active
+production baseline and reclassifies the complete baseline-to-target range;
+the merged application paths make that cumulative route a deployable full
+route, rather than a packaging no-op. It then follows the normal production
+child path, including the source-bound backup, exact-SHA build and release
+guards; any additional baseline runtime proof required by the cumulative
+manifest must pass. The
+existing regression `test_candidate_packaging_reconcile_source_is_closed_and_cumulative`
+checks both branches: pure packaging is a no-op, while packaging plus an app
+path is a deployable cumulative route. Docs-only and recovery-only no-backup
+rules do not apply to this candidate-packaging path.
 
 The frontend audit also found no justified dependency removal, no duplicate
 eager detail/bracket fetch, and no need to change nonce CSP, authentication,
@@ -84,9 +108,9 @@ dependency installation; no safe CI speedup was selected.
   interpreter with isolated loopback-only dummy service URLs; no live database
   or Redis access.
 - Candidate `git diff --check`: passed.
-- Full exact-SHA Security and the web-hermetic/browser guard: pending.
+- Original application candidate PR exact-SHA Security CI (run `43382587717`): passed, including web-hermetic/browser guard and full backend contours. The narrow classifier correction and final full-range exact-SHA CI: pending.
 - Production combined deploy, post-deploy checks and final `CURRENT.md` update:
-  pending; no candidate production mutation has occurred.
+  pending; no candidate production mutation has occurred. The merged app source is not deployed until the exact final-source classifier result is non-fallback and deployable and the normal backup/AUTO/child chain completes.
 
 Official primary references used for the implementation and boundary review:
 [FastAPI response-model filtering](https://fastapi.tiangolo.com/tutorial/response-model/),

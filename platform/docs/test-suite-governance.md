@@ -237,8 +237,9 @@ trusted-push authority. The exact candidate allowlist is owned by the
 | known `docs-only` | `docs`, `verification-contract` | `false` | never deployable; auto-deploy is a successful no-op |
 | exact production host-tools provisioning ADR and recovery-bootstrap-only family, excluding the active LiveQA guard and runtime builder | all first eight gates | `false` | non-deployable baseline reconcile; AUTO skips backup only for its closed no-op-only route and the child must prove cumulative no-op before build; active payload/runtime-builder fixes use the runtime-sensitive ordinary full route so a reviewed `dev` push builds and installs them |
 | known `out-of-scope` | `verification-contract` | `false` | never deployable; auto-deploy is a successful no-op |
-| known full candidate-packaging-only path set (candidate workflow/helper, contract test/catalog/verification updates and platform docs) | all first eight gates | `false` | never deployable; trusted pushes are successful CI-only no-ops |
+| known full candidate-packaging-only path set (candidate workflow/helper, contract test/catalog/verification updates and platform docs) | all first eight gates | `false` | the incremental manifest never grants deploy authority. AUTO sends a trusted push through authenticated baseline reconciliation with the source-bound backup; it is a no-op only when the full active-baseline-to-target range is itself the closed candidate-packaging family. A cumulative deployable app route follows the ordinary release path. |
 | exact storage-operations family (diagnostics/maintenance workflow or exact storage-retention skill, plus only its closed classifier/AUTO/recovery-workflow/tests/catalog set and docs) | all first eight gates plus runtime-sensitive gates | `false` | full verification, non-deployable; AUTO takes no-deploy; producer uploads an attested skip receipt; publisher checks exact producer/parent CI evidence and performs no host-bundle or marker action |
+| either exact project change/cleanup skill file co-changed with a `platform/apps/` source path | all first eight gates | `false` | the mixed route follows normal full-route authorization; only a non-fallback push to current `dev` can be deployable. The two exact skill paths are recognized only with application source; skills-only changes remain out-of-scope/non-deployable, docs or workflow paths alone do not enable this route, and other `.agents/` paths remain fail-closed fallback |
 | known `full` application/runtime/migration/release path (including `platform/tools/platform_workflow_remote_dispatch.py`, invoked by external-load from the active app) | all first eight gates | `false` | deployable only for a non-fallback push to current `dev`; dispatcher changes are runtime-sensitive |
 | unknown or malformed full fallback | all first eight gates | `true` | never deployable; fail-closed verification only |
 
@@ -250,9 +251,12 @@ release artifact builder `platform/tools/platform_build_live_qa_runtime.py`
 are excluded from that family because their changes must reach a new immutable
 app release; their runtime-sensitive full routes require the exact runtime
 gates.
-Candidate-packaging-only changes remain non-deployable; a mixed application
-change follows its app path and may deploy on a trusted push. Host-only
-pin/bundle/bootstrap remain no-op.
+Candidate-packaging-only incremental changes remain non-deployable by
+themselves. AUTO authenticates the cumulative active-baseline-to-target route:
+a closed packaging-only range is a no-op, while a deployable full app range
+continues through backup and the ordinary release path. A mixed application
+change is classified on its app path and may deploy on a trusted push.
+Host-only pin/bundle/bootstrap remain no-op.
 `platform/contracts/host_tools_pin.json` is the
 single bounded pin contract: application-only changes keep the reviewed
 `HOST_TOOLS_SHA`, while a host-control closure edit must update the pin and its
@@ -332,7 +336,7 @@ Each consumer applies its policy to the authenticated, digest-bound manifest:
 | --- | --- | --- |
 | Trusted PR candidate workflow | Authenticated no-candidate completion; no candidate artifacts | Strict full verification and existing candidate eligibility checks |
 | Push auto-deploy | Docs-only uses authenticated baseline reconciliation with no app writes; out-of-scope completes no-deploy/no-backup | Preserve route policy: candidate uses source-bound baseline reconciliation and backup but grants no app-release authority; recovery uses baseline reconciliation, storage skips deployment/backup, ordinary eligible full push may deploy |
-| Recovery bootstrap producer/publisher | Docs, out-of-scope, storage and candidate-packaging each produce their distinct authenticated skip receipt; no recovery bundle | Ordinary eligible full and recovery-bootstrap routes retain bundle validation; candidate-packaging is CI-only and grants no recovery authority |
+| Recovery bootstrap producer/publisher | Docs, out-of-scope, storage and candidate-packaging each produce their distinct authenticated skip receipt; no recovery bundle | Ordinary eligible full and recovery-bootstrap routes retain bundle validation; a candidate-packaging skip receipt grants no recovery authority, and AUTO separately authenticates the cumulative route before any app release |
 
 Consumers bind route family, source, run/attempt and digest; malformed, failed or mismatched evidence fails closed. A missing/null nested artifact attempt is omitted only after exact name, run ID and head binding; a non-null value must match, and the source attempt is independently checked. `test_platform_ci_classifier` owns classifier/AUTO selection; `test_platform_host_tools_bundle` owns candidate handling; `test_platform_release_build_contract` and `test_platform_workflow_provenance` own auto-deploy/provenance; `test_platform_recovery_bootstrap` owns bundle validation. The [classifier](../tools/platform_ci_classifier.py) and workflows own implementation. The retained-load abort's source-job exception is also owned by `test_platform_workflow_provenance`: only an exact digest-valid, deployable, non-fallback, runtime-insensitive full `push` route may skip `Trusted dev immutable release runtime`; `Conditional release runtime fixture` and every other source gate must succeed, with no route or job rewriting.
 
