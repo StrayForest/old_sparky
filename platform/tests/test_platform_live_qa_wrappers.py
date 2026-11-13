@@ -4872,6 +4872,167 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             live_user_browser=False,
         )
 
+    def test_only_exact_full_public_suite_uses_the_longer_capture_cap(self) -> None:
+        source_sha = "a" * 40
+        provider_sha = "b" * 40
+        runner_sha = "d" * 40
+        suffix = "a1b2c3d4"
+        suite_root = f"/var/lib/oldsparky-liveqa/runtime-suite-{source_sha}-{suffix}"
+        engine_root = f"/var/lib/oldsparky-liveqa/runtime-engine-{provider_sha}-{suffix}"
+        gate = "/run/oldsparky-liveqa/public-live-qa.abcdefgh"
+        command = [
+            "/usr/bin/systemd-run", "--no-ask-password", "--quiet", "--wait",
+            "--collect", "--pipe", "--service-type=exec", "--expand-environment=no",
+            "--unit=oldsparky-liveqa-browser.service", "--uid=1001", "--gid=1001",
+            f"--working-directory={suite_root}/web", "--property=KillMode=control-group",
+            "--property=Restart=no", "--property=RuntimeMaxSec=30min",
+            "--property=SendSIGKILL=yes", "--property=TimeoutStopSec=5s",
+            "--property=UMask=0077",
+            f"--property=BindReadOnlyPaths={suite_root}:{suite_root}",
+            f"--property=BindReadOnlyPaths={engine_root}:{engine_root}",
+            "--", "/usr/bin/env", "-i",
+            "CHROME_DEVEL_SANDBOX="
+            f"{engine_root}/{platform_live_qa_guard.CHROMIUM_SANDBOX_RELATIVE.as_posix()}",
+            f"HOME={gate}/home", "LANG=C.UTF-8",
+            f"NODE_PATH={engine_root}/web/node_modules",
+            f"PATH={engine_root}/node/bin:/usr/bin:/bin",
+            "PLATFORM_LIVE_EXPECTED_ORIGIN=https://old-sparky.com",
+            "PLATFORM_LIVE_USER_QA_UID=1001", f"PLATFORM_QA_BROWSER_GATE_DIR={gate}",
+            f"PLATFORM_LIVE_QA_RUNNER_SHA={runner_sha}",
+            f"PLATFORM_LIVE_QA_TARGET_SHA={source_sha}",
+            f"PLATFORM_LIVE_QA_MARKER_SHA256={'c' * 64}",
+            f"PLAYWRIGHT_BROWSERS_PATH={engine_root}/browsers",
+            "PLAYWRIGHT_LIVE_BASE_URL=https://old-sparky.com",
+            f"TMPDIR={gate}/tmp", f"XDG_CACHE_HOME={gate}/home/.cache",
+            f"{engine_root}/node/bin/node",
+            f"{engine_root}/web/node_modules/@playwright/test/cli.js", "test",
+            f"--config={suite_root}/web/playwright.live.config.ts",
+            f"{suite_root}/web/tests/smoke/live-launch.spec.ts",
+        ]
+        def is_public_browser(candidate: list[str]) -> bool:
+            with patch.object(
+                platform_live_qa_guard,
+                "liveqa_identity",
+                return_value=(1001, 1001),
+            ):
+                return platform_live_qa_guard._is_fixed_public_live_browser_command(candidate)
+
+        self.assertTrue(platform_live_qa_guard._is_fixed_live_browser_command(command))
+        self.assertTrue(is_public_browser(command))
+
+        project_subset = [*command, "--project=live-desktop"]
+        self.assertTrue(platform_live_qa_guard._is_fixed_live_browser_command(project_subset))
+        self.assertFalse(
+            is_public_browser(project_subset)
+        )
+        malformed_public = [*command, "--update-snapshots"]
+        self.assertFalse(platform_live_qa_guard._is_fixed_live_browser_command(malformed_public))
+
+        separator = command.index("--")
+        fixed_prefix = command[:separator]
+        invalid_prefixes = (
+            [*fixed_prefix, "--uid=0"],
+            [*fixed_prefix, "--gid=0"],
+            [*fixed_prefix, f"--working-directory={engine_root}/web"],
+            [*fixed_prefix, "--property=Restart=no"],
+            [*fixed_prefix, "--property=BindReadOnlyPaths=/run:/run"],
+        )
+        for invalid_prefix in invalid_prefixes:
+            malformed = [*invalid_prefix, *command[separator:]]
+            self.assertTrue(platform_live_qa_guard._is_fixed_live_browser_command(malformed))
+            self.assertFalse(is_public_browser(malformed))
+
+        wrong_suite_binding = [
+            item.replace(
+                f"PLATFORM_LIVE_QA_TARGET_SHA={source_sha}",
+                f"PLATFORM_LIVE_QA_TARGET_SHA={'e' * 40}",
+            )
+            for item in command
+        ]
+        self.assertTrue(platform_live_qa_guard._is_fixed_live_browser_command(wrong_suite_binding))
+        self.assertFalse(is_public_browser(wrong_suite_binding))
+
+        wrong_suite_sha = "e" * 40
+        wrong_suite_root = f"/var/lib/oldsparky-liveqa/runtime-suite-{wrong_suite_sha}-{suffix}"
+        wrong_suite_identity = [
+            item.replace(suite_root, wrong_suite_root) for item in command
+        ]
+        self.assertTrue(platform_live_qa_guard._is_fixed_live_browser_command(wrong_suite_identity))
+        self.assertFalse(
+            is_public_browser(wrong_suite_identity)
+        )
+
+        duplicate_environment = list(command)
+        node_position = duplicate_environment.index(f"{engine_root}/node/bin/node")
+        duplicate_environment.insert(node_position, duplicate_environment[separator + 3])
+        self.assertTrue(
+            platform_live_qa_guard._is_fixed_live_browser_command(duplicate_environment)
+        )
+        self.assertFalse(
+            is_public_browser(duplicate_environment)
+        )
+
+        node_position = command.index(f"{engine_root}/node/bin/node")
+        engine_preflight = [
+            *command[:node_position + 1],
+            f"{suite_root}/web/tests/support/live-engine-preflight.cjs",
+        ]
+        self.assertTrue(platform_live_qa_guard._is_fixed_live_browser_command(engine_preflight))
+        self.assertFalse(
+            is_public_browser(engine_preflight)
+        )
+
+        replaced_uid = [
+            item.replace("--uid=1001", "--uid=1002").replace(
+                "PLATFORM_LIVE_USER_QA_UID=1001", "PLATFORM_LIVE_USER_QA_UID=1002"
+            )
+            for item in command
+        ]
+        self.assertTrue(platform_live_qa_guard._is_fixed_live_browser_command(replaced_uid))
+        self.assertFalse(is_public_browser(replaced_uid))
+        replaced_gid = [item.replace("--gid=1001", "--gid=1002") for item in command]
+        self.assertTrue(platform_live_qa_guard._is_fixed_live_browser_command(replaced_gid))
+        self.assertFalse(is_public_browser(replaced_gid))
+
+        with patch.object(
+            platform_live_qa_guard,
+            "liveqa_identity",
+            side_effect=platform_live_qa_guard.GuardError("identity unavailable"),
+        ):
+            self.assertFalse(
+                platform_live_qa_guard._is_fixed_public_live_browser_command(command)
+            )
+
+        marker = (
+            "LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=none stdout_bytes=1 "
+            "stderr_bytes=0 truncated=false child_exit=0\n"
+        )
+
+        def selected_timeout(candidate: list[str]) -> float:
+            with (
+                patch.object(platform_live_qa_guard.os, "geteuid", return_value=0),
+                patch.object(
+                    platform_live_qa_guard,
+                    "liveqa_identity",
+                    return_value=(1001, 1001),
+                ),
+                patch.object(
+                    platform_live_qa_guard,
+                    "_capture_qa_child",
+                    return_value=(0, marker),
+                ) as capture,
+                redirect_stdout(StringIO()),
+            ):
+                result = platform_live_qa_guard.main(
+                    ["capture-qa-browser-child", "--", *candidate]
+                )
+            self.assertEqual(result, 0)
+            return capture.call_args.kwargs["timeout_seconds"]
+
+        self.assertEqual(selected_timeout(command), 1500.0)
+        self.assertEqual(selected_timeout(project_subset), 300.0)
+        self.assertEqual(selected_timeout(engine_preflight), 300.0)
+
     def test_deploy_marker_capture_keeps_bounded_timeout_cleanup(self) -> None:
         expected = ("deploy", "gha-123456-2-aaaaaaaaaaaa", "a" * 40)
         child_code = (
