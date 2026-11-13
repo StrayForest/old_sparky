@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -25,6 +26,13 @@ SECURITY_WORKFLOW = REPO_ROOT / ".github/workflows/platform-security.yml"
 CI_INSTALLER = PLATFORM_ROOT / "tools/platform_install_ci_python.sh"
 CI_LOCK_GENERATOR = PLATFORM_ROOT / "tools/platform_generate_ci_lock.sh"
 CI_ENV_WRAPPER = PLATFORM_ROOT / "tools/platform_ci_pip_env.sh"
+LOCK_UPDATE_SPEC = importlib.util.spec_from_file_location(
+    "platform_ci_lock_update", PLATFORM_ROOT / "tests/support/platform_ci_lock_update.py"
+)
+if LOCK_UPDATE_SPEC is None or LOCK_UPDATE_SPEC.loader is None:
+    raise RuntimeError("focused CI lock update contract helper is unavailable")
+platform_ci_lock_update = importlib.util.module_from_spec(LOCK_UPDATE_SPEC)
+LOCK_UPDATE_SPEC.loader.exec_module(platform_ci_lock_update)
 LOCK_LINE = re.compile(
     r"^(?P<name>[A-Za-z0-9_.-]+)=="
     r"(?P<version>[A-Za-z0-9][A-Za-z0-9_.+!-]*)"
@@ -67,6 +75,85 @@ def _ci_lock_pins(path: Path = CI_LOCK) -> dict[str, str]:
 
 
 class PlatformPipPinContractTests(unittest.TestCase):
+    def test_focused_ci_lock_update_preserves_every_other_pin(self) -> None:
+        original_lines = [
+            "alpha==1.0 --hash=sha256:" + "1" * 64,
+            "dnspython==2.9.0 --hash=sha256:" + "2" * 64,
+            "zeta==3.0 --hash=sha256:" + "3" * 64,
+        ]
+        with tempfile.TemporaryDirectory(prefix="ci-lock-focused-update-") as temp_dir:
+            root = Path(temp_dir)
+            original = root / "current.lock"
+            constraints = root / "constraints.txt"
+            candidate = root / "candidate.lock"
+            original.write_text("\n".join(original_lines) + "\n", encoding="utf-8")
+
+            canonical_spec = platform_ci_lock_update.prepare(
+                "DnSpython==2.9.2", original, constraints
+            )
+            self.assertEqual(canonical_spec, "dnspython==2.9.2")
+            self.assertEqual(
+                constraints.read_text(encoding="utf-8"),
+                f"{original_lines[0]}\n{original_lines[2]}\n",
+            )
+
+            candidate.write_text(
+                "\n".join(
+                    [
+                        original_lines[0],
+                        "dnspython==2.9.2 --hash=sha256:" + "4" * 64,
+                        original_lines[2],
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            platform_ci_lock_update.verify(canonical_spec, original, candidate)
+
+            candidate.write_text(
+                "\n".join(
+                    [
+                        "alpha==1.0 --hash=sha256:" + "5" * 64,
+                        "dnspython==2.9.2 --hash=sha256:" + "4" * 64,
+                        original_lines[2],
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                platform_ci_lock_update.LockUpdateError,
+                "non-target package pin",
+            ):
+                platform_ci_lock_update.verify(canonical_spec, original, candidate)
+
+            with self.assertRaisesRegex(
+                platform_ci_lock_update.LockUpdateError,
+                "not present",
+            ):
+                platform_ci_lock_update.prepare(
+                    "missing-package==1.0", original, constraints
+                )
+
+    def test_focused_ci_lock_update_rejects_malformed_or_stale_target(self) -> None:
+        original = CI_LOCK
+        with tempfile.TemporaryDirectory(prefix="ci-lock-focused-invalid-") as temp_dir:
+            constraints = Path(temp_dir) / "constraints.txt"
+            for spec in ("dnspython", "dnspython==", "dnspython==2.9.0 extra==1"):
+                with self.subTest(spec=spec), self.assertRaisesRegex(
+                    platform_ci_lock_update.LockUpdateError,
+                    "one exact NAME==VERSION",
+                ):
+                    platform_ci_lock_update.prepare(spec, original, constraints)
+            with self.assertRaisesRegex(
+                platform_ci_lock_update.LockUpdateError,
+                "already has the requested version",
+            ):
+                current_version = _ci_lock_pins()["dnspython"]
+                platform_ci_lock_update.prepare(
+                    f"dnspython=={current_version}", original, constraints
+                )
+
     def test_ci_lock_covers_runtime_quality_and_bootstrap_inputs(self) -> None:
         runtime = _direct_pins(PLATFORM_ROOT / "requirements-platform.txt")
         quality = _direct_pins(PLATFORM_ROOT / "requirements-quality.txt")
@@ -100,6 +187,8 @@ class PlatformPipPinContractTests(unittest.TestCase):
         self.assertIn("requirements-ci-locker.lock.txt", generator)
         self.assertIn("requirements-ci.lock.meta.json", generator)
         self.assertIn("--update", generator)
+        self.assertIn("--upgrade-package", generator)
+        self.assertIn("target-constraints.txt", generator)
         self.assertIn("--constraint", generator)
         self.assertIn("--isolated", generator)
         self.assertNotIn("PLATFORM_PIP_COMPILE", generator)
@@ -107,6 +196,10 @@ class PlatformPipPinContractTests(unittest.TestCase):
         self.assertEqual(metadata["toolchain_lock_file"], "requirements-ci-locker.lock.txt")
         self.assertEqual(metadata["toolchain"]["pip-tools"], "7.6.1")
         self.assertEqual(metadata["freshness_policy"]["default"], "reuse-existing-locked-versions")
+        self.assertEqual(
+            metadata["freshness_policy"]["targeted_update"],
+            "explicit --upgrade-package NAME==VERSION; preserve every other locked pin",
+        )
         self.assertEqual(
             [item["path"] for item in metadata["input_files"]],
             [

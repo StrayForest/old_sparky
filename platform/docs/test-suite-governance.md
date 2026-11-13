@@ -458,12 +458,12 @@ runtime, test/quality and security package, including exact hashed `pip`,
 
 The generator's separate
 [`requirements-ci-locker.lock.txt`](../requirements-ci-locker.lock.txt)
-pins pip-tools and its own transitive bootstrap set. Default generation is a
-byte-stable freshness check constrained by the current CI lock; only explicit
-`tools/platform_generate_ci_lock.sh --update` may resolve newer versions.
-[`requirements-ci.lock.meta.json`](../requirements-ci.lock.meta.json) records
-the nested input closure, target, toolchain versions and SHA-256 digests, so
-new `-r` includes cannot bypass the contract.
+pins pip-tools and its own transitive bootstrap set. Default generation stays
+byte-stable under current-lock constraints. Full `--update` may refresh every
+pin; focused `--upgrade-package NAME==VERSION` changes only that pin and fails
+closed otherwise. [`requirements-ci.lock.meta.json`](../requirements-ci.lock.meta.json)
+records the nested input closure, target, toolchain versions and digests; new
+`-r` includes cannot bypass it.
 
 The lock is currently scoped to Python 3.12 on Linux x86_64 because the
 platform and quality pins include native wheels. The generator and installer
@@ -478,7 +478,7 @@ The installer and generator sanitize ambient pip configuration through
 [`tools/platform_ci_pip_env.sh`](../tools/platform_ci_pip_env.sh), use only
 the canonical PyPI index, and never forward extra indexes, trusted hosts,
 find-links, certificate paths or proxy variables.
-The dependency audit covers runtime, quality and security tool dependencies in the complete CI lock; setup-python caches follow their lock, and local bootstrap stays separate from hash-locked CI.
+The `security` gate runs `pip-audit` from the hash-locked CI environment against both `requirements-ci.lock.txt` and the separate release/runtime `requirements-platform.lock.txt`. This keeps the audit tool pinned while checking every locked deployment dependency; setup-python caches follow the CI lock, and local bootstrap stays separate from hash-locked CI.
 `backend-static`, `backend-integration`, `release-runtime` and `release-runtime-real` use `ubuntu-latest`; `backend-privileged` and `verification-contract` remain on
 `ubuntu-24.04`. Keep jobs current and adapt fixtures/tooling to their contract. The privileged builder validates
 setup-python 3.12 source/ABI, copies to private root-owned storage, then restores prefix mode 0700 after `cp -a`.

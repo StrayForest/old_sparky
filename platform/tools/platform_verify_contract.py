@@ -1365,6 +1365,9 @@ def _ci_dependency_issues(security_text: str) -> list[str]:
         if metadata.get("freshness_policy") != {
             "default": "reuse-existing-locked-versions",
             "update": "explicit --update required for newer resolution",
+            "targeted_update": (
+                "explicit --upgrade-package NAME==VERSION; preserve every other locked pin"
+            ),
         }:
             issues.append("CI lock metadata freshness policy is missing or changed")
 
@@ -1397,6 +1400,8 @@ def _ci_dependency_issues(security_text: str) -> list[str]:
             "--isolated",
             "--constraint",
             "--update",
+            "--upgrade-package",
+            "tests/support/platform_ci_lock_update.py",
             "platform_ci_pip_env.sh",
         ):
             if marker not in generator_text:

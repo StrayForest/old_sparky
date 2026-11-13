@@ -143,10 +143,12 @@ The generator bootstraps its exact hash-locked pip-tools environment from
 [`requirements-ci-locker.lock.txt`](../requirements-ci-locker.lock.txt), so it
 does not depend on an ambient `pip-compile`. Its default mode is a freshness
 check that reuses all existing locked versions and must remain byte-stable.
-Only an explicit `--update` may resolve newer transitive versions; review the
-resulting diff and rerun the security audit before accepting it. The metadata
-file records the complete nested input closure, lock digests and toolchain
-versions.
+An explicit `--update` resolves the complete dependency graph. For a reviewed
+single-package refresh, `--upgrade-package NAME==VERSION` constrains every
+other existing lock entry and fails if any unrelated pin or package changes.
+Review the generated lock and rerun the security audit before accepting either
+update. The metadata file records the complete nested input closure, lock
+digests and toolchain versions.
 
 To verify the current CI lock, run the generator on the same Python 3.12 Linux
 x86_64 contract:
@@ -164,6 +166,13 @@ git diff -- \
   requirements-ci.in requirements-platform.txt requirements-quality.txt \
   requirements-ci-locker.lock.txt requirements-ci.lock.txt \
   requirements-ci.lock.meta.json
+```
+
+To refresh only one package while preserving every other locked pin, use the
+exact package and version explicitly:
+
+```bash
+tools/platform_generate_ci_lock.sh --upgrade-package dnspython==2.9.2
 ```
 
 Review the nested runtime and quality inputs together with the locked

@@ -1318,6 +1318,10 @@ def _dispatch_deterministic(gate_id: str, arguments: Sequence[str]) -> int:
                 [_python(), "-m", "pip_audit", "-r", "requirements-ci.lock.txt"],
             ),
             (
+                "security/dependency-audit-runtime",
+                [_python(), "-m", "pip_audit", "-r", "requirements-platform.lock.txt"],
+            ),
+            (
                 "security/bandit",
                 [
                     _python(),

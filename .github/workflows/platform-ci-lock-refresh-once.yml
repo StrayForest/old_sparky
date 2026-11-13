@@ -45,7 +45,7 @@ jobs:
       - name: Bind this one-time generator run to its exact source commit
         shell: bash
         env:
-          EXPECTED_BASE_SHA: 49159742282e332860a4ba0d00c7d793f37af485
+          EXPECTED_BASE_SHA: 7b791208772e5ae8ad0cf433ff92239ef2e1140e
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
@@ -61,12 +61,12 @@ jobs:
         working-directory: platform
         env:
           PLATFORM_CI_PYTHON: python
-        run: tools/platform_generate_ci_lock.sh --update
+        run: tools/platform_generate_ci_lock.sh --upgrade-package dnspython==2.9.2
 
       - name: Validate the generated lock scope and bind its contents
         shell: bash
         env:
-          EXPECTED_BASE_SHA: 49159742282e332860a4ba0d00c7d793f37af485
+          EXPECTED_BASE_SHA: 7b791208772e5ae8ad0cf433ff92239ef2e1140e
         run: |
           set -euo pipefail
           /usr/bin/python3 -I -B - "$RUNNER_TEMP/platform-ci-lock-refresh-receipt.json" <<'PY'

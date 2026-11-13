@@ -19,7 +19,7 @@ click-didyoumean==0.3.1 --hash=sha256:5c4bb6007cfea5f2fd6583a2fb6701a22a41eb9895
 click-plugins==1.1.1.2 --hash=sha256:008d65743833ffc1f5417bf0e78e8d2c23aab04d9745ba817bd3e71b0feb6aa6
 click-repl==0.3.0 --hash=sha256:fb7e06deb8da8de86180a33a9da97ac316751c094c6899382da7feeeeb51b812
 click==8.3.3 --hash=sha256:a2bf429bb3033c89fa4936ffb35d5cb471e3719e1f3c8a7c3fff0b8314305613
-dnspython==2.8.0 --hash=sha256:01d9bbc4a2d76bf0db7c1f729812ded6d912bd318d3b1cf81d30c0f845dbf3af
+dnspython==2.9.2 --hash=sha256:af15f7d385a6ae2fb35a796fde2138004c8c42c7389090e2addc83e3b3340fd8
 email-validator==2.3.0 --hash=sha256:80f13f623413e6b197ae73bb10bf4eb0908faf509ad8362c5edeb0be7fd450b4
 fastapi==0.137.2 --hash=sha256:791d36261e916a98b25ac85ee591bc3db159394070f6d3d096d94fb378f60ce2
 greenlet==3.4.0 --hash=sha256:a1c4f6b453006efb8310affb2d132832e9bbb4fc01ce6df6b70d810d38f1f6dc
