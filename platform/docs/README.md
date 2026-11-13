@@ -32,6 +32,7 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | Failed maintenance service evidence and guarded reset | [Encrypted maintenance evidence transport ADR](adr/maintenance-failure-evidence-encryption.md), [maintenance failure capture and reset ADR](adr/maintenance-failure-capture-and-reset.md) and [deployment runbook](deployment-runbook.md#immutable-recovery-bootstrap) |
 | Report-only failed-deployment recovery | [Recovery bootstrap ADR](adr/recovery-bootstrap-retained-abort.md#operator-recovery-deployment-for-a-report-only-invalid-marker) and [deployment runbook](deployment-runbook.md#manual-workflow-fallback) |
 | Test-suite ownership and CI/live runners | [Test-suite governance](test-suite-governance.md) |
+| Automated authentication lifecycle coverage | [Auth lifecycle E2E](auth-lifecycle-e2e.md) |
 | CSP rollout / production browser and live-user QA | [CSP and live QA runbook](csp-live-qa-runbook.md) |
 | Cleanup of an expired exact LiveQA bundle roster | [Stale LiveQA bundle recovery](liveqa-stale-bundle-recovery.md) |
 | Missing immutable LiveQA engine provider | [Provider recovery runbook](liveqa-provider-recovery.md) |

@@ -2468,6 +2468,7 @@ def collect_issues() -> list[str]:
             else set()
         )
         expected_ignored_specs = {
+            "auth-lifecycle-e2e.spec.ts",
             "frontend-audit-regressions.spec.ts",
             "live-launch.spec.ts",
             "live-user-journey.spec.ts",

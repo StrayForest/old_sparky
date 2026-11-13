@@ -170,8 +170,10 @@ test("auth lifecycle uses the real API, local mail capture, and strict verificat
   browser,
   page
 }) => {
-  let extraContext: BrowserContext | null = null;
-  let resetContext: BrowserContext | null = null;
+  const contexts: { extra: BrowserContext | null; reset: BrowserContext | null } = {
+    extra: null,
+    reset: null
+  };
   let cleanupResult: CleanupResult | null = null;
   try {
     await test.step("01-registration-verification-code", async () => {
@@ -213,16 +215,16 @@ test("auth lifecycle uses the real API, local mail capture, and strict verificat
       await page.context().clearCookies();
       await loginThroughUi(page, REGISTRATION_PASSWORD);
 
-      extraContext = await browser.newContext({ baseURL: WEB_ORIGIN });
-      const secondPage = await extraContext.newPage();
+      contexts.extra = await browser.newContext({ baseURL: WEB_ORIGIN });
+      const secondPage = await contexts.extra.newPage();
       await installWidgetStub(secondPage);
       await loginThroughUi(secondPage, REGISTRATION_PASSWORD);
-      await expectSessionStatus(extraContext, 200);
+      await expectSessionStatus(contexts.extra, 200);
     });
 
     await test.step("03-password-reset-and-session-invalidation", async () => {
-      resetContext = await browser.newContext({ baseURL: WEB_ORIGIN });
-      const resetPage = await resetContext.newPage();
+      contexts.reset = await browser.newContext({ baseURL: WEB_ORIGIN });
+      const resetPage = await contexts.reset.newPage();
       await installWidgetStub(resetPage);
       await resetPage.goto("/reset-password");
       const resetRequestForm = resetPage.locator("form#password-reset-request-form");
@@ -259,11 +261,13 @@ test("auth lifecycle uses the real API, local mail capture, and strict verificat
       await expect(resetPage).toHaveURL(/\/profile(?:\/me)?(?:\?|$)/u);
       await expectSessionStatus(resetPage.context(), 200);
       await expectSessionStatus(page.context(), 401);
-      await expectSessionStatus(extraContext!, 401);
+      if (!contexts.extra) throw new Error("Auth E2E second login context is unavailable.");
+      await expectSessionStatus(contexts.extra, 401);
     });
 
     await test.step("04-change-password-and-relogin", async () => {
-      const resetPage = resetContext!.pages()[0];
+      if (!contexts.reset) throw new Error("Auth E2E reset context is unavailable.");
+      const resetPage = contexts.reset.pages()[0];
       await resetPage.goto("/profile/me?tab=account");
       const accountPasswordForm = resetPage.locator("form#account-password-change-form");
       await accountPasswordForm.locator('input[name="current_password"]').fill(RESET_PASSWORD);
@@ -311,8 +315,8 @@ test("auth lifecycle uses the real API, local mail capture, and strict verificat
         // The job's disposable database is destroyed on every exit path.
       }
     }
-    await extraContext?.close();
-    await resetContext?.close();
+    await contexts.extra?.close();
+    await contexts.reset?.close();
   }
 });
 

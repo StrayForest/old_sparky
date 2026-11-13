@@ -349,7 +349,6 @@ async def serve() -> None:
     from apps.platform_api.app.main import create_app
     from apps.platform_api.app.services import auth_mail
     from python_packages.platform_infra.db import session_factory
-    from python_packages.platform_infra.db import dispose_engine
     from python_packages.platform_infra.models import (
         AuditLog,
         EmailVerificationToken,

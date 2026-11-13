@@ -93,32 +93,8 @@ but are workflow-only.
 
 The security workflow runs credential-free `host-tools-pin-preflight` before applicable test jobs. It resolves the exact-SHA pin against full history; downstream jobs require its success, and status finalization fails closed on a skipped prerequisite. The resolver result is not an input to the backup-verifier artifact.
 
-The `web-hermetic` workflow runs `npm run test:auth-lifecycle-e2e` against the
-real FastAPI routes, a migrated disposable PostgreSQL service, and isolated
-Redis databases before the separate public-browser and participant contours.
-The suite exercises registration, generated-email verification, login,
-password reset, password change, session invalidation, and exact fixture
-cleanup. A loopback SMTP sink captures the application's generated messages;
-a test-only HTTPX transport supplies Siteverify responses to the unchanged
-strict Turnstile verifier. The fixture covers provider rejection and hostname,
-action, and missing-action failures. It does not contact Resend or Cloudflare,
-and it does not certify production Cloudflare scoring or challenge behavior.
-
-The auth contour is CI-only: its preflight requires the exact test environment,
-loopback service endpoints and empty disposable database/Redis state before
-starting clients. It does not flush shared resources. Dedicated Playwright
-configuration excludes the spec from generic smoke/live discovery, disables
-retries and captures no trace, video, screenshot, HTML report, or upload. On
-failure, its closed reporter emits only the fixed test/stage identifier,
-source anchor, numeric source line and bounded category; it never prints
-Playwright error text or values. API
-and Next child processes receive separate explicit environment allowlists; a
-contract verifies parent-only secret sentinels are absent from both. Cleanup
-checks that the exact fixture user, sessions, tokens, and audit rows are gone.
-Post-deploy production public QA and authenticated UserQA remain source-bound
-release contours; UserQA performs the provisioned fixture cleanup and absence
-proof after public QA succeeds. Human Chrome/Turnstile execution is an optional
-diagnostic and is not evidence supplied by the isolated auth fixture.
+The hosted auth lifecycle E2E implementation, isolation contract and limits
+are documented in [Auth lifecycle E2E](auth-lifecycle-e2e.md).
 
 ## Backend catalog and contours
 
