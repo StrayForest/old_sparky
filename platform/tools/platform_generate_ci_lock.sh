@@ -4,9 +4,9 @@ set -euo pipefail
 # Generate the CI lock from a hash-locked, ephemeral pip-tools toolchain.
 #
 # The default mode is a freshness check: existing package versions are passed
-# as constraints and any byte change fails closed.  ``--update`` is the only
-# mode allowed to resolve newer transitive versions; its diff must be reviewed
-# and audited before it is accepted.
+# as constraints and any byte change fails closed. ``--update`` may resolve the
+# complete graph; ``--upgrade-package NAME==VERSION`` refreshes one existing
+# pin and rejects any changes to the remaining lock entries.
 
 export LC_ALL=C
 
@@ -20,6 +20,8 @@ EXPECTED_PIP_TOOLS_VERSION="7.6.1"
 CANONICAL_PYPI_INDEX="https://pypi.org/simple"
 CLEAN_ENV_TOOL="$PLATFORM_ROOT/tools/platform_ci_pip_env.sh"
 MODE="${1:-}"
+UPDATE_PACKAGE_SPEC="${2:-}"
+TARGETED_UPDATE=false
 
 fail() {
   echo "CI dependency lock generation blocked: $*" >&2
@@ -27,9 +29,20 @@ fail() {
 }
 
 case "$MODE" in
-  "") UPDATE_MODE=false ;;
-  --update) UPDATE_MODE=true ;;
-  *) fail "unsupported argument $MODE (use --update only for a reviewed refresh)" ;;
+  "")
+    [[ "$#" -eq 0 ]] || fail "default freshness mode accepts no arguments"
+    UPDATE_MODE=false
+    ;;
+  --update)
+    [[ "$#" -eq 1 ]] || fail "--update accepts no package arguments"
+    UPDATE_MODE=true
+    ;;
+  --upgrade-package)
+    [[ "$#" -eq 2 ]] || fail "--upgrade-package requires one exact NAME==VERSION"
+    UPDATE_MODE=true
+    TARGETED_UPDATE=true
+    ;;
+  *) fail "unsupported argument $MODE (use --update or --upgrade-package NAME==VERSION)" ;;
 esac
 
 [[ -f "$INPUT_FILE" && ! -L "$INPUT_FILE" ]] || fail "input file is missing or a symlink"
@@ -90,6 +103,14 @@ TEMP_DIR="$(mktemp -d /tmp/platform-ci-lock.XXXXXX)"
 trap 'rm -rf -- "$TEMP_DIR"' EXIT
 mkdir -m 0700 "$TEMP_DIR/wheelhouse"
 
+if [[ "$TARGETED_UPDATE" == true ]]; then
+  validate_lock "$OUTPUT_FILE"
+  UPDATE_PACKAGE_SPEC="$($PYTHON_BIN -I -B \
+    "$PLATFORM_ROOT/tests/support/platform_ci_lock_update.py" prepare \
+    "$UPDATE_PACKAGE_SPEC" "$OUTPUT_FILE" "$TEMP_DIR/target-constraints.txt")" \
+    || fail "focused package update target or current lock is invalid"
+fi
+
 "$PYTHON_BIN" -m venv "$TEMP_DIR/tool-venv"
 TOOL_PYTHON="$TEMP_DIR/tool-venv/bin/python"
 PIP_COMPILE_BIN="$TEMP_DIR/tool-venv/bin/pip-compile"
@@ -121,10 +142,10 @@ tool_version="$("$CLEAN_ENV_TOOL" "$PIP_COMPILE_BIN" --version)"
   --index-url "$CANONICAL_PYPI_INDEX" \
   --dest "$TEMP_DIR/wheelhouse" \
   --requirement "$INPUT_FILE"
-if [[ "$UPDATE_MODE" == false ]]; then
+if [[ "$UPDATE_MODE" == false || "$TARGETED_UPDATE" == true ]]; then
   # Download the existing artifacts as well as direct inputs.  This prevents a
-  # newer PyPI candidate from making default freeze mode drift merely because
-  # the old wheel is no longer the resolver's first candidate.
+  # newer PyPI candidate from making freshness or focused mode drift merely
+  # because the old wheel is no longer the resolver's first candidate.
   "$CLEAN_ENV_TOOL" "$TOOL_PYTHON" -m pip download \
     --isolated \
     --disable-pip-version-check \
@@ -135,6 +156,17 @@ if [[ "$UPDATE_MODE" == false ]]; then
     --dest "$TEMP_DIR/wheelhouse" \
     --require-hashes \
     --requirement "$OUTPUT_FILE"
+fi
+if [[ "$TARGETED_UPDATE" == true ]]; then
+  "$CLEAN_ENV_TOOL" "$TOOL_PYTHON" -m pip download \
+    --isolated \
+    --disable-pip-version-check \
+    --no-cache-dir \
+    --no-deps \
+    --only-binary=:all: \
+    --index-url "$CANONICAL_PYPI_INDEX" \
+    --dest "$TEMP_DIR/wheelhouse" \
+    "$UPDATE_PACKAGE_SPEC"
 fi
 
 compile_args=(
@@ -151,6 +183,11 @@ compile_args=(
 )
 if [[ "$UPDATE_MODE" == false ]]; then
   compile_args+=(--constraint "$OUTPUT_FILE")
+elif [[ "$TARGETED_UPDATE" == true ]]; then
+  compile_args+=(
+    --constraint "$TEMP_DIR/target-constraints.txt"
+    --upgrade-package "$UPDATE_PACKAGE_SPEC"
+  )
 fi
 "$CLEAN_ENV_TOOL" "$PIP_COMPILE_BIN" "${compile_args[@]}" "$INPUT_FILE"
 
@@ -177,6 +214,13 @@ awk '
 ' "$TEMP_DIR/compiled.txt" | sort > "$TEMP_DIR/lock.txt" \
   || fail "pip-compile produced an unparseable lock"
 validate_lock "$TEMP_DIR/lock.txt"
+
+if [[ "$TARGETED_UPDATE" == true ]]; then
+  "$PYTHON_BIN" -I -B \
+    "$PLATFORM_ROOT/tests/support/platform_ci_lock_update.py" verify \
+    "$UPDATE_PACKAGE_SPEC" "$OUTPUT_FILE" "$TEMP_DIR/lock.txt" \
+    || fail "focused package update changed a non-target lock pin"
+fi
 
 if [[ "$UPDATE_MODE" == false ]]; then
   cmp -s "$TEMP_DIR/lock.txt" "$OUTPUT_FILE" || fail \
@@ -255,6 +299,9 @@ payload = {
     "freshness_policy": {
         "default": "reuse-existing-locked-versions",
         "update": "explicit --update required for newer resolution",
+        "targeted_update": (
+            "explicit --upgrade-package NAME==VERSION; preserve every other locked pin"
+        ),
     },
 }
 metadata_file.write_text(

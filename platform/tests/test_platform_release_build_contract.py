@@ -9456,7 +9456,7 @@ cleanup
         policy = (REPO_ROOT / "platform/deploy/python-venv-policy.json").read_text()
         self.assertEqual(
             json.loads(policy),
-            {"schema": 1, "transition": "require_proven_reuse"},
+            {"schema": 1, "transition": "require_fresh_venv"},
         )
 
         # Exercise the production parser and reuse guard in isolation. The

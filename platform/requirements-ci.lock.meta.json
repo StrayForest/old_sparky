@@ -1,6 +1,7 @@
 {
   "freshness_policy": {
     "default": "reuse-existing-locked-versions",
+    "targeted_update": "explicit --upgrade-package NAME==VERSION; preserve every other locked pin",
     "update": "explicit --update required for newer resolution"
   },
   "index_url": "https://pypi.org/simple",
@@ -19,7 +20,7 @@
     }
   ],
   "lock_file": "requirements-ci.lock.txt",
-  "lock_sha256": "4fb21615650f65a748b4bceed97c9fb22d3b15ec1773af4f46c3722ff6f12843",
+  "lock_sha256": "5fa912b9cf7131c37fa44ba3b8ef5510d37d4c4c113606d037cff7a110accaca",
   "schema": 1,
   "target": {
     "architecture": "x86_64",
