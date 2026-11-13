@@ -141,6 +141,7 @@ class WorkflowProvenanceTests(unittest.TestCase):
         attempt_state: str,
         latest_attempt: int = 1,
         timeout_probe: bool = False,
+        job_rows: list[dict[str, str]] | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], list[str], str]:
         workflow = yaml.safe_load(STATUS_FINALIZER_WORKFLOW.read_text(encoding="utf-8"))
         shell = workflow["jobs"]["finalize-status"]["steps"][0]["run"]
@@ -227,8 +228,17 @@ class WorkflowProvenanceTests(unittest.TestCase):
             runner_temp.mkdir()
             output_path = root / "github-output"
             output_path.touch()
-            required_jobs = [
+            required_success_jobs = [
+                "CI route classifier",
                 "Authenticate internal baseline runtime proof",
+                "Exact-source host-tools pin preflight",
+                "Conditional release runtime fixture",
+                "Trusted dev immutable release runtime",
+                "status-start",
+                "status-final",
+                "Dispatch exact baseline proof finalizer",
+            ]
+            required_skipped_jobs = [
                 "Backend DB-free contours",
                 "Backend PostgreSQL and Redis integration",
                 "Backend privileged ephemeral contour",
@@ -240,21 +250,21 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 "Documentation consistency",
                 "Migration scenarios",
                 "Verification contract",
-                "Conditional release runtime fixture",
-                "Trusted dev immutable release runtime",
-                "status-start",
-                "status-final",
-                "Dispatch exact baseline proof finalizer",
             ]
+            if job_rows is None:
+                job_rows = [
+                    {"name": name, "status": "completed", "conclusion": "success"}
+                    for name in required_success_jobs
+                ] + [
+                    {"name": name, "status": "completed", "conclusion": "skipped"}
+                    for name in required_skipped_jobs
+                ]
             jobs_path = root / "jobs.json"
             jobs_path.write_text(
                 json.dumps(
                     {
-                        "total_count": len(required_jobs),
-                        "jobs": [
-                            {"name": name, "status": "completed", "conclusion": "success"}
-                            for name in required_jobs
-                        ],
+                        "total_count": len(job_rows),
+                        "jobs": job_rows,
                     }
                 ),
                 encoding="utf-8",
@@ -347,6 +357,64 @@ class WorkflowProvenanceTests(unittest.TestCase):
         self.assertIn(f"target_sha={self.SHA}", output)
         self.assertIn("publish=true", output)
         self.assertIn("https://github.com/StrayForest/old_sparky/actions/runs/12345/attempts/1", output)
+
+        required_success_jobs = {
+            "CI route classifier",
+            "Authenticate internal baseline runtime proof",
+            "Exact-source host-tools pin preflight",
+            "Conditional release runtime fixture",
+            "Trusted dev immutable release runtime",
+            "status-start",
+            "status-final",
+            "Dispatch exact baseline proof finalizer",
+        }
+        valid_rows = [
+            {"name": name, "status": "completed", "conclusion": "success"}
+            for name in sorted(required_success_jobs)
+        ] + [
+            {"name": name, "status": "completed", "conclusion": "skipped"}
+            for name in (
+                "Backend DB-free contours",
+                "Backend PostgreSQL and Redis integration",
+                "Backend privileged ephemeral contour",
+                "Backend aggregate",
+                "Python quality",
+                "Security gates",
+                "web-quality",
+                "Web hermetic",
+                "Documentation consistency",
+                "Migration scenarios",
+                "Verification contract",
+            )
+        ]
+        invalid_rows = {
+            "proof-job-missing": [row for row in valid_rows if row["name"] != "Trusted dev immutable release runtime"],
+            "proof-job-duplicate": [*valid_rows, dict(next(row for row in valid_rows if row["name"] == "status-final"))],
+            "classifier-job-missing": [row for row in valid_rows if row["name"] != "CI route classifier"],
+            "classifier-job-duplicate": [*valid_rows, dict(next(row for row in valid_rows if row["name"] == "CI route classifier"))],
+            "classifier-job-unsuccessful": [
+                {**row, "conclusion": "failure"} if row["name"] == "CI route classifier" else row
+                for row in valid_rows
+            ],
+            "proof-job-unsuccessful": [
+                {**row, "conclusion": "skipped"} if row["name"] == "Conditional release runtime fixture" else row
+                for row in valid_rows
+            ],
+            "skipped-gate-missing": [row for row in valid_rows if row["name"] != "Backend DB-free contours"],
+            "skipped-gate-duplicate": [*valid_rows, dict(next(row for row in valid_rows if row["name"] == "Security gates"))],
+            "skipped-gate-unexpected-success": [
+                {**row, "conclusion": "success"} if row["name"] == "Backend PostgreSQL and Redis integration" else row
+                for row in valid_rows
+            ],
+        }
+        for case, rows in invalid_rows.items():
+            with self.subTest(case=case):
+                rejected, _, _ = self._run_finalizer_dispatch_wait(
+                    attempt_state="pending-then-success",
+                    job_rows=rows,
+                )
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertIn("internal baseline", rejected.stderr)
 
         failed, failure_requests, _ = self._run_finalizer_dispatch_wait(
             attempt_state="failed",
