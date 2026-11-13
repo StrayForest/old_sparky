@@ -1,29 +1,85 @@
 # Platform simplification and performance audit — 2026-11-13
 
-- Status: One cumulative application deployment completed; public browser QA and roster cleanup remain open
+- Status: Corrected release and automated QA closed; manual auth remains open
 - Owner: Platform maintainers
 - Scope: Production platform, frontend SSR/client boundary, public tournament catalog, and CI/release/backup controls
 
 ## Verified production and rollback baseline
 
-Production now runs application and installed LiveQA payload source
-`126d4114542369af9d999e219563fa1d53b09568`; its previous app is the initial
-rollback source `cb1a75114aac0f4fb0ee6cc407011f90c6e76f31`. Host-tools pin C3
-is `625bbaa11023ffaf059dfa03a34a4850b02d4f93`. The single app deployment
-followed exact-SHA Security `43401840198`, source-bound restore-verified backup
-`43404066694`, AUTO `43403887168`, and automatic production child `43404454746`.
-Post-deploy readiness and health passed with an operations receipt/checkpoint;
-this is not a public browser QA pass.
-Deployment preflight compared Alembic `current` with `heads` at
-`20261112_0055`; no downgrade occurred. The application change did not alter
-schema, dependencies, or the host-tools pin. The standard application rollback
-pointer remains the initial `cb1a...` release.
+Production runs application source
+`9a3d203c8b8d3bb09226e010e559516657d21034` in release
+`gha-43426930984-1-9a3d203c8b8d`; the exact previous application source is
+the initial rollback target `cb1a75114aac0f4fb0ee6cc407011f90c6e76f31` in
+release `gha-43367073524-1-cb1a75114aac`. The earlier candidate
+`126d4114542369af9d999e219563fa1d53b09568` was rolled back to that initial
+source before the corrected release. The corrected deployment preserves
+`cb1a...` as `previous`.
 
-The initial bounded readiness result preceded activation and is not the final
-deployment evidence. The post-deploy operations receipt/checkpoint is the
-source for the successful health result. A null source-binding digest is
-expected where the runner and app source SHAs are equal; it is not a failed
-binding.
+Host-tools C4 source `64cae2a4c8235df1ba5c044446cd2f497f4abdca` is active,
+verified installed and self-tested; C3
+`625bbaa11023ffaf059dfa03a34a4850b02d4f93` remains retained. C3 and C4
+preserve the same 15 helper files and capability set, with 17 total bundle
+files. The only C4 host-tools contract changes are dispatcher timeout from 300
+to 2,400 seconds and the derived capability hash. The application guard permits
+1,500 seconds only for the strict canonical public command.
+
+PR 360 source `9a3d203c8b8d3bb09226e010e559516657d21034` passed exact-SHA
+Security `43422580427/1`, post-provision preflight `43426001349/1`,
+source-bound restore-verified backup `43426481223/1`, AUTO `43424193707`, and
+automatic production child `43426930984/1`; the child succeeded. Required
+post-deploy strict preflight, origin/SNI checks, public smokes and fresh
+readiness passed. The readiness receipt confirms current source `9a3d...`,
+previous `cb1a...`, selected C4 and retained C3. Runtime schema is unchanged.
+The root-only source-bound readiness receipt is
+`/root/.codex/checkpoints/oldsparky-live-readiness-postdeploy-M-mrVZsWAR/readiness.json`.
+
+After the strict age threshold, the old 13-account roster was recovered through
+the active M immutable payload under both canonical locks. Exact cleanup and
+absence proof passed; the root-only receipt is
+`/root/.oldsparky/reports/liveqa-recover-bundle.2PxPsM/`.
+
+Exact-source public workflow `43439319991` completed all three jobs
+successfully. Its sanitized artifact records 57 logical cases and attempts:
+47 passed and 10 skipped, with zero failures, timeouts, flaky, interrupted or
+expected-failure cases, and zero retries. Process and child exit codes were 0.
+The root-only artifact is
+`/root/.codex/checkpoints/oldsparky-liveqa-candidate-public-20261113/sanitized/live-launch-sanitized.json`
+with SHA-256
+`cca1531730ea9ac523d8ca345a9ac54bdf73cdd4afce4d778e8c65d9762aaa0`.
+
+After fresh canonical provisioning, exact-source public workflow `43449584614`
+also passed: 57 logical cases and attempts, 47 passed and 10 skipped, with zero
+failures, timeouts, flaky, interrupted or expected-failure cases, zero retries,
+and process/child exit 0.
+
+The first automated UserQA workflow `43440684487` failed with browser child
+exit 1 and remains uncredited; its journey cause is unknown. Report publication
+was blocked by an unrelated Nov 11 root-owned diagnostics directory. A
+reviewer-approved helper (`0501cdc1c7db6b7a77652ef2936dfb169f3f5f0ebbea6c0aad9f08ff02eaa7cb`)
+preserved it outside retention under canonical locks. The preservation receipt
+is `/root/.oldsparky/private-preservation/liveqa-diagnostic-store-preserved-20261113T144953Z-e22f5d205332/completion.json`.
+It confirms the source slot is absent and the preserved destination inode and
+two child metadata identities remain unchanged; no file contents were read or
+deleted. This repaired the report-store precondition but does not explain the
+browser failure; the app source and pin did not change.
+
+Fresh exact-source UserQA `43450827101` passed complete coverage: one journey,
+one attempt, zero skips, failures, flaky, timeouts, interruptions or expected
+failures, child exit 0. The sanitized report is
+`/root/.codex/checkpoints/oldsparky-liveqa-candidate-public-20261113/userqa-retry-sanitized/live-user-qa-report.json`.
+The wrapper completed exact cleanup and absence proof before state removal.
+Final guard checks under both locks found zero automated/manual recovery
+states, public gates, QA processes or diagnostic entries. The sanitized
+absence proof is
+`/root/.codex/checkpoints/oldsparky-liveqa-candidate-public-20261113/post-userqa-cleanup/absence-proof.txt`;
+the final readiness receipt is
+`/root/.codex/checkpoints/oldsparky-liveqa-candidate-public-20261113/post-userqa-cleanup/readiness.json`.
+It reports ready with current M, previous `cb1a`, C4 active/C3 retained,
+API/web 200, locks free, no pending jobs and consistency passed. Human Chrome
+authentication and Turnstile QA remain deferred for the user. Before manual
+QA, reconcile the fixed production checkout to the exact active source while
+preserving retained local work, then require the owner runbook's
+checkout-provenance guard to pass.
 
 ## Audit decisions
 
@@ -39,6 +95,13 @@ database/cache, profile/admin, tournament form/client, and Draft surfaces was
 for finding behavior-preserving opportunities; it does not mean those controls
 were candidates for removal.
 
+The frontend audit found no justified dependency removal, duplicate eager
+detail/bracket fetch, or reason to change nonce CSP, authentication, CSRF,
+session, cache, component, Draft, or production routing boundaries. The DTO
+serializer is the only measured application performance improvement here;
+SSR and end-to-end production latency were not byte- or time-quantified by this
+audit.
+
 | Candidate | Decision | Evidence and safeguards |
 | --- | --- | --- |
 | Serialize the public tournament catalog DTO list directly with one module-level Pydantic adapter | Accepted | Keeps the declared `TournamentCardResponse` schema, public DTO fields, pagination/cache headers and cold/warm body. The ASGI regression checks a fixed nested-media payload, key order, nulls, UTC timestamp, status, headers, cache parity, DB call count, OpenAPI schema and omission of private worker error detail. |
@@ -50,22 +113,6 @@ were candidates for removal.
 | Remove the optional Node auth transport and simplify its pinned host-tools/deploy boundary | Rejected for this release | The latest SSR C32 A/B evidence reports no pairwise performance gain. The selector also crosses the release-independent host-tools pin, service environment rendering, workflows, tests and operations guidance; removing only the app side would break a coherent rollback. See the [performance matrix](../../performance/README.md) and [host-tools pin](../../tools/platform_host_tools_pin.py). |
 | Consolidate or further parallelize CI contours, or remove/relax backup, host-tools, release-provenance, recovery or retention gates | Rejected | Independent owner gates already run concurrently. The longest measured spans are test execution, and preserving serial ownership inside each contour avoids changing test isolation and evidence boundaries. Exact-source no-op routing already skips app artifact build/deploy for non-runtime changes. No measured evidence supports additional restructuring or weakening gates. |
 | Migrate the single-VPS application services from systemd to Docker Compose | Deferred | The accepted [systemd versus Docker ADR](../adr/systemd-vs-docker.md) identifies no measured launch blocker and requires a separate migration/rollback decision. A rough 10–20 engineer-day estimate covers only application services on the existing VPS; it excludes PostgreSQL, Redis, and Kubernetes migration and is not measured effort or AI wall-clock time. No account-specific usage metrics were available, so this audit makes no AI quota or percentage claim; see the public [pricing documentation](https://learn.chatgpt.com/docs/pricing). |
-
-### Delivery of the reviewed application changes
-
-The cumulative application source `126d4114542369af9d999e219563fa1d53b09568`
-was activated in the one production app deployment recorded above. The final
-classifier route carried the application source through normal exact-SHA
-Security, source-bound backup, AUTO and child deployment. The previous app
-remains the initial `cb1a...` rollback release. No schema, dependency, or
-host-tools pin change was included.
-
-The frontend audit found no justified dependency removal, duplicate eager
-detail/bracket fetch, or reason to change nonce CSP, authentication, CSRF,
-session, cache, component, Draft, or production routing boundaries. The DTO
-serializer is the only measured application performance improvement here;
-SSR and end-to-end production latency were not byte- or time-quantified by this
-audit.
 
 ## Measured results and limits
 
@@ -99,28 +146,12 @@ dependency installation; no safe CI speedup was selected.
 - Focused backend API/cache suites: 14 passed under the immutable production
   interpreter with isolated loopback-only dummy service URLs; no live database
   or Redis access.
-- Exact-SHA Security `43401840198`, restore-verified source-bound backup
-  `43404066694`, AUTO `43403887168`, and production child `43404454746`
-  completed; post-deploy readiness and health passed per the operations
-  receipt/checkpoint. This receipt does not certify public browser QA.
-- Public launch runs `43405943415` and `43408704800` timed out with exit 124
-  and produced no case counts. Both exact orphan gates were recovered through
-  the trusted path; the recovery preserved the bundle and 13 generated roster
-  entries. A supported direct public run against the same deployed source
-  lasted about 300.2 seconds at
-  the systemd-unit level; its terminal output was lost, so it has no pass or
-  failure credit. The unit, gate, and runtime mount aliases are gone. Automated
-  user QA has not started; human Chrome authentication and Turnstile QA remain
-  for the user.
-- The 13 generated roster entries await canonical recovery-bundle cleanup. The
-  recorded bundle `created_at` is `2026-11-13T10:02:41Z`, so eligibility is
-  after `2026-11-13T14:02:41Z`. Fresh-bundle cleanup refused; no replacement
-  inventory was fabricated. The main manual account was not pre-created and
-  the control identity is excluded.
-- A separate public-QA timeout change is not part of the deployed source and
-  is not installed; the active host-tools pin remains C3. Future validation of
-  that change does not count as public QA for this deployed source. No
-  deployment result for the timeout change is claimed here.
+- Historical public launches `43405943415` and `43408704800` timed out with
+  exit 124 and no case counts; both exact orphan gates were recovered through
+  the trusted path. A later supported public run lasted about 300.2 seconds at
+  the systemd-unit level, but its terminal output was lost. These earlier runs
+  receive no pass or failure credit; they do not supersede the exact-source
+  public result recorded above.
 
 Official primary references used for the implementation and boundary review:
 [FastAPI response-model filtering](https://fastapi.tiangolo.com/tutorial/response-model/),
