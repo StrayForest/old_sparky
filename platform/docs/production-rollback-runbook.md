@@ -110,14 +110,14 @@ checks. The expected CSP mode must match the active release.
 
 ```bash
 cd /opt/oldsparky/platform/current
-run_private origin-smoke /opt/oldsparky/platform/shared/venv/bin/python \
+run_private origin-smoke /opt/oldsparky/platform/shared/venv/bin/python -B \
   tools/platform_deploy_smoke.py \
   --edge-origin https://127.0.0.1 \
   --edge-host old-sparky.com \
   --edge-insecure-loopback \
   --expected-csp-mode enforce || exit 1
 
-run_private public-smoke /opt/oldsparky/platform/shared/venv/bin/python \
+run_private public-smoke /opt/oldsparky/platform/shared/venv/bin/python -B \
   tools/platform_deploy_smoke.py \
   --edge-origin https://old-sparky.com \
   --expected-csp-mode enforce || exit 1

@@ -3434,6 +3434,12 @@ except lock.VerificationLockError as exc:
         self.assertEqual(ALLOWED_ACTION_OWNERS, frozenset({"actions"}))
         self.assertEqual(action_pin_issues(), [])
         self.assertEqual(workflow_level_permission_issues(), [])
+        actionlint_config = (
+            Path(__file__).resolve().parents[2] / ".github/actionlint.yaml"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(actionlint_config.count("ignore:"), 3)
+        exact_queue_pattern = 'unexpected key "queue" for "concurrency" section\\. expected one of "cancel-in-progress", "group"'
+        self.assertEqual(actionlint_config.count(exact_queue_pattern), 3)
         autodeploy = (
             Path(__file__).resolve().parents[2]
             / ".github/workflows/platform-production-autodeploy.yml"

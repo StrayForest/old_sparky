@@ -58,10 +58,14 @@ belong in the linked owner documents below.
   previous `cb1a`, C4 active/C3 retained, API/web 200, locks free, no pending
   jobs, and consistency passed. The root-only receipt is
   `/root/.codex/checkpoints/oldsparky-liveqa-candidate-public-20261113/post-userqa-cleanup/readiness.json`.
-- Automated public and UserQA gates are closed. Human Chrome authentication
-  and Turnstile QA remain deferred for the user. The manual helper remains
-  blocked until the fixed production checkout is reconciled to the active
-  source with retained work preserved and its provenance guard passes.
+- Automated public and UserQA gates are closed for the recorded release.
+  Human Chrome authentication and Turnstile QA were deferred; they are
+  optional diagnostics and do not prove production Cloudflare scoring when
+  simulated. A separate isolated auth lifecycle CI gate is being implemented
+  and has not yet earned hosted-CI validation. This work does not retroactively
+  change the recorded release evidence. The manual helper still requires the
+  fixed production checkout to be reconciled to the active source with retained
+  work preserved and its provenance guard passed before use.
 - Historical timeout and uncredited-run detail is in the
   [closeout audit](archive/simplification-performance-audit-2026-11-13.md).
 - The 11-cell production matrix is complete, but cell 9 failed its stress
@@ -80,12 +84,14 @@ belong in the linked owner documents below.
 
 ## Open QA and cleanup gates
 
-- The user completes human Chrome authentication and production Turnstile QA
-  after the automated cleanup recorded above. Before that phase, reconcile the
-  fixed production checkout to the exact active source while preserving
-  retained local work, then require the owner runbook's checkout-provenance
-  guard to pass. The current checkout is not yet approved for the manual
-  helper; do not run `prepare` until the source check succeeds.
+- The isolated auth lifecycle suite is not yet a validated required gate;
+  complete its exact-source hosted-CI validation before relying on it for later
+  releases. Human Chrome authentication and real Turnstile QA remain optional
+  diagnostics. Before running the manual helper, reconcile the fixed production
+  checkout to the exact active source while preserving retained local work,
+  then require the owner runbook's checkout-provenance guard to pass. The
+  current checkout is not approved for the helper; do not run `prepare` until
+  the source check succeeds.
 - The completed external HTTP matrix is not whole-site functional coverage.
   Cell 9's attribution failure and cell 7's unresolved client/origin join are
   not closed by the separate SSR diagnostics. No cause or server capacity

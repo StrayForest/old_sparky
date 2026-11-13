@@ -318,11 +318,16 @@ lifecycle and it is not the browser grid/pixel test. Run the public browser
 gate separately after a reviewed deploy:
 
 ```bash
+gh api repos/StrayForest/old_sparky/commits/dev --jq .sha
+EXPECTED_TARGET_SHA='<copy the exact dev SHA printed above>'
 gh workflow run platform-live-launch.yml \
   --repo StrayForest/old_sparky --ref dev \
-  -f base_url=https://old-sparky.com -f provision=false
+  -f base_url=https://old-sparky.com -f provision=false \
+  -f expected_target_sha="$EXPECTED_TARGET_SHA"
 gh run watch <browser-run-id> --repo StrayForest/old_sparky --exit-status
 ```
+
+`expected_target_sha` binds the current `dev` runner commit; the launch workflow separately authenticates the active app source, which may differ during a docs-only/no-op state.
 
 For the full lifecycle at scale, use the QA/preprod owner route and an
 explicitly reviewed harness plan: 20 tournaments × 500 users (10,000 users),

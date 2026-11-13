@@ -26,6 +26,7 @@ if (productionLiveQa) {
 
 export default defineConfig({
   testDir: "./tests/smoke",
+  testIgnore: ["auth-lifecycle-e2e.spec.ts"],
   outputDir: secretBearingLiveQa && process.env.PLATFORM_QA_BROWSER_GATE_DIR
     ? path.join(process.env.PLATFORM_QA_BROWSER_GATE_DIR, "test-results")
     : "./test-results-live",

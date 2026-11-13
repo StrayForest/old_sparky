@@ -1053,8 +1053,38 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
     ):
         if expression not in production:
             issues.append(f"production deploy job must require {expression}")
-    if "continue-on-error" in production or (build and "continue-on-error" in build):
+    production_deploy_step = next(
+        (
+            step
+            for step in _workflow_step_blocks(production)
+            if re.search(
+                r"^      - name:\s*Run production preflight or deployment\s*$",
+                step,
+                re.MULTILINE,
+            )
+        ),
+        "",
+    )
+    if (
+        (build and "continue-on-error" in build)
+        or not production_deploy_step
+        or "continue-on-error" in production_deploy_step
+    ):
         issues.append("production candidate/build jobs must propagate failures")
+    optional_receipts = {
+        "Create exact actual-deployment mode receipt",
+        "Upload exact actual-deployment mode receipt",
+    }
+    for step in _workflow_step_blocks(production):
+        name_match = re.search(r"^      - name:\s*(.*?)\s*$", step, re.MULTILINE)
+        if name_match is None:
+            continue
+        name = name_match.group(1)
+        if name in optional_receipts:
+            if "continue-on-error: true" not in step:
+                issues.append(f"{name} must remain best-effort after a successful deploy")
+        elif "continue-on-error" in step:
+            issues.append(f"production step must propagate failure: {name}")
 
     exact_artifact_name = "platform-release-artifact-${{ github.run_id }}-${{ github.run_attempt }}"
     if exact_artifact_name not in production:
@@ -1854,6 +1884,24 @@ def actionlint_workflow_issues(security_text: str) -> list[str]:
     ):
         if marker not in wrapper_source:
             issues.append(f"actionlint wrapper must retain {description}")
+    actionlint_config_path = PLATFORM_ROOT.parent / ".github" / "actionlint.yaml"
+    try:
+        actionlint_config = actionlint_config_path.read_text(encoding="utf-8")
+    except OSError:
+        issues.append("actionlint must retain the narrow pinned-queue compatibility config")
+    else:
+        for filename in (
+            "platform-live-launch.yml",
+            "platform-live-user-qa.yml",
+            "platform-postdeploy-live-qa.yml",
+        ):
+            if f".github/workflows/{filename}:" not in actionlint_config:
+                issues.append(f"actionlint queue compatibility config is missing {filename}")
+        exact_queue_pattern = 'unexpected key "queue" for "concurrency" section\\. expected one of "cancel-in-progress", "group"'
+        if actionlint_config.count("ignore:") != 3:
+            issues.append("actionlint queue compatibility config must contain exactly three path-scoped ignores")
+        if actionlint_config.count(exact_queue_pattern) != 3:
+            issues.append("actionlint queue compatibility config must match only its exact diagnostic")
     return issues
 
 
@@ -2468,6 +2516,7 @@ def collect_issues() -> list[str]:
             else set()
         )
         expected_ignored_specs = {
+            "auth-lifecycle-e2e.spec.ts",
             "frontend-audit-regressions.spec.ts",
             "live-launch.spec.ts",
             "live-user-journey.spec.ts",

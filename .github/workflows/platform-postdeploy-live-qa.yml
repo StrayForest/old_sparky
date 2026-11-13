@@ -1,0 +1,108 @@
+name: Platform post-deploy live QA
+
+run-name: >-
+  Automatic post-deploy QA parent=${{ github.event.workflow_run.id }}.${{ github.event.workflow_run.run_attempt }} source=${{ github.event.workflow_run.head_sha }}
+
+on:
+  workflow_run:
+    workflows:
+      - Platform production deploy
+    types:
+      - completed
+    branches:
+      - dev
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-live-qa
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  sequence:
+    name: Validate deployment and run ordered live QA
+    if: >-
+      github.event.workflow_run.event == 'workflow_dispatch' &&
+      github.event.workflow_run.status == 'completed' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 125
+    permissions:
+      actions: write
+      contents: read
+      statuses: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PARENT_DEPLOY_RUN_ID: ${{ github.event.workflow_run.id }}
+      PARENT_DEPLOY_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+      PARENT_DEPLOY_SHA: ${{ github.event.workflow_run.head_sha }}
+      PARENT_DEPLOY_EVENT: ${{ github.event.workflow_run.event }}
+      PARENT_DEPLOY_BRANCH: ${{ github.event.workflow_run.head_branch }}
+      PARENT_DEPLOY_STATUS: ${{ github.event.workflow_run.status }}
+      PARENT_DEPLOY_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+    steps:
+      - name: Check out trusted default-branch sequencer
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Require the trusted dev default branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/dev
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Dispatch public production QA
+        id: dispatch_public
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 platform/tools/platform_live_qa_sequence.py dispatch-public
+      - name: Create exact public child receipt
+        shell: bash
+        env:
+          CHILD_RUN_ID: ${{ steps.dispatch_public.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 platform/tools/platform_live_qa_sequence.py write-receipt public
+      - name: Upload exact public child receipt
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-postdeploy-live-qa-child-public-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/child-receipt-public/child-dispatch-receipt.json
+          if-no-files-found: error
+          retention-days: 1
+      - name: Require exact public success and dispatch UserQA
+        id: dispatch_userqa
+        shell: bash
+        env:
+          PUBLIC_CHILD_RUN_ID: ${{ steps.dispatch_public.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 platform/tools/platform_live_qa_sequence.py finish-public
+      - name: Create exact UserQA child receipt
+        shell: bash
+        env:
+          CHILD_RUN_ID: ${{ steps.dispatch_userqa.outputs.run_id }}
+          PUBLIC_CHILD_RUN_ID: ${{ steps.dispatch_userqa.outputs.public_run_id }}
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 platform/tools/platform_live_qa_sequence.py write-receipt user-qa
+      - name: Upload exact UserQA child receipt
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-postdeploy-live-qa-child-user-qa-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/child-receipt-user-qa/child-dispatch-receipt.json
+          if-no-files-found: error
+          retention-days: 1
+      - name: Require exact UserQA and cleanup success
+        env:
+          USER_QA_CHILD_RUN_ID: ${{ steps.dispatch_userqa.outputs.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 platform/tools/platform_live_qa_sequence.py wait-userqa
