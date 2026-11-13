@@ -35,11 +35,14 @@ handoff.
 ## Verification
 
 - Run `rg` again for deleted symbols and removed routes.
-- Run the smallest relevant type/build/test check:
-  - web, from `platform/`: `tools/platform_run_quiet.sh "web build" -- tools/platform_web_npm.sh --prefix apps/platform_web run build`;
-  - backend, from `platform/`: `tools/platform_run_quiet.sh "platform tests" -- .venv_platform/bin/python -m unittest discover -s tests`;
-  - tools/skills/docs: `tools/platform_verify.py docs` from `platform/`, plus
-    the system skill creator validator for a newly created skill when available.
+- Use `platform/tools/platform_verify.py impact --changed-path <repo-relative-path>`
+  from `platform/` to select the affected owner gates, then run the complete
+  gates listed for the changed paths. Do not substitute raw `unittest`, npm,
+  Alembic or tool commands for a registry gate. Gate ownership and prerequisites
+  are defined in `platform/docs/test-suite-governance.md`.
+- For tools, skills and docs, run `docs`; also run
+  `verification-contract` when instruction or workflow policy changed. For a
+  newly created skill, run the system skill creator validator when available.
 - Treat TypeScript unused imports, failed imports, stale tests, and stale docs
   as cleanup failures, not as separate future work.
 

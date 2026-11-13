@@ -55,6 +55,7 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | Release-independent host-tools generations / trusted PR handoff | [Production host-tools provisioning ADR](adr/production-host-tools-provisioning.md) |
 | Trusted CI-handoff source/merge identity | [Closed source-versus-tested merge identity](adr/production-host-tools-provisioning.md#closed-source-versus-tested-merge-identity) |
 | Historical implementation context | [`archive/`](archive/) |
+| 2026-11-13 simplification and performance audit | [`archive/simplification-performance-audit-2026-11-13.md`](archive/simplification-performance-audit-2026-11-13.md) |
 | Accepted architectural decisions | [`adr/`](adr/) |
 | Private tournament bearer reads | [Private bearer read boundary](adr/private-tournament-bearer-read-boundary.md) |
 | Ready Check / bracket boundary | [Timing and bracket ADR](adr/ready-check-and-bracket-boundary.md) |

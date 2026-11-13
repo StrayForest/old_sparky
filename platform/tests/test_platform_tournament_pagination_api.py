@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 import unittest
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import httpx
+from fastapi import FastAPI
 from sqlalchemy.dialects import postgresql
 from starlette.responses import Response
 
@@ -18,11 +21,17 @@ from apps.platform_api.app.api.pagination import (
 )
 from apps.platform_api.app.api.routes.admin import admin_list_tournaments
 from apps.platform_api.app.api.routes.tournaments import (
+    get_lazy_db_session,
     list_my_tournaments,
     list_tournament_participants,
     list_tournaments,
+    router as tournament_router,
 )
-from apps.platform_api.app.api.schemas import TournamentCardResponse
+from apps.platform_api.app.api.schemas import (
+    MediaDescriptorResponse,
+    MediaVariantResponse,
+)
+from apps.platform_api.app.services import tournament_catalog_cache
 from apps.platform_api.app.services.tournament_catalog_cache import (
     PublicTournamentListCacheEntry,
 )
@@ -43,13 +52,15 @@ def empty_result() -> Mock:
     return result
 
 
-def tournament_result(row_count: int = 1) -> Mock:
+def tournament_result(row_count: int = 1, *, include_media: bool = False) -> Mock:
     tournament = TournamentListReadModel(
         id="tournament-1",
         slug="night-cup",
         name="Night Cup",
         description=None,
         cover_url=None,
+        banner_asset_id="cover-asset" if include_media else None,
+        organizer_avatar_asset_id="avatar-asset" if include_media else None,
         visibility="public",
         status="registration_open",
         format_slug="solo",
@@ -70,7 +81,7 @@ def tournament_result(row_count: int = 1) -> Mock:
         automation_captain_round_started_at=None,
         automation_captain_round_finalized_at=None,
         automation_assignment_generated_at=None,
-        automation_last_error=None,
+        automation_last_error="private worker failure detail",
         organizer_user_id="organizer-1",
         organizer_display_name="Organizer",
         participant_count=7,
@@ -83,6 +94,17 @@ def tournament_result(row_count: int = 1) -> Mock:
     result.scalars.return_value.all.return_value = [tournament] * row_count
     result.all.return_value = [(tournament, None)] * row_count
     return result
+
+
+class _CatalogRedis:
+    def __init__(self) -> None:
+        self.values: dict[str, bytes] = {}
+
+    async def get(self, key: str) -> bytes | None:
+        return self.values.get(key)
+
+    async def set(self, key: str, value: bytes, *, ex: int) -> None:
+        self.values[key] = value
 
 
 class PlatformTournamentPaginationTests(PlatformIsolatedAsyncioTestCase):
@@ -111,10 +133,7 @@ class PlatformTournamentPaginationTests(PlatformIsolatedAsyncioTestCase):
         db_session.connection = AsyncMock()
         db_session.scalar = AsyncMock()
         db_session.execute = AsyncMock(return_value=tournament_result())
-        response = Response()
-
-        payload = await list_tournaments(
-            response=response,
+        result = await list_tournaments(
             search="Night",
             rank=["Oracle", "Phantom"],
             open_registration=True,
@@ -126,23 +145,27 @@ class PlatformTournamentPaginationTests(PlatformIsolatedAsyncioTestCase):
             db_session=db_session,
         )
 
+        self.assertIsInstance(result, Response)
+        payload = json.loads(result.body)
         self.assertEqual(len(payload), 1)
-        self.assertIsInstance(payload[0], TournamentCardResponse)
-        self.assertEqual(payload[0].slug, "night-cup")
-        self.assertIsNone(payload[0].organizer_avatar_url)
+        self.assertEqual(payload[0]["slug"], "night-cup")
+        self.assertIsNone(payload[0]["organizer_avatar_url"])
+        self.assertNotIn("automation_last_error", payload[0])
+        self.assertNotIn("private worker failure detail", result.body.decode())
         self.assertEqual(db_session.scalar.await_count, 0)
         self.assertEqual(db_session.execute.await_count, 1)
-        self.assertEqual(response.headers["X-Limit"], "9")
-        self.assertEqual(response.headers["X-Has-More"], "false")
+        self.assertEqual(result.headers["Content-Type"], "application/json")
+        self.assertEqual(result.headers["X-Limit"], "9")
+        self.assertEqual(result.headers["X-Has-More"], "false")
         self.assertEqual(
-            response.headers["Cache-Control"],
+            result.headers["Cache-Control"],
             "public, max-age=5, s-maxage=15, stale-while-revalidate=30",
         )
-        self.assertNotIn("X-Total-Count", response.headers)
-        self.assertNotIn("X-Offset", response.headers)
+        self.assertNotIn("X-Total-Count", result.headers)
+        self.assertNotIn("X-Offset", result.headers)
         self.assertIn(
             "X-Next-Cursor",
-            response.headers["Access-Control-Expose-Headers"],
+            result.headers["Access-Control-Expose-Headers"],
         )
 
         page_sql = compiled_sql(db_session.execute.await_args.args[0])
@@ -161,9 +184,182 @@ class PlatformTournamentPaginationTests(PlatformIsolatedAsyncioTestCase):
         self.assertNotIn("COUNT(", page_sql)
         self.assertNotIn("JOIN platform.users", page_sql)
 
+    async def test_public_list_cold_and_cached_responses_share_the_same_body(self) -> None:
+        db_session = Mock()
+        db_session.connection = AsyncMock()
+        db_session.execute = AsyncMock(
+            return_value=tournament_result(row_count=2, include_media=True)
+        )
+        redis = _CatalogRedis()
+        media_descriptors = {
+            "cover-asset": MediaDescriptorResponse(
+                asset_id="cover-asset",
+                purpose="tournament_banner",
+                status="ready",
+                variants=[
+                    MediaVariantResponse(
+                        name="banner-1120",
+                        width=1120,
+                        height=280,
+                        byte_size=1200,
+                        url="https://cdn.old-sparky.com/tournament/banner-1120.webp",
+                    )
+                ],
+            ),
+            "avatar-asset": MediaDescriptorResponse(
+                asset_id="avatar-asset",
+                purpose="profile_avatar",
+                status="ready",
+                variants=[
+                    MediaVariantResponse(
+                        name="avatar-256",
+                        width=256,
+                        height=256,
+                        byte_size=600,
+                        url="https://cdn.old-sparky.com/profile/avatar-256.webp",
+                    )
+                ],
+            ),
+        }
+
+        app = FastAPI()
+        app.include_router(tournament_router, prefix="/tournaments")
+
+        async def provide_db_session():
+            return db_session
+
+        app.dependency_overrides[get_lazy_db_session] = provide_db_session
+
+        with (
+            patch(
+                "apps.platform_api.app.services.tournament_catalog_cache._cache_enabled",
+                return_value=True,
+            ),
+            patch(
+                "apps.platform_api.app.services.tournament_catalog_cache.redis_client",
+                return_value=redis,
+            ),
+            patch(
+                "apps.platform_api.app.api.routes.tournaments.load_media_descriptors",
+                AsyncMock(return_value=media_descriptors),
+            ),
+        ):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://testserver",
+            ) as client:
+                cold = await client.get("/tournaments", params={"limit": 1})
+                warm = await client.get("/tournaments", params={"limit": 1})
+
+        self.assertEqual(cold.status_code, 200, cold.text)
+        self.assertEqual(warm.status_code, 200, warm.text)
+        self.assertEqual(cold.content, warm.content)
+        self.assertEqual(cold.headers["X-Has-More"], "true")
+        self.assertTrue(cold.headers.get("X-Next-Cursor"))
+        for header in (
+            "Content-Type",
+            "Cache-Control",
+            "X-Limit",
+            "X-Has-More",
+            "X-Next-Cursor",
+            "Access-Control-Expose-Headers",
+        ):
+            self.assertEqual(cold.headers.get(header), warm.headers.get(header))
+        cold_items = cold.json()
+        self.assertEqual(
+            list(cold_items[0]),
+            [
+                "id",
+                "slug",
+                "name",
+                "cover_url",
+                "cover_media",
+                "visibility",
+                "status",
+                "format_slug",
+                "organizer_user_id",
+                "organizer_display_name",
+                "organizer_avatar_url",
+                "organizer_avatar_media",
+                "participant_count",
+                "allowed_ranks",
+                "max_participants",
+                "current_user_participant_status",
+                "registration_starts_at",
+                "registration_closes_at",
+                "starts_at",
+                "teams_count",
+                "created_at",
+            ],
+        )
+        self.assertEqual(
+            cold_items,
+            [
+                {
+                    "id": "tournament-1",
+                    "slug": "night-cup",
+                    "name": "Night Cup",
+                    "cover_url": "https://cdn.old-sparky.com/tournament/banner-1120.webp",
+                    "cover_media": {
+                        "asset_id": "cover-asset",
+                        "purpose": "tournament_banner",
+                        "status": "ready",
+                        "error_code": None,
+                        "variants": [
+                            {
+                                "name": "banner-1120",
+                                "width": 1120,
+                                "height": 280,
+                                "byte_size": 1200,
+                                "url": "https://cdn.old-sparky.com/tournament/banner-1120.webp",
+                            }
+                        ],
+                    },
+                    "visibility": "public",
+                    "status": "registration_open",
+                    "format_slug": "solo",
+                    "organizer_user_id": "organizer-1",
+                    "organizer_display_name": "Organizer",
+                    "organizer_avatar_url": "https://cdn.old-sparky.com/profile/avatar-256.webp",
+                    "organizer_avatar_media": {
+                        "asset_id": "avatar-asset",
+                        "purpose": "profile_avatar",
+                        "status": "ready",
+                        "error_code": None,
+                        "variants": [
+                            {
+                                "name": "avatar-256",
+                                "width": 256,
+                                "height": 256,
+                                "byte_size": 600,
+                                "url": "https://cdn.old-sparky.com/profile/avatar-256.webp",
+                            }
+                        ],
+                    },
+                    "participant_count": 7,
+                    "allowed_ranks": [],
+                    "max_participants": None,
+                    "current_user_participant_status": None,
+                    "registration_starts_at": None,
+                    "registration_closes_at": None,
+                    "starts_at": None,
+                    "teams_count": None,
+                    "created_at": "2026-06-13T00:00:00Z",
+                }
+            ],
+        )
+        self.assertNotIn("automation_last_error", cold_items[0])
+        self.assertNotIn("private worker failure detail", cold.text)
+        self.assertEqual(db_session.execute.await_count, 1)
+        self.assertEqual(
+            app.openapi()["paths"]["/tournaments"]["get"]["responses"]["200"]["content"][
+                "application/json"
+            ]["schema"]["items"]["$ref"],
+            "#/components/schemas/TournamentCardResponse",
+        )
+
     async def test_public_list_cache_hit_does_not_checkout_database(self) -> None:
         db_session = Mock()
-        response = Response()
         cached = PublicTournamentListCacheEntry(
             body=b"[]",
             limit=50,
@@ -176,7 +372,6 @@ class PlatformTournamentPaginationTests(PlatformIsolatedAsyncioTestCase):
             AsyncMock(return_value=cached),
         ):
             result = await list_tournaments(
-                response=response,
                 search=None,
                 rank=[],
                 open_registration=False,
@@ -188,7 +383,9 @@ class PlatformTournamentPaginationTests(PlatformIsolatedAsyncioTestCase):
                 db_session=db_session,
             )
 
+        self.assertIsInstance(result, Response)
         self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.body, b"[]")
         db_session.execute.assert_not_called()
         db_session.connection.assert_not_called()
 
@@ -197,10 +394,7 @@ class PlatformTournamentPaginationTests(PlatformIsolatedAsyncioTestCase):
         db_session.connection = AsyncMock()
         db_session.scalar = AsyncMock()
         db_session.execute = AsyncMock(return_value=empty_result())
-        response = Response()
-
-        payload = await list_tournaments(
-            response=response,
+        result = await list_tournaments(
             search=None,
             rank=[],
             open_registration=False,
@@ -212,7 +406,7 @@ class PlatformTournamentPaginationTests(PlatformIsolatedAsyncioTestCase):
             db_session=db_session,
         )
 
-        self.assertEqual(payload, [])
+        self.assertEqual(json.loads(result.body), [])
         page_sql = compiled_sql(db_session.execute.await_args.args[0])
         self.assertEqual(db_session.scalar.await_count, 0)
         self.assertIn("platform.tournament_list_read_models.status =", page_sql)
@@ -368,7 +562,6 @@ class PlatformTournamentPaginationTests(PlatformIsolatedAsyncioTestCase):
         db_session = Mock()
         db_session.connection = AsyncMock()
         db_session.execute = AsyncMock(return_value=empty_result())
-        response = Response()
         cursor = encode_cursor(
             {
                 "v": 1,
@@ -379,7 +572,6 @@ class PlatformTournamentPaginationTests(PlatformIsolatedAsyncioTestCase):
         )
 
         await list_tournaments(
-            response=response,
             search=None,
             rank=[],
             open_registration=False,
@@ -404,10 +596,7 @@ class PlatformTournamentPaginationTests(PlatformIsolatedAsyncioTestCase):
         db_session.connection = AsyncMock()
         db_session.scalar = AsyncMock()
         db_session.execute = AsyncMock(return_value=tournament_result(row_count=2))
-        response = Response()
-
-        payload = await list_tournaments(
-            response=response,
+        result = await list_tournaments(
             search=None,
             rank=[],
             open_registration=False,
@@ -419,9 +608,9 @@ class PlatformTournamentPaginationTests(PlatformIsolatedAsyncioTestCase):
             db_session=db_session,
         )
 
-        self.assertEqual(len(payload), 1)
-        self.assertEqual(response.headers["X-Has-More"], "true")
-        self.assertTrue(response.headers.get("X-Next-Cursor"))
+        self.assertEqual(len(json.loads(result.body)), 1)
+        self.assertEqual(result.headers["X-Has-More"], "true")
+        self.assertTrue(result.headers.get("X-Next-Cursor"))
         self.assertEqual(db_session.scalar.await_count, 0)
 
 

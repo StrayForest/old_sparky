@@ -17,10 +17,10 @@ import {
 } from "@/lib/performance-diagnostic-plan";
 import { withWorkspaceDiagnosticPrearmHeader } from "@/lib/workspace-diagnostic-prearm.mjs";
 import {
-  getTournamentWorkspace,
   normalizeTournamentInviteCode,
   PlatformApiError
 } from "@/lib/platform-api";
+import { getServerTournamentWorkspace } from "@/lib/server-tournament-workspace";
 import type { TournamentDetail } from "@/lib/types";
 
 export const metadata: Metadata = {
@@ -84,9 +84,9 @@ export default async function TournamentDetailPage({
       };
       const workspace = await (ssrTraceSampled
         ? measureSsrStage("tournament_workspace", () =>
-          getTournamentWorkspace(slug, workspaceHeaders, workspaceOptions)
+          getServerTournamentWorkspace(slug, workspaceHeaders, workspaceOptions)
         )
-        : getTournamentWorkspace(slug, workspaceHeaders, workspaceOptions));
+        : getServerTournamentWorkspace(slug, workspaceHeaders, workspaceOptions));
       if (!workspace) {
         notFound();
       }
