@@ -145,13 +145,13 @@ async function expectSessionStatus(context: BrowserContext, expectedStatus: numb
 async function profileLogout(page: Page, context: BrowserContext): Promise<void> {
   await page.goto("/profile/me?tab=account");
   await page.getByTestId("profile-logout-button").click();
-  await expect(page).toHaveURL(/\/auth\/login/u);
+  await expect(page).toHaveURL(`${WEB_ORIGIN}/`);
   await expectSessionStatus(context, 401);
 }
 
 async function loginThroughUi(page: Page, password: string): Promise<void> {
   await page.context().clearCookies();
-  await page.goto("/auth/login");
+  await page.goto("/auth/login?returnTo=%2Fprofile%2Fme");
   const form = page.locator("form#login-form");
   await form.locator('input[name="username"]').fill(FIXTURE_EMAIL);
   await form.locator('input[name="current_password"]').fill(password);
