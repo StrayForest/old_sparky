@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-11-12
+- Last reviewed: 2026-11-13
 
 Read this page for live pins, pending release work, open QA gates and hard
 operational limits. Product contracts, procedures and detailed run evidence
@@ -11,35 +11,36 @@ belong in the linked owner documents below.
 ## Live and pending state
 
 - Production app and runner source S are
+  `6b9b6d5453f58bce19979b24837517386d931289` (release
+  `gha-43360279476-1-6b9b6d5453f5`); previous app A is
   `79b3b95ede586da84c3d49138bf88888f866c6b3` (release
-  `gha-43176891484-1-79b3b95ede58`); previous app A is
-  `3be46c5f5bb44bac9b555517c5fb6931e29ba462` (release
-  `gha-43090225420-1-3be46c5f5bb4`). Active host-tools C3 is
+  `gha-43176891484-1-79b3b95ede58`). Active host-tools C3 is
   `625bbaa11023ffaf059dfa03a34a4850b02d4f93`. Exact-SHA Security
-  `43174523722/1`, source-bound restore-verified backup `43176543408/1`, AUTO
-  `43176180004/1`, and its automatic production child `43176891484/1`
-  completed successfully. The backup receipt confirms restore and Alembic
-  verification. Draft Cloudflare publish `43176180092/1` also completed
-  successfully. Production activation and smoke passed.
-- The immutable LiveQA runtime for S is installed at
+  `43358065014/1`, source-bound restore-verified backup `43359932837/1`, AUTO
+  `43359787418/1`, and automatic production child `43360279476/1` completed
+  successfully. Production activation, runtime readiness and public smoke
+  passed. The deployed source's Alembic head is `20261112_0055`. Public
+  `/api/v1/appearance` returned revision 1 and all 24 palette roles; those
+  values matched the server-rendered root CSS. The settings were read-only
+  during smoke. The site and tournament page both returned HTTP 200.
+- The retained immutable LiveQA runtime still targets the previous production
+  source `79b3b95ede586da84c3d49138bf88888f866c6b3` at
   `/root/.oldsparky/liveqa/releases/79b3b95ede586da84c3d49138bf88888f866c6b3/runtime`;
-  the release-operation marker is absent. The canonical public browser suite
-  passed: 57 logical checks, 47 passed, 10 approved public-mode skips, and no
-  failures, flaky, interrupted or timed-out checks. These skips do not provide
-  authenticated-profile coverage. The separate bounded read-only public DTO
-  check returned ready data for four patches, each with 64 typed stat rows;
-  Nurse's localized base formula is `22 + 0,24 × Спиритическая мощь`, its T3
-  scale addition is `+0,4`, the charge rate is `100 %` at `0,15 %/с`, and the
-  buff extension is `+6 %`. The browser summary did not export a separate
-  decoded-image or Draft-catalog count, so no catalog-wide decode total is
-  claimed for this release. Cleanup left no QA gate, runner process or active
-  QA service.
-- Read-only storage diagnostics `43179640777/1` confirmed the current and
-  previous releases, an unlocked release lock, active application services,
-  11,547,768,896 bytes free (71.11% used), and no stale LiveQA cache
-  candidates. Its bounded maintenance preview completed in dry-run mode with
-  no planned deletions; it created no backup and left the filesystem
-  unchanged. Keep the operator preview artifacts and user-retained previews.
+  its prior public browser and DTO results remain historical evidence for that
+  source, not QA for the current appearance release. The release-operation
+  marker is absent. No LiveQA runtime was changed for this app-only release.
+- Read-only storage diagnostics `43361490756/1` confirmed the current and
+  previous releases, an unlocked release lock, active API/worker/web services,
+  enabled maintenance timer, verified backup restore/Alembic state, no stale
+  LiveQA cache candidates, and 10,509,746,176 bytes free (73.71% used). The
+  guarded maintenance workflow `43362126152/1` then completed successfully for
+  the active source. Its restore-verified backup passed Alembic verification
+  and retained one verified backup pair; its locked retention sweep removed
+  one unprotected production release while preserving current and previous.
+  No stale LiveQA runtime or transient browser/build/screenshot artifacts were
+  removed. The maintenance service exited successfully, with 10,568,884,224
+  bytes free (73.56% used) afterward. Keep the operator preview artifacts and
+  user-retained previews.
 - SSR composite `42862469594/1` measured on app A
   `645a5ee0d14b98e4784be2dbf276f64961c9eb66`, runner source S
   `154be3f847007accd83f077f3079b3f3ccf85813` and host-tools C2. Its unprofiled
