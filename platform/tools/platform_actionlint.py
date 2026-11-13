@@ -14,6 +14,19 @@ import tempfile
 
 PINNED_VERSION = "1.7.12"
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+QUEUE_COMPATIBILITY_FILES = frozenset(
+    {
+        "platform-live-launch.yml",
+        "platform-live-user-qa.yml",
+        "platform-postdeploy-live-qa.yml",
+    }
+)
+QUEUE_COMPATIBILITY_DIAGNOSTIC = re.compile(
+    r"^(?P<path>(?:[A-Za-z0-9_./-]+/)?\.github/workflows/"
+    r"(?P<name>platform-live-launch|platform-live-user-qa|platform-postdeploy-live-qa)\.yml)"
+    r":[0-9]+:[0-9]+: unexpected key \"queue\" for \"concurrency\" section\. "
+    r"expected one of \"cancel-in-progress\", \"group\" \[syntax-check\]$"
+)
 
 
 class ActionlintError(RuntimeError):
@@ -63,6 +76,37 @@ def _run_actionlint(binary: Path, files: list[Path]) -> subprocess.CompletedProc
         check=False,
         timeout=90,
     )
+
+
+def _filter_unsupported_queue_diagnostics(
+    stdout: str, stderr: str
+) -> tuple[str, str, tuple[str, ...]]:
+    """Filter only the pinned linter's known native concurrency-queue gap.
+
+    GitHub supports ``concurrency.queue: max``; actionlint 1.7.12 does not yet
+    recognize that key. The independent workflow contract checks the exact
+    queue policy in these three workflows, so ignore only its exact diagnostic
+    when all three expected files produce one occurrence each.
+    """
+
+    combined = [("stdout", line) for line in stdout.splitlines(keepends=True)] + [
+        ("stderr", line) for line in stderr.splitlines(keepends=True)
+    ]
+    matched: list[tuple[str, str, str]] = []
+    for stream_name, line in combined:
+        match = QUEUE_COMPATIBILITY_DIAGNOSTIC.fullmatch(line.rstrip("\r\n"))
+        if match is not None:
+            matched.append((stream_name, line, match.group("name") + ".yml"))
+    names = [name for _, _, name in matched]
+    if len(names) != len(QUEUE_COMPATIBILITY_FILES) or set(names) != QUEUE_COMPATIBILITY_FILES:
+        return stdout, stderr, ()
+
+    filtered: dict[str, list[str]] = {"stdout": [], "stderr": []}
+    for stream_name, line in combined:
+        if any(stream_name == source and line == matched_line for source, matched_line, _ in matched):
+            continue
+        filtered[stream_name].append(line)
+    return "".join(filtered["stdout"]), "".join(filtered["stderr"]), tuple(sorted(names))
 
 
 def _check_runner_context_fixtures(binary: Path) -> None:
@@ -118,12 +162,22 @@ def run() -> int:
         if not workflows:
             raise ActionlintError("workflow directory contains no YAML workflow files")
         result = _run_actionlint(binary, workflows)
-        if result.stdout:
-            sys.stdout.write(result.stdout)
-        if result.stderr:
-            sys.stderr.write(result.stderr)
+        stdout, stderr, suppressed = _filter_unsupported_queue_diagnostics(
+            result.stdout, result.stderr
+        )
+        if suppressed:
+            print(
+                "actionlint 1.7.12 compatibility: ignored its exact unsupported "
+                "concurrency.queue diagnostic for the three live-QA workflows; "
+                "workflow contracts validate queue=max and cancel-in-progress=false"
+            )
+        if stdout:
+            sys.stdout.write(stdout)
+        if stderr:
+            sys.stderr.write(stderr)
         if result.returncode != 0:
-            return result.returncode
+            if not suppressed or stdout.strip() or stderr.strip():
+                return result.returncode
         print(
             f"actionlint {PINNED_VERSION}: {len(workflows)} workflows and runner-context fixtures passed"
         )

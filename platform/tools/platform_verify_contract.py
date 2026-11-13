@@ -1881,6 +1881,10 @@ def actionlint_workflow_issues(security_text: str) -> list[str]:
         ("runner.environment", "runner-context fixture regression"),
         ('"*.yml"', "YAML workflow discovery"),
         ('"*.yaml"', "YAML workflow discovery"),
+        ("_filter_unsupported_queue_diagnostics", "narrow unsupported queue diagnostic filter"),
+        ("QUEUE_COMPATIBILITY_DIAGNOSTIC", "exact actionlint queue diagnostic match"),
+        ("expected one of", "actionlint concurrency queue compatibility wording"),
+        ("platform-postdeploy-live-qa", "post-deploy queue diagnostic scope"),
     ):
         if marker not in wrapper_source:
             issues.append(f"actionlint wrapper must retain {description}")

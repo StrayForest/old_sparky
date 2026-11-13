@@ -4777,7 +4777,7 @@ jobs:
 
       - name: Create exact actual-deployment mode receipt
         id: actual_deploy_receipt
-        if: ${{ success() && steps.production_deploy.outputs.deployed_source_sha != '' }}
+        if: ${{ success() && steps.cleanup_ssh.outcome == 'success' && steps.production_deploy.outputs.deployed_source_sha != '' }}
         continue-on-error: true
         shell: bash
         env:
@@ -4830,7 +4830,7 @@ jobs:
           PY
 
       - name: Upload exact actual-deployment mode receipt
-        if: ${{ steps.actual_deploy_receipt.outcome == 'success' }}
+        if: ${{ steps.cleanup_ssh.outcome == 'success' && steps.actual_deploy_receipt.outcome == 'success' }}
         continue-on-error: true
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:

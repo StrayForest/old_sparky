@@ -2165,7 +2165,8 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         for workflow_name, directory_name in standard_cleanup_dirs.items():
             source = (WORKFLOW_DIR / workflow_name).read_text(encoding="utf-8")
             cleanup_start = source.index("      - name: Remove production SSH material")
-            cleanup = source[cleanup_start:]
+            next_step = source.find("\n      - name:", cleanup_start + 1)
+            cleanup = source[cleanup_start:] if next_step == -1 else source[cleanup_start:next_step]
             self.assertIn(
                 f'ssh_dir="$RUNNER_TEMP/{directory_name}"',
                 cleanup,

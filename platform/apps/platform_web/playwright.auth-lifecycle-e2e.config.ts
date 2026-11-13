@@ -38,6 +38,7 @@ export default defineConfig({
   },
   webServer: [
     {
+      name: "auth-e2e-api",
       command: "../../tools/platform_node.sh tests/support/auth-e2e-api-launcher.cjs",
       env: {
         PLATFORM_AUTH_E2E: "1",
@@ -68,6 +69,7 @@ export default defineConfig({
       timeout: 45_000
     },
     {
+      name: "auth-e2e-next",
       command: standaloneServer,
       env: {
         HOSTNAME: "127.0.0.1",

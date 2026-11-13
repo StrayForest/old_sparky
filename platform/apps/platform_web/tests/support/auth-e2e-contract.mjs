@@ -101,68 +101,137 @@ assert.match(config, /screenshot:\s*"off"/u);
 assert.match(config, /auth-e2e-safe-reporter\.cjs/u);
 assert.match(config, /auth-e2e-api-launcher\.cjs/u);
 assert.match(config, /auth-e2e-next-launcher\.cjs/u);
+assert.match(config, /name: "auth-e2e-api"/u);
+assert.match(config, /name: "auth-e2e-next"/u);
 assert.match(genericConfig, /sharedIgnoredSpecs\s*=\s*\[[\s\S]*?"auth-lifecycle-e2e\.spec\.ts"/u);
 assert.match(genericConfig, /testIgnore:\s*sharedIgnoredSpecs/u);
 assert.match(liveConfig, /testIgnore:\s*\["auth-lifecycle-e2e\.spec\.ts"\]/u);
 assert.match(reporter, /const EXPECTED_TESTS = new Set\(\[/u);
-assert.match(reporter, /test\.titlePath\(\)\.at\(-1\)/u);
-assert.match(reporter, /status=invalid-suite tests=\$\{tests\.length\} exact=\$\{exact\.length\}/u);
+assert.match(reporter, /function isExpectedTest\(test\)/u);
+assert.match(reporter, /onError\(error\)/u);
+assert.match(reporter, /process\.argv\.includes\("--list"\)/u);
+assert.match(reporter, /this\.discoveryRequested === this\.listMode/u);
+assert.match(reporter, /AUTH_E2E_SETUP_ERROR category=\$\{category\} component=\$\{component\} source=\$\{source\} line=\$\{line\}/u);
+assert.match(reporter, /AUTH_E2E_API_LAUNCH status=/u);
+assert.match(reporter, /AUTH_E2E_NEXT_LAUNCH status=/u);
+assert.match(reporter, /AUTH_E2E_DISCOVERY status=\$\{status\} tests=/u);
+assert.match(reporter, /return \{ status: "failed" \}/u);
 assert.match(reporter, /AUTH_E2E status=\$\{status\} tests=/u);
 assert.match(reporter, /AUTH_E2E_FAILURE test=auth-lifecycle stage=\$\{stage\} category=\$\{category\} source=\$\{source\}/u);
 assert.match(reporter, /const EXPECTED_STEPS = new Set\(\[/u);
 assert.match(reporter, /function failedStage\(steps\)/u);
-assert.doesNotMatch(reporter, /error\.message|result\.errors|attachments/u);
+assert.doesNotMatch(reporter, /process\.stdout\.write\([^\n]*error\.message/u);
+assert.doesNotMatch(reporter, /error\.stack|result\.errors|attachments/u);
 
-const expectedAuthTitle = "auth lifecycle uses the real API, local mail capture, and strict verification";
+const authTitle = "auth lifecycle uses the real API, local mail capture, and strict verification";
 const authSpecPath = path.join(webRoot, "tests/smoke/auth-lifecycle-e2e.spec.ts");
-function playwrightTestCase({ title = expectedAuthTitle, file = authSpecPath, line = 177 } = {}) {
-  return {
-    titlePath: () => ["", "chromium", "tests/smoke/auth-lifecycle-e2e.spec.ts", title],
-    location: { file, line }
-  };
-}
-function captureReporterOutput(callback) {
+const expectedCase = (title = authTitle) => ({
+  titlePath: () => ["", "chromium", "tests/smoke/auth-lifecycle-e2e.spec.ts", title],
+  location: { file: authSpecPath, line: 177 }
+});
+function exerciseReporter({
+  discoveryFlag,
+  listMode,
+  cases = [expectedCase()],
+  attempts = [],
+  serverOutput,
+  globalError = false
+}) {
+  const originalArgv = process.argv;
+  const originalCwd = process.cwd();
+  const originalFlag = process.env.PLATFORM_AUTH_E2E_DISCOVERY_ONLY;
   const originalWrite = process.stdout.write;
   let output = "";
-  process.stdout.write = (chunk) => {
-    output += String(chunk);
-    return true;
-  };
   try {
-    callback();
+    process.chdir(webRoot);
+    if (discoveryFlag === undefined) delete process.env.PLATFORM_AUTH_E2E_DISCOVERY_ONLY;
+    else process.env.PLATFORM_AUTH_E2E_DISCOVERY_ONLY = discoveryFlag;
+    process.argv = listMode
+      ? [...originalArgv.filter((arg) => arg !== "--list"), "--list"]
+      : originalArgv.filter((arg) => arg !== "--list");
+    const reporterInstance = new AuthE2ESafeReporter();
+    process.stdout.write = (chunk) => {
+      output += String(chunk);
+      return true;
+    };
+    try {
+      reporterInstance.onBegin({}, { allTests: () => cases });
+    } catch {
+      // Playwright's reporter multiplexer catches reporter callback exceptions.
+    }
+    for (const attempt of attempts) {
+      reporterInstance.onTestBegin(attempt.test);
+      reporterInstance.onTestEnd(attempt.test, {
+        status: attempt.status,
+        retry: attempt.retry,
+        steps: []
+      });
+    }
+    if (serverOutput) reporterInstance.onStdErr(serverOutput);
+    if (globalError) {
+      reporterInstance.onError({
+        message: "Timed out waiting for config.webServer.",
+        location: { file: "/outside/source.ts", line: 9 }
+      });
+    }
+    const end = reporterInstance.onEnd({ status: "passed" });
+    return { end, output };
   } finally {
     process.stdout.write = originalWrite;
+    process.argv = originalArgv;
+    process.chdir(originalCwd);
+    if (originalFlag === undefined) delete process.env.PLATFORM_AUTH_E2E_DISCOVERY_ONLY;
+    else process.env.PLATFORM_AUTH_E2E_DISCOVERY_ONLY = originalFlag;
   }
-  return output;
 }
-const recognizedReporter = new AuthE2ESafeReporter();
-assert.doesNotThrow(() => recognizedReporter.onBegin({}, {
-  allTests: () => [playwrightTestCase()]
-}));
-for (const [cases, expectedCounts] of [
-  [[playwrightTestCase({ title: "unexpected title" })], "tests=1 exact=0"],
-  [[playwrightTestCase({ file: path.join(webRoot, "tests/smoke/other.spec.ts") })], "tests=1 exact=0"],
-  [[playwrightTestCase(), playwrightTestCase()], "tests=2 exact=2"],
-  [[], "tests=0 exact=0"]
+
+const expectedAttempt = { test: expectedCase(), status: "passed", retry: 0 };
+const normalReporterPass = exerciseReporter({ attempts: [expectedAttempt] });
+assert.equal(normalReporterPass.end, undefined);
+assert.match(normalReporterPass.output, /AUTH_E2E status=passed tests=1 passed=1 failed=0/u);
+const listReporterPass = exerciseReporter({ discoveryFlag: "1", listMode: true });
+assert.equal(listReporterPass.end, undefined);
+assert.match(listReporterPass.output, /AUTH_E2E_DISCOVERY status=passed tests=1 exact=1/u);
+assert.doesNotMatch(listReporterPass.output, /AUTH_E2E status=passed/u);
+
+for (const mismatch of [
+  { discoveryFlag: undefined, listMode: true },
+  { discoveryFlag: "1", listMode: false }
 ]) {
-  const output = captureReporterOutput(() => {
-    assert.throws(
-      () => new AuthE2ESafeReporter().onBegin({}, { allTests: () => cases }),
-      /Auth E2E suite identity is invalid/u
-    );
-  });
-  assert.equal(output, `AUTH_E2E status=invalid-suite ${expectedCounts}\n`);
-  assert.doesNotMatch(output, /unexpected title|other\.spec|auth lifecycle uses/u);
+  const outcome = exerciseReporter({ ...mismatch, attempts: [expectedAttempt] });
+  assert.deepEqual(outcome.end, { status: "failed" });
+  assert.match(outcome.output, /AUTH_E2E status=failed/u);
+  assert.doesNotMatch(outcome.output, /AUTH_E2E_DISCOVERY status=passed/u);
 }
-const skippedOutput = captureReporterOutput(() => {
-  const skippedReporter = new AuthE2ESafeReporter();
-  const skippedCase = playwrightTestCase();
-  skippedReporter.onBegin({}, { allTests: () => [skippedCase] });
-  skippedReporter.onTestEnd(skippedCase, { status: "skipped", steps: [] });
-  skippedReporter.onEnd({ status: "passed" });
+
+const wrongIdentity = exerciseReporter({ cases: [expectedCase("unexpected title")] });
+assert.deepEqual(wrongIdentity.end, { status: "failed" });
+assert.match(wrongIdentity.output, /status=invalid-suite tests=1 exact=0/u);
+assert.match(wrongIdentity.output, /AUTH_E2E status=failed/u);
+const emptySuite = exerciseReporter({ cases: [] });
+assert.deepEqual(emptySuite.end, { status: "failed" });
+assert.match(emptySuite.output, /status=invalid-suite tests=0 exact=0/u);
+const skippedAttempt = exerciseReporter({
+  attempts: [{ test: expectedCase(), status: "skipped", retry: 0 }]
 });
-assert.match(skippedOutput, /AUTH_E2E_FAILURE test=auth-lifecycle stage=unattributed category=setup/u);
-assert.match(skippedOutput, /AUTH_E2E status=failed tests=1 passed=0 failed=1/u);
+assert.deepEqual(skippedAttempt.end, { status: "failed" });
+assert.match(skippedAttempt.output, /AUTH_E2E status=failed tests=1 .*failed=1/u);
+const retriedAttempt = exerciseReporter({
+  attempts: [{ test: expectedCase(), status: "passed", retry: 1 }]
+});
+assert.deepEqual(retriedAttempt.end, { status: "failed" });
+assert.match(retriedAttempt.output, /AUTH_E2E status=failed/u);
+const setupError = exerciseReporter({ attempts: [expectedAttempt], globalError: true });
+assert.deepEqual(setupError.end, { status: "failed" });
+assert.match(setupError.output, /AUTH_E2E_SETUP_ERROR category=webserver-setup component=unknown source=unknown line=0/u);
+assert.match(setupError.output, /AUTH_E2E status=failed/u);
+const namedServerError = exerciseReporter({
+  attempts: [expectedAttempt],
+  serverOutput: "\u001b[2m[auth-e2e-next] \u001b[0mlauncher could not start\n",
+  globalError: true
+});
+assert.deepEqual(namedServerError.end, { status: "failed" });
+assert.match(namedServerError.output, /AUTH_E2E_SETUP_ERROR category=webserver-setup component=next source=unknown line=0/u);
 
 assert.match(server, /os\.environ\.get\("GITHUB_ACTIONS"\) == "true"/u);
 assert.match(server, /database_url\.path\.lstrip\("\/"\) == "platformdb_test"/u);
@@ -180,6 +249,13 @@ assert.match(spec, /wrong-action/u);
 assert.match(spec, /missing-action/u);
 assert.match(spec, /profile-password-change-success/u);
 assert.match(spec, /cleanupComplete/u);
+const discoveryPosition = hermetic.indexOf("run test:auth-lifecycle-e2e -- --list");
+const buildPosition = hermetic.indexOf("run build");
+const journeyPosition = hermetic.lastIndexOf("run test:auth-lifecycle-e2e");
+assert.ok(discoveryPosition >= 0 && discoveryPosition < buildPosition);
+assert.ok(journeyPosition > buildPosition && journeyPosition !== discoveryPosition);
+assert.equal((hermetic.match(/PLATFORM_AUTH_E2E_DISCOVERY_ONLY=1/gu) ?? []).length, 1);
+assert.match(hermetic, /PLATFORM_AUTH_E2E_DISCOVERY_ONLY=1[\s\\\n]*"\$TOOLS_DIR\/platform_web_npm\.sh" run test:auth-lifecycle-e2e -- --list/u);
 assert.match(hermetic, /run test:auth-lifecycle-e2e/u);
 
 process.stdout.write("AUTH_E2E_CONTRACT status=passed\n");

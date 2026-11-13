@@ -7,7 +7,13 @@ const path = require("node:path");
 const { nextChildEnv } = require("./auth-e2e-child-env.cjs");
 
 const standaloneServer = path.resolve(process.cwd(), ".next/standalone/server.js");
-const env = nextChildEnv();
+let env;
+try {
+  env = nextChildEnv();
+} catch {
+  process.stderr.write("AUTH_E2E_NEXT_LAUNCH status=missing-config\n");
+  process.exit(2);
+}
 
 const child = spawn(process.execPath, [standaloneServer], {
   cwd: process.cwd(),

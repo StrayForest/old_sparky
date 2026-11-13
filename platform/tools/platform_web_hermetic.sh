@@ -60,6 +60,15 @@ fi
   "$WEB_ROOT/tests/support/live-count-reporter-contract.cjs"
 "$TOOLS_DIR/platform_node.sh" \
   "$WEB_ROOT/tests/support/auth-e2e-contract.mjs"
+# Ask the pinned Playwright runner to load and enumerate the exact auth spec
+# before the standalone build. This is a discovery preflight only: the normal
+# full auth lifecycle invocation below remains required and separate.
+mkdir -m 700 "$BUILD_DIR/auth-e2e-output"
+PLATFORM_AUTH_E2E_CONTROL_FILE="$BUILD_DIR/auth-e2e-control" \
+PLATFORM_AUTH_E2E_OUTPUT_DIR="$BUILD_DIR/auth-e2e-output" \
+PLATFORM_WEB_HERMETIC_BUILD_DIR="$BUILD_DIR" \
+PLATFORM_AUTH_E2E_DISCOVERY_ONLY=1 \
+  "$TOOLS_DIR/platform_web_npm.sh" run test:auth-lifecycle-e2e -- --list
 # Both isolated Playwright contours use the same localhost API destination in
 # the standalone artifact.  The participant contour owns a fresh server on
 # this port after smoke exits; no server or database state is shared.
@@ -95,7 +104,6 @@ PLATFORM_WEB_HERMETIC_BUILD_DIR="$BUILD_DIR" \
 # loopback Siteverify/SMTP fixtures. Its control token, output and captured
 # mail remain under the exact private build directory and are removed by the
 # exit trap; no browser trace/video/report is retained or uploaded.
-mkdir -m 700 "$BUILD_DIR/auth-e2e-output"
 PLATFORM_AUTH_E2E_CONTROL_FILE="$BUILD_DIR/auth-e2e-control" \
 PLATFORM_AUTH_E2E_OUTPUT_DIR="$BUILD_DIR/auth-e2e-output" \
 PLATFORM_UPLOAD_DIR="$BUILD_DIR/auth-e2e-uploads" \

@@ -214,7 +214,8 @@ active deployed app source and its QA runtime; in a docs-only/no-op state those
 SHAs can differ.
 
 ```bash
-EXPECTED_TARGET_SHA="$(gh api repos/StrayForest/old_sparky/commits/dev --jq .sha)"
+gh api repos/StrayForest/old_sparky/commits/dev --jq .sha
+EXPECTED_TARGET_SHA='<copy the exact dev SHA printed above>'
 gh workflow run platform-live-user-qa.yml \
   --ref dev \
   -f confirmation=RUN-LIVE-USER-QA \
@@ -256,7 +257,8 @@ roster. Any remaining old scope fails closed and must be recovered before a
 retry.
 
 ```bash
-EXPECTED_TARGET_SHA="$(gh api repos/StrayForest/old_sparky/commits/dev --jq .sha)"
+gh api repos/StrayForest/old_sparky/commits/dev --jq .sha
+EXPECTED_TARGET_SHA='<copy the exact dev SHA printed above>'
 gh workflow run platform-live-launch.yml \
   --ref dev \
   -f base_url=https://old-sparky.com \

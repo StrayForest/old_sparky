@@ -7923,6 +7923,16 @@ cleanup
         workflow = (
             REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
         ).read_text(encoding="utf-8")
+        self.assertIn(
+            "if: ${{ success() && steps.cleanup_ssh.outcome == 'success' "
+            "&& steps.production_deploy.outputs.deployed_source_sha != '' }}",
+            workflow,
+        )
+        self.assertIn(
+            "if: ${{ steps.cleanup_ssh.outcome == 'success' "
+            "&& steps.actual_deploy_receipt.outcome == 'success' }}",
+            workflow,
+        )
         activation = self._workflow_step_run(
             workflow, "Run production preflight or deployment"
         )
@@ -8022,6 +8032,7 @@ cleanup
                 "TARGET_SHA": sha,
                 "GITHUB_API_URL": "https://api.github.com",
                 "GITHUB_REPOSITORY": "example/oldsparky",
+                "GITHUB_OUTPUT": str(root / "github-output"),
                 "GH_TOKEN": "test-token-not-used-by-stub",
                 "SSH_DIR": str(root / "ssh-config"),
                 "HOST_TOOLS_DISPATCHER": "/unused/host-tools-dispatcher.py",

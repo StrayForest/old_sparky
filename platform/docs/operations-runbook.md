@@ -318,7 +318,8 @@ lifecycle and it is not the browser grid/pixel test. Run the public browser
 gate separately after a reviewed deploy:
 
 ```bash
-EXPECTED_TARGET_SHA="$(gh api repos/StrayForest/old_sparky/commits/dev --jq .sha)"
+gh api repos/StrayForest/old_sparky/commits/dev --jq .sha
+EXPECTED_TARGET_SHA='<copy the exact dev SHA printed above>'
 gh workflow run platform-live-launch.yml \
   --repo StrayForest/old_sparky --ref dev \
   -f base_url=https://old-sparky.com -f provision=false \

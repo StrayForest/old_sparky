@@ -75,6 +75,7 @@ from tools.platform_verify import (
     dispatch_ci,
     registry_payload,
 )
+from tools.platform_actionlint import _filter_unsupported_queue_diagnostics
 from tools.platform_test_runner import (
     ContourTimeout,
     TimingRunner,
@@ -3434,6 +3435,33 @@ except lock.VerificationLockError as exc:
         self.assertEqual(ALLOWED_ACTION_OWNERS, frozenset({"actions"}))
         self.assertEqual(action_pin_issues(), [])
         self.assertEqual(workflow_level_permission_issues(), [])
+        exact_queue_errors = "".join(
+            f'.github/workflows/{name}:57:3: unexpected key "queue" for "concurrency" section. '
+            'expected one of "cancel-in-progress", "group" [syntax-check]\n'
+            for name in (
+                "platform-live-launch.yml",
+                "platform-live-user-qa.yml",
+                "platform-postdeploy-live-qa.yml",
+            )
+        )
+        filtered_out, filtered_err, suppressed = _filter_unsupported_queue_diagnostics(
+            exact_queue_errors, ""
+        )
+        self.assertEqual((filtered_out, filtered_err), ("", ""))
+        self.assertEqual(
+            set(suppressed),
+            {
+                "platform-live-launch.yml",
+                "platform-live-user-qa.yml",
+                "platform-postdeploy-live-qa.yml",
+            },
+        )
+        unrelated = '.github/workflows/platform-production-deploy.yml:4:2: unexpected key "queue" for "concurrency" section. expected one of "cancel-in-progress", "group" [syntax-check]\n'
+        kept, _, suppressed_with_other_error = _filter_unsupported_queue_diagnostics(
+            exact_queue_errors + unrelated, ""
+        )
+        self.assertEqual(kept, unrelated)
+        self.assertEqual(set(suppressed_with_other_error), set(suppressed))
         autodeploy = (
             Path(__file__).resolve().parents[2]
             / ".github/workflows/platform-production-autodeploy.yml"
