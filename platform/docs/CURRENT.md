@@ -10,37 +10,37 @@ belong in the linked owner documents below.
 
 ## Live and pending state
 
-- Production app and runner source S are
-  `6b9b6d5453f58bce19979b24837517386d931289` (release
-  `gha-43360279476-1-6b9b6d5453f5`); previous app A is
+- Production app and runner source is
+  `cb1a75114aac0f4fb0ee6cc407011f90c6e76f31` (release
+  `gha-43367073524-1-cb1a75114aac`); previous app is
   `79b3b95ede586da84c3d49138bf88888f866c6b3` (release
   `gha-43176891484-1-79b3b95ede58`). Active host-tools C3 is
   `625bbaa11023ffaf059dfa03a34a4850b02d4f93`. Exact-SHA Security
-  `43358065014/1`, source-bound restore-verified backup `43359932837/1`, AUTO
-  `43359787418/1`, and automatic production child `43360279476/1` completed
-  successfully. Production activation, runtime readiness and public smoke
-  passed. The deployed source's Alembic head is `20261112_0055`. Public
-  `/api/v1/appearance` returned revision 1 and all 24 palette roles; those
-  values matched the server-rendered root CSS. The settings were read-only
-  during smoke. The site and tournament page both returned HTTP 200.
+  `43365424621/1`, source-bound restore-verified backup `43366747281/1`, AUTO
+  `43366680112/1`, and automatic production child `43367073524/1` completed
+  successfully. The app source was reverted to the previous production visual
+  design, then published through the standard production chain. Strict release
+  preflight and origin/SNI plus public-edge smoke passed. API, worker, web and
+  Nginx are active; the database remains at Alembic head `20261112_0055` with
+  no downgrade. The removed public `/api/v1/appearance` endpoint returns HTTP
+  404. The site and tournament page return HTTP 200.
 - The retained immutable LiveQA runtime still targets the previous production
   source `79b3b95ede586da84c3d49138bf88888f866c6b3` at
   `/root/.oldsparky/liveqa/releases/79b3b95ede586da84c3d49138bf88888f866c6b3/runtime`;
   its prior public browser and DTO results remain historical evidence for that
   source, not QA for the current appearance release. The release-operation
   marker is absent. No LiveQA runtime was changed for this app-only release.
-- Read-only storage diagnostics `43361490756/1` confirmed the current and
-  previous releases, an unlocked release lock, active API/worker/web services,
-  enabled maintenance timer, verified backup restore/Alembic state, no stale
-  LiveQA cache candidates, and 10,509,746,176 bytes free (73.71% used). The
-  guarded maintenance workflow `43362126152/1` then completed successfully for
-  the active source. Its restore-verified backup passed Alembic verification
-  and retained one verified backup pair; its locked retention sweep removed
-  one unprotected production release while preserving current and previous.
-  No stale LiveQA runtime or transient browser/build/screenshot artifacts were
-  removed. The maintenance service exited successfully, with 10,568,884,224
-  bytes free (73.56% used) afterward. Keep the operator preview artifacts and
-  user-retained previews.
+- Read-only storage diagnostics `43368405441/1` confirmed the current cb1a and
+  previous 79b3 releases, unlocked release lock, active API/worker/web
+  services, verified backup state, and 10,503,340,032 bytes free (73.0% used).
+  The guarded maintenance workflow `43368589822/1` completed successfully for
+  cb1a. Its fresh backup passed restore and Alembic verification (37 tables);
+  the locked retention sweep removed one unprotected production release while
+  preserving current, previous and the shared-venv origin. One verified backup
+  pair remains. No LiveQA runtime or transient browser/build/screenshot
+  artifacts were removed. The maintenance service exited successfully, with
+  10,629,095,424 bytes free (73% used) afterward. Current/previous pointers,
+  API/web readiness and absence of a pending release operation were rechecked.
 - SSR composite `42862469594/1` measured on app A
   `645a5ee0d14b98e4784be2dbf276f64961c9eb66`, runner source S
   `154be3f847007accd83f077f3079b3f3ccf85813` and host-tools C2. Its unprofiled

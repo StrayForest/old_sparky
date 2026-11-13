@@ -21,7 +21,8 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | Standing translation regression and warm-up procedure | [Patch translation](patch-translation.md#qa) |
 | UI system and responsive rules | [Visual theme](platform-visual-theme.md) |
 | Admin console structure and metric definitions | [Admin console IA](admin-console-information-architecture.md) |
-| Normal release or rollback | [Deployment runbook](deployment-runbook.md) |
+| Normal production release | [Deployment runbook](deployment-runbook.md) |
+| Production application rollback | [Production rollback runbook](production-rollback-runbook.md) |
 | Production web/API/worker service recovery | [Service recovery runbook](service-recovery-runbook.md) |
 | Space-bounded production release bootstrap | [Release bootstrap subset extraction ADR](adr/release-bootstrap-subset-extraction.md) |
 | Release transaction and recovery | [Release state machine](release-state-machine.md) |

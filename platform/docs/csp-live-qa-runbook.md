@@ -4,9 +4,11 @@
 - Owner: Production operator
 - Last reviewed: 2026-10-20
 
-This is the special CSP/browser/live-user QA path. Normal production release,
-rollback and release-transaction recovery are owned by
-[`deployment-runbook.md`](deployment-runbook.md).
+This is the special CSP/browser/live-user QA path. Normal production release
+and install-transaction recovery are owned by
+[`deployment-runbook.md`](deployment-runbook.md); application rollback and
+interrupted rollback recovery are owned by the
+[production rollback runbook](production-rollback-runbook.md).
 
 ## Preconditions
 
@@ -560,39 +562,18 @@ reports rather than documentation.
 
 ## Rollback
 
-Install and rollback share a durable transaction record. If either command
-reports a pending operation, do not retry, edit symlinks or remove the record.
-Recover the inode-checked operation first from the stable shared bundle. If the
-rollback pointer has already switched, `current/tools/platform_release_rollback.sh`
-is a compatibility shim to the same bundle:
-
-```bash
-/opt/oldsparky/platform/shared/.release-recovery/platform_release_rollback.sh \
-  --recover-pending \
-  --app-dir /opt/oldsparky/platform
-```
-
-Recovery resumes only `rollback-cache-purged`; legacy `restart-pending` receipts
-fail closed without purge proof. After it succeeds, rerun preflight and smoke
-for the restored CSP mode before deciding
-whether to retry installation or perform a normal rollback.
-
-Preview, then apply the symlink rollback:
-
-```bash
-cd /opt/oldsparky/platform/current
-tools/platform_release_rollback.sh --dry-run
-tools/platform_release_rollback.sh
-```
-
-The rollback script applies by default; it has no `--apply` option and must
-never be invoked with one. A CSP release rolls back to the previous enforced
-application release by the normal pointer/service rollback. Both releases
-keep the document policy in the Next.js proxy; rollback does not enable a
-diagnostic Report-Only policy.
-
-Validate the restored release with the rollback tool and
-`--expected-csp-mode enforce`.
+Follow the canonical [production rollback procedure](production-rollback-runbook.md),
+including its local-first host identification, lock-protected dry run, explicit
+review, apply-by-default command, receipt handling and post-rollback smoke.
+If a rollback is interrupted, follow the canonical
+[interrupted rollback recovery](production-rollback-runbook.md#interrupted-rollback);
+do not use a compatibility shim as recovery control code. After recovery,
+rerun preflight and smoke for the restored CSP mode before deciding whether to
+retry installation or perform a normal rollback. A CSP release rolls back to the exact previous
+application release by the normal pointer/service rollback; both releases keep
+the document policy in the Next.js proxy, so rollback does not enable a
+diagnostic Report-Only policy. Validate the restored release with the expected
+CSP mode required by the canonical rollback procedure.
 
 If a rollback ever targets a release predating nonce CSP, rerun preflight and
 invoke that old release's deploy-smoke tool without `--expected-csp-mode`; that

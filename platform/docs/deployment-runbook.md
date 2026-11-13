@@ -516,27 +516,10 @@ Draft publication and public convergence are separate checks: a successful Worke
 
 ## Smoke
 
-```bash
-cd /opt/oldsparky/platform/current
-
-tools/platform_release_preflight.sh \
-  --require-previous --require-verified-backup --require-edge-parity \
-  --backup-max-age-hours 24
-
-/opt/oldsparky/platform/shared/venv/bin/python \
-  tools/platform_deploy_smoke.py \
-  --edge-origin https://127.0.0.1 \
-  --edge-host old-sparky.com \
-  --edge-insecure-loopback \
-  --expected-csp-mode enforce
-
-/opt/oldsparky/platform/shared/venv/bin/python \
-  tools/platform_deploy_smoke.py \
-  --edge-origin https://old-sparky.com \
-  --expected-csp-mode enforce
-```
-
-`--edge-insecure-loopback` is allowed only for loopback. Public smoke keeps normal certificate verification. The expected CSP mode must match the active release.
+After production deploy or rollback, require preflight plus independent
+origin/SNI and public-edge smoke checks. The exact commands, private exit/log
+capture and rollback-specific additive migration condition are owned by the
+[production rollback runbook](production-rollback-runbook.md#preflight-and-smoke).
 
 Remote production deploy/preflight also requires a complete structured
 `RELEASE_DEPLOY schema=1` marker. A zero SSH exit without that marker is a
@@ -556,32 +539,12 @@ Dry-run is the default. Apply only after policy validation and `nginx -t` succee
 
 ## Rollback
 
-Use the shared recovery/rollback tooling and the exact previous release.
-Rollback switches application release pointers; it does **not** automatically
-downgrade Alembic. Do not bypass a missing or mismatched rollback receipt or
-dependency-freeze proof. The rollback tool prepares a root-owned shared
-recovery bundle and a compatibility handoff in the previous release before
-switching `current`, so recovery remains available if the process dies after
-the pointer switch.
-
-If an operation-ID rollback is interrupted, use the exact content-addressed
-generation selected and verified by the release-recover workflow. Invoke its
-immutable wrapper directly; do not use `current/tools` or a release rollback
-shim as recovery control code:
-
-```bash
-/opt/oldsparky/platform/shared/.release-recovery/generations/<bundle-sha256>/platform_recover_pending.sh \
-  --app-dir /opt/oldsparky/platform
-```
-
-The wrapper resumes the recorded rollback phase, validates the operation-ID
-and systemd receipt pair before systemd or runtime work, and completes receipt
-cleanup in two phases. A crash after receipt clear is finished from the
-transaction phase without querying systemd. The legacy shim remains only for
-normal rollback handoff compatibility and is not an operation-ID recovery
-authority.
-
-After rollback, repeat preflight plus origin/SNI and public smoke against the restored release.
+Use the [production rollback runbook](production-rollback-runbook.md) for the
+local-first host check, database compatibility review, guarded dry run and
+apply, interrupted-transaction recovery, post-rollback smoke, and separate
+source-control revert. Rollback changes application pointers only; it does not
+downgrade Alembic. Never bypass a missing or mismatched rollback receipt,
+dependency-freeze proof, lock or target identity.
 
 A successful `Platform security and build` run for a push to the current `dev` HEAD continues automatically into production deployment; ignore stale successes.
 Failed or missing gates stop the chain before production side effects.
