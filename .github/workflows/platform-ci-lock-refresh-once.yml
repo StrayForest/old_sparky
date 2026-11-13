@@ -1,0 +1,149 @@
+name: Platform CI lock refresh (one-time CVE fix)
+
+on:
+  push:
+    branches:
+      - codex/dnspython-cve-2026-128089-20261114
+    paths:
+      - .github/workflows/platform-ci-lock-refresh-once.yml
+      - platform/requirements-ci.in
+      - platform/requirements-ci-locker.lock.txt
+      - platform/requirements-platform.txt
+      - platform/requirements-quality.txt
+      - platform/tools/platform_ci_pip_env.sh
+      - platform/tools/platform_generate_ci_lock.sh
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-ci-lock-refresh-once-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    name: Generate exact-source CI lock and metadata
+    if: github.event_name == 'push' && github.repository == 'StrayForest/old_sparky'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the exact fix-branch push without credentials
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Set up the supported lock-generation interpreter
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+          architecture: x64
+
+      - name: Bind this one-time generator run to its exact source commit
+        shell: bash
+        env:
+          EXPECTED_BASE_SHA: 49159742282e332860a4ba0d00c7d793f37af485
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          test "$GITHUB_EVENT_NAME" = push
+          test "$GITHUB_REF" = "refs/heads/codex/dnspython-cve-2026-128089-20261114"
+          test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
+          test "$EXPECTED_BASE_SHA" = "$(git rev-parse HEAD^1)"
+          test -z "$(git status --porcelain)"
+          test "$(python -c 'import platform, sys; print(f"{sys.version_info[0]}.{sys.version_info[1]} {sys.platform} {platform.machine()}")')" = "3.12 linux x86_64"
+
+      - name: Run the governed hash-locked CI lock generator
+        shell: bash
+        working-directory: platform
+        env:
+          PLATFORM_CI_PYTHON: python
+        run: tools/platform_generate_ci_lock.sh --update
+
+      - name: Validate the generated lock scope and bind its contents
+        shell: bash
+        env:
+          EXPECTED_BASE_SHA: 49159742282e332860a4ba0d00c7d793f37af485
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -I -B - "$RUNNER_TEMP/platform-ci-lock-refresh-receipt.json" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+
+          root = Path.cwd()
+          expected = [
+              "platform/requirements-ci.lock.meta.json",
+              "platform/requirements-ci.lock.txt",
+          ]
+          changed = subprocess.run(
+              ["git", "diff", "--name-only", "--"],
+              cwd=root,
+              check=True,
+              capture_output=True,
+              text=True,
+          ).stdout.splitlines()
+          if sorted(changed) != expected:
+              raise SystemExit("generator changed an unexpected file set")
+          if subprocess.run(["git", "diff", "--check"], cwd=root).returncode:
+              raise SystemExit("generated lock diff has whitespace errors")
+
+          lock_path = root / expected[1]
+          entries = [line for line in lock_path.read_text(encoding="utf-8").splitlines()
+                     if line.lower().startswith("dnspython==")]
+          if len(entries) != 1 or re.fullmatch(
+              r"dnspython==2\.9\.2 --hash=sha256:[0-9a-f]{64}", entries[0]
+          ) is None:
+              raise SystemExit("generated lock does not contain the reviewed dnspython 2.9.2 pin")
+
+          sha = os.environ.get("GITHUB_SHA", "")
+          run_id = os.environ.get("GITHUB_RUN_ID", "")
+          attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+          if re.fullmatch(r"[0-9a-f]{40}", sha) is None:
+              raise SystemExit("workflow source SHA is malformed")
+          if not run_id.isdecimal() or not attempt.isdecimal():
+              raise SystemExit("workflow run identity is malformed")
+          if os.environ.get("EXPECTED_BASE_SHA") != subprocess.run(
+              ["git", "rev-parse", "HEAD^1"], cwd=root, check=True,
+              capture_output=True, text=True,
+          ).stdout.strip():
+              raise SystemExit("generator commit base does not match the reviewed base")
+
+          receipt = {
+              "schema": 1,
+              "repository": os.environ.get("GITHUB_REPOSITORY"),
+              "event": os.environ.get("GITHUB_EVENT_NAME"),
+              "ref": os.environ.get("GITHUB_REF"),
+              "source_sha": sha,
+              "base_sha": os.environ["EXPECTED_BASE_SHA"],
+              "run_id": run_id,
+              "run_attempt": attempt,
+              "python_contract": "3.12 linux x86_64",
+              "files": {
+                  name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+                  for name in expected
+              },
+          }
+          output = Path(sys.argv[1])
+          output.write_text(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n",
+                            encoding="utf-8")
+          output.chmod(0o600)
+          PY
+
+      - name: Upload generated lock, metadata and closed source binding
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-ci-lock-refresh-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            platform/requirements-ci.lock.txt
+            platform/requirements-ci.lock.meta.json
+            ${{ runner.temp }}/platform-ci-lock-refresh-receipt.json
+          if-no-files-found: error
+          retention-days: 3
