@@ -709,7 +709,9 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
         self.assertEqual(positions, sorted(positions))
         for source in (launch, userqa):
             self.assertIn("queue: max", source)
+            self.assertEqual(source.count("queue:"), 1)
             self.assertIn("cancel-in-progress: false", source)
+        self.assertEqual(successor.count("queue:"), 1)
         self.assertIn("platform-postdeploy-live-qa-child-public-", successor)
         self.assertIn("platform-postdeploy-live-qa-child-user-qa-", successor)
 

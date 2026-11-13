@@ -91,14 +91,6 @@ PLAYWRIGHT_BROWSERS_PATH="$BUILD_DIR/browsers" \
 # dependency, so run them once in their dedicated runner.
 "$TOOLS_DIR/platform_web_npm.sh" run test:source-contract
 
-# The smoke and participant contours remain separate Playwright runs with
-# separate API server processes and server environments.  They consume the
-# same immutable standalone build sequentially, which removes the proven
-# duplicate Next build without sharing a running server or a database.
-PLAYWRIGHT_BROWSERS_PATH="$BUILD_DIR/browsers" \
-PLATFORM_WEB_HERMETIC_BUILD_DIR="$BUILD_DIR" \
-  "$TOOLS_DIR/platform_web_npm.sh" run test:smoke
-
 # This privacy-closed full-stack auth contour uses the same immutable Next
 # build, plus the job's disposable PostgreSQL/Redis services and test-only
 # loopback Siteverify/SMTP fixtures. Its control token, output and captured
@@ -111,6 +103,14 @@ PLATFORM_MEDIA_STAGING_DIR="$BUILD_DIR/auth-e2e-media-staging" \
 PLAYWRIGHT_BROWSERS_PATH="$BUILD_DIR/browsers" \
 PLATFORM_WEB_HERMETIC_BUILD_DIR="$BUILD_DIR" \
   "$TOOLS_DIR/platform_web_npm.sh" run test:auth-lifecycle-e2e
+
+# The smoke and participant contours remain separate Playwright runs with
+# separate API server processes and server environments. They consume the
+# same immutable standalone build sequentially, which removes the proven
+# duplicate Next build without sharing a running server or a database.
+PLAYWRIGHT_BROWSERS_PATH="$BUILD_DIR/browsers" \
+PLATFORM_WEB_HERMETIC_BUILD_DIR="$BUILD_DIR" \
+  "$TOOLS_DIR/platform_web_npm.sh" run test:smoke
 
 PLAYWRIGHT_BROWSERS_PATH="$BUILD_DIR/browsers" \
 PLATFORM_WEB_HERMETIC_BUILD_DIR="$BUILD_DIR" \

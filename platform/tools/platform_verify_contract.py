@@ -1881,13 +1881,27 @@ def actionlint_workflow_issues(security_text: str) -> list[str]:
         ("runner.environment", "runner-context fixture regression"),
         ('"*.yml"', "YAML workflow discovery"),
         ('"*.yaml"', "YAML workflow discovery"),
-        ("_filter_unsupported_queue_diagnostics", "narrow unsupported queue diagnostic filter"),
-        ("QUEUE_COMPATIBILITY_DIAGNOSTIC", "exact actionlint queue diagnostic match"),
-        ("expected one of", "actionlint concurrency queue compatibility wording"),
-        ("platform-postdeploy-live-qa", "post-deploy queue diagnostic scope"),
     ):
         if marker not in wrapper_source:
             issues.append(f"actionlint wrapper must retain {description}")
+    actionlint_config_path = PLATFORM_ROOT.parent / ".github" / "actionlint.yaml"
+    try:
+        actionlint_config = actionlint_config_path.read_text(encoding="utf-8")
+    except OSError:
+        issues.append("actionlint must retain the narrow pinned-queue compatibility config")
+    else:
+        for filename in (
+            "platform-live-launch.yml",
+            "platform-live-user-qa.yml",
+            "platform-postdeploy-live-qa.yml",
+        ):
+            if f".github/workflows/{filename}:" not in actionlint_config:
+                issues.append(f"actionlint queue compatibility config is missing {filename}")
+        exact_queue_pattern = 'unexpected key "queue" for "concurrency" section\\. expected one of "cancel-in-progress", "group"'
+        if actionlint_config.count("ignore:") != 3:
+            issues.append("actionlint queue compatibility config must contain exactly three path-scoped ignores")
+        if actionlint_config.count(exact_queue_pattern) != 3:
+            issues.append("actionlint queue compatibility config must match only its exact diagnostic")
     return issues
 
 

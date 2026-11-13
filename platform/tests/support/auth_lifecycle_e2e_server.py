@@ -50,6 +50,36 @@ TEST_TOKENS = frozenset(
         "missing-action",
     }
 )
+STARTUP_STAGE = "startup"
+
+
+def _startup_stage(stage: str) -> None:
+    global STARTUP_STAGE
+    STARTUP_STAGE = stage
+
+
+def _startup_failure_category(error: Exception) -> str:
+    """Return a closed error class; never expose exception text or data."""
+
+    if isinstance(error, ModuleNotFoundError):
+        return "module-missing"
+    if isinstance(error, ImportError):
+        return "module-import"
+    if isinstance(error, PermissionError):
+        return "permission"
+    if isinstance(error, FileNotFoundError):
+        return "path-missing"
+    if isinstance(error, OSError):
+        return "os-error"
+    if isinstance(error, ValueError):
+        return "value-error"
+    if isinstance(error, TypeError):
+        return "type-error"
+    if isinstance(error, NameError):
+        return "name-error"
+    if isinstance(error, RuntimeError):
+        return "guard-or-runtime"
+    return "unexpected"
 
 
 def _require(condition: bool, message: str) -> None:
@@ -329,7 +359,9 @@ def _control_secret_file(path: Path) -> str:
 
 
 async def serve() -> None:
+    _startup_stage("environment")
     validate_environment()
+    _startup_stage("smtp-capture")
     smtp = LocalSmtpCapture()
     await smtp.start()
     os.environ["PLATFORM_SUPPORT_SMTP_HOST"] = "127.0.0.1"
@@ -339,6 +371,7 @@ async def serve() -> None:
     os.environ["PLATFORM_EMAIL_SENDER_EMAIL"] = "Auth E2E <noreply@example.test>"
     os.environ["PLATFORM_SUPPORT_SMTP_SENDER_EMAIL"] = ""
 
+    _startup_stage("application-import")
     from fastapi import HTTPException, Request
     from fastapi.responses import JSONResponse
     import httpx
@@ -361,6 +394,7 @@ async def serve() -> None:
         verify_turnstile_token,
     )
 
+    _startup_stage("settings-validation")
     settings = __import__(
         "python_packages.platform_infra.config", fromlist=["get_settings"]
     ).get_settings()
@@ -375,6 +409,7 @@ async def serve() -> None:
 
     # The checked test service must begin empty. Never flush shared data to make
     # the fixture fit; fail before exposing the API if ownership is ambiguous.
+    _startup_stage("service-isolation")
     await assert_empty_services()
 
     state: dict[str, int] = {
@@ -448,9 +483,11 @@ async def serve() -> None:
 
         await asyncio.to_thread(_send_email_message_sync, settings_arg, message)
 
+    _startup_stage("app-creation")
     auth_routes.verify_turnstile_token = fixture_verify
     auth_mail.send_email_message = capture_email
     app = create_app()
+    _startup_stage("control-file")
     control_token = _control_secret_file(Path(os.environ[CONTROL_ENV]))
 
     def require_control(request: Request) -> None:
@@ -557,6 +594,15 @@ async def serve() -> None:
             }
         )
 
+    # These handlers are nested so they can close over the fixture state.
+    # With postponed annotations, FastAPI resolves their annotations against
+    # module globals; Request and JSONResponse were imported only inside
+    # serve(), so bind the concrete types before route registration.
+    for endpoint in (mailbox, fixture_stats, cleanup_fixture):
+        endpoint.__annotations__["request"] = Request
+        endpoint.__annotations__["return"] = JSONResponse
+
+    _startup_stage("route-registration")
     app.add_api_route("/__auth_e2e__/mail/{purpose}", mailbox, methods=["GET"], include_in_schema=False)
     app.add_api_route("/__auth_e2e__/stats", fixture_stats, methods=["GET"], include_in_schema=False)
     app.add_api_route("/__auth_e2e__/cleanup", cleanup_fixture, methods=["POST"], include_in_schema=False)
@@ -572,7 +618,10 @@ async def serve() -> None:
     )
     server = uvicorn.Server(config)
     try:
+        _startup_stage("uvicorn-startup")
         await server.serve()
+        if not server.started:
+            raise RuntimeError("auth E2E API server did not complete startup")
     finally:
         await smtp.close()
 
@@ -581,6 +630,7 @@ def main() -> int:
     logging.disable(logging.CRITICAL)
     try:
         if sys.argv[1:] == ["--preflight"]:
+            _startup_stage("preflight")
             validate_environment(require_control_file=False)
             asyncio.run(assert_empty_services())
         elif not sys.argv[1:]:
@@ -588,8 +638,13 @@ def main() -> int:
         else:
             print("AUTH_E2E_API status=invalid-args", file=sys.stderr)
             return 2
-    except (OSError, RuntimeError, ValueError, TypeError):
-        print("AUTH_E2E_API status=failed", file=sys.stderr)
+    except Exception as error:
+        category = _startup_failure_category(error)
+        marker = (
+            f"AUTH_E2E_API_STARTUP status=failed stage={STARTUP_STAGE} "
+            f"category={category}"
+        )
+        print(marker, file=sys.stderr, flush=True)
         return 1
     return 0
 

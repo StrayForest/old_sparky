@@ -20,6 +20,14 @@ const SAFE_ERROR_CODES = new Set([
   "ERR_REQUIRE_ESM",
   "ERR_UNKNOWN_FILE_EXTENSION"
 ]);
+const API_STARTUP_PATTERN = new RegExp(
+  "^AUTH_E2E_API_STARTUP status=failed stage=("
+    + "environment|smtp-capture|application-import|settings-validation|service-isolation"
+    + "|app-creation|route-registration|control-file|uvicorn-startup|preflight|startup"
+    + ") category=(module-missing|module-import|permission|path-missing|os-error"
+    + "|value-error|type-error|name-error|guard-or-runtime|unexpected)$",
+  "mu"
+);
 
 function errorCategory(error) {
   const message = typeof error?.message === "string" ? error.message : "";
@@ -133,7 +141,14 @@ class AuthE2ESafeReporter {
 
   onStdErr(chunk) {
     const value = String(chunk);
-    if (/AUTH_E2E_API_LAUNCH status=(?:missing-config|failed)/u.test(value)) {
+    const apiStartup = API_STARTUP_PATTERN.exec(value);
+    if (apiStartup) {
+      this.observedServerFailure = "api";
+      this.observedServerOutputComponent = "api";
+      if (this.reportedApiStartup) return;
+      this.reportedApiStartup = true;
+      process.stdout.write(`AUTH_E2E_API_STARTUP stage=${apiStartup[1]} category=${apiStartup[2]}\n`);
+    } else if (/AUTH_E2E_API_LAUNCH status=(?:missing-config|failed)/u.test(value)) {
       this.observedServerFailure = "api";
       this.observedServerOutputComponent = "api";
     } else if (/AUTH_E2E_NEXT_LAUNCH status=(?:missing-config|failed)/u.test(value)) {

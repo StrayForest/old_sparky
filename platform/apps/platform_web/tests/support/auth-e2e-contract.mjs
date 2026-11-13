@@ -86,7 +86,15 @@ assert.equal(childEnvSource.includes("const API_NAMES = ["), true);
 
 assert.match(apiLauncher, /apiChildEnv\(\)/u);
 assert.match(nextLauncher, /nextChildEnv\(\)/u);
-assert.match(apiLauncher, /env,\s*stdio:\s*"ignore"/u);
+assert.match(apiLauncher, /env,\s*stdio:\s*\["ignore",\s*"ignore",\s*"pipe"\]/u);
+assert.match(apiLauncher, /safeStartupStages\.has\(match\[1\]\)/u);
+assert.match(apiLauncher, /safeStartupCategories\.has\(match\[2\]\)/u);
+assert.match(server, /AUTH_E2E_API_STARTUP status=failed stage=\{STARTUP_STAGE\}/u);
+assert.match(server, /f"category=\{category\}"/u);
+assert.match(server, /endpoint\.__annotations__\["request"\]\s*=\s*Request/u);
+assert.match(server, /endpoint\.__annotations__\["return"\]\s*=\s*JSONResponse/u);
+assert.match(server, /_startup_stage\("route-registration"\)/u);
+assert.match(server, /if str\(PLATFORM_ROOT\) not in sys\.path:/u);
 assert.match(apiLauncher, /apiChildEnv\(\)/u);
 assert.doesNotMatch(apiLauncher, /env\s*:\s*\{\s*\.\.\.process\.env/u);
 assert.match(nextLauncher, /nextChildEnv\(\)/u);
@@ -232,6 +240,13 @@ const namedServerError = exerciseReporter({
 });
 assert.deepEqual(namedServerError.end, { status: "failed" });
 assert.match(namedServerError.output, /AUTH_E2E_SETUP_ERROR category=webserver-setup component=next source=unknown line=0/u);
+const apiStartupError = exerciseReporter({
+  serverOutput: "AUTH_E2E_API_STARTUP status=failed stage=route-registration category=name-error\n",
+  globalError: true
+});
+assert.deepEqual(apiStartupError.end, { status: "failed" });
+assert.match(apiStartupError.output, /AUTH_E2E_API_STARTUP stage=route-registration category=name-error/u);
+assert.match(apiStartupError.output, /AUTH_E2E_SETUP_ERROR category=webserver-setup component=api source=unknown line=0/u);
 
 assert.match(server, /os\.environ\.get\("GITHUB_ACTIONS"\) == "true"/u);
 assert.match(server, /database_url\.path\.lstrip\("\/"\) == "platformdb_test"/u);
@@ -252,8 +267,10 @@ assert.match(spec, /cleanupComplete/u);
 const discoveryPosition = hermetic.indexOf("run test:auth-lifecycle-e2e -- --list");
 const buildPosition = hermetic.indexOf("run build");
 const journeyPosition = hermetic.lastIndexOf("run test:auth-lifecycle-e2e");
+const smokePosition = hermetic.indexOf("run test:smoke");
 assert.ok(discoveryPosition >= 0 && discoveryPosition < buildPosition);
 assert.ok(journeyPosition > buildPosition && journeyPosition !== discoveryPosition);
+assert.ok(journeyPosition < smokePosition);
 assert.equal((hermetic.match(/PLATFORM_AUTH_E2E_DISCOVERY_ONLY=1/gu) ?? []).length, 1);
 assert.match(hermetic, /PLATFORM_AUTH_E2E_DISCOVERY_ONLY=1[\s\\\n]*"\$TOOLS_DIR\/platform_web_npm\.sh" run test:auth-lifecycle-e2e -- --list/u);
 assert.match(hermetic, /run test:auth-lifecycle-e2e/u);

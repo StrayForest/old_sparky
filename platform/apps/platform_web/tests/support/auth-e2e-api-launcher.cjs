@@ -22,7 +22,48 @@ try {
 const child = spawn(python, ["-I", "-B", server], {
   cwd: platformRoot,
   env,
-  stdio: "ignore"
+  stdio: ["ignore", "ignore", "pipe"]
+});
+const safeStartupStages = new Set([
+  "environment",
+  "smtp-capture",
+  "application-import",
+  "settings-validation",
+  "service-isolation",
+  "app-creation",
+  "route-registration",
+  "control-file",
+  "uvicorn-startup",
+  "preflight",
+  "startup"
+]);
+const safeStartupCategories = new Set([
+  "module-missing",
+  "module-import",
+  "permission",
+  "path-missing",
+  "os-error",
+  "value-error",
+  "type-error",
+  "name-error",
+  "guard-or-runtime",
+  "unexpected"
+]);
+let stderrBuffer = "";
+child.stderr.on("data", (chunk) => {
+  stderrBuffer += chunk.toString("utf8");
+  if (stderrBuffer.length > 512) stderrBuffer = "";
+  let newline = stderrBuffer.indexOf("\n");
+  while (newline >= 0) {
+    const line = stderrBuffer.slice(0, newline).replace(/\r$/u, "");
+    stderrBuffer = stderrBuffer.slice(newline + 1);
+    const match = /^AUTH_E2E_API_STARTUP status=failed stage=([a-z-]+) category=([a-z-]+)$/u
+      .exec(line);
+    if (match && safeStartupStages.has(match[1]) && safeStartupCategories.has(match[2])) {
+      process.stderr.write(`${line}\n`);
+    }
+    newline = stderrBuffer.indexOf("\n");
+  }
 });
 let stopping = false;
 const stop = (signal) => {

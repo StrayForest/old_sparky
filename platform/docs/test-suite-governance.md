@@ -298,7 +298,7 @@ The `platform-codex-archive-retention-build.yml` workflow is a read-only build a
 The existing SSH-key contract generates an ephemeral OpenSSH key and validates its multiline private-key format with `/usr/bin/ssh-keygen`; that executable is a required test prerequisite. Negative configuration cases assert only closed reason codes and the existing exit contract, never secret values, digests or public-key output. If the parser executable is unavailable, report `LOCAL GATE BLOCKED` rather than skipping the case or substituting a mock parser.
 The `verification-contract` gate runs pinned actionlint 1.7.12 on every workflow YAML file with shellcheck and pyflakes disabled; owner tests exercise positive and negative `runner.environment` context fixtures. Security CI downloads the official archive into private `RUNNER_TEMP`, checks its fixed SHA-256, and verifies its GitHub attestation against the exact release tag and [upstream release workflow](https://github.com/rhysd/actionlint/blob/v1.7.12/.github/workflows/release.yaml) before extraction or execution. The [installation guide](https://github.com/rhysd/actionlint/blob/v1.7.12/docs/install.md) and [GitHub CLI attestation command](https://cli.github.com/manual/gh_attestation_verify) document this verification; a missing exact local binary is `LOCAL GATE BLOCKED`, never a skipped workflow check.
 
-GitHub documents native FIFO concurrency with `queue: max` in its [workflow concurrency guide](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency). Pinned actionlint 1.7.12 does not recognize that key ([upstream issue](https://github.com/rhysd/actionlint/issues/746)), so the wrapper filters only its exact syntax diagnostic for the public launch, UserQA and post-deploy sequencer workflows. The workflow contract independently requires `queue: max` and `cancel-in-progress: false` on all three; every other actionlint diagnostic remains fatal.
+GitHub documents native FIFO concurrency with `queue: max` in its [workflow concurrency guide](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency). Pinned actionlint 1.7.12 does not recognize that key ([upstream issue](https://github.com/rhysd/actionlint/issues/746)), so `.github/actionlint.yaml` ignores its exact syntax diagnostic only for the public launch, UserQA and post-deploy sequencer workflows. The workflow contract independently requires exactly one `queue: max` and `cancel-in-progress: false` on each workflow; every other actionlint diagnostic remains fatal.
 The same gate invokes `host_tools_candidate_workflow_issues()` so default-branch guards, narrow permissions, pinned actions, data-only candidate handling, isolated-Python use, TOCTOU rechecks and production artifact isolation fail closed. A base-reachable pin is a successful no-op; only a novel eligible pin reaches build, attestation and upload. `test_platform_noop_source_binding` belongs to `backend-tool-contract` and covers the closed no-op receipt, distinct runner/application SHA binding, authenticated artifact metadata, bounded archive extraction and redirect handling without production access. Its output is review evidence only, not production authority.
 Production workflows must not consume the candidate workflow's artifact prefixes.
 The handoff context keeps the triggering PR source head **E** separate from
@@ -397,11 +397,11 @@ The web package has three explicit deterministic owners. The
 [`playwright.source-contract.config.ts`](../apps/platform_web/playwright.source-contract.config.ts)
 must not define `webServer` or boot an API/browser server. The
 [`platform_web_hermetic.sh`](../tools/platform_web_hermetic.sh)
-runner builds the standalone Next artifact once in a temporary directory,
-then runs source-contract, smoke and participant suites from that same
-immutable build. Smoke and participant runs are separate and sequential; each
-starts fresh API/web processes with `reuseExistingServer: false`, so no
-ambient server, browser or database state is reused.
+runner performs Playwright `--list` discovery, builds the standalone Next
+artifact once, then runs source-contract, required auth lifecycle E2E, smoke
+and participant suites from that build. Auth precedes smoke; smoke and
+participant are separate runs with fresh API/web processes and
+`reuseExistingServer: false`, so no ambient server/browser/database is reused.
 
 The responsive smoke project owns `desktop`, `wide-1300`, `tablet-820` and
 `mobile-layout` viewports. Responsive specs run in that matrix; the explicit
