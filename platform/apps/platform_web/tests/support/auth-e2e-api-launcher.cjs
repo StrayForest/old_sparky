@@ -7,6 +7,7 @@ const path = require("node:path");
 const { apiChildEnv } = require("./auth-e2e-child-env.cjs");
 const {
   createPythonDiagnosticParser,
+  shouldInitiateChildStop,
   shouldReportEarlyExit
 } = require("./auth-e2e-python-diagnostics.cjs");
 
@@ -44,10 +45,15 @@ child.stderr.on("data", (chunk) => {
 });
 let stopping = false;
 let spawnFailed = false;
+let childExited = false;
 const stop = (signal) => {
-  if (stopping) return;
+  if (!shouldInitiateChildStop({
+    stopping,
+    childExited,
+    exitCode: child.exitCode,
+    signalCode: child.signalCode
+  })) return;
   stopping = true;
-  if (child.exitCode !== null || child.signalCode !== null) return;
   child.kill(signal);
   const force = setTimeout(() => {
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
@@ -56,6 +62,9 @@ const stop = (signal) => {
 };
 process.on("SIGTERM", () => stop("SIGTERM"));
 process.on("SIGINT", () => stop("SIGINT"));
+child.on("exit", () => {
+  childExited = true;
+});
 child.on("error", () => {
   spawnFailed = true;
   process.stderr.write(

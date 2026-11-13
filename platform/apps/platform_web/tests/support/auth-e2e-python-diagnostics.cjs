@@ -1,5 +1,7 @@
 "use strict";
 
+/* eslint @typescript-eslint/no-require-imports: "off" -- This CommonJS parser is test support. */
+
 const path = require("node:path");
 
 const SAFE_STAGES = new Set([
@@ -130,4 +132,12 @@ function shouldReportEarlyExit({ stopping, spawnFailed }) {
   return !stopping && !spawnFailed;
 }
 
-module.exports = { createPythonDiagnosticParser, shouldReportEarlyExit };
+function shouldInitiateChildStop({ stopping, childExited, exitCode, signalCode }) {
+  return !stopping && !childExited && exitCode === null && signalCode === null;
+}
+
+module.exports = {
+  createPythonDiagnosticParser,
+  shouldInitiateChildStop,
+  shouldReportEarlyExit
+};

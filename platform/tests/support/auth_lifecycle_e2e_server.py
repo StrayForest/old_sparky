@@ -416,7 +416,9 @@ async def serve() -> None:
     settings = __import__(
         "python_packages.platform_infra.config", fromlist=["get_settings"]
     ).get_settings()
-    validate_environment()
+    # The full environment guard ran before installing the local SMTP fixture.
+    # Re-running it here would mistake the fixture sender address for a
+    # configured provider sender.
     _require(settings.platform_environment == "test", "auth E2E settings mode changed")
     _require(settings.platform_turnstile_mode == "always", "auth E2E Turnstile mode changed")
     _require(settings.platform_turnstile_secret_key == SITE_SECRET, "auth E2E secret changed")

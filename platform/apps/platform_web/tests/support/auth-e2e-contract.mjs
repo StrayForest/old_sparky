@@ -25,7 +25,11 @@ const diagnosticsSource = read("platform/apps/platform_web/tests/support/auth-e2
 const require = createRequire(import.meta.url);
 const { apiChildEnv, nextChildEnv } = require("./auth-e2e-child-env.cjs");
 const AuthE2ESafeReporter = require("./auth-e2e-safe-reporter.cjs");
-const { createPythonDiagnosticParser, shouldReportEarlyExit } =
+const {
+  createPythonDiagnosticParser,
+  shouldInitiateChildStop,
+  shouldReportEarlyExit
+} =
   require("./auth-e2e-python-diagnostics.cjs");
 const parentOnly = {
   PATH: process.env.PATH || "/usr/bin:/bin",
@@ -98,10 +102,17 @@ assert.match(server, /f"category=\{category\}"/u);
 assert.match(server, /endpoint\.__annotations__\["request"\]\s*=\s*Request/u);
 assert.match(server, /endpoint\.__annotations__\["return"\]\s*=\s*JSONResponse/u);
 assert.match(server, /_startup_stage\("route-registration"\)/u);
+const apiServeSource = server.slice(server.indexOf("async def serve()"), server.indexOf("def main()"));
+assert.equal((apiServeSource.match(/validate_environment\(\)/gu) ?? []).length, 1);
+assert.ok(apiServeSource.indexOf("validate_environment()") < apiServeSource.indexOf("LocalSmtpCapture()"));
+assert.match(apiServeSource, /os\.environ\["PLATFORM_EMAIL_SENDER_EMAIL"\]\s*=\s*"Auth E2E/u);
+assert.match(apiServeSource, /_require\(settings\.platform_support_smtp_host == "127\.0\.0\.1"/u);
 assert.match(server, /if str\(PLATFORM_ROOT\) not in sys\.path:/u);
 assert.match(server, /AUTH_E2E_API_PROGRESS stage=\{stage\}/u);
 assert.match(apiLauncher, /createPythonDiagnosticParser\(platformRoot\)/u);
 assert.match(apiLauncher, /shouldReportEarlyExit\(\{ stopping, spawnFailed \}\)/u);
+assert.match(apiLauncher, /shouldInitiateChildStop\(/u);
+assert.match(apiLauncher, /child\.on\("exit"/u);
 assert.match(apiLauncher, /child\.on\("close"/u);
 assert.match(diagnosticsSource, /AUTH_E2E_API_EXIT status=early stage=/u);
 assert.doesNotMatch(diagnosticsSource, /process\.stderr\.write\(chunk|console\.(?:log|error)\(line/u);
@@ -324,6 +335,24 @@ assert.equal(shouldReportEarlyExit({ stopping: false, spawnFailed: false }), tru
 assert.equal(shouldReportEarlyExit({ stopping: true, spawnFailed: false }), false);
 assert.equal(shouldReportEarlyExit({ stopping: false, spawnFailed: true }), false);
 assert.equal(shouldReportEarlyExit({ stopping: false, spawnFailed: false }), true);
+assert.equal(shouldInitiateChildStop({
+  stopping: false,
+  childExited: false,
+  exitCode: null,
+  signalCode: null
+}), true);
+assert.equal(shouldInitiateChildStop({
+  stopping: false,
+  childExited: true,
+  exitCode: 0,
+  signalCode: null
+}), false);
+assert.equal(shouldInitiateChildStop({
+  stopping: true,
+  childExited: false,
+  exitCode: null,
+  signalCode: null
+}), false);
 
 assert.match(server, /os\.environ\.get\("GITHUB_ACTIONS"\) == "true"/u);
 assert.match(server, /database_url\.path\.lstrip\("\/"\) == "platformdb_test"/u);
