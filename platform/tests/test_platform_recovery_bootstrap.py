@@ -5728,12 +5728,23 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         )
         cumulative_deploy = baseline.classify_cumulative_baseline(
             incremental_recovery,
-            pure_bootstrap_paths + ["platform/apps/platform_api/app/main.py"],
+            pure_bootstrap_paths
+            + [
+                "platform/apps/platform_api/app/main.py",
+                "platform/tools/platform_build_release.sh",
+            ],
             expected_target_sha="a" * 40,
         )
         self.assertFalse(cumulative_deploy["no_op"])
-        self.assertFalse(
-            baseline.validate_cumulative_reconcile_route(cumulative_deploy)["no_op"]
+        self.assertTrue(cumulative_deploy["manifest"]["deployable"])
+        self.assertEqual(
+            cumulative_deploy["manifest"]["expected_gates"],
+            list(classifier.FULL_GATE_IDS),
+        )
+        self.assertTrue(cumulative_deploy["manifest"]["runtime_sensitive"])
+        self.assertEqual(
+            baseline.validate_cumulative_reconcile_route(cumulative_deploy),
+            {"no_op": False, "runtime_required": True},
         )
         backup_gate_start = auto_deploy_source.index(
             "          backup_required=true\n          no_backup_noop_only=false"
@@ -5819,8 +5830,8 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         contract_owner_auto = run_auto_backup_gate(
             contract_owner_manifest, dispatch_mode="baseline-reconcile"
         )
-        self.assertEqual(contract_owner_auto["backup_required"], "false")
-        self.assertEqual(contract_owner_auto["no_backup_noop_only"], "true")
+        self.assertEqual(contract_owner_auto["backup_required"], "true")
+        self.assertEqual(contract_owner_auto["no_backup_noop_only"], "false")
 
         # This is the exact P4-to-candidate cumulative path set. Both test-only
         # contract owners are now in the closed recovery family; an app path
@@ -5864,8 +5875,8 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         auto_noop_decision = run_auto_backup_gate(
             incremental_recovery, dispatch_mode="baseline-reconcile"
         )
-        self.assertEqual(auto_noop_decision["backup_required"], "false")
-        self.assertEqual(auto_noop_decision["no_backup_noop_only"], "true")
+        self.assertEqual(auto_noop_decision["backup_required"], "true")
+        self.assertEqual(auto_noop_decision["no_backup_noop_only"], "false")
         docs_only_route = classifier.classify(
             ["platform/docs/README.md"],
             event="push",
@@ -5888,6 +5899,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         )
         self.assertEqual(candidate_auto_decision["backup_required"], "true")
         self.assertEqual(candidate_auto_decision["no_backup_noop_only"], "false")
+
         for disqualifying_route in (
             "ROUTE_STORAGE_OPERATIONS_ONLY",
             "ROUTE_FALLBACK",
@@ -5919,7 +5931,6 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             '"$ROUTE_CLASS" == "full"',
             '"$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "true"',
             '"$ROUTE_CANDIDATE_PACKAGING_ONLY" == "false"',
-            '"$ROUTE_DOCS_ONLY" == "false"',
             '"$ROUTE_STORAGE_OPERATIONS_ONLY" == "false"',
             '"$ROUTE_OUT_OF_SCOPE_ONLY" == "false"',
             '"$ROUTE_FALLBACK" == "false"',
@@ -5928,12 +5939,8 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         self.assertIn('inputs.no_backup_noop_only != true', deploy_workflow_source)
         self.assertIn('no_backup_noop_only == "true"', deploy_workflow_source)
         self.assertIn(
-            'incremental.get("reason") == baseline_contract.RECOVERY_BOOTSTRAP_REASON',
-            deploy_workflow_source,
-        )
-        self.assertIn(
             "no_backup_noop_only:\n"
-            '        description: "Require an authenticated cumulative no-op because the automatic caller skipped backup"\n'
+            '        description: "Require an authenticated cumulative docs-only no-op because AUTO skipped backup"\n'
             "        required: false\n"
             "        default: false\n"
             "        type: boolean",
@@ -5990,12 +5997,6 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"NO_BACKUP_NOOP_ONLY": flag}):
                 exec(compile(no_backup_guard, "deploy-workflow-noop-guard", "exec"), namespace)
 
-        execute_no_backup_guard(
-            incremental_recovery,
-            no_op=True,
-            runtime_required=False,
-            flag="true",
-        )
         docs_incremental = classifier.classify(
             ["platform/docs/README.md"],
             event="push",
@@ -6021,6 +6022,13 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             execute_no_backup_guard(
                 incremental_recovery,
+                no_op=True,
+                runtime_required=False,
+                flag="true",
+            )
+        with self.assertRaises(SystemExit):
+            execute_no_backup_guard(
+                incremental_recovery,
                 no_op=False,
                 runtime_required=True,
                 flag="true",
@@ -6039,6 +6047,12 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 runtime_required=False,
                 flag="true",
             )
+        execute_no_backup_guard(
+            incremental_recovery,
+            no_op=True,
+            runtime_required=False,
+            flag="false",
+        )
         execute_no_backup_guard(
             incremental_recovery,
             no_op=False,

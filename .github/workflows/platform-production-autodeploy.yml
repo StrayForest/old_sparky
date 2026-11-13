@@ -778,21 +778,6 @@ jobs:
             # to stop unless that proof yields a no-op receipt.
             backup_required=false
             no_backup_noop_only=true
-          elif [[ "$dispatch_mode" == "baseline-reconcile" \
-            && "$ROUTE_CLASS" == "full" \
-            && "$ROUTE_DEPLOYABLE" == "false" \
-            && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "true" \
-            && "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "false" \
-            && "$ROUTE_DOCS_ONLY" == "false" \
-            && "$ROUTE_STORAGE_OPERATIONS_ONLY" == "false" \
-            && "$ROUTE_OUT_OF_SCOPE_ONLY" == "false" \
-            && "$ROUTE_FALLBACK" == "false" ]]; then
-            # This incremental route is recovery-only, but its cumulative
-            # range may include app changes. The child is told to require an
-            # authenticated cumulative no-op before any release build; if
-            # that fails, it stops and a later deployable source needs backup.
-            backup_required=false
-            no_backup_noop_only=true
           fi
           echo "backup_required=$backup_required" >> "$GITHUB_OUTPUT"
           echo "no_backup_noop_only=$no_backup_noop_only" >> "$GITHUB_OUTPUT"
@@ -1170,14 +1155,11 @@ jobs:
                 [[ "$NO_BACKUP_NOOP_ONLY" == "true" \
                   && "$ROUTE_FALLBACK" == "false" \
                   && "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "false" \
+                  && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "false" \
                   && "$ROUTE_STORAGE_OPERATIONS_ONLY" == "false" \
                   && "$ROUTE_OUT_OF_SCOPE_ONLY" == "false" \
                   && ( ( "$ROUTE_CLASS" == "docs-only" \
-                      && "$ROUTE_DOCS_ONLY" == "true" \
-                      && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "false" ) \
-                    || ( "$ROUTE_CLASS" == "full" \
-                      && "$ROUTE_DOCS_ONLY" == "false" \
-                      && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "true" ) ) ]] || {
+                      && "$ROUTE_DOCS_ONLY" == "true" ) ) ]] || {
                   echo "No-backup baseline reconciliation requires an exact closed no-op-only route." >&2; exit 1;
                 }
               else
