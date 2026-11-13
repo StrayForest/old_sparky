@@ -1202,7 +1202,7 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         backup_policy = 'dispatch_mode="$DISPATCH_MODE"\n' + gate_script[policy_start:policy_end]
         route_cases = (
             ("deploy", "full", "true", "false", "false", "false", "false", "false", "false", "true", "false"),
-            ("baseline-reconcile", "full", "false", "false", "true", "false", "false", "false", "false", "false", "true"),
+            ("baseline-reconcile", "full", "false", "false", "true", "false", "false", "false", "false", "true", "false"),
             ("baseline-reconcile", "full", "false", "false", "false", "true", "false", "false", "false", "true", "false"),
             ("baseline-reconcile", "docs-only", "false", "true", "false", "false", "false", "false", "false", "false", "true"),
             # Inconsistent docs/recovery flags cannot produce the exemption.
@@ -1279,8 +1279,8 @@ class BackupProbeWorkflowContractTests(unittest.TestCase):
         self.assertNotIn("curl", validation_script)
         dispatch_cases = (
             ("ordinary deploy", "deploy", "full", "true", "false", "false", "false", "false", "false", "true", "false", True),
-            ("recovery no-op", "baseline-reconcile", "full", "false", "false", "true", "false", "false", "false", "false", "true", True),
-            ("recovery no-op flag missing", "baseline-reconcile", "full", "false", "false", "true", "false", "false", "false", "false", "false", False),
+            ("recovery forged no-backup no-op", "baseline-reconcile", "full", "false", "false", "true", "false", "false", "false", "false", "true", False),
+            ("recovery no-backup flag missing", "baseline-reconcile", "full", "false", "false", "true", "false", "false", "false", "false", "false", False),
             ("recovery requires backup", "baseline-reconcile", "full", "false", "false", "true", "false", "false", "false", "true", "false", True),
             ("candidate reconcile", "baseline-reconcile", "full", "false", "false", "false", "true", "false", "false", "true", "false", True),
             ("exact docs no-op", "baseline-reconcile", "docs-only", "false", "true", "false", "false", "false", "false", "false", "true", True),

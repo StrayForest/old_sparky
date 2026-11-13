@@ -190,8 +190,8 @@ is not the CI or release reproducibility contract.
 5. Add regression coverage before broad gates. For async UI mutations, cover duplicate-submit, stale-response and editable-draft races when applicable; permission-sensitive UI must consume backend capabilities rather than infer access from visibility or presentation state.
 6. Remove replaced imports, CSS, mocks, routes and stale documentation.
 7. Push the coherent reviewed package and use GitHub Actions as the release verification authority. Local checks may help diagnose a failure but are not the normal production gate.
-8. `Platform security and build` always runs its fail-closed classifier. A strict `platform/docs/**` change runs only `docs` and `verification-contract`; an out-of-scope change runs the contract check; unknown/global/dependency/config/migration/workflow/registry changes use all deterministic gates. Trusted candidate-packaging-only changes also use all deterministic gates but set `deployable=false`; that incremental manifest grants no release authority by itself. AUTO may authenticate the full active-baseline-to-target range and continue a cumulative deployable app route; a pure candidate-packaging range is a no-op.
-9. For production-bound work merged or pushed to `dev`, wait for the exact-SHA `Platform security and build` push run. `Platform production auto-deploy` downloads and validates that exact classifier artifact. Deployable full routes proceed through ordinary deployment; candidate-packaging incremental routes enter authenticated baseline reconciliation, which requires the source-bound backup and reclassifies the complete baseline-to-target range before allowing an app release. Other valid CI-only routes follow their documented no-op behavior.
+8. `Platform security and build` always runs its fail-closed classifier. A strict `platform/docs/**` change runs only `docs` and `verification-contract`; an out-of-scope change runs the contract check; unknown/global/dependency/config/migration/workflow/registry changes use all deterministic gates. Trusted candidate-packaging-only and recovery-bootstrap-only changes also use all deterministic gates but set `deployable=false`; neither incremental manifest grants release authority by itself. AUTO authenticates the full active-baseline-to-target range and can continue a cumulative deployable app route. Pure candidate-packaging or recovery-bootstrap ranges are no-ops.
+9. For production-bound work merged or pushed to `dev`, wait for the exact-SHA `Platform security and build` push run. `Platform production auto-deploy` downloads and validates that exact classifier artifact. Deployable full routes proceed through ordinary deployment; candidate-packaging and recovery-bootstrap incremental routes enter authenticated baseline reconciliation, require the source-bound backup and reclassify the complete baseline-to-target range before allowing an app release. Strict docs-only reconciliation is the sole no-backup exception; other valid CI-only routes follow their documented no-op behavior.
 10. Follow the deployment runbook and the [release state machine](release-state-machine.md) through live validation. Do not manually dispatch production for the normal `dev` path and do not call the low-level release installer directly.
 11. Commit each coherent verified change/package and push it to the matching GitHub branch before handoff unless explicitly requested otherwise.
 
@@ -212,7 +212,9 @@ list and a valid target SHA, a known platform/workflow path is exactly
 `fallback=false` and all full gates, but set `deployable=false` for both PR and
 trusted push events. Their incremental artifact is non-authorizing; AUTO may
 reclassify the authenticated full baseline-to-target range and release only
-when that cumulative route is itself deployable. Application/runtime/migration/release paths are
+when that cumulative route is itself deployable. Recovery-bootstrap-only
+paths have the same non-deployable incremental authority, but require backup
+before cumulative reconciliation. Application/runtime/migration/release paths are
 deployable only when they are the current `push` to `dev` and pass the exact
 release guard.
 
@@ -331,7 +333,7 @@ the migration gate only when preparing the disposable database for
 For a production-bound `dev` change, final verification is the GitHub chain for the same tested execution SHA:
 
 1. `Platform security and build` succeeds and publishes `platform-security-build=success` plus a classifier artifact whose `target_sha` matches the tested execution SHA; the exact `TESTED_SHA` and pull-request source-head boundary are defined in [test-suite governance](test-suite-governance.md).
-2. `Platform production auto-deploy` accepts that SHA and validates its exact route. Docs-only and out-of-scope routes are no-ops. Candidate-packaging incremental routes use authenticated baseline reconciliation: pure packaging ranges are no-ops, while a deployable cumulative app range proceeds through the backup and normal release gates.
+2. `Platform production auto-deploy` accepts that SHA and validates its exact route. Docs-only and out-of-scope routes are no-ops. Candidate-packaging and recovery-bootstrap incremental routes use authenticated baseline reconciliation with source-bound backup: pure family ranges are no-ops, while a deployable cumulative app range proceeds through the normal release gates.
 3. `Platform production deploy` succeeds, including immutable-artifact validation and live smoke.
 
 Manual `Platform production deploy` remains an operator fallback/read-only preflight tool, not the routine continuation of a successful `dev` push.

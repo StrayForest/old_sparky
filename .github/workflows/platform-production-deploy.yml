@@ -75,7 +75,7 @@ on:
         default: ""
         type: string
       no_backup_noop_only:
-        description: "Require an authenticated cumulative no-op because the automatic caller skipped backup"
+        description: "Require an authenticated cumulative docs-only no-op because AUTO skipped backup"
         required: false
         default: false
         type: boolean
@@ -1844,28 +1844,8 @@ jobs:
                       for path in incremental_route_files
                   )
               )
-              recovery_bootstrap_incremental = bool(
-                  incremental.get("class") == "full"
-                  and incremental.get("expected_gates") == list(baseline_contract.FULL_GATE_IDS)
-                  and incremental.get("fallback") is False
-                  and incremental.get("deployable") is False
-                  and incremental.get("reason") == baseline_contract.RECOVERY_BOOTSTRAP_REASON
-                  and isinstance(incremental_files, list)
-                  and any(
-                      path in baseline_contract.RECOVERY_BOOTSTRAP_FILES
-                      for path in incremental_route_files
-                  )
-                  and all(
-                      isinstance(path, str)
-                      and (
-                          path in baseline_contract.RECOVERY_BOOTSTRAP_FILES
-                          or path.startswith(baseline_contract.DOCS_PREFIX)
-                      )
-                      for path in incremental_route_files
-                  )
-              )
-              if not (docs_only_incremental or recovery_bootstrap_incremental):
-                  raise SystemExit("no-backup input is outside the exact docs or recovery-bootstrap route")
+              if not docs_only_incremental:
+                  raise SystemExit("no-backup input is outside the exact strict docs-only route")
               if not (
                   cumulative_no_op is True
                   and reconcile_route == {"no_op": True, "runtime_required": False}
