@@ -43,7 +43,6 @@ from python_packages.platform_infra.media.hard_delete import (
     purge_deleted_media_metadata,
 )
 from python_packages.platform_infra.models import (
-    AppearanceSettings,
     AuditLog,
     PreprodTestRun,
     Tournament,
