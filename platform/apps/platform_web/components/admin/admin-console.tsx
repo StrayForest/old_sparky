@@ -2,13 +2,11 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Activity, BarChart3, ClipboardList, ExternalLink, LayoutDashboard, Palette, RefreshCcw, ShieldCheck, Trophy, UsersRound } from "lucide-react";
+import { Activity, BarChart3, ClipboardList, ExternalLink, LayoutDashboard, RefreshCcw, ShieldCheck, Trophy, UsersRound } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useI18n } from "@/components/i18n-provider";
 import { AdminAnalytics, AdminOverview, type AdminView } from "@/components/admin/admin-insights";
 import { AdminAuditPage } from "@/components/admin/admin-audit-page";
-import { AdminAppearancePage } from "@/components/admin/admin-appearance-page";
-import "@/components/admin/admin-appearance.css";
 import { AdminPreprodPage } from "@/components/admin/admin-preprod-page";
 import { AdminTournamentsPage } from "@/components/admin/admin-tournaments-page";
 import { AdminUsersPage } from "@/components/admin/admin-users-page";
@@ -148,7 +146,6 @@ export function AdminConsole() {
         <div className="ops-nav-group">{t("admin.new.manageGroup")}</div>
         <NavItem active={activeView === "users"} icon={<UsersRound size={17} />} label={t("admin.new.users")} count={overview.analytics?.users_total ?? overview.users_total} onClick={() => navigate("users")} />
         <NavItem active={activeView === "tournaments"} icon={<Trophy size={17} />} label={t("admin.new.tournaments")} count={overview.analytics?.tournaments_total ?? overview.tournaments_total} onClick={() => navigate("tournaments")} />
-        <NavItem active={activeView === "appearance"} icon={<Palette size={17} />} label={t("admin.appearance.navigation")} onClick={() => navigate("appearance")} />
         <div className="ops-nav-group">{t("admin.new.observeGroup")}</div>
         <NavItem active={activeView === "analytics"} icon={<BarChart3 size={17} />} label={t("admin.new.analytics")} onClick={() => navigate("analytics")} />
         <NavItem active={activeView === "audit"} icon={<ClipboardList size={17} />} label={t("admin.new.audit")} count={overview.analytics?.audit_events_total ?? overview.audit_events_total} onClick={() => navigate("audit")} />
@@ -166,7 +163,6 @@ export function AdminConsole() {
         {activeView === "tournaments" ? <AdminTournamentsPage tournaments={tournaments} filteredTotal={tournamentTotal} selectedSlug={selectedTournamentSlug} filters={tournamentFilters} hasMore={hasMoreTournaments} isFiltering={isFilteringTournaments} isLoadingMore={isLoadingMoreTournaments} isReloading={isRefreshing} pageError={tournamentPageError} enumLabel={enumLabel} formatDate={formatDate} onFiltersChange={setTournamentFilters} onSelect={setSelectedTournamentSlug} onLoadMore={() => void loadMoreTournaments()} onRetry={() => failedTournamentOffset === 0 ? void loadFilteredTournaments(activeTournamentFilters.current, tournamentQueryKey(activeTournamentFilters.current)) : void loadMoreTournaments()} onUpdate={(updated) => setTournaments((current) => current.map((item) => item.id === updated.id ? updated : item))} onDelete={(slug) => { const deleted = tournaments.find((item) => item.slug === slug); setTournaments((current) => current.filter((item) => item.slug !== slug)); setSelectedTournamentSlug(null); setTournamentTotal((current) => Math.max(0, current - 1)); setOverview((current) => current?.analytics ? { ...current, tournaments_total: Math.max(0, current.analytics.tournaments_total - 1), analytics: { ...current.analytics, tournaments_total: Math.max(0, current.analytics.tournaments_total - 1), active_tournaments: deleted && ["registration_open", "registration_closed", "in_progress"].includes(deleted.status) ? Math.max(0, current.analytics.active_tournaments - 1) : current.analytics.active_tournaments } } : current); }} /> : null}
         {activeView === "audit" ? <AdminAuditPage auditLogs={auditLogs} selectedAuditId={selectedAuditId} formatDate={formatDate} onSelect={setSelectedAuditId} /> : null}
         {activeView === "preprod" ? <AdminPreprodPage runs={preprodRuns} currentUser={currentUser} formatDate={formatDate} onReload={loadPreprod} /> : null}
-        {activeView === "appearance" ? <AdminAppearancePage /> : null}
       </main>
     </div>
   </section>;
@@ -174,7 +170,7 @@ export function AdminConsole() {
 
 function NavItem({ active, icon, label, count, onClick }: { active: boolean; icon: ReactNode; label: string; count?: number | null; onClick: () => void }) { return <button className={active ? "ops-nav-item is-active" : "ops-nav-item"} type="button" aria-label={label} title={label} aria-current={active ? "page" : undefined} onClick={onClick}>{icon}<span>{label}</span>{count !== undefined && count !== null ? <small>{count.toLocaleString("ru-RU")}</small> : null}</button>; }
 function AdminState({ title, copy, action }: { title: string; copy: string; action?: ReactNode }) { return <section className="ops-state-page"><div className="ops-state-mark"><ShieldCheck size={22} /></div><h1>{title}</h1><p>{copy}</p>{action ? <div className="ops-state-action">{action}</div> : null}</section>; }
-function viewLabel(view: AdminView, t: (key: string) => string): string { return ({ overview: t("admin.new.overview"), users: t("admin.new.users"), tournaments: t("admin.new.tournaments"), analytics: t("admin.new.analytics"), audit: t("admin.new.audit"), preprod: t("admin.new.preprod"), appearance: t("admin.appearance.navigation") })[view]; }
+function viewLabel(view: AdminView, t: (key: string) => string): string { return ({ overview: t("admin.new.overview"), users: t("admin.new.users"), tournaments: t("admin.new.tournaments"), analytics: t("admin.new.analytics"), audit: t("admin.new.audit"), preprod: t("admin.new.preprod") })[view]; }
 function tournamentListPath(filters: AdminTournamentFilters, offset: number): string { const query = new URLSearchParams({ limit: String(adminTournamentPageSize), offset: String(offset) }); if (filters.search.trim()) query.set("search", filters.search.trim()); if (filters.status !== "all") query.set("status", filters.status); if (filters.visibility !== "all") query.set("visibility", filters.visibility); if (filters.attentionOnly) query.set("attention", "true"); return `/admin/tournaments?${query.toString()}`; }
 function tournamentQueryKey(filters: AdminTournamentFilters): string { return JSON.stringify({ search: filters.search.trim(), status: filters.status, visibility: filters.visibility, attentionOnly: filters.attentionOnly }); }
 function appendUnique(current: PlatformAdminTournament[], incoming: PlatformAdminTournament[]): PlatformAdminTournament[] { const ids = new Set(current.map((item) => item.id)); return [...current, ...incoming.filter((item) => { if (ids.has(item.id)) return false; ids.add(item.id); return true; })]; }

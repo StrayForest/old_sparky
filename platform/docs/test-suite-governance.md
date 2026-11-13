@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform maintainers
-- Last reviewed: 2026-11-12
+- Last reviewed: 2026-11-04
 
 The executable registry at `platform/tools/platform_verify.py` is the single source of truth for verification ownership, commands, environment
 requirements and CI membership. Use `list --json` when tooling needs the
@@ -101,7 +101,7 @@ one-contour ownership, exact IDs and the expected snapshot. Refresh the
 snapshot from `registry_payload()` whenever discovery changes any ID, including
 a new method in an existing module. Before publishing, run the canonical
 catalog tests with `tools/platform_verify.py backend-tool-contract --focused tests.test_platform_backend_test_catalog`, then run the changed test's owner contour through `platform_verify.py`. CI loads only catalog-owned IDs; the
-`backend` gate aggregates these five contours; `test_platform_user_account_read_models.UserAccountReadModelTests` (backend-unit) owns hit/miss, Redis failure, privacy-safe timing, response materialization and `/users/me` DB-release-before-SET behavior. `UserAccountReadModelRedisIntegrationTests.test_real_lua_generation_guard_rejects_stale_and_expired_writers` is the backend-integration exception; it runs the Lua scripts against UUID-owned Redis DB 15 keys and covers generation replacement, invalidation, expiry and legacy-envelope rejection. The same owner covers DB/Redis-free route regressions for exactly-once event finalization and attempted SET timing when writes fail or are cancelled, including final connection-release failure. `test_platform_domain.PlatformDomainTests` owns appearance manifest/derived roles, strict HEX, contrast and the CSS literal guard; `PlatformAdminApiTests` and `PlatformAppearanceRedisIntegrationTests` own admin/public reads, permissions, revision conflicts, audit/persistence and stale-publish behavior.
+`backend` gate aggregates these five contours; `test_platform_user_account_read_models.UserAccountReadModelTests` (backend-unit) owns hit/miss, Redis failure, privacy-safe timing, response materialization and `/users/me` DB-release-before-SET behavior. `UserAccountReadModelRedisIntegrationTests.test_real_lua_generation_guard_rejects_stale_and_expired_writers` is the backend-integration exception; it runs the Lua scripts against UUID-owned Redis DB 15 keys and covers generation replacement, invalidation, expiry and legacy-envelope rejection. The same owner covers DB/Redis-free route regressions for exactly-once event finalization and attempted SET timing when writes fail or are cancelled, including final connection-release failure.
 
 | Catalog contour | Timeout | Shared-resource execution | Ownership boundary |
 | --- | ---: | --- | --- |
@@ -404,7 +404,7 @@ immutable build. Smoke and participant runs are separate and sequential; each
 starts fresh API/web processes with `reuseExistingServer: false`, so no
 ambient server, browser or database state is reused.
 
-The responsive smoke projects own `desktop`, `wide-1300`, `tablet-820` and
+The responsive smoke project owns `desktop`, `wide-1300`, `tablet-820` and
 `mobile-layout` viewports. Responsive specs run in that matrix; the explicit
 desktop-only list in the
 [`playwright.config.ts`](../apps/platform_web/playwright.config.ts)
@@ -414,7 +414,8 @@ its own sequential one-worker contour and explicit desktop/mobile projects in
 Do not infer viewport ownership from a test name or silently add an exclusion;
 update the owning config and its contract test when the matrix changes.
 
-The `platform-routes.spec.ts` suite owns raw SSR (`page.goto()`), SPA URL/DOM and password-login Turnstile coverage: pending login stays alert-free; rejected retries keep actionable errors visible. Appearance home/editor preview screenshots and picker interactions run in responsive projects with local palette tokens; the `appearance-recovery` dependency project runs after every responsive project and exclusively owns singleton fixture writes, public SSR persistence, and low-contrast reload/reset recovery. Screenshots stay outside the repository.
+The `platform-routes.spec.ts` suite owns raw SSR (`page.goto()`), SPA URL/DOM,
+and password-login Turnstile coverage: pending login stays alert-free; rejected retries keep actionable errors visible.
 
 ## Local and GitHub verification
 

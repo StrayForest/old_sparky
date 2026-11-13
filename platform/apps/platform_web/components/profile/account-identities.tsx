@@ -535,7 +535,7 @@ function IdentityStyles() {
       }
 
       .account-email-identity .account-input {
-        color: var(--ui-text);
+        color: var(--ui-text, var(--text-main));
         background: transparent;
       }
 
@@ -548,7 +548,7 @@ function IdentityStyles() {
         align-items: center;
         gap: 11px;
         padding: 0 14px;
-        color: var(--ui-text-soft);
+        color: var(--ui-text-soft, var(--text-soft));
         background: var(--bg-input);
         border: 1px solid var(--border-main);
         border-radius: var(--ui-radius-md, 12px);
@@ -564,10 +564,10 @@ function IdentityStyles() {
 
       .account-steam-link-button:hover,
       .account-steam-link-button:focus-visible {
-        color: var(--ui-text);
+        color: var(--ui-text, var(--text-main));
         background: var(--ui-surface-hover, var(--bg-card-soft));
-        border-color: color-mix(in srgb, var(--ui-primary) 52%, transparent);
-        box-shadow: 0 0 0 3px var(--ui-primary-soft);
+        border-color: rgba(167, 139, 250, .52);
+        box-shadow: 0 0 0 3px rgba(139, 92, 246, .08);
         outline: none;
       }
 
@@ -591,7 +591,7 @@ function IdentityStyles() {
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
-        color: var(--ui-text);
+        color: var(--ui-text, var(--text-main));
         font-variant-numeric: tabular-nums;
       }
 
@@ -602,7 +602,7 @@ function IdentityStyles() {
         display: grid;
         place-items: center;
         padding: 0;
-        color: var(--ui-danger);
+        color: var(--ui-danger, var(--red));
         background: transparent;
         border: 0;
         border-radius: 9px;
@@ -612,15 +612,15 @@ function IdentityStyles() {
 
       .account-identity-unlink:hover,
       .account-identity-unlink:focus-visible {
-        color: var(--ui-danger);
-        background: var(--ui-danger-soft);
+        color: #fff;
+        background: rgba(251, 113, 133, .16);
         outline: none;
       }
 
       .account-identity-message {
         display: block;
         margin-top: 8px;
-        color: var(--ui-danger);
+        color: var(--red);
         font-size: 12px;
         line-height: 1.4;
       }
@@ -628,7 +628,7 @@ function IdentityStyles() {
       .account-identity-hint {
         display: block;
         margin-top: 8px;
-        color: var(--ui-text-muted);
+        color: var(--text-muted, var(--ui-muted, #8e8a82));
         font-size: 12px;
         line-height: 1.4;
       }

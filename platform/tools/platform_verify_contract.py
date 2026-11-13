@@ -2486,27 +2486,6 @@ def collect_issues() -> list[str]:
         for project_name in ("desktop", "wide-1300", "tablet-820", "mobile-layout"):
             if f'name: "{project_name}"' not in web_config:
                 issues.append(f"web hermetic project matrix is missing {project_name}")
-        recovery_project = re.search(
-            r'\{\s*// The public appearance palette is singleton state in the mock API\.'
-            r'.*?name: "appearance-recovery"(?P<body>.*?)\n    \}',
-            web_config,
-            re.DOTALL,
-        )
-        if not recovery_project:
-            issues.append("appearance recovery must have a dedicated Playwright project")
-        else:
-            recovery_body = recovery_project.group("body")
-            required_dependencies = (
-                'dependencies: ["desktop", "wide-1300", "tablet-820", "mobile-layout"]'
-            )
-            if required_dependencies not in recovery_body:
-                issues.append(
-                    "appearance recovery must run after all responsive projects that share its fixture"
-                )
-            if 'testMatch: "**/admin-appearance.spec.ts"' not in recovery_body:
-                issues.append(
-                    "appearance recovery project must exclusively own the stateful appearance spec"
-                )
         for spec_name in (
             "account-email-flow.spec.ts",
             "admin-progressive-tournaments.spec.ts",

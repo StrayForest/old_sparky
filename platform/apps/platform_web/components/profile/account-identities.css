@@ -13,18 +13,18 @@
   display: flex;
   align-items: center;
   overflow: hidden;
-  border: 1px solid var(--ui-border-strong) !important;
+  border: 1px solid var(--ui-border-strong, var(--border-main)) !important;
   border-radius: var(--ui-radius-md, 12px) !important;
 }
 
 .account-form-grid .account-steam-identity .account-steam-link-button {
   justify-content: center !important;
   padding: 0 42px !important;
-  color: var(--ui-text-soft) !important;
+  color: var(--ui-text-soft, var(--text-soft)) !important;
   background:
-    radial-gradient(circle at 12% 18%, color-mix(in srgb, var(--ui-primary) 14%, transparent), transparent 38%),
-    linear-gradient(145deg, color-mix(in srgb, var(--ui-canvas-deep) 98%, transparent), color-mix(in srgb, var(--ui-canvas-deep) 98%, transparent)) !important;
-  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--ui-text) 2.5%, transparent) !important;
+    radial-gradient(circle at 12% 18%, rgba(139, 92, 246, .14), transparent 38%),
+    linear-gradient(145deg, rgba(15, 22, 39, .98), rgba(8, 13, 25, .98)) !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .025) !important;
   font: inherit;
   font-weight: 700;
   text-align: center !important;
@@ -38,7 +38,7 @@
   height: 18px !important;
   margin: 0 !important;
   transform: translateY(-50%) !important;
-  color: var(--ui-text-muted);
+  color: var(--ui-text-muted, var(--text-muted));
 }
 
 .account-form-grid .account-steam-identity .account-steam-link-button > span {
@@ -50,12 +50,12 @@
 
 .account-form-grid .account-steam-identity .account-steam-link-button:hover,
 .account-form-grid .account-steam-identity .account-steam-link-button:focus-visible {
-  color: var(--ui-text) !important;
+  color: var(--ui-text, var(--text-main)) !important;
   background:
-    radial-gradient(circle at 12% 18%, color-mix(in srgb, var(--ui-primary) 19%, transparent), transparent 38%),
-    linear-gradient(145deg, color-mix(in srgb, var(--ui-canvas-deep) 98%, transparent), color-mix(in srgb, var(--ui-canvas-deep) 98%, transparent)) !important;
-  border-color: color-mix(in srgb, var(--ui-primary) 48%, transparent) !important;
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ui-primary) 8%, transparent), inset 0 1px 0 color-mix(in srgb, var(--ui-text) 4%, transparent) !important;
+    radial-gradient(circle at 12% 18%, rgba(139, 92, 246, .19), transparent 38%),
+    linear-gradient(145deg, rgba(19, 28, 49, .98), rgba(10, 16, 31, .98)) !important;
+  border-color: rgba(167, 139, 250, .48) !important;
+  box-shadow: 0 0 0 3px rgba(139, 92, 246, .08), inset 0 1px 0 rgba(255, 255, 255, .04) !important;
   outline: none;
 }
 
@@ -67,8 +67,8 @@
 .account-form-grid .account-steam-identity .account-identity-linked-row {
   gap: 0 !important;
   padding: 0 !important;
-  color: var(--ui-text-soft);
-  background: var(--ui-surface) !important;
+  color: var(--ui-text-soft, var(--text-soft));
+  background: var(--bg-input) !important;
   box-shadow: none !important;
 }
 
@@ -81,7 +81,7 @@
   flex: 0 0 18px;
   margin: 0 !important;
   transform: translateY(-50%) !important;
-  color: var(--ui-text-muted);
+  color: var(--ui-text-muted, var(--text-muted));
   pointer-events: none;
 }
 
@@ -97,7 +97,7 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--ui-text);
+  color: var(--ui-text, var(--text-main));
   background: transparent !important;
   border: 0 !important;
   border-radius: 0 !important;
@@ -127,7 +127,7 @@
   padding: 0 !important;
   margin: 0 !important;
   transform: translateY(-50%) !important;
-  color: var(--ui-danger) !important;
+  color: var(--ui-danger, #ff667a) !important;
   background: transparent !important;
   border: 0 !important;
   border-radius: 0 !important;
@@ -145,7 +145,7 @@
 
 .account-form-grid .account-steam-identity .account-identity-unlink:hover,
 .account-form-grid .account-steam-identity .account-identity-unlink:focus-visible {
-  color: var(--ui-danger) !important;
+  color: var(--ui-danger-strong, #ff435f) !important;
   background: transparent !important;
   box-shadow: none !important;
   outline: none;

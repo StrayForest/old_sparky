@@ -14,8 +14,6 @@ from apps.platform_api.app.api.pagination import (
 from apps.platform_api.app.api.schemas import (
     AdminAuditLogResponse,
     AdminAnalyticsResponse,
-    AdminAppearanceResponse,
-    AdminAppearanceUpdateRequest,
     AdminOverviewResponse,
     AdminPreprodCleanupRequest,
     AdminPreprodCleanupResponse,
@@ -54,15 +52,6 @@ from python_packages.platform_infra.models import (
     Role,
     User,
     UserRole,
-)
-from python_packages.platform_domain.appearance_palette import (
-    APPEARANCE_GROUPS,
-    resolve_appearance_colors,
-)
-from apps.platform_api.app.services.appearance_settings import (
-    invalidate_appearance_cache,
-    load_appearance_settings,
-    lock_appearance_settings,
 )
 from python_packages.platform_infra.object_storage import get_object_storage, object_key_from_upload_url
 from python_packages.platform_infra.security import (
@@ -458,58 +447,6 @@ async def admin_overview(
         preprod_test_runs_total=analytics.preprod_test_runs_total,
         preprod_test_users_total=analytics.preprod_test_users_total,
         analytics=analytics,
-    )
-
-
-@router.get("/appearance", response_model=AdminAppearanceResponse)
-async def admin_get_appearance(
-    auth_session=Depends(get_authenticated_session),
-    db_session: AsyncSession = Depends(get_db_session),
-) -> AdminAppearanceResponse:
-    ensure_admin_role(auth_session)
-    payload = await load_appearance_settings(db_session)
-    return AdminAppearanceResponse(
-        **payload,
-        groups={group: list(keys) for group, keys in APPEARANCE_GROUPS.items()},
-    )
-
-
-@router.put("/appearance", response_model=AdminAppearanceResponse)
-async def admin_update_appearance(
-    payload: AdminAppearanceUpdateRequest,
-    auth_session=Depends(get_authenticated_session),
-    db_session: AsyncSession = Depends(get_db_session),
-) -> AdminAppearanceResponse:
-    ensure_admin_role(auth_session)
-    row = await lock_appearance_settings(db_session)
-    if row.revision != payload.expected_revision:
-        await db_session.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Appearance settings changed since they were loaded.",
-        )
-    previous_colors = dict(row.colors)
-    next_colors = dict(payload.colors)
-    changed = sorted(key for key in next_colors if next_colors[key] != previous_colors.get(key))
-    if changed:
-        row.colors = next_colors
-        row.revision += 1
-        await write_audit_log(
-            db_session,
-            actor_user_id=auth_session.user.id,
-            action="admin.appearance.update",
-            subject_type="appearance_settings",
-            subject_id="1",
-            payload={"changed_colors": changed, "revision": row.revision},
-        )
-        await db_session.commit()
-        await invalidate_appearance_cache(
-            {"colors": next_colors, "revision": row.revision}
-        )
-    return AdminAppearanceResponse(
-        colors=resolve_appearance_colors(row.colors),
-        revision=row.revision,
-        groups={group: list(keys) for group, keys in APPEARANCE_GROUPS.items()},
     )
 
 

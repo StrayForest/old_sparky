@@ -3,7 +3,6 @@ from fastapi import APIRouter
 from apps.platform_api.app.api.routes import (
     admin,
     admin_user_delete,
-    appearance,
     audit,
     auth,
     auth_identities,
@@ -27,7 +26,6 @@ api_router.include_router(
     tags=["tournaments"],
 )
 api_router.include_router(health.router, prefix="/health", tags=["health"])
-api_router.include_router(appearance.router, prefix="/appearance", tags=["appearance"])
 # Registration owns POST /auth/register while the remaining authentication
 # routes stay in their established module.
 api_router.include_router(registration.router, prefix="/auth", tags=["auth"])

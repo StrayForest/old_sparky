@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
-import json
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -18,7 +17,6 @@ from python_packages.platform_infra.csrf import csrf_cookie_name
 from python_packages.platform_infra.config import get_settings
 from python_packages.platform_infra.db import dispose_engine, engine, session_factory
 from python_packages.platform_infra.models import (
-    AppearanceSettings,
     AuditLog,
     DeadlockProfile,
     MediaAsset,
@@ -314,71 +312,6 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
             if existing is None:
                 db_session.add(UserRole(user_id=user_id, role_id=role.id))
                 await db_session.commit()
-
-    async def test_appearance_is_publicly_readable_and_admin_updates_are_revision_guarded(self) -> None:
-        from apps.platform_api.app.services.appearance_settings import invalidate_appearance_cache
-        from python_packages.platform_domain.appearance_palette import (
-            DEFAULT_APPEARANCE_COLORS,
-            resolve_appearance_colors,
-        )
-
-        visitor = await self._register_user("appearance-visitor")
-        admin_user = await self._register_user("appearance-admin")
-        await self._grant_role(admin_user["user_id"], "admin")
-        original = await visitor["client"].get("/api/v1/appearance")
-        self.assertEqual(original.status_code, 200, original.text)
-        self.assertEqual(original.headers.get("cache-control"), "private, no-store")
-        self.assertEqual(original.json()["colors"], resolve_appearance_colors(DEFAULT_APPEARANCE_COLORS))
-        forbidden = await visitor["client"].get("/api/v1/admin/appearance")
-        self.assertEqual(forbidden.status_code, 403, forbidden.text)
-        admin_response = await admin_user["client"].get("/api/v1/admin/appearance")
-        self.assertEqual(admin_response.status_code, 200, admin_response.text)
-        starting_revision = admin_response.json()["revision"]
-        previous_colors = {key: admin_response.json()["colors"][key] for key in DEFAULT_APPEARANCE_COLORS}
-
-        async def restore_appearance() -> None:
-            async with session_factory()() as db_session:
-                row = await db_session.scalar(select(AppearanceSettings).where(AppearanceSettings.id == 1))
-                if row is None:
-                    return
-                if row.colors != previous_colors:
-                    row.colors = dict(previous_colors)
-                    row.revision += 1
-                    await db_session.commit()
-                restore_payload = {"colors": dict(previous_colors), "revision": row.revision}
-            await invalidate_appearance_cache(restore_payload)
-
-        self.addAsyncCleanup(restore_appearance)
-        requested = {**previous_colors, "background": "#490000"}
-        saved = await admin_user["client"].put(
-            "/api/v1/admin/appearance",
-            json={"colors": requested, "expected_revision": starting_revision},
-            headers=same_origin_request_headers(admin_user["client"]),
-        )
-        self.assertEqual(saved.status_code, 200, saved.text)
-        self.assertEqual(saved.json()["revision"], starting_revision + 1)
-        self.assertEqual(saved.json()["colors"], resolve_appearance_colors(requested))
-        conflict = await admin_user["client"].put(
-            "/api/v1/admin/appearance",
-            json={"colors": requested, "expected_revision": starting_revision},
-            headers=same_origin_request_headers(admin_user["client"]),
-        )
-        self.assertEqual(conflict.status_code, 409, conflict.text)
-        public_after_save = await visitor["client"].get("/api/v1/appearance")
-        self.assertEqual(public_after_save.status_code, 200, public_after_save.text)
-        self.assertEqual(public_after_save.json()["revision"], starting_revision + 1)
-        self.assertEqual(public_after_save.json()["colors"]["background"], "#490000")
-        async with session_factory()() as db_session:
-            row = await db_session.scalar(select(AppearanceSettings).where(AppearanceSettings.id == 1))
-            self.assertIsNotNone(row)
-            audit = await db_session.scalar(
-                select(AuditLog)
-                .where(AuditLog.action == "admin.appearance.update", AuditLog.subject_id == "1")
-                .order_by(AuditLog.id.desc())
-            )
-            self.assertIsNotNone(audit)
-            self.assertEqual(audit.actor_user_id, admin_user["user_id"])
-            self.assertEqual(audit.payload["changed_colors"], ["background"])
 
     async def _lock_deadlock_roster(self, slug: str, organizer_user_id: str) -> None:
         now = datetime.now(UTC)
@@ -1823,65 +1756,3 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
             )
             self.assertIsNotNone(audit)
             self.assertEqual(audit.payload["note"], "Remove the approved account.")
-
-
-class PlatformAppearanceRedisIntegrationTests(PlatformIsolatedAsyncioTestCase):
-    async def test_revision_floor_rejects_stale_reader_and_second_worker_refreshes(self) -> None:
-        from redis.asyncio import from_url
-
-        from python_packages.platform_infra.config import get_settings
-        from apps.platform_api.app.services.appearance_settings import _PUBLISH_SCRIPT
-        from python_packages.platform_domain.appearance_palette import DEFAULT_APPEARANCE_COLORS
-
-        identity = uuid4().hex
-        cache_key = f"platform:test:appearance:{identity}"
-        revision_key = f"{cache_key}:revision"
-        client = from_url(get_settings().platform_redis_url, decode_responses=False)
-        stale = json.dumps({"v": 1, "colors": DEFAULT_APPEARANCE_COLORS, "revision": 10})
-        fresh_colors = {**DEFAULT_APPEARANCE_COLORS, "background": "#490000"}
-        fresh = json.dumps({"v": 1, "colors": fresh_colors, "revision": 11})
-
-        async def publish(revision: int, encoded: str) -> int:
-            return await client.eval(
-                _PUBLISH_SCRIPT,
-                2,
-                cache_key,
-                revision_key,
-                revision,
-                encoded,
-                60,
-            )
-
-        try:
-            self.assertEqual(await publish(10, stale), 1)
-            stale_reader_ready = asyncio.Event()
-            resume_stale_reader = asyncio.Event()
-
-            async def delayed_database_miss_reader() -> int:
-                stale_reader_ready.set()
-                await resume_stale_reader.wait()
-                return await publish(10, stale)
-
-            stale_reader = asyncio.create_task(delayed_database_miss_reader())
-            await stale_reader_ready.wait()
-            self.assertEqual(await publish(11, fresh), 1)
-            resume_stale_reader.set()
-            self.assertEqual(await stale_reader, 0)
-
-            async with client.pipeline(transaction=False) as pipe:
-                pipe.get(cache_key)
-                pipe.get(revision_key)
-                cached_raw, floor_raw = await pipe.execute()
-            cached = json.loads(cached_raw)
-            self.assertEqual(cached["revision"], 11)
-            self.assertEqual(int(floor_raw), 11)
-            self.assertEqual(cached["colors"]["background"], "#490000")
-
-            await client.pexpire(cache_key, 0)
-            self.assertEqual(await publish(10, stale), 0)
-            self.assertEqual(int(await client.get(revision_key)), 11)
-        finally:
-            try:
-                await client.unlink(cache_key, revision_key)
-            finally:
-                await client.aclose()

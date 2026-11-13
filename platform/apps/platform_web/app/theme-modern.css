@@ -5,11 +5,54 @@
  */
 
 :root {
+  color-scheme: dark;
+  --ui-canvas: #050813;
+  --ui-canvas-deep: #02050c;
+  --ui-surface: rgba(10, 15, 28, .92);
+  --ui-surface-strong: rgba(14, 20, 36, .97);
+  --ui-surface-soft: rgba(18, 25, 43, .78);
+  --ui-surface-hover: rgba(25, 34, 57, .9);
+  --ui-border: rgba(151, 170, 210, .16);
+  --ui-border-strong: rgba(151, 170, 210, .28);
+  --ui-primary: #8b5cf6;
+  --ui-primary-bright: #a78bfa;
+  --ui-primary-deep: #6d28d9;
+  --ui-primary-soft: rgba(139, 92, 246, .14);
+  --ui-secondary: #2dd4bf;
+  --ui-secondary-soft: rgba(45, 212, 191, .13);
+  --ui-warning: #fb923c;
+  --ui-danger: #fb7185;
+  --ui-success: #4ade80;
+  --ui-text: #f7f8fc;
+  --ui-text-soft: #c3cad9;
+  --ui-text-muted: #8590a6;
   --ui-radius-sm: 8px;
   --ui-radius-md: 12px;
   --ui-radius-lg: 16px;
-  --ui-shadow: 0 18px 48px color-mix(in srgb, var(--ui-canvas-deep) 34%, transparent);
-  --ui-shadow-soft: 0 10px 28px color-mix(in srgb, var(--ui-canvas-deep) 24%, transparent);
+  --ui-shadow: 0 18px 48px rgba(0, 0, 0, .34);
+  --ui-shadow-soft: 0 10px 28px rgba(0, 0, 0, .24);
+
+  /* Compatibility mapping for the existing component layer. */
+  --bg-main: var(--ui-canvas-deep);
+  --bg-page: var(--ui-canvas);
+  --bg-panel: var(--ui-surface);
+  --bg-card: #080d19;
+  --bg-card-soft: #0d1423;
+  --bg-input: #090e1a;
+  --border-main: var(--ui-border-strong);
+  --border-soft: var(--ui-border);
+  --gold: var(--ui-primary);
+  --gold-bright: var(--ui-primary-bright);
+  --gold-muted: #7c5bd8;
+  --text-main: var(--ui-text);
+  --text-soft: var(--ui-text-soft);
+  --text-muted: var(--ui-text-muted);
+  --green: var(--ui-success);
+  --green-bg: rgba(20, 83, 45, .7);
+  --red: var(--ui-danger);
+  --red-bg: rgba(90, 24, 42, .74);
+  --blue: #60a5fa;
+  --cyan: var(--ui-secondary);
   --header-h: 72px;
   --page-max: 1680px;
   --hero-title-size: 42px;
@@ -76,8 +119,8 @@
 }
 
 .tournament-card.theme-teal {
-  --logo-color: var(--ui-primary);
-  --org-color: var(--ui-secondary);
+  --logo-color: #d99031;
+  --org-color: #aa46f2;
 }
 
 progress.progress,
@@ -96,21 +139,21 @@ progress.stats-rank-meter {
 progress.progress::-webkit-progress-bar,
 progress.progress-track::-webkit-progress-bar,
 progress.stats-rank-meter::-webkit-progress-bar {
-  background: color-mix(in srgb, var(--ui-surface) 16%, transparent);
+  background: rgba(148, 163, 184, .16);
   border-radius: inherit;
 }
 
 progress.progress::-webkit-progress-value {
-  background: linear-gradient(90deg, var(--ui-primary), var(--ui-primary));
+  background: linear-gradient(90deg, #f2b632, #ffbd46);
   border-radius: inherit;
-  box-shadow: 0 0 10px color-mix(in srgb, var(--ui-primary) 30%, transparent);
+  box-shadow: 0 0 10px rgba(242, 182, 50, .3);
 }
 
 progress.progress::-moz-progress-bar {
-  background: linear-gradient(90deg, var(--ui-primary), var(--ui-primary));
+  background: linear-gradient(90deg, #f2b632, #ffbd46);
   border: 0;
   border-radius: inherit;
-  box-shadow: 0 0 10px color-mix(in srgb, var(--ui-primary) 30%, transparent);
+  box-shadow: 0 0 10px rgba(242, 182, 50, .3);
 }
 
 progress.progress.green::-webkit-progress-value {
@@ -130,20 +173,20 @@ progress.progress.red::-moz-progress-bar {
 }
 
 progress.progress.yellow::-webkit-progress-value {
-  background: var(--ui-warning);
+  background: #d7b442;
 }
 
 progress.progress.yellow::-moz-progress-bar {
-  background: var(--ui-warning);
+  background: #d7b442;
 }
 
 progress.progress.muted::-webkit-progress-value {
-  background: color-mix(in srgb, var(--ui-surface) 28%, transparent);
+  background: rgba(180, 180, 180, .28);
   box-shadow: none;
 }
 
 progress.progress.muted::-moz-progress-bar {
-  background: color-mix(in srgb, var(--ui-surface) 28%, transparent);
+  background: rgba(180, 180, 180, .28);
   box-shadow: none;
 }
 
@@ -151,39 +194,39 @@ progress.progress-track::-webkit-progress-value {
   background: linear-gradient(90deg, var(--ui-primary-deep), var(--ui-primary-bright));
   border: 0;
   border-radius: inherit;
-  box-shadow: 0 0 14px color-mix(in srgb, var(--ui-primary) 32%, transparent);
+  box-shadow: 0 0 14px rgba(139, 92, 246, .32);
 }
 
 progress.progress-track::-moz-progress-bar {
   background: linear-gradient(90deg, var(--ui-primary-deep), var(--ui-primary-bright));
   border: 0;
   border-radius: inherit;
-  box-shadow: 0 0 14px color-mix(in srgb, var(--ui-primary) 32%, transparent);
+  box-shadow: 0 0 14px rgba(139, 92, 246, .32);
 }
 
 progress.stats-rank-meter::-webkit-progress-value {
-  background: linear-gradient(90deg, var(--ui-primary), var(--ui-secondary));
+  background: linear-gradient(90deg, #f2b632, #64b7e8);
   border: 0;
-  box-shadow: 0 0 10px color-mix(in srgb, var(--ui-primary) 30%, transparent);
+  box-shadow: 0 0 10px rgba(242, 182, 50, .3);
 }
 
 progress.stats-rank-meter::-moz-progress-bar {
-  background: linear-gradient(90deg, var(--ui-primary), var(--ui-secondary));
+  background: linear-gradient(90deg, #f2b632, #64b7e8);
   border: 0;
-  box-shadow: 0 0 10px color-mix(in srgb, var(--ui-primary) 30%, transparent);
+  box-shadow: 0 0 10px rgba(242, 182, 50, .3);
 }
 
 ::selection {
-  color: var(--ui-text);
-  background: color-mix(in srgb, var(--ui-primary) 70%, transparent);
+  color: #fff;
+  background: rgba(139, 92, 246, .7);
 }
 
 body {
   background-color: var(--ui-canvas-deep);
   background-image:
-    radial-gradient(circle at 78% 4%, color-mix(in srgb, var(--ui-primary) 22%, transparent), transparent 30%),
-    radial-gradient(circle at 14% 18%, color-mix(in srgb, var(--ui-secondary) 9%, transparent), transparent 27%),
-    linear-gradient(180deg, color-mix(in srgb, var(--ui-canvas-deep) 76%, transparent), color-mix(in srgb, var(--ui-canvas-deep) 90%, transparent) 58%, var(--ui-canvas-deep)),
+    radial-gradient(circle at 78% 4%, rgba(124, 58, 237, .22), transparent 30%),
+    radial-gradient(circle at 14% 18%, rgba(14, 165, 233, .09), transparent 27%),
+    linear-gradient(180deg, rgba(2, 5, 12, .76), rgba(3, 7, 16, .9) 58%, #030610),
     url("/assets/background/old-sparky-modern-city-v2.webp");
   background-position: center top;
   background-repeat: no-repeat;
@@ -194,17 +237,17 @@ body {
 }
 
 * {
-  scrollbar-color: color-mix(in srgb, var(--ui-primary) 80%, transparent) color-mix(in srgb, var(--ui-surface-strong) 86%, transparent);
+  scrollbar-color: rgba(139, 92, 246, .8) rgba(6, 10, 19, .86);
 }
 
 *::-webkit-scrollbar-track {
-  background: color-mix(in srgb, var(--ui-canvas-deep) 86%, transparent);
+  background: rgba(6, 10, 19, .86);
 }
 
 *::-webkit-scrollbar-thumb,
 *::-webkit-scrollbar-thumb:hover {
   background: linear-gradient(180deg, var(--ui-primary-bright), var(--ui-primary-deep));
-  border-color: color-mix(in srgb, var(--ui-surface-strong) 86%, transparent);
+  border-color: rgba(6, 10, 19, .86);
 }
 
 .page-noise {
@@ -217,9 +260,9 @@ body {
   top: 0;
   z-index: 30;
   height: var(--header-h);
-  background: color-mix(in srgb, var(--ui-canvas-deep) 84%, transparent);
+  background: rgba(3, 7, 16, .84);
   border-bottom: 1px solid var(--ui-border);
-  box-shadow: 0 10px 30px color-mix(in srgb, var(--ui-canvas-deep) 28%, transparent);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .28);
   backdrop-filter: blur(18px) saturate(125%);
 }
 
@@ -234,13 +277,9 @@ body {
 }
 
 .brand-mark {
-  display: block;
   width: 46px;
   height: 46px;
-  background-color: var(--ui-text);
-  -webkit-mask: url("/assets/main_logo/old-sparky-arena-logo-v3.webp") center / contain no-repeat;
-  mask: url("/assets/main_logo/old-sparky-arena-logo-v3.webp") center / contain no-repeat;
-  filter: drop-shadow(0 0 14px color-mix(in srgb, var(--ui-primary) 42%, transparent));
+  filter: drop-shadow(0 0 14px rgba(139, 92, 246, .42));
 }
 
 .brand-title {
@@ -281,7 +320,7 @@ body {
 .site-header .nav-link:focus-visible,
 .site-header .nav-link-active {
   color: var(--ui-text);
-  background: linear-gradient(180deg, transparent, color-mix(in srgb, var(--ui-primary) 8%, transparent));
+  background: linear-gradient(180deg, transparent, rgba(139, 92, 246, .08));
 }
 
 .site-header .nav-link-active::after {
@@ -290,7 +329,7 @@ body {
   left: 16px;
   height: 2px;
   background: linear-gradient(90deg, var(--ui-primary), var(--ui-primary-bright));
-  box-shadow: 0 0 16px color-mix(in srgb, var(--ui-primary) 65%, transparent);
+  box-shadow: 0 0 16px rgba(139, 92, 246, .65);
   border-radius: 999px 999px 0 0;
 }
 
@@ -311,7 +350,7 @@ body {
 
 .header-actions .login-button {
   color: var(--ui-text-soft);
-  background: color-mix(in srgb, var(--ui-canvas-deep) 78%, transparent);
+  background: rgba(9, 14, 26, .78);
   border: 1px solid var(--ui-border-strong);
   box-shadow: none;
 }
@@ -320,7 +359,7 @@ body {
 .header-actions .login-button:focus-visible {
   color: var(--ui-text);
   background: var(--ui-surface-hover);
-  border-color: color-mix(in srgb, var(--ui-primary) 48%, transparent);
+  border-color: rgba(167, 139, 250, .48);
 }
 
 .header-actions .header-shell-link {
@@ -335,7 +374,7 @@ body {
 .header-actions .header-shell-link:focus-visible,
 .header-actions .header-shell-link.active {
   color: var(--ui-text);
-  background: linear-gradient(180deg, transparent, color-mix(in srgb, var(--ui-primary) 8%, transparent));
+  background: linear-gradient(180deg, transparent, rgba(139, 92, 246, .08));
   border-color: transparent;
 }
 
@@ -346,7 +385,7 @@ body {
   left: 13px;
   height: 2px;
   background: linear-gradient(90deg, var(--ui-primary), var(--ui-primary-bright));
-  box-shadow: 0 0 16px color-mix(in srgb, var(--ui-primary) 65%, transparent);
+  box-shadow: 0 0 16px rgba(139, 92, 246, .65);
   border-radius: 999px 999px 0 0;
   content: "";
 }
@@ -357,19 +396,20 @@ body {
   justify-content: center;
   gap: 8px;
   min-width: 146px;
-  color: var(--ui-on-primary);
+  color: #fff;
   text-decoration: none;
-  background: linear-gradient(135deg, var(--ui-primary), var(--ui-primary));
-  border: 1px solid color-mix(in srgb, var(--ui-primary) 54%, transparent);
-  box-shadow: 0 8px 24px color-mix(in srgb, var(--ui-primary) 28%, transparent), inset 0 1px 0 color-mix(in srgb, var(--ui-text) 16%, transparent);
+  background: linear-gradient(135deg, var(--ui-primary-deep), var(--ui-primary));
+  border: 1px solid rgba(167, 139, 250, .54);
+  box-shadow: 0 8px 24px rgba(109, 40, 217, .28), inset 0 1px 0 rgba(255, 255, 255, .16);
   transition: transform .16s ease, filter .16s ease, box-shadow .16s ease;
 }
 
 .header-create-button:hover,
 .header-create-button:focus-visible,
 .header-create-button.active {
-  color: var(--ui-on-primary);
-  box-shadow: 0 10px 30px color-mix(in srgb, var(--ui-primary) 40%, transparent), inset 0 1px 0 color-mix(in srgb, var(--ui-text) 20%, transparent);
+  color: #fff;
+  filter: brightness(1.11);
+  box-shadow: 0 10px 30px rgba(124, 58, 237, .4), inset 0 1px 0 rgba(255, 255, 255, .2);
   transform: translateY(-1px);
 }
 
@@ -383,8 +423,8 @@ body {
   --hero-section-gap: 38px;
   border-bottom: 0;
   background:
-    linear-gradient(90deg, color-mix(in srgb, var(--ui-surface-strong) 78%, transparent), color-mix(in srgb, var(--ui-surface-strong) 24%, transparent) 72%, transparent),
-    radial-gradient(circle at 76% 12%, color-mix(in srgb, var(--ui-primary) 13%, transparent), transparent 32%);
+    linear-gradient(90deg, rgba(5, 8, 19, .78), rgba(5, 8, 19, .24) 72%, transparent),
+    radial-gradient(circle at 76% 12%, rgba(139, 92, 246, .13), transparent 32%);
 }
 
 .hero-inner {
@@ -399,7 +439,7 @@ body {
   font-size: var(--hero-title-size);
   font-weight: 850;
   letter-spacing: -.035em;
-  text-shadow: 0 10px 34px color-mix(in srgb, var(--ui-canvas-deep) 34%, transparent);
+  text-shadow: 0 10px 34px rgba(0, 0, 0, .34);
 }
 
 .hero-subtitle {
@@ -414,8 +454,8 @@ body {
   display: flex;
   align-items: stretch;
   background:
-    linear-gradient(90deg, color-mix(in srgb, var(--ui-surface-strong) 94%, transparent) 0%, color-mix(in srgb, var(--ui-surface-strong) 58%, transparent) 50%, color-mix(in srgb, var(--ui-surface-strong) 8%, transparent) 82%),
-    radial-gradient(circle at 72% 44%, color-mix(in srgb, var(--ui-primary) 22%, transparent), transparent 31%);
+    linear-gradient(90deg, rgba(3, 6, 15, .94) 0%, rgba(3, 6, 15, .58) 50%, rgba(4, 7, 16, .08) 82%),
+    radial-gradient(circle at 72% 44%, rgba(139, 92, 246, .22), transparent 31%);
 }
 
 .hero-wrap-home .hero-inner {
@@ -443,14 +483,14 @@ body {
 
 .hero-title-accent {
   color: var(--ui-primary-bright);
-  text-shadow: 0 0 34px color-mix(in srgb, var(--ui-primary) 28%, transparent);
+  text-shadow: 0 0 34px rgba(139, 92, 246, .28);
 }
 
 .hero-wrap-home .hero-subtitle {
   grid-row: 2;
   max-width: 620px;
   margin-bottom: 0;
-  color: var(--ui-text-soft);
+  color: #aeb8ca;
   font-size: 17px;
 }
 
@@ -477,30 +517,30 @@ body {
 }
 
 .hero-action-primary {
-  color: var(--ui-on-primary);
-  background: linear-gradient(135deg, var(--ui-primary), var(--ui-primary));
-  border-color: color-mix(in srgb, var(--ui-primary) 62%, transparent);
-  box-shadow: 0 10px 28px color-mix(in srgb, var(--ui-primary) 28%, transparent), inset 0 1px 0 color-mix(in srgb, var(--ui-text) 14%, transparent);
+  color: #fff;
+  background: linear-gradient(135deg, var(--ui-primary-deep), var(--ui-primary));
+  border-color: rgba(167, 139, 250, .62);
+  box-shadow: 0 10px 28px rgba(109, 40, 217, .28), inset 0 1px 0 rgba(255, 255, 255, .14);
 }
 
 .hero-action-secondary {
-  background: color-mix(in srgb, var(--ui-secondary) 58%, transparent);
+  background: rgba(6, 11, 23, .58);
 }
 
 .hero-action:hover,
 .hero-action:focus-visible {
-  border-color: color-mix(in srgb, var(--ui-secondary) 72%, transparent);
+  border-color: rgba(196, 181, 253, .72);
 }
 
 .hero-action-primary:hover,
 .hero-action-primary:focus-visible {
-  background: linear-gradient(135deg, var(--ui-primary), var(--ui-primary));
-  box-shadow: 0 12px 32px color-mix(in srgb, var(--ui-primary) 36%, transparent), inset 0 1px 0 color-mix(in srgb, var(--ui-text) 18%, transparent);
+  background: linear-gradient(135deg, #7c3aed, #9f67f7);
+  box-shadow: 0 12px 32px rgba(109, 40, 217, .36), inset 0 1px 0 rgba(255, 255, 255, .18);
 }
 
 .hero-action-secondary:hover,
 .hero-action-secondary:focus-visible {
-  background: color-mix(in srgb, var(--ui-secondary) 82%, transparent);
+  background: rgba(20, 28, 48, .82);
 }
 
 .main {
@@ -516,7 +556,7 @@ body {
 .info-section,
 .info-anchor-nav {
   background:
-    linear-gradient(145deg, color-mix(in srgb, var(--ui-secondary) 96%, transparent), color-mix(in srgb, var(--ui-secondary) 95%, transparent));
+    linear-gradient(145deg, rgba(16, 23, 40, .96), rgba(8, 13, 25, .95));
   border: 1px solid var(--ui-border);
   border-radius: var(--ui-radius-md);
   box-shadow: var(--ui-shadow-soft);
@@ -550,18 +590,18 @@ body {
 .primary-button,
 .primary-action,
 .match-controls button:not(:disabled) {
-  color: var(--ui-on-primary);
-  background: linear-gradient(135deg, var(--ui-primary), var(--ui-primary));
-  border: 1px solid color-mix(in srgb, var(--ui-primary) 46%, transparent);
+  color: #fff;
+  background: linear-gradient(135deg, var(--ui-primary-deep), var(--ui-primary));
+  border: 1px solid rgba(167, 139, 250, .46);
   border-radius: var(--ui-radius-sm);
-  box-shadow: 0 9px 24px color-mix(in srgb, var(--ui-primary) 24%, transparent), inset 0 1px 0 color-mix(in srgb, var(--ui-text) 14%, transparent);
+  box-shadow: 0 9px 24px rgba(109, 40, 217, .24), inset 0 1px 0 rgba(255, 255, 255, .14);
 }
 
 .primary-button:hover,
 .primary-button:focus-visible,
 .primary-action:hover,
 .primary-action:focus-visible {
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ui-primary) 38%, transparent);
+  filter: brightness(1.1);
 }
 
 .secondary-button,
@@ -572,7 +612,7 @@ body {
 .icon-button,
 .reset-area {
   color: var(--ui-text-soft);
-  background: color-mix(in srgb, var(--ui-canvas-deep) 90%, transparent);
+  background: rgba(13, 20, 35, .9);
   border: 1px solid var(--ui-border-strong);
   border-radius: var(--ui-radius-sm);
   box-shadow: none;
@@ -586,7 +626,7 @@ body {
 .reset-area:hover {
   color: var(--ui-text);
   background: var(--ui-surface-hover);
-  border-color: color-mix(in srgb, var(--ui-primary) 48%, transparent);
+  border-color: rgba(167, 139, 250, .48);
 }
 
 .secondary-button.active,
@@ -595,9 +635,9 @@ body {
 .rank-pill.active,
 .pill.active,
 .date-sort-button.active {
-  color: var(--ui-secondary);
+  color: #dcd3ff;
   background: var(--ui-primary-soft);
-  border-color: color-mix(in srgb, var(--ui-primary) 64%, transparent);
+  border-color: rgba(167, 139, 250, .64);
 }
 
 .filter-control,
@@ -610,10 +650,10 @@ body {
 .account-input,
 .match-score-controls input {
   color: var(--ui-text);
-  background: color-mix(in srgb, var(--ui-canvas-deep) 88%, transparent);
+  background: rgba(7, 12, 23, .88);
   border-color: var(--ui-border-strong);
   border-radius: var(--ui-radius-sm);
-  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--ui-text) 1.8%, transparent);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .018);
 }
 
 .filter-control:focus-within,
@@ -624,8 +664,8 @@ body {
 .support-form select:focus,
 .support-form textarea:focus,
 .account-input:focus {
-  border-color: color-mix(in srgb, var(--ui-primary) 72%, transparent);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ui-primary) 11%, transparent);
+  border-color: rgba(167, 139, 250, .72);
+  box-shadow: 0 0 0 3px rgba(139, 92, 246, .11);
 }
 
 .filter-control:focus-visible,
@@ -635,12 +675,12 @@ body {
 
 .filter-control:focus-within {
   border-radius: var(--ui-radius-sm);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ui-primary) 12%, transparent);
+  box-shadow: 0 0 0 3px rgba(139, 92, 246, .12);
 }
 
 .date-sort-button:focus-visible {
   border-radius: var(--ui-radius-sm);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ui-primary) 12%, transparent);
+  box-shadow: 0 0 0 3px rgba(139, 92, 246, .12);
 }
 
 .filter-select,
@@ -650,7 +690,7 @@ body {
 }
 
 .filter-select option {
-  background: var(--ui-canvas-deep);
+  background: #0b1120;
 }
 
 .filters-panel {
@@ -662,7 +702,7 @@ body {
   min-height: 68px;
   gap: 10px;
   padding: 12px;
-  background: color-mix(in srgb, var(--ui-canvas-deep) 88%, transparent);
+  background: rgba(9, 14, 26, .88);
   border: 1px solid var(--ui-border);
   border-radius: var(--ui-radius-md);
   box-shadow: var(--ui-shadow-soft);
@@ -679,27 +719,27 @@ body {
 .status-action,
 .disabled-action {
   color: var(--ui-text-soft);
-  background: color-mix(in srgb, var(--ui-canvas-deep) 86%, transparent);
+  background: rgba(9, 15, 28, .86);
   border-color: var(--ui-border-strong);
   border-radius: var(--ui-radius-sm);
 }
 
 .cover-template-button:hover,
 .cover-template-button.active {
-  color: var(--ui-secondary);
+  color: #ded5ff;
   background: var(--ui-primary-soft);
-  border-color: color-mix(in srgb, var(--ui-primary) 65%, transparent);
+  border-color: rgba(167, 139, 250, .65);
 }
 
 .visibility-info-button {
   color: var(--ui-text-muted);
-  background: color-mix(in srgb, var(--ui-secondary) 88%, transparent);
+  background: rgba(9, 15, 28, .88);
   border-color: var(--ui-border-strong);
 }
 
 .visibility-tooltip {
   color: var(--ui-text-soft);
-  background: color-mix(in srgb, var(--ui-canvas-deep) 98%, transparent);
+  background: rgba(7, 12, 23, .98);
   border-color: var(--ui-border-strong);
   border-radius: var(--ui-radius-sm);
   box-shadow: var(--ui-shadow);
@@ -707,7 +747,7 @@ body {
 
 .schedule-field {
   padding: 14px;
-  background: color-mix(in srgb, var(--ui-canvas-deep) 72%, transparent);
+  background: rgba(9, 15, 28, .72);
   border: 0;
   border-radius: var(--ui-radius-sm);
 }
@@ -722,17 +762,17 @@ body {
 
 .schedule-picker {
   color: var(--ui-text);
-  background: color-mix(in srgb, var(--ui-canvas-deep) 90%, transparent);
+  background: rgba(7, 12, 23, .9);
   border-color: var(--ui-border-strong);
   border-radius: var(--ui-radius-sm);
-  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--ui-text) 1.8%, transparent);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .018);
 }
 
 .schedule-picker:hover,
 .schedule-picker.active,
 .schedule-picker:focus-visible {
-  border-color: color-mix(in srgb, var(--ui-primary) 70%, transparent);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ui-primary) 11%, transparent);
+  border-color: rgba(167, 139, 250, .7);
+  box-shadow: 0 0 0 3px rgba(139, 92, 246, .11);
 }
 
 .schedule-picker > svg {
@@ -741,7 +781,7 @@ body {
 
 .schedule-popover {
   color: var(--ui-text-soft);
-  background: var(--ui-canvas-deep);
+  background: #080e1a;
   border-color: var(--ui-border-strong);
   border-radius: var(--ui-radius-sm);
   box-shadow: var(--ui-shadow);
@@ -761,7 +801,7 @@ body {
 .schedule-time-options button:hover,
 .schedule-calendar-grid button.selected,
 .schedule-time-options button.selected {
-  color: var(--ui-text);
+  color: #fff;
   background: var(--ui-primary);
   border-color: var(--ui-primary-bright);
   border-radius: 6px;
@@ -785,7 +825,7 @@ body {
 .tournament-card {
   height: var(--card-h);
   min-height: var(--card-h);
-  background: var(--ui-canvas-deep);
+  background: #070c17;
   border: 1px solid var(--ui-border);
   border-radius: var(--ui-radius-md);
   box-shadow: var(--ui-shadow-soft);
@@ -793,14 +833,14 @@ body {
 
 a.tournament-card:hover,
 a.tournament-card:focus-visible {
-  border-color: color-mix(in srgb, var(--ui-primary) 56%, transparent);
-  box-shadow: 0 18px 42px color-mix(in srgb, var(--ui-canvas-deep) 38%, transparent), 0 0 0 1px color-mix(in srgb, var(--ui-primary) 12%, transparent);
+  border-color: rgba(167, 139, 250, .56);
+  box-shadow: 0 18px 42px rgba(0, 0, 0, .38), 0 0 0 1px rgba(139, 92, 246, .12);
   transform: none;
 }
 
 .card-banner {
   aspect-ratio: 5 / 1;
-  border-bottom-color: color-mix(in srgb, var(--ui-primary) 16%, transparent);
+  border-bottom-color: rgba(167, 139, 250, .16);
 }
 
 .card-body {
@@ -810,8 +850,8 @@ a.tournament-card:focus-visible {
   align-content: space-between;
   gap: 10px;
   background:
-    radial-gradient(circle at top right, color-mix(in srgb, var(--ui-primary) 9%, transparent), transparent 36%),
-    linear-gradient(180deg, color-mix(in srgb, var(--ui-surface-strong) 99%, transparent), color-mix(in srgb, var(--ui-surface-strong) 99%, transparent));
+    radial-gradient(circle at top right, rgba(139, 92, 246, .09), transparent 36%),
+    linear-gradient(180deg, rgba(12, 18, 31, .99), rgba(7, 11, 21, .99));
 }
 
 .card-top {
@@ -869,7 +909,7 @@ a.tournament-card:focus-visible {
 
 .timer.registration-open,
 .timer.registration-closed {
-  color: var(--ui-secondary);
+  color: #69c7ff;
 }
 
 .timer.start {
@@ -968,8 +1008,8 @@ a.tournament-card:focus-visible {
   height: 5px;
   margin-top: 5px;
   overflow: hidden;
-  background: color-mix(in srgb, var(--ui-surface) 12%, transparent);
-  border-color: color-mix(in srgb, var(--ui-border-strong) 12%, transparent);
+  background: rgba(148, 163, 184, .12);
+  border-color: rgba(148, 163, 184, .12);
   border-radius: 999px;
 }
 
@@ -982,9 +1022,9 @@ a.tournament-card:focus-visible {
   padding: 0 10px;
   border-radius: 999px;
   color: var(--ui-text-soft);
-  background: color-mix(in srgb, var(--ui-canvas-deep) 82%, transparent);
-  border: 1px solid color-mix(in srgb, var(--ui-border-strong) 20%, transparent);
-  box-shadow: 0 5px 14px color-mix(in srgb, var(--ui-canvas-deep) 18%, transparent);
+  background: rgba(11, 17, 31, .82);
+  border: 1px solid rgba(148, 163, 184, .2);
+  box-shadow: 0 5px 14px rgba(0, 0, 0, .18);
   backdrop-filter: blur(10px);
   font-size: 10px;
   font-weight: 760;
@@ -1003,38 +1043,32 @@ a.tournament-card:focus-visible {
 }
 
 .badge.status.tournament-status-registration-open {
-  color: var(--ui-success);
-  background: var(--ui-success-soft);
-  border-color: color-mix(in srgb, var(--ui-success) 42%, transparent);
-  box-shadow: 0 5px 14px color-mix(in srgb, var(--ui-canvas-deep) 18%, transparent), 0 0 16px color-mix(in srgb, var(--ui-success) 16%, transparent);
+  color: #d8fbea;
+  background: rgba(20, 83, 65, .58);
+  border-color: rgba(74, 222, 128, .42);
+  box-shadow: 0 5px 14px rgba(0, 0, 0, .18), 0 0 16px rgba(74, 222, 128, .16);
 }
 
 .badge.status.tournament-status-registration-closed {
-  color: var(--ui-secondary);
-  background: color-mix(in srgb, var(--ui-surface) 14%, transparent);
-  border-color: color-mix(in srgb, var(--ui-secondary) 36%, transparent);
-  box-shadow: 0 5px 14px color-mix(in srgb, var(--ui-canvas-deep) 18%, transparent), 0 0 15px color-mix(in srgb, var(--ui-secondary) 11%, transparent);
+  color: #f8fafc;
+  background: rgba(148, 163, 184, .14);
+  border-color: rgba(226, 232, 240, .36);
+  box-shadow: 0 5px 14px rgba(0, 0, 0, .18), 0 0 15px rgba(226, 232, 240, .11);
 }
 
 .badge.status.tournament-status-in-progress {
-  color: var(--ui-secondary);
-  background: var(--ui-secondary-soft);
-  border-color: color-mix(in srgb, var(--ui-secondary) 42%, transparent);
-  box-shadow: 0 5px 14px color-mix(in srgb, var(--ui-canvas-deep) 18%, transparent), 0 0 16px color-mix(in srgb, var(--ui-secondary) 16%, transparent);
+  color: #d9efff;
+  background: rgba(30, 82, 139, .52);
+  border-color: rgba(96, 165, 250, .42);
+  box-shadow: 0 5px 14px rgba(0, 0, 0, .18), 0 0 16px rgba(96, 165, 250, .16);
 }
 
+.badge.status.tournament-status-completed,
 .badge.status.tournament-status-cancelled {
-  color: var(--ui-danger);
-  background: var(--ui-danger-soft);
-  border-color: color-mix(in srgb, var(--ui-danger) 38%, transparent);
-  box-shadow: 0 5px 14px color-mix(in srgb, var(--ui-canvas-deep) 18%, transparent), 0 0 16px color-mix(in srgb, var(--ui-danger) 14%, transparent);
-}
-
-.badge.status.tournament-status-completed {
-  color: var(--ui-success);
-  background: var(--ui-success-soft);
-  border-color: color-mix(in srgb, var(--ui-success) 38%, transparent);
-  box-shadow: 0 5px 14px color-mix(in srgb, var(--ui-canvas-deep) 18%, transparent), 0 0 16px color-mix(in srgb, var(--ui-success) 14%, transparent);
+  color: #f8d7dd;
+  background: rgba(87, 29, 45, .58);
+  border-color: rgba(251, 113, 133, .38);
+  box-shadow: 0 5px 14px rgba(0, 0, 0, .18), 0 0 16px rgba(251, 113, 133, .14);
 }
 
 .create-layout {
@@ -1077,7 +1111,7 @@ a.tournament-card:focus-visible {
   gap: 0;
   height: 46px;
   overflow: hidden;
-  background: color-mix(in srgb, var(--ui-canvas-deep) 90%, transparent);
+  background: rgba(9, 15, 28, .9);
   border: 1px solid var(--ui-border-strong);
   border-radius: var(--ui-radius-sm);
 }
@@ -1110,10 +1144,10 @@ a.tournament-card:focus-visible {
 .team-count-field .infinity-limit-button.active,
 .participation-grid .infinity-limit-button.active,
 .visibility-segmented .visibility-segment.active {
-  color: var(--ui-secondary);
+  color: #ded5ff;
   background: var(--ui-primary-soft);
-  border-color: color-mix(in srgb, var(--ui-primary) 65%, transparent);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ui-primary) 28%, transparent);
+  border-color: rgba(167, 139, 250, .65);
+  box-shadow: inset 0 0 0 1px rgba(167, 139, 250, .28);
 }
 
 .visibility-segmented {
@@ -1124,7 +1158,7 @@ a.tournament-card:focus-visible {
   height: 46px;
   padding: 0;
   overflow: hidden;
-  background: color-mix(in srgb, var(--ui-canvas-deep) 90%, transparent);
+  background: rgba(9, 15, 28, .9);
   border: 1px solid var(--ui-border-strong);
   border-radius: var(--ui-radius-sm);
 }
@@ -1143,8 +1177,8 @@ a.tournament-card:focus-visible {
 }
 
 .visibility-segmented:has(.visibility-segment.active)::after {
-  background: color-mix(in srgb, var(--ui-primary) 72%, transparent);
-  box-shadow: 0 0 7px color-mix(in srgb, var(--ui-primary) 24%, transparent);
+  background: rgba(167, 139, 250, .72);
+  box-shadow: 0 0 7px rgba(139, 92, 246, .24);
 }
 
 .visibility-segmented .visibility-segment {
@@ -1176,7 +1210,7 @@ a.tournament-card:focus-visible {
   gap: 0;
   height: 46px;
   overflow: hidden;
-  background: color-mix(in srgb, var(--ui-canvas-deep) 90%, transparent);
+  background: rgba(9, 15, 28, .9);
   border: 1px solid var(--ui-border-strong);
   border-radius: var(--ui-radius-sm);
 }
@@ -1268,9 +1302,9 @@ a.tournament-card:focus-visible {
 
 .number-control .input:focus,
 .number-control .input:focus-visible {
-  border-color: color-mix(in srgb, var(--ui-primary) 72%, transparent);
+  border-color: rgba(167, 139, 250, .72);
   outline: 0;
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ui-primary) 20%, transparent);
+  box-shadow: inset 0 0 0 1px rgba(139, 92, 246, .2);
 }
 
 @media (min-width: 1661px) {
@@ -1371,14 +1405,14 @@ a.tournament-card:focus-visible {
   isolation: isolate;
   overflow: hidden;
   background:
-    radial-gradient(circle at 100% 0, color-mix(in srgb, var(--ui-primary) 20%, transparent), transparent 48%),
-    linear-gradient(135deg, color-mix(in srgb, var(--ui-surface-strong) 98%, transparent), color-mix(in srgb, var(--ui-surface-strong) 98%, transparent));
+    radial-gradient(circle at 100% 0, rgba(139, 92, 246, .2), transparent 48%),
+    linear-gradient(135deg, rgba(13, 21, 38, .98), rgba(5, 10, 21, .98));
   border: 1px solid var(--ui-border);
   border-radius: var(--ui-radius-md);
   box-shadow:
-    0 14px 32px color-mix(in srgb, var(--ui-surface-strong) 26%, transparent),
-    inset 0 1px 0 color-mix(in srgb, var(--ui-text-soft) 10%, transparent),
-    inset 0 -1px 0 color-mix(in srgb, var(--ui-primary) 10%, transparent);
+    0 14px 32px rgba(0, 0, 0, .26),
+    inset 0 1px 0 rgba(255, 255, 255, .1),
+    inset 0 -1px 0 rgba(139, 92, 246, .1);
 }
 
 .home-flow-card::after {
@@ -1398,8 +1432,8 @@ a.tournament-card:focus-visible {
   inset: 0;
   pointer-events: none;
   background:
-    linear-gradient(116deg, color-mix(in srgb, var(--ui-text-soft) 7%, transparent), transparent 30% 72%, color-mix(in srgb, var(--ui-primary) 6%, transparent)),
-    linear-gradient(180deg, color-mix(in srgb, var(--ui-text-soft) 3.5%, transparent), transparent 42%);
+    linear-gradient(116deg, rgba(255, 255, 255, .07), transparent 30% 72%, rgba(167, 139, 250, .06)),
+    linear-gradient(180deg, rgba(255, 255, 255, .035), transparent 42%);
 }
 
 .home-flow-copy {
@@ -1517,10 +1551,10 @@ a.tournament-card:focus-visible {
 }
 
 .video-card {
-  background: color-mix(in srgb, var(--ui-canvas-deep) 96%, transparent);
+  background: rgba(8, 13, 24, .96);
   border: 1px solid var(--ui-border);
   border-radius: var(--ui-radius-sm);
-  box-shadow: 0 8px 22px color-mix(in srgb, var(--ui-canvas-deep) 20%, transparent);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, .2);
 }
 
 .video-card {
@@ -1528,12 +1562,12 @@ a.tournament-card:focus-visible {
   height: var(--home-feature-height);
   grid-template-rows: minmax(0, 1fr) auto;
   isolation: isolate;
-  background: linear-gradient(145deg, color-mix(in srgb, var(--ui-canvas-deep) 76%, transparent), color-mix(in srgb, var(--ui-canvas-deep) 68%, transparent));
-  border-color: color-mix(in srgb, var(--ui-primary) 34%, transparent);
+  background: linear-gradient(145deg, rgba(20, 28, 48, .76), rgba(7, 12, 24, .68));
+  border-color: rgba(167, 139, 250, .34);
   box-shadow:
-    0 16px 36px color-mix(in srgb, var(--ui-surface-strong) 30%, transparent),
-    inset 0 1px 0 color-mix(in srgb, var(--ui-text-soft) 15%, transparent),
-    inset 0 -1px 0 color-mix(in srgb, var(--ui-primary) 10%, transparent);
+    0 16px 36px rgba(0, 0, 0, .3),
+    inset 0 1px 0 rgba(255, 255, 255, .15),
+    inset 0 -1px 0 rgba(139, 92, 246, .1);
   backdrop-filter: blur(13px) saturate(138%);
 }
 
@@ -1543,16 +1577,16 @@ a.tournament-card:focus-visible {
   z-index: 2;
   inset: 0;
   pointer-events: none;
-  background: linear-gradient(118deg, color-mix(in srgb, var(--ui-surface) 10%, transparent), transparent 27% 72%, color-mix(in srgb, var(--ui-primary) 6%, transparent));
+  background: linear-gradient(118deg, rgba(255, 255, 255, .1), transparent 27% 72%, rgba(167, 139, 250, .06));
 }
 
 .video-card:hover,
 .video-card:focus-visible {
-  border-color: color-mix(in srgb, var(--ui-secondary) 62%, transparent);
+  border-color: rgba(196, 181, 253, .62);
   box-shadow:
-    0 20px 44px color-mix(in srgb, var(--ui-surface-strong) 36%, transparent),
-    inset 0 1px 0 color-mix(in srgb, var(--ui-text-soft) 20%, transparent),
-    0 0 22px color-mix(in srgb, var(--ui-primary) 12%, transparent);
+    0 20px 44px rgba(0, 0, 0, .36),
+    inset 0 1px 0 rgba(255, 255, 255, .2),
+    0 0 22px rgba(139, 92, 246, .12);
   transform: none;
 }
 
@@ -1564,7 +1598,7 @@ a.tournament-card:focus-visible {
 .video-card:hover .video-play,
 .video-card:focus-visible .video-play {
   filter: brightness(1.12);
-  box-shadow: 0 0 18px color-mix(in srgb, var(--ui-primary) 24%, transparent);
+  box-shadow: 0 0 18px rgba(139, 92, 246, .24);
 }
 
 .patch-showcase {
@@ -1579,8 +1613,8 @@ a.tournament-card:focus-visible {
 .patch-compact-card {
   min-width: 0;
   overflow: hidden;
-  background: var(--ui-canvas-deep);
-  border: 1px solid color-mix(in srgb, var(--ui-border) 30%, transparent);
+  background: #090f1c;
+  border: 1px solid rgba(116, 127, 151, .3);
   border-radius: var(--ui-radius-sm);
 }
 
@@ -1600,14 +1634,14 @@ a.tournament-card:focus-visible {
   align-items: center;
   justify-content: center;
   padding: 0;
-  color: var(--ui-on-primary);
-  background: linear-gradient(135deg, var(--ui-primary), var(--ui-primary));
-  box-shadow: 0 8px 28px color-mix(in srgb, var(--ui-primary) 42%, transparent);
+  color: #fff;
+  background: linear-gradient(135deg, #7c3aed, #a78bfa);
+  box-shadow: 0 8px 28px rgba(124, 58, 237, .42);
   font-size: 13px;
   font-weight: 900;
   letter-spacing: .09em;
   line-height: 1;
-  text-shadow: 0 2px 8px color-mix(in srgb, var(--ui-canvas-deep) 60%, transparent);
+  text-shadow: 0 2px 8px rgba(24, 8, 58, .6);
   transform: rotate(45deg);
   transform-origin: center;
 }
@@ -1617,8 +1651,8 @@ a.tournament-card:focus-visible {
   display: block;
   overflow: hidden;
   background:
-    radial-gradient(circle at 74% 30%, color-mix(in srgb, var(--ui-primary) 40%, transparent), transparent 24%),
-    linear-gradient(135deg, color-mix(in srgb, var(--ui-secondary) 94%, transparent), color-mix(in srgb, var(--ui-surface-strong) 98%, transparent) 62%);
+    radial-gradient(circle at 74% 30%, rgba(139, 92, 246, .4), transparent 24%),
+    linear-gradient(135deg, rgba(36, 29, 74, .94), rgba(7, 12, 25, .98) 62%);
 }
 
 .patch-featured-art {
@@ -1638,7 +1672,7 @@ a.tournament-card:focus-visible {
   position: absolute;
   z-index: -1;
   inset: 0;
-  background: linear-gradient(90deg, color-mix(in srgb, var(--ui-canvas-deep) 92%, transparent), color-mix(in srgb, var(--ui-canvas-deep) 35%, transparent) 62%, color-mix(in srgb, var(--ui-canvas-deep) 10%, transparent));
+  background: linear-gradient(90deg, rgba(3, 7, 17, .92), rgba(3, 7, 17, .35) 62%, rgba(3, 7, 17, .1));
 }
 
 .patch-featured-copy {
@@ -1668,18 +1702,18 @@ a.tournament-card:focus-visible {
   gap: 10px;
   margin-top: 8px;
   padding: 0 16px;
-  color: var(--ui-on-primary);
+  color: #fff;
   text-decoration: none;
-  background: linear-gradient(135deg, var(--ui-primary), var(--ui-primary));
-  border: 1px solid color-mix(in srgb, var(--ui-primary) 58%, transparent);
+  background: linear-gradient(135deg, var(--ui-primary-deep), var(--ui-primary));
+  border: 1px solid rgba(167, 139, 250, .58);
   border-radius: var(--ui-radius-sm);
-  box-shadow: 0 8px 22px color-mix(in srgb, var(--ui-primary) 24%, transparent);
+  box-shadow: 0 8px 22px rgba(109, 40, 217, .24);
 }
 
 .patch-read-action:hover,
 .patch-read-action:focus-visible {
-  background: linear-gradient(135deg, var(--ui-primary), var(--ui-primary));
-  border-color: color-mix(in srgb, var(--ui-secondary) 76%, transparent);
+  background: linear-gradient(135deg, #7c3aed, #9f67f7);
+  border-color: rgba(196, 181, 253, .76);
 }
 
 .patch-archive {
@@ -1709,14 +1743,14 @@ a.tournament-card:focus-visible {
   z-index: -1;
   inset: 0;
   background:
-    linear-gradient(180deg, color-mix(in srgb, var(--ui-surface-strong) 24%, transparent), color-mix(in srgb, var(--ui-surface-strong) 50%, transparent)),
-    linear-gradient(90deg, color-mix(in srgb, var(--ui-surface-strong) 34%, transparent), color-mix(in srgb, var(--ui-surface-strong) 12%, transparent));
+    linear-gradient(180deg, rgba(5, 9, 19, .24), rgba(5, 9, 19, .5)),
+    linear-gradient(90deg, rgba(5, 9, 19, .34), rgba(5, 9, 19, .12));
 }
 
 .patch-compact-card:hover,
 .patch-compact-card:focus-visible {
-  background: var(--ui-canvas-deep);
-  border-color: color-mix(in srgb, var(--ui-primary-bright) 52%, transparent);
+  background: #10182a;
+  border-color: rgba(167, 139, 250, .52);
 }
 
 .patch-compact-copy {
@@ -1743,7 +1777,7 @@ a.tournament-card:focus-visible {
   font-size: 15px;
   font-weight: 850;
   line-height: 1.25;
-  text-shadow: 0 2px 12px color-mix(in srgb, var(--ui-canvas-deep) 80%, transparent);
+  text-shadow: 0 2px 12px rgba(0, 0, 0, .8);
 }
 
 .patch-date {
@@ -1755,7 +1789,7 @@ a.tournament-card:focus-visible {
 
 .patch-showcase-loading .patch-featured,
 .patch-showcase-loading .patch-compact-card {
-  background: linear-gradient(90deg, color-mix(in srgb, var(--ui-canvas-deep) 80%, transparent), color-mix(in srgb, var(--ui-primary) 62%, transparent), color-mix(in srgb, var(--ui-canvas-deep) 80%, transparent));
+  background: linear-gradient(90deg, rgba(18, 25, 43, .8), rgba(76, 59, 126, .62), rgba(18, 25, 43, .8));
   background-size: 220% 100%;
   animation: home-loading 1.6s linear infinite;
 }
@@ -1776,9 +1810,9 @@ a.tournament-card:focus-visible {
 }
 
 .video-play {
-  color: var(--ui-on-primary);
-  background: linear-gradient(135deg, var(--ui-primary), var(--ui-primary));
-  box-shadow: 0 10px 28px color-mix(in srgb, var(--ui-primary) 35%, transparent);
+  color: #fff;
+  background: linear-gradient(135deg, var(--ui-primary-deep), var(--ui-primary));
+  box-shadow: 0 10px 28px rgba(109, 40, 217, .35);
 }
 
 .video-card-copy strong {
@@ -1803,7 +1837,6 @@ a.tournament-card:focus-visible {
 }
 
 .home-social-card {
-  /* Social mark colors below follow each official network logo; surfaces use platform tokens. */
   --social-accent: #a78bfa;
   min-width: 0;
   min-height: 92px;
@@ -1813,17 +1846,17 @@ a.tournament-card:focus-visible {
   overflow: hidden;
   color: var(--ui-text);
   text-decoration: none;
-  background: color-mix(in srgb, var(--ui-surface) 94%, var(--social-accent) 6%);
+  background: color-mix(in srgb, #0a101d 94%, var(--social-accent) 6%);
   border: 1px solid color-mix(in srgb, var(--social-accent) 24%, var(--ui-border));
   border-radius: var(--ui-radius-sm);
-  box-shadow: 0 4px 12px color-mix(in srgb, var(--ui-canvas-deep) 22%, transparent);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, .22);
   backdrop-filter: none;
   transition: border-color .16s ease, background-color .16s ease;
 }
 
 .home-social-card:hover,
 .home-social-card:focus-visible {
-  background: color-mix(in srgb, var(--ui-surface-hover) 90%, var(--social-accent) 10%);
+  background: color-mix(in srgb, #0d1525 90%, var(--social-accent) 10%);
   border-color: color-mix(in srgb, var(--social-accent) 52%, var(--ui-border));
 }
 
@@ -1842,8 +1875,6 @@ a.tournament-card:focus-visible {
   filter: brightness(1.14) drop-shadow(0 0 8px color-mix(in srgb, var(--social-accent) 30%, transparent));
 }
 
-/* Deliberate media-brand exceptions: these accents match official social marks. */
-/* Official network mark colors are retained so each external brand stays recognizable. */
 .home-social-twitch { --social-accent: #a78bfa; }
 .home-social-youtube { --social-accent: #ff7185; }
 .home-social-discord { --social-accent: #9ca8ff; }
@@ -1856,7 +1887,7 @@ a.tournament-card:focus-visible {
 
 .home-loading-grid span,
 .patch-page-skeleton span {
-  background: linear-gradient(90deg, color-mix(in srgb, var(--ui-canvas-deep) 80%, transparent), color-mix(in srgb, var(--ui-primary) 62%, transparent), color-mix(in srgb, var(--ui-canvas-deep) 80%, transparent));
+  background: linear-gradient(90deg, rgba(18, 25, 43, .8), rgba(76, 59, 126, .62), rgba(18, 25, 43, .8));
   border-color: var(--ui-border);
   border-radius: var(--ui-radius-sm);
 }
@@ -1864,7 +1895,7 @@ a.tournament-card:focus-visible {
 .patch-article,
 .patch-section,
 .patch-ability {
-  background: linear-gradient(145deg, color-mix(in srgb, var(--ui-canvas-deep) 96%, transparent), color-mix(in srgb, var(--ui-canvas-deep) 97%, transparent));
+  background: linear-gradient(145deg, rgba(15, 22, 38, .96), rgba(7, 12, 23, .97));
   border-color: var(--ui-border);
   border-radius: var(--ui-radius-md);
 }
@@ -1911,7 +1942,7 @@ a.tournament-card:focus-visible {
 }
 
 .patch-ability-stat {
-  background: color-mix(in srgb, var(--ui-canvas-deep) 76%, transparent);
+  background: rgba(9, 15, 28, .76);
   border-color: var(--ui-border);
 }
 
@@ -1924,7 +1955,7 @@ a.tournament-card:focus-visible {
 }
 
 .patch-ability-tier {
-  background: color-mix(in srgb, var(--ui-canvas-deep) 72%, transparent);
+  background: rgba(9, 15, 28, .72);
   border-color: var(--ui-border);
 }
 
@@ -1975,42 +2006,42 @@ a.tournament-card:focus-visible {
 .patch-ability header > span {
   color: var(--ui-secondary);
   background: var(--ui-secondary-soft);
-  border-color: color-mix(in srgb, var(--ui-secondary) 28%, transparent);
+  border-color: rgba(45, 212, 191, .28);
   border-radius: var(--ui-radius-sm);
 }
 
 .item-patch-section {
   background:
-    radial-gradient(circle at top right, color-mix(in srgb, var(--ui-primary) 10%, transparent), transparent 34%),
-    linear-gradient(145deg, color-mix(in srgb, var(--ui-surface-strong) 96%, transparent), color-mix(in srgb, var(--ui-surface-strong) 97%, transparent));
+    radial-gradient(circle at top right, rgba(139, 92, 246, .1), transparent 34%),
+    linear-gradient(145deg, rgba(15, 22, 38, .96), rgba(7, 12, 23, .97));
 }
 
 .objective-patch-section {
   background:
-    radial-gradient(circle at top right, color-mix(in srgb, var(--ui-secondary) 12%, transparent), transparent 36%),
-    linear-gradient(145deg, color-mix(in srgb, var(--ui-surface-strong) 96%, transparent), color-mix(in srgb, var(--ui-surface-strong) 97%, transparent));
+    radial-gradient(circle at top right, rgba(45, 212, 191, .12), transparent 36%),
+    linear-gradient(145deg, rgba(15, 22, 38, .96), rgba(7, 12, 23, .97));
 }
 
 .patch-item-image {
   object-fit: contain;
-  filter: drop-shadow(0 0 14px color-mix(in srgb, var(--ui-primary) 22%, transparent));
+  filter: drop-shadow(0 0 14px rgba(139, 92, 246, .22));
 }
 
 .patch-objective-image {
-  filter: drop-shadow(0 0 16px color-mix(in srgb, var(--ui-secondary) 24%, transparent));
+  filter: drop-shadow(0 0 16px rgba(45, 212, 191, .24));
 }
 
 .patch-objective-fallback {
   color: var(--ui-secondary);
   background: var(--ui-secondary-soft);
-  border-color: color-mix(in srgb, var(--ui-secondary) 30%, transparent);
+  border-color: rgba(45, 212, 191, .3);
 }
 
 .patch-ability-icon {
   padding: 7px;
   object-fit: contain;
-  background: color-mix(in srgb, var(--ui-primary) 14%, transparent);
-  border: 1px solid color-mix(in srgb, var(--ui-primary) 25%, transparent);
+  background: rgba(139, 92, 246, .14);
+  border: 1px solid rgba(167, 139, 250, .25);
   border-radius: var(--ui-radius-sm);
   filter: brightness(0) invert(1);
   opacity: .9;
@@ -2025,7 +2056,7 @@ a.tournament-card:focus-visible {
 .info-rules-list article,
 .info-faq-list details {
   color: var(--ui-text-soft);
-  background: color-mix(in srgb, var(--ui-secondary) 72%, transparent);
+  background: rgba(9, 15, 28, .72);
   border-color: var(--ui-border);
 }
 
@@ -2134,7 +2165,7 @@ a.tournament-card:focus-visible {
   border-top-width: 4px;
   border-bottom-width: 4px;
   border-left: 7px solid var(--ui-primary-bright);
-  filter: drop-shadow(0 0 5px color-mix(in srgb, var(--ui-primary) 50%, transparent));
+  filter: drop-shadow(0 0 5px rgba(139, 92, 246, .5));
 }
 
 .description-meta-item,
@@ -2146,7 +2177,7 @@ a.tournament-card:focus-visible {
 .tournament-profile-panel,
 .stats-card,
 .stats-rank-row {
-  background: color-mix(in srgb, var(--ui-canvas-deep) 76%, transparent);
+  background: rgba(9, 15, 28, .76);
   border-color: var(--ui-border);
   border-radius: var(--ui-radius-sm);
 }
@@ -2158,10 +2189,10 @@ a.tournament-card:focus-visible {
 .steps-panel .step.done .primary-action,
 .steps-panel .step.done .disabled-action,
 .steps-panel .step.done .status-action {
-  color: var(--ui-success);
-  background: color-mix(in srgb, var(--ui-success) 82%, transparent);
-  border-color: color-mix(in srgb, var(--ui-success) 42%, transparent);
-  box-shadow: 0 10px 25px color-mix(in srgb, var(--ui-success) 20%, transparent);
+  color: #dcffe8;
+  background: rgba(22, 101, 52, .82);
+  border-color: rgba(74, 222, 128, .42);
+  box-shadow: 0 10px 25px rgba(20, 83, 45, .2);
 }
 
 .steps-panel .primary-action,
@@ -2186,13 +2217,13 @@ a.tournament-card:focus-visible {
   overflow: hidden;
   padding: 14px 18px 16px;
   background:
-    radial-gradient(circle at 92% 4%, color-mix(in srgb, var(--ui-primary) 11%, transparent), transparent 30%),
-    linear-gradient(145deg, color-mix(in srgb, var(--ui-surface-strong) 94%, transparent), color-mix(in srgb, var(--ui-surface-strong) 96%, transparent));
+    radial-gradient(circle at 92% 4%, rgba(139, 92, 246, .11), transparent 30%),
+    linear-gradient(145deg, rgba(12, 19, 34, .94), rgba(7, 12, 24, .96));
   border: 1px solid var(--ui-border);
   border-radius: var(--ui-radius-md);
   box-shadow:
-    0 18px 42px color-mix(in srgb, var(--ui-surface-strong) 22%, transparent),
-    inset 0 1px 0 color-mix(in srgb, var(--ui-text-soft) 3.5%, transparent);
+    0 18px 42px rgba(0, 0, 0, .22),
+    inset 0 1px 0 rgba(255, 255, 255, .035);
 }
 
 .team-header {
@@ -2204,7 +2235,7 @@ a.tournament-card:focus-visible {
   gap: 12px;
   margin: 0;
   padding: 0 0 9px 10px;
-  border-bottom: 1px solid color-mix(in srgb, var(--ui-primary) 18%, transparent);
+  border-bottom: 1px solid rgba(167, 139, 250, .18);
 }
 
 .opponent-team-panel .team-header {
@@ -2241,7 +2272,7 @@ a.tournament-card:focus-visible {
   justify-content: center;
   padding: 0 10px;
   color: var(--ui-text-soft);
-  background: color-mix(in srgb, var(--ui-canvas-deep) 90%, transparent);
+  background: rgba(12, 19, 34, .9);
   border: 1px solid var(--ui-border-strong);
   border-radius: var(--ui-radius-sm);
   font-size: 12px;
@@ -2258,18 +2289,18 @@ a.tournament-card:focus-visible {
 
 .team-control:hover,
 .team-control:focus-visible {
-  color: var(--ui-secondary);
-  background: color-mix(in srgb, var(--ui-primary) 38%, transparent);
-  border-color: color-mix(in srgb, var(--ui-primary) 68%, transparent);
-  box-shadow: 0 0 18px color-mix(in srgb, var(--ui-primary) 20%, transparent);
+  color: #f3efff;
+  background: rgba(76, 29, 149, .38);
+  border-color: rgba(167, 139, 250, .68);
+  box-shadow: 0 0 18px rgba(139, 92, 246, .2);
   outline: none;
 }
 
 .team-control:active {
-  color: var(--ui-text);
-  background: color-mix(in srgb, var(--ui-primary) 56%, transparent);
-  border-color: color-mix(in srgb, var(--ui-secondary) 84%, transparent);
-  box-shadow: 0 0 22px color-mix(in srgb, var(--ui-primary) 30%, transparent);
+  color: #fff;
+  background: rgba(109, 40, 217, .56);
+  border-color: rgba(196, 181, 253, .84);
+  box-shadow: 0 0 22px rgba(139, 92, 246, .3);
 }
 
 .team-badge {
@@ -2294,7 +2325,7 @@ a.tournament-card:focus-visible {
 }
 
 .team-panel .table tbody tr:hover {
-  background: color-mix(in srgb, var(--ui-primary) 5.5%, transparent);
+  background: rgba(139, 92, 246, .055);
 }
 
 .team-panel .table td {
@@ -2306,7 +2337,7 @@ a.tournament-card:focus-visible {
 }
 
 .team-panel .table tbody tr + tr td {
-  border-top: 1px solid color-mix(in srgb, var(--ui-primary-bright) 13%, transparent);
+  border-top: 1px solid rgba(167, 139, 250, .13);
 }
 
 .team-panel .table .player-cell {
@@ -2350,8 +2381,8 @@ a.tournament-card:focus-visible {
   place-items: center;
   overflow: visible;
   color: var(--ui-primary-bright);
-  background: linear-gradient(145deg, color-mix(in srgb, var(--ui-primary) 72%, transparent), color-mix(in srgb, var(--ui-canvas-deep) 96%, transparent));
-  border: 1px solid color-mix(in srgb, var(--ui-primary) 42%, transparent);
+  background: linear-gradient(145deg, rgba(76, 29, 149, .72), rgba(8, 14, 27, .96));
+  border: 1px solid rgba(167, 139, 250, .42);
   border-radius: 50%;
   font-size: 10px;
   letter-spacing: .04em;
@@ -2373,24 +2404,24 @@ a.tournament-card:focus-visible {
   width: 18px;
   height: 18px;
   place-items: center;
-  color: var(--ui-primary);
-  background: var(--ui-primary);
-  border: 1px solid color-mix(in srgb, var(--ui-border-strong) 42%, transparent);
+  color: #fff5c2;
+  background: #5b3b8f;
+  border: 1px solid rgba(255, 255, 255, .42);
   border-radius: 50%;
-  box-shadow: 0 2px 7px color-mix(in srgb, var(--ui-canvas-deep) 45%, transparent);
+  box-shadow: 0 2px 7px rgba(0, 0, 0, .45);
   pointer-events: none;
 }
 
 .team-player-role-icon-captain {
-  color: var(--ui-surface-strong);
-  background: linear-gradient(145deg, var(--ui-primary), var(--ui-primary));
-  border-color: color-mix(in srgb, var(--ui-primary) 90%, transparent);
+  color: #241506;
+  background: linear-gradient(145deg, #ffe08a, #d99a2b);
+  border-color: rgba(255, 235, 167, .9);
 }
 
 .team-player-role-icon-substitute {
-  color: var(--ui-secondary);
-  background: linear-gradient(145deg, var(--ui-secondary), var(--ui-secondary));
-  border-color: color-mix(in srgb, var(--ui-secondary) 72%, transparent);
+  color: #c8f7ff;
+  background: linear-gradient(145deg, #216d82, #173653);
+  border-color: rgba(123, 224, 239, .72);
 }
 
 .team-player-rank {
@@ -2404,7 +2435,7 @@ a.tournament-card:focus-visible {
   align-items: center;
   justify-content: center;
   gap: 0;
-  color: var(--ui-secondary);
+  color: #ddd4ff;
   font-size: 12px;
   font-weight: 780;
   line-height: 1;
@@ -2431,12 +2462,12 @@ a.tournament-card:focus-visible {
   margin-right: 10px;
   background: var(--ui-primary);
   border-radius: 50%;
-  box-shadow: 0 0 8px color-mix(in srgb, var(--ui-primary) 28%, transparent);
+  box-shadow: 0 0 8px rgba(139, 92, 246, .28);
 }
 
-.team-list-mark.mark-2 { background: var(--ui-surface); }
-.team-list-mark.mark-3 { background: var(--ui-primary); }
-.team-list-mark.mark-4 { background: var(--ui-danger); }
+.team-list-mark.mark-2 { background: #6f9a8d; }
+.team-list-mark.mark-3 { background: #8a74a7; }
+.team-list-mark.mark-4 { background: #a65d48; }
 
 .opponent-title-short {
   display: none;
@@ -2474,14 +2505,14 @@ a.tournament-card:focus-visible {
   align-items: center;
   padding: 20px 26px;
   background:
-    radial-gradient(circle at 13% 22%, color-mix(in srgb, var(--ui-primary) 24%, transparent), transparent 31%),
-    radial-gradient(circle at 90% 10%, color-mix(in srgb, var(--ui-primary) 20%, transparent), transparent 38%),
-    linear-gradient(145deg, color-mix(in srgb, var(--ui-surface-strong) 97%, transparent), color-mix(in srgb, var(--ui-surface-strong) 97%, transparent));
-  border-color: color-mix(in srgb, var(--ui-primary) 34%, transparent);
+    radial-gradient(circle at 13% 22%, rgba(139, 92, 246, .24), transparent 31%),
+    radial-gradient(circle at 90% 10%, rgba(139, 92, 246, .2), transparent 38%),
+    linear-gradient(145deg, rgba(16, 23, 40, .97), rgba(8, 13, 25, .97));
+  border-color: rgba(167, 139, 250, .34);
   box-shadow:
-    0 18px 46px color-mix(in srgb, var(--ui-surface-strong) 30%, transparent),
-    0 0 30px color-mix(in srgb, var(--ui-primary) 13%, transparent),
-    inset 0 1px 0 color-mix(in srgb, var(--ui-text-soft) 5%, transparent);
+    0 18px 46px rgba(0, 0, 0, .3),
+    0 0 30px rgba(139, 92, 246, .13),
+    inset 0 1px 0 rgba(255, 255, 255, .05);
 }
 
 .public-profile-identity {
@@ -2500,10 +2531,10 @@ a.tournament-card:focus-visible {
   place-items: center;
   overflow: hidden;
   color: var(--ui-primary-bright);
-  background: radial-gradient(circle at 50% 42%, color-mix(in srgb, var(--ui-secondary) 18%, transparent), color-mix(in srgb, var(--ui-canvas-deep) 95%, transparent) 58%, var(--ui-canvas-deep) 100%);
-  border: 1px solid color-mix(in srgb, var(--ui-primary) 50%, transparent);
+  background: radial-gradient(circle at 50% 42%, rgba(45, 212, 191, .18), rgba(18, 25, 43, .95) 58%, #070c17 100%);
+  border: 1px solid rgba(167, 139, 250, .5);
   border-radius: 50%;
-  box-shadow: 0 0 26px color-mix(in srgb, var(--ui-primary) 18%, transparent);
+  box-shadow: 0 0 26px rgba(139, 92, 246, .18);
 }
 
 .public-profile-avatar img {
@@ -2567,11 +2598,11 @@ a.tournament-card:focus-visible {
   place-items: center;
   padding: 14px;
   background:
-    radial-gradient(circle at 50% 42%, color-mix(in srgb, var(--ui-primary) 20%, transparent), transparent 38%),
-    linear-gradient(160deg, color-mix(in srgb, var(--ui-surface-strong) 96%, transparent), color-mix(in srgb, var(--ui-surface-strong) 98%, transparent));
-  border: 1px solid color-mix(in srgb, var(--ui-primary) 38%, transparent);
+    radial-gradient(circle at 50% 42%, rgba(139, 92, 246, .2), transparent 38%),
+    linear-gradient(160deg, rgba(16, 23, 40, .96), rgba(7, 12, 23, .98));
+  border: 1px solid rgba(167, 139, 250, .38);
   border-radius: var(--ui-radius-md);
-  box-shadow: inset 0 0 32px color-mix(in srgb, var(--ui-primary) 8%, transparent), 0 0 24px color-mix(in srgb, var(--ui-primary) 10%, transparent);
+  box-shadow: inset 0 0 32px rgba(139, 92, 246, .08), 0 0 24px rgba(139, 92, 246, .1);
 }
 
 .public-profile-details {
@@ -2589,7 +2620,7 @@ a.tournament-card:focus-visible {
 }
 
 .public-profile-details > * + * {
-  border-top: 1px solid color-mix(in srgb, var(--ui-primary) 14%, transparent);
+  border-top: 1px solid rgba(167, 139, 250, .14);
 }
 
 .public-profile-stats {
@@ -2636,7 +2667,7 @@ a.tournament-card:focus-visible {
 }
 
 .public-profile-contact + .public-profile-contact {
-  border-top: 1px solid color-mix(in srgb, var(--ui-primary) 14%, transparent);
+  border-top: 1px solid rgba(167, 139, 250, .14);
 }
 
 .public-profile-contact-icon {
@@ -2686,7 +2717,7 @@ a.tournament-card:focus-visible {
 
 .public-profile-copy-button:hover,
 .public-profile-copy-button:focus-visible {
-  color: var(--ui-secondary);
+  color: #e2dcff;
   background: transparent;
 }
 
@@ -2719,9 +2750,9 @@ a.tournament-card:focus-visible {
 
 .public-profile-pills span {
   padding: 8px 12px;
-  color: var(--ui-secondary);
+  color: #ddd4ff;
   background: var(--ui-primary-soft);
-  border: 1px solid color-mix(in srgb, var(--ui-primary) 30%, transparent);
+  border: 1px solid rgba(167, 139, 250, .3);
   border-radius: 999px;
   font-size: 12px;
   font-weight: 700;
@@ -2776,7 +2807,7 @@ a.tournament-card:focus-visible {
   padding: 4px 3px 6px;
   overflow: hidden;
   color: var(--ui-text-soft);
-  background: color-mix(in srgb, var(--ui-canvas-deep) 86%, transparent);
+  background: rgba(9, 15, 28, .86);
   border: 1px solid var(--ui-border-strong);
   border-radius: var(--ui-radius-sm);
   cursor: pointer;
@@ -2795,10 +2826,10 @@ a.tournament-card:focus-visible {
 .profile-rank-card:hover,
 .profile-rank-card:focus-visible,
 .profile-rank-card.active {
-  color: var(--ui-secondary);
+  color: #e3dcff;
   background: var(--ui-primary-soft);
-  border-color: color-mix(in srgb, var(--ui-primary) 64%, transparent);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ui-primary) 13%, transparent);
+  border-color: rgba(167, 139, 250, .64);
+  box-shadow: 0 0 0 2px rgba(139, 92, 246, .13);
 }
 
 .profile-rank-card.active::after {
@@ -2811,10 +2842,10 @@ a.tournament-card:focus-visible {
   height: 18px;
   display: grid;
   place-items: center;
-  color: var(--ui-text);
+  color: #fff;
   background: var(--ui-primary);
   border-radius: 50%;
-  box-shadow: 0 0 12px color-mix(in srgb, var(--ui-primary) 38%, transparent);
+  box-shadow: 0 0 12px rgba(139, 92, 246, .38);
   font-size: 12px;
   font-weight: 900;
 }
@@ -2851,30 +2882,30 @@ a.tournament-card:focus-visible {
 .profile-summary,
 .captain-banner {
   background:
-    radial-gradient(circle at top right, color-mix(in srgb, var(--ui-primary) 13%, transparent), transparent 34%),
-    linear-gradient(145deg, color-mix(in srgb, var(--ui-surface-strong) 97%, transparent), color-mix(in srgb, var(--ui-surface-strong) 97%, transparent));
+    radial-gradient(circle at top right, rgba(139, 92, 246, .13), transparent 34%),
+    linear-gradient(145deg, rgba(16, 23, 40, .97), rgba(8, 13, 25, .97));
 }
 
 .profile-summary {
-  border-color: color-mix(in srgb, var(--ui-primary) 34%, transparent);
+  border-color: rgba(167, 139, 250, .34);
   box-shadow:
-    0 18px 46px color-mix(in srgb, var(--ui-surface-strong) 28%, transparent),
-    0 0 30px color-mix(in srgb, var(--ui-primary) 12%, transparent),
-    inset 0 1px 0 color-mix(in srgb, var(--ui-text-soft) 5%, transparent);
+    0 18px 46px rgba(0, 0, 0, .28),
+    0 0 30px rgba(139, 92, 246, .12),
+    inset 0 1px 0 rgba(255, 255, 255, .05);
 }
 
 .profile-summary .avatar,
 .profile-avatar {
   color: var(--ui-primary-bright);
-  background: radial-gradient(circle at 50% 42%, color-mix(in srgb, var(--ui-secondary) 20%, transparent), color-mix(in srgb, var(--ui-canvas-deep) 94%, transparent) 58%, var(--ui-canvas-deep) 100%);
+  background: radial-gradient(circle at 50% 42%, rgba(45, 212, 191, .2), rgba(18, 25, 43, .94) 58%, #070c17 100%);
   border-color: var(--ui-primary-bright);
-  box-shadow: 0 0 24px color-mix(in srgb, var(--ui-primary) 20%, transparent), inset 0 0 28px color-mix(in srgb, var(--ui-primary) 8%, transparent);
+  box-shadow: 0 0 24px rgba(139, 92, 246, .2), inset 0 0 28px rgba(139, 92, 246, .08);
 }
 
 .completion .progress-track {
   overflow: hidden;
   height: 8px;
-  background: color-mix(in srgb, var(--ui-surface) 16%, transparent);
+  background: rgba(148, 163, 184, .16);
   border: 0;
   border-radius: 999px;
 }
@@ -2882,7 +2913,7 @@ a.tournament-card:focus-visible {
 .tabs {
   gap: 4px;
   padding: 4px;
-  background: color-mix(in srgb, var(--ui-canvas-deep) 90%, transparent);
+  background: rgba(8, 13, 25, .9);
   border: 1px solid var(--ui-border);
   border-radius: var(--ui-radius-md);
   box-shadow: var(--ui-shadow-soft);
@@ -2903,15 +2934,15 @@ a.tournament-card:focus-visible {
 }
 
 .tab-button.active {
-  color: var(--ui-secondary);
-  background: linear-gradient(135deg, color-mix(in srgb, var(--ui-primary) 42%, transparent), color-mix(in srgb, var(--ui-primary) 18%, transparent));
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ui-primary) 28%, transparent);
+  color: #e3dcff;
+  background: linear-gradient(135deg, rgba(109, 40, 217, .42), rgba(139, 92, 246, .18));
+  box-shadow: inset 0 0 0 1px rgba(167, 139, 250, .28);
 }
 
 .balance-icon {
   color: var(--ui-primary-bright);
   background: var(--ui-primary-soft);
-  border-color: color-mix(in srgb, var(--ui-primary) 34%, transparent);
+  border-color: rgba(167, 139, 250, .34);
 }
 
 .captain-banner {
@@ -2924,20 +2955,20 @@ a.tournament-card:focus-visible {
 }
 
 .selected-badge {
-  color: var(--ui-secondary);
+  color: #ddd4ff;
   background: var(--ui-primary-soft);
-  border-color: color-mix(in srgb, var(--ui-primary) 42%, transparent);
+  border-color: rgba(167, 139, 250, .42);
   border-radius: var(--ui-radius-sm);
 }
 
 .hero-card.selected::after {
-  color: var(--ui-text);
+  color: #fff;
   background: var(--ui-primary);
 }
 
 .dream-hero-picker-toggle {
   color: var(--ui-text-soft);
-  background: color-mix(in srgb, var(--ui-canvas-deep) 90%, transparent);
+  background: rgba(7, 12, 23, .9);
   border-color: var(--ui-border-strong);
   border-radius: var(--ui-radius-sm);
 }
@@ -2945,35 +2976,35 @@ a.tournament-card:focus-visible {
 .dream-hero-picker-toggle:hover,
 .dream-hero-picker-toggle:focus-visible,
 .dream-hero-picker-toggle.active {
-  color: var(--ui-secondary);
+  color: #e3dcff;
   background: var(--ui-primary-soft);
-  border-color: color-mix(in srgb, var(--ui-primary) 58%, transparent);
+  border-color: rgba(167, 139, 250, .58);
 }
 
 .dream-selected-heroes.empty {
-  background: color-mix(in srgb, var(--ui-canvas-deep) 55%, transparent);
+  background: rgba(7, 12, 23, .55);
   border: 0;
   border-radius: var(--ui-radius-sm);
 }
 
 .dream-selected-hero,
 .dream-hero-picker-panel {
-  background: color-mix(in srgb, var(--ui-canvas-deep) 86%, transparent);
+  background: rgba(9, 15, 28, .86);
   border-color: var(--ui-border);
   border-radius: var(--ui-radius-sm);
 }
 
 .dream-hero {
   color: var(--ui-text-soft);
-  background: color-mix(in srgb, var(--ui-canvas-deep) 90%, transparent);
+  background: rgba(7, 12, 23, .9);
   border-color: var(--ui-border);
   border-radius: var(--ui-radius-sm);
 }
 
 .dream-hero.selected {
-  color: var(--ui-secondary);
-  border-color: color-mix(in srgb, var(--ui-primary) 72%, transparent);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ui-primary) 16%, transparent);
+  color: #e3dcff;
+  border-color: rgba(167, 139, 250, .72);
+  box-shadow: 0 0 0 2px rgba(139, 92, 246, .16);
 }
 
 .dream-hero.selected::after {
@@ -2986,18 +3017,18 @@ a.tournament-card:focus-visible {
   height: 18px;
   display: grid;
   place-items: center;
-  color: var(--ui-text);
+  color: #fff;
   background: var(--ui-primary);
-  border: 1px solid color-mix(in srgb, var(--ui-border-strong) 74%, transparent);
+  border: 1px solid rgba(255, 255, 255, .74);
   border-radius: 50%;
   font-size: 11px;
   font-weight: 900;
   line-height: 1;
-  box-shadow: 0 2px 8px color-mix(in srgb, var(--ui-canvas-deep) 42%, transparent);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, .42);
 }
 
 .account-avatar-editor {
-  background: color-mix(in srgb, var(--ui-canvas-deep) 55%, transparent);
+  background: rgba(7, 12, 23, .55);
   border: 0;
   border-radius: var(--ui-radius-sm);
 }
@@ -3031,15 +3062,15 @@ a.tournament-card:focus-visible {
   justify-content: flex-start;
   gap: 22px;
   background:
-    radial-gradient(circle at 12% 18%, color-mix(in srgb, var(--ui-primary) 14%, transparent), transparent 38%),
-    linear-gradient(145deg, color-mix(in srgb, var(--ui-surface-strong) 98%, transparent), color-mix(in srgb, var(--ui-surface-strong) 98%, transparent));
+    radial-gradient(circle at 12% 18%, rgba(139, 92, 246, .14), transparent 38%),
+    linear-gradient(145deg, rgba(15, 22, 39, .98), rgba(8, 13, 25, .98));
 }
 
 .account-signoff-icon {
-  color: var(--ui-secondary);
-  background: color-mix(in srgb, var(--ui-primary) 16%, transparent);
-  border: 1px solid color-mix(in srgb, var(--ui-primary) 24%, transparent);
-  box-shadow: 0 0 18px color-mix(in srgb, var(--ui-primary) 12%, transparent);
+  color: #d8ccff;
+  background: rgba(124, 58, 237, .16);
+  border: 1px solid rgba(167, 139, 250, .24);
+  box-shadow: 0 0 18px rgba(124, 58, 237, .12);
 }
 
 .account-signoff-copy h3 {
@@ -3079,7 +3110,7 @@ a.tournament-card:focus-visible {
 }
 
 .account-signoff-error {
-  color: var(--ui-danger);
+  color: #f7b5c0;
 }
 
 .account-avatar-editor {
@@ -3112,7 +3143,7 @@ a.tournament-card:focus-visible {
 .empty-state,
 .tournament-list-state {
   color: var(--ui-text-muted);
-  background: color-mix(in srgb, var(--ui-canvas-deep) 88%, transparent);
+  background: rgba(8, 13, 25, .88);
   border: 1px solid var(--ui-border);
   border-radius: var(--ui-radius-md);
 }
@@ -3140,7 +3171,7 @@ a.tournament-card:focus-visible {
   font-weight: 850;
   line-height: .9;
   letter-spacing: -.06em;
-  text-shadow: 0 0 36px color-mix(in srgb, var(--ui-primary) 32%, transparent);
+  text-shadow: 0 0 36px rgba(139, 92, 246, .32);
 }
 
 .not-found-panel h2 {
@@ -3188,7 +3219,7 @@ a.tournament-card:focus-visible {
   height: 24px;
   margin: 0 auto;
   content: "";
-  border: 2px solid color-mix(in srgb, var(--ui-primary) 20%, transparent);
+  border: 2px solid rgba(167, 139, 250, .2);
   border-top-color: var(--ui-primary-bright);
   border-radius: 50%;
   animation: modern-loading-spin .7s linear infinite;
@@ -3201,12 +3232,12 @@ a.tournament-card:focus-visible {
 .loading-dot {
   background: var(--ui-primary-bright);
   border-radius: 50%;
-  box-shadow: 0 0 0 8px color-mix(in srgb, var(--ui-primary) 10%, transparent), 0 0 22px color-mix(in srgb, var(--ui-primary) 28%, transparent);
+  box-shadow: 0 0 0 8px rgba(139, 92, 246, .1), 0 0 22px rgba(139, 92, 246, .28);
 }
 
 .skeleton-line,
 .skeleton-card {
-  background: linear-gradient(90deg, color-mix(in srgb, var(--ui-canvas-deep) 74%, transparent), color-mix(in srgb, var(--ui-primary) 46%, transparent), color-mix(in srgb, var(--ui-canvas-deep) 74%, transparent));
+  background: linear-gradient(90deg, rgba(18, 25, 43, .74), rgba(95, 72, 156, .46), rgba(18, 25, 43, .74));
   background-size: 220% 100%;
   border-color: var(--ui-border);
   border-radius: var(--ui-radius-sm);
@@ -3218,9 +3249,9 @@ a.tournament-card:focus-visible {
 
 .account-avatar-preview {
   color: var(--ui-primary-bright);
-  background: radial-gradient(circle at 50% 42%, color-mix(in srgb, var(--ui-secondary) 20%, transparent), color-mix(in srgb, var(--ui-canvas-deep) 94%, transparent) 58%, var(--ui-canvas-deep) 100%);
+  background: radial-gradient(circle at 50% 42%, rgba(45, 212, 191, .2), rgba(18, 25, 43, .94) 58%, #070c17 100%);
   border-color: var(--ui-primary-bright);
-  box-shadow: 0 0 24px color-mix(in srgb, var(--ui-primary) 20%, transparent), inset 0 0 28px color-mix(in srgb, var(--ui-primary) 8%, transparent);
+  box-shadow: 0 0 24px rgba(139, 92, 246, .2), inset 0 0 28px rgba(139, 92, 246, .08);
 }
 
 .account-input-wrap > svg {
@@ -3234,22 +3265,22 @@ a.tournament-card:focus-visible {
 
 .hero-card.selected,
 .dream-hero.selected {
-  border-color: color-mix(in srgb, var(--ui-primary) 78%, transparent);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ui-primary) 18%, transparent);
+  border-color: rgba(167, 139, 250, .78);
+  box-shadow: 0 0 0 2px rgba(139, 92, 246, .18);
 }
 
 .bracket-shell,
 .bracket-viewport {
   background:
-    radial-gradient(circle at 50% 12%, color-mix(in srgb, var(--ui-primary) 8%, transparent), transparent 34%),
-    color-mix(in srgb, var(--ui-surface-strong) 94%, transparent);
+    radial-gradient(circle at 50% 12%, rgba(139, 92, 246, .08), transparent 34%),
+    rgba(4, 8, 17, .94);
   border-color: var(--ui-border);
   border-radius: var(--ui-radius-md);
 }
 
 .floating-zoom-button {
   color: var(--ui-primary-bright);
-  background: color-mix(in srgb, var(--ui-canvas-deep) 92%, transparent);
+  background: rgba(9, 15, 28, .92);
   border-color: var(--ui-border-strong);
   border-radius: var(--ui-radius-sm);
 }
@@ -3257,11 +3288,11 @@ a.tournament-card:focus-visible {
 .floating-zoom-button:hover,
 .floating-zoom-button:focus-visible {
   background: var(--ui-primary-soft);
-  border-color: color-mix(in srgb, var(--ui-primary) 58%, transparent);
+  border-color: rgba(167, 139, 250, .58);
 }
 
 .bracket-lines path {
-  stroke: color-mix(in srgb, var(--ui-primary) 46%, transparent);
+  stroke: rgba(167, 139, 250, .46);
 }
 
 .match {
@@ -3305,7 +3336,7 @@ a.tournament-card:focus-visible {
   padding: 0 6px;
   color: var(--ui-text-soft);
   color-scheme: dark;
-  background: color-mix(in srgb, var(--ui-canvas-deep) 94%, transparent);
+  background: rgba(7, 12, 23, .94);
   border: 1px solid var(--ui-border-strong);
   border-radius: 6px;
   font: inherit;
@@ -3320,9 +3351,9 @@ a.tournament-card:focus-visible {
   width: 36px;
   height: 32px;
   padding: 0;
-  color: var(--ui-on-primary);
-  background: linear-gradient(135deg, var(--ui-primary), var(--ui-primary));
-  border: 1px solid color-mix(in srgb, var(--ui-primary) 42%, transparent);
+  color: #fff;
+  background: linear-gradient(135deg, var(--ui-primary-deep), var(--ui-primary));
+  border: 1px solid rgba(167, 139, 250, .42);
   border-radius: 6px;
   font-size: 10px;
   font-weight: 800;
@@ -3338,10 +3369,10 @@ a.tournament-card:focus-visible {
   display: grid;
   overflow: hidden;
   grid-template-rows: 26px repeat(2, var(--bracket-team-row-height));
-  background: color-mix(in srgb, var(--ui-canvas-deep) 98%, transparent);
+  background: rgba(11, 17, 30, .98);
   border: 1px solid var(--ui-border-strong);
   border-radius: var(--ui-radius-sm);
-  box-shadow: 0 10px 24px color-mix(in srgb, var(--ui-canvas-deep) 24%, transparent);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, .24);
 }
 
 .match-meta {
@@ -3351,7 +3382,7 @@ a.tournament-card:focus-visible {
   justify-content: center;
   padding: 0 8px;
   color: var(--ui-text-muted);
-  background: color-mix(in srgb, var(--ui-canvas-deep) 98%, transparent);
+  background: rgba(14, 20, 36, .98);
   border-color: var(--ui-border);
   font-size: 11px;
 }
@@ -3478,17 +3509,17 @@ a.tournament-card:focus-visible {
 
 .bracket-empty-state {
   color: var(--ui-text-muted);
-  background: color-mix(in srgb, var(--ui-canvas-deep) 90%, transparent);
+  background: rgba(8, 13, 25, .9);
   border-color: var(--ui-border);
   border-radius: var(--ui-radius-md);
 }
 
 .site-footer {
   background:
-    radial-gradient(circle at 12% 0%, color-mix(in srgb, var(--ui-primary) 10%, transparent), transparent 34%),
-    color-mix(in srgb, var(--ui-surface-strong) 96%, transparent);
+    radial-gradient(circle at 12% 0%, rgba(139, 92, 246, .1), transparent 34%),
+    rgba(3, 7, 16, .96);
   border-top: 1px solid var(--ui-border);
-  box-shadow: 0 -14px 32px color-mix(in srgb, var(--ui-canvas-deep) 24%, transparent);
+  box-shadow: 0 -14px 32px rgba(0, 0, 0, .24);
 }
 
 .site-footer-nav h2 {
@@ -3512,7 +3543,7 @@ a.tournament-card:focus-visible {
 }
 
 :where(a, button, input, textarea, select, summary):focus-visible {
-  outline: 2px solid color-mix(in srgb, var(--ui-primary) 88%, transparent);
+  outline: 2px solid rgba(167, 139, 250, .88);
   outline-offset: 2px;
 }
 
@@ -4013,21 +4044,21 @@ a.tournament-card:focus-visible {
   min-height: 38px;
   margin-top: 0;
   padding: 0 14px;
-  color: var(--ui-danger);
-  background: color-mix(in srgb, var(--ui-primary) 30%, transparent);
-  border-color: color-mix(in srgb, var(--ui-danger) 40%, transparent);
+  color: #f7b5c0;
+  background: rgba(90, 24, 42, .3);
+  border-color: rgba(251, 113, 133, .4);
 }
 
 .account-avatar-copy .media-delete-button:hover,
 .account-avatar-copy .media-delete-button:focus-visible {
-  color: var(--ui-danger);
-  background: color-mix(in srgb, var(--ui-danger) 45%, transparent);
-  border-color: color-mix(in srgb, var(--ui-danger) 68%, transparent);
+  color: #ffe4e9;
+  background: rgba(125, 32, 55, .45);
+  border-color: rgba(251, 113, 133, .68);
 }
 
 .account-identity-value {
   color: var(--ui-text-soft);
-  background: color-mix(in srgb, var(--ui-canvas-deep) 90%, transparent);
+  background: rgba(7, 12, 23, .9);
   border-color: var(--ui-border-strong);
   border-radius: var(--ui-radius-sm);
 }

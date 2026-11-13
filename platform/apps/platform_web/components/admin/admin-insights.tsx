@@ -22,7 +22,7 @@ import type {
 } from "@/lib/platform-types";
 import { useI18n } from "@/components/i18n-provider";
 
-export type AdminView = "overview" | "users" | "tournaments" | "analytics" | "audit" | "preprod" | "appearance";
+export type AdminView = "overview" | "users" | "tournaments" | "analytics" | "audit" | "preprod";
 
 type InsightProps = {
   formatDate: (value: string) => string;

@@ -731,19 +731,7 @@ test("site footer exposes valid navigation and project attribution", async ({ pa
   await expect(header.locator(".brand-title")).toHaveText("OLD SPARKY");
   await expect(header.locator(".brand-title")).toHaveCSS("white-space", "nowrap");
   await expect(header.locator(".brand-sub")).toHaveText("ARENA");
-  const brandMark = header.locator(".brand-mark");
-  await expect(brandMark).toHaveCSS("mask-image", /old-sparky-arena-logo-v3\.webp/);
-  const brandForeground = await page.evaluate(() => {
-    const mark = document.querySelector<HTMLElement>(".site-header .brand-mark")!;
-    const token = getComputedStyle(document.documentElement).getPropertyValue("--ui-text").trim();
-    const probe = document.createElement("span");
-    probe.style.backgroundColor = token;
-    document.body.append(probe);
-    const expected = getComputedStyle(probe).backgroundColor;
-    probe.remove();
-    return { expected, actual: getComputedStyle(mark).backgroundColor };
-  });
-  expect(brandForeground.actual).toBe(brandForeground.expected);
+  await expect(header.locator(".brand-mark")).toHaveAttribute("src", "/assets/main_logo/old-sparky-arena-logo-v3.webp");
   const footer = page.getByRole("contentinfo");
   await expect(footer).toHaveCount(1);
   await expect(page.getByText("Турниры, обновления Deadlock, Драфты и новые видео Old Sparky.", { exact: true })).toBeVisible();
@@ -1065,30 +1053,6 @@ test("unknown tournament detail and bracket stay 404 while the API is delayed", 
     await expectRawRobotsResponse(navigation, 404, /^noindex$/u);
   }
 });
-
-async function computedThemeMix(page: import("@playwright/test").Page, tokenName: string, percentage: number) {
-  return page.evaluate(({ tokenName: role, percentage: amount }) => {
-    const token = getComputedStyle(document.documentElement).getPropertyValue(role).trim();
-    const probe = document.createElement("span");
-    probe.style.color = `color-mix(in srgb, ${token} ${amount}%, transparent)`;
-    document.body.append(probe);
-    const color = getComputedStyle(probe).color;
-    probe.remove();
-    return color;
-  }, { tokenName, percentage });
-}
-
-async function computedThemeRole(page: import("@playwright/test").Page, tokenName: string) {
-  return page.evaluate((role) => {
-    const token = getComputedStyle(document.documentElement).getPropertyValue(role).trim();
-    const probe = document.createElement("span");
-    probe.style.color = token;
-    document.body.append(probe);
-    const color = getComputedStyle(probe).color;
-    probe.remove();
-    return color;
-  }, tokenName);
-}
 
 test("robots metadata stays singular across hydrated public, private, and missing navigation", async ({ page }) => {
   await authenticateTestUser(page);
@@ -1937,15 +1901,10 @@ test("status badges display labels from status data", async ({ page }) => {
   const closed = page.getByTestId("tournament-status-badge").filter({ hasText: "Регистрация закрыта" }).first();
   await expect(open).toBeVisible();
   await expect(closed).toBeVisible();
-  await expect(open).toHaveCSS("color", await computedThemeRole(page, "--ui-success"));
-  await expect(open).toHaveCSS("background-color", await computedThemeRole(page, "--ui-success-soft"));
-  await expect(open).toHaveCSS("border-color", await computedThemeMix(page, "--ui-success", 42));
-  await expect(closed).toHaveCSS("background-color", await computedThemeMix(page, "--ui-surface", 14));
-  await expect(closed).toHaveCSS("border-color", await computedThemeMix(page, "--ui-secondary", 36));
-  const openShadow = await open.evaluate((element) => getComputedStyle(element).boxShadow);
-  const closedShadow = await closed.evaluate((element) => getComputedStyle(element).boxShadow);
-  expect(openShadow).toContain(await computedThemeMix(page, "--ui-success", 16));
-  expect(closedShadow).toContain(await computedThemeMix(page, "--ui-secondary", 11));
+  await expect(open).toHaveCSS("background-color", "rgba(20, 83, 65, 0.58)");
+  await expect(closed).toHaveCSS("background-color", "rgba(148, 163, 184, 0.14)");
+  await expect(open).toHaveCSS("box-shadow", /rgba\(74, 222, 128, 0\.16\)/);
+  await expect(closed).toHaveCSS("box-shadow", /rgba\(226, 232, 240, 0\.11\)/);
   await expect(open).toHaveCSS("position", "absolute");
   for (const badge of [open, closed]) {
     const placement = await badge.evaluate((element) => {
@@ -1973,9 +1932,9 @@ test("status badges display labels from status data", async ({ page }) => {
       document.body.append(badge);
     }
   });
-  await expect(page.locator('[data-test-status="in-progress"]')).toHaveCSS("background-color", await computedThemeRole(page, "--ui-secondary-soft"));
-  await expect(page.locator('[data-test-status="completed"]')).toHaveCSS("background-color", await computedThemeRole(page, "--ui-success-soft"));
-  await expect(page.locator('[data-test-status="cancelled"]')).toHaveCSS("background-color", await computedThemeRole(page, "--ui-danger-soft"));
+  await expect(page.locator('[data-test-status="in-progress"]')).toHaveCSS("background-color", "rgba(30, 82, 139, 0.52)");
+  await expect(page.locator('[data-test-status="completed"]')).toHaveCSS("background-color", "rgba(87, 29, 45, 0.58)");
+  await expect(page.locator('[data-test-status="cancelled"]')).toHaveCSS("background-color", "rgba(87, 29, 45, 0.58)");
 });
 
 test("patch detail keeps objective sections, the upper cover crop, and no source toolbar", async ({ page }) => {
@@ -2436,7 +2395,7 @@ test("home uses a balanced hero, numbered workflow, and featured patch hierarchy
   await expect(firstSocial.locator(".home-social-logo")).not.toHaveCSS("filter", "none");
   await compactPatches.first().hover();
   await expect(compactPatches.first()).toHaveCSS("transform", "none");
-  await expect(compactPatches.first()).toHaveCSS("border-color", await computedThemeMix(page, "--ui-primary-bright", 52));
+  await expect(compactPatches.first()).toHaveCSS("border-color", "rgba(167, 139, 250, 0.52)");
   const surfaceStyles = await page.evaluate(() => {
     const flow = document.querySelector<HTMLElement>(".home-flow-card")!;
     const flowNumber = flow.querySelector<HTMLElement>(".home-flow-number")!;
@@ -5097,7 +5056,7 @@ test("tournament detail switches opponent roster panel and returns to team list"
   expect(firstRowBox?.height).toBeCloseTo(56, 0);
   expect(secondRowBox?.height).toBeCloseTo(56, 0);
   const modernSeparator = await teamMemberRows.nth(1).locator("td").first().evaluate((node) => getComputedStyle(node).borderTopColor);
-  expect(modernSeparator).toBe(await computedThemeMix(page, "--ui-primary-bright", 13));
+  expect(modernSeparator).toBe("rgba(167, 139, 250, 0.13)");
   if (testInfo.project.name === "desktop") {
     await page.screenshot({
       fullPage: true,
