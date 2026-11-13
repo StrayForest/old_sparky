@@ -145,6 +145,46 @@ required evidence, review, safety checks and release gates.
   wait for its exit and inspect the retained failure log on nonzero status.
   After an interrupted build or browser run, verify owned processes and fixed
   ports are clear before starting another build.
+- For a long gate that can outlive its interactive session, capture its actual
+  exit code with one private detached supervisor around the unchanged canonical
+  quiet-wrapper command. From the repository root, create a mode-0700 receipt
+  directory and separate log/status files; have the supervisor write run ID,
+  canonical command, UTC finish time and captured exit code to a mode-0600
+  temporary status file, then atomically rename it. Poll that receipt, not the
+  log or process list. If the session is lost without a receipt, mark the run
+  incomplete, stop only its owned process group, and prove descendants, fixed
+  ports and temporary artifacts are clear before one rerun.
+  Example launcher:
+
+  ```bash
+  gate_id=web-hermetic
+  run_id="${gate_id}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  platform_dir="$(git rev-parse --show-toplevel)/platform"
+  receipt_dir="$(mktemp -d /tmp/platform-gate.XXXXXX)"
+  chmod 0700 "$receipt_dir"
+  umask 077
+  status_file="$receipt_dir/$run_id.status"
+  log_file="$receipt_dir/$run_id.log"
+  nohup setsid bash -c '
+    platform_dir="$1"; gate_id="$2"; run_id="$3"; status_file="$4"; label="$5"
+    set +e
+    if cd "$platform_dir"; then
+      ./tools/platform_run_quiet.sh "$label" -- ./.venv_platform/bin/python tools/platform_verify.py "$gate_id"
+      rc=$?
+    else
+      rc=125
+    fi
+    finished_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    umask 077
+    printf "run_id=%s\ncommand=platform_run_quiet.sh -- .venv_platform/bin/python tools/platform_verify.py %s\nfinished_utc=%s\nexit_code=%s\n" \
+      "$run_id" "$gate_id" "$finished_utc" "$rc" > "$status_file.tmp"
+    mv "$status_file.tmp" "$status_file"
+    exit "$rc"
+  ' gate-supervisor "$platform_dir" "$gate_id" "$run_id" "$status_file" "$gate_id" \
+    </dev/null >"$log_file" 2>&1 &
+  supervisor_pid=$!
+  printf 'supervisor_pid=%s\nreceipt_dir=%s\n' "$supervisor_pid" "$receipt_dir"
+  ```
 - For gates that import runtime dependencies, use the canonical locked
   environment or defer to CI. Do not rebuild the environment one missing
   import at a time.

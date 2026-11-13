@@ -1,0 +1,35 @@
+{
+  "revision": 1,
+  "groups": {
+    "theme": ["background", "accent", "foreground"],
+    "system": ["secondary", "warning", "danger", "success"]
+  },
+  "defaults": {
+    "background": "#050813",
+    "accent": "#8B5CF6",
+    "foreground": "#F7F8FC",
+    "secondary": "#2DD4BF",
+    "warning": "#FB923C",
+    "danger": "#FB7185",
+    "success": "#4ADE80"
+  },
+  "derived": {
+    "backgroundDeep": {"mix": ["background", "#000000", 0.2]},
+    "onPrimary": {"contrast": {"against": "accent", "light": "#FFFFFF", "dark": "#000000", "threshold": 0.179}},
+    "surface": {"mix": ["background", "accent", 0.045]},
+    "surfaceStrong": {"mix": ["background", "foreground", 0.055]},
+    "surfaceSoft": {"mix": ["background", "accent", 0.075]},
+    "surfaceHover": {"mix": ["background", "foreground", 0.09]},
+    "border": {"mix": ["background", "foreground", 0.48]},
+    "borderStrong": {"mix": ["background", "foreground", 0.62]},
+    "accentBright": {"mix": ["accent", "#FFFFFF", 0.20]},
+    "accentDeep": {"mix": ["accent", "#000000", 0.27]},
+    "accentSoft": {"mix": ["background", "accent", 0.14]},
+    "secondarySoft": {"mix": ["background", "secondary", 0.13]},
+    "successSoft": {"mix": ["background", "success", 0.14]},
+    "warningSoft": {"mix": ["background", "warning", 0.14]},
+    "dangerSoft": {"mix": ["background", "danger", 0.14]},
+    "foregroundSoft": {"mix": ["foreground", "background", 0.22]},
+    "foregroundMuted": {"mix": ["foreground", "background", 0.3]}
+  }
+}

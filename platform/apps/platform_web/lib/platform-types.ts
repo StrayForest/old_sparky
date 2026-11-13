@@ -258,6 +258,12 @@ export type PlatformAdminOverview = {
   analytics?: PlatformAdminAnalytics | null;
 };
 
+export type PlatformAppearance = {
+  colors: Record<string, string>;
+  revision: number;
+  groups?: { theme: string[]; system: string[] };
+};
+
 export type PlatformAdminAnalyticsBucket = {
   key: string;
   count: number;

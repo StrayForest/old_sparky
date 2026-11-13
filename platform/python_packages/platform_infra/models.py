@@ -1421,6 +1421,23 @@ class AuditLog(Base):
     )
 
 
+class AppearanceSettings(Base):
+    """The single database-owned public color palette and optimistic revision."""
+
+    __tablename__ = "appearance_settings"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="appearance_settings_singleton"),
+        CheckConstraint("revision >= 1", name="appearance_settings_revision_positive"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    colors: Mapped[dict] = mapped_column(JSON, nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class PreprodTestRun(TimestampMixin, Base):
     __tablename__ = "preprod_test_runs"
 

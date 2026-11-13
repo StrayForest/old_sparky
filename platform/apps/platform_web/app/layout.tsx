@@ -9,6 +9,8 @@ import { SiteHeader } from "@/components/layout/site-header";
 import { CspNonceProvider } from "@/components/security/csp-nonce-provider";
 import { CspRouteAnnouncer } from "@/components/security/csp-route-announcer";
 import { getServerAuthBootstrap, platformSessionCookieName } from "@/lib/server-auth";
+import { appearanceCss } from "@/lib/appearance-palette";
+import { getServerAppearanceColors } from "@/lib/server-appearance";
 import {
   isSsrTraceSampled,
   measureSsrStage,
@@ -40,10 +42,12 @@ export default async function RootLayout({
   const renderRoot = (
     nonce: string | null,
     initialAuth: Awaited<ReturnType<typeof getServerAuthBootstrap>>,
-    adsenseEnabled: boolean
+    adsenseEnabled: boolean,
+    appearanceColors: Awaited<ReturnType<typeof getServerAppearanceColors>>
   ) => (
     <html lang="ru">
       <head>
+        <style nonce={nonce ?? undefined}>{appearanceCss(appearanceColors)}</style>
         {adsenseEnabled ? (
           <script
             async
@@ -77,8 +81,9 @@ export default async function RootLayout({
     const initialAuth = requestCookies.has(platformSessionCookieName())
       ? await measureSsrStage("auth_bootstrap", () => getServerAuthBootstrap(cookieHeader))
       : { status: "anonymous" as const, user: null };
+    const appearanceColors = await measureSsrStage("appearance_palette", getServerAppearanceColors);
     const adsenseEnabled = process.env.PLATFORM_ADSENSE_ENABLED !== "false";
-    const rendered = renderRoot(nonce, initialAuth, adsenseEnabled);
+    const rendered = renderRoot(nonce, initialAuth, adsenseEnabled, appearanceColors);
     if (startedAt !== null) {
       await recordSsrStage("root_layout", performance.now() - startedAt);
     }

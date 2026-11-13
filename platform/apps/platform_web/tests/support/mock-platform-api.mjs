@@ -7,6 +7,7 @@ const defaultReadyCheckServerTime = "2026-06-07T15:35:00Z";
 const mockCsrfToken = `mock.${"c".repeat(64)}`;
 let mockMediaSequence = 0;
 const mockMediaAssets = new Map();
+let testAppearancePayload = null;
 const deadlockHeroNames = [
   "Abrams", "Apollo", "Bebop", "Billy", "Calico", "Celeste", "The Doorman", "Drifter",
   "Dynamo", "Graves", "Grey Talon", "Haze", "Holliday", "Infernus", "Ivy", "Kelvin",
@@ -149,6 +150,17 @@ function json(response, status, payload, headers = {}) {
     ...headers
   });
   response.end(JSON.stringify(payload));
+}
+
+async function readJsonBody(request) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of request) {
+    size += chunk.length;
+    if (size > 16_384) throw new Error("Test fixture payload is too large.");
+    chunks.push(chunk);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
 }
 
 function authenticated(request) {
@@ -372,6 +384,23 @@ function serverTimeForRequest(request) {
 const server = createServer((request, response) => {
   const url = new URL(request.url ?? "/", `http://${host}:${port}`);
   const path = url.pathname.replace(/\/$/, "") || "/";
+
+  if (path === "/__test/appearance" && request.method === "PUT") {
+    void readJsonBody(request).then((payload) => {
+      if (!payload || typeof payload !== "object" || !payload.colors || !Number.isInteger(payload.revision)) {
+        json(response, 400, { detail: "Invalid appearance fixture." });
+        return;
+      }
+      testAppearancePayload = payload;
+      json(response, 200, { saved: true });
+    }).catch(() => json(response, 400, { detail: "Invalid appearance fixture." }));
+    return;
+  }
+
+  if (path === "/api/v1/appearance" && request.method === "GET") {
+    json(response, testAppearancePayload ? 200 : 404, testAppearancePayload ?? { detail: "Appearance fixture not configured." });
+    return;
+  }
 
   if (path === "/api/v1/health/live" || path === "/api/v1/health/ready") {
     json(response, 200, { status: "ok", service: "platform-api-mock" });

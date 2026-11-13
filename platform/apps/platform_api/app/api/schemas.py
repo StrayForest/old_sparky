@@ -7,6 +7,35 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, mo
 
 from python_packages.platform_domain.deadlock.constants import RANKS
 from python_packages.platform_domain.tournaments import READY_CHECK_MAX_DURATION_SECONDS
+from python_packages.platform_domain.appearance_palette import APPEARANCE_COLOR_KEYS
+
+
+class PublicAppearanceResponse(BaseModel):
+    colors: dict[str, str]
+    revision: int = Field(ge=1)
+
+
+class AdminAppearanceResponse(PublicAppearanceResponse):
+    groups: dict[str, list[str]]
+
+
+class AdminAppearanceUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    colors: dict[str, str]
+    expected_revision: int = Field(ge=1)
+
+    @field_validator("colors")
+    @classmethod
+    def validate_colors(cls, value: dict[str, str]) -> dict[str, str]:
+        if set(value) != APPEARANCE_COLOR_KEYS:
+            raise ValueError("Colors must contain every supported palette key.")
+        for color in value.values():
+            if not isinstance(color, str) or len(color) != 7 or color[0] != "#":
+                raise ValueError("Colors must use the #RRGGBB format.")
+            if any(char not in "0123456789abcdefABCDEF" for char in color[1:]):
+                raise ValueError("Colors must use the #RRGGBB format.")
+        return {key: value[key].upper() for key in value}
 
 
 class HealthResponse(BaseModel):

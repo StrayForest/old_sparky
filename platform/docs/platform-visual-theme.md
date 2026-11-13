@@ -2,19 +2,58 @@
 
 - Status: Active reference
 - Owner: Platform web
-- Last reviewed: 2026-09-11
+- Last reviewed: 2026-11-12
 
 ## Ownership
 
-- `app/globals.css` owns structure and fallback geometry.
-- `app/theme-modern.css` owns semantic tokens and active presentation; it is
-  imported after `globals.css`.
+- `python_packages/platform_domain/appearance_palette.json` is the only source
+  for the seven editable colors (background, accent, foreground, secondary,
+  warning, danger and success), their editor groups and the derived color
+  recipes. The Python API validator and web preview/SSR resolver consume this
+  same manifest.
+- The first three colors are the site gamma seeds. Surface, border, muted text,
+  accent shades and soft status fills derive from those seeds; editing the
+  gamma never requires editing those values independently. System colors are
+  separate controls in the admin palette editor.
+- `app/globals.css` owns structure and fallback geometry; `app/theme-modern.css`
+  owns active presentation and consumes the server-rendered `--ui-*` roles.
+  The palette arrives in a nonce-bearing style block from the root layout,
+  before page content is painted. The server reads the public palette from the
+  API over its loopback service address and falls back to manifest defaults or
+  its last-known-good value if that read is unavailable.
+- The API stores one singleton palette row. `GET /api/v1/appearance` is public
+  and returns only the resolved colors and revision. Admin and superadmin may
+  update the palette at `PUT /api/v1/admin/appearance`; the request must carry
+  the revision it loaded. A stale revision returns `409`, and a successful
+  write records an audit event.
+- Palette changes are cached in Redis for up to 60 seconds and published after
+  commit through a revision-aware atomic compare-and-set. A successful publish
+  replaces the shared value immediately; with Redis unavailable, each API
+  process may use its last-known-good value for at most two seconds without
+  republishing it. If Redis reads still work but the post-commit publish fails,
+  an already cached old value can remain until its current 60-second expiry.
+  Independent Redis eviction or reset can also lose the revision watermark;
+  the database remains authoritative and stale shared data can persist for up
+  to the 60-second shared TTL. The web process keeps a successful server read
+  for one second. Open pages do not poll; a new page receives the update after
+  the bounded cache path expires or a successful publish.
+- The admin console shell uses the same manifest's default resolved colors so
+  its navigation, save and reset controls remain readable if visitors receive
+  a low-contrast custom palette. Only the sample preview uses the unsaved draft.
+- Intentional visual exceptions are Deadlock rank identity colors, official
+  social network logo colors and supplied image/media colors. They represent
+  game or third-party identity rather than the site's editable interface
+  palette.
 - Components own semantics and interaction, not page-specific theme colors.
 - Russian UI text belongs in `lib/i18n.ts`.
 
-Use `--ui-*` tokens for canvas, surfaces, actions, state, content, radius and
-shadow. The old `--gold`, `--bg-*` and `--text-*` mapping is retained only as a
-compatibility layer while structural CSS still consumes it.
+Use `--ui-*` tokens for canvas, surfaces, actions, state and content. The old
+`--gold`, `--bg-*` and `--text-*` mapping is retained only as a compatibility
+layer while structural CSS still consumes it. The theme editor accepts strict
+six-digit HEX values, with or without a leading `#`; draft changes stay local
+until an explicit save. It offers hue, saturation and brightness sliders, the
+native color picker and an exact HEX field. Contrast warnings do not block any
+color.
 
 ## Visual rules
 

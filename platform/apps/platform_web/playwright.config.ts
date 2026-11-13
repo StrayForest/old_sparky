@@ -107,6 +107,14 @@ export default defineConfig({
       name: "mobile-layout",
       testIgnore: [...sharedIgnoredSpecs, ...desktopOnlySpecs],
       use: { ...devices["Pixel 5"] }
+    },
+    {
+      // The public appearance palette is singleton state in the mock API.
+      // Run its save/reload/recovery proof after all non-mutating viewports.
+      name: "appearance-recovery",
+      dependencies: ["desktop", "wide-1300", "tablet-820", "mobile-layout"],
+      testMatch: "**/admin-appearance.spec.ts",
+      use: { ...devices["Desktop Chrome"], viewport: { width: 1440, height: 1000 } }
     }
   ]
 });
