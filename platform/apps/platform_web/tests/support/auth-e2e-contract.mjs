@@ -22,6 +22,11 @@ const hermetic = read("platform/tools/platform_web_hermetic.sh");
 const childEnvSource = read("platform/apps/platform_web/tests/support/auth-e2e-child-env.cjs");
 const diagnosticsSource = read("platform/apps/platform_web/tests/support/auth-e2e-python-diagnostics.cjs");
 
+const serverFixtureEmail = server.match(/^FIXTURE_EMAIL = "([^"]+)"$/mu)?.[1];
+const browserFixtureEmail = spec.match(/^const FIXTURE_EMAIL = "([^"]+)";$/mu)?.[1];
+assert.equal(serverFixtureEmail, "auth-e2e@example.com");
+assert.equal(browserFixtureEmail, serverFixtureEmail);
+
 const require = createRequire(import.meta.url);
 const { apiChildEnv, nextChildEnv } = require("./auth-e2e-child-env.cjs");
 const AuthE2ESafeReporter = require("./auth-e2e-safe-reporter.cjs");

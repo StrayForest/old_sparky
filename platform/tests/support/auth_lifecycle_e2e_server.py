@@ -27,7 +27,7 @@ PLATFORM_ROOT = Path(__file__).resolve().parents[2]
 if str(PLATFORM_ROOT) not in sys.path:
     sys.path.insert(0, str(PLATFORM_ROOT))
 
-FIXTURE_EMAIL = "auth-e2e@example.test"
+FIXTURE_EMAIL = "auth-e2e@example.com"
 FIXTURE_DISPLAY_NAME = "AuthE2E"
 FIXTURE_REGISTRATION_PASSWORD = "AuthE2E-Registration-Password-1!"
 FIXTURE_RESET_PASSWORD = "AuthE2E-Reset-Password-2!"

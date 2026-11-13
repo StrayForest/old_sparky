@@ -3,7 +3,7 @@ import { lstatSync, readFileSync } from "node:fs";
 
 const API_ORIGIN = "http://127.0.0.1:3199";
 const WEB_ORIGIN = "http://127.0.0.1:3100";
-const FIXTURE_EMAIL = "auth-e2e@example.test";
+const FIXTURE_EMAIL = "auth-e2e@example.com";
 const REGISTRATION_PASSWORD = "AuthE2E-Registration-Password-1!";
 const RESET_PASSWORD = "AuthE2E-Reset-Password-2!";
 const DISPLAY_NAME = "AuthE2E";
