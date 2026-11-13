@@ -1,33 +1,29 @@
 # Platform simplification and performance audit — 2026-11-13
 
-- Status: Application candidate CI passed; exact final-source route correction CI and production release pending
+- Status: One cumulative application deployment completed; public browser QA and roster cleanup remain open
 - Owner: Platform maintainers
 - Scope: Production platform, frontend SSR/client boundary, public tournament catalog, and CI/release/backup controls
 
 ## Verified production and rollback baseline
 
-The bounded read-only readiness collector returned `ready` for current app
-`cb1a75114aac0f4fb0ee6cc407011f90c6e76f31`, release
-`gha-43367073524-1-cb1a75114aac`, and previous app
-`79b3b95ede586da84c3d49138bf88888f866c6b3`, release
-`gha-43176891484-1-79b3b95ede58`. Host-tools C3
-`625bbaa11023ffaf059dfa03a34a4850b02d4f93` passed all 15 pinned-member and
-mode checks. API/web readiness, service state, locks, operation marker,
-maintenance timer, disk availability and final pointer consistency passed.
-Database Alembic head is `20261112_0055`; the source-bound backup and
-maintenance receipts confirm restore/Alembic verification across 37 tables.
-The read-only readiness collector itself does not query Alembic state.
+Production now runs application and installed LiveQA payload source
+`126d4114542369af9d999e219563fa1d53b09568`; its previous app is the initial
+rollback source `cb1a75114aac0f4fb0ee6cc407011f90c6e76f31`. Host-tools pin C3
+is `625bbaa11023ffaf059dfa03a34a4850b02d4f93`. The single app deployment
+followed exact-SHA Security `43401840198`, source-bound restore-verified backup
+`43404066694`, AUTO `43403887168`, and automatic production child `43404454746`.
+Post-deploy readiness and health passed with an operations receipt/checkpoint;
+this is not a public browser QA pass.
+Deployment preflight compared Alembic `current` with `heads` at
+`20261112_0055`; no downgrade occurred. The application change did not alter
+schema, dependencies, or the host-tools pin. The standard application rollback
+pointer remains the initial `cb1a...` release.
 
-The application candidate was reviewed from source
-`6bd19b64d8b4711e49da8c98ef3ce2c9727d74c6` and merged as
-`02a3da635ce2df26567f83df8de245d2deb428eb`. Its original exact-SHA PR CI
-passed. A narrow classifier correction is in review so the two exact
-project-change skills can accompany `platform/apps/` source without triggering
-unknown-path fallback; the final source still requires full exact-SHA CI and
-release authorization. It changes no schema, runtime dependencies or
-host-tools pin. For the single app deployment, preserve current `cb1a...` as the initial
-rollback release; require the usual exact-source restore-verified backup.
-Rollback switches application releases and does not downgrade Alembic.
+The initial bounded readiness result preceded activation and is not the final
+deployment evidence. The post-deploy operations receipt/checkpoint is the
+source for the successful health result. A null source-binding digest is
+expected where the runner and app source SHAs are equal; it is not a failed
+binding.
 
 ## Audit decisions
 
@@ -50,33 +46,26 @@ were candidates for removal.
 | Route project change/cleanup skills through the canonical verification registry | Accepted | Replaces raw `unittest discover`/npm/Alembic substitution instructions with the impact planner and complete owner gates. Exact-SHA CI, production backup, AUTO/child and recovery rules remain mandatory. |
 | Recognize the two reviewed project change/cleanup skill files as companions to application source in the CI classifier | Accepted | The exception removes only those exact paths from classification when the remaining route is already full, non-fallback and contains `platform/apps/` source. It retains all full gates and event-based deployment authority; skill-only and docs-only plus skills remain non-deployable, and other `.agents/` paths retain fail-closed fallback. Focused regression cases cover these boundaries. |
 | Require a source-bound backup for every full baseline-reconcile route | Accepted | AUTO now skips backup only for strict docs-only reconciliation. Recovery-bootstrap and candidate-packaging routes retain exact-source backup and the child authenticates the complete baseline-to-target range before choosing a no-op or app release. The tradeoff is one extra verified backup for recovery-only no-op changes; the latest observed baseline backup took 1m16s, not a duration guarantee. Storage remains a separate no-deploy route. |
+| Finalize the internal baseline proof against its expected workflow outcomes (PR #359) | Accepted | The finalizer requires the eight expected successful proof jobs and eleven expected general-skip jobs. This validates the internal proof summary; ordinary full-source Security gates remain unchanged. |
 | Remove the optional Node auth transport and simplify its pinned host-tools/deploy boundary | Rejected for this release | The latest SSR C32 A/B evidence reports no pairwise performance gain. The selector also crosses the release-independent host-tools pin, service environment rendering, workflows, tests and operations guidance; removing only the app side would break a coherent rollback. See the [performance matrix](../../performance/README.md) and [host-tools pin](../../tools/platform_host_tools_pin.py). |
 | Consolidate or further parallelize CI contours, or remove/relax backup, host-tools, release-provenance, recovery or retention gates | Rejected | Independent owner gates already run concurrently. The longest measured spans are test execution, and preserving serial ownership inside each contour avoids changing test isolation and evidence boundaries. Exact-source no-op routing already skips app artifact build/deploy for non-runtime changes. No measured evidence supports additional restructuring or weakening gates. |
-| Migrate production to Docker | Deferred | The accepted [systemd versus Docker ADR](../adr/systemd-vs-docker.md) identifies no measured launch blocker and requires a separate migration/rollback decision. |
+| Migrate the single-VPS application services from systemd to Docker Compose | Deferred | The accepted [systemd versus Docker ADR](../adr/systemd-vs-docker.md) identifies no measured launch blocker and requires a separate migration/rollback decision. A rough 10–20 engineer-day estimate covers only application services on the existing VPS; it excludes PostgreSQL, Redis, and Kubernetes migration and is not measured effort or AI wall-clock time. No account-specific usage metrics were available, so this audit makes no AI quota or percentage claim; see the public [pricing documentation](https://learn.chatgpt.com/docs/pricing). |
 
-### Delivery of the merged application source
+### Delivery of the reviewed application changes
 
-The route-policy correction is a non-deployable full recovery-bootstrap
-increment: it carries no app source by itself. On a trusted `dev` push, AUTO
-recognizes that exact closed route and dispatches the automatic
-`baseline-reconcile` child with a source-bound restore-verified backup. The
-child authenticates the active
-production baseline and reclassifies the complete baseline-to-target range;
-the merged application paths make that cumulative route a deployable full
-route, rather than a packaging no-op. It then follows the normal production
-child path, including the source-bound backup, exact-SHA build and release
-guards; any additional baseline runtime proof required by the cumulative
-manifest must pass. The
-existing regression `test_candidate_packaging_reconcile_source_is_closed_and_cumulative`
-checks both branches: pure packaging is a no-op, while packaging plus an app
-path is a deployable cumulative route. Only a strict docs-only reconciliation
-may use the no-backup path; recovery-bootstrap and candidate-packaging full
-routes keep the source-bound backup even when their cumulative result is a
-no-op.
+The cumulative application source `126d4114542369af9d999e219563fa1d53b09568`
+was activated in the one production app deployment recorded above. The final
+classifier route carried the application source through normal exact-SHA
+Security, source-bound backup, AUTO and child deployment. The previous app
+remains the initial `cb1a...` rollback release. No schema, dependency, or
+host-tools pin change was included.
 
-The frontend audit also found no justified dependency removal, no duplicate
-eager detail/bracket fetch, and no need to change nonce CSP, authentication,
-CSRF, session, cache, component, Draft, or production routing boundaries.
+The frontend audit found no justified dependency removal, duplicate eager
+detail/bracket fetch, or reason to change nonce CSP, authentication, CSRF,
+session, cache, component, Draft, or production routing boundaries. The DTO
+serializer is the only measured application performance improvement here;
+SSR and end-to-end production latency were not byte- or time-quantified by this
+audit.
 
 ## Measured results and limits
 
@@ -96,7 +85,7 @@ web-hermetic guard passes. The old 30,036-byte chunk contained unrelated
 modules, so it does not support an attributable bundle-size delta. No user
 experience or production latency gain is claimed.
 
-One successful full Security run on baseline `cb1a751...` completed in 11m33s;
+A successful full Security run on the prior baseline `cb1a751...` completed in 11m33s;
 its privileged contour ran 10m51s (10m18s in the serial contour), Web hermetic
 8m21s (7m13s in the gate and 52s dependency install), and DB-free backend
 contours 4m48s (4m23s in the serial run step). Production backup completed in
@@ -110,10 +99,28 @@ dependency installation; no safe CI speedup was selected.
 - Focused backend API/cache suites: 14 passed under the immutable production
   interpreter with isolated loopback-only dummy service URLs; no live database
   or Redis access.
-- Candidate `git diff --check`: passed.
-- Original application candidate PR exact-SHA Security CI (run `43382587717`): passed, including web-hermetic/browser guard and full backend contours. The narrow classifier correction and final full-range exact-SHA CI: pending.
-- Production combined deploy, post-deploy checks and final `CURRENT.md` update:
-  pending; no candidate production mutation has occurred. The merged app source is not deployed until the exact final-source classifier result is non-fallback and deployable and the normal backup/AUTO/child chain completes.
+- Exact-SHA Security `43401840198`, restore-verified source-bound backup
+  `43404066694`, AUTO `43403887168`, and production child `43404454746`
+  completed; post-deploy readiness and health passed per the operations
+  receipt/checkpoint. This receipt does not certify public browser QA.
+- Public launch runs `43405943415` and `43408704800` timed out with exit 124
+  and produced no case counts. Both exact orphan gates were recovered through
+  the trusted path; the recovery preserved the bundle and 13 generated roster
+  entries. A supported direct public run against the same deployed source
+  lasted about 300.2 seconds at
+  the systemd-unit level; its terminal output was lost, so it has no pass or
+  failure credit. The unit, gate, and runtime mount aliases are gone. Automated
+  user QA has not started; human Chrome authentication and Turnstile QA remain
+  for the user.
+- The 13 generated roster entries await canonical recovery-bundle cleanup. The
+  recorded bundle `created_at` is `2026-11-13T10:02:41Z`, so eligibility is
+  after `2026-11-13T14:02:41Z`. Fresh-bundle cleanup refused; no replacement
+  inventory was fabricated. The main manual account was not pre-created and
+  the control identity is excluded.
+- A separate public-QA timeout change is not part of the deployed source and
+  is not installed; the active host-tools pin remains C3. Future validation of
+  that change does not count as public QA for this deployed source. No
+  deployment result for the timeout change is claimed here.
 
 Official primary references used for the implementation and boundary review:
 [FastAPI response-model filtering](https://fastapi.tiangolo.com/tutorial/response-model/),
