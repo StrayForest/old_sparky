@@ -243,27 +243,10 @@ trusted-push authority. The exact candidate allowlist is owned by the
 | known `full` application/runtime/migration/release path (including `platform/tools/platform_workflow_remote_dispatch.py`, invoked by external-load from the active app) | all first eight gates | `false` | deployable only for a non-fallback push to current `dev`; dispatcher changes are runtime-sensitive |
 | unknown or malformed full fallback | all first eight gates | `true` | never deployable; fail-closed verification only |
 
-Host-tools lifecycle files use full-route verification. The exact host-tools
-provisioning ADR is part of the recovery-bootstrap-only family so its enforced
-pin contract receives the full gate set; it remains non-deployable by itself.
-The active payload helper `platform/tools/platform_live_qa_guard.py` and the
-release artifact builder `platform/tools/platform_build_live_qa_runtime.py`
-are excluded from that family because their changes must reach a new immutable
-app release; their runtime-sensitive full routes require the exact runtime
-gates.
-Candidate-packaging-only incremental changes remain non-deployable by
-themselves. AUTO authenticates the cumulative active-baseline-to-target route:
-a closed packaging-only range is a no-op, while a deployable full app range
-continues through backup and the ordinary release path. A mixed application
-change is classified on its app path and may deploy on a trusted push.
-Host-only pin/bundle/bootstrap remain no-op.
+Host-tools lifecycle files use full-route verification. The exact host-tools provisioning ADR is in the recovery-bootstrap-only family so its enforced pin contract receives the full gate set; it remains non-deployable by itself. Active payload helper `platform/tools/platform_live_qa_guard.py` and release artifact builder `platform/tools/platform_build_live_qa_runtime.py` are excluded because their changes must reach a new immutable app release; their runtime-sensitive full routes require exact runtime gates.
+Candidate-packaging-only incremental changes remain non-deployable by themselves. AUTO authenticates the cumulative active-baseline-to-target route: a closed packaging-only range is a no-op, while a deployable full app range continues through backup and the ordinary release path. A mixed application change is classified on its app path and may deploy on a trusted push. Host-only pin/bundle/bootstrap remain no-op.
 
-The closed candidate-packaging and recovery-bootstrap lists overlap on some
-classifier, catalog and contract files. Their existing classifier precedence
-is unchanged. AUTO requires a source-bound backup for every full
-baseline-reconcile route, including recovery-bootstrap and candidate-packaging;
-only strict docs-only reconciliation may skip backup. The full cumulative
-classifier still decides whether an app release is allowed.
+The closed candidate-packaging and recovery-bootstrap lists overlap on some classifier, catalog and contract files; their existing classifier precedence is unchanged. AUTO requires a source-bound backup for every full baseline-reconcile route, including recovery-bootstrap and candidate-packaging; only strict docs-only reconciliation may skip backup. The full cumulative classifier still decides whether an app release is allowed.
 `platform/contracts/host_tools_pin.json` is the
 single bounded pin contract: application-only changes keep the reviewed
 `HOST_TOOLS_SHA`, while a host-control closure edit must update the pin and its
