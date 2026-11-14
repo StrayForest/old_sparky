@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-11-13
+- Last reviewed: 2026-11-14
 
 Read this page for live pins, pending release work, open QA gates and hard
 operational limits. Product contracts, procedures and detailed run evidence
@@ -11,61 +11,43 @@ belong in the linked owner documents below.
 ## Live and pending state
 
 - Production runs application source
-  `9a3d203c8b8d3bb09226e010e559516657d21034` in release
-  `gha-43426930984-1-9a3d203c8b8d`; `previous` is the initial rollback source
+  `d52eb46080fed7a4dbc6c86c4b875cbe11cfa3a5` in release
+  `gha-43572099804-1-d52eb46080fe`; `previous` is original rollback source
   `cb1a75114aac0f4fb0ee6cc407011f90c6e76f31` in release
-  `gha-43367073524-1-cb1a75114aac`. The earlier
-  `126d4114542369af9d999e219563fa1d53b09568` release was rolled back to this
-  initial source before the corrected deployment. Preserve `cb1a...` as the
-  rollback target.
-- Host-tools C4 source `64cae2a4c8235df1ba5c044446cd2f497f4abdca` is active,
-  verified installed and self-tested; C3
-  `625bbaa11023ffaf059dfa03a34a4850b02d4f93` remains retained. C3 and C4
-  preserve the same 15 helper files and capability set, with 17 total bundle
-  files. C4 changes only the host-tools dispatcher timeout from 300 to 2,400
-  seconds and the derived capability hash. The application guard allows 1,500
-  seconds only for the strict canonical public command.
-- PR 360 source `9a3d203c8b8d3bb09226e010e559516657d21034` passed exact-SHA
-  Security `43422580427/1`, post-provision preflight `43426001349/1`,
-  source-bound restore-verified backup `43426481223/1`, AUTO `43424193707`, and
-  automatic production child `43426930984/1`. The child succeeded. Required
-  post-deploy strict preflight, origin/SNI checks and public smokes passed.
-  Fresh readiness confirms current `9a3d...`, previous `cb1a...`, selected C4
-  and retained C3. Runtime schema is unchanged. The source-bound readiness
-  receipt is retained in the operations checkpoint.
-- The previous 13-account roster was recovered after its age threshold by the
-  active M immutable payload under both canonical locks. Exact cleanup and
-  absence proof passed; receipt:
-  `/root/.oldsparky/reports/liveqa-recover-bundle.2PxPsM/`.
-- Public workflow `43439319991` remains a successful exact-source run. After
-  fresh canonical provisioning, public workflow `43449584614` also passed
-  against source M: 57 logical cases and attempts, 47 passed and 10 skipped,
-  with zero failures, timeouts, flaky, interrupted or expected-failure cases,
-  zero retries, and process/child exit 0.
-- The first automated UserQA workflow `43440684487` failed with browser child
-  exit 1; the journey cause remains unknown and receives no pass credit. Its
-  report-publication blocker was an unrelated Nov 11 diagnostics directory;
-  operations preserved it outside retention through a reviewed, locked helper.
-  This repaired the report-store precondition but does not explain the browser
-  failure. Fresh exact-source UserQA `43450827101` passed its complete coverage:
-  1 journey, 1 attempt, 0 skipped, failed, flaky, timed-out, interrupted or
-  expected-failure cases, child exit 0. Its sanitized report is
-  `/root/.codex/checkpoints/oldsparky-liveqa-candidate-public-20261113/userqa-retry-sanitized/live-user-qa-report.json`.
-  The wrapper's exact cleanup and
-  absence proof passed before state removal. Final guard checks under both
-  locks found zero automated/manual recovery states, public gates, QA
-  processes or diagnostic entries. Final readiness is ready: current M,
-  previous `cb1a`, C4 active/C3 retained, API/web 200, locks free, no pending
-  jobs, and consistency passed. The root-only receipt is
-  `/root/.codex/checkpoints/oldsparky-liveqa-candidate-public-20261113/post-userqa-cleanup/readiness.json`.
-- Automated public and UserQA gates are closed for the recorded release.
-  Human Chrome authentication and Turnstile QA were deferred; they are
-  optional diagnostics and do not prove production Cloudflare scoring when
-  simulated. A separate isolated auth lifecycle CI gate is being implemented
-  and has not yet earned hosted-CI validation. This work does not retroactively
-  change the recorded release evidence. The manual helper still requires the
-  fixed production checkout to be reconciled to the active source with retained
-  work preserved and its provenance guard passed before use.
+  `gha-43367073524-1-cb1a75114aac`. Preserve `cb1a...` as the rollback target.
+  Host-tools C4 `64cae2a4c8235df1ba5c044446cd2f497f4abdca` is selected and C3
+  `625bbaa11023ffaf059dfa03a34a4850b02d4f93` retained. The shared venv origin
+  is d52; Alembic current equals head `20261112_0055`.
+- Source `d52eb46080fed7a4dbc6c86c4b875cbe11cfa3a5` passed exact-SHA
+  Security run `43569313507/1` and backup `43571845676/1`. AUTO
+  `43570533763/1` succeeded. Production deploy `43572099804/1` succeeded;
+  actual-deploy artifact `14105022133` binds mode `deploy`, release
+  `gha-43572099804-1-d52eb46080fe` and source d52. Authorization artifact
+  `14104787647` binds sequencer `43572731917/1` (workflow 417784007) to that
+  deploy attempt and source. Public child `43572752214/1` created and uploaded
+  its receipt, passed child authentication, and completed public QA. Artifact
+  `14105615416` reports 57 attempts: 47 passed and 10 allowlisted expected
+  skips, with zero failures, flaky, interrupted or timed-out cases. The
+  coverage contract requires all 57 expected cases and validates each skip
+  annotation. UserQA child `43573228506/1` (workflow 340531613) bound to public
+  `43572752214/1`, deploy `43572099804/1` and source d52; artifact `14105311501`
+  reports complete coverage, one journey/attempt passed, zero skipped or
+  failed, child exit 0. Exact cleanup path and absence assertions passed.
+  Sequencer `43572731917/1`, public QA and UserQA all completed successfully.
+  Final strict preflight, origin
+  smokes and public smokes (33 checks, zero failures each) passed. Final
+  post-cleanup readiness is ready. API and web returned 200, all three app
+  services were active, both locks were free, there were no pending systemd
+  jobs, operation marker or diagnostic plans, and final consistency passed.
+  No GitHub workflow runs remained active. The maintenance service is
+  inactive/dead and its timer active/enabled. `dev` remains frozen.
+- The a289 sequencer attempt `43567504351/1` dispatched public child
+  `43567523083/1`, but failed while writing the exact child receipt; public
+  authentication rejected the child before browser QA, and no public or
+  UserQA result is credited. The six-value writer correction is in the d52
+  release. Human Chrome and live Cloudflare challenge/scoring remain
+  optional diagnostics; the CI Siteverify fixture does not establish
+  production Cloudflare scoring.
 - Historical timeout and uncredited-run detail is in the
   [closeout audit](archive/simplification-performance-audit-2026-11-13.md).
 - The 11-cell production matrix is complete, but cell 9 failed its stress
@@ -82,16 +64,12 @@ belong in the linked owner documents below.
   [deployment runbook](deployment-runbook.md) and
   [backup and restore runbook](backup-restore-runbook.md).
 
-## Open QA and cleanup gates
+## QA and cleanup gates
 
-- The isolated auth lifecycle suite is not yet a validated required gate;
-  complete its exact-source hosted-CI validation before relying on it for later
-  releases. Human Chrome authentication and real Turnstile QA remain optional
-  diagnostics. Before running the manual helper, reconcile the fixed production
-  checkout to the exact active source while preserving retained local work,
-  then require the owner runbook's checkout-provenance guard to pass. The
-  current checkout is not approved for the helper; do not run `prepare` until
-  the source check succeeds.
+- Required production deployment, automatic public/UserQA, exact cleanup and
+  final idle-readiness gates are closed for d52. Human Chrome and real
+  Cloudflare challenge/scoring remain optional diagnostics; the CI Siteverify
+  fixture does not establish production Cloudflare scoring.
 - The completed external HTTP matrix is not whole-site functional coverage.
   Cell 9's attribution failure and cell 7's unresolved client/origin join are
   not closed by the separate SSR diagnostics. No cause or server capacity
