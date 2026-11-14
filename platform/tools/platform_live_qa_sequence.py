@@ -981,6 +981,8 @@ class GitHubActions:
         path = SEQUENCER_WORKFLOW_PATH
         workflow_id = self.workflow_id(path)
         current = self.request("GET", f"/actions/runs/{current_run_id}")
+        # The API's run `name` follows workflow `run-name`; workflow id/path
+        # and the exact parent-derived display title bind the sequencer run.
         if (
             not isinstance(current, Mapping)
             or current.get("id") != current_run_id
@@ -991,7 +993,6 @@ class GitHubActions:
             or current.get("event") != "workflow_dispatch"
             or current.get("head_branch") != "dev"
             or current.get("head_sha") != workflow_source_sha
-            or current.get("name") != "Platform post-deploy live QA"
             or current.get("display_title") != expected_name
         ):
             raise SequenceError("dedupe", "successor_identity_invalid")
@@ -1014,12 +1015,7 @@ class GitHubActions:
             for row in rows:
                 if not isinstance(row, Mapping):
                     raise SequenceError("dedupe", "successor_listing_invalid")
-                # GitHub exposes the workflow's static name separately from
-                # the dynamic `run-name` value in `display_title`.
-                if row.get("name") != "Platform post-deploy live QA":
-                    continue
-                run_name = row.get("display_title")
-                if run_name != expected_name:
+                if row.get("display_title") != expected_name:
                     continue
                 if (
                     row.get("workflow_id") != workflow_id
@@ -1050,7 +1046,6 @@ class GitHubActions:
                     or prior.get("event") != "workflow_dispatch"
                     or prior.get("head_branch") != "dev"
                     or prior.get("head_sha") != workflow_source_sha
-                    or prior.get("name") != "Platform post-deploy live QA"
                     or prior.get("display_title") != expected_name
                     or type(prior.get("run_attempt")) is not int
                     or prior.get("run_attempt") != 1
@@ -1175,6 +1170,7 @@ class GitHubActions:
         workflow_id = self.workflow_id(path)
         run = self.request("GET", f"/actions/runs/{sequence_run_id}")
         expected_title = _run_name(str(deploy_run_id), str(deploy_attempt), target_sha)
+        # Do not compare the API's dynamic run name with the static workflow name.
         if (
             not isinstance(run, Mapping)
             or run.get("id") != sequence_run_id
@@ -1185,7 +1181,6 @@ class GitHubActions:
             or run.get("event") != "workflow_dispatch"
             or run.get("head_branch") != "dev"
             or run.get("head_sha") != target_sha
-            or run.get("name") != "Platform post-deploy live QA"
             or run.get("display_title") != expected_title
             or run.get("status") != "in_progress"
             or run.get("conclusion") is not None
