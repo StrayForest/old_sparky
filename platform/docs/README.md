@@ -2,9 +2,9 @@
 
 - Status: Active
 - Owner: Platform maintainers
-- Last reviewed: 2026-10-25
+- Last reviewed: 2026-11-14
 
-Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current production state and next engineering priority. Open deeper documents only when the task requires them.
+Start with [`CURRENT.md`](CURRENT.md) for dated production state, open gates and hard limits. Use the roadmap for engineering priorities and open deeper documents only when the task requires them.
 
 ## Choose the document by task
 
@@ -53,7 +53,8 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | Incident handling | [Incident response](incident-response.md) |
 | Security findings and evidence | [Application security audit](application-security-audit.md) |
 | Secret-bearing workflow artifact boundary | [Secret-job artifact boundary ADR](adr/secret-job-artifact-boundary.md) |
-| Release-independent host-tools generations / trusted PR handoff | [Production host-tools provisioning ADR](adr/production-host-tools-provisioning.md) |
+| Release-independent host-tools decision / trusted PR handoff | [Production host-tools ADR](adr/production-host-tools-provisioning.md) |
+| Host-tools provisioning hold and required support | [Host-tools provisioning status](host-tools-provisioning-runbook.md) |
 | Trusted CI-handoff source/merge identity | [Closed source-versus-tested merge identity](adr/production-host-tools-provisioning.md#closed-source-versus-tested-merge-identity) |
 | Historical implementation context | [`archive/`](archive/) |
 | 2026-11-13 simplification and performance audit | [`archive/simplification-performance-audit-2026-11-13.md`](archive/simplification-performance-audit-2026-11-13.md) |

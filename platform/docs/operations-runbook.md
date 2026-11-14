@@ -227,12 +227,13 @@ first large p95 increase with a flat throughput gain as an admission candidate;
 it is evidence for an operator-selected runtime profile, not an automatic
 configuration change. This is a stress diagnostic, so bounded typed
 authenticated-read shedding is counted separately from unexpected errors. Run
-it only in the approved window and complete exact cleanup. Accept a Ready
-Check knee only when all eight state guards pass with 40/40 active cohorts and
+it only in an approved window and complete exact cleanup. Accept a Ready Check
+knee only when all eight state guards pass with 40/40 active cohorts and
 positive per-response deadline headroom; HTTP success alone is insufficient.
-Rerun only cell 9 after exact-SHA CI, automatic app deployment and its single
-source-bound backup; then obtain FULL readiness as described in the
-[performance matrix](../performance/README.md#current-11-profile-production-matrix).
+Before planning another matrix run, check [current state](CURRENT.md) and the
+[performance matrix](../performance/README.md#current-11-profile-production-matrix);
+do not repeat a completed or explicitly closed cell without a newly recorded
+owner decision.
 
 The SSR dependency graph has a hermetic browser contract in the platform web
 smoke suite: an authenticated tournament page must call `/auth/bootstrap` and
@@ -245,8 +246,10 @@ origin-side Next.js/API/DB observer. It is still a request benchmark, not
 20,000 browser processes.
 
 The selectable runtime A/B profiles are `uvicorn-classic`, `uvicorn-optimized`, `pool-pre-ping-off`, `authenticated-read-admission-32`, `authenticated-read-admission-24x8`, `authenticated-read-admission-24x8-native`, `web-ssr-diagnostics`, `web-ssr-native-transport`, `web-ssr-workers-2` and `api-pool-{12,16,20,24}`. Apply one at a time and restore the baseline; SSR diagnostics sample 1% of Next.js stages plus event-loop/Nginx timing and do not change SSR/CSP. The native transport profile changes only the trusted loopback auth GET implementation with one web worker; the combined `authenticated-read-admission-24x8-native` profile preserves the exact 24x8 admission tuple and changes only `PLATFORM_WEB_SERVER_AUTH_TRANSPORT` to `node`, enabling a reproducible runtime-profile A/B. The workers-2 profile combines that transport with two web workers and remains an explicitly measured candidate. The diagnostic profile pins the API to the public `INFO`/performance-logging selectors so fast auth rows remain visible, then restarts `deadlock-api` because its sampled auth/API log gate is read at API startup. Profiles that change startup-read SSR flags restart `deadlock-web` after applying the shared environment so the selected state is not left stale in the existing Next.js process. Readiness is checked for both services, and the restore path clears the diagnostic gate and logging selectors. The `pool-pre-ping-off` recovery test is mandatory.
-The 2026-09-03 ramp and authenticated-page A/B selected
-`authenticated-read-admission-32` (c32 knee, c48 first queued stage); it uses API pool 24, `max_overflow=0` and `pool_pre_ping=true`. The bounded `authenticated-read-admission-24x8` candidate keeps the same 32-request per-worker resident-plus-waiting envelope (24 admitted, at most 8 waiters for 250 ms) while avoiding immediate shedding at the resident limit. Current managed profiles keep the independent SSR heap sampler disabled; applying any profile explicitly writes its false default. This candidate does not increase the database connection budget or authorize retries beyond an endpoint's existing policy. The pre-ping-off A/B was rejected; public/static HTML remains dynamic and nonce-CSP protected.
+Profile settings and their measured outcomes are owned by the
+[performance evidence](../performance/README.md). Do not apply an experimental
+profile based on historical runbook results; use the reviewed profile contract
+and its required release, readiness and restore gates.
 
 Before attributing a transport result to Nginx, record `nginx -v` and run
 `nginx -t`. The named `platform_api` and `platform_web` upstreams have explicit
@@ -347,28 +350,14 @@ If the workflow is canceled, perform the exact retained-load abort/cleanup
 procedure with the same run ID before another load. The temporary manifest
 must not be copied to Actions artifacts.
 
-### Retained Ready Vote result
+### Retained Ready Vote results
 
-The reviewed reference is `ready-vote-static-8`: per worker its admission
-minimum/initial/maximum is exactly `8/8/8`, with the existing two workers and
-the unchanged API pool (`24`, no overflow). The measured canonical ramp on
-`77fd8682` (workflow `33335224474`) passed the strict SLO through 60 logical
-actions/s, first shed at 70, and reached 79.385 actions/s goodput at 80 while
-that final phase failed the strict SLO. Thus report both values: SLO capacity
-`60 actions/s`, maximum observed stable goodput `79.385 actions/s`, and knee
-/ shedding onset `70 actions/s`. Determine the knee from accepted and logical
-latency, inflight/admission and pool wait, shedding/retries, goodput and CPU;
-CPU alone is insufficient.
-
-The same 20–80 ramp with adaptive-v2 (deploy `33337237276`, load workflow
-`33337425315`) had the same SLO capacity but lower maximum goodput
-(`73.528 actions/s`) and severe logical-tail/failure pressure at 80. It was
-not promoted. Restore/static-8 deploy `33337943520` is the final runtime
-reference. The spike run `33338160338` passed normal → burst → normal with
-zero shedding/retries and p99 `431.439 → 238.336 → 181.006 ms`. The stress
-run `33339421320` passed its separate behavior/correctness contract despite
-overload failures; do not apply the normal final-failure SLO to it. The
-optional 20k stress profile remains skipped.
+Use the [performance evidence](../performance/README.md) for the current
+profile inventory, retained measurements and capacity conclusions. Historical
+profile results in this runbook were removed to keep one owner and must not be
+used to infer a current production ceiling. The active production matrix does
+not certify a server capacity ceiling; see [current state](CURRENT.md) before
+planning any follow-up.
 
 For each retained result, preserve requested and actual offered rate, HTTP
 attempts/statuses, accepted and logical latency percentiles/maxima, goodput,

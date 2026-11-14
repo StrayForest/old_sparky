@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform API and web
-- Last reviewed: 2026-09-13
+- Last reviewed: 2026-11-14
 
 ## Public surface
 
