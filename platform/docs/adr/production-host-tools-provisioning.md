@@ -83,6 +83,14 @@ compares the complete immutable context. These checks apply to the
 non-deployable pull-request evidence path; production push authority remains
 the separate exact-SHA release contract.
 
+From the root of the exact target checkout, resolve the pin with
+`platform/tools/platform_host_tools_pin.py resolve --source-root "$PWD" --target-sha "$TARGET_SHA" --expected-repository StrayForest/old_sparky`.
+The resolver validates source ancestry and closure; it selects
+`HOST_TOOLS_SHA` but does not prove that the generation is installed.
+Record the resolver-selected source in the operation receipts.
+Its dated installed-state record is evidence, not a live probe.
+`CURRENT.md` owns the installed active generation.
+
 ## Operator provisioning status
 
 The [host-tools provisioning runbook](../host-tools-provisioning-runbook.md#current-operator-instruction)
