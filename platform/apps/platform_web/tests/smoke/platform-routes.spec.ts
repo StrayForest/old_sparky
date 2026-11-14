@@ -3657,9 +3657,10 @@ test("automatic Turnstile continuation stops after server rejects the token", as
   await expect(page.getByRole("button", { name: "Войти", exact: true })).toBeDisabled();
   await expect(page.getByLabel("Email")).toBeDisabled();
   await expect(page.getByLabel("Пароль")).toBeDisabled();
-  expect(loginPayloads).toHaveLength(2);
+  await expect.poll(() => loginPayloads.length).toBe(2);
   expect(loginPayloads[0]).toEqual({ email: "rejected@example.test", password: "long-password" });
   expect(loginPayloads[1].turnstile_token).toBe("rejected-turnstile-token");
+  await expect(page.locator(".auth-turnstile")).toHaveAttribute("data-state", "checking");
 
   await page.evaluate(() => {
     (window as Window & { __deliverFreshTurnstileToken?: () => void }).__deliverFreshTurnstileToken?.();
