@@ -1688,7 +1688,7 @@ def dispatch_handoff() -> int:
 
 
 def write_child_receipt(role: str) -> Path:
-    target_sha, parent_id, parent_attempt, current_id, current_attempt, source_sha, _ = _event_context()
+    target_sha, parent_id, parent_attempt, current_id, current_attempt, source_sha = _event_context()
     child_id = _environment_id("CHILD_RUN_ID")
     if (
         current_attempt != 1

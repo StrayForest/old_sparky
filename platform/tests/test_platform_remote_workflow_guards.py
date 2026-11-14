@@ -814,42 +814,129 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
         from unittest.mock import patch
 
         target = "a" * 40
-        receipt = {
-            "schema": 1,
-            "kind": "platform-live-qa-child-dispatch",
-            "repository": "StrayForest/old_sparky",
-            "sequence_workflow_path": ".github/workflows/platform-postdeploy-live-qa.yml",
-            "sequence_run_id": "90",
-            "sequence_run_attempt": "1",
-            "sequence_source_sha": target,
-            "deploy_run_id": "12",
-            "deploy_run_attempt": "2",
-            "source_sha": target,
-            "role": "public",
-            "child_workflow_path": platform_live_qa_sequence.PUBLIC_WORKFLOW_PATH,
-            "child_workflow_id": 51,
-            "child_run_id": "431",
-            "child_run_attempt": "1",
-            "expected_target_sha": target,
-            "public_run_id": "431",
-            "marker": platform_live_qa_sequence._marker("12", "2", target),
-        }
+
+        class ReceiptWriter:
+            def workflow_id(self, path: str) -> int:
+                if path == platform_live_qa_sequence.PUBLIC_WORKFLOW_PATH:
+                    return 51
+                if path == platform_live_qa_sequence.USER_QA_WORKFLOW_PATH:
+                    return 52
+                raise AssertionError(path)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            writer_env = {
+                "GITHUB_EVENT_NAME": "workflow_dispatch",
+                "GITHUB_REF": "refs/heads/dev",
+                "GITHUB_REPOSITORY": "StrayForest/old_sparky",
+                "GITHUB_RUN_ID": "90",
+                "GITHUB_RUN_ATTEMPT": "1",
+                "GITHUB_SHA": target,
+                "GITHUB_API_URL": "https://api.github.com",
+                "GH_TOKEN": "test-token",
+                "DEPLOY_TARGET_SHA": target,
+                "DEPLOY_RUN_ID": "12",
+                "DEPLOY_RUN_ATTEMPT": "2",
+                "CHILD_RUN_ID": "431",
+                "RUNNER_TEMP": temp_dir,
+            }
+            with patch.dict("os.environ", writer_env, clear=True), patch.object(
+                platform_live_qa_sequence, "GitHubActions", return_value=ReceiptWriter()
+            ), patch("builtins.print"):
+                self.assertEqual(platform_live_qa_sequence.main(["write-receipt", "public"]), 0)
+            public_receipt_path = (
+                Path(temp_dir) / "child-receipt-public"
+                / platform_live_qa_sequence.CHILD_RECEIPT_FILE
+            )
+            receipt = json.loads(public_receipt_path.read_text(encoding="ascii"))
+            self.assertEqual(receipt["sequence_run_id"], "90")
+            self.assertEqual(receipt["child_run_id"], "431")
+            self.assertEqual(receipt["role"], "public")
+            platform_live_qa_sequence.validate_child_receipt(
+                receipt,
+                repository="StrayForest/old_sparky",
+                role="public",
+                sequence_run_id=90,
+                sequence_attempt=1,
+                sequence_source_sha=target,
+                deploy_run_id=12,
+                deploy_attempt=2,
+                child_run_id=431,
+                child_attempt=1,
+                child_workflow_id=51,
+                target_sha=target,
+            )
+
+            with patch.dict(
+                "os.environ",
+                {**writer_env, "CHILD_RUN_ID": "432", "PUBLIC_CHILD_RUN_ID": "431"},
+                clear=True,
+            ), patch.object(
+                platform_live_qa_sequence, "GitHubActions", return_value=ReceiptWriter()
+            ), patch("builtins.print"):
+                self.assertEqual(platform_live_qa_sequence.main(["write-receipt", "user-qa"]), 0)
+            user_receipt_path = (
+                Path(temp_dir) / "child-receipt-user-qa"
+                / platform_live_qa_sequence.CHILD_RECEIPT_FILE
+            )
+            user_receipt = json.loads(user_receipt_path.read_text(encoding="ascii"))
+            self.assertEqual(user_receipt["child_run_id"], "432")
+            self.assertEqual(user_receipt["public_run_id"], "431")
+            platform_live_qa_sequence.validate_child_receipt(
+                user_receipt,
+                repository="StrayForest/old_sparky",
+                role="user-qa",
+                sequence_run_id=90,
+                sequence_attempt=1,
+                sequence_source_sha=target,
+                deploy_run_id=12,
+                deploy_attempt=2,
+                child_run_id=432,
+                child_attempt=1,
+                child_workflow_id=52,
+                target_sha=target,
+                expected_public_run_id="431",
+            )
 
         class FakeActions:
             repository = "StrayForest/old_sparky"
 
-            def __init__(self, *, run_changes: dict[str, object] | None = None) -> None:
+            def __init__(
+                self,
+                *,
+                role: str = "public",
+                child_id: int = 431,
+                child_receipt: dict[str, object] | None = None,
+                run_changes: dict[str, object] | None = None,
+            ) -> None:
+                self.role = role
+                self.child_id = child_id
+                self.child_receipt = receipt if child_receipt is None else child_receipt
                 self.run_changes = run_changes or {}
 
-            def workflow_id(self, _path: str) -> int:
-                return 51
+            def workflow_id(self, path: str) -> int:
+                expected_path = (
+                    platform_live_qa_sequence.PUBLIC_WORKFLOW_PATH
+                    if self.role == "public"
+                    else platform_live_qa_sequence.USER_QA_WORKFLOW_PATH
+                )
+                if path != expected_path:
+                    raise AssertionError(path)
+                return 51 if self.role == "public" else 52
 
             def request(self, _method: str, path: str) -> object:
-                if not re.fullmatch(r"/actions/runs/[0-9]+", path):
+                match = re.fullmatch(r"/actions/runs/([0-9]+)", path)
+                if match is None:
                     raise AssertionError(path)
+                requested_id = int(match.group(1))
+                child_path = (
+                    platform_live_qa_sequence.PUBLIC_WORKFLOW_PATH
+                    if self.role == "public"
+                    else platform_live_qa_sequence.USER_QA_WORKFLOW_PATH
+                )
                 return {
-                    "id": 431, "run_attempt": 1, "workflow_id": 51,
-                    "path": platform_live_qa_sequence.PUBLIC_WORKFLOW_PATH,
+                    "id": requested_id, "run_attempt": 1,
+                    "workflow_id": 51 if self.role == "public" else 52,
+                    "path": child_path,
                     "event": "workflow_dispatch", "head_branch": "dev", "head_sha": target,
                     "status": "in_progress", "conclusion": None,
                     "actor": {"login": "github-actions[bot]"},
@@ -860,7 +947,7 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
                 return None
 
             def exact_child_receipt(self, **_kwargs: object) -> dict[str, object]:
-                return receipt
+                return self.child_receipt
 
         env = {
             "GITHUB_EVENT_NAME": "workflow_dispatch",
@@ -898,17 +985,29 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
         ):
             platform_live_qa_sequence.validate_active_child_from_environment()
 
+        userqa_env = {
+            **env,
+            "GITHUB_RUN_ID": "432",
+            "SEQUENCE_CHILD_ROLE": "user-qa",
+            "SEQUENCE_PUBLIC_RUN_ID": "431",
+        }
+        userqa = FakeActions(role="user-qa", child_id=432, child_receipt=user_receipt)
+        with patch.dict("os.environ", userqa_env, clear=True), patch.object(
+            platform_live_qa_sequence, "GitHubActions", return_value=userqa
+        ):
+            platform_live_qa_sequence.validate_active_child_from_environment()
+
         cases = (
-            ({"EXPECTED_TARGET_SHA": "b" * 40}, {}, "child_event_invalid"),
-            ({"SEQUENCE_RUN_ID": "0"}, {}, "run_id_invalid"),
-            ({}, {"head_sha": "b" * 40}, "child_run_identity_invalid"),
-            ({"GITHUB_RUN_ID": "432"}, {}, "child_run_identity_invalid"),
-            ({"SEQUENCE_CHILD_ROLE": "user-qa"}, {}, "child_run_identity_invalid"),
-            ({"SEQUENCE_SOURCE_SHA": "b" * 40}, {}, "receipt_identity_invalid"),
+            ({"EXPECTED_TARGET_SHA": "b" * 40}, {}, "child_event_invalid", "public"),
+            ({"SEQUENCE_RUN_ID": "0"}, {}, "run_id_invalid", "public"),
+            ({}, {"head_sha": "b" * 40}, "child_run_identity_invalid", "public"),
+            ({"GITHUB_RUN_ID": "432"}, {}, "receipt_identity_invalid", "public"),
+            ({"SEQUENCE_CHILD_ROLE": "user-qa"}, {}, "receipt_identity_invalid", "user-qa"),
+            ({"SEQUENCE_SOURCE_SHA": "b" * 40}, {}, "receipt_identity_invalid", "public"),
         )
-        for env_changes, run_changes, reason in cases:
+        for env_changes, run_changes, reason, fake_role in cases:
             with self.subTest(reason=reason):
-                fake = FakeActions(run_changes=run_changes)
+                fake = FakeActions(role=fake_role, run_changes=run_changes)
                 with patch.dict("os.environ", {**env, **env_changes}, clear=True), patch.object(
                     platform_live_qa_sequence, "GitHubActions", return_value=fake
                 ), self.assertRaises(platform_live_qa_sequence.SequenceError) as caught:
@@ -936,6 +1035,9 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
             self.assertLess(validator, first_live_operation)
             self.assertIn("sequence_run_id", source)
             self.assertIn("platform-live-qa-sequenced-child-", source)
+        userqa_job = _job_block(userqa, "live-user-qa")
+        self.assertIn("- name: Remove production SSH material", userqa_job)
+        self.assertIn("steps.cleanup_ssh.outcome == 'success'", userqa_job)
         self.assertIn("group: platform-live-qa", successor)
         self.assertIn("workflow_dispatch:", successor)
         self.assertNotIn("workflow_run:", successor)
@@ -976,10 +1078,17 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
         from unittest.mock import patch
 
         class FakeActions:
-            def __init__(self, advance_after_public: bool) -> None:
+            def __init__(
+                self,
+                advance_after_public: bool,
+                *,
+                public_success: bool = False,
+            ) -> None:
                 self.dev_reads = 0
                 self.advance_after_public = advance_after_public
-                self.dispatches: list[str] = []
+                self.public_success = public_success
+                self.dispatches: list[tuple[str, int, dict[str, str]]] = []
+                self.waits: list[tuple[int, int, str, tuple[str, ...]]] = []
 
             def verify_parent_deploy(self, **_kwargs: object) -> tuple[str, int, str]:
                 return "deploy", 12, "gha-12-2-aaaaaaaaaaaa"
@@ -1003,13 +1112,44 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
             def workflow_id(self, path: str) -> int:
                 return 51 if path.endswith("platform-live-launch.yml") else 52
 
-            def wait_for_run(self, **_kwargs: object) -> None:
-                if not self.advance_after_public:
-                    raise platform_live_qa_sequence.SequenceError("child", "run_not_successful")
+            def verify_active_sequence(self, **_kwargs: object) -> None:
+                return None
 
-            def dispatch(self, path: str, _workflow_id: int, _inputs: dict[str, str]) -> int:
-                self.dispatches.append(path)
-                return 431
+            def wait_for_run(
+                self,
+                *,
+                run_id: int,
+                workflow_id: int,
+                target_sha: str,
+                expected_jobs: tuple[str, ...],
+            ) -> None:
+                self.waits.append((run_id, workflow_id, target_sha, expected_jobs))
+                if run_id == 431:
+                    jobs = (
+                        "Validate live-launch handoff",
+                        "live-sanity",
+                        "Sanitize live-launch report",
+                    )
+                    if not self.public_success:
+                        raise platform_live_qa_sequence.SequenceError("child", "run_not_successful")
+                else:
+                    jobs = (
+                        "Validate live-user QA handoff",
+                        "Automated live-user QA on production server",
+                    )
+                rows = [
+                    {"name": name, "status": "completed", "conclusion": "success"}
+                    for name in jobs
+                ]
+                platform_live_qa_sequence.validate_required_jobs(
+                    {"total_count": len(rows), "jobs": rows}, expected_jobs
+                )
+
+            def dispatch(
+                self, path: str, workflow_id: int, inputs: dict[str, str]
+            ) -> int:
+                self.dispatches.append((path, workflow_id, inputs))
+                return 432
 
         env = {
             "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/dev",
@@ -1019,15 +1159,88 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
             "DEPLOY_RUN_ID": "12", "DEPLOY_RUN_ATTEMPT": "2",
             "PUBLIC_CHILD_RUN_ID": "431",
         }
-        cases = ((False, "run_not_successful"), (True, "dev_head_mismatch"))
-        for advances, reason in cases:
-            fake = FakeActions(advances)
+        cases = (
+            (False, False, "run_not_successful"),
+            (True, True, "dev_head_mismatch"),
+        )
+        for advances, public_success, reason in cases:
+            fake = FakeActions(advances, public_success=public_success)
             with patch.dict("os.environ", env, clear=True), patch.object(
                 platform_live_qa_sequence, "GitHubActions", return_value=fake
             ), self.assertRaises(platform_live_qa_sequence.SequenceError) as caught:
                 platform_live_qa_sequence.finish_public_and_dispatch_userqa()
             self.assertEqual(caught.exception.reason, reason)
             self.assertEqual(fake.dispatches, [])
+
+        completed = FakeActions(False, public_success=True)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "github-output"
+            output_path.touch()
+            with patch.dict(
+                "os.environ", {**env, "GITHUB_OUTPUT": str(output_path)}, clear=True
+            ), patch.object(
+                platform_live_qa_sequence, "GitHubActions", return_value=completed
+            ):
+                self.assertEqual(platform_live_qa_sequence.finish_public_and_dispatch_userqa(), 432)
+                self.assertEqual(
+                    completed.dispatches,
+                    [(
+                        platform_live_qa_sequence.USER_QA_WORKFLOW_PATH,
+                        52,
+                        {
+                            "confirmation": "RUN-LIVE-USER-QA",
+                            "expected_target_sha": "a" * 40,
+                            "sequence_run_id": "90",
+                            "sequence_run_attempt": "1",
+                            "sequence_deploy_run_id": "12",
+                            "sequence_deploy_run_attempt": "2",
+                            "sequence_source_sha": "a" * 40,
+                            "sequence_public_run_id": "431",
+                        },
+                    )],
+                )
+                with patch.dict(
+                    "os.environ",
+                    {**env, "USER_QA_CHILD_RUN_ID": "432", "GITHUB_OUTPUT": str(output_path)},
+                    clear=True,
+                ):
+                    self.assertEqual(
+                        platform_live_qa_sequence.wait_userqa(),
+                        (432, "a" * 40),
+                    )
+            self.assertEqual(
+                output_path.read_text(encoding="ascii").splitlines(),
+                [
+                    "run_id=432",
+                    "workflow_id=52",
+                    "public_run_id=431",
+                    f"marker={platform_live_qa_sequence._marker('12', '2', 'a' * 40)}",
+                ],
+            )
+        self.assertEqual(
+            completed.waits,
+            [
+                (
+                    431,
+                    51,
+                    "a" * 40,
+                    (
+                        "Validate live-launch handoff",
+                        "live-sanity",
+                        "Sanitize live-launch report",
+                    ),
+                ),
+                (
+                    432,
+                    52,
+                    "a" * 40,
+                    (
+                        "Validate live-user QA handoff",
+                        "Automated live-user QA on production server",
+                    ),
+                ),
+            ],
+        )
 
 
 def _job_block(source: str, name: str) -> str:
