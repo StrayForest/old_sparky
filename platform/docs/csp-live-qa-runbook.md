@@ -216,7 +216,8 @@ finish successfully and revalidates the actual deployment and authorization
 before dispatching public QA; UserQA follows only after public success. A failed
 or missing handoff leaves the app deployment successful but earns no QA pass
 credit. Recovery, baseline-reconcile and preflight-only runs do not dispatch
-live QA.
+live QA; explicit `!cancelled()` plus production-success and `mode=deploy` guards
+are required because normal deploy skips mode-specific branches.
 For a direct rerun, `expected_target_sha` is the current `dev` commit that the
 workflow runner will check out. The workflow separately authenticates the
 active deployed app source and its QA runtime; in a docs-only/no-op state those
