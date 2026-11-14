@@ -207,7 +207,16 @@ before invoking the trusted supervisor. Never bypass that check or copy a
 helper from an unrelated checkout.
 
 An explicit UserQA rerun is operator-triggered only after the public suite has
-passed. Normal deployment dispatches the public suite and UserQA automatically.
+passed. A successful production deployment's separate secret-free handoff job
+dispatches the post-deploy sequencer with `workflow_dispatch`. The parent job
+requires the completed successful production job and exact actual-deployment
+receipt, then records the acknowledged sequencer run ID in a parent-owned
+authorization artifact. The sequencer waits for the full parent workflow to
+finish successfully and revalidates the actual deployment and authorization
+before dispatching public QA; UserQA follows only after public success. A failed
+or missing handoff leaves the app deployment successful but earns no QA pass
+credit. Recovery, baseline-reconcile and preflight-only runs do not dispatch
+live QA.
 For a direct rerun, `expected_target_sha` is the current `dev` commit that the
 workflow runner will check out. The workflow separately authenticates the
 active deployed app source and its QA runtime; in a docs-only/no-op state those

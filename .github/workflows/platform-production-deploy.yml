@@ -4849,3 +4849,64 @@ jobs:
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
           curl --fail-with-body --silent --show-error --request POST --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" --data "{\"state\":\"failure\",\"context\":\"platform-production-deploy\",\"description\":\"Production deployment failed\",\"target_url\":\"${run_url}\"}"
+
+  postdeploy-handoff:
+    name: Dispatch automatic post-deploy live QA
+    needs:
+      - production
+    if: ${{ needs.production.result == 'success' && inputs.mode == 'deploy' }}
+    # QA handoff failure never changes the successful app-install outcome.
+    # The sequencer requires both this exact authorization artifact and the
+    # terminal successful parent run before any public QA side effect.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      GITHUB_API_URL: ${{ github.api_url }}
+      WORKFLOW_MODE: ${{ inputs.mode }}
+    steps:
+      - name: Check out exact deployed source for handoff validation
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Dispatch sequencer and bind its exact run ID
+        id: authorize_sequence
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 platform/tools/platform_live_qa_sequence.py dispatch-handoff
+
+      - name: Upload parent-issued exact-child authorization
+        id: upload_authorization
+        if: ${{ steps.authorize_sequence.outcome == 'success' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-postdeploy-live-qa-authorization-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.authorize_sequence.outputs.receipt_path }}
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Record bounded QA handoff outcome
+        if: ${{ always() }}
+        continue-on-error: true
+        shell: bash
+        env:
+          DISPATCH_OUTCOME: ${{ steps.authorize_sequence.outcome }}
+          AUTHORIZATION_OUTCOME: ${{ steps.upload_authorization.outcome }}
+        run: |
+          set -euo pipefail
+          if [[ "$DISPATCH_OUTCOME" == success && "$AUTHORIZATION_OUTCOME" == success ]]; then
+            printf '%s\n' 'Automatic post-deploy QA handoff: dispatched and authorized.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '%s\n' 'Automatic post-deploy QA handoff: unavailable; production QA receives no pass credit.' >> "$GITHUB_STEP_SUMMARY"
+          fi

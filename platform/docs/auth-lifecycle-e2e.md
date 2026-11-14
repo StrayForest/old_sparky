@@ -34,7 +34,15 @@ prints only a fixed test/stage ID, source anchor, numeric source line and
 bounded timeout/assertion/setup category. It never prints Playwright error
 text, form values, email codes, tokens or response bodies.
 
-Production release QA remains source-bound: public QA passes before
-authenticated UserQA, which performs exact provisioned-fixture cleanup and
-absence proof. Human Chrome and real Turnstile interaction are optional
-diagnostics; they are not supplied by this simulated verifier transport.
+Production release QA remains source-bound. The successful production job's
+separate secret-free handoff checks the exact deployment receipt and completed
+production job, dispatches the sequencer with `workflow_dispatch`, and records
+the exact acknowledged sequence run in a parent-owned authorization artifact.
+The sequencer waits for the whole parent workflow to succeed and revalidates
+that authorization before public QA; authenticated UserQA runs only after
+public success and performs exact fixture cleanup and absence proof. A failed
+handoff does not fail the app installation and cannot receive QA pass credit;
+only the exact parent-issued authorization artifact, not a job summary or job
+conclusion, authorizes the sequencer.
+Human Chrome and real Turnstile interaction are optional diagnostics; they
+are not supplied by this simulated verifier transport.

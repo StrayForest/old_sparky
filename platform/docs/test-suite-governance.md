@@ -99,11 +99,11 @@ are documented in [Auth lifecycle E2E](auth-lifecycle-e2e.md).
 ## Backend catalog and contours
 
 The executable [backend test catalog](../tools/platform_test_catalog.py) and
-[catalog runner](../tools/platform_test_runner.py) own test discovery,
-one-contour ownership, exact IDs and the expected snapshot. Refresh the
-snapshot from `registry_payload()` whenever discovery changes any ID, including
-a new method in an existing module. Before publishing, run the canonical
-catalog tests with `tools/platform_verify.py backend-tool-contract --focused tests.test_platform_backend_test_catalog`, then run the changed test's owner contour through `platform_verify.py`. CI loads only catalog-owned IDs; the
+[catalog runner](../tools/platform_test_runner.py) own discovery, contour ownership,
+IDs and the expected snapshot. Refresh on discovery changes from the actual static
+registry payload; never hand-edit IDs, counts or digests. From `platform/`, project
+the payload's snapshot and contour counts/digests with:
+`/usr/bin/python3.12 -I -B -c 'import json,sys; sys.path.insert(0,"tools"); import platform_test_catalog as c; p=c.registry_payload(); print(json.dumps({"snapshot":p["snapshot"],"contours":[{k:x[k] for k in ("id","test_count","test_id_digest")} for x in p["contours"]]},sort_keys=True))'`. Copy fields verbatim and leave unchanged contours untouched. Before publishing, run `tools/platform_verify.py backend-tool-contract --focused tests.test_platform_backend_test_catalog`, then the changed test's owner contour through `platform_verify.py`. CI loads only catalog-owned IDs; the
 `backend` gate aggregates these five contours; `test_platform_user_account_read_models.UserAccountReadModelTests` (backend-unit) owns hit/miss, Redis failure, privacy-safe timing, response materialization and `/users/me` DB-release-before-SET behavior. `UserAccountReadModelRedisIntegrationTests.test_real_lua_generation_guard_rejects_stale_and_expired_writers` is the backend-integration exception; it runs the Lua scripts against UUID-owned Redis DB 15 keys and covers generation replacement, invalidation, expiry and legacy-envelope rejection. The same owner covers DB/Redis-free route regressions for exactly-once event finalization and attempted SET timing when writes fail or are cancelled, including final connection-release failure.
 
 | Catalog contour | Timeout | Shared-resource execution | Ownership boundary |
