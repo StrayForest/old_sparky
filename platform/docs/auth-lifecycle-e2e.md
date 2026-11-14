@@ -43,6 +43,8 @@ that authorization before public QA; authenticated UserQA runs only after
 public success and performs exact fixture cleanup and absence proof. A failed
 handoff does not fail the app installation and cannot receive QA pass credit;
 only the exact parent-issued authorization artifact, not a job summary or job
-conclusion, authorizes the sequencer.
+conclusion, authorizes the sequencer. Sequencer identity is bound to its exact
+workflow ID/path, dispatch source/ref/attempt and parent-derived display title;
+the run's dynamic API name is not used as workflow identity.
 Human Chrome and real Turnstile interaction are optional diagnostics; they
 are not supplied by this simulated verifier transport.

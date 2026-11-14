@@ -639,7 +639,7 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
                         "id": 90, "run_attempt": 1, "workflow_id": 77,
                         "path": platform_live_qa_sequence.SEQUENCER_WORKFLOW_PATH,
                         "event": "workflow_dispatch", "head_branch": "dev", "head_sha": "a" * 40,
-                        "name": "Platform post-deploy live QA",
+                        "name": platform_live_qa_sequence._run_name("12", "2", "a" * 40),
                         "display_title": platform_live_qa_sequence._run_name("12", "2", "a" * 40),
                         "status": "in_progress", "conclusion": None,
                         **self.run_changes,
@@ -670,6 +670,10 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
             (FakeActions(job_name="Unrelated job"), "sequence_job_not_active"),
             (FakeActions(run_changes={"run_attempt": 2}), "sequence_identity_invalid"),
             (FakeActions(run_changes={"head_sha": "b" * 40}), "sequence_identity_invalid"),
+            (
+                FakeActions(run_changes={"display_title": "Wrong parent title"}),
+                "sequence_identity_invalid",
+            ),
             (FakeActions(dev_sha="b" * 40), "dev_head_mismatch"),
         )
         for fake, reason in cases:
@@ -682,7 +686,7 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
                 )
             self.assertEqual(caught.exception.reason, reason)
 
-    def test_dynamic_run_name_uses_display_title_not_static_name(self) -> None:
+    def test_dynamic_run_name_identity_uses_exact_parent_bound_title(self) -> None:
         class FakeActions(platform_live_qa_sequence.GitHubActions):
             def __init__(self) -> None:
                 self.repository = "StrayForest/old_sparky"
@@ -699,14 +703,14 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
                         "path": platform_live_qa_sequence.SEQUENCER_WORKFLOW_PATH,
                         "event": "workflow_dispatch", "head_branch": "dev",
                         "head_sha": "a" * 40,
-                        "name": "Platform post-deploy live QA",
+                        "name": platform_live_qa_sequence._run_name("12", "2", "a" * 40),
                         "display_title": platform_live_qa_sequence._run_name("12", "2", "a" * 40),
                     }
                 return {"total_count": 1, "workflow_runs": [{
                     "id": 90, "run_attempt": 1, "workflow_id": 77,
                     "path": platform_live_qa_sequence.SEQUENCER_WORKFLOW_PATH,
                     "event": "workflow_dispatch", "head_branch": "dev", "head_sha": "a" * 40,
-                    "name": "Platform post-deploy live QA",
+                    "name": platform_live_qa_sequence._run_name("12", "2", "a" * 40),
                     "display_title": platform_live_qa_sequence._run_name("12", "2", "a" * 40),
                 }]}
 
@@ -719,12 +723,13 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
         ))
         fake = FakeActions()
         original = fake.request
-        def bad_static_name(method: str, path: str) -> object:
+        def wrong_parent_title(method: str, path: str) -> object:
             value = original(method, path)
             if isinstance(value, dict) and value.get("id") == 90:
-                return {**value, "name": value["display_title"]}
+                wrong_title = platform_live_qa_sequence._run_name("13", "2", "a" * 40)
+                return {**value, "display_title": wrong_title}
             return value
-        fake.request = bad_static_name  # type: ignore[method-assign]
+        fake.request = wrong_parent_title  # type: ignore[method-assign]
         with self.assertRaises(platform_live_qa_sequence.SequenceError):
             fake.verify_sequence_first_delivery(
                 current_run_id=90, current_attempt=1, workflow_source_sha="a" * 40,
@@ -752,7 +757,7 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
                     "id": 90, "run_attempt": 1, "workflow_id": 77,
                     "path": platform_live_qa_sequence.SEQUENCER_WORKFLOW_PATH,
                     "event": "workflow_dispatch", "head_branch": "dev", "head_sha": "a" * 40,
-                    "name": "Platform post-deploy live QA",
+                    "name": platform_live_qa_sequence._run_name("12", "2", "a" * 40),
                     "display_title": platform_live_qa_sequence._run_name("12", "2", "a" * 40),
                 }
                 if path == "/actions/runs/90":
