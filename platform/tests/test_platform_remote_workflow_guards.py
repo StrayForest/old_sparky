@@ -46,6 +46,235 @@ WORKFLOWS = {
 
 
 class AutomaticLiveQASequenceContractTests(unittest.TestCase):
+    def test_parent_handoff_authorization_binds_both_runs_and_deploy_mode(self) -> None:
+        target = "a" * 40
+        slug = "gha-12-2-aaaaaaaaaaaa"
+        document = {
+            "schema": 1,
+            "kind": platform_live_qa_sequence.HANDOFF_AUTH_KIND,
+            "repository": "StrayForest/old_sparky",
+            "deploy_workflow_path": platform_live_qa_sequence.DEPLOY_WORKFLOW_PATH,
+            "deploy_run_id": "12",
+            "deploy_run_attempt": "2",
+            "source_sha": target,
+            "mode": "deploy",
+            "release_slug": slug,
+            "sequence_workflow_path": platform_live_qa_sequence.SEQUENCER_WORKFLOW_PATH,
+            "sequence_workflow_id": 77,
+            "sequence_run_id": "90",
+            "sequence_run_attempt": "1",
+        }
+        kwargs = {
+            "repository": "StrayForest/old_sparky",
+            "parent_run_id": 12,
+            "parent_attempt": 2,
+            "target_sha": target,
+            "release_slug": slug,
+            "sequence_run_id": 90,
+            "sequence_attempt": 1,
+            "sequence_workflow_id": 77,
+        }
+        self.assertEqual(
+            platform_live_qa_sequence.validate_handoff_authorization(document, **kwargs),
+            document,
+        )
+        for changes in (
+            {"deploy_run_id": "13"},
+            {"deploy_run_attempt": "1"},
+            {"source_sha": "b" * 40},
+            {"mode": "baseline-reconcile"},
+            {"sequence_run_id": "91"},
+            {"sequence_run_attempt": "2"},
+            {"sequence_workflow_id": 78},
+            {"unexpected": "field"},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(
+                platform_live_qa_sequence.SequenceError
+            ):
+                platform_live_qa_sequence.validate_handoff_authorization(
+                    {**document, **changes}, **kwargs
+                )
+
+    def test_handoff_requires_completed_deploy_job_and_active_parent(self) -> None:
+        class FakeActions(platform_live_qa_sequence.GitHubActions):
+            def __init__(self, *, run_changes=None, jobs=None, mode="deploy"):
+                self.repository = "StrayForest/old_sparky"
+                self.run_changes = run_changes or {}
+                self.jobs = jobs or [{
+                    "name": "Deploy production", "status": "completed", "conclusion": "success",
+                }]
+                self.mode = mode
+
+            def workflow_id(self, path: str) -> int:
+                if path != platform_live_qa_sequence.DEPLOY_WORKFLOW_PATH:
+                    raise AssertionError(path)
+                return 19
+
+            def request(self, _method: str, path: str) -> object:
+                if path == "/actions/workflows/platform-production-deploy.yml":
+                    return {"id": 19, "path": platform_live_qa_sequence.DEPLOY_WORKFLOW_PATH, "state": "active"}
+                if path == "/actions/runs/12":
+                    return {
+                        "id": 12, "run_attempt": 2, "workflow_id": 19,
+                        "path": platform_live_qa_sequence.DEPLOY_WORKFLOW_PATH,
+                        "event": "workflow_dispatch", "head_branch": "dev",
+                        "head_sha": "a" * 40, "name": platform_live_qa_sequence.DEPLOY_WORKFLOW_NAME,
+                        "display_title": platform_live_qa_sequence.DEPLOY_WORKFLOW_NAME,
+                        "status": "in_progress", "conclusion": None,
+                        **self.run_changes,
+                    }
+                if path == "/actions/runs/12/attempts/2/jobs?per_page=100&page=1":
+                    return {"total_count": len(self.jobs), "jobs": self.jobs}
+                raise AssertionError(path)
+
+            def exact_deployment_receipt(self, **_kwargs: object) -> dict[str, object]:
+                return {
+                    "verified_mode": self.mode,
+                    "release_slug": "gha-12-2-aaaaaaaaaaaa",
+                }
+
+            def current_dev_sha(self) -> str:
+                return "a" * 40
+
+        good = FakeActions()
+        self.assertEqual(
+            good.verify_parent_handoff_ready(parent_id=12, attempt=2, target_sha="a" * 40),
+            (19, "gha-12-2-aaaaaaaaaaaa"),
+        )
+        cases = (
+            (FakeActions(run_changes={"status": "completed", "conclusion": "success"}), "parent_run_identity_invalid"),
+            (FakeActions(run_changes={"id": True}), "parent_run_identity_invalid"),
+            (FakeActions(run_changes={"workflow_id": True}), "parent_run_identity_invalid"),
+            (FakeActions(jobs=[{"name": "Deploy production", "status": "in_progress"}]), "production_job_not_successful"),
+            (FakeActions(jobs=[{"name": "Deploy production", "status": "completed", "conclusion": "failure"}]), "production_job_not_successful"),
+            (FakeActions(jobs=[None]), "parent_jobs_invalid"),
+            (FakeActions(mode="baseline-reconcile"), "mode_not_normal_deploy"),
+        )
+        for fake, reason in cases:
+            with self.subTest(reason=reason), self.assertRaises(
+                (platform_live_qa_sequence.SequenceError, platform_live_qa_sequence.SequenceSkipped)
+            ) as caught:
+                fake.verify_parent_handoff_ready(parent_id=12, attempt=2, target_sha="a" * 40)
+            self.assertEqual(caught.exception.reason, reason)
+
+    def test_dispatch_handoff_binds_acknowledged_child_to_parent_artifact(self) -> None:
+        from unittest.mock import patch
+
+        class FakeActions:
+            repository = "StrayForest/old_sparky"
+
+            def __init__(self) -> None:
+                self.dispatch_args = None
+
+            def verify_parent_handoff_ready(self, **kwargs: object) -> tuple[int, str]:
+                self.assert_parent = kwargs
+                return 19, "gha-12-2-aaaaaaaaaaaa"
+
+            def workflow_id(self, path: str) -> int:
+                if path != platform_live_qa_sequence.SEQUENCER_WORKFLOW_PATH:
+                    raise AssertionError(path)
+                return 77
+
+            def dispatch(self, path: str, workflow_id: int, inputs: dict[str, str]) -> int:
+                self.dispatch_args = (path, workflow_id, inputs)
+                return 90
+
+        fake = FakeActions()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "output"
+            output.touch()
+            env = {
+                "GITHUB_EVENT_NAME": "workflow_dispatch",
+                "GITHUB_REF": "refs/heads/dev",
+                "GITHUB_REPOSITORY": "StrayForest/old_sparky",
+                "GITHUB_RUN_ID": "12",
+                "GITHUB_RUN_ATTEMPT": "2",
+                "GITHUB_SHA": "a" * 40,
+                "GITHUB_API_URL": "https://api.github.com",
+                "GH_TOKEN": "test-token",
+                "WORKFLOW_MODE": "deploy",
+                "RUNNER_TEMP": temp_dir,
+                "GITHUB_OUTPUT": str(output),
+            }
+            with patch.dict("os.environ", env, clear=True), patch.object(
+                platform_live_qa_sequence, "GitHubActions", return_value=fake
+            ):
+                self.assertEqual(platform_live_qa_sequence.dispatch_handoff(), 90)
+            self.assertEqual(
+                fake.dispatch_args,
+                (
+                    platform_live_qa_sequence.SEQUENCER_WORKFLOW_PATH,
+                    77,
+                    {"deploy_run_id": "12", "deploy_run_attempt": "2", "target_sha": "a" * 40},
+                ),
+            )
+            receipt_path = Path(temp_dir) / "postdeploy-handoff-authorization" / platform_live_qa_sequence.HANDOFF_AUTH_FILE
+            mode = platform_live_qa_sequence.stat.S_IMODE(receipt_path.stat().st_mode)
+            self.assertEqual(mode, 0o600)
+            document = json.loads(receipt_path.read_text(encoding="ascii"))
+            self.assertEqual(document["sequence_run_id"], "90")
+            self.assertEqual(document["deploy_run_attempt"], "2")
+            self.assertEqual(document["mode"], "deploy")
+            self.assertIn("receipt_path=", output.read_text(encoding="ascii"))
+
+    def test_public_dispatch_waits_for_terminal_success_of_parent_workflow(self) -> None:
+        from unittest.mock import patch
+
+        class FakeActions:
+            repository = "StrayForest/old_sparky"
+
+            def __init__(self, *, authorization_available: bool = True) -> None:
+                self.dispatched: list[str] = []
+                self.calls: list[str] = []
+                self.authorization_available = authorization_available
+
+            def exact_deployment_receipt(self, **_kwargs: object) -> dict[str, object]:
+                self.calls.append("deploy_receipt")
+                return {"verified_mode": "deploy", "release_slug": "gha-12-2-aaaaaaaaaaaa"}
+
+            def workflow_id(self, _path: str) -> int:
+                return 77
+
+            def exact_handoff_authorization(self, **_kwargs: object) -> dict[str, object]:
+                self.calls.append("authorization")
+                if not self.authorization_available:
+                    raise platform_live_qa_sequence.SequenceError(
+                        "authorization", "artifact_unavailable"
+                    )
+                return {"sequence_run_id": "90"}
+
+            def wait_for_parent_success(self, **_kwargs: object) -> None:
+                self.calls.append("parent_wait")
+                raise platform_live_qa_sequence.SequenceError("parent", "run_not_successful")
+
+            def dispatch(self, path: str, **_kwargs: object) -> int:
+                self.dispatched.append(path)
+                return 431
+
+        env = {
+            "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/dev",
+            "GITHUB_REPOSITORY": "StrayForest/old_sparky", "GITHUB_SHA": "a" * 40,
+            "GITHUB_RUN_ID": "90", "GITHUB_RUN_ATTEMPT": "1",
+            "DEPLOY_TARGET_SHA": "a" * 40, "DEPLOY_RUN_ID": "12", "DEPLOY_RUN_ATTEMPT": "2",
+        }
+        fake = FakeActions()
+        with patch.dict("os.environ", env, clear=True), patch.object(
+            platform_live_qa_sequence, "GitHubActions", return_value=fake
+        ), self.assertRaises(platform_live_qa_sequence.SequenceError) as caught:
+            platform_live_qa_sequence.dispatch_public()
+        self.assertEqual(caught.exception.reason, "run_not_successful")
+        self.assertEqual(fake.calls, ["deploy_receipt", "authorization", "parent_wait"])
+        self.assertEqual(fake.dispatched, [])
+
+        missing_receipt = FakeActions(authorization_available=False)
+        with patch.dict("os.environ", env, clear=True), patch.object(
+            platform_live_qa_sequence, "GitHubActions", return_value=missing_receipt
+        ), self.assertRaises(platform_live_qa_sequence.SequenceError) as caught:
+            platform_live_qa_sequence.dispatch_public()
+        self.assertEqual(caught.exception.reason, "artifact_unavailable")
+        self.assertEqual(missing_receipt.calls, ["deploy_receipt", "authorization"])
+        self.assertEqual(missing_receipt.dispatched, [])
+
     def test_dispatch_ack_requires_exact_documented_run_identity(self) -> None:
         self.assertEqual(
             platform_live_qa_sequence.parse_dispatch_ack(
@@ -409,7 +638,7 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
                     return {
                         "id": 90, "run_attempt": 1, "workflow_id": 77,
                         "path": platform_live_qa_sequence.SEQUENCER_WORKFLOW_PATH,
-                        "event": "workflow_run", "head_branch": "dev", "head_sha": "a" * 40,
+                        "event": "workflow_dispatch", "head_branch": "dev", "head_sha": "a" * 40,
                         "name": "Platform post-deploy live QA",
                         "display_title": platform_live_qa_sequence._run_name("12", "2", "a" * 40),
                         "status": "in_progress", "conclusion": None,
@@ -424,6 +653,9 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
 
             def verify_parent_deploy(self, **_kwargs: object) -> tuple[str, int, str]:
                 return self.mode, 12, "gha-12-2-aaaaaaaaaaaa"
+
+            def exact_handoff_authorization(self, **_kwargs: object) -> dict[str, object]:
+                return {"sequence_run_id": "90"}
 
             def current_dev_sha(self) -> str:
                 return self.dev_sha
@@ -465,7 +697,7 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
                     return {
                         "id": 90, "run_attempt": 1, "workflow_id": 77,
                         "path": platform_live_qa_sequence.SEQUENCER_WORKFLOW_PATH,
-                        "event": "workflow_run", "head_branch": "dev",
+                        "event": "workflow_dispatch", "head_branch": "dev",
                         "head_sha": "a" * 40,
                         "name": "Platform post-deploy live QA",
                         "display_title": platform_live_qa_sequence._run_name("12", "2", "a" * 40),
@@ -473,7 +705,7 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
                 return {"total_count": 1, "workflow_runs": [{
                     "id": 90, "run_attempt": 1, "workflow_id": 77,
                     "path": platform_live_qa_sequence.SEQUENCER_WORKFLOW_PATH,
-                    "event": "workflow_run", "head_branch": "dev", "head_sha": "a" * 40,
+                    "event": "workflow_dispatch", "head_branch": "dev", "head_sha": "a" * 40,
                     "name": "Platform post-deploy live QA",
                     "display_title": platform_live_qa_sequence._run_name("12", "2", "a" * 40),
                 }]}
@@ -483,6 +715,7 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
             current_run_id=90, current_attempt=1, workflow_source_sha="a" * 40,
             expected_name=platform_live_qa_sequence._run_name("12", "2", "a" * 40),
             parent_run_id="12", parent_attempt="2", target_sha="a" * 40,
+            release_slug="gha-12-2-aaaaaaaaaaaa",
         ))
         fake = FakeActions()
         original = fake.request
@@ -497,12 +730,15 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
                 current_run_id=90, current_attempt=1, workflow_source_sha="a" * 40,
                 expected_name=platform_live_qa_sequence._run_name("12", "2", "a" * 40),
                 parent_run_id="12", parent_attempt="2", target_sha="a" * 40,
+                release_slug="gha-12-2-aaaaaaaaaaaa",
             )
 
     def test_first_delivery_rejects_reruns_and_honors_older_claimed_run(self) -> None:
         class FakeActions(platform_live_qa_sequence.GitHubActions):
-            def __init__(self, *, prior_claimed: bool, prior_conclusion: str = "cancelled") -> None:
+            def __init__(self, *, authorized_prior: bool, prior_claimed: bool,
+                         prior_conclusion: str = "cancelled") -> None:
                 self.repository = "StrayForest/old_sparky"
+                self.authorized_prior = authorized_prior
                 self.prior_claimed = prior_claimed
                 self.prior_conclusion = prior_conclusion
                 self.calls: list[str] = []
@@ -515,7 +751,7 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
                 current = {
                     "id": 90, "run_attempt": 1, "workflow_id": 77,
                     "path": platform_live_qa_sequence.SEQUENCER_WORKFLOW_PATH,
-                    "event": "workflow_run", "head_branch": "dev", "head_sha": "a" * 40,
+                    "event": "workflow_dispatch", "head_branch": "dev", "head_sha": "a" * 40,
                     "name": "Platform post-deploy live QA",
                     "display_title": platform_live_qa_sequence._run_name("12", "2", "a" * 40),
                 }
@@ -533,6 +769,9 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
                     }
                 raise AssertionError(path)
 
+            def exact_handoff_authorization(self, **_kwargs: object) -> dict[str, object]:
+                return {"sequence_run_id": "89" if self.authorized_prior else "90"}
+
             def _has_prior_child_receipt(self, **kwargs: object) -> bool:
                 if kwargs.get("sequence_run_id") != 89:
                     raise AssertionError("prior run identity was not checked")
@@ -546,22 +785,21 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
             "parent_run_id": "12",
             "parent_attempt": "2",
             "target_sha": "a" * 40,
+            "release_slug": "gha-12-2-aaaaaaaaaaaa",
         }
-        for claimed, conclusion, expected in (
-            (True, "cancelled", False),
-            (False, "failure", True),
-        ):
-            with self.subTest(prior_child_receipt=claimed):
-                fake = FakeActions(prior_claimed=claimed, prior_conclusion=conclusion)
-                self.assertEqual(fake.verify_sequence_first_delivery(**args), expected)
-                self.assertIn("/actions/runs/89", fake.calls)
+        prior_claimed = FakeActions(authorized_prior=True, prior_claimed=True)
+        self.assertFalse(prior_claimed.verify_sequence_first_delivery(**args))
+        self.assertIn("/actions/runs/89", prior_claimed.calls)
 
-        cancelled_without_receipt = FakeActions(prior_claimed=False)
+        unauthorized_prior = FakeActions(authorized_prior=False, prior_claimed=False)
+        self.assertTrue(unauthorized_prior.verify_sequence_first_delivery(**args))
+
+        cancelled_without_receipt = FakeActions(authorized_prior=True, prior_claimed=False)
         with self.assertRaises(platform_live_qa_sequence.SequenceError) as caught:
             cancelled_without_receipt.verify_sequence_first_delivery(**args)
-        self.assertEqual(caught.exception.reason, "cancelled_prior_without_receipt")
+        self.assertEqual(caught.exception.reason, "prior_authorized_without_child_receipt")
 
-        rerun = FakeActions(prior_claimed=False)
+        rerun = FakeActions(authorized_prior=False, prior_claimed=False)
         with self.assertRaises(platform_live_qa_sequence.SequenceError) as caught:
             rerun.verify_sequence_first_delivery(**{**args, "current_attempt": 2})
         self.assertEqual(caught.exception.reason, "successor_rerun_refused")
@@ -683,6 +921,7 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
         self.assertTrue(any(isinstance(item, platform_live_qa_sequence._NoRedirect) for item in client.opener.handlers))
 
     def test_child_workflows_gate_host_effects_and_hold_parent_lock(self) -> None:
+        production = (WORKFLOW_ROOT / "platform-production-deploy.yml").read_text(encoding="utf-8")
         launch = (WORKFLOW_ROOT / "platform-live-launch.yml").read_text(encoding="utf-8")
         userqa = (WORKFLOW_ROOT / "platform-live-user-qa.yml").read_text(encoding="utf-8")
         successor = (WORKFLOW_ROOT / "platform-postdeploy-live-qa.yml").read_text(encoding="utf-8")
@@ -693,6 +932,8 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
             self.assertIn("sequence_run_id", source)
             self.assertIn("platform-live-qa-sequenced-child-", source)
         self.assertIn("group: platform-live-qa", successor)
+        self.assertIn("workflow_dispatch:", successor)
+        self.assertNotIn("workflow_run:", successor)
         self.assertIn("queue: max", successor)
         self.assertIn("cancel-in-progress: false", successor)
         sequence_job = _job_block(successor, "sequence")
@@ -714,6 +955,16 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
         self.assertEqual(successor.count("queue:"), 1)
         self.assertIn("platform-postdeploy-live-qa-child-public-", successor)
         self.assertIn("platform-postdeploy-live-qa-child-user-qa-", successor)
+        handoff_job = _job_block(production, "postdeploy-handoff")
+        self.assertIn("needs.production.result == 'success'", handoff_job)
+        self.assertIn("inputs.mode == 'deploy'", handoff_job)
+        self.assertIn("continue-on-error: true", handoff_job)
+        self.assertIn("Record bounded QA handoff outcome", handoff_job)
+        self.assertIn("actions: write", handoff_job)
+        self.assertIn("contents: read", handoff_job)
+        self.assertNotIn("environment: production", handoff_job)
+        self.assertIn("dispatch-handoff", handoff_job)
+        self.assertIn("platform-postdeploy-live-qa-authorization-", handoff_job)
 
     def test_public_failure_or_dev_advance_never_dispatches_userqa(self) -> None:
         from unittest.mock import patch
@@ -726,6 +977,15 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
 
             def verify_parent_deploy(self, **_kwargs: object) -> tuple[str, int, str]:
                 return "deploy", 12, "gha-12-2-aaaaaaaaaaaa"
+
+            def exact_deployment_receipt(self, **_kwargs: object) -> dict[str, object]:
+                return {"verified_mode": "deploy", "release_slug": "gha-12-2-aaaaaaaaaaaa"}
+
+            def exact_handoff_authorization(self, **_kwargs: object) -> dict[str, object]:
+                return {"sequence_run_id": "90"}
+
+            def wait_for_parent_success(self, **_kwargs: object) -> None:
+                return None
 
             def verify_sequence_first_delivery(self, **_kwargs: object) -> bool:
                 return True
@@ -746,13 +1006,11 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
                 return 431
 
         env = {
-            "GITHUB_EVENT_NAME": "workflow_run", "GITHUB_REF": "refs/heads/dev",
+            "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/dev",
             "GITHUB_SHA": "a" * 40, "GITHUB_RUN_ID": "90", "GITHUB_RUN_ATTEMPT": "1",
             "GITHUB_REPOSITORY": "StrayForest/old_sparky", "GITHUB_API_URL": "https://api.github.com",
-            "GH_TOKEN": "test-token", "PARENT_DEPLOY_SHA": "a" * 40,
-            "PARENT_DEPLOY_RUN_ID": "12", "PARENT_DEPLOY_RUN_ATTEMPT": "2",
-            "PARENT_DEPLOY_EVENT": "workflow_dispatch", "PARENT_DEPLOY_BRANCH": "dev",
-            "PARENT_DEPLOY_STATUS": "completed", "PARENT_DEPLOY_CONCLUSION": "success",
+            "GH_TOKEN": "test-token", "DEPLOY_TARGET_SHA": "a" * 40,
+            "DEPLOY_RUN_ID": "12", "DEPLOY_RUN_ATTEMPT": "2",
             "PUBLIC_CHILD_RUN_ID": "431",
         }
         cases = ((False, "run_not_successful"), (True, "dev_head_mismatch"))

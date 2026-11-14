@@ -1,16 +1,23 @@
 name: Platform post-deploy live QA
 
 run-name: >-
-  Automatic post-deploy QA parent=${{ github.event.workflow_run.id }}.${{ github.event.workflow_run.run_attempt }} source=${{ github.event.workflow_run.head_sha }}
+  Automatic post-deploy QA parent=${{ inputs.deploy_run_id }}.${{ inputs.deploy_run_attempt }} source=${{ inputs.target_sha }}
 
 on:
-  workflow_run:
-    workflows:
-      - Platform production deploy
-    types:
-      - completed
-    branches:
-      - dev
+  workflow_dispatch:
+    inputs:
+      deploy_run_id:
+        description: Exact completed production-deploy workflow run ID
+        required: true
+        type: string
+      deploy_run_attempt:
+        description: Exact production-deploy run attempt
+        required: true
+        type: string
+      target_sha:
+        description: Exact source SHA of the production deployment
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -23,11 +30,7 @@ concurrency:
 jobs:
   sequence:
     name: Validate deployment and run ordered live QA
-    if: >-
-      github.event.workflow_run.event == 'workflow_dispatch' &&
-      github.event.workflow_run.status == 'completed' &&
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_branch == 'dev'
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 125
     permissions:
@@ -36,13 +39,9 @@ jobs:
       statuses: read
     env:
       GH_TOKEN: ${{ github.token }}
-      PARENT_DEPLOY_RUN_ID: ${{ github.event.workflow_run.id }}
-      PARENT_DEPLOY_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
-      PARENT_DEPLOY_SHA: ${{ github.event.workflow_run.head_sha }}
-      PARENT_DEPLOY_EVENT: ${{ github.event.workflow_run.event }}
-      PARENT_DEPLOY_BRANCH: ${{ github.event.workflow_run.head_branch }}
-      PARENT_DEPLOY_STATUS: ${{ github.event.workflow_run.status }}
-      PARENT_DEPLOY_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+      DEPLOY_RUN_ID: ${{ inputs.deploy_run_id }}
+      DEPLOY_RUN_ATTEMPT: ${{ inputs.deploy_run_attempt }}
+      DEPLOY_TARGET_SHA: ${{ inputs.target_sha }}
     steps:
       - name: Check out trusted default-branch sequencer
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
