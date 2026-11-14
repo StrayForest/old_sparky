@@ -1,8 +1,8 @@
 # Automated authentication lifecycle E2E
 
-- Status: Active implementation; exact-source hosted CI validation pending
+- Status: Required hosted auth and production live QA gates passed
 - Owner: Web and platform maintainers
-- Last reviewed: 2026-11-13
+- Last reviewed: 2026-11-14
 
 The `web-hermetic` gate runs `npm run test:auth-lifecycle-e2e` after the
 standalone web build and before separate browser contours. It uses the real
@@ -10,6 +10,25 @@ FastAPI routes with a migrated disposable PostgreSQL service and isolated
 Redis databases. The browser covers registration, generated-email
 verification, login, password reset, password change, session invalidation,
 and exact fixture cleanup.
+
+Exact-SHA Security run `43569313507/1` passed for source
+`d52eb46080fed7a4dbc6c86c4b875cbe11cfa3a5`, including the required hosted
+auth lifecycle gate. No separate numeric auth report is available. Production
+deploy `43572099804/1` succeeded and automatic sequencer `43572731917/1`,
+public child `43572752214/1`, and UserQA child `43573228506/1` all completed
+successfully against the same source. Public artifact `14105615416` records
+57 attempts: 47 passed and 10 allowlisted expected skips, with zero failed,
+flaky, interrupted or timed-out cases; coverage requires all 57 expected
+cases and validates each skip annotation. UserQA artifact `14105311501` records
+complete coverage, one journey/attempt passed, zero skipped or failed, and
+child exit 0. Exact cleanup path and absence assertions passed. Final strict
+preflight and origin/public smokes (33 checks, zero failures each) passed.
+Final readiness confirmed d52 current and original cb1a previous, C4 selected/
+C3 retained, venv origin d52, Alembic current equals head `20261112_0055`,
+API/web 200, all three app services active, locks free, no pending systemd jobs,
+no operation marker or diagnostic plans, and consistency passed. No workflow
+runs remained active. The auth fixture
+does not establish production Cloudflare scoring or challenge behavior.
 
 The application generates the email messages; a loopback SMTP sink captures
 them in memory for the verification/reset codes. A test-only HTTPX transport
