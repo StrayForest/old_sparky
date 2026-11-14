@@ -6,7 +6,15 @@
 
 ## Ephemeral synthetic restore diagnostic
 
-The privileged Security contour creates a fixed PG16 custom archive containing 4,096 rows with 8,192-byte search payloads (32 MiB total), a `pg_trgm` GIN index, and the synthetic Alembic marker, then runs three serial restores inside the verified scratch unit. The [test-suite governance](test-suite-governance.md) owns fixture generation, per-phase equivalence checks, runner preflight and the sanitized success metrics artifact. A standard Security `workflow_dispatch` on a non-`dev` branch may select exactly one backend, `tmpfs_v1` (default) or `disk_ext4_image_v1`; push, pull-request, `dev` and non-standard dispatch paths are forced to `tmpfs_v1`. Run and review the backends as separate dispatches, with cleanup, health, storage and fresh resource admission between them; never chain into disk after a failed tmpfs result. Compare fixture identity, PostgreSQL version, arm definitions and per-arm logical hashes, not archive hashes. The report separates `restore_platform` and `restore_public`: cluster-wide WAL counters bracket each `pg_restore` command, with the after-snapshot taken only after sessions in that exact restore database exit; command and precheck-through-postcheck elapsed times are distinct, cgroup peak is reset per command, and the selected filesystem's high-water and capacity are reported under backend-specific fields. This early result is diagnostic-only and does not replace the required full `dev` gate. It does not change production restore settings or prove production capacity. On failure, sibling `synthetic-restore-diagnostic-failure.json` retains the selected backend, fixed unit status, bounded stderr byte/hash metadata, and a bounded exact-unit journal projection containing only closed reason/namespace/errno/target enums; raw journal messages are never exported. Capture requests a bounded-time `journalctl --sync` before querying the exact generated unit; separate sync and query statuses distinguish sync from a query stream read fully under byte/line caps, not a complete causal trace. A failed synthetic unit is retained through evidence capture, then stopped, reset if still loaded, and required to become `not-found` before mount cleanup. `unknown` is not a cause and the failure artifact contains no successful three-arm metrics. Before the synthetic unit starts, the root GitHub-hosted test provisions only missing directories from its fixed `InaccessiblePaths=` target set as root-owned mode `0700`, records their inode identities, and removes only those still-empty created directories after exact unit unload. Existing targets are left untouched; an unexpected symlink, unsafe parent, changed identity, or non-empty created directory fails closed. This ephemeral runner fixture keeps the mandatory namespace protections active without creating paths on production hosts.
+The privileged Security workflow runs this diagnostic only on GitHub-hosted
+runners. The [test-suite governance](test-suite-governance.md) owns the fixed
+fixture, backend selection, equivalence checks, runner confinement and
+sanitized artifacts. `tmpfs_v1` is the default; a standard Security dispatch
+on a non-`dev` branch may select `disk_ext4_image_v1` as a separate run. Review
+the first run, cleanup, health, storage and fresh resource admission before a
+second backend run; never continue to disk after a failed tmpfs run. The
+diagnostic does not change production restore settings, satisfy the full `dev`
+gate, or prove production restore capacity.
 
 ## Local verified backup
 
@@ -73,46 +81,14 @@ The legacy schema-1 admission receipt and its bounded best-effort RSS samples
 remain accepted unchanged. These diagnostics never change the 1 GiB guard and
 are excluded from public workflow output and artifacts.
 
-The current source candidate sets `shared_buffers=16MB` for the isolated
-PostgreSQL 16 cluster through [`initdb --set`](https://www.postgresql.org/docs/16/app-initdb.html)
-and the matching `pg_ctl` startup option. A controlled PG16 startup
-measurement found lower fixed main shared-memory use at this setting; it does
-not prove that a full restore will pass the memory guard. Durability,
-authentication, confinement and resource guards remain unchanged. An earlier
-paired 32 MiB candidate was reverted to 64 MiB after its backup attempt failed
-the unchanged reserve guard without completing restore/Alembic verification.
-That failure neither measured a saving nor established a cause. This 16 MiB
-setting applies only to the scratch restore cluster and does not change
-production PostgreSQL settings. See the [performance checkpoint](../performance/README.md#backup-and-restore-follow-up-2026-10-15)
-for the measured fixed shared-memory delta and its limitations. Future attempts
-retain the 1 GiB host guard and full restore/Alembic checks.
-
-Two source-bound backup attempts on 2026-10-15 failed the 1 GiB reserve guard;
-the second used the paired 32 MiB candidate before it was reverted. Neither is
-a restore/Alembic pass, and no causal comparison or memory-saving result was
-established. Keep the reserve and all restore checks unchanged; see the [performance
-checkpoint](../performance/README.md#backup-and-restore-follow-up-2026-10-15)
-for the observed failures and their limits.
-
-A third bound create, run `38722295410` attempt 1, also failed the unchanged
-guard during `restore_platform`: `MemAvailable` was 1,066,323,968 bytes, a
-7,417,856-byte deficit. Scratch cleanup was confirmed; restore/Alembic
-completion remains UNKNOWN, no backup pair was produced, and automatic
-deployment did not run. Security run `38671815760` attempt 2 passed all 18
-jobs for source `16d956c63c1b0360d147b7916c9e513fe9b4876c` (16 success, 2
-expected skips). The 20 prior backup pairs and four protected roots remain
-preserved. These observations do not establish a restore-memory cause or
-change the 1 GiB guard.
-
-Run `38738894181/1` failed `parent_active_poll` by 10,694,656 bytes; the last sample was 9.76 seconds after restore start.
-It showed nine 16 MiB WAL segments (150,994,944 bytes) and 157,286,400 allocated bytes under `base`, not an atomic peak or proof WAL alone caused failure.
-Cleanup was confirmed; restore/Alembic remain UNKNOWN, no pair was produced, and the PostgreSQL patch version is unknown.
-Run `38759048702/1` failed in `public_summary`; see the [performance checkpoint](../performance/README.md#backup-and-restore-follow-up-2026-10-15) for inventory and evidence limits.
-
-The un-deployed scratch-only candidate sets `max_wal_size=64MB` and `min_wal_size=32MB` (PostgreSQL 16 defaults: 1 GB and 80 MB).
-Max is a soft checkpoint threshold; min is a recycling floor, not a storage cap ([PostgreSQL WAL settings](https://www.postgresql.org/docs/16/runtime-config-wal.html)).
-Durability settings, the 1 GiB guard and existing limits stay unchanged; more checkpoint I/O/CPU is possible. This is a hypothesis,
-not a verified memory fix or passing restore.
+The disposable PostgreSQL 16 cluster uses `shared_buffers=16MB`,
+`max_wal_size=64MB` and `min_wal_size=32MB` during initialization/startup.
+These are scratch-cluster settings only; the WAL values are checkpoint and
+recycling thresholds, not hard storage caps. Durability settings, the 1 GiB
+host-memory reserve and full restore/Alembic checks remain unchanged. The
+[performance evidence](../performance/README.md#backup-and-restore-follow-up-2026-10-15)
+owns the dated measurements and failed-run detail; none establishes a restore
+capacity pass or permits weakening the guards.
 
 For a private failure during the parent active-poll guard, the root-private
 failure receipt may also contain the optional closed
@@ -210,21 +186,6 @@ After publishing both the dump and metadata entries, the drill fsyncs the
 backup directory before rotation or success. If that directory sync fails, it
 removes only the exact newly published inodes and leaves pre-existing pairs
 untouched; failure to confirm that rollback is reported as an integrity error.
-
-Backup-only performs the common keep-one rotation after the new pair has
-passed isolated restore and Alembic verification; it skips other retention
-categories. The `--backup-keep` option accepts only `1`. The fixed private
-manifest is retained as an audit input for the source-bound workflow, but
-listed pairs receive no retention exemption. Verify the exact installed unit
-and source-bound workflow before operation.
-
-The pair inventory is checked before DB work and again before publication;
-each pair's identity and sidecar claims are rechecked before unlink. The
-private proof records the latest selected pair and each removed pair's
-pre-delete identities, sidecar claims, reason and falsey restore-status class
-where applicable. It does not hash dump payloads. Drift fails closed, but
-pruning that already began is not transactional. Public
-summaries omit manifest names, paths and proof digests.
 
 For a normal reviewed `dev` release, the operator owns backup dispatch;
 auto-deploy only checks its exact proof. Use this order:

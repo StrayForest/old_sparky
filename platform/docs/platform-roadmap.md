@@ -2,7 +2,7 @@
 
 - Status: Active backlog and priority map
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-01
+- Last reviewed: 2026-11-14
 
 For the production baseline and immediate engineering target, read [`CURRENT.md`](CURRENT.md). This file deliberately omits release diaries and detailed audit evidence.
 
@@ -10,7 +10,7 @@ For the production baseline and immediate engineering target, read [`CURRENT.md`
 
 ### AS-18 — Hot-path capacity and backpressure
 
-**Resolved.** Participant slots, idempotent join, non-locking ordinary ready
+**Implemented; production capacity acceptance remains open.** Participant slots, idempotent join, non-locking ordinary ready
 votes, conditional ETag reads, bounded pools and priority queues are
 implemented and deployed. The package covers join capacity slots,
 compact conditional workflow reads, bounded API/worker pools, Celery
@@ -18,8 +18,11 @@ priority/backpressure and retained load evidence. Existing 128-shard ready
 votes and PostgreSQL workflow authority remain in force. Ready Check uses the
 server-known timing contract, and passive grid changes are visible after
 manual reload. Ready Vote additionally uses a process-local adaptive
-admission boundary and bounded browser retries; production Pareto evidence
-for the unchanged 15k/20k external workloads remains an operator gate.
+admission boundary and bounded browser retries. The completed production
+matrix did not certify a server capacity ceiling; its unresolved attribution
+is recorded in [`CURRENT.md`](CURRENT.md) and the
+[performance evidence index](../performance/README.md). No matrix rerun is
+currently pending.
 
 ### AS-17 — End-to-end release transaction and recovery
 

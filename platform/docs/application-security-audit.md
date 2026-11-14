@@ -2,7 +2,7 @@
 
 - Status: Active security/correctness tracker
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-13
+- Last reviewed: 2026-11-14
 - Historical point-in-time audits and resolved findings: [`archive/`](archive/)
 
 This document contains only findings that still require action or direct operator verification. Historical evidence is archived so routine security work does not load resolved context.
@@ -64,9 +64,6 @@ The decision and compatibility impact are recorded in the
 
 ## Active findings
 
-AS-12 origin-perimeter closure evidence is retained in
-[`archive/as-12-origin-perimeter-2026-09-05.md`](archive/as-12-origin-perimeter-2026-09-05.md).
-
 ### AUD-02 — Cloudflare dashboard/runtime evidence reconciliation
 
 The public catalog cache behavior is now live-proven and the previous
@@ -84,45 +81,10 @@ Cloudflare-range/UFW alert workflow are now evidenced. Details are in
 The checklist must not be called fully closed until the remaining
 secret-scope and provider-entitlement checks have evidence.
 
-### Additional audit actions
-
-- Canonical env group-read was removed; renderer/preflight now reject stale or
-  unsafe service envs.
-- The unit installer now installs the off-site-backup unit/timer and enables the
-  reviewed maintenance, Cloudflare-range and health timers. Off-site backup
-  activation remains behind its restore-drill gate.
-- Post-deploy patch translation is reported as a controlled warm-up with an
-  explicit OpenAI cache-miss call budget, not read-only QA.
-- The production workflow builds and attests the immutable release and
-  artifact-bound wheelhouse in CI, publishes its digest, and sends only that
-  digest-verified artifact to the VPS. The VPS does not resolve dependencies or
-  build from a source checkout.
-- Normal production deployment is now automatically chained from a successful
-  `Platform security and build` push run for the current `dev` HEAD. The
-  `Platform production auto-deploy` gate rejects stale successful runs,
-  requires the exact `platform-security-build=success` status and skips SHAs
-  already marked `platform-production-deploy=success`; manual deploy remains an
-  operator fallback rather than the routine path.
-- The frontend audit follow-up hardens client authorization and asynchronous
-  mutation state: anonymous invite-only page reads become an explicit login
-  flow, private registration consumes the backend invite-access capability,
-  auth/security feature fallbacks fail closed, Steam link UI requires confirmed
-  runtime capability, tournament creation serializes submit/invite-code state,
-  profile editors block overlapping saves, destructive pre-production cleanup
-  no longer reports a committed cleanup as failed because a later reload failed,
-  and invite-code readiness uses the same 10-character minimum as validation.
-  Deterministic regression coverage in
-  `apps/platform_web/tests/smoke/frontend-audit-regressions.spec.ts` locks these
-  contracts.
-
 ## Remediation order
 
 Complete the remaining AUD-02 dashboard/operator checks in
 [`cloudflare-production-checklist.md`](cloudflare-production-checklist.md).
-
-AS-13 was closed on 2026-09-01 after the exact-SHA security/build run passed;
-the evidence is retained in
-[`archive/application-security-as-13-2026-09-01.md`](archive/application-security-as-13-2026-09-01.md).
 
 
 Any newly confirmed Critical issue or direct authentication bypass blocks production installation. Do not widen CSP, disable Turnstile, add privileged-route bypasses or weaken application RBAC to simplify testing.

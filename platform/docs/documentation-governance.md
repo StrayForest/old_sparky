@@ -2,7 +2,7 @@
 
 - Status: Active reference and maintenance how-to
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-01
+- Last reviewed: 2026-11-14
 
 This document defines where platform facts belong and how to keep the
 repository's documentation, agent instructions and project skills coherent.
@@ -95,9 +95,12 @@ dependency is not a pass; report it as `LOCAL GATE BLOCKED`.
 
 ## External orientation
 
-The maintenance rules are aligned with current guidance from [OpenAI's Codex
-engineering guide](https://openai.com/business/guides-and-resources/how-openai-uses-codex/),
-[Anthropic's memory guidance](https://code.claude.com/docs/en/memory),
-[GitHub's custom-instructions model](https://docs.github.com/en/copilot/concepts/prompting/response-customization),
-[Google's code-review practices](https://google.github.io/eng-practices/review/reviewer/looking-for.html),
-and the [Diátaxis documentation framework](https://diataxis.fr/).
+For current Codex instruction behavior, see [OpenAI's `AGENTS.md`
+documentation](https://developers.openai.com/codex/agent-configuration/agents-md).
+For skill structure and supporting resources, see [OpenAI's skill authoring
+guide](https://developers.openai.com/plugins/build/skills). These sources
+inform this repository's guidance; its explicit scope, safety and release
+rules remain authoritative.
+For documentation structure and review, see [Diátaxis](https://diataxis.fr/),
+[GitHub's style guide](https://docs.github.com/en/contributing/style-guide-and-content-model/style-guide)
+and [Google's code-review guidance](https://google.github.io/eng-practices/review/reviewer/looking-for.html).

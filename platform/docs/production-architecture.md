@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform maintainers
-- Last reviewed: 2026-10-20
+- Last reviewed: 2026-11-14
 
 ## Invariants
 

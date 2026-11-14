@@ -23,11 +23,13 @@ release-root `wheelhouse/` tree and
 extraction. The complete archive and checksum remain unchanged; the candidate
 deploy helper performs the normal full release extraction later.
 
-The [host-tools provisioning ADR](production-host-tools-provisioning.md)
-records the current C2/P3 generation and owns its pin, exact closure and
-provisioning history. The canonical resolver verifies the closure paths,
-source modes, hashes and ancestry; this decision record owns only the
-bootstrap extraction behavior.
+The [host-tools provisioning ADR](production-host-tools-provisioning.md) owns
+the immutable-generation trust boundary; the canonical
+[`host_tools_pin.json`](../../contracts/host_tools_pin.json) owns the selected
+source and exact closure, while [`CURRENT.md`](../CURRENT.md) owns installed
+generation state. The resolver verifies closure paths, source modes, hashes
+and ancestry; this decision record owns only the bootstrap extraction
+behavior.
 
 ## Consequences
 

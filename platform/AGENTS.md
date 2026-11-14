@@ -60,23 +60,14 @@
   web: `web-quality` and, when applicable, `web-hermetic`.
 - Release: follow `docs/deployment-runbook.md` and the current CSP mode documented in `docs/CURRENT.md`.
 
-For raw GitHub Actions artifact ZIPs, use the authenticated `gh api` command
-with stdout redirected to a private file created under `umask 077`. Verify the
-exact artifact API identity, size and digest before opening it. Do not attach
+For authenticated GitHub Actions artifact ZIPs, use `gh api` with stdout
+redirected to a private file created under `umask 077`. Verify the exact
+artifact identity, size and digest before opening the archive. Do not attach
 manual `Authorization` headers, follow storage redirects yourself, or use
-`gh run download` when the outer ZIP digest must be verified; it extracts the
-artifact contents.
+`gh run download` when the outer ZIP digest must be verified.
 
-External-load fixture inputs and manifests contain live fixture credentials.
-Only age-encrypted bytes may cross Actions artifacts; the public descriptor
-must remain closed and credential-free. Decryption identities are fixture-only
-environment secrets, never SSH/Cloudflare credentials. Do not upload, log, or
-manually download/decrypt the raw input or manifest; inspect sanitized reports
-and fingerprints only. Scrub `control_email` in trusted event-processing
-steps before candidate checkout or cleanup processing. The raw
-`GITHUB_EVENT_PATH` is runner-owned: validate and seal the already-open file
-descriptor before reading it, accept the runner's safe `0600` or `0644` input
-modes, and pass later cleanup validation through its stable private handoff
-rather than relying on cross-step event-file mutation. Serialize and encrypt
-the operator input on a separate runner before any candidate code executes;
-mode-0600 files do not isolate same-user processes.
+External-load fixture inputs and manifests contain live credentials. Follow
+[`docs/fixture-credential-transport.md`](docs/fixture-credential-transport.md)
+and the owning workflow for the event-file boundary, encryption, trusted-step
+ordering and cleanup handoff. Never upload or log plaintext credentials; use
+sanitized reports and fingerprints.

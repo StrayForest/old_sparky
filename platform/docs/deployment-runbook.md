@@ -13,7 +13,7 @@ Use this document for the normal immutable release path. CSP mode changes and pr
    non-fallback for this normal app release. Global-guidance routes do not qualify; documented recovery, bootstrap,
    candidate and docs routes use their own procedures.
 3. For a deployable app release, the operator owns exactly one `operation=create` dispatch; AUTO never creates the backup. After exact Security PASS, inspect for a successful receipt or active producer bound to the same Security run/attempt/SHA: reuse the receipt or wait for that producer. If neither exists and there is no failed/cancelled or duplicate match, confirm `dev` is unchanged and the shared slot unowned, then dispatch once using the [backup procedure](backup-restore-runbook.md#local-verified-backup).
-4. The create waits for exact Security success/current `dev`; AUTO only polls for its source-bound restore-verified receipt. The same parent then builds and attests host-tools C, provisions/self-tests it in the 1,800-second pre-child window, verifies readiness and dispatches the app child. This parent-bound route needs no separate preflight or second backup. Strict docs-only reconciliation uses its separate no-backup proof path.
+4. The create waits for exact Security success/current `dev`; AUTO only polls for its source-bound restore-verified receipt. AUTO builds and attests its pinned host-tools bootstrap artifact, then waits up to 1,800 seconds for the exact installed generation before dispatching the app child. If that generation is missing, stop: the current generic verifier has no supported operator bootstrap route for the AUTO artifact. Strict docs-only reconciliation uses its separate no-backup proof path.
 5. Confirm migration compatibility, healthy services and at least `max(5 GiB, 10% of total)` free / at most 90% used; protect `current`/`previous`. Never manually deploy. Other routes use their own procedures; local tests do not replace release gates.
 
 If Auto's proof wait ends, a matching run failed/cancelled, multiple matches exist, or `dev` moved, stop and follow the [backup recovery procedure](backup-restore-runbook.md#local-verified-backup); never duplicate or manually deploy.
@@ -86,25 +86,26 @@ to `dev`. The chain is:
    head. If `dev` moved from `TARGET_SHA`, the workflow aborts
    closed; only then does it transfer and install the artifact and run
    production smoke.
-6. Before the expensive release build, `build-host-tools` resolves the
-   repository-owned `platform/contracts/host_tools_pin.json` from the exact
-   target source, validates its repository/commit ancestry and closure
-   baseline, then checks out and runs the pinned `HOST_TOOLS_SHA` helper to
-   create and attest the deterministic release-independent host-tools handoff. Auto-deploy keeps full history in its exact-source checkout for ancestry validation, disables persisted checkout credentials, and reports missing pinned ancestors as a shallow-history failure without weakening validation.
-   The environment-approved `host-capability-preflight` verifies that exact
-   artifact and the already provisioned
-   `/opt/oldsparky/platform/shared/host-tools/<HOST_TOOLS_SHA>` generation. It
-   requires the configured SSH identity to be root and checks the generation's
-   owner, mode, link count, type, capabilities and every digest with fixed
-   absolute tools. The 15-member, four-component candidate adds
-   `cpu_diagnostic_plan_control=1`; its contract is in the [host-tools ADR](adr/production-host-tools-provisioning.md).
-   The closure remains inactive until pinning and deployment; dispatchers use
-   `/usr/bin/python3.12 -I -B`.
-   A missing or mismatched generation fails before app build/attestation,
-   pending status or transfer.
-   Host bundle/source bind to `HOST_TOOLS_SHA`; app artifact, provenance,
-   migration and receipt bind to `TARGET_SHA`. API artifact ID/name/run/source/digest and downloaded size are cross-checked by bounded canonical verification. An artifact-list `workflow_run.run_attempt` may be absent or null; exact name, run ID and head SHA remain required, any non-null attempt must match, and the source attempt is independently resolved from GitHub's authoritative attempt endpoint.
-   For installer/evidence/validator changes, follow the host-tools ADR's **C→P** sequence: backward-compatible validator C, pin-only P, exact-P CI and read-only preflight, signed bundle verification, out-of-band provisioning, installed self-test and successful exact-P preflight. If cumulative application changes cannot deploy with strict reuse, withhold P's backup so its automatic parent refuses before readiness/child dispatch; do not rerun that parent or use baseline reconciliation. A later app source enables fresh policy and follows normal Security, source-bound backup and automatic deployment. A pin or bundle is not installation proof. The ADR owns provisioning/rollback; shared-venv reuse and managed LiveQA runtime procedures are in the [CSP and live-QA runbook](csp-live-qa-runbook.md).
+6. AUTO resolves the repository-owned `platform/contracts/host_tools_pin.json`
+   from the exact Security target, validates its ancestry and closure, then
+   builds and attests the root-provisioning bootstrap artifact from the pinned
+   `HOST_TOOLS_SHA`. Its `workflow_run` artifact is distinct from the later
+   `platform-production-deploy.yml` artifact. AUTO's host-readiness job uses
+   the bootstrap artifact to verify the already installed immutable generation
+   at `/opt/oldsparky/platform/shared/host-tools/<HOST_TOOLS_SHA>` before it
+   dispatches the production child. Host-control `HOST_TOOLS_SHA` and
+   application `TARGET_SHA` are separate identities. A missing or mismatched
+   generation fails before app build/attestation, pending status or transfer.
+   The generic operator verifier does not accept AUTO's in-progress
+   `workflow_run` artifact, and the current preflight cannot succeed when the
+   generation is missing; see the [host-tools provisioning runbook](host-tools-provisioning-runbook.md).
+   For installer/evidence/validator changes, retain the ADR's **C→P** source
+   sequence, but do not activate P in production until the missing-generation
+   bootstrap path is supported and reviewed. If cumulative application changes
+   cannot deploy with strict reuse, withhold P's backup so AUTO refuses before
+   readiness/child dispatch; do not rerun the parent or use baseline
+   reconciliation. Shared-venv reuse and managed LiveQA runtime procedures are
+   in the [CSP and live-QA runbook](csp-live-qa-runbook.md).
 
 ### Recovery-bootstrap baseline reconciliation
 
@@ -247,6 +248,14 @@ loopback readiness probe and one 10-second certificate probe (55 seconds),
 with a 35-second margin in the systemd unit (`TimeoutStartSec=90s`). A timeout
 is a failed health result, never a successful readiness signal.
 
+### Missing host-tools generation: stop
+
+If the pinned generation is missing or fails its host-capability check, stop.
+The [host-tools provisioning runbook](host-tools-provisioning-runbook.md)
+documents the current hold and required provenance support. Do not stage an
+AUTO bootstrap or failed-child artifact, dispatch a normal deployment, or
+bypass the gate.
+
 ### Manual workflow fallback
 
 `Platform production deploy` keeps `workflow_dispatch` for diagnosis or a reviewed current `dev` HEAD; it is not the normal release path.
@@ -265,17 +274,7 @@ failed. Never rerun **R** or invoke an installer.
 See the [recovery-bootstrap ADR](adr/recovery-bootstrap-retained-abort.md#operator-recovery-deployment-for-a-report-only-invalid-marker)
 for the exact evidence and tuple contract.
 
-Deploy/preflight require immutable host-tools and exact full CI on pin-bearing **P** descended from **C**.
-Normally, read-only preflight at **P** builds and attests **C**. A natural bundle may also be
-provisioned from the exact auto-parent during its active 1,800-second pre-child window, only for
-current-`dev` **P** after the source-bound restore-verified backup, parent build/attestation/upload
-and preceding host-contract checks succeed. No child, app write, pending state or competing operation may exist; provision before the deadline and bind the artifact to the exact parent run/attempt independently of the source Security attempt. The parent verifies **C** before child dispatch; see the [host-tools ADR](adr/production-host-tools-provisioning.md) for trust checks.
-The separate child-failure path remains limited to capability failure solely because **C** was missing before build, pending state, transfer or protected writes. For that path only, after self-testing **C**, rerun all jobs on the exact auto-deploy run only while **P** remains `dev`, source proof and host tuple are unchanged, and no operation is pending. This creates a fresh child; verify its run IDs/attempts and success markers. Never manually deploy/reconcile or rerun a failed child.
-
-After a verified pre-install failure, allow one all-jobs rerun only if the exact auto target remains
-current `dev`, source CI succeeds, baseline is unchanged, no transaction is pending, locks are free,
-and backup/edge/config/readiness/host checks pass. Require a fresh child; never rerun child/jobs or
-manually dispatch. Stop if it fails again or the stage is unclear.
+Deploy/preflight still require immutable host-tools and exact full CI on pin-bearing **P** descended from **C**. A pin or successfully built bundle is not installation proof. The current missing-generation bootstrap path is blocked pending separately reviewed provenance support; see the [host-tools provisioning runbook](host-tools-provisioning-runbook.md). Do not rerun a failed child or manually dispatch deployment to work around the missing generation.
 Do not run `platform_build_release.sh` or `platform_release_deploy.sh` directly for a normal release.
 They are workflow implementation details; direct server execution is limited to explicitly authorized recovery or rollback.
 
