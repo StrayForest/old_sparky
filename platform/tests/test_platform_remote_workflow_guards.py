@@ -686,7 +686,7 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
                 )
             self.assertEqual(caught.exception.reason, reason)
 
-    def test_dynamic_run_name_identity_uses_exact_parent_bound_title(self) -> None:
+    def test_dynamic_run_name_uses_display_title_not_static_name(self) -> None:
         class FakeActions(platform_live_qa_sequence.GitHubActions):
             def __init__(self) -> None:
                 self.repository = "StrayForest/old_sparky"
