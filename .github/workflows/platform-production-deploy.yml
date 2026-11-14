@@ -4854,7 +4854,7 @@ jobs:
     name: Dispatch automatic post-deploy live QA
     needs:
       - production
-    if: ${{ needs.production.result == 'success' && inputs.mode == 'deploy' }}
+    if: ${{ !cancelled() && needs.production.result == 'success' && inputs.mode == 'deploy' }}
     # QA handoff failure never changes the successful app-install outcome.
     # The sequencer requires both this exact authorization artifact and the
     # terminal successful parent run before any public QA side effect.

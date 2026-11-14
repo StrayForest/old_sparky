@@ -956,6 +956,7 @@ class AutomaticLiveQASequenceContractTests(unittest.TestCase):
         self.assertIn("platform-postdeploy-live-qa-child-public-", successor)
         self.assertIn("platform-postdeploy-live-qa-child-user-qa-", successor)
         handoff_job = _job_block(production, "postdeploy-handoff")
+        self.assertIn("!cancelled()", handoff_job)
         self.assertIn("needs.production.result == 'success'", handoff_job)
         self.assertIn("inputs.mode == 'deploy'", handoff_job)
         self.assertIn("continue-on-error: true", handoff_job)
