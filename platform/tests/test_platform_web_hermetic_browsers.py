@@ -35,10 +35,12 @@ class PlatformWebHermeticBrowserProvisioningTests(unittest.TestCase):
             if target.name == fail_on:
                 (target / "partial-download").write_bytes(b"partial")
                 raise provisioner.guard.PinnedArchiveError(target.name, "download")
-            executable = target / expected_executables[target.name]
-            executable.parent.mkdir(parents=True, exist_ok=True)
-            executable.write_bytes(b"pinned executable")
-            executable.chmod(0o755)
+            relative_executable = expected_executables.get(target.name)
+            if relative_executable is not None:
+                executable = target / relative_executable
+                executable.parent.mkdir(parents=True, exist_ok=True)
+                executable.write_bytes(b"pinned executable")
+                executable.chmod(0o755)
             (target / "INSTALLATION_COMPLETE").touch(mode=0o644)
 
         return download

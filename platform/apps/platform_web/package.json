@@ -18,6 +18,7 @@
     "test:ssr-diagnostic-e2e": "../../tools/platform_node.sh ./node_modules/@playwright/test/cli.js test --config=playwright.ssr-diagnostic.config.ts",
     "test:source-contract": "../../tools/platform_node.sh ./node_modules/@playwright/test/cli.js test --config=playwright.source-contract.config.ts",
     "test:hermetic": "../../tools/platform_web_hermetic.sh",
+    "test:image-inventory:webkit": "../../tools/platform_node.sh ./node_modules/@playwright/test/cli.js test --config=playwright.image-inventory.config.ts --project=webkit-mobile",
     "test:shutdown-guard": "../../tools/platform_node.sh tests/shutdown-guard-contract.cjs",
     "test:ssr-stream-diagnostics": "../../tools/platform_node.sh tests/ssr-stream-diagnostics-contract.cjs",
     "test:ssr-heap-metrics": "../../tools/platform_node.sh tests/ssr-heap-metrics-contract.mjs",

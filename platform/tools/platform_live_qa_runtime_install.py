@@ -128,6 +128,7 @@ RUNTIME_REQUIRED_FILES = (
     "web/node_modules/playwright-core/package.json",
     "browsers/chromium-1228/chrome-linux64/chrome_sandbox",
 )
+LIVE_IMAGE_INVENTORY_IMPORT = b"../support/live-image-inventory"
 
 # All executable/source files used by the trusted wrapper.  The API source
 # and platform package trees are copied into the payload so DB fixture tools
@@ -1162,10 +1163,17 @@ def _validate_runtime_source(
         and launch_spec_path.is_file()
         and b"../support/patch-acceptance" in launch_spec_path.read_bytes()
     )
+    needs_live_image_inventory = (
+        not attested_provider_recovery
+        and launch_spec_path.is_file()
+        and LIVE_IMAGE_INVENTORY_IMPORT in launch_spec_path.read_bytes()
+    )
     if not legacy_reporter_runtime and not attested_provider_recovery:
         required.append("web/tests/support/live-count-reporter.cjs")
     if needs_patch_acceptance:
         required.append("web/tests/support/patch-acceptance.ts")
+    if needs_live_image_inventory:
+        required.append("web/tests/support/live-image-inventory.ts")
     for relative in required:
         path = root / relative
         _regular(path, allow_sandbox=relative == RUNTIME_SANDBOX_RELATIVE.as_posix())
@@ -1183,6 +1191,8 @@ def _validate_runtime_source(
         allowed_web_files.add("web/tests/support/live-count-reporter.cjs")
     if needs_patch_acceptance:
         allowed_web_files.add("web/tests/support/patch-acceptance.ts")
+    if needs_live_image_inventory:
+        allowed_web_files.add("web/tests/support/live-image-inventory.ts")
     if not attested_provider_recovery:
         allowed_web_files.add("web/tests/support/live-engine-preflight.cjs")
     allowed_package_roots = (
@@ -1364,6 +1374,10 @@ def _validate_runtime_source(
             root / "web/tests/smoke/live-launch.spec.ts"
         ).read_bytes():
             required_suite.add("web/tests/support/patch-acceptance.ts")
+        if LIVE_IMAGE_INVENTORY_IMPORT in (
+            root / "web/tests/smoke/live-launch.spec.ts"
+        ).read_bytes():
+            required_suite.add("web/tests/support/live-image-inventory.ts")
         if not legacy_reporter_runtime:
             required_suite.add("web/tests/support/live-count-reporter.cjs")
         if source_only_v3:
@@ -1385,6 +1399,8 @@ def _validate_runtime_source(
         _regular(launch_spec_path)
         if b"../support/patch-acceptance" in launch_spec_path.read_bytes():
             required_runtime_files.add("web/tests/support/patch-acceptance.ts")
+        if LIVE_IMAGE_INVENTORY_IMPORT in launch_spec_path.read_bytes():
+            required_runtime_files.add("web/tests/support/live-image-inventory.ts")
     for relative in required_runtime_files:
         _regular(root / relative, allow_sandbox=relative == RUNTIME_SANDBOX_RELATIVE.as_posix())
     for browser_root in RUNTIME_BROWSER_ROOTS:
@@ -1461,6 +1477,20 @@ def _validate_engine_root(
                 "web/tests/support/live-engine-preflight.cjs",
             }
         )
+        launch_spec = root / "web/tests/smoke/live-launch.spec.ts"
+        try:
+            launch_metadata = launch_spec.lstat()
+        except FileNotFoundError:
+            launch_metadata = None
+        if launch_metadata is not None:
+            launch_metadata = _regular(launch_spec, mode=0o444)
+            if LIVE_IMAGE_INVENTORY_IMPORT in _read_bounded_regular(
+                launch_spec,
+                metadata=launch_metadata,
+                maximum=MAX_FILE_BYTES,
+                mode=0o444,
+            ):
+                allowed_web_files.add("web/tests/support/live-image-inventory.ts")
         allowed_web_directories.update(
             {"web/tests", "web/tests/smoke", "web/tests/support"}
         )

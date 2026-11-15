@@ -103,6 +103,10 @@ from tools.platform_verification_lock import (
 
 from tools.platform_verify_contract import (
     ALLOWED_ACTION_OWNERS,
+    WEB_IMAGE_INVENTORY_CONFIG,
+    WEB_IMAGE_INVENTORY_SPEC,
+    WEB_HERMETIC_RUNNER,
+    WEB_PACKAGE,
     PRODUCTION_WORKFLOW,
     SECURITY_WORKFLOW,
     _workflow_job_block,
@@ -4021,6 +4025,130 @@ except lock.VerificationLockError as exc:
                     )
                 )
         self.assertEqual(collect_issues(), [])
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_root = Path(directory)
+            package_path = temporary_root / "package.json"
+            package = json.loads(WEB_PACKAGE.read_text(encoding="utf-8"))
+            package["scripts"]["test:image-inventory:webkit"] = (
+                "../../tools/platform_node.sh ./node_modules/@playwright/test/cli.js "
+                "test --config=playwright.live.config.ts --project=live-webkit-mobile"
+            )
+            package_path.write_text(json.dumps(package), encoding="utf-8")
+            with patch("tools.platform_verify_contract.WEB_PACKAGE", package_path):
+                package_issues = collect_issues()
+            self.assertTrue(
+                any(
+                    "dedicated hermetic WebKit project" in issue
+                    for issue in package_issues
+                )
+            )
+
+            config_path = temporary_root / "image-inventory.config.ts"
+            config_path.write_text(
+                WEB_IMAGE_INVENTORY_CONFIG.read_text(encoding="utf-8").replace(
+                    'name: "webkit-mobile"', 'name: "live-webkit-mobile"', 1
+                ),
+                encoding="utf-8",
+            )
+            with patch(
+                "tools.platform_verify_contract.WEB_IMAGE_INVENTORY_CONFIG",
+                config_path,
+            ):
+                config_issues = collect_issues()
+            self.assertTrue(
+                any(
+                    "isolated WebKit fixture" in issue for issue in config_issues
+                )
+            )
+
+            config_with_server_path = temporary_root / "image-inventory-server.config.ts"
+            config_with_server_path.write_text(
+                WEB_IMAGE_INVENTORY_CONFIG.read_text(encoding="utf-8")
+                + "\nwebServer: [],\n",
+                encoding="utf-8",
+            )
+            with patch(
+                "tools.platform_verify_contract.WEB_IMAGE_INVENTORY_CONFIG",
+                config_with_server_path,
+            ):
+                config_server_issues = collect_issues()
+            self.assertTrue(
+                any(
+                    "must not start a web or API server" in issue
+                    for issue in config_server_issues
+                )
+            )
+
+            spec_path = temporary_root / "live-image-inventory.spec.ts"
+            spec_path.write_text(
+                WEB_IMAGE_INVENTORY_SPEC.read_text(encoding="utf-8")
+                + '\nconst forbiddenOrigin = "https://old-sparky.com";\n',
+                encoding="utf-8",
+            )
+            with patch(
+                "tools.platform_verify_contract.WEB_IMAGE_INVENTORY_SPEC", spec_path
+            ):
+                spec_issues = collect_issues()
+            self.assertTrue(
+                any(
+                    "synthetic image/API routes" in issue for issue in spec_issues
+                )
+            )
+
+            spec_with_live_gate_path = temporary_root / "live-gate-image-inventory.spec.ts"
+            spec_with_live_gate_path.write_text(
+                WEB_IMAGE_INVENTORY_SPEC.read_text(encoding="utf-8")
+                + '\nconst liveGate = "PLAYWRIGHT_LIVE_BASE_URL";\n',
+                encoding="utf-8",
+            )
+            with patch(
+                "tools.platform_verify_contract.WEB_IMAGE_INVENTORY_SPEC",
+                spec_with_live_gate_path,
+            ):
+                live_gate_issues = collect_issues()
+            self.assertTrue(
+                any(
+                    "synthetic image/API routes" in issue
+                    for issue in live_gate_issues
+                )
+            )
+
+            runner_path = temporary_root / "web-hermetic.sh"
+            runner = WEB_HERMETIC_RUNNER.read_text(encoding="utf-8")
+            runner_without_build_dir = runner.replace(
+                'PLATFORM_WEB_HERMETIC_BUILD_DIR="$BUILD_DIR" \\\n  "$TOOLS_DIR/platform_web_npm.sh" run test:image-inventory:webkit',
+                '  "$TOOLS_DIR/platform_web_npm.sh" run test:image-inventory:webkit',
+                1,
+            )
+            self.assertNotEqual(runner_without_build_dir, runner)
+            runner_path.write_text(runner_without_build_dir, encoding="utf-8")
+            with patch(
+                "tools.platform_verify_contract.WEB_HERMETIC_RUNNER", runner_path
+            ):
+                runner_issues = collect_issues()
+            self.assertTrue(
+                any(
+                    "isolated WebKit inventory" in issue for issue in runner_issues
+                )
+            )
+
+            runner_without_browser_root = runner.replace(
+                'PLAYWRIGHT_BROWSERS_PATH="$BUILD_DIR/browsers" \\\nPLATFORM_WEB_HERMETIC_BUILD_DIR="$BUILD_DIR" \\\n  "$TOOLS_DIR/platform_web_npm.sh" run test:image-inventory:webkit',
+                'PLATFORM_WEB_HERMETIC_BUILD_DIR="$BUILD_DIR" \\\n  "$TOOLS_DIR/platform_web_npm.sh" run test:image-inventory:webkit',
+                1,
+            )
+            self.assertNotEqual(runner_without_browser_root, runner)
+            runner_path.write_text(runner_without_browser_root, encoding="utf-8")
+            with patch(
+                "tools.platform_verify_contract.WEB_HERMETIC_RUNNER", runner_path
+            ):
+                browser_root_issues = collect_issues()
+            self.assertTrue(
+                any(
+                    "isolated WebKit inventory" in issue
+                    for issue in browser_root_issues
+                )
+            )
         synthetic_setup_job = SECURITY_WORKFLOW.read_text(encoding="utf-8") + """
   synthetic-python:
     runs-on: ubuntu-latest

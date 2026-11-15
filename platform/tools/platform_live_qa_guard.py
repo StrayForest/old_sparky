@@ -5209,6 +5209,7 @@ def _trusted_runtime_root() -> Path:
             "web/tests/smoke/live-user-journey.spec.ts",
             "web/tests/support/live-qa-origin.ts",
             "web/tests/support/live-qa-sandbox.ts",
+            "web/tests/support/live-image-inventory.ts",
             "web/tests/support/live-count-reporter.cjs",
             "web/tests/support/live-engine-preflight.cjs",
             "runtime-manifest.json",

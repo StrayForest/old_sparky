@@ -187,7 +187,7 @@ def prepare_postgres(password: str, *, host: str, port: int | None) -> None:
         "--no-align",
         "--command",
         "SELECT current_database() || '|' || current_user || '|' || "
-        "inet_server_addr()::text || '|' || inet_server_port();",
+        "host(inet_server_addr()) || '|' || inet_server_port();",
     )
     expected_identity = f"postgres|postgres|{host}|{5432 if port is None else port}"
     if target_identity != expected_identity:
