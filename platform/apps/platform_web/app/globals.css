@@ -4764,6 +4764,53 @@ img.rank-icon,
   gap: 22px;
 }
 
+.ops-manual-test-grid { min-width: 0; display: grid; grid-template-columns: minmax(260px, .9fr) minmax(300px, 1.1fr); gap: 12px; align-items: start; }
+.ops-manual-test-grid > .ops-panel { min-width: 0; padding: 16px; }
+.ops-test-detail-panel { grid-column: 1 / -1; display: grid; gap: 13px; }
+.ops-panel-heading, .ops-test-detail-header { min-width: 0; display: flex; align-items: flex-start; gap: 10px; }
+.ops-panel-heading > div, .ops-test-detail-header > div { min-width: 0; display: grid; gap: 4px; }
+.ops-panel-heading h2, .ops-test-detail-header h2 { margin: 0; color: var(--ui-text); font-size: 14px; }
+.ops-panel-heading p, .ops-test-detail-header p { margin: 0; color: var(--ui-text-muted); font-size: 10px; line-height: 1.5; }
+.ops-panel-icon { width: 30px; height: 30px; flex: 0 0 30px; display: grid; place-items: center; color: var(--ui-primary-bright); background: var(--ui-primary-soft); border-radius: 8px; }
+.ops-test-create-form { display: grid; gap: 10px; margin-top: 15px; }
+.ops-test-create-form > .ops-info { margin: 0; }
+.ops-test-session-list { display: grid; gap: 6px; margin-top: 13px; }
+.ops-test-session { min-width: 0; display: grid; gap: 4px; padding: 10px; color: var(--ui-text-soft); background: rgba(5, 8, 19, .38); border: 1px solid var(--ui-border); border-radius: 8px; text-align: left; cursor: pointer; }
+.ops-test-session:hover, .ops-test-session.is-selected { border-color: rgba(139, 92, 246, .55); background: rgba(139, 92, 246, .08); }
+.ops-test-session strong, .ops-test-session small { min-width: 0; overflow-wrap: anywhere; }
+.ops-test-session strong { color: var(--ui-text); font-size: 11px; }
+.ops-test-session small, .ops-test-session-status { color: var(--ui-text-muted); font-size: 9px; }
+.ops-test-session-status { color: var(--ui-primary-bright); }
+.ops-test-empty { min-height: 70px; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--ui-text-muted); font-size: 10px; text-align: center; }
+.ops-test-detail-header { justify-content: space-between; align-items: center; }
+.ops-test-detail-header h2 { font-size: 17px; overflow-wrap: anywhere; }
+.ops-test-access { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px; background: rgba(5, 8, 19, .38); border: 1px solid var(--ui-border); border-radius: 8px; }
+.ops-test-access > div { min-width: 0; display: grid; gap: 4px; }
+.ops-test-access span { color: var(--ui-text-muted); font-size: 9px; }
+.ops-test-access code { overflow-wrap: anywhere; color: var(--ui-text); font: 700 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.ops-test-count-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.ops-test-count { min-width: 0; display: grid; gap: 4px; padding: 10px; background: rgba(5, 8, 19, .38); border: 1px solid var(--ui-border); border-radius: 8px; }
+.ops-test-count span, .ops-test-count small { color: var(--ui-text-muted); font-size: 9px; line-height: 1.4; }
+.ops-test-count strong { color: var(--ui-text); font-size: 19px; }
+.ops-test-stage { display: grid; gap: 9px; padding-top: 12px; border-top: 1px solid var(--ui-border); }
+.ops-test-stage h3 { margin: 0; color: var(--ui-text); font-size: 11px; }
+.ops-test-inline-action { display: grid; grid-template-columns: minmax(120px, 170px) minmax(0, 1fr) auto; align-items: end; gap: 8px; }
+.ops-test-inline-action small { padding-bottom: 10px; color: var(--ui-text-muted); font-size: 9px; }
+.ops-test-cleanup { margin-top: 3px; }
+
+@media (max-width: 760px) {
+  .ops-manual-test-grid { grid-template-columns: 1fr; }
+  .ops-test-detail-panel { grid-column: auto; }
+  .ops-test-count-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 520px) {
+  .ops-test-detail-header, .ops-test-access { align-items: stretch; flex-direction: column; }
+  .ops-test-inline-action { grid-template-columns: minmax(0, 1fr) auto; }
+  .ops-test-inline-action small { grid-column: 1 / -1; padding-bottom: 0; }
+  .ops-test-count-grid { grid-template-columns: 1fr 1fr; }
+}
+
 .ops-page-intro h1,
 .ops-page-title-row h1 {
   margin: 7px 0 6px;

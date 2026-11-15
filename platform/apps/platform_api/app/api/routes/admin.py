@@ -42,16 +42,18 @@ from python_packages.platform_infra.media.hard_delete import (
 )
 from python_packages.platform_infra.models import (
     AuditLog,
+    AdminTournamentTestFixture,
+    AdminTournamentTestPlayer,
     PreprodTestRun,
     Tournament,
     TournamentDeadlockAssignmentRun,
     TournamentDeadlockCaptainRound,
     TournamentDeadlockReadyRound,
     TournamentMatch,
-    TournamentParticipant,
     Role,
     User,
     UserRole,
+    TournamentParticipant,
 )
 from python_packages.platform_infra.object_storage import get_object_storage, object_key_from_upload_url
 from python_packages.platform_infra.security import (
@@ -203,7 +205,10 @@ async def delete_by_ids(
 ) -> int:
     total = 0
     for chunk in preprod_cleanup_chunks(ids):
-        result = await db_session.execute(delete(model).where(model.id.in_(chunk)))
+        statement = delete(model).where(model.id.in_(chunk))
+        if model is Tournament:
+            statement = statement.where(Tournament.admin_test_fixture.is_(False))
+        result = await db_session.execute(statement)
         total += int(result.rowcount or 0)
     return total
 
@@ -532,6 +537,36 @@ async def cleanup_preprod_runs(
         user_ids.update(preprod_run_user_ids(run))
         tournament_ids.update(preprod_run_tournament_ids(run))
 
+    protected_tournaments = set()
+    if tournament_ids:
+        protected_tournaments = set((await db_session.scalars(
+            select(AdminTournamentTestFixture.tournament_id).where(
+                AdminTournamentTestFixture.tournament_id.in_(tournament_ids)
+            )
+        )).all())
+        protected_tournaments.update((await db_session.scalars(
+            select(Tournament.id).where(
+                Tournament.id.in_(tournament_ids),
+                Tournament.admin_test_fixture.is_(True),
+            )
+        )).all())
+    protected_fake_users = set()
+    if user_ids:
+        protected_fake_users = set((await db_session.scalars(
+            select(AdminTournamentTestPlayer.user_id).where(
+                AdminTournamentTestPlayer.user_id.in_(user_ids)
+            )
+        )).all())
+    if protected_tournaments or protected_fake_users:
+        await db_session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "manual_test_fixture_requires_fixture_cleanup",
+                "message": "Удалите тестовый турнир и его синтетические аккаунты через раздел ручного тестирования.",
+            },
+        )
+
     try:
         await purge_deleted_media_metadata(
             db_session,
@@ -797,7 +832,6 @@ async def _admin_roster_mutation(
     )
     if tournament is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found.")
-
     payload_data = payload.model_dump(mode="json")
     reservation = await reserve_mutation_idempotency(
         db_session,
@@ -990,6 +1024,11 @@ async def admin_delete_tournament(
     )
     if tournament is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found.")
+    if tournament.admin_test_fixture:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Удалите тестовый турнир через раздел ручного тестирования.",
+        )
     if payload.confirmation_name.strip() != tournament.name:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,

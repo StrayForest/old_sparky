@@ -3,6 +3,7 @@ from fastapi import APIRouter
 from apps.platform_api.app.api.routes import (
     admin,
     admin_user_delete,
+    admin_tournament_tests,
     audit,
     auth,
     auth_identities,
@@ -47,6 +48,7 @@ api_router.include_router(
 )
 api_router.include_router(stats.router, prefix="/stats", tags=["stats"])
 api_router.include_router(admin.router, prefix="/admin", tags=["admin"])
+api_router.include_router(admin_tournament_tests.router, prefix="/admin", tags=["admin"])
 api_router.include_router(admin_user_delete.router, prefix="/admin", tags=["admin"])
 api_router.include_router(audit.router, prefix="/audit", tags=["audit"])
 api_router.include_router(content.router, prefix="/content", tags=["content"])

@@ -248,6 +248,7 @@ KNOWN_TEST_MODULES = frozenset(
     test_as09_login_guessing
     test_as11_worker_error_sanitization
     test_platform_admin_api
+    test_platform_admin_tournament_tests
     test_platform_admin_roster_api
     test_platform_async_test_contract
     test_platform_audit_api
@@ -694,12 +695,12 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {
 # the sorted current IDs to these digests; a new test therefore needs an
 # explicit catalog update instead of silently inheriting a module default.
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
-    "module_count": 176,
-    "module_digest": "5f5168273bae9359473f971b7c853b7c517f39f21ea91cf025a2ff24eca391c4",
-    "test_count": 2434,
-    "test_id_digest": "679816a4335406a0298a4b7ca64810cc71e6f620331cb6fc06ae1da3e5cdd263",
-    "backend_test_count": 2353,
-    "backend_test_id_digest": "37ce51a1b09fc7aeebe1fd7dc553ff14879ac3f19286f73e08f5e92df76a8f0a",
+    "module_count": 177,
+    "module_digest": "d24e21bd94174b086b8a956b27b5fdf6cdeee26eacdd02801453047f47d17b48",
+    "test_count": 2447,
+    "test_id_digest": "d5c5401b17a87c9c8b60fe34e9fcec23b8d8f4b491aba94502d39bd1f4737404",
+    "backend_test_count": 2366,
+    "backend_test_id_digest": "10c9743f5e6fb53f594b897eb7368258d68559d6a1f9b89af7c44c35f6c921e6",
     "verification_test_count": 81,
     "verification_test_id_digest": "f99ceb2e340987b65b0325877c1965e2c7c44d82806d490c6848d2dff904efd5",
     "verification_classifier_test_count": 44,
@@ -723,20 +724,20 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-unit": {
         "module_count": 48,
         "module_digest": "97da81814d431484c5023f96dab71a84df718c6a84c13b548142621d599335f6",
-        "test_count": 361,
-        "test_id_digest": "a9550041c501998de7ba68ce603e93a578b340cdf576e3359026e0b7628bb689",
+        "test_count": 363,
+        "test_id_digest": "fdbdaa257d66f847a5b43e9e054a7222162d36eb7a418f485ddfd9a73f6c9bb1",
     },
     "backend-tool-contract": {
         "module_count": 55,
         "module_digest": "66eabc37edf399774d49df08165a506daa128ba1a1fc1511e8bfd0df0705fd3b",
-        "test_count": 675,
-        "test_id_digest": "9ed4c0ad0ad1469e3714d9eced334100a321e2c9b9c6167604e61c0864e39bdd",
+        "test_count": 678,
+        "test_id_digest": "40f7e6b456d40ee7b0be554776196b80bd23818a7b577ed20bd1cd4f07682311",
     },
     "backend-integration": {
-        "module_count": 42,
-        "module_digest": "53e33e8411615f9f2b1f40ca2fb561452b7ec78b9f7f54f1c963975b398522c4",
-        "test_count": 267,
-        "test_id_digest": "da80781a4ff61c823ae77f01b84e382537ba5dfccfca950c29f98adc94f880d7",
+        "module_count": 43,
+        "module_digest": "93422c022abd4ef9f163073545d35665ce32153ea1f3d196c5eb235712b6b214",
+        "test_count": 275,
+        "test_id_digest": "f43ab07235126dbe6559170d71fff11bcbb0117d3d2a8c411df3d263fd5e0571",
     },
     "backend-privileged": {
         "module_count": 28,

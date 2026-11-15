@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform API and web
-- Last reviewed: 2026-09-13
+- Last reviewed: 2026-11-15
 
 ## Public surface
 
@@ -78,6 +78,34 @@ exceptions live in the [security audit](application-security-audit.md).
   retains those fields.
 - Ready-check, captain selection, assignment, roster lock and bracket changes
   are server-owned transitions. The UI never infers permission or state.
+- Admin and superadmin users can resume manual tournament test fixtures through
+  `/api/v1/admin/tournament-tests`. A fixture starts with open registration;
+  public fixtures are visibly prefixed `[TEST]`. The admin-only response
+  carries the invite code for either visibility without adding it to the
+  ordinary public tournament DTO.
+- A manual fixture opts out of scheduled Deadlock automation. Admins explicitly
+  start and close Ready Check, then may add up to 50 fixture-owned synthetic
+  players with complete profiles and confirmed registrations. Synthetic
+  readiness is stored as fixture preparation; it never inserts a vote into a
+  closed Ready Check. The ordinary Ready Check vote and no-show rules remain
+  unchanged for other tournaments.
+- Manual fixture generation uses the normal captain, assignment, roster-lock
+  and bracket handoff. In this test-only path every active human registrant is
+  a required assignment member even when their real Ready Check vote is not
+  `yes`; the vote record is never changed. Generation is blocked until every
+  active human has a Deadlock profile. Team sizing uses complete seven
+  player teams and selects the largest supported size that fits all humans and
+  prepared fakes. The API reports exact filler needs and blocks sessions that
+  exceed the 50-fake capacity. The transaction verifies persisted team members
+  and active commitments include every human before commit.
+- Manual fixture deletion requires the exact tournament name, verifies durable
+  fixture ownership, locks synthetic user rows and rejects users referenced
+  outside that fixture. It removes the fixture tournament and only its owned
+  synthetic accounts; humans are retained. The normal media cleanup guard also
+  applies. The general admin tournament-delete route refuses marked fixtures.
+  Before rolling application code back to a version that does not honor the
+  fixture marker, clean up active test fixtures with this admin API. The
+  migration is additive; rollback does not require a schema downgrade.
 - The hidden legacy captain `respond`, `close` and `finalize` routes remain
   compatibility writers only; each takes the tournament workflow lock and
   revalidates the round/participant state before committing. Automation and

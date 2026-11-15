@@ -35,6 +35,7 @@ import type {
   PlatformStatsRankBucket,
   PlatformTournamentScopedProfile,
   PlatformAdminRoster,
+  PlatformAdminTournamentTestSession,
   PlatformUser
 } from "@/lib/platform-types";
 
@@ -655,6 +656,43 @@ export async function mutateAdminTournamentRoster(
   );
 }
 
+export type AdminTournamentTestMutation = "players" | "ready-check/start" | "ready-check/close" | "teams/generate";
+
+export function getAdminTournamentTests(signal?: AbortSignal): Promise<PlatformAdminTournamentTestSession[]> {
+  return platformApiRequest<PlatformAdminTournamentTestSession[]>("/admin/tournament-tests", { signal });
+}
+
+export function createAdminTournamentTest(
+  payload: { name: string; visibility: "public" | "invite_only"; format_slug: "solo" },
+  idempotencyKey: string
+): Promise<PlatformAdminTournamentTestSession> {
+  return platformApiRequest<PlatformAdminTournamentTestSession>("/admin/tournament-tests", {
+    method: "POST",
+    headers: { "Idempotency-Key": idempotencyKey },
+    body: JSON.stringify(payload)
+  });
+}
+
+export function mutateAdminTournamentTest(
+  fixtureId: string,
+  operation: AdminTournamentTestMutation,
+  payload: Record<string, unknown>,
+  idempotencyKey: string
+): Promise<PlatformAdminTournamentTestSession> {
+  return platformApiRequest<PlatformAdminTournamentTestSession>(
+    `/admin/tournament-tests/${encodeURIComponent(fixtureId)}/${operation}`,
+    { method: "POST", headers: { "Idempotency-Key": idempotencyKey }, body: JSON.stringify(payload) }
+  );
+}
+
+export function deleteAdminTournamentTest(fixtureId: string, confirmationName: string, idempotencyKey: string): Promise<void> {
+  return platformApiRequest<void>(`/admin/tournament-tests/${encodeURIComponent(fixtureId)}`, {
+    method: "DELETE",
+    headers: { "Idempotency-Key": idempotencyKey },
+    body: JSON.stringify({ confirmation_name: confirmationName })
+  });
+}
+
 export function platformApiUrl(path: string): string {
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
   return `${apiBaseUrl}${normalizedPath}`;
@@ -665,8 +703,11 @@ function apiErrorDetail(detail: unknown): string {
     return detail;
   }
   if (detail && typeof detail === "object") {
-    const message = (detail as { message?: unknown }).message;
-    return typeof message === "string" ? message : "";
+    const structured = detail as { message?: unknown; detail?: unknown };
+    if (typeof structured.message === "string") {
+      return structured.message;
+    }
+    return apiErrorDetail(structured.detail);
   }
   return "";
 }

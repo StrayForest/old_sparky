@@ -98,6 +98,19 @@ Tournaments is the owner of lifecycle and incident operations.
 - No automatic bracket regeneration or silent result reset is offered by the
   UI.
 
+### Manual testing
+
+Manual testing is a separate admin-only navigation item for creating, resuming
+and cleaning up explicitly marked test tournaments. It shows the registration
+link and code, active real participants, fake participants, ready counts,
+required team slots and server-provided stage actions/blockers. Registration
+opens immediately. The test assignment includes every active real registrant
+even when they have not voted ready; their persisted readiness answers remain
+unchanged. The backend owns this guarantee and the synthetic fixture boundary.
+Fake accounts are capped at 50 per session. Cleanup requires the exact test
+tournament name and removes only fixture-owned records; real accounts are never
+part of this cleanup action.
+
 ### Analytics
 
 Analytics is a deeper read-only view for product decisions. It reuses the

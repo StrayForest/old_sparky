@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import os
 from pathlib import Path
 import secrets
@@ -70,15 +71,23 @@ def loopback_database_parts(database_url: str) -> tuple[str, int | None, str]:
     normalized = database_url.replace("postgresql+asyncpg://", "postgresql://", 1)
     parsed = urlsplit(normalized)
     database = parsed.path.lstrip("/")
+    try:
+        parsed_host = ipaddress.ip_address(parsed.hostname or "")
+    except ValueError:
+        parsed_host = None
     if (
         parsed.scheme not in {"postgresql", "postgres"}
-        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or parsed_host is None
+        or not parsed_host.is_loopback
         or database not in {"platformdb", TEST_DATABASE}
+        or parsed.query
+        or parsed.fragment
+        or (parsed.port is not None and not 1 <= parsed.port <= 65535)
     ):
         raise RuntimeError(
             "Local env must currently target loopback platformdb or platformdb_test."
         )
-    return parsed.hostname, parsed.port, parsed.query
+    return parsed_host.compressed, parsed.port, parsed.query
 
 
 def test_database_url(source_url: str, password: str) -> str:
@@ -146,9 +155,18 @@ def sanitized_env(
     return "\n".join(output).rstrip() + "\n"
 
 
-def postgres_command(*command: str, input_text: str | None = None) -> str:
+def postgres_command(
+    host: str,
+    port: int | None,
+    *command: str,
+    input_text: str | None = None,
+) -> str:
+    # Explicit CLI target arguments override ambient PGHOST/PGPORT and prevent
+    # privileged local-client defaults from silently selecting another cluster.
+    effective_port = 5432 if port is None else port
+    target_args = [f"--host={host}", f"--port={effective_port}"]
     result = subprocess.run(
-        ["runuser", "-u", "postgres", "--", *command],
+        ["runuser", "-u", "postgres", "--", *command[:1], *target_args, *command[1:]],
         check=True,
         capture_output=True,
         input=input_text,
@@ -157,7 +175,24 @@ def postgres_command(*command: str, input_text: str | None = None) -> str:
     return result.stdout.strip()
 
 
-def prepare_postgres(password: str) -> None:
+def prepare_postgres(password: str, *, host: str, port: int | None) -> None:
+    target_identity = postgres_command(
+        host,
+        port,
+        "psql",
+        "--no-psqlrc",
+        "--dbname=postgres",
+        "--set=ON_ERROR_STOP=1",
+        "--tuples-only",
+        "--no-align",
+        "--command",
+        "SELECT current_database() || '|' || current_user || '|' || "
+        "inet_server_addr()::text || '|' || inet_server_port();",
+    )
+    expected_identity = f"postgres|postgres|{host}|{5432 if port is None else port}"
+    if target_identity != expected_identity:
+        raise RuntimeError("PostgreSQL administrative connection target identity mismatch.")
+
     escaped_password = password.replace("'", "''")
     role_sql = f"""
 DO $body$
@@ -171,6 +206,8 @@ END
 $body$;
 """
     postgres_command(
+        host,
+        port,
         "psql",
         "--no-psqlrc",
         "--dbname=postgres",
@@ -179,6 +216,8 @@ $body$;
         input_text=role_sql,
     )
     exists = postgres_command(
+        host,
+        port,
         "psql",
         "--no-psqlrc",
         "--dbname=postgres",
@@ -188,8 +227,10 @@ $body$;
         f"SELECT 1 FROM pg_database WHERE datname = '{TEST_DATABASE}';",
     )
     if exists != "1":
-        postgres_command("createdb", "--owner", TEST_DATABASE_USER, TEST_DATABASE)
+        postgres_command(host, port, "createdb", "--owner", TEST_DATABASE_USER, TEST_DATABASE)
     postgres_command(
+        host,
+        port,
         "psql",
         "--no-psqlrc",
         "--dbname=postgres",
@@ -236,7 +277,7 @@ def main() -> int:
     lines, values = read_private_env(args.env_file)
     source_database_url = values.get("PLATFORM_DATABASE_URL", "")
     source_redis_url = values.get("PLATFORM_REDIS_URL", "redis://127.0.0.1:6379/0")
-    loopback_database_parts(source_database_url)
+    host, port, _ = loopback_database_parts(source_database_url)
     test_redis_url(source_redis_url)
     if not args.apply:
         print(
@@ -246,7 +287,7 @@ def main() -> int:
         return 0
 
     password = secrets.token_urlsafe(32)
-    prepare_postgres(password)
+    prepare_postgres(password, host=host, port=port)
     content = sanitized_env(
         lines,
         database_url=test_database_url(source_database_url, password),

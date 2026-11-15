@@ -618,6 +618,7 @@ class Tournament(TimestampMixin, Base):
     match_format: Mapped[str] = mapped_column(String(20), default="bo1")
     final_format: Mapped[str] = mapped_column(String(20), default="bo3")
     bracket_revision: Mapped[int] = mapped_column(Integer, default=0)
+    admin_test_fixture: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     profile_access_generation: Mapped[int] = mapped_column(
         BigInteger, server_default="0", nullable=False
     )
@@ -650,6 +651,42 @@ class Tournament(TimestampMixin, Base):
         ForeignKey("platform.users.id", ondelete="RESTRICT"),
         index=True,
     )
+
+
+class AdminTournamentTestFixture(TimestampMixin, Base):
+    """Durable ownership record for an admin-created manual tournament test."""
+
+    __tablename__ = "admin_tournament_test_fixtures"
+    __table_args__ = (
+        UniqueConstraint("tournament_id", name="uq_admin_test_fixture_tournament"),
+        CheckConstraint("status IN ('active', 'cleaned')", name="status_allowed"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    tournament_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("platform.tournaments.id", ondelete="CASCADE")
+    )
+    creator_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("platform.users.id", ondelete="RESTRICT"), index=True
+    )
+    status: Mapped[str] = mapped_column(String(20), default="active", server_default="active")
+
+
+class AdminTournamentTestPlayer(Base):
+    """Marks one synthetic account as owned exclusively by a test fixture."""
+
+    __tablename__ = "admin_tournament_test_players"
+    __table_args__ = (
+        UniqueConstraint("user_id", name="uq_admin_test_player_user"),
+    )
+
+    fixture_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("platform.admin_tournament_test_fixtures.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("platform.users.id", ondelete="CASCADE"), primary_key=True
+    )
+    prepared_ready: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=text("true"))
 
 
 Index(

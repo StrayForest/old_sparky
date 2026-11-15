@@ -339,6 +339,42 @@ missing path disables dotenv loading, and an unset value keeps the default
 the migration gate only when preparing the disposable database for
 `backend-integration` or the full `backend` aggregate.
 
+### Bootstrap a disposable integration target
+
+Only when provisioning a new local test target, create a private mode-`0600`
+env file with `PLATFORM_DATABASE_URL` naming a literal loopback IP, port and
+`platformdb_test`, and `PLATFORM_REDIS_URL` naming loopback DB 15. From
+`platform/`, run:
+
+```bash
+PLATFORM_ENV_FILE="$test_env_file" .cache/platform-ci-venv/bin/python tools/platform_prepare_test_runtime.py --apply --env-file "$test_env_file"
+PLATFORM_PYTHON_BIN=.cache/platform-ci-venv/bin/python PLATFORM_ENV_FILE="$test_env_file" tools/platform_run_alembic.sh upgrade head
+```
+
+The helper creates or rotates only the test role/database and rewrites that
+env file with disposable credentials. It binds administrative commands to the
+URL endpoint and checks cluster identity before writes. Do not use it to
+restore roles after a test-runner teardown; that teardown preserves the
+Alembic marker, so `upgrade head` cannot recreate truncated data.
+
+### Restore disposable backend integration database
+
+After an integration runner truncates platform tables, its public Alembic
+marker remains, so `upgrade head` alone will not restore the initial roles.
+Using the already-validated private env file for the disposable target, reset
+the migration fixture and restore the current schema:
+
+```bash
+PLATFORM_ENV_FILE="$test_env_file" .cache/platform-ci-venv/bin/python tools/platform_verify.py migration
+PLATFORM_PYTHON_BIN=.cache/platform-ci-venv/bin/python PLATFORM_ENV_FILE="$test_env_file" tools/platform_run_alembic.sh upgrade head
+PLATFORM_ENV_FILE="$test_env_file" .cache/platform-ci-venv/bin/python tools/platform_verify.py backend-integration
+```
+
+Both gates validate the exact disposable target. Keep the env file outside the
+repository and remove it after local verification. Never substitute
+`platformdb` or shared data. A refused target or failed recovery leaves the
+DB-backed gate blocked; do not fall back to direct Alembic or psql commands.
+
 For a production-bound `dev` change, final verification is the GitHub chain for the same tested execution SHA:
 
 1. `Platform security and build` succeeds and publishes `platform-security-build=success` plus a classifier artifact whose `target_sha` matches the tested execution SHA; the exact `TESTED_SHA` and pull-request source-head boundary are defined in [test-suite governance](test-suite-governance.md).
