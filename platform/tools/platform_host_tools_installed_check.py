@@ -116,8 +116,8 @@ def main():
         elif payload["toolset_version"] == "production-host-tools-v4":
             capability = f"HOST_TOOLS schema=1 source_sha={sha} generation={sha} dispatcher=4 artifact_prepare=2 supervisor=3 input_guard=2 release_baseline=1 retained_load_export_cleanup=1 retained_load_source_binding=1 cpu_diagnostic_plan_control=1 python_isolated=1 python_bytecode_disabled=1\n"
         else: raise RuntimeError("toolset version invalid")
-        cap = (generation / "capabilities.txt").read_bytes()
-        if cap != capability.encode("ascii"): raise RuntimeError("capability text mismatch")
+        # capabilities.txt is the structured, hash-bound bundle contract.
+        # The dispatcher self-test below emits a separate one-line summary.
         result = subprocess.run(["/usr/bin/python3.12", "-I", "-B", str(generation / "platform_workflow_remote_dispatch.py"), "host-capabilities"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20, check=False, env={"PATH":"/usr/sbin:/usr/bin:/sbin:/bin", "PYTHONDONTWRITEBYTECODE":"1", "LC_ALL":"C"})
         if result.returncode != 0 or len(result.stdout) > 512 or result.stdout != capability.encode("ascii"): raise RuntimeError("dispatcher self-test failed")
         sys.stdout.write(f"HOST_TOOLS_READY schema=1 source_sha={sha} manifest_sha256={payload['manifest_sha256']}\n")
@@ -126,9 +126,10 @@ def main():
         for fd in reversed(held):
             try: fcntl.flock(fd, fcntl.LOCK_UN)
             finally: os.close(fd)
-try: raise SystemExit(main())
-except Busy: raise SystemExit(75)
-except BaseException: raise SystemExit(1)
+try: exit_code = main()
+except Busy: exit_code = 75
+except BaseException: exit_code = 1
+raise SystemExit(exit_code)
 '''
 # OpenSSH private-key files are multiline text. GitHub Actions secrets are
 # limited to 48 KiB; reserve another 16 KiB for envelope/formatting overhead

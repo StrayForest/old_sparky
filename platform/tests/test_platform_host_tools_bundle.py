@@ -99,6 +99,147 @@ class HostToolsBundleTests(unittest.TestCase):
             installed_check._run(child, timeout=3, max_output=128)
         self.assertLess(time.monotonic() - started, 2)
 
+    def _assert_locked_final_check_executes_structured_v4_capabilities(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="locked-host-tools-") as temporary:
+            root = Path(temporary)
+            lock_dir = root / "locks"
+            lock_dir.mkdir(mode=0o700)
+            generation = root / "host-tools" / SOURCE_SHA
+            generation.mkdir(parents=True)
+            marker_dir = root / "shared"
+            marker_dir.mkdir(mode=0o700)
+            lock_paths = (
+                lock_dir / "release.lock",
+                lock_dir / "liveqa.lock",
+            )
+            for path in lock_paths:
+                path.write_bytes(b"")
+                path.chmod(0o600)
+
+            layout = bundle._layout_for_files(bundle.CPU_DIAGNOSTIC_HOST_TOOL_FILES)
+            expected_summary = (
+                f"HOST_TOOLS schema=1 source_sha={SOURCE_SHA} generation={SOURCE_SHA} dispatcher=4 "
+                "artifact_prepare=2 supervisor=3 input_guard=2 release_baseline=1 "
+                "retained_load_export_cleanup=1 retained_load_source_binding=1 "
+                "cpu_diagnostic_plan_control=1 python_isolated=1 python_bytecode_disabled=1\n"
+            )
+            structured_capabilities = bundle._capabilities_text(SOURCE_SHA, layout)
+            self.assertIn(b"schema=1\ntoolset_version=production-host-tools-v4\n", structured_capabilities)
+            self.assertIn(b"capability=cpu_diagnostic_plan_control\n", structured_capabilities)
+            self.assertNotEqual(structured_capabilities, expected_summary.encode("ascii"))
+
+            tool_contents: dict[str, bytes] = {}
+            for name in layout["files"]:
+                if name == "platform_workflow_remote_dispatch.py":
+                    content = (
+                        "import sys\n"
+                        f"sys.stdout.write({expected_summary!r})\n"
+                    ).encode("ascii")
+                else:
+                    content = f"fixture host tool {name}\n".encode("ascii")
+                tool_contents[name] = content
+                path = generation / name
+                path.write_bytes(content)
+                path.chmod(0o555)
+
+            capability_hash = hashlib.sha256(structured_capabilities).hexdigest()
+            records = [
+                {"path": name, "sha256": hashlib.sha256(content).hexdigest(), "mode": 0o555}
+                for name, content in tool_contents.items()
+            ]
+            records.append({"path": "capabilities.txt", "sha256": capability_hash, "mode": 0o444})
+            records.sort(key=lambda row: row["path"])
+            manifest = bundle._canonical_json(bundle._manifest(SOURCE_SHA, records, layout))
+            (generation / "manifest.json").write_bytes(manifest)
+            (generation / "manifest.json").chmod(0o444)
+            (generation / "capabilities.txt").write_bytes(structured_capabilities)
+            (generation / "capabilities.txt").chmod(0o444)
+            generation.chmod(0o555)
+
+            digests = [
+                (hashlib.sha256(content).hexdigest(), name)
+                for name, content in tool_contents.items()
+            ]
+            digests.append((capability_hash, "capabilities.txt"))
+            digests.sort(key=lambda row: row[1])
+            manifest_hash = hashlib.sha256(manifest).hexdigest()
+            members = installed_check._locked_generation_members(
+                digests,
+                "production-host-tools-v4",
+                manifest_hash,
+                capability_hash,
+            )
+            payload = {
+                "generation": str(generation),
+                "source_sha": SOURCE_SHA,
+                "toolset_version": "production-host-tools-v4",
+                "manifest_sha256": manifest_hash,
+                "capabilities_sha256": capability_hash,
+                "expected_member_count": len(members),
+                "members": members,
+            }
+            encoded_payload = base64.b64encode(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("ascii")
+            ).decode("ascii")
+
+            check_code = installed_check.LOCKED_FINAL_CHECK
+            replacements = {
+                f'"{installed_check.RELEASE_LOCK_PATH}"': json.dumps(str(lock_paths[0])),
+                f'"{installed_check.LIVE_QA_LOCK_PATH}"': json.dumps(str(lock_paths[1])),
+                '"/opt/oldsparky/platform/shared/.release-operation.json"': json.dumps(
+                    str(marker_dir / ".release-operation.json")
+                ),
+                '"/usr/bin/python3.12"': json.dumps(sys.executable),
+                "st_uid != 0": f"st_uid != {os.geteuid()}",
+                "st_gid != 0": f"st_gid != {os.getegid()}",
+            }
+            for original, replacement in replacements.items():
+                self.assertIn(original, check_code)
+                check_code = check_code.replace(original, replacement)
+            encoded_code = base64.b64encode(check_code.encode("ascii")).decode("ascii")
+            launcher = textwrap.dedent(
+                """
+                import base64, json, sys
+                encoded_code = sys.argv[1]
+                payload = sys.argv[2]
+                exceptions = []
+                def trace(frame, event, arg):
+                    if frame.f_code.co_filename == "<locked-final-check>" and event == "exception":
+                        exception_type, _exception_value, _traceback = arg
+                        if exception_type is not SystemExit:
+                            exceptions.append({"class": exception_type.__name__, "phase": frame.f_code.co_name, "line": frame.f_lineno})
+                    return trace
+                sys.argv = ["-c", payload]
+                code = 1
+                try:
+                    sys.settrace(trace)
+                    exec(compile(base64.b64decode(encoded_code), "<locked-final-check>", "exec"))
+                except SystemExit as exc:
+                    code = exc.code if isinstance(exc.code, int) else 1
+                finally:
+                    sys.settrace(None)
+                if exceptions:
+                    print(json.dumps(exceptions[-4:], separators=(",", ":")), file=sys.stderr)
+                raise SystemExit(code)
+                """
+            )
+            result = subprocess.run(
+                [sys.executable, "-I", "-B", "-c", launcher, encoded_code, encoded_payload],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout or "no verifier diagnostic")
+            self.assertEqual(
+                result.stdout,
+                f"HOST_TOOLS_READY schema=1 source_sha={SOURCE_SHA} "
+                f"manifest_sha256={manifest_hash}\n",
+            )
+            self.assertEqual(result.stderr, "")
+
     def _installed_checker_contract(self, root: Path) -> Path:
         contract = root / "contract"
         contract.mkdir()
@@ -346,6 +487,39 @@ class HostToolsBundleTests(unittest.TestCase):
                     manifest_hash="b" * 64,
                     capabilities_hash="c" * 64,
                 ))
+
+            v4_rows = [
+                (f"{index:064x}", f"platform_tool_{index}.py")
+                for index in range(15)
+            ] + [("c" * 64, "capabilities.txt")]
+            locked_args = {
+                "sha": SOURCE_SHA,
+                "toolset_version": "production-host-tools-v4",
+                "generation": generation,
+                "digests": v4_rows,
+                "manifest_hash": "b" * 64,
+                "capabilities_hash": "c" * 64,
+            }
+            for returncode in (75, 1, 255):
+                with self.subTest(locked_final_check_returncode=returncode):
+                    with patch.object(
+                        installed_check,
+                        "_run",
+                        side_effect=installed_check.RemoteCommandFailure(returncode),
+                    ):
+                        if returncode == 75:
+                            self.assertFalse(
+                                installed_check._locked_final_generation_check(
+                                    ["/usr/bin/ssh"], **locked_args
+                                )
+                            )
+                        else:
+                            with self.assertRaises(installed_check.RemoteCommandFailure):
+                                installed_check._locked_final_generation_check(
+                                    ["/usr/bin/ssh"], **locked_args
+                                )
+
+            self._assert_locked_final_check_executes_structured_v4_capabilities()
 
             # The deploy workflow can precreate this directory from its own
             # banner-tolerant scan before calling the shared verifier. Reuse
