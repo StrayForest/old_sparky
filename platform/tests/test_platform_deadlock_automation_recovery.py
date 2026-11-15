@@ -47,6 +47,7 @@ def _tournament(**overrides: object) -> SimpleNamespace:
         "slug": "recovery-tournament",
         "format_slug": "solo",
         "status": "registration_closed",
+        "admin_test_fixture": False,
         "bracket_revision": 0,
         "registration_starts_at": None,
         "registration_closes_at": None,

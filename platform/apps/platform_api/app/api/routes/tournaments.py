@@ -602,6 +602,7 @@ class WorkspaceTournamentSnapshot:
     visibility: str
     status: str
     format_slug: str
+    admin_test_fixture: bool
     allowed_ranks: list[str]
     max_participants: int | None
     registration_starts_at: datetime | None
@@ -4288,7 +4289,10 @@ async def update_tournament_status(
     db_session: AsyncSession = Depends(get_db_session),
 ) -> TournamentResponse:
     tournament = await get_tournament_or_404(db_session, slug)
-    ensure_tournament_organizer(auth_session, tournament)
+    if tournament.admin_test_fixture:
+        ensure_tournament_manager(auth_session, tournament)
+    else:
+        ensure_tournament_organizer(auth_session, tournament)
     try:
         transition = await transition_tournament_status(
             db_session,
@@ -5850,7 +5854,10 @@ async def start_deadlock_ready_check(
     tournament = await lock_tournament_for_workflow(db_session, tournament.id)
     await db_session.refresh(tournament)
     ensure_deadlock_tournament_format(tournament)
-    ensure_tournament_organizer(auth_session, tournament)
+    if tournament.admin_test_fixture:
+        ensure_tournament_manager(auth_session, tournament)
+    else:
+        ensure_tournament_organizer(auth_session, tournament)
     if tournament.automation_ready_check_closed_at is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -6161,7 +6168,10 @@ async def close_deadlock_ready_check(
     tournament = await lock_tournament_for_workflow(db_session, tournament.id)
     await db_session.refresh(tournament)
     ensure_deadlock_tournament_format(tournament)
-    ensure_tournament_organizer(auth_session, tournament)
+    if tournament.admin_test_fixture:
+        ensure_tournament_manager(auth_session, tournament)
+    else:
+        ensure_tournament_organizer(auth_session, tournament)
     try:
         ensure_deadlock_roster_staging_allowed(
             format_slug=tournament.format_slug,

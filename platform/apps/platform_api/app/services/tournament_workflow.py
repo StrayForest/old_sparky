@@ -64,6 +64,8 @@ from python_packages.platform_domain.tournaments import (
 )
 from python_packages.platform_infra.audit import write_audit_log
 from python_packages.platform_infra.models import (
+    AdminTournamentTestPlayer,
+    AdminTournamentTestFixture,
     DeadlockDreamSlot,
     DeadlockProfile,
     PlayerProfile,
@@ -412,6 +414,7 @@ class ReadyVoteTournamentSnapshot:
     slug: str
     format_slug: str
     status: str
+    admin_test_fixture: bool
     registration_closes_at: datetime | None
     ready_check_starts_at: datetime | None
     ready_check_ends_at: datetime | None
@@ -560,7 +563,7 @@ async def prepare_deadlock_ready_vote(
             active_only=True,
         )
     round_was_created = False
-    if active_round is None and has_participant:
+    if active_round is None and has_participant and not tournament.admin_test_fixture:
         if not tournament_is_locked:
             tournament = await lock_tournament_for_workflow(db_session, tournament.id)
             tournament_is_locked = True
@@ -612,52 +615,60 @@ async def prepare_deadlock_ready_vote(
                 tournament_id=tournament.id,
                 active_only=True,
             )
-        if active_round is not None:
-            return ReadyVoteRoutePreflight(
-                tournament=tournament,
-                active_round=_ready_vote_round_snapshot(active_round, user_id=user_id),
-                has_participant=has_participant,
-                has_deadlock_profile=has_deadlock_profile,
-                has_locked_roster=has_locked_roster,
-            )
-        participant_user_ids = [
-            str(participant_user_id)
-            for participant_user_id in (
-                await db_session.scalars(
-                    select(TournamentParticipant.user_id).where(
-                        TournamentParticipant.tournament_id == tournament.id,
-                        TournamentParticipant.status.not_in(INACTIVE_PARTICIPANT_STATUSES),
-                    )
+    if active_round is not None:
+        return ReadyVoteRoutePreflight(
+            tournament=tournament,
+            active_round=(
+                _ready_vote_round_snapshot(active_round, user_id=user_id)
+                if isinstance(active_round, TournamentDeadlockReadyRound)
+                else active_round
+            ),
+            has_participant=has_participant,
+            has_deadlock_profile=has_deadlock_profile,
+            has_locked_roster=has_locked_roster,
+        )
+    if tournament.admin_test_fixture:
+        raise ReadyCheckVoteWindowError(
+            "An administrator must start Ready Check for this test tournament."
+        )
+    participant_user_ids = [
+        str(participant_user_id)
+        for participant_user_id in (
+            await db_session.scalars(
+                select(TournamentParticipant.user_id).where(
+                    TournamentParticipant.tournament_id == tournament.id,
+                    TournamentParticipant.status.not_in(INACTIVE_PARTICIPANT_STATUSES),
                 )
-            ).all()
-        ]
-        decision = prepare_ready_check_start(
-            participant_user_ids,
-            has_active_round=False,
-        )
-        if not decision.should_create_round:
-            raise ReadyCheckVoteWindowError("No participants are available for Ready Check.")
-        active_round = TournamentDeadlockReadyRound(
-            tournament_id=tournament.id,
-            status="active",
-            eligible_user_ids=list(decision.user_ids),
-            initiated_by_user_id=None,
-        )
-        db_session.add(active_round)
-        await db_session.flush()
-        round_was_created = True
-        await write_audit_log(
-            db_session,
-            actor_user_id=user_id,
-            action="tournament.deadlock.ready_check.lazy_start",
-            subject_type="tournament_deadlock_ready_round",
-            subject_id=str(active_round.id),
-            payload={
-                "tournament_slug": tournament.slug,
-                "eligible_participant_count": len(decision.user_ids),
-                "trigger": "ready_vote",
-            },
-        )
+            )
+        ).all()
+    ]
+    decision = prepare_ready_check_start(
+        participant_user_ids,
+        has_active_round=False,
+    )
+    if not decision.should_create_round:
+        raise ReadyCheckVoteWindowError("No participants are available for Ready Check.")
+    active_round = TournamentDeadlockReadyRound(
+        tournament_id=tournament.id,
+        status="active",
+        eligible_user_ids=list(decision.user_ids),
+        initiated_by_user_id=None,
+    )
+    db_session.add(active_round)
+    await db_session.flush()
+    round_was_created = True
+    await write_audit_log(
+        db_session,
+        actor_user_id=user_id,
+        action="tournament.deadlock.ready_check.lazy_start",
+        subject_type="tournament_deadlock_ready_round",
+        subject_id=str(active_round.id),
+        payload={
+            "tournament_slug": tournament.slug,
+            "eligible_participant_count": len(decision.user_ids),
+            "trigger": "ready_vote",
+        },
+    )
 
     # A vote can be the first request to observe an already-open schedule.
     # Record that workflow processing has started even when the background
@@ -957,6 +968,7 @@ _READY_VOTE_PREFLIGHT_STATEMENT = (
         Tournament.slug,
         Tournament.format_slug,
         Tournament.status,
+        Tournament.admin_test_fixture,
         Tournament.registration_closes_at,
         Tournament.ready_check_starts_at,
         Tournament.ready_check_ends_at,
@@ -1013,6 +1025,7 @@ async def ready_vote_preflight_snapshot(
         slug=str(row.slug),
         format_slug=str(row.format_slug),
         status=str(row.status),
+        admin_test_fixture=bool(row.admin_test_fixture),
         registration_closes_at=row.registration_closes_at,
         ready_check_starts_at=row.ready_check_starts_at,
         ready_check_ends_at=row.ready_check_ends_at,
@@ -1414,6 +1427,39 @@ async def deadlock_ready_candidate_rows_for_round(
     tournament_id: str,
     round_id: int,
 ) -> list[dict[str, object]]:
+    test_tournament = await db_session.scalar(
+        select(Tournament.admin_test_fixture).where(Tournament.id == tournament_id)
+    )
+    if test_tournament:
+        rows = await db_session.execute(
+            select(
+                User.id.label("user_id"),
+                func.coalesce(PlayerProfile.display_name, User.display_name).label("display_name"),
+                DeadlockProfile.rank,
+                DeadlockProfile.subrank,
+                DeadlockProfile.playtime,
+                DeadlockProfile.captain_priority,
+                AdminTournamentTestPlayer.user_id.is_not(None).label("is_test_fake"),
+            )
+            .select_from(TournamentParticipant)
+            .join(User, User.id == TournamentParticipant.user_id)
+            .outerjoin(PlayerProfile, PlayerProfile.user_id == User.id)
+            .join(DeadlockProfile, DeadlockProfile.user_id == User.id)
+            .outerjoin(AdminTournamentTestPlayer, AdminTournamentTestPlayer.user_id == User.id)
+            .where(
+                TournamentParticipant.tournament_id == tournament_id,
+                TournamentParticipant.status.not_in(INACTIVE_PARTICIPANT_STATUSES),
+                ~exists(
+                    select(1).where(
+                        PlayerTournamentCommitment.user_id == User.id,
+                        PlayerTournamentCommitment.released_at.is_(None),
+                    )
+                ),
+            )
+            .order_by(AdminTournamentTestPlayer.user_id.is_not(None), User.id)
+        )
+        return [dict(row._mapping) for row in rows]
+
     rows = await db_session.execute(
         select(
             User.id.label("user_id"),
@@ -1538,6 +1584,76 @@ async def deadlock_ready_player_rows_for_assignment(
     source_ready_round_id: int,
     exclude_user_ids: list[str],
 ) -> list[dict[str, object]]:
+    test_tournament = await db_session.scalar(
+        select(Tournament.admin_test_fixture).where(Tournament.id == tournament_id)
+    )
+    if test_tournament:
+        assigned = set(exclude_user_ids)
+        human_rows = await db_session.execute(
+            select(
+                User.id.label("user_id"),
+                func.coalesce(PlayerProfile.display_name, User.display_name).label("username"),
+                DeadlockProfile.rank,
+                DeadlockProfile.subrank,
+                DeadlockProfile.playtime,
+                DeadlockProfile.pool,
+                DeadlockProfile.roles,
+            )
+            .select_from(TournamentParticipant)
+            .join(User, User.id == TournamentParticipant.user_id)
+            .outerjoin(PlayerProfile, PlayerProfile.user_id == User.id)
+            .join(DeadlockProfile, DeadlockProfile.user_id == User.id)
+            .outerjoin(AdminTournamentTestPlayer, AdminTournamentTestPlayer.user_id == User.id)
+            .where(
+                TournamentParticipant.tournament_id == tournament_id,
+                TournamentParticipant.status.not_in(INACTIVE_PARTICIPANT_STATUSES),
+                AdminTournamentTestPlayer.user_id.is_(None),
+                User.id.not_in(assigned) if assigned else text("true"),
+                ~exists(
+                    select(1).where(
+                        PlayerTournamentCommitment.user_id == User.id,
+                        PlayerTournamentCommitment.released_at.is_(None),
+                    )
+                ),
+            )
+            .order_by(User.id)
+        )
+        humans = [dict(row._mapping) for row in human_rows]
+        required = max(0, int((await db_session.scalar(select(Tournament.teams_count).where(Tournament.id == tournament_id)) or 0) * 7) - len(exclude_user_ids) - len(humans))
+        fake_rows = await db_session.execute(
+            select(
+                User.id.label("user_id"),
+                func.coalesce(PlayerProfile.display_name, User.display_name).label("username"),
+                DeadlockProfile.rank,
+                DeadlockProfile.subrank,
+                DeadlockProfile.playtime,
+                DeadlockProfile.pool,
+                DeadlockProfile.roles,
+            )
+            .select_from(AdminTournamentTestPlayer)
+            .join(User, User.id == AdminTournamentTestPlayer.user_id)
+            .outerjoin(PlayerProfile, PlayerProfile.user_id == User.id)
+            .join(DeadlockProfile, DeadlockProfile.user_id == User.id)
+            .join(TournamentParticipant, TournamentParticipant.user_id == User.id)
+            .where(
+                AdminTournamentTestPlayer.fixture_id == select(AdminTournamentTestFixture.id).where(
+                    AdminTournamentTestFixture.tournament_id == tournament_id
+                ).scalar_subquery(),
+                TournamentParticipant.tournament_id == tournament_id,
+                TournamentParticipant.status.not_in(INACTIVE_PARTICIPANT_STATUSES),
+                User.id.not_in(assigned) if assigned else text("true"),
+                ~exists(
+                    select(1).where(
+                        PlayerTournamentCommitment.user_id == User.id,
+                        PlayerTournamentCommitment.released_at.is_(None),
+                    )
+                ),
+            )
+            .order_by(User.id)
+            .limit(required)
+        )
+        return humans + [dict(row._mapping) for row in fake_rows]
+
     stmt = (
         select(
             TournamentDeadlockReadyVote.user_id.label("user_id"),

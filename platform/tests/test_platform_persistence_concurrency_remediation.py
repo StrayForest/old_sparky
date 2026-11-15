@@ -13,12 +13,14 @@ from fastapi.exceptions import RequestValidationError
 from sqlalchemy.dialects import postgresql
 
 from apps.platform_api.app.api.routes import profiles, tournaments
-from apps.platform_api.app.services import deadlock_automation, player_commitments
+from apps.platform_api.app.services import deadlock_automation, player_commitments, tournament_workflow
 from apps.platform_api.app.services.mutation_idempotency import (
     mutation_payload_fingerprint,
     request_idempotency_key,
 )
 from apps.platform_api.app.services.tournament_workflow import (
+    ReadyVoteRoutePreflight,
+    ReadyVoteRoundSnapshot,
     ReadyVoteTournamentSnapshot,
     ready_vote_preflight_snapshot,
     upsert_deadlock_ready_vote,
@@ -365,6 +367,7 @@ class PersistenceConcurrencyRemediationTests(PlatformIsolatedAsyncioTestCase):
             slug="demo",
             format_slug="solo",
             status="registration_closed",
+            admin_test_fixture=False,
             registration_closes_at=None,
             ready_check_starts_at=None,
             ready_check_ends_at=None,
@@ -380,6 +383,7 @@ class PersistenceConcurrencyRemediationTests(PlatformIsolatedAsyncioTestCase):
             slug="demo",
             format_slug="solo",
             status="registration_closed",
+            admin_test_fixture=False,
             registration_closes_at=None,
             ready_check_starts_at=None,
             ready_check_ends_at=None,
@@ -403,12 +407,98 @@ class PersistenceConcurrencyRemediationTests(PlatformIsolatedAsyncioTestCase):
         self.assertFalse(preflight.has_deadlock_profile)
         self.assertFalse(preflight.has_locked_roster)
 
+    async def test_manual_fixture_ready_vote_cannot_lazily_start_ready_check(self) -> None:
+        now = datetime(2026, 11, 15, 12, 0, tzinfo=UTC)
+        tournament = ReadyVoteTournamentSnapshot(
+            id="test-fixture",
+            slug="test-fixture",
+            format_slug="solo",
+            status="registration_closed",
+            admin_test_fixture=True,
+            registration_closes_at=None,
+            ready_check_starts_at=now,
+            ready_check_ends_at=now.replace(hour=13),
+            automation_ready_check_closed_at=None,
+        )
+        snapshot = ReadyVoteRoutePreflight(
+            tournament=tournament,
+            active_round=None,
+            has_participant=True,
+            has_deadlock_profile=True,
+            has_locked_roster=False,
+        )
+        db_session = Mock()
+        db_session.add = Mock()
+        db_session.scalars = AsyncMock()
+        with (
+            patch.object(tournament_workflow, "ready_vote_preflight_snapshot", AsyncMock(return_value=snapshot)),
+            patch.object(tournament_workflow, "deadlock_ready_round_for_tournament", AsyncMock(return_value=None)) as active_round,
+        ):
+            with self.assertRaises(tournament_workflow.ReadyCheckVoteWindowError):
+                await tournament_workflow.prepare_deadlock_ready_vote(
+                    db_session,
+                    slug=tournament.slug,
+                    user_id="real-player",
+                    choice="yes",
+                    now=now,
+                )
+        active_round.assert_awaited_once_with(db_session, tournament_id=tournament.id, active_only=True)
+        db_session.scalars.assert_not_awaited()
+        db_session.add.assert_not_called()
+
+    async def test_manual_fixture_with_active_ready_check_uses_existing_vote_round(self) -> None:
+        now = datetime(2026, 11, 15, 12, 0, tzinfo=UTC)
+        tournament = ReadyVoteTournamentSnapshot(
+            id="test-fixture-active",
+            slug="test-fixture-active",
+            format_slug="solo",
+            status="registration_closed",
+            admin_test_fixture=True,
+            registration_closes_at=None,
+            ready_check_starts_at=now,
+            ready_check_ends_at=now.replace(hour=13),
+            automation_ready_check_closed_at=None,
+        )
+        active_round = ReadyVoteRoundSnapshot(
+            id=17,
+            tournament_id=tournament.id,
+            status="active",
+            eligible_participant_count=1,
+            user_is_eligible=True,
+        )
+        snapshot = ReadyVoteRoutePreflight(
+            tournament=tournament,
+            active_round=active_round,
+            has_participant=True,
+            has_deadlock_profile=True,
+            has_locked_roster=False,
+        )
+        db_session = Mock()
+        db_session.scalars = AsyncMock()
+        db_session.add = Mock()
+        with (
+            patch.object(tournament_workflow, "ready_vote_preflight_snapshot", AsyncMock(return_value=snapshot)),
+            patch.object(tournament_workflow, "deadlock_ready_round_for_tournament", AsyncMock()) as lookup,
+        ):
+            result = await tournament_workflow.prepare_deadlock_ready_vote(
+                db_session,
+                slug=tournament.slug,
+                user_id="real-player",
+                choice="yes",
+                now=now,
+            )
+        self.assertIs(result.active_round, active_round)
+        lookup.assert_not_awaited()
+        db_session.scalars.assert_not_awaited()
+        db_session.add.assert_not_called()
+
     async def test_ready_vote_preflight_reuses_immutable_statement_shape(self) -> None:
         row = SimpleNamespace(
             id="tournament",
             slug="demo",
             format_slug="solo",
             status="registration_closed",
+            admin_test_fixture=False,
             registration_closes_at=None,
             ready_check_starts_at=None,
             ready_check_ends_at=None,

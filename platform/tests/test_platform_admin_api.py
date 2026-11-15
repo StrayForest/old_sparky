@@ -7,7 +7,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 import httpx
-from sqlalchemy import delete, event, or_, select, update
+from sqlalchemy import delete, event, func, or_, select, text, update
 
 from apps.platform_api.app.main import create_app
 from apps.platform_api.app.services.tournament_teams import (
@@ -17,6 +17,8 @@ from python_packages.platform_infra.csrf import csrf_cookie_name
 from python_packages.platform_infra.config import get_settings
 from python_packages.platform_infra.db import dispose_engine, engine, session_factory
 from python_packages.platform_infra.models import (
+    AdminTournamentTestFixture,
+    AdminTournamentTestPlayer,
     AuditLog,
     DeadlockProfile,
     MediaAsset,
@@ -26,6 +28,7 @@ from python_packages.platform_infra.models import (
     TournamentDeadlockAssignmentRun,
     TournamentDeadlockCaptainRound,
     TournamentDeadlockReadyRound,
+    TournamentDeadlockReadyVote,
     TournamentInvite,
     TournamentMatch,
     TournamentParticipant,
@@ -64,6 +67,18 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
 
     async def _cleanup_test_data(self) -> None:
         async with session_factory()() as db_session:
+            fixture_rows = (await db_session.execute(
+                select(AdminTournamentTestFixture.id, AdminTournamentTestFixture.tournament_id)
+                .join(Tournament, Tournament.id == AdminTournamentTestFixture.tournament_id)
+                .where(Tournament.name.like(f"%{self.prefix}%"))
+            )).all()
+            fixture_ids = [row.id for row in fixture_rows]
+            fixture_tournament_ids = [row.tournament_id for row in fixture_rows]
+            fixture_user_ids = list((await db_session.scalars(
+                select(AdminTournamentTestPlayer.user_id).where(
+                    AdminTournamentTestPlayer.fixture_id.in_(fixture_ids or ["-"])
+                )
+            )).all())
             user_ids = list(
                 (
                     await db_session.scalars(
@@ -82,9 +97,12 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
                     delete(MediaAsset).where(MediaAsset.owner_user_id.in_(user_ids))
                 )
             await db_session.execute(delete(Tournament).where(Tournament.slug.like(f"{self.prefix}%")))
+            if fixture_tournament_ids:
+                await db_session.execute(delete(Tournament).where(Tournament.id.in_(fixture_tournament_ids)))
             await db_session.execute(delete(PreprodTestRun).where(PreprodTestRun.marker.like(f"{self.prefix}%")))
-            if user_ids:
-                await db_session.execute(delete(User).where(User.id.in_(user_ids)))
+            all_user_ids = set(user_ids) | set(fixture_user_ids)
+            if all_user_ids:
+                await db_session.execute(delete(User).where(User.id.in_(all_user_ids)))
             await db_session.commit()
 
     async def _new_client(self) -> httpx.AsyncClient:
@@ -982,6 +1000,364 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
             self.assertIsNotNone(run)
             self.assertEqual(run.status, "cleaned")
             self.assertTrue(run.cleanup_state["ok"])
+
+    async def test_preprod_cleanup_refuses_manual_fixture_and_owned_fake_atomically(self) -> None:
+        superadmin = await self._register_user("fixture-cleanup-superadmin")
+        await self._grant_role(superadmin["user_id"], "superadmin")
+        marker = f"{self.prefix}-fixture-cleanup"
+        fake_user_id: str
+        fixture_id: str
+        tournament_id: str
+        missing_owner_marker = f"{marker}-missing-owner"
+        async with session_factory()() as db_session:
+            tournament = Tournament(
+                slug=f"{self.prefix}-fixture-cleanup",
+                name=f"{self.prefix} fixture cleanup",
+                visibility="invite_only",
+                status="registration_open",
+                format_slug="solo",
+                allowed_ranks=[],
+                organizer_user_id=superadmin["user_id"],
+                admin_test_fixture=True,
+            )
+            db_session.add(tournament)
+            await db_session.flush()
+            fixture = AdminTournamentTestFixture(
+                tournament_id=tournament.id,
+                creator_user_id=superadmin["user_id"],
+            )
+            fake = User(email=None, display_name=f"{self.prefix} fake", status="active")
+            db_session.add_all([fixture, fake])
+            await db_session.flush()
+            db_session.add(AdminTournamentTestPlayer(
+                fixture_id=fixture.id,
+                user_id=fake.id,
+                prepared_ready=True,
+            ))
+            db_session.add(PreprodTestRun(
+                marker=marker,
+                status="passed",
+                origin="http://testserver",
+                requested_users=1,
+                created_users=1,
+                tournaments_created=1,
+                report={"user_ids": [fake.id], "tournament_ids": [tournament.id]},
+                started_at=datetime.now(UTC),
+                finished_at=datetime.now(UTC),
+            ))
+            marker_only_tournament = Tournament(
+                slug=f"{self.prefix}-fixture-marker-only",
+                name=f"{self.prefix} fixture marker only",
+                visibility="invite_only",
+                status="registration_open",
+                format_slug="solo",
+                allowed_ranks=[],
+                organizer_user_id=superadmin["user_id"],
+                admin_test_fixture=True,
+            )
+            marker_only_user = User(
+                email=f"{self.prefix}-marker-target@example.com",
+                display_name=f"{self.prefix} marker target",
+                status="active",
+            )
+            db_session.add_all([marker_only_tournament, marker_only_user])
+            await db_session.flush()
+            db_session.add(PreprodTestRun(
+                marker=missing_owner_marker,
+                status="passed",
+                origin="http://testserver",
+                requested_users=1,
+                created_users=1,
+                tournaments_created=1,
+                report={"user_ids": [marker_only_user.id], "tournament_ids": [marker_only_tournament.id]},
+                started_at=datetime.now(UTC),
+                finished_at=datetime.now(UTC),
+            ))
+            await db_session.commit()
+            fixture_id, fake_user_id, tournament_id = fixture.id, fake.id, tournament.id
+            marker_only_tournament_id, marker_only_user_id = marker_only_tournament.id, marker_only_user.id
+
+        response = await superadmin["client"].post(
+            f"/api/v1/admin/preprod-test-runs/{marker}/cleanup",
+            json={"confirm": "DELETE_TEST_DATA", "note": "Must preserve owned fixture data."},
+            headers=same_origin_request_headers(superadmin["client"]),
+        )
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json()["detail"]["code"], "manual_test_fixture_requires_fixture_cleanup")
+        marker_only_response = await superadmin["client"].post(
+            f"/api/v1/admin/preprod-test-runs/{missing_owner_marker}/cleanup",
+            json={"confirm": "DELETE_TEST_DATA", "note": "Must preserve marker-only fixture data."},
+            headers=same_origin_request_headers(superadmin["client"]),
+        )
+        self.assertEqual(marker_only_response.status_code, 409, marker_only_response.text)
+        self.assertEqual(marker_only_response.json()["detail"]["code"], "manual_test_fixture_requires_fixture_cleanup")
+        async with session_factory()() as db_session:
+            self.assertIsNotNone(await db_session.get(Tournament, tournament_id))
+            self.assertIsNotNone(await db_session.get(AdminTournamentTestFixture, fixture_id))
+            self.assertIsNotNone(await db_session.get(AdminTournamentTestPlayer, (fixture_id, fake_user_id)))
+            self.assertIsNotNone(await db_session.get(User, fake_user_id))
+            run = await db_session.scalar(select(PreprodTestRun).where(PreprodTestRun.marker == marker))
+            self.assertIsNotNone(run)
+            self.assertEqual(run.status, "passed")
+            self.assertEqual(run.cleanup_state, {})
+            self.assertIsNotNone(await db_session.get(Tournament, marker_only_tournament_id))
+            self.assertIsNotNone(await db_session.get(User, marker_only_user_id))
+            marker_only_run = await db_session.scalar(select(PreprodTestRun).where(
+                PreprodTestRun.marker == missing_owner_marker
+            ))
+            self.assertIsNotNone(marker_only_run)
+            self.assertEqual(marker_only_run.status, "passed")
+            self.assertEqual(marker_only_run.cleanup_state, {})
+
+    async def test_admin_manual_test_fixture_stages_and_safe_fake_cleanup(self) -> None:
+        admin = await self._register_user("manual-test-admin")
+        await self._grant_role(admin["user_id"], "admin")
+        headers = same_origin_request_headers(admin["client"])
+        headers["Idempotency-Key"] = f"{self.prefix}-manual-create"
+        fixture = self._assert_status(
+            await admin["client"].post(
+                "/api/v1/admin/tournament-tests",
+                json={"name": f"{self.prefix}-manual", "visibility": "invite_only"},
+                headers=headers,
+            ),
+            201,
+        )
+        self.assertEqual(fixture["stage"], "registration_open")
+        self.assertEqual(fixture["status"], "registration_open")
+        self.assertTrue(fixture["join_code"])
+
+        async with session_factory()() as db_session:
+            tournament_id = await db_session.scalar(select(Tournament.id).where(Tournament.slug == fixture["slug"]))
+            db_session.add(TournamentParticipant(
+                tournament_id=tournament_id,
+                user_id=admin["user_id"],
+                entry_type="solo",
+                status="registered",
+            ))
+            await db_session.commit()
+
+        started = self._assert_status(
+            await admin["client"].post(
+                f"/api/v1/admin/tournament-tests/{fixture['id']}/ready-check/start",
+                headers=same_origin_request_headers(admin["client"]),
+            ),
+            200,
+        )
+        self.assertEqual(started["stage"], "ready_check_active")
+        closed = self._assert_status(
+            await admin["client"].post(
+                f"/api/v1/admin/tournament-tests/{fixture['id']}/ready-check/close",
+                headers=same_origin_request_headers(admin["client"]),
+            ),
+            200,
+        )
+        self.assertEqual(closed["stage"], "ready_check_closed")
+        self.assertIn("human_profiles_missing", {blocker["code"] for blocker in closed["blockers"]})
+        self.assertFalse(closed["capabilities"]["can_generate_teams"])
+        missing_profile_generate = await admin["client"].post(
+            f"/api/v1/admin/tournament-tests/{fixture['id']}/teams/generate",
+            headers=same_origin_request_headers(admin["client"]),
+        )
+        self.assertEqual(missing_profile_generate.status_code, 409, missing_profile_generate.text)
+        self.assertEqual(missing_profile_generate.json()["detail"]["code"], "human_profiles_missing")
+
+        add_headers = same_origin_request_headers(admin["client"])
+        add_headers["Idempotency-Key"] = f"{self.prefix}-manual-add"
+        with_fake = self._assert_status(
+            await admin["client"].post(
+                f"/api/v1/admin/tournament-tests/{fixture['id']}/players",
+                json={"count": 1}, headers=add_headers,
+            ),
+            200,
+        )
+        self.assertEqual(with_fake["counts"]["fake_total"], 1)
+        self.assertEqual(with_fake["counts"]["fake_ready_yes"], 1)
+        async with session_factory()() as db_session:
+            fake_id = await db_session.scalar(select(AdminTournamentTestPlayer.user_id).where(
+                AdminTournamentTestPlayer.fixture_id == fixture["id"]
+            ))
+            self.assertIsNotNone(fake_id)
+            votes = await db_session.scalar(select(func.count()).select_from(TournamentDeadlockReadyVote).where(
+                TournamentDeadlockReadyVote.user_id == fake_id
+            ))
+            self.assertEqual(votes, 0, "Post-close fake readiness must not forge a ready-check vote.")
+
+        delete_headers = same_origin_request_headers(admin["client"])
+        delete_headers["Idempotency-Key"] = f"{self.prefix}-manual-delete"
+        confirmation = with_fake["name"]
+        deleted = await admin["client"].request(
+            "DELETE", f"/api/v1/admin/tournament-tests/{fixture['id']}",
+            json={"confirmation_name": confirmation}, headers=delete_headers,
+        )
+        self.assertEqual(deleted.status_code, 204, deleted.text)
+        repeated = await admin["client"].request(
+            "DELETE", f"/api/v1/admin/tournament-tests/{fixture['id']}",
+            json={"confirmation_name": confirmation}, headers=delete_headers,
+        )
+        self.assertEqual(repeated.status_code, 204, repeated.text)
+        async with session_factory()() as db_session:
+            self.assertIsNone(await db_session.get(User, fake_id))
+            self.assertIsNotNone(await db_session.get(User, admin["user_id"]))
+
+    async def test_manual_test_fake_additions_serialize_at_the_fifty_player_cap(self) -> None:
+        admin = await self._register_user("manual-race-admin")
+        await self._grant_role(admin["user_id"], "admin")
+        client = admin["client"]
+        create_headers = same_origin_request_headers(client)
+        create_headers["Idempotency-Key"] = f"{self.prefix}-race-create"
+        fixture = self._assert_status(await client.post(
+            "/api/v1/admin/tournament-tests",
+            json={"name": f"{self.prefix}-race", "visibility": "public", "format_slug": "solo"},
+            headers=create_headers,
+        ), 201)
+
+        async with session_factory()() as db_session:
+            tournament_id = await db_session.scalar(select(Tournament.id).where(Tournament.slug == fixture["slug"]))
+            db_session.add(TournamentParticipant(
+                tournament_id=tournament_id,
+                user_id=admin["user_id"],
+                entry_type="solo",
+                status="registered",
+            ))
+            await db_session.commit()
+
+        self._assert_status(await client.post(
+            f"/api/v1/admin/tournament-tests/{fixture['id']}/ready-check/start",
+            headers=same_origin_request_headers(client),
+        ), 200)
+        self._assert_status(await client.post(
+            f"/api/v1/admin/tournament-tests/{fixture['id']}/ready-check/close",
+            headers=same_origin_request_headers(client),
+        ), 200)
+
+        initial_headers = same_origin_request_headers(client)
+        initial_headers["Idempotency-Key"] = f"{self.prefix}-race-initial"
+        initial = self._assert_status(await client.post(
+            f"/api/v1/admin/tournament-tests/{fixture['id']}/players",
+            json={"count": 20}, headers=initial_headers,
+        ), 200)
+        self.assertEqual(initial["counts"]["fake_total"], 20)
+
+        async def add(count: int, key: str):
+            headers = same_origin_request_headers(client)
+            headers["Idempotency-Key"] = key
+            return await client.post(
+                f"/api/v1/admin/tournament-tests/{fixture['id']}/players",
+                json={"count": count}, headers=headers,
+            )
+
+        concurrent = await asyncio.gather(
+            add(20, f"{self.prefix}-race-20"),
+            add(30, f"{self.prefix}-race-30"),
+        )
+        self.assertEqual(sorted(response.status_code for response in concurrent), [200, 422])
+        async with session_factory()() as db_session:
+            actual_total = int(await db_session.scalar(select(func.count()).select_from(AdminTournamentTestPlayer).where(
+                AdminTournamentTestPlayer.fixture_id == fixture["id"]
+            )) or 0)
+            self.assertGreaterEqual(actual_total, 40)
+            self.assertLessEqual(actual_total, 50)
+
+    async def test_manual_test_cleanup_waits_for_cross_tournament_user_reference(self) -> None:
+        admin = await self._register_user("manual-cleanup-race-admin")
+        await self._grant_role(admin["user_id"], "admin")
+        client = admin["client"]
+        create_headers = same_origin_request_headers(client)
+        create_headers["Idempotency-Key"] = f"{self.prefix}-cleanup-race-create"
+        fixture = self._assert_status(await client.post(
+            "/api/v1/admin/tournament-tests",
+            json={"name": f"{self.prefix}-cleanup-race", "visibility": "public", "format_slug": "solo"},
+            headers=create_headers,
+        ), 201)
+
+        async with session_factory()() as db_session:
+            target_tournament = await db_session.scalar(select(Tournament).where(Tournament.slug == fixture["slug"]))
+            target_tournament_id = target_tournament.id
+            db_session.add(TournamentParticipant(
+                tournament_id=target_tournament_id,
+                user_id=admin["user_id"],
+                entry_type="solo",
+                status="registered",
+            ))
+            external_tournament = Tournament(
+                slug=f"{self.prefix}-external",
+                name=f"{self.prefix} external fixture",
+                visibility="invite_only",
+                status="registration_open",
+                format_slug="solo",
+                organizer_user_id=admin["user_id"],
+            )
+            db_session.add(external_tournament)
+            await db_session.commit()
+            external_tournament_id = external_tournament.id
+
+        self._assert_status(await client.post(
+            f"/api/v1/admin/tournament-tests/{fixture['id']}/ready-check/start",
+            headers=same_origin_request_headers(client),
+        ), 200)
+        self._assert_status(await client.post(
+            f"/api/v1/admin/tournament-tests/{fixture['id']}/ready-check/close",
+            headers=same_origin_request_headers(client),
+        ), 200)
+        add_headers = same_origin_request_headers(client)
+        add_headers["Idempotency-Key"] = f"{self.prefix}-cleanup-race-add"
+        added = self._assert_status(await client.post(
+            f"/api/v1/admin/tournament-tests/{fixture['id']}/players",
+            json={"count": 1}, headers=add_headers,
+        ), 200)
+        async with session_factory()() as db_session:
+            fake_id = await db_session.scalar(select(AdminTournamentTestPlayer.user_id).where(
+                AdminTournamentTestPlayer.fixture_id == fixture["id"]
+            ))
+            self.assertIsNotNone(fake_id)
+
+        async with session_factory()() as writer:
+            await writer.begin()
+            external_participant = TournamentParticipant(
+                tournament_id=external_tournament_id,
+                user_id=fake_id,
+                entry_type="solo",
+                status="registered",
+            )
+            writer.add(external_participant)
+            await writer.flush()  # Holds the FK's KEY SHARE lock on the synthetic User row.
+
+            delete_headers = same_origin_request_headers(client)
+            delete_headers["Idempotency-Key"] = f"{self.prefix}-cleanup-race-delete"
+            delete_request = asyncio.create_task(client.request(
+                "DELETE", f"/api/v1/admin/tournament-tests/{fixture['id']}",
+                json={"confirmation_name": added["name"]}, headers=delete_headers,
+            ))
+            deadline = asyncio.get_running_loop().time() + 5
+            lock_wait_observed = False
+            while asyncio.get_running_loop().time() < deadline and not delete_request.done():
+                async with session_factory()() as observer:
+                    lock_wait_observed = bool(await observer.scalar(text(
+                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                        "WHERE datname = current_database() AND state = 'active' "
+                        "AND wait_event_type = 'Lock' AND query ILIKE '%users%' "
+                        "AND query ILIKE '%for update%')"
+                    )))
+                if lock_wait_observed:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertTrue(
+                lock_wait_observed,
+                "Fixture cleanup must wait on its deterministic User FOR UPDATE lock before scanning external refs.",
+            )
+            await writer.commit()
+
+        deleted = await asyncio.wait_for(delete_request, timeout=5)
+        self.assertEqual(deleted.status_code, 409, deleted.text)
+        self.assertEqual(deleted.json()["detail"]["code"], "fake_users_have_external_references")
+        async with session_factory()() as db_session:
+            self.assertIsNotNone(await db_session.get(User, fake_id))
+            self.assertIsNotNone(await db_session.get(Tournament, target_tournament_id))
+            self.assertIsNotNone(await db_session.get(Tournament, external_tournament_id))
+            self.assertIsNotNone(await db_session.scalar(select(TournamentParticipant.id).where(
+                TournamentParticipant.tournament_id == external_tournament_id,
+                TournamentParticipant.user_id == fake_id,
+            )))
 
     async def test_opening_registration_requires_a_new_future_workflow_schedule(self) -> None:
         organizer = await self._register_user("schedule-organizer")

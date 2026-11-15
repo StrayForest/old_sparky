@@ -357,6 +357,50 @@ export type PlatformAdminPreprodCleanupResult = {
   remaining_tournaments: number;
 };
 
+export type PlatformAdminTournamentTestCounts = {
+  human_active: number;
+  human_ready_yes: number;
+  fake_total: number;
+  fake_ready_yes: number;
+  required_slots: number;
+  teams_count: number;
+  teams_locked: number;
+  assigned_humans: number;
+  filler_needed: number;
+};
+
+export type PlatformAdminTournamentTestBlocker = {
+  code: string;
+  required: number | null;
+  available: number | null;
+  filler_needed: number | null;
+};
+
+export type PlatformAdminTournamentTestCapabilities = {
+  can_add_fake_players: boolean;
+  can_start_ready_check: boolean;
+  can_close_ready_check: boolean;
+  can_generate_teams: boolean;
+  can_delete: boolean;
+};
+
+export type PlatformAdminTournamentTestSession = {
+  id: string;
+  slug: string;
+  name: string;
+  visibility: "public" | "invite_only";
+  status: string;
+  join_code: string;
+  is_test_fixture: true;
+  stage: "registration_open" | "ready_check_active" | "ready_check_closed" | "teams_locked";
+  counts: PlatformAdminTournamentTestCounts;
+  capabilities: PlatformAdminTournamentTestCapabilities;
+  blockers: PlatformAdminTournamentTestBlocker[];
+  cleanup_blocked_reason: string | null;
+  assignment_run_id?: string | null;
+  bracket_match_count?: number | null;
+};
+
 export type PlatformStatsRankBucket = {
   rank: string;
   count: number;

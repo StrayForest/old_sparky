@@ -206,6 +206,171 @@ test("admin tournament list progressively loads, retries, and deduplicates pages
   await expectNoHorizontalOverflow(page);
 });
 
+test("admin manual tournament test resumes, includes non-ready humans, and cleans up only its fixture", async ({ page }) => {
+  await page.context().addCookies([{
+    name: "deadlock_platform_session",
+    value: "admin-manual-test-session",
+    url: "http://127.0.0.1:3100"
+  }]);
+
+  await page.route("**/api/v1/admin/overview", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ users_total: 1, tournaments_total: 0, tournaments_attention_total: 0, audit_events_total: 0 }) });
+  });
+  await page.route("**/api/v1/admin/users**", async (route) => route.fulfill({ status: 200, contentType: "application/json", body: "[]" }));
+  await page.route("**/api/v1/admin/audit-logs**", async (route) => route.fulfill({ status: 200, contentType: "application/json", body: "[]" }));
+  await page.route("**/api/v1/admin/preprod-test-runs**", async (route) => route.fulfill({ status: 200, contentType: "application/json", body: "[]" }));
+  await page.route("**/api/v1/admin/tournaments**", async (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    headers: { "X-Total-Count": "0", "X-Limit": "25", "X-Offset": "0", "X-Has-More": "false" },
+    body: "[]"
+  }));
+
+  const humanCount = 1;
+  const requestedName = "Тест ручного турнира".padEnd(110, "я");
+  const session = {
+    id: "fixture-1",
+    slug: "test-manual-flow",
+    name: `[TEST] ${requestedName}`,
+    visibility: "public",
+    status: "registration_open",
+    stage: "registration_open",
+    is_test_fixture: true,
+    join_code: "TESTJOIN123",
+    counts: { human_active: humanCount, human_ready_yes: 0, fake_total: 0, fake_ready_yes: 0, required_slots: 14, teams_count: 2, teams_locked: 0, assigned_humans: 0, filler_needed: 14 },
+    capabilities: { can_add_fake_players: true, can_start_ready_check: true, can_close_ready_check: false, can_generate_teams: false, can_delete: true },
+    blockers: [{ code: "insufficient_fillers", required: 14, available: humanCount, filler_needed: 13 }],
+    cleanup_blocked_reason: null
+  };
+  let retryReadyStart = true;
+  let rejectFirstGeneration = true;
+  let fixtureExists = false;
+  const readyStartKeys: string[] = [];
+  const operations: string[] = [];
+
+  await page.route("**/api/v1/admin/tournament-tests**", async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const method = request.method();
+    if (method === "GET") {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(fixtureExists ? [session] : []) });
+      return;
+    }
+    if (method === "POST" && url.pathname === "/api/v1/admin/tournament-tests") {
+      const payload = request.postDataJSON() as { name: string; visibility: string; format_slug: string };
+      expect(payload).toEqual({ name: requestedName, visibility: "public", format_slug: "solo" });
+      expect(request.headers()["idempotency-key"]).toBeTruthy();
+      fixtureExists = true;
+      await route.fulfill({ status: 201, contentType: "application/json", body: JSON.stringify(session) });
+      return;
+    }
+    const pathParts = url.pathname.split("/");
+    const fixtureIndex = pathParts.indexOf("tournament-tests") + 1;
+    const operation = pathParts.slice(fixtureIndex + 1).join("/");
+    if (method === "DELETE") {
+      const payload = request.postDataJSON() as { confirmation_name: string };
+      expect(payload.confirmation_name).toBe(session.name);
+      fixtureExists = false;
+      await route.fulfill({ status: 204 });
+      return;
+    }
+    operations.push(operation);
+    if (operation === "ready-check/start") {
+      readyStartKeys.push(request.headers()["idempotency-key"] ?? "");
+      if (retryReadyStart) {
+        retryReadyStart = false;
+        await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ detail: "Временно недоступно, повторите запуск." }) });
+        return;
+      }
+      session.stage = "ready_check_active";
+      session.counts.fake_ready_yes = session.counts.fake_total;
+      session.capabilities = { can_add_fake_players: false, can_start_ready_check: false, can_close_ready_check: true, can_generate_teams: false, can_delete: true };
+    } else if (operation === "ready-check/close") {
+      session.stage = "ready_check_closed";
+      session.capabilities = { can_add_fake_players: true, can_start_ready_check: false, can_close_ready_check: false, can_generate_teams: false, can_delete: true };
+    } else if (operation === "players") {
+      const payload = request.postDataJSON() as { count: number };
+      expect(payload.count).toBe(13);
+      session.counts.fake_total += payload.count;
+      session.counts.fake_ready_yes += payload.count;
+      session.counts.filler_needed = 0;
+      session.blockers = [];
+      session.capabilities.can_add_fake_players = true;
+      session.capabilities.can_generate_teams = true;
+    } else if (operation === "teams/generate") {
+      if (rejectFirstGeneration) {
+        rejectFirstGeneration = false;
+        await route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify({ detail: { detail: "Недостаточно тестовых игроков.", blocker: { code: "insufficient_fillers", required: 14, available: 14, filler_needed: 0 } } }) });
+        return;
+      }
+      session.stage = "teams_locked";
+      session.counts.teams_locked = 2;
+      session.counts.assigned_humans = humanCount;
+      session.capabilities.can_add_fake_players = false;
+      session.capabilities.can_generate_teams = false;
+    } else {
+      throw new Error(`Unexpected test workflow operation: ${operation}`);
+    }
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(session) });
+  });
+
+  await page.goto("/platform-ops");
+  await expect(page.getByTestId("admin-console")).toBeVisible();
+  await page.getByLabel("Навигация админ-панели").getByRole("button", { name: /Ручное тестирование/ }).click();
+  await expect(page.getByTestId("admin-manual-testing")).toBeVisible();
+  await expect(page.getByText("Активных тестовых сессий нет.")).toBeVisible();
+
+  const nameInput = page.getByLabel("Название теста");
+  await expect(nameInput).toHaveAttribute("maxlength", "110");
+  await nameInput.fill(requestedName);
+  await expect(nameInput).toHaveValue(requestedName);
+  await page.getByLabel("Видимость").selectOption("public");
+  await page.getByRole("button", { name: "Создать и открыть регистрацию" }).click();
+  await expect(page.getByRole("heading", { name: session.name, exact: true })).toBeVisible();
+  await expect(page.getByText("TESTJOIN123", { exact: true })).toBeVisible();
+  await expect(page.getByText("В этом тестовом режиме все активные реальные участники попадут в команды независимо от ready-ответа. Их фактические ответы не меняются.")).toBeVisible();
+
+  await page.getByRole("button", { name: "Начать ready-check" }).click();
+  await expect(page.getByText("Временно недоступно, повторите запуск.", { exact: true })).toBeVisible();
+  await page.reload();
+  await page.getByLabel("Навигация админ-панели").getByRole("button", { name: /Ручное тестирование/ }).click();
+  await expect(page.getByTestId("admin-manual-testing")).toBeVisible();
+  await expect(page.getByText("Регистрация открыта", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Начать ready-check" }).click();
+  await expect(page.getByText("Ready-check активен", { exact: true })).toBeVisible();
+  expect(readyStartKeys).toHaveLength(2);
+  expect(readyStartKeys[0]).toBeTruthy();
+  expect(readyStartKeys[1]).toBe(readyStartKeys[0]);
+
+  await page.getByRole("button", { name: "Завершить ready-check" }).click();
+  await expect(page.getByText("Ready-check завершён", { exact: true })).toBeVisible();
+  await page.getByLabel("Добавить тестовых игроков").fill("13");
+  await page.getByRole("button", { name: "Добавить игроков" }).click();
+  await expect(page.getByText("Тестовые участники")).toBeVisible();
+  await page.getByRole("button", { name: "Сформировать команды и bracket" }).click();
+  await expect(page.getByText("Недостаточно тестовых игроков.", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Сформировать команды и bracket" }).click();
+  await expect(page.getByText("Команды и bracket готовы", { exact: true })).toBeVisible();
+  await expect(page.locator(".ops-test-count").filter({ hasText: "Реальные участники в командах" }).locator("strong")).toHaveText("1");
+  expect(operations).toEqual(["ready-check/start", "ready-check/start", "ready-check/close", "players", "teams/generate", "teams/generate"]);
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  const documentWidth = await page.evaluate(() => document.documentElement.scrollWidth);
+  expect(documentWidth).toBeLessThanOrEqual(390);
+
+  await page.reload();
+  await page.getByLabel("Навигация админ-панели").getByRole("button", { name: /Ручное тестирование/ }).click();
+  await expect(page.getByTestId("admin-manual-testing")).toBeVisible();
+  await expect(page.getByRole("heading", { name: session.name, exact: true })).toBeVisible();
+  await page.getByText("Завершить тест и удалить данные").click();
+  await page.getByLabel("Введите точное название турнира").fill(session.name);
+  await page.getByRole("button", { name: "Удалить тестовый турнир и фейки" }).click();
+  await expect(page.getByText("Тестовый турнир и принадлежащие ему фейковые аккаунты удалены.")).toBeVisible();
+  expect(fixtureExists).toBe(false);
+  await page.getByRole("button", { name: "Обновить сессии" }).click();
+  await expect(page.getByText("Активных тестовых сессий нет.")).toBeVisible();
+});
+
 async function expectNoHorizontalOverflow(page: import("@playwright/test").Page) {
   const overflow = await page.evaluate(() => (
     Math.max(0, document.documentElement.scrollWidth - document.documentElement.clientWidth)

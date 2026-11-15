@@ -13,6 +13,7 @@ from python_packages.platform_infra.media.hard_delete import (
     purge_deleted_media_metadata,
 )
 from python_packages.platform_infra.models import (
+    AdminTournamentTestPlayer,
     Role,
     Tournament,
     TournamentParticipant,
@@ -113,6 +114,20 @@ async def admin_delete_user(
     )
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+
+    is_manual_test_player = await db_session.scalar(
+        select(AdminTournamentTestPlayer.user_id).where(
+            AdminTournamentTestPlayer.user_id == user.id
+        )
+    )
+    if is_manual_test_player is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "manual_test_player_requires_fixture_cleanup",
+                "message": "Удалите синтетического игрока через очистку его тестового турнира.",
+            },
+        )
 
     # A concurrent membership writer may have committed while the tournament
     # locks were being acquired. Recheck after the User lock; if it introduced

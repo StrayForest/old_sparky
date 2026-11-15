@@ -297,11 +297,18 @@ def prepare_captain_round_entries(
     teams_count: int,
     *,
     auto_assign: bool = False,
+    required_captain_user_ids: set[str] | None = None,
 ) -> tuple[CaptainRoundEntryState, ...]:
     if teams_count < 1:
         raise CaptainRoundError("Captain-round teams count must be positive.")
 
     ordered_candidates = sort_captain_candidates(rows)
+    if required_captain_user_ids:
+        required = [candidate for candidate in ordered_candidates if candidate.user_id in required_captain_user_ids]
+        optional = [candidate for candidate in ordered_candidates if candidate.user_id not in required_captain_user_ids]
+        if len(required) > teams_count:
+            raise CaptainRoundError("More required captains than team slots.")
+        ordered_candidates = required + optional
     assignments_by_user_id = {
         assignment.user_id: assignment.team_id
         for assignment in assign_captain_team_numbers(ordered_candidates[:teams_count])

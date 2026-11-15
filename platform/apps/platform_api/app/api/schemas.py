@@ -1536,6 +1536,87 @@ class AdminPreprodCleanupRequest(BaseModel):
     note: str = Field(min_length=3, max_length=500)
 
 
+class AdminTournamentTestCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=3, max_length=110)
+    visibility: Literal["public", "invite_only"]
+    format_slug: Literal["solo"] = "solo"
+
+
+class AdminTournamentTestPlayersRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    count: int = Field(ge=1, le=50)
+
+
+class AdminTournamentTestDeleteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirmation_name: str = Field(min_length=3, max_length=120)
+
+
+class AdminTournamentTestCountsResponse(BaseModel):
+    human_active: int = 0
+    human_ready_yes: int = 0
+    fake_total: int = 0
+    fake_ready_yes: int = 0
+    required_slots: int = 0
+    teams_count: int = 0
+    teams_locked: int = 0
+    assigned_humans: int = 0
+    filler_needed: int = 0
+
+
+class AdminTournamentTestCapabilitiesResponse(BaseModel):
+    can_add_fake_players: bool = False
+    can_start_ready_check: bool = False
+    can_close_ready_check: bool = False
+    can_generate_teams: bool = False
+    can_delete: bool = True
+
+
+class AdminTournamentTestBlockerResponse(BaseModel):
+    code: Literal[
+        "insufficient_fillers",
+        "too_many_humans",
+        "human_profiles_missing",
+        "human_assignment_failed",
+        "fake_users_have_external_references",
+    ]
+    required: int | None = None
+    available: int | None = None
+    filler_needed: int | None = None
+
+
+class AdminTournamentTestResponse(BaseModel):
+    id: str
+    slug: str
+    name: str
+    visibility: Literal["public", "invite_only"]
+    status: str
+    stage: Literal[
+        "registration_open",
+        "registration_closed",
+        "ready_check_active",
+        "ready_check_closed",
+        "teams_locked",
+    ]
+    is_test_fixture: Literal[True] = True
+    join_code: str
+    counts: AdminTournamentTestCountsResponse
+    capabilities: AdminTournamentTestCapabilitiesResponse
+    blockers: list[AdminTournamentTestBlockerResponse] = Field(default_factory=list)
+    cleanup_blocked_reason: str | None = None
+
+
+class AdminTournamentTestGenerateResponse(AdminTournamentTestResponse):
+    assignment_run_id: str
+    assignment_status: Literal["locked"] = "locked"
+    teams: list[dict[str, Any]] = Field(default_factory=list)
+    bracket_match_count: int = 0
+
+
 class AdminPreprodCleanupResponse(BaseModel):
     ok: bool
     runs_updated: int = 0

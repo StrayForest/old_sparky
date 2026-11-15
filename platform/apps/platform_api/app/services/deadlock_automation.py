@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 import logging
 from typing import Any
 
-from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy import and_, case, exists, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -63,7 +63,9 @@ from python_packages.platform_infra.audit import write_audit_log
 from python_packages.platform_infra.config import get_settings
 from python_packages.platform_infra.db import session_factory
 from python_packages.platform_infra.models import (
+    AdminTournamentTestPlayer,
     DeadlockProfile,
+    PlayerTournamentCommitment,
     Tournament,
     TournamentDeadlockAssignmentRun,
     TournamentDeadlockCaptainEntry,
@@ -71,6 +73,8 @@ from python_packages.platform_infra.models import (
     TournamentDeadlockReadyRound,
     TournamentMatch,
     TournamentParticipant,
+    TournamentTeamMember,
+    TournamentTeam,
     User,
 )
 from python_packages.platform_infra.performance import measure_compute_block
@@ -79,6 +83,19 @@ from python_packages.platform_infra.performance import measure_compute_block
 AUTOMATION_ACTOR_USER_ID: str | None = None
 AUTOMATION_TERMINAL_STATUSES = ("in_progress", "completed", "cancelled")
 logger = logging.getLogger(__name__)
+
+
+async def _admin_test_human_user_ids(db_session: AsyncSession, tournament_id: str) -> tuple[str, ...]:
+    rows = await db_session.scalars(
+        select(TournamentParticipant.user_id)
+        .where(
+            TournamentParticipant.tournament_id == tournament_id,
+            TournamentParticipant.status.not_in(("withdrawn", "disqualified")),
+            ~exists(select(1).where(AdminTournamentTestPlayer.user_id == TournamentParticipant.user_id)),
+        )
+        .order_by(TournamentParticipant.user_id)
+    )
+    return tuple(str(user_id) for user_id in rows.all())
 
 
 async def _refresh_catalog_projection_after_commit(
@@ -267,6 +284,7 @@ def _deadlock_automation_cohort_statement(*, now: datetime, limit: int) -> Any:
         .select_from(Tournament)
         .where(
             Tournament.format_slug == SOLO_TOURNAMENT_FORMAT,
+            Tournament.admin_test_fixture.is_(False),
             Tournament.status.not_in(AUTOMATION_TERMINAL_STATUSES),
             Tournament.automation_assignment_generated_at.is_(None),
             or_(
@@ -491,6 +509,7 @@ async def advance_deadlock_tournament_automation(
     tournament: Tournament,
     now: datetime | None = None,
     allow_assignment_generation: bool = True,
+    allow_manual_test: bool = False,
 ) -> DeadlockAutomationResult:
     tournament_id = tournament.id
     tournament = await lock_tournament_for_workflow(
@@ -503,6 +522,7 @@ async def advance_deadlock_tournament_automation(
             tournament=tournament,
             now=(now or _aware_now()).astimezone(UTC),
             allow_assignment_generation=allow_assignment_generation,
+            allow_manual_test=allow_manual_test,
         )
     except (AutoAssignmentError, TournamentWorkflowError) as exc:
         await db_session.rollback()
@@ -550,7 +570,11 @@ async def _advance_tournament(
     tournament: Tournament,
     now: datetime,
     allow_assignment_generation: bool = True,
+    allow_manual_test: bool = False,
 ) -> DeadlockAutomationResult:
+    is_admin_test_fixture = tournament.admin_test_fixture
+    if is_admin_test_fixture and not allow_manual_test:
+        return DeadlockAutomationResult()
     if not is_solo_tournament_format(tournament.format_slug):
         return DeadlockAutomationResult()
     if await tournament_has_locked_deadlock_roster(db_session, tournament=tournament):
@@ -801,6 +825,17 @@ async def _ensure_captain_round_started(
         prepare_deadlock_captain_candidate_rows(candidate_rows),
         teams_count,
         auto_assign=True,
+        required_captain_user_ids=(
+            set(
+                sorted(
+                    str(row["user_id"])
+                    for row in candidate_rows
+                    if not row.get("is_test_fake")
+                )[:teams_count]
+            )
+            if tournament.admin_test_fixture
+            else None
+        ),
     )
     for entry in prepared_entries:
         db_session.add(
@@ -1068,6 +1103,25 @@ async def _ensure_assignment_generated(
             list(current_inputs.dream_slot_rows),
         )
 
+    if tournament.admin_test_fixture:
+        required_humans = set(await _admin_test_human_user_ids(db_session, tournament.id))
+        assigned_user_ids: set[str] = set()
+        for team in run.result_snapshot.get("teams", []):
+            captain = team.get("captain") or {}
+            if captain.get("user_id"):
+                assigned_user_ids.add(str(captain["user_id"]))
+            for slot in team.get("starter_slots", []):
+                assigned = (slot.get("assigned_player") or {}).get("user_id")
+                if assigned:
+                    assigned_user_ids.add(str(assigned))
+            reserve = ((team.get("reserve_slot") or {}).get("assigned_player") or {}).get("user_id")
+            if reserve:
+                assigned_user_ids.add(str(reserve))
+        if not required_humans.issubset(assigned_user_ids):
+            raise TournamentWorkflowError(
+                "The manual test assignment could not include every active human registrant."
+            )
+
     result_snapshot = dict(run.result_snapshot)
     result_snapshot["input_fingerprint"] = current_inputs.input_fingerprint
     run_row = TournamentDeadlockAssignmentRun(
@@ -1089,6 +1143,27 @@ async def _ensure_assignment_generated(
         run_row=run_row,
         now=now,
     )
+    if tournament.admin_test_fixture:
+        required_humans = set(await _admin_test_human_user_ids(db_session, tournament.id))
+        persisted_members = set((await db_session.scalars(
+            select(TournamentTeamMember.user_id)
+            .join(TournamentTeam, TournamentTeam.id == TournamentTeamMember.team_id)
+            .where(
+                TournamentTeamMember.tournament_id == tournament.id,
+                TournamentTeam.source_assignment_run_id == run_row.id,
+            )
+        )).all())
+        active_commitments = set((await db_session.scalars(
+            select(PlayerTournamentCommitment.user_id).where(
+                PlayerTournamentCommitment.tournament_id == tournament.id,
+                PlayerTournamentCommitment.assignment_run_id == run_row.id,
+                PlayerTournamentCommitment.released_at.is_(None),
+            )
+        )).all())
+        if not required_humans.issubset(persisted_members) or not required_humans.issubset(active_commitments):
+            raise TournamentWorkflowError(
+                "The manual test assignment could not include every active human registrant."
+            )
     tournament.automation_assignment_generated_at = now
     await write_audit_log(
         db_session,
