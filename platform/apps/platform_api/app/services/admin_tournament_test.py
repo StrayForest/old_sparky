@@ -17,7 +17,6 @@ from python_packages.platform_infra.models import (
     AdminTournamentTestFixture,
     AdminTournamentTestPlayer,
     DeadlockProfile,
-    PlayerTournamentCommitment,
     Tournament,
     TournamentDeadlockAssignmentRun,
     TournamentDeadlockReadyRound,

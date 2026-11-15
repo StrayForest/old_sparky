@@ -224,11 +224,11 @@ class AdminTournamentTestWorkflowTests(PlatformIsolatedAsyncioTestCase):
         ), 200)
         self.assertEqual(started["stage"], "ready_check_active")
         self.assertEqual(started_replay["stage"], "ready_check_active")
-        vote_yes = self._assert_status(await human["client"].post(
+        self._assert_status(await human["client"].post(
             f"/api/v1/tournaments/{fixture['slug']}/deadlock/ready-check/vote",
             json={"choice": "yes"}, headers=same_origin_request_headers(human["client"]),
         ), 200)
-        vote_no = self._assert_status(await humans[1]["client"].post(
+        self._assert_status(await humans[1]["client"].post(
             f"/api/v1/tournaments/{fixture['slug']}/deadlock/ready-check/vote",
             json={"choice": "no"}, headers=same_origin_request_headers(humans[1]["client"]),
         ), 200)
@@ -414,7 +414,7 @@ class AdminTournamentTestWorkflowTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(overflow.status_code, 422, overflow.text)
         self.assertEqual(overflow.json()["detail"]["code"], "fake_player_limit")
         summary = self._assert_status(await operator["client"].get(
-            f"/api/v1/admin/tournament-tests",
+            "/api/v1/admin/tournament-tests",
         ), 200)
         private_summary = next(item for item in summary if item["id"] == fixture["id"])
         self.assertEqual(private_summary["counts"]["fake_total"], 50)

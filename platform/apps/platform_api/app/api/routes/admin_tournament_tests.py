@@ -3,9 +3,9 @@ from __future__ import annotations
 import re
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from starlette.concurrency import run_in_threadpool
-from sqlalchemy import delete, exists, func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.platform_api.app.api.schemas import (
@@ -29,30 +29,25 @@ from apps.platform_api.app.services.admin_tournament_test import (
     summarize_admin_tournament_test,
 )
 from apps.platform_api.app.services.tournament_catalog_read_models import refresh_tournament_list_read_model_after_commit
-from apps.platform_api.app.services.tournament_read_models import delete_tournament_read_models, refresh_tournament_read_models
+from apps.platform_api.app.services.tournament_read_models import delete_tournament_read_models
 from apps.platform_api.app.services.tournament_profile_access import delete_tournament_profile_access_state
 from apps.platform_api.app.services.tournament_runtime_cache import invalidate_tournament_runtime_caches
 from apps.platform_api.app.services.user_account_read_models import delete_user_account_read_model
 from python_packages.platform_infra.media.hard_delete import MediaCleanupRequired, purge_deleted_media_metadata
 from python_packages.platform_infra.object_storage import get_object_storage, object_key_from_upload_url
 from apps.platform_api.app.services.deadlock_automation import advance_deadlock_tournament_automation
-from apps.platform_api.app.services.tournament_workflow import upsert_deadlock_ready_vote
 from python_packages.platform_infra.audit import write_audit_log
 from python_packages.platform_infra.db import get_db_session
 from python_packages.platform_infra.models import (
     AdminTournamentTestFixture,
     AdminTournamentTestPlayer,
     DeadlockProfile,
-    ExternalIdentity,
-    PasswordCredential,
     PlayerProfile,
     Tournament,
     TournamentDeadlockAssignmentRun,
     TournamentDeadlockReadyRound,
     TournamentInvite,
     TournamentMatch,
-    TournamentParticipant,
-    TournamentTeamMember,
     User,
 )
 from python_packages.platform_infra.security import get_authenticated_session
@@ -180,7 +175,6 @@ async def add_admin_tournament_test_players(
     if existing + payload.count > MAX_FAKE_PLAYERS:
         raise HTTPException(status_code=422, detail={"code": "fake_player_limit", "remaining": MAX_FAKE_PLAYERS-existing})
     from apps.platform_api.app.api.routes.tournaments import create_participant
-    now = auth_session.now
     for index in range(existing + 1, existing + payload.count + 1):
         suffix = uuid4().hex[:8]
         user = User(email=None, display_name=f"Тестовый игрок {index:02d}", status="active")
