@@ -775,6 +775,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             "tests/smoke/live-user-journey.spec.ts",
             "tests/support/live-qa-origin.ts",
             "tests/support/live-qa-sandbox.ts",
+            "tests/support/live-image-inventory.ts",
             "tests/support/live-count-reporter.cjs",
             "tests/support/patch-acceptance.ts",
             "tests/support/live-engine-preflight.cjs",
@@ -930,20 +931,29 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
                 "web/tests/support/patch-acceptance.ts", manifest["suite_files"]
             )
             self.assertIn(
+                "web/tests/support/live-image-inventory.ts", manifest["suite_files"]
+            )
+            self.assertIn(
                 "web/tests/support/live-engine-preflight.cjs", manifest["suite_files"]
             )
             self.assertIn(
                 "web/tests/support/patch-acceptance.ts", manifest["suite_files"]
             )
-            with self.assertRaises(platform_build_live_qa_runtime.RuntimeBuildError):
-                platform_build_live_qa_runtime.validate_runtime_source_imports(
-                    web_root=platform_root / "apps/platform_web",
-                    source_files=tuple(
-                        relative
-                        for relative in platform_build_live_qa_runtime.RUNTIME_SOURCE_FILES
-                        if relative != "tests/support/patch-acceptance.ts"
-                    ),
-                )
+            for missing_helper in (
+                "tests/support/patch-acceptance.ts",
+                "tests/support/live-image-inventory.ts",
+            ):
+                with self.subTest(missing_helper=missing_helper), self.assertRaises(
+                    platform_build_live_qa_runtime.RuntimeBuildError
+                ):
+                    platform_build_live_qa_runtime.validate_runtime_source_imports(
+                        web_root=platform_root / "apps/platform_web",
+                        source_files=tuple(
+                            relative
+                            for relative in platform_build_live_qa_runtime.RUNTIME_SOURCE_FILES
+                            if relative != missing_helper
+                        ),
+                    )
             self.assertEqual(
                 platform_live_qa_runtime_install._validate_runtime_source(output)["version"],
                 3,
@@ -1100,6 +1110,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
                 "tampered",
                 "unlisted",
                 "missing-patch-acceptance",
+                "missing-live-image-inventory",
             ):
                 with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as case_dir:
                     candidate = Path(case_dir) / "runtime"
@@ -1107,6 +1118,8 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
                     reporter = candidate / reporter_relative
                     if mutation == "missing-patch-acceptance":
                         (candidate / patch_helper_relative).unlink()
+                    elif mutation == "missing-live-image-inventory":
+                        (candidate / "web/tests/support/live-image-inventory.ts").unlink()
                     elif mutation == "missing":
                         reporter.unlink()
                     elif mutation == "tampered":

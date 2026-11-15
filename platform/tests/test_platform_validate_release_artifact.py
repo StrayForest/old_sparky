@@ -150,7 +150,9 @@ class ArchiveBuilder:
             "web/playwright.live.config.ts": b"export default {};\n",
             "web/tests/smoke/live-launch.spec.ts": (
                 b'import { patchAcceptanceIssues } from "../support/patch-acceptance";\n'
+                b'import { collectLiveImageInventory } from "../support/live-image-inventory";\n'
                 b"void patchAcceptanceIssues;\n"
+                b"void collectLiveImageInventory;\n"
                 b"test('launch', () => {});\n"
             ),
             "web/tests/smoke/live-user-journey.spec.ts": b"test('live', () => {});\n",
@@ -163,6 +165,10 @@ class ArchiveBuilder:
             "web/tests/support/patch-acceptance.ts": (
                 REPO_ROOT
                 / "platform/apps/platform_web/tests/support/patch-acceptance.ts"
+            ).read_bytes(),
+            "web/tests/support/live-image-inventory.ts": (
+                REPO_ROOT
+                / "platform/apps/platform_web/tests/support/live-image-inventory.ts"
             ).read_bytes(),
             "web/tests/support/live-engine-preflight.cjs": (
                 REPO_ROOT
@@ -851,11 +857,15 @@ class PlatformReleaseArtifactValidationTests(unittest.TestCase):
             f"{RELEASE_SLUG}/liveqa-runtime/"
             "web/tests/support/patch-acceptance.ts"
         )
+        image_inventory_helper_name = (
+            f"{RELEASE_SLUG}/liveqa-runtime/"
+            "web/tests/support/live-image-inventory.ts"
+        )
         historical_launch_spec = b"test('historical launch', () => {});\n"
         historical_importless.entries = [
             (member, content)
             for member, content in historical_importless.entries
-            if member.name != helper_name
+            if member.name not in {helper_name, image_inventory_helper_name}
         ]
         for member, _content in historical_importless.entries:
             if member.name == launch_spec_name:
@@ -887,6 +897,20 @@ class PlatformReleaseArtifactValidationTests(unittest.TestCase):
         ):
             validator.validate_archive(
                 missing_helper.write(), release_slug=RELEASE_SLUG
+            )
+
+        missing_image_helper = ArchiveBuilder(self.root / "missing-image-helper.tar.gz")
+        missing_image_helper.entries = [
+            (member, content)
+            for member, content in missing_image_helper.entries
+            if member.name != image_inventory_helper_name
+        ]
+        with self.assertRaisesRegex(
+            validator.ArtifactError,
+            "missing required file: web/tests/support/live-image-inventory.ts",
+        ):
+            validator.validate_archive(
+                missing_image_helper.write(), release_slug=RELEASE_SLUG
             )
 
         with tarfile.open(artifact, "r:gz") as archive:

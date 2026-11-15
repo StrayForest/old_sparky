@@ -706,6 +706,7 @@ def _validate_liveqa_runtime(
     if len(launch_spec) != launch_spec_member.size:
         raise ArtifactError("liveqa-runtime launch spec is truncated")
     requires_patch_acceptance = b"../support/patch-acceptance" in launch_spec
+    requires_live_image_inventory = b"../support/live-image-inventory" in launch_spec
     if requires_patch_acceptance:
         helper_member = by_name.get(
             f"{prefix}/web/tests/support/patch-acceptance.ts"
@@ -714,6 +715,15 @@ def _validate_liveqa_runtime(
             raise ArtifactError(
                 "liveqa-runtime is missing required file: "
                 "web/tests/support/patch-acceptance.ts"
+            )
+    if requires_live_image_inventory:
+        helper_member = by_name.get(
+            f"{prefix}/web/tests/support/live-image-inventory.ts"
+        )
+        if helper_member is None or not helper_member.isfile():
+            raise ArtifactError(
+                "liveqa-runtime is missing required file: "
+                "web/tests/support/live-image-inventory.ts"
             )
     runtime_prefix = f"{prefix}/"
     allowed_top = {"node", "web", "browsers", "runtime-manifest.json"}
@@ -728,6 +738,8 @@ def _validate_liveqa_runtime(
         "web/tests/support/patch-acceptance.ts",
         "web/tests/support/live-engine-preflight.cjs",
     }
+    if requires_live_image_inventory:
+        allowed_web_files.add("web/tests/support/live-image-inventory.ts")
     allowed_package_roots = {
         "web/node_modules/@playwright/test",
         "web/node_modules/playwright",

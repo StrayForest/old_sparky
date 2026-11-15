@@ -9,10 +9,13 @@ provide only the verified generation SHA and local bundle contract directory.
 from __future__ import annotations
 
 import argparse
+import base64
+import json
 import os
 from pathlib import Path
 import re
 import selectors
+import shlex
 import shutil
 import subprocess
 import sys
@@ -21,12 +24,112 @@ import time
 
 HOST_KEY_FINGERPRINT = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y"
 GENERATION_ROOT = "/opt/oldsparky/platform/shared/host-tools"
+RELEASE_LOCK_PATH = "/run/lock/oldsparky-platform-release.lock"
+LIVE_QA_LOCK_PATH = "/run/lock/oldsparky-liveqa.lock"
 SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
 PATH_RE = re.compile(r"(?:platform_[A-Za-z0-9_.-]+\.(?:py|sh)|capabilities\.txt|manifest\.json)\Z")
 USER_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}\Z")
 HOST_RE = re.compile(r"[A-Za-z0-9.-]{1,253}\Z")
 MAX_CONTRACT_ROWS = 32
 MAX_REMOTE_OUTPUT = 16384
+# The last readiness decision runs as one remote process while it owns both
+# canonical locks. This closes the window in which AUTO could observe the new
+# generation and dispatch its child before the root-console self-test finishes.
+# It opens existing lock files only: there is no O_CREAT, chmod, or state write.
+LOCKED_FINAL_CHECK = r'''import base64, fcntl, hashlib, json, os, pathlib, stat, subprocess, sys
+class Busy(Exception): pass
+def acquire(path):
+    path = pathlib.Path(path)
+    parent = path.parent
+    pm = parent.lstat()
+    if not stat.S_ISDIR(pm.st_mode) or pm.st_uid != 0 or parent.is_symlink() or ((stat.S_IMODE(pm.st_mode) & 0o022) and not (stat.S_IMODE(pm.st_mode) & stat.S_ISVTX)):
+        raise RuntimeError("unsafe lock directory")
+    pfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        po = os.fstat(pfd)
+        if (po.st_dev, po.st_ino) != (pm.st_dev, pm.st_ino): raise RuntimeError("lock directory changed")
+        before = os.stat(path.name, dir_fd=pfd, follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode) or before.st_uid != 0 or before.st_gid != 0 or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) != 0o600: raise RuntimeError("unsafe lock file")
+        fd = os.open(path.name, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=pfd)
+    finally:
+        os.close(pfd)
+    opened = os.fstat(fd)
+    current = path.lstat()
+    if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino) or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino) or opened.st_uid != 0 or opened.st_gid != 0 or opened.st_nlink != 1 or stat.S_IMODE(opened.st_mode) != 0o600:
+        os.close(fd); raise RuntimeError("lock identity changed")
+    try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd); raise Busy()
+    after = path.lstat()
+    if (after.st_dev, after.st_ino, after.st_mode, after.st_uid, after.st_gid, after.st_nlink) != (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid, opened.st_gid, opened.st_nlink):
+        os.close(fd); raise RuntimeError("lock identity changed after acquisition")
+    parent_after = parent.lstat()
+    if (parent_after.st_dev, parent_after.st_ino) != (po.st_dev, po.st_ino):
+        os.close(fd); raise RuntimeError("lock directory changed after acquisition")
+    return fd
+def digest_file(path, mode, expected, maximum=524288):
+    before = path.lstat()
+    if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode) or before.st_uid != 0 or before.st_gid != 0 or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) != mode or before.st_size > maximum: raise RuntimeError("generation member metadata mismatch")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino): raise RuntimeError("generation member changed")
+        data = bytearray()
+        while len(data) <= maximum:
+            chunk = os.read(fd, min(65536, maximum + 1 - len(data)))
+            if not chunk: break
+            data.extend(chunk)
+        after = os.fstat(fd)
+        if len(data) != opened.st_size or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns, after.st_nlink) != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns, 1): raise RuntimeError("generation member changed while reading")
+    finally: os.close(fd)
+    raw = bytes(data)
+    if hashlib.sha256(raw).hexdigest() != expected: raise RuntimeError("generation member digest mismatch")
+    return raw
+def main():
+    payload = json.loads(base64.b64decode(sys.argv[1], validate=True))
+    required = {"generation", "source_sha", "toolset_version", "manifest_sha256", "capabilities_sha256", "expected_member_count", "members"}
+    if not isinstance(payload, dict) or set(payload) != required: raise RuntimeError("input contract schema mismatch")
+    expected_member_count = {"production-host-tools-v3": 16, "production-host-tools-v4": 17}.get(payload["toolset_version"])
+    if type(payload["expected_member_count"]) is not int or payload["expected_member_count"] != expected_member_count: raise RuntimeError("inventory size contract mismatch")
+    held = []
+    try:
+        for path in ("/run/lock/oldsparky-platform-release.lock", "/run/lock/oldsparky-liveqa.lock"): held.append(acquire(path))
+        operation = pathlib.Path("/opt/oldsparky/platform/shared/.release-operation.json")
+        if operation.exists() or operation.is_symlink(): raise RuntimeError("release transaction is pending")
+        generation = pathlib.Path(payload["generation"])
+        directory = generation.lstat()
+        if not stat.S_ISDIR(directory.st_mode) or stat.S_ISLNK(directory.st_mode) or directory.st_uid != 0 or directory.st_gid != 0 or directory.st_nlink != 2 or stat.S_IMODE(directory.st_mode) != 0o555: raise RuntimeError("generation directory metadata mismatch")
+        members = payload["members"]
+        names = {item["name"] for item in members}
+        if not isinstance(members, list) or len(members) != expected_member_count or len(names) != expected_member_count or not {"manifest.json", "capabilities.txt"}.issubset(names): raise RuntimeError("generation inventory contract mismatch")
+        if {entry.name for entry in generation.iterdir()} != names: raise RuntimeError("generation has unexpected entries")
+        digest_file(generation / "manifest.json", 0o444, payload["manifest_sha256"])
+        digest_file(generation / "capabilities.txt", 0o444, payload["capabilities_sha256"])
+        for item in members:
+            if not isinstance(item, dict) or set(item) != {"name", "sha256", "mode"}: raise RuntimeError("member contract malformed")
+            if item["name"] in {"manifest.json", "capabilities.txt"}: continue
+            if item["mode"] != 0o555: raise RuntimeError("tool mode contract mismatch")
+            digest_file(generation / item["name"], 0o555, item["sha256"])
+        sha = payload["source_sha"]
+        if payload["toolset_version"] == "production-host-tools-v3":
+            capability = f"HOST_TOOLS schema=1 source_sha={sha} generation={sha} dispatcher=4 artifact_prepare=2 supervisor=3 input_guard=2 release_baseline=1 retained_load_export_cleanup=1 retained_load_source_binding=1 python_isolated=1 python_bytecode_disabled=1\n"
+        elif payload["toolset_version"] == "production-host-tools-v4":
+            capability = f"HOST_TOOLS schema=1 source_sha={sha} generation={sha} dispatcher=4 artifact_prepare=2 supervisor=3 input_guard=2 release_baseline=1 retained_load_export_cleanup=1 retained_load_source_binding=1 cpu_diagnostic_plan_control=1 python_isolated=1 python_bytecode_disabled=1\n"
+        else: raise RuntimeError("toolset version invalid")
+        cap = (generation / "capabilities.txt").read_bytes()
+        if cap != capability.encode("ascii"): raise RuntimeError("capability text mismatch")
+        result = subprocess.run(["/usr/bin/python3.12", "-I", "-B", str(generation / "platform_workflow_remote_dispatch.py"), "host-capabilities"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20, check=False, env={"PATH":"/usr/sbin:/usr/bin:/sbin:/bin", "PYTHONDONTWRITEBYTECODE":"1", "LC_ALL":"C"})
+        if result.returncode != 0 or len(result.stdout) > 512 or result.stdout != capability.encode("ascii"): raise RuntimeError("dispatcher self-test failed")
+        sys.stdout.write(f"HOST_TOOLS_READY schema=1 source_sha={sha} manifest_sha256={payload['manifest_sha256']}\n")
+        return 0
+    finally:
+        for fd in reversed(held):
+            try: fcntl.flock(fd, fcntl.LOCK_UN)
+            finally: os.close(fd)
+try: raise SystemExit(main())
+except Busy: raise SystemExit(75)
+except BaseException: raise SystemExit(1)
+'''
 # OpenSSH private-key files are multiline text. GitHub Actions secrets are
 # limited to 48 KiB; reserve another 16 KiB for envelope/formatting overhead
 # while preventing an unbounded secret from reaching the runner's SSH directory.
@@ -298,6 +401,73 @@ def _remote(remote: list[str], *fixed_args: str, timeout: int = 60, max_output: 
     return _run([*remote, *fixed_args], timeout=timeout, max_output=max_output)
 
 
+def _locked_final_generation_check(
+    remote: list[str],
+    *,
+    sha: str,
+    toolset_version: str,
+    generation: str,
+    digests: list[tuple[str, str]],
+    manifest_hash: str,
+    capabilities_hash: str,
+) -> bool:
+    """Return false only when a canonical lock is busy; validate under both."""
+
+    members = _locked_generation_members(digests, toolset_version, manifest_hash, capabilities_hash)
+    expected_member_count = 16 if toolset_version == "production-host-tools-v3" else 17
+    payload = {
+        "generation": generation,
+        "source_sha": sha,
+        "toolset_version": toolset_version,
+        "manifest_sha256": manifest_hash,
+        "capabilities_sha256": capabilities_hash,
+        "expected_member_count": expected_member_count,
+        "members": members,
+    }
+    encoded = base64.b64encode(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("ascii")
+    ).decode("ascii")
+    code = base64.b64encode(LOCKED_FINAL_CHECK.encode("ascii")).decode("ascii")
+    remote_command = " ".join(shlex.quote(value) for value in (
+        "/usr/bin/python3.12", "-I", "-B", "-c",
+        f"import base64; exec(base64.b64decode('{code}'))", encoded,
+    ))
+    try:
+        output = _run([*remote, remote_command], timeout=35, max_output=1024)
+    except RemoteCommandFailure as exc:
+        if exc.returncode == 75:
+            return False
+        raise
+    expected = f"HOST_TOOLS_READY schema=1 source_sha={sha} manifest_sha256={manifest_hash}\n".encode("ascii")
+    if output != expected:
+        raise VerificationError("locked host-tools generation verification failed")
+    return True
+
+
+def _locked_generation_members(
+    digests: list[tuple[str, str]], toolset_version: str,
+    manifest_hash: str, capabilities_hash: str,
+) -> list[dict[str, object]]:
+    """Build the exact v3/v4 installed inventory, with root files only once."""
+
+    members = [
+        {"name": name, "sha256": digest, "mode": 0o555}
+        for digest, name in digests
+        if name not in {"manifest.json", "capabilities.txt"}
+    ]
+    members.extend((
+        {"name": "manifest.json", "sha256": manifest_hash, "mode": 0o444},
+        {"name": "capabilities.txt", "sha256": capabilities_hash, "mode": 0o444},
+    ))
+    names = [item["name"] for item in members]
+    expected_count = {"production-host-tools-v3": 16, "production-host-tools-v4": 17}.get(toolset_version)
+    if expected_count is None or len(names) != expected_count or len(set(names)) != expected_count:
+        raise VerificationError("host-tools locked inventory cardinality is invalid")
+    if sum(item["name"] == "capabilities.txt" and item["mode"] == 0o444 for item in members) != 1:
+        raise VerificationError("host-tools capabilities inventory is invalid")
+    return members
+
+
 def verify_installed_generation(
     sha: str, toolset_version: str, contract_dir: Path, *, wait_seconds: int = 0,
 ) -> tuple[Path, Path, bool]:
@@ -386,6 +556,23 @@ def verify_installed_generation(
         capability_output = _remote(remote, "/usr/bin/python3.12", "-I", "-B", dispatcher, "host-capabilities", timeout=20, max_output=512)
         if capability_output != expected_capability.encode("ascii"):
             raise VerificationError("installed host-tools capability self-test failed")
+        # A provisioner may publish the exact generation while holding both
+        # canonical locks and run the same self-test. Retry only true lock
+        # contention; malformed or missing lock state remains fail-closed.
+        while True:
+            if _locked_final_generation_check(
+                remote,
+                sha=sha,
+                toolset_version=toolset_version,
+                generation=generation,
+                digests=digests,
+                manifest_hash=manifest_hash,
+                capabilities_hash=capabilities_hash,
+            ):
+                break
+            if time.monotonic() >= deadline:
+                raise VerificationError("canonical production locks remained busy")
+            time.sleep(min(5, max(0.0, deadline - time.monotonic())))
         return ssh_dir, Path(generation), created
     finally:
         if created:

@@ -63,29 +63,29 @@ class PlatformPrepareTestRuntimeTests(unittest.TestCase):
                 prepare.loopback_database_parts(url)
 
     def test_postgres_bootstrap_binds_admin_commands_to_source_host_and_port(self) -> None:
-        calls: list[list[str]] = []
-        outputs = [
-            "postgres|postgres|127.0.0.1|55432",
-            "",
-            "1",
-            "",
-        ]
+        for host, identity in (("127.0.0.1", "127.0.0.1"), ("::1", "::1")):
+            with self.subTest(host=host):
+                calls: list[list[str]] = []
+                outputs = [f"postgres|postgres|{identity}|55432", "", "1", ""]
 
-        def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-            calls.append(command)
-            return subprocess.CompletedProcess(command, 0, outputs.pop(0), "")
+                def run(
+                    command: list[str], **kwargs: object
+                ) -> subprocess.CompletedProcess[str]:
+                    calls.append(command)
+                    return subprocess.CompletedProcess(command, 0, outputs.pop(0), "")
 
-        with patch.dict(os.environ, {"PGHOST": "127.0.0.1", "PGPORT": "5432"}), patch.object(
-            prepare.subprocess, "run", side_effect=run,
-        ):
-            prepare.prepare_postgres("test-password", host="127.0.0.1", port=55432)
+                with patch.dict(
+                    os.environ, {"PGHOST": "127.0.0.1", "PGPORT": "5432"}
+                ), patch.object(prepare.subprocess, "run", side_effect=run):
+                    prepare.prepare_postgres("test-password", host=host, port=55432)
 
-        self.assertGreaterEqual(len(calls), 4)
-        for command in calls:
-            self.assertIn("--host=127.0.0.1", command)
-            self.assertIn("--port=55432", command)
-            self.assertNotIn("--port=5432", command)
-        self.assertIn("inet_server_port()", calls[0][-1])
+                self.assertGreaterEqual(len(calls), 4)
+                for command in calls:
+                    self.assertIn(f"--host={host}", command)
+                    self.assertIn("--port=55432", command)
+                    self.assertNotIn("--port=5432", command)
+                self.assertIn("host(inet_server_addr())", calls[0][-1])
+                self.assertIn("inet_server_port()", calls[0][-1])
 
     def test_postgres_bootstrap_fails_before_writes_when_bound_cluster_is_unavailable(self) -> None:
         with patch.object(

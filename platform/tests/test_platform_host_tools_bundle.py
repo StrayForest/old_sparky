@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -180,6 +181,22 @@ class HostToolsBundleTests(unittest.TestCase):
             runner_temp = root / "runner-temp"
             runner_temp.mkdir()
             contract = self._installed_checker_contract(root)
+            (contract / "platform_example.py").unlink()
+            contract_rows: list[tuple[str, str]] = []
+            for index in range(15):
+                name = f"platform_tool_{index}.py"
+                content = f"fixture host tool {index}\n".encode("ascii")
+                (contract / name).write_bytes(content)
+                contract_rows.append((hashlib.sha256(content).hexdigest(), name))
+            contract_rows.append(("c" * 64, "capabilities.txt"))
+            (contract / "files.sha256").write_text(
+                "".join(f"{digest} {name}\n" for digest, name in contract_rows),
+                encoding="ascii",
+            )
+            (contract / "files.modes").write_text(
+                "".join(f"{'444' if name == 'capabilities.txt' else '555'} {name}\n" for _, name in contract_rows),
+                encoding="ascii",
+            )
             private_key = self._temporary_ed25519_private_key(root)
             private_key_path = root / "fixture-id-ed25519"
             public_key_fields = subprocess.run(
@@ -221,6 +238,32 @@ class HostToolsBundleTests(unittest.TestCase):
                         ["/usr/bin/timeout", "--foreground", "4s", "/usr/bin/ssh-keyscan", "-T", "3", "-t", "ed25519", "production.example.test"],
                     )
                     return f"# SSH-2.0-OpenSSH_10.2\n\n{expected_host_key}\n".encode("ascii")
+                if argv[0] == "/usr/bin/ssh":
+                    remote_argv = shlex.split(argv[-1])
+                    self.assertEqual(remote_argv[:3], ["/usr/bin/python3.12", "-I", "-B"])
+                    self.assertEqual(remote_argv[3], "-c")
+                    payload = json.loads(base64.b64decode(remote_argv[-1], validate=True))
+                    members = payload["members"]
+                    expected_count = 16 if payload["toolset_version"] == "production-host-tools-v3" else 17
+                    self.assertEqual(payload["expected_member_count"], expected_count)
+                    names = [row["name"] for row in members]
+                    self.assertEqual(len(names), expected_count)
+                    self.assertEqual(len(set(names)), expected_count)
+                    self.assertEqual(names.count("capabilities.txt"), 1)
+                    self.assertEqual(names.count("manifest.json"), 1)
+                    self.assertEqual(
+                        next(row["mode"] for row in members if row["name"] == "capabilities.txt"),
+                        0o444,
+                    )
+                    self.assertEqual(
+                        next(row["mode"] for row in members if row["name"] == "manifest.json"),
+                        0o444,
+                    )
+                    self.assertEqual(sum(row["mode"] == 0o555 for row in members), expected_count - 2)
+                    return (
+                        f"HOST_TOOLS_READY schema=1 source_sha={SOURCE_SHA} "
+                        f"manifest_sha256={manifest_hash}\n"
+                    ).encode("ascii")
                 if argv[:2] == ["/usr/bin/ssh-keygen", "-lf"]:
                     self.assertIn(argv[2], {str(ssh_dir / "known_hosts.scan"), str(ssh_dir / "known_hosts")})
                     self.assertEqual(argv[3:], ["-E", "sha256"])
@@ -289,6 +332,20 @@ class HostToolsBundleTests(unittest.TestCase):
             self.assertEqual(str(checked_generation), generation)
             self.assertTrue(created)
             self.assertFalse(ssh_dir.exists())
+            v3_rows = [
+                (f"{index:064x}", f"platform_tool_{index}.py")
+                for index in range(14)
+            ] + [("d" * 64, "capabilities.txt")]
+            with patch.object(installed_check, "_run", side_effect=local_command):
+                self.assertTrue(installed_check._locked_final_generation_check(
+                    ["/usr/bin/ssh", "-n", "-T", "-o", "BatchMode=yes"],
+                    sha=SOURCE_SHA,
+                    toolset_version="production-host-tools-v3",
+                    generation=generation,
+                    digests=v3_rows,
+                    manifest_hash="b" * 64,
+                    capabilities_hash="c" * 64,
+                ))
 
             # The deploy workflow can precreate this directory from its own
             # banner-tolerant scan before calling the shared verifier. Reuse
@@ -489,6 +546,37 @@ class HostToolsBundleTests(unittest.TestCase):
             self.assertEqual(modes, [("555", "platform_example.py")])
             self.assertEqual(manifest, "b" * 64)
             self.assertEqual(capabilities, "c" * 64)
+
+            v4_contract_rows = [
+                (f"{index:064x}", f"platform_tool_{index}.py")
+                for index in range(15)
+            ] + [("d" * 64, "capabilities.txt")]
+            locked_members = installed_check._locked_generation_members(
+                v4_contract_rows, "production-host-tools-v4", "b" * 64, "c" * 64
+            )
+            self.assertEqual(len(locked_members), 17)
+            self.assertEqual(len({row["name"] for row in locked_members}), 17)
+            self.assertEqual(
+                [row for row in locked_members if row["name"] == "capabilities.txt"],
+                [{"name": "capabilities.txt", "sha256": "c" * 64, "mode": 0o444}],
+            )
+            self.assertEqual(
+                [row for row in locked_members if row["name"] == "manifest.json"],
+                [{"name": "manifest.json", "sha256": "b" * 64, "mode": 0o444}],
+            )
+            v3_contract_rows = [
+                (f"{index:064x}", f"platform_tool_{index}.py")
+                for index in range(14)
+            ] + [("d" * 64, "capabilities.txt")]
+            v3_members = installed_check._locked_generation_members(
+                v3_contract_rows, "production-host-tools-v3", "b" * 64, "c" * 64
+            )
+            self.assertEqual(len(v3_members), 16)
+            self.assertEqual(len({row["name"] for row in v3_members}), 16)
+            with self.assertRaises(installed_check.VerificationError):
+                installed_check._locked_generation_members(
+                    v4_contract_rows, "production-host-tools-v3", "b" * 64, "c" * 64
+                )
             (contract / "files.sha256").write_text(f"{'a' * 64} ../escape\n", encoding="ascii")
             (contract / "files.sha256").chmod(0o600)
             with self.assertRaises(installed_check.VerificationError):

@@ -2438,6 +2438,7 @@ class LiveQaGuardTests(unittest.TestCase):
             provider_version: int = 1,
             link_alias: bool = False,
             extra_provider_suite_file: bool = False,
+            live_image_inventory_helper: bool = False,
             nested_package_files: bool = False,
             nested_node_modules: bool = False,
         ) -> tuple[Path, Path]:
@@ -2497,6 +2498,11 @@ class LiveQaGuardTests(unittest.TestCase):
 
             web_root = runtime_root / "web"
             web_root.mkdir(mode=0o555)
+            if live_image_inventory_helper:
+                helper = runtime_root / "web/tests/support/live-image-inventory.ts"
+                helper.parent.mkdir(mode=0o555, parents=True)
+                helper.write_text("export {}\n", encoding="ascii")
+                os.chmod(helper, 0o444)
             package_lock = b"{}\n"
             (web_root / "package-lock.json").write_bytes(package_lock)
             os.chmod(web_root / "package-lock.json", 0o444)
@@ -2683,6 +2689,7 @@ class LiveQaGuardTests(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(guard.GuardError, "file map is invalid"):
                     resolve(pointer, base / "trusted" / "releases")
+
             with tempfile.TemporaryDirectory(dir="/root") as temporary:
                 base = Path(temporary)
                 pointer, _node = make_provider(
@@ -2695,6 +2702,17 @@ class LiveQaGuardTests(unittest.TestCase):
                     guard.GuardError, "unreviewed directory|unreviewed file"
                 ):
                     resolve(pointer, base / "trusted" / "releases")
+
+        with self.subTest("provider v1 admits only the fixed inventory helper path"):
+            with tempfile.TemporaryDirectory(dir="/root") as temporary:
+                base = Path(temporary)
+                pointer, _node = make_provider(
+                    base, provider_version=1, live_image_inventory_helper=True
+                )
+                self.assertEqual(
+                    resolve(pointer, base / "trusted" / "releases"),
+                    base / "trusted" / "releases" / provider_sha / "runtime",
+                )
 
         with self.subTest("provider v2 self-owned"):
             with tempfile.TemporaryDirectory(dir="/root") as temporary:

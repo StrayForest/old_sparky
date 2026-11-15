@@ -89,6 +89,15 @@ CI_LOCK_GENERATOR = PLATFORM_ROOT / "tools" / "platform_generate_ci_lock.sh"
 CI_PIP_ENV = PLATFORM_ROOT / "tools" / "platform_ci_pip_env.sh"
 WEB_PACKAGE = PLATFORM_ROOT / "apps" / "platform_web" / "package.json"
 WEB_PLAYWRIGHT_CONFIG = PLATFORM_ROOT / "apps" / "platform_web" / "playwright.config.ts"
+WEB_IMAGE_INVENTORY_CONFIG = (
+    PLATFORM_ROOT / "apps" / "platform_web" / "playwright.image-inventory.config.ts"
+)
+WEB_IMAGE_INVENTORY_SPEC = (
+    PLATFORM_ROOT
+    / "apps"
+    / "platform_web"
+    / "tests/image-inventory/live-image-inventory.spec.ts"
+)
 WEB_PARTICIPANT_CONFIG = PLATFORM_ROOT / "apps" / "platform_web" / "playwright.participant.config.ts"
 WEB_SOURCE_CONTRACT_CONFIG = PLATFORM_ROOT / "apps" / "platform_web" / "playwright.source-contract.config.ts"
 WEB_HERMETIC_RUNNER = PLATFORM_ROOT / "tools" / "platform_web_hermetic.sh"
@@ -2508,6 +2517,14 @@ def collect_issues() -> list[str]:
         source_contract_script = scripts.get("test:source-contract")
         if not isinstance(source_contract_script, str) or "playwright.source-contract.config.ts" not in source_contract_script:
             issues.append("source-contract assertions must have a dedicated Playwright runner")
+        expected_image_inventory_script = (
+            "../../tools/platform_node.sh ./node_modules/@playwright/test/cli.js test "
+            "--config=playwright.image-inventory.config.ts --project=webkit-mobile"
+        )
+        if scripts.get("test:image-inventory:webkit") != expected_image_inventory_script:
+            issues.append(
+                "image inventory regression must use the dedicated hermetic WebKit project"
+            )
 
     try:
         web_config = WEB_PLAYWRIGHT_CONFIG.read_text(encoding="utf-8")
@@ -2566,6 +2583,43 @@ def collect_issues() -> list[str]:
             issues.append("participant hermetic fixture must use the shared prepared-build API destination")
 
     try:
+        image_inventory_config = WEB_IMAGE_INVENTORY_CONFIG.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        issues.append(f"image inventory Playwright config is unreadable: {exc}")
+    else:
+        for required in (
+            'testDir: "./tests/image-inventory"',
+            'testMatch: ["live-image-inventory.spec.ts"]',
+            'name: "webkit-mobile"',
+            '...devices["iPhone 13"]',
+            "PLATFORM_WEB_HERMETIC_BUILD_DIR",
+            "image-inventory-results",
+        ):
+            if required not in image_inventory_config:
+                issues.append(
+                    "image inventory config must run only the isolated WebKit fixture"
+                )
+                break
+        if "webServer" in image_inventory_config:
+            issues.append("image inventory fixture must not start a web or API server")
+
+    try:
+        image_inventory_spec = WEB_IMAGE_INVENTORY_SPEC.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        issues.append(f"image inventory fixture is unreadable: {exc}")
+    else:
+        if (
+            'page.route("http://image-inventory.test/**"' not in image_inventory_spec
+            or "route.fulfill" not in image_inventory_spec
+            or "old-sparky.com" in image_inventory_spec
+            or "PLAYWRIGHT_LIVE_BASE_URL" in image_inventory_spec
+            or "PLATFORM_QA_BROWSER_GATE_DIR" in image_inventory_spec
+        ):
+            issues.append(
+                "image inventory fixture must fulfill only its local synthetic image/API routes"
+            )
+
+    try:
         source_contract_config = WEB_SOURCE_CONTRACT_CONFIG.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         issues.append(f"source-contract Playwright config is unreadable: {exc}")
@@ -2583,6 +2637,30 @@ def collect_issues() -> list[str]:
             issues.append("web hermetic build must serialize the shared API rewrite destination")
         if "test:source-contract" not in runner_text:
             issues.append("web hermetic runner must execute source-contract assertions once")
+        image_test_command = 'run test:image-inventory:webkit'
+        runner_lines = runner_text.splitlines()
+        image_test_line = next(
+            (
+                index
+                for index, line in enumerate(runner_lines)
+                if image_test_command in line
+            ),
+            -1,
+        )
+        image_test_block = (
+            "\n".join(runner_lines[image_test_line - 2 : image_test_line + 1])
+            if image_test_line >= 2
+            else ""
+        )
+        if (
+            not image_test_block
+            or 'PLAYWRIGHT_BROWSERS_PATH="$BUILD_DIR/browsers"' not in image_test_block
+            or 'PLATFORM_WEB_HERMETIC_BUILD_DIR="$BUILD_DIR"' not in image_test_block
+            or not runner_lines[image_test_line].lstrip().startswith('"$TOOLS_DIR/platform_web_npm.sh"')
+        ):
+            issues.append(
+                "web hermetic runner must use the isolated WebKit inventory with its pinned browser root"
+            )
 
     if not CLASSIFIER_TOOL.is_file():
         issues.append("platform_ci_classifier.py is missing")

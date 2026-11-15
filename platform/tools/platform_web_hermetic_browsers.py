@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Provision the pinned Chromium browsers for the hermetic web contour."""
+"""Provision pinned Chromium and WebKit browsers for the hermetic web contour."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ except ModuleNotFoundError:  # Imported as ``tools.platform_web_hermetic_browser
 HERMETIC_ARCHIVE_NAMES = (
     "chromium-1228",
     "chromium_headless_shell-1228",
+    "webkit-2311",
     "ffmpeg-1011",
 )
 HERMETIC_BROWSER_ROOTS = frozenset(HERMETIC_ARCHIVE_NAMES)
@@ -77,7 +78,7 @@ def _exclusive_output_parent(parent: Path):
 
 
 def _selected_archives() -> tuple[tuple[str, str, str, int], ...]:
-    """Return exactly the Chromium/Headless/ffmpeg records from the guard."""
+    """Return exactly the Chromium/Headless/WebKit/ffmpeg records from the guard."""
 
     selected = tuple(
         archive
@@ -135,7 +136,7 @@ def _assert_inventory(root: Path) -> None:
 
 
 def provision(web_root: Path, output: Path) -> None:
-    """Install the lock-selected Chromium archives into a fresh run directory."""
+    """Install the lock-selected browser archives into a fresh run directory."""
 
     web_root = web_root.resolve(strict=True)
     if not web_root.is_dir():

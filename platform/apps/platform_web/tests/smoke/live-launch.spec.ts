@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 import type { Locator } from "@playwright/test";
 import LiveCountReporter from "../support/live-count-reporter.cjs";
+import { collectLiveImageInventory } from "../support/live-image-inventory";
 import { assertLiveQaChromiumSandbox } from "../support/live-qa-sandbox";
 import { patchAcceptanceIssues } from "../support/patch-acceptance";
 import type { PlatformPatchDetail, PlatformPatchSection } from "../../lib/platform-types";
@@ -935,6 +936,50 @@ test("live Cloudflare Analytics is conditionally observed without widening CSP",
   });
 });
 
+async function waitForImageRouteContent(
+  page: import("@playwright/test").Page,
+  route: string,
+  patchId: string,
+): Promise<void> {
+  if (route === "/") {
+    const contentResponsePromise = page.waitForResponse((response) => (
+      new URL(response.url()).pathname.endsWith("/api/v1/content/home")
+    ));
+    const navigationResponse = await page.goto(route);
+    expect(navigationResponse?.ok(), "home route should render successfully").toBe(true);
+    const contentResponse = await contentResponsePromise;
+    expect(contentResponse.ok(), "home content should load successfully").toBe(true);
+    await expect(page.locator(".home-content-error")).toHaveCount(0);
+    await expect(
+      page.locator(
+        ".patch-showcase:not(.patch-showcase-loading), .home-content-group .home-empty-state",
+      ).first(),
+    ).toBeVisible();
+    return;
+  }
+
+  if (route.startsWith("/patches/")) {
+    const contentResponsePromise = page.waitForResponse((response) => (
+      new URL(response.url()).pathname.endsWith(`/api/v1/content/patches/${patchId}`)
+    ));
+    const navigationResponse = await page.goto(route);
+    expect(navigationResponse?.ok(), "patch route should render successfully").toBe(true);
+    const contentResponse = await contentResponsePromise;
+    expect(contentResponse.ok(), "patch content should load successfully").toBe(true);
+    await expect(page.locator(".home-content-error")).toHaveCount(0);
+    await expect(page.locator(".patch-article")).toBeVisible();
+    return;
+  }
+
+  const navigationResponse = await page.goto(route);
+  expect(navigationResponse?.ok(), "tournament route should render successfully").toBe(true);
+  const tournamentGrid = page.getByTestId("tournaments-grid");
+  await expect(tournamentGrid).toBeVisible();
+  await expect(tournamentGrid).toHaveAttribute("aria-busy", "false");
+  await expect(tournamentGrid.getByRole("alert")).toHaveCount(0);
+  await expect(page.locator(".tournament-list-error")).toHaveCount(0);
+}
+
 test("live image currentSrc inventory stays inside the exact CSP hosts", async ({ page, request }, testInfo) => {
   test.setTimeout(120_000);
   const allowedHosts = new Set([
@@ -950,56 +995,15 @@ test("live image currentSrc inventory stays inside the exact CSP hosts", async (
   const inventory: Array<{ host: string; path: string; route: string }> = [];
   const patchId = await currentIndexedPatchId(request);
   for (const route of ["/", `/patches/${patchId}`, "/tournaments"]) {
-    await page.goto(route);
+    const imageResult = await collectLiveImageInventory(page, {
+      route,
+      waitForContent: () => waitForImageRouteContent(page, route, patchId),
+      timeoutMs: 30_000,
+    });
     allowedHosts.add(new URL(page.url()).hostname);
-    const imageLocator = page.locator("img");
-    let previousCount = -1;
-    let stablePasses = 0;
-    for (let pass = 0; pass < 5 && stablePasses < 2; pass += 1) {
-      const imageCount = await imageLocator.count();
-      stablePasses = imageCount === previousCount ? stablePasses + 1 : 0;
-      previousCount = imageCount;
-      for (let index = 0; index < imageCount; index += 1) {
-        await imageLocator.nth(index).evaluate(
-          (image) => {
-            image.scrollIntoView({ block: "center", inline: "nearest" });
-          },
-          undefined,
-          { timeout: 2_000 },
-        ).catch(() => undefined);
-        // WebKit can keep a background tab's animation frame queue paused;
-        // this wait is only to give lazy images a scheduling opportunity and
-        // must not make the inventory test hang until the test timeout.
-        await page.waitForTimeout(50);
-      }
-    }
-    let images: Array<{
-      alt: string;
-      currentSrc: string;
-      loaded: boolean;
-      source: string;
-    }> = [];
+    const images = imageResult.images;
     try {
-      await expect.poll(
-        async () => {
-          images = await imageLocator.evaluateAll((elements) => elements.map((element) => {
-            const image = element as HTMLImageElement;
-            return {
-              alt: image.alt,
-              currentSrc: image.currentSrc,
-              loaded: image.complete && image.naturalWidth > 0,
-              source: image.getAttribute("src") ?? "",
-            };
-          }));
-          return images.length > 0 && images.every((image) => (
-            Boolean(image.currentSrc) && image.loaded
-          ));
-        },
-        {
-          message: `all images load on ${route}`,
-          timeout: 30_000,
-        },
-      ).toBe(true);
+      expect(imageResult.complete, `all images load on ${route}`).toBe(true);
     } catch (error) {
       await testInfo.attach(`failed-image-snapshot-${route.replaceAll("/", "-") || "root"}`, {
         body: JSON.stringify(images.filter((image) => !image.currentSrc || !image.loaded)),

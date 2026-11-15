@@ -118,3 +118,10 @@ PLATFORM_WEB_HERMETIC_BUILD_DIR="$BUILD_DIR" \
 PLAYWRIGHT_BROWSERS_PATH="$BUILD_DIR/browsers" \
 PLATFORM_WEB_HERMETIC_BUILD_DIR="$BUILD_DIR" \
   "$TOOLS_DIR/platform_web_npm.sh" run test:ssr-diagnostic-e2e
+
+# A separate local-only WebKit contour reproduces image lazy-loading timing in
+# the browser engine used by public mobile QA. It uses checked-in fixtures,
+# fulfills image requests locally and writes Playwright output under BUILD_DIR.
+PLAYWRIGHT_BROWSERS_PATH="$BUILD_DIR/browsers" \
+PLATFORM_WEB_HERMETIC_BUILD_DIR="$BUILD_DIR" \
+  "$TOOLS_DIR/platform_web_npm.sh" run test:image-inventory:webkit

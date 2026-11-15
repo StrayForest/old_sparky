@@ -33,7 +33,7 @@ Fork, mixed, unknown, sensitive, `merge_group` and `dev` push routes retain full
 | `migration` | persistence owners | disposable PostgreSQL only | CI |
 | `docs` | platform maintainers | repository checkout; Markdown docs and project skill metadata | local feedback + CI |
 | `web-quality` | web owners | Node 26.3.1 and locked dependencies | local feedback + CI |
-| `web-hermetic` | web owners | local/mocked API and Chromium; hosted CI also runs isolated PostgreSQL/Redis auth lifecycle E2E | hosted CI; local run is blocked unless the exact disposable CI services are configured |
+| `web-hermetic` | web owners | local/mocked API, pinned Chromium and WebKit; hosted WebKit uses the locked Playwright CLI to install browser system dependencies on an ephemeral Ubuntu 24.04 runner; auth lifecycle E2E requires the GitHub Actions identity plus isolated PostgreSQL/Redis services | hosted CI; full local run stops at the hosted-only auth E2E preflight |
 | `verification-contract` | platform tooling owners | repository checkout; attested actionlint 1.7.12 | local feedback + CI |
 | `release-runtime` | release owners | root test user; disposable staged checkout and local ZIP fixtures | conditional runtime-sensitive/fallback fixture route |
 | `server-smoke` | release owners | exact deployed SHA | deployment workflow |
@@ -402,7 +402,7 @@ runner performs Playwright `--list` discovery, builds the standalone Next
 artifact once, then runs source-contract, required auth lifecycle E2E, smoke
 and participant suites from that build. Auth precedes smoke; smoke and
 participant are separate runs with fresh API/web processes and
-`reuseExistingServer: false`, so no ambient server/browser/database is reused.
+`reuseExistingServer: false`, so no ambient server/browser/database is reused; it then invokes the isolated `test:image-inventory:webkit` project with the same pinned browser root, no server/API/database/external image requests, and output under the run-private build directory removed on exit.
 
 The responsive smoke project owns `desktop`, `wide-1300`, `tablet-820` and
 `mobile-layout` viewports. Responsive specs run in that matrix; the explicit
