@@ -7569,6 +7569,8 @@ def _stop_timed_out_qa_browser_unit() -> bool:
             return False
     if _liveqa_cgroup_process_ids():
         return False
+    if _liveqa_process_ids():
+        return False
 
     try:
         state = subprocess.run(  # nosec B603
@@ -7595,10 +7597,21 @@ def _stop_timed_out_qa_browser_unit() -> bool:
     rows = state.stdout.decode("ascii", errors="ignore").splitlines()
     if state.returncode == 0 and rows == ["LoadState=loaded", "ActiveState=inactive"]:
         return True
+    if (
+        state.returncode == 0
+        and rows == ["LoadState=not-found", "ActiveState=inactive"]
+        and not _liveqa_cgroup_process_ids()
+        and not _liveqa_process_ids()
+    ):
+        # `systemd-run --collect` may remove the fixed transient unit as soon
+        # as the stopped service is reaped.  Treat that collected state as
+        # clean only after the cgroup and dedicated QA identity are both empty.
+        return True
     return (
         state.returncode == 1
         and rows == ["LoadState=not-found", "ActiveState="]
         and not _liveqa_cgroup_process_ids()
+        and not _liveqa_process_ids()
     )
 
 
@@ -8019,12 +8032,21 @@ def _is_fixed_public_live_browser_command(command: list[str]) -> bool:
             or engine_match is None
             or suite_match.group(1) != env["PLATFORM_LIVE_QA_TARGET_SHA"]
             or suite_match.group(2) != engine_match.group(2)
-            or bind_paths != [f"{suite_root}:{suite_root}", f"{engine_root}:{engine_root}"]
         ):
             return False
+        try:
+            suite_source = TRUSTED_PAYLOAD_ROOT / suite_match.group(1) / "runtime"
+            engine_source = _trusted_runtime_root()
+        except (GuardError, OSError):
+            return False
+        if bind_paths != [
+            f"{suite_source}:{suite_root}",
+            f"{engine_source}:{engine_root}",
+        ]:
+            return False
         expected_bind_args = [
-            f"--property=BindReadOnlyPaths={suite_root}:{suite_root}",
-            f"--property=BindReadOnlyPaths={engine_root}:{engine_root}",
+            f"--property=BindReadOnlyPaths={suite_source}:{suite_root}",
+            f"--property=BindReadOnlyPaths={engine_source}:{engine_root}",
         ]
     expected_before = [
         "/usr/bin/systemd-run",

@@ -4707,6 +4707,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         with (
             patch.object(platform_live_qa_guard.subprocess, "run", side_effect=(stop, state)) as run,
             patch.object(platform_live_qa_guard, "_liveqa_cgroup_process_ids", return_value=()),
+            patch.object(platform_live_qa_guard, "_liveqa_process_ids", return_value=()),
         ):
             self.assertTrue(platform_live_qa_guard._stop_timed_out_qa_browser_unit())
         self.assertEqual(run.call_args_list[0].args[0], [
@@ -4716,6 +4717,31 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             "oldsparky-liveqa-browser.service",
         ])
         self.assertEqual(run.call_args_list[1].args[0][-1], "oldsparky-liveqa-browser.service")
+
+        collected = SimpleNamespace(
+            returncode=0,
+            stdout=b"LoadState=not-found\nActiveState=inactive\n",
+        )
+        with (
+            patch.object(platform_live_qa_guard.subprocess, "run", side_effect=(stop, collected)),
+            patch.object(platform_live_qa_guard, "_liveqa_cgroup_process_ids", return_value=()),
+            patch.object(platform_live_qa_guard, "_liveqa_process_ids", return_value=()),
+        ):
+            self.assertTrue(platform_live_qa_guard._stop_timed_out_qa_browser_unit())
+
+        with (
+            patch.object(platform_live_qa_guard.subprocess, "run", side_effect=(stop, collected)),
+            patch.object(platform_live_qa_guard, "_liveqa_cgroup_process_ids", return_value=(123,)),
+            patch.object(platform_live_qa_guard, "_liveqa_process_ids", return_value=()),
+        ):
+            self.assertFalse(platform_live_qa_guard._stop_timed_out_qa_browser_unit())
+
+        with (
+            patch.object(platform_live_qa_guard.subprocess, "run", side_effect=(stop, collected)),
+            patch.object(platform_live_qa_guard, "_liveqa_cgroup_process_ids", return_value=()),
+            patch.object(platform_live_qa_guard, "_liveqa_process_ids", return_value=(123,)),
+        ):
+            self.assertFalse(platform_live_qa_guard._stop_timed_out_qa_browser_unit())
 
         failed = SimpleNamespace(returncode=1, stdout=b"")
         with patch.object(platform_live_qa_guard.subprocess, "run", return_value=failed):
@@ -4879,6 +4905,8 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         suffix = "a1b2c3d4"
         suite_root = f"/var/lib/oldsparky-liveqa/runtime-suite-{source_sha}-{suffix}"
         engine_root = f"/var/lib/oldsparky-liveqa/runtime-engine-{provider_sha}-{suffix}"
+        suite_source = f"/root/.oldsparky/liveqa/releases/{source_sha}/runtime"
+        engine_source = f"/root/.oldsparky/liveqa/releases/{provider_sha}/provider-runtime"
         gate = "/run/oldsparky-liveqa/public-live-qa.abcdefgh"
         command = [
             "/usr/bin/systemd-run", "--no-ask-password", "--quiet", "--wait",
@@ -4888,8 +4916,8 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             "--property=Restart=no", "--property=RuntimeMaxSec=30min",
             "--property=SendSIGKILL=yes", "--property=TimeoutStopSec=5s",
             "--property=UMask=0077",
-            f"--property=BindReadOnlyPaths={suite_root}:{suite_root}",
-            f"--property=BindReadOnlyPaths={engine_root}:{engine_root}",
+            f"--property=BindReadOnlyPaths={suite_source}:{suite_root}",
+            f"--property=BindReadOnlyPaths={engine_source}:{engine_root}",
             "--", "/usr/bin/env", "-i",
             "CHROME_DEVEL_SANDBOX="
             f"{engine_root}/{platform_live_qa_guard.CHROMIUM_SANDBOX_RELATIVE.as_posix()}",
@@ -4914,14 +4942,26 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 platform_live_qa_guard,
                 "liveqa_identity",
                 return_value=(1001, 1001),
+            ), patch.object(
+                platform_live_qa_guard,
+                "_trusted_runtime_root",
+                return_value=Path(engine_source),
             ):
                 return platform_live_qa_guard._is_fixed_public_live_browser_command(candidate)
 
-        self.assertTrue(platform_live_qa_guard._is_fixed_live_browser_command(command))
+        def is_fixed_browser(candidate: list[str]) -> bool:
+            with patch.object(
+                platform_live_qa_guard,
+                "_trusted_runtime_root",
+                return_value=Path(engine_source),
+            ):
+                return platform_live_qa_guard._is_fixed_live_browser_command(candidate)
+
+        self.assertTrue(is_fixed_browser(command))
         self.assertTrue(is_public_browser(command))
 
         project_subset = [*command, "--project=live-desktop"]
-        self.assertTrue(platform_live_qa_guard._is_fixed_live_browser_command(project_subset))
+        self.assertTrue(is_fixed_browser(project_subset))
         self.assertFalse(
             is_public_browser(project_subset)
         )
@@ -4939,7 +4979,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         )
         for invalid_prefix in invalid_prefixes:
             malformed = [*invalid_prefix, *command[separator:]]
-            self.assertTrue(platform_live_qa_guard._is_fixed_live_browser_command(malformed))
+            self.assertTrue(is_fixed_browser(malformed))
             self.assertFalse(is_public_browser(malformed))
 
         wrong_suite_binding = [
@@ -4949,7 +4989,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             )
             for item in command
         ]
-        self.assertTrue(platform_live_qa_guard._is_fixed_live_browser_command(wrong_suite_binding))
+        self.assertTrue(is_fixed_browser(wrong_suite_binding))
         self.assertFalse(is_public_browser(wrong_suite_binding))
 
         wrong_suite_sha = "e" * 40
@@ -4957,10 +4997,34 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         wrong_suite_identity = [
             item.replace(suite_root, wrong_suite_root) for item in command
         ]
-        self.assertTrue(platform_live_qa_guard._is_fixed_live_browser_command(wrong_suite_identity))
+        self.assertTrue(is_fixed_browser(wrong_suite_identity))
         self.assertFalse(
             is_public_browser(wrong_suite_identity)
         )
+
+        wrong_suite_source = [
+            item.replace(suite_source, "/run/untrusted-suite") for item in command
+        ]
+        self.assertTrue(is_fixed_browser(wrong_suite_source))
+        self.assertFalse(is_public_browser(wrong_suite_source))
+
+        wrong_engine_source = [
+            item.replace(engine_source, "/run/untrusted-engine") for item in command
+        ]
+        self.assertTrue(is_fixed_browser(wrong_engine_source))
+        with patch.object(
+            platform_live_qa_guard,
+            "_trusted_runtime_root",
+            return_value=Path(engine_source),
+        ):
+            self.assertFalse(is_public_browser(wrong_engine_source))
+
+        alias_bindings = [
+            item.replace(suite_source, suite_root).replace(engine_source, engine_root)
+            for item in command
+        ]
+        self.assertTrue(platform_live_qa_guard._is_fixed_live_browser_command(alias_bindings))
+        self.assertFalse(is_public_browser(alias_bindings))
 
         duplicate_environment = list(command)
         node_position = duplicate_environment.index(f"{engine_root}/node/bin/node")
@@ -5018,6 +5082,11 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 ),
                 patch.object(
                     platform_live_qa_guard,
+                    "_trusted_runtime_root",
+                    return_value=Path(engine_source),
+                ),
+                patch.object(
+                    platform_live_qa_guard,
                     "_capture_qa_child",
                     return_value=(0, marker),
                 ) as capture,
@@ -5032,6 +5101,9 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertEqual(selected_timeout(command), 1500.0)
         self.assertEqual(selected_timeout(project_subset), 300.0)
         self.assertEqual(selected_timeout(engine_preflight), 300.0)
+        self.assertEqual(selected_timeout(wrong_suite_source), 300.0)
+        self.assertEqual(selected_timeout(wrong_engine_source), 300.0)
+        self.assertEqual(selected_timeout(alias_bindings), 300.0)
 
     def test_deploy_marker_capture_keeps_bounded_timeout_cleanup(self) -> None:
         expected = ("deploy", "gha-123456-2-aaaaaaaaaaaa", "a" * 40)
