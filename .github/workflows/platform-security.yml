@@ -1036,7 +1036,7 @@ jobs:
     name: Web hermetic
     needs: [classifier, baseline-runtime-guard, host-tools-pin-preflight]
     if: ${{ !cancelled() && needs.classifier.result == 'success' && needs.host-tools-pin-preflight.result == 'success' && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime') && contains(fromJSON(needs.classifier.outputs.expected_gates), 'web-hermetic') }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     services:
       postgres:
@@ -1115,6 +1115,12 @@ jobs:
       - name: Install locked web dependencies
         working-directory: platform/apps/platform_web
         run: npm ci
+
+      - name: Install WebKit system dependencies for the pinned Playwright runner
+        run: >-
+          platform/tools/platform_node.sh
+          platform/apps/platform_web/node_modules/@playwright/test/cli.js
+          install-deps webkit
 
       - name: Run canonical web hermetic gate
         run: python3 platform/tools/platform_verify.py web-hermetic

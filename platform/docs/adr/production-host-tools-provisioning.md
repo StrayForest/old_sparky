@@ -329,7 +329,9 @@ installer:
    competing production operation exists; or (c) the exact automatic child whose only failure
    was the missing pinned generation, with prior checks passed and no build, pending state or
    production write. For (b), provision before the deadline; the parent verifies the generation
-   before dispatching its child. No other failure qualifies. Bind `TARGET_SHA`, `HOST_TOOLS_SHA`,
+   before dispatching its child. For route (b), AUTO's readiness job and shared verifier step
+   must still be `in_progress`; stop if readiness completed or dispatch started.
+   No other failure qualifies. Bind `TARGET_SHA`, `HOST_TOOLS_SHA`,
    builder job and full Sigstore signature/chain/subject/signer/source/invocation to exact runs.
    The parent artifact ID/name/digest must bind its exact parent run/attempt, independent of the
    source Security attempt; use its emitted name. Download through the approved channel and
@@ -343,24 +345,21 @@ installer:
    records for the 14 tools plus `capabilities.txt`; `manifest.json` is the
    separate sixteenth archive member and is not self-listed. Do not treat the
    record count as the archive member count.
-3. Through the approved root-only console or host-image pipeline, extract
-   verified bytes into a private staging directory for the exact
-   `HOST_TOOLS_SHA`. Before publication, independently check the complete
-   top-level name set against those 16 expected members, then verify each
-   member is a root-owned regular single-link file with the mode and digest
-   bound by the verified bundle and manifest. Reject extra entries such as
-   `__pycache__` and reject a missing `manifest.json`, even if all 14 tools
-   match. Do not import or execute a staged archive member while validating
-   this tree. Create the published generation with a `0555` directory and
-   `0555`/`0444` files as specified, and use an atomic no-replace rename only
-   after the complete independent check passes. Never install through the
-   deployment workflow or execute a downloaded installer or candidate
-   repository file on the host.
-4. Keep the previous valid generation untouched.  Before allowing deployment,
-   run the same inventory checks recorded by the workflow.  If any check fails,
-   remove only the incomplete new generation through the approved authority
-   and continue using the previous generation; do not repoint `current` and do
-   not weaken the gate.
+3. Through the approved root-only console or host-image pipeline, extract verified bytes into
+   private staging for the exact `HOST_TOOLS_SHA`. Derive the exact inventory from the pin and
+   bundle: v3 has 16 top-level members/15 records (14 tools, capabilities and manifest); v4 has
+   17 members/16 records (15 tools, capabilities and manifest). Verify that complete name set
+   and each root-owned regular single-link file's mode/digest; reject extras, a missing manifest,
+   or any staged member execution. Hold the canonical release then LiveQA locks through final
+   fresh source/window checks, no-replace publication, inventory recheck and fixed self-test.
+   Immediately before publication require AUTO readiness and its shared verifier still
+   `in_progress`, with no dispatch started. The shared verifier waits for both locks and checks
+   the final inventory/capabilities/self-test under them, so AUTO cannot dispatch early.
+4. Keep the previous generation untouched. On any post-publication check, fixed self-test or
+   success-evidence failure, remove or quarantine only the exact new generation inode after
+   checking its fixed path and complete tree, while both locks remain held. Preserve the prior
+   generation; never repoint `current`. Stop if exact cleanup cannot be proven. Never use the
+   deployment workflow as installer or execute downloaded/candidate code on the host.
 
 The evidence record must include the exact application `TARGET_SHA`, pinned
 `HOST_TOOLS_SHA`, GitHub artifact ID, outer artifact digest, inner bundle

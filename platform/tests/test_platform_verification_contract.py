@@ -2963,6 +2963,25 @@ except lock.VerificationLockError as exc:
         self.assertEqual(workflow_data["jobs"]["release-runtime"]["runs-on"], "ubuntu-latest")
         self.assertEqual(workflow_data["jobs"]["release-runtime-real"]["runs-on"], "ubuntu-latest")
         self.assertEqual(workflow_data["jobs"]["backend-privileged"]["runs-on"], "ubuntu-24.04")
+        web_hermetic = workflow_data["jobs"]["web-hermetic"]
+        self.assertEqual(web_hermetic["runs-on"], "ubuntu-24.04")
+        web_steps = web_hermetic["steps"]
+        webkit_dependency_step = next(
+            step for step in web_steps
+            if step.get("name") == "Install WebKit system dependencies for the pinned Playwright runner"
+        )
+        self.assertEqual(
+            " ".join(webkit_dependency_step["run"].split()),
+            "platform/tools/platform_node.sh platform/apps/platform_web/node_modules/@playwright/test/cli.js install-deps webkit",
+        )
+        self.assertLess(
+            next(i for i, step in enumerate(web_steps) if step.get("name") == "Install locked web dependencies"),
+            web_steps.index(webkit_dependency_step),
+        )
+        self.assertLess(
+            web_steps.index(webkit_dependency_step),
+            next(i for i, step in enumerate(web_steps) if step.get("name") == "Run canonical web hermetic gate"),
+        )
         integration_steps = workflow_data["jobs"]["backend-integration"]["steps"]
         self.assertEqual(
             workflow_data["jobs"]["backend-integration"]["env"],
