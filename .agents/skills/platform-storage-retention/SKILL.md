@@ -67,8 +67,10 @@ calling the task complete.
    release; an `unchanged` chain or receipt resolves to its validated older
    origin. Missing or invalid lineage fails the plan before backup or
    deletion. Apply a full sweep only when its fresh preview shows the
-   validated origin in `production_releases.retained` and absent from
-   `deleted`.
+   validated shared-venv origin in `production_releases.protected` or
+   `retained`, and absent from `deleted`. When the origin is the `current` or
+   `previous` pointer, it belongs in `protected`; otherwise it must be in
+   `retained`.
 
    Run the resolver from the exact active release. It prints only the validated
    origin slug; it fails closed if the active release lacks the CLI option or
@@ -92,8 +94,9 @@ calling the task complete.
    the property or edit the immutable release.
 
 3. Apply the bounded sweep through the installed service only when the fresh
-   exact preview confirms the validated shared-venv origin is retained and not
-   deleted. If origin validation fails or the preview lists it in `deleted`,
+   exact preview confirms the validated shared-venv origin is protected or
+   retained and not deleted. If origin validation fails or the preview lists it
+   in `deleted`,
    do not apply the full sweep; use step 4's release-only procedure or keep
    retention read-only until the origin is protected. When the precondition
    passes, use the reviewed
@@ -245,9 +248,9 @@ PY
 
    This emergency staging step may delete only the exact reviewed unprotected
    release candidates. Afterward, collect a fresh full-maintenance preview.
-   Start `deadlock-maintenance.service` only if that preview still retains the
-   validated origin and excludes it from `deleted`; otherwise keep the full
-   sweep read-only. Do not use `--skip-backup` for the full sweep.
+   Start `deadlock-maintenance.service` only if that preview still protects or
+   retains the validated origin and excludes it from `deleted`; otherwise keep
+   the full sweep read-only. Do not use `--skip-backup` for the full sweep.
 
 5. Verify and record the result before another run:
 
