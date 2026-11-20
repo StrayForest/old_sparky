@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-11-14
+- Last reviewed: 2026-11-20
 
 Read this page for live pins, pending release work, open QA gates and hard
 operational limits. Product contracts, procedures and detailed run evidence
@@ -11,43 +11,47 @@ belong in the linked owner documents below.
 ## Live and pending state
 
 - Production runs application source
-  `d52eb46080fed7a4dbc6c86c4b875cbe11cfa3a5` in release
-  `gha-43572099804-1-d52eb46080fe`; `previous` is original rollback source
-  `cb1a75114aac0f4fb0ee6cc407011f90c6e76f31` in release
-  `gha-43367073524-1-cb1a75114aac`. Preserve `cb1a...` as the rollback target.
-  Host-tools C4 `64cae2a4c8235df1ba5c044446cd2f497f4abdca` is selected and C3
-  `625bbaa11023ffaf059dfa03a34a4850b02d4f93` retained. The shared venv origin
-  is d52; Alembic current equals head `20261112_0055`.
-- Source `d52eb46080fed7a4dbc6c86c4b875cbe11cfa3a5` passed exact-SHA
-  Security run `43569313507/1` and backup `43571845676/1`. AUTO
-  `43570533763/1` succeeded. Production deploy `43572099804/1` succeeded;
-  actual-deploy artifact `14105022133` binds mode `deploy`, release
-  `gha-43572099804-1-d52eb46080fe` and source d52. Authorization artifact
-  `14104787647` binds sequencer `43572731917/1` (workflow 417784007) to that
-  deploy attempt and source. Public child `43572752214/1` created and uploaded
-  its receipt, passed child authentication, and completed public QA. Artifact
-  `14105615416` reports 57 attempts: 47 passed and 10 allowlisted expected
-  skips, with zero failures, flaky, interrupted or timed-out cases. The
-  coverage contract requires all 57 expected cases and validates each skip
-  annotation. UserQA child `43573228506/1` (workflow 340531613) bound to public
-  `43572752214/1`, deploy `43572099804/1` and source d52; artifact `14105311501`
-  reports complete coverage, one journey/attempt passed, zero skipped or
-  failed, child exit 0. Exact cleanup path and absence assertions passed.
-  Sequencer `43572731917/1`, public QA and UserQA all completed successfully.
-  Final strict preflight, origin
-  smokes and public smokes (33 checks, zero failures each) passed. Final
-  post-cleanup readiness is ready. API and web returned 200, all three app
-  services were active, both locks were free, there were no pending systemd
-  jobs, operation marker or diagnostic plans, and final consistency passed.
-  No GitHub workflow runs remained active. The maintenance service is
-  inactive/dead and its timer active/enabled. `dev` remains frozen.
-- The a289 sequencer attempt `43567504351/1` dispatched public child
-  `43567523083/1`, but failed while writing the exact child receipt; public
-  authentication rejected the child before browser QA, and no public or
-  UserQA result is credited. The six-value writer correction is in the d52
-  release. Human Chrome and live Cloudflare challenge/scoring remain
-  optional diagnostics; the CI Siteverify fixture does not establish
-  production Cloudflare scoring.
+  `8c575dbc0a510be5cf4cf6bbd4abc312c9a7db89` in release
+  `gha-44700419645-1-8c575dbc0a51`; `previous` is source
+  `720a6ea1a90090ef9aacc76c93b2ef8d8cc40a24` in release
+  `gha-43743890016-1-720a6ea1a900`. Host-tools pin
+  `aa4f9e075156bd9aadb699eb3a13253e80daf79a` is installed
+  as manifest `production-host-tools-v4` (SHA-256
+  `8363ca5c5b90de003e0e1e3b39179852621fd1a8383c167bc8107b3efa3b73c7`). The
+  deployed source updates Next.js to patched version 16.4.6. Active runtime
+  manifest is v3 with Node 26.3.1; runtime provider v2 is bound to source 8c.
+  Alembic current and head are both `20261115_0056` (admin tournament test
+  fixtures). The shared virtual-environment origin resolves to current 8c.
+- Source 8c passed exact-SHA Security run `44694724609/1` and backup
+  `44696295210/1`. AUTO `44696145318/2` succeeded, followed by production
+  deploy `44700419645/1`. The lock-held release preflight, runtime verification
+  and loopback/public-origin smokes passed.
+- Public QA `44701659435/1` passed 47 cases, skipped 10 allowlisted cases, and
+  had zero failures. UserQA `44702730670/1` succeeded. Parent run
+  `44701610827/1` succeeded with exact UserQA cleanup. The retention preview
+  and apply protected current and previous releases, deleted one
+  eligible old release, and removed no live-QA cache. The post-apply preview
+  has no remaining eligible deletions.
+  Canonical post-QA maintenance run `44705121244/1` succeeded in apply mode,
+  creating a new restore-verified backup of 135,102,570 bytes and retaining one
+  backup; disk had 6,804,692,992 bytes free (about 83% used). The earlier
+  deploy backup run remains the exact CI-bound release backup. Final readiness
+  found source 8c current and 720 previous, all app services active, live,
+  ready and web root endpoints returning 200, no transaction, zero LiveQA
+  gates and zero retained UserQA state directories. Maintenance service is
+  inactive with successful result and its timer is active/enabled. The fresh
+  post-retention preview protects current, previous and the current venv
+  origin, with zero remaining deletion candidates.
+- The active source includes admin manual tournament fixtures and migration
+  `20261115_0056_admin_tournament_test_fixtures.py`. Admins can create and
+  resume a marked fixture, prepare synthetic participants, generate teams
+  through the normal workflow and explicitly clean up only fixture-owned data.
+  The session list refreshes on entry or when the admin selects
+  “Обновить сессии”. See the [manual testing guide](admin-console-information-architecture.md#manual-testing)
+  and [product contract](product-reference.md).
+- Human Chrome and live Cloudflare challenge/scoring remain optional
+  diagnostics; the CI Siteverify fixture does not establish production
+  Cloudflare scoring.
 - Historical timeout and uncredited-run detail is in the
   [closeout audit](archive/simplification-performance-audit-2026-11-13.md).
 - The 11-cell production matrix is complete, but cell 9 failed its stress
@@ -66,10 +70,11 @@ belong in the linked owner documents below.
 
 ## QA and cleanup gates
 
-- Required production deployment, automatic public/UserQA, exact cleanup and
-  final idle-readiness gates are closed for d52. Human Chrome and real
-  Cloudflare challenge/scoring remain optional diagnostics; the CI Siteverify
-  fixture does not establish production Cloudflare scoring.
+- Required production deployment, public QA, UserQA and exact UserQA cleanup
+  passed for source 8c. Post-QA readiness, exact absence and maintenance
+  retention closeout passed. Human Chrome and real Cloudflare challenge/scoring
+  remain optional diagnostics; the CI Siteverify fixture does not establish
+  production Cloudflare scoring.
 - The completed external HTTP matrix is not whole-site functional coverage.
   Cell 9's attribution failure and cell 7's unresolved client/origin join are
   not closed by the separate SSR diagnostics. No cause or server capacity
