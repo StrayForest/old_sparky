@@ -79,9 +79,9 @@ systemctl show deadlock-maintenance.service --no-pager \
     /etc/systemd/system/deadlock-maintenance.service
 ```
 
-The preview lists pointers in `protected`, configured/operator pins plus the validated shared-venv origin in `retained`, and removals in `deleted`. The canonical planner resolves a fresh `snapshot`, `unchanged` lineage, or validated receipt; missing/invalid lineage fails before backup/deletion. Noncanonical roots use explicit pins. If an older validator rejects `MainPID=0`, keep it and retry after a reviewed update.
+The preview lists pointers in `protected`, configured/operator pins plus the validated shared-venv origin in `retained`, and removals in `deleted`. When the shared-venv origin is also `current` or `previous`, it appears in `protected` instead. The canonical planner resolves a fresh `snapshot`, `unchanged` lineage, or validated receipt; missing/invalid lineage fails before backup/deletion. Noncanonical roots use explicit pins. If an older validator rejects `MainPID=0`, keep it and retry after a reviewed update.
 
-For a retention preview only, stop the timer and verify the service is inactive; leave it stopped until the fresh preview retains the validated origin. Preserve its enabled state:
+For a retention preview only, stop the timer and verify the service is inactive; leave it stopped until the fresh preview shows the validated origin in `protected` or `retained`, and absent from `deleted`. Preserve its enabled state:
 
 ```bash
 set -euo pipefail
@@ -92,7 +92,7 @@ systemctl show deadlock-maintenance.timer --property=UnitFileState,NextElapseUSe
 systemctl show deadlock-maintenance.service --property=ActiveState,SubState,ExecStart --no-pager
 ```
 
-After a successful preview shows the validated origin in `retained`, not `deleted`, resume only if the timer was enabled before stopping; on failure keep it stopped and never start the service directly:
+After a successful preview shows the validated origin in `protected` or `retained`, and not in `deleted`, resume only if the timer was enabled before stopping; on failure keep it stopped and never start the service directly:
 
 ```bash
 set -euo pipefail
