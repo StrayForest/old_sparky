@@ -167,6 +167,12 @@ export type PlatformPatchAbilityStat = {
   upgrade_type?: PlatformPatchAbilityUpgradeType | null;
 };
 
+export type PlatformPatchChangeGroup = {
+  heading_index: number;
+  description_start: number;
+  description_end: number;
+};
+
 export type PlatformPatchAbility = {
   name: string;
   display_name?: string | null;
@@ -176,6 +182,7 @@ export type PlatformPatchAbility = {
   stats_pending?: boolean;
   icon_url: string | null;
   changes: string[];
+  change_groups?: PlatformPatchChangeGroup[];
 };
 
 export type PlatformPatchSection = {
@@ -195,6 +202,7 @@ export type PlatformPatchSection = {
   objective_key?: "urn" | "unstable_rift" | "mid_boss" | null;
   objective_icon_url?: string | null;
   changes: string[];
+  change_groups?: PlatformPatchChangeGroup[];
   abilities: PlatformPatchAbility[];
 };
 

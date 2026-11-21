@@ -51,6 +51,18 @@ descriptions and stats. New-hero and new-ability introductions, plus full
 ability replacements, expose the catalog/announcement description and
 source-backed numeric stats. Stats come from the latest game-data catalog, not
 a historical launch snapshot, so the client labels them as current values.
+
+The patch API keeps section and ability changes as ordered strings and adds
+optional index ranges for groups backed by explicit source markup: a standalone
+bold heading immediately followed by a Steam list. The heading and list items
+remain in their existing order in `changes`; the indexes only describe their
+presentation relationship. The web nests those list items under the heading.
+Unmarked paragraphs remain ordinary changes. The patch-source cache namespace
+is versioned when parser output changes; older cache entries without group
+metadata render as flat lists until refreshed.
+This parser metadata does not change translation segments, source hashes or the
+translation version.
+
 Each ability carries `presentation_kind` with
 `balance`, `introduction` or `replacement`; the client displays description
 and stats only for the latter two kinds. Intro stats retain a localized

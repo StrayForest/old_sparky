@@ -5829,6 +5829,32 @@ img.rank-icon,
   line-height: 1.55;
 }
 
+.patch-change-list > .patch-change-group {
+  padding-left: 0;
+  color: var(--text-main);
+}
+
+.patch-change-list > .patch-change-group::before {
+  content: none;
+}
+
+.patch-change-group > strong {
+  display: block;
+  font-weight: 700;
+}
+
+.patch-change-group-list {
+  display: grid;
+  gap: 7px;
+  margin: 8px 0 0;
+  padding: 0 0 0 16px;
+  list-style: none;
+}
+
+.patch-change-group-list > li {
+  padding-left: 18px;
+}
+
 .patch-change-list li::before {
   content: "";
   position: absolute;

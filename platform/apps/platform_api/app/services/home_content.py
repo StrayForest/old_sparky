@@ -37,7 +37,7 @@ DEADLOCK_ASSET_BASE_URL = "https://deadlock.io"
 HOME_CONTENT_KEY = "platform:home-content:v4"
 HOME_CONTENT_STALE_KEY = "platform:home-content:stale:v4"
 HOME_CONTENT_LOCK_KEY = "platform:home-content:refresh-lock:v4"
-PATCH_DETAIL_KEY_PREFIX = "platform:home-content:patch:v17:"
+PATCH_DETAIL_KEY_PREFIX = "platform:home-content:patch:v18:"
 PATCH_ASSET_CATALOG_KEY = "platform:home-content:patch-assets:v9"
 PATCH_ASSET_CATALOG_STALE_KEY = "platform:home-content:patch-assets-stale:v3"
 PATCH_ASSET_PENDING_RETRY_KEY = "platform:home-content:patch-assets-pending-retry:v1"
@@ -174,6 +174,39 @@ def _plain_text(value: str, *, max_length: int) -> str:
         flags=re.IGNORECASE,
     )
     return normalized[:max_length]
+
+
+def _extract_patch_change_group_sources(value: str) -> list[dict[str, Any]]:
+    """Keep explicit bold-heading/list relationships before Steam markup is flattened."""
+    patterns = (
+        re.compile(
+            r"\[b\](?P<heading>(?:(?!\[/b\]).)*)\[/b\](?:\s|\[/?p\])*\[list(?:=[^\]]*)?\](?P<items>.*?)\[/list\]",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        re.compile(
+            r"<(?:b|strong)\b[^>]*>(?P<heading>(?:(?!</(?:b|strong)>).)*)</(?:b|strong)>(?:\s|</?p\b[^>]*>)*<(?:ul|ol)\b[^>]*>(?P<items>.*?)</(?:ul|ol)>",
+            re.IGNORECASE | re.DOTALL,
+        ),
+    )
+    item_patterns = (
+        re.compile(r"\[\*\](?P<item>.*?)(?=\[\*\]|\[/list\]|$)", re.IGNORECASE | re.DOTALL),
+        re.compile(r"<li\b[^>]*>(?P<item>.*?)</li>", re.IGNORECASE | re.DOTALL),
+    )
+    groups: list[dict[str, Any]] = []
+    for block_pattern in patterns:
+        for block in block_pattern.finditer(value):
+            heading = _plain_text(block.group("heading"), max_length=120)
+            items_source = block.group("items")
+            item_pattern = item_patterns[0] if block_pattern is patterns[0] else item_patterns[1]
+            items = [
+                _plain_text(match.group("item"), max_length=10000)
+                for match in item_pattern.finditer(items_source)
+            ]
+            items = [item for item in items if item]
+            group = {"heading": heading, "items": items}
+            if heading and items and group not in groups:
+                groups.append(group)
+    return groups
 
 
 _STEAM_BBCODE_SCOPE_RE = re.compile(
@@ -439,6 +472,65 @@ def _change_chunks(value: str, *, max_length: int = 1000) -> list[str]:
     if remaining:
         chunks.append(remaining)
     return chunks
+
+
+def _apply_patch_change_groups(
+    sections: list[dict[str, Any]],
+    source_groups: Any,
+) -> None:
+    """Attach source-derived indexes only when all list items align exactly."""
+    if not isinstance(source_groups, list):
+        return
+    for source_group in source_groups:
+        if not isinstance(source_group, dict):
+            continue
+        heading = str(source_group.get("heading") or "")
+        source_items = source_group.get("items")
+        if (
+            not heading
+            or not isinstance(source_items, list)
+            or not source_items
+            or any(not isinstance(item, str) for item in source_items)
+        ):
+            continue
+        heading_chunks = _change_chunks(heading)
+        expected = list(heading_chunks)
+        for source_item in source_items:
+            expected.extend(_change_chunks(source_item))
+        if not heading_chunks or len(expected) <= len(heading_chunks):
+            continue
+        candidates: list[tuple[dict[str, Any], int]] = []
+        for section in sections:
+            owners = [section]
+            owners.extend(
+                ability
+                for ability in section.get("abilities", [])
+                if isinstance(ability, dict)
+            )
+            for owner in owners:
+                changes = owner.get("changes")
+                if not isinstance(changes, list):
+                    continue
+                start = next(
+                    (
+                        index
+                        for index in range(len(changes) - len(expected) + 1)
+                        if changes[index:index + len(expected)] == expected
+                    ),
+                    None,
+                )
+                if start is None:
+                    continue
+                candidates.append((owner, start))
+        if len(candidates) == 1:
+            owner, start = candidates[0]
+            owner.setdefault("change_groups", []).append(
+                {
+                    "heading_index": start,
+                    "description_start": start + len(heading_chunks),
+                    "description_end": start + len(expected),
+                }
+            )
 
 
 def _is_official_deadlock_announcement(item: dict[str, Any]) -> bool:
@@ -2061,7 +2153,11 @@ def _structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dic
     for section in hero_sections.values():
         section.pop("_ability_map", None)
         sections.append(section)
-    return {**raw, "sections": sections}
+    _apply_patch_change_groups(sections, raw.get("change_group_sources"))
+    return {
+        **{key: value for key, value in raw.items() if key != "change_group_sources"},
+        "sections": sections,
+    }
 
 
 async def _fetch_steam_patches(client: httpx.AsyncClient) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
@@ -2123,6 +2219,9 @@ async def _fetch_steam_patches(client: httpx.AsyncClient) -> tuple[list[dict[str
             "published_at": published_at.isoformat(),
             "url": url,
             "content": content,
+            "change_group_sources": _extract_patch_change_group_sources(
+                str(item.get("contents") or "")
+            ),
         }
     patches = sorted(
         patches_by_id.values(),

@@ -918,8 +918,12 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
         section.pop("_ability_map", None)
         sections.append(section)
 
+    base._apply_patch_change_groups(sections, raw.get("change_group_sources"))
+
+    public_raw = {key: value for key, value in raw.items() if key != "change_group_sources"}
+
     return {
-        **raw,
+        **public_raw,
         "sections": sections,
         "hero_metadata_pending": any(
             section.get("hero_metadata_pending") for section in sections

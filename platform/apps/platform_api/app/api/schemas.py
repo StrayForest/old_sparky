@@ -82,6 +82,12 @@ class PatchAbilityStatResponse(BaseModel):
     upgrade_type: str | None = Field(default=None, max_length=32)
 
 
+class PatchChangeGroupResponse(BaseModel):
+    heading_index: int = Field(ge=0, le=499)
+    description_start: int = Field(ge=1, le=500)
+    description_end: int = Field(ge=2, le=500)
+
+
 class PatchAbilityResponse(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     display_name: str | None = Field(default=None, max_length=120)
@@ -91,6 +97,26 @@ class PatchAbilityResponse(BaseModel):
     stats_pending: bool = False
     icon_url: str | None = Field(default=None, max_length=1000)
     changes: list[str] = Field(default_factory=list, max_length=100)
+    change_groups: list[PatchChangeGroupResponse] = Field(default_factory=list, max_length=50)
+
+    @model_validator(mode="after")
+    def validate_change_groups(self) -> "PatchAbilityResponse":
+        _validate_patch_change_groups(self.changes, self.change_groups)
+        return self
+
+
+def _validate_patch_change_groups(
+    changes: list[str],
+    groups: list[PatchChangeGroupResponse],
+) -> None:
+    previous_end = -1
+    for group in groups:
+        if not (
+            group.heading_index < group.description_start < group.description_end <= len(changes)
+            and group.heading_index >= previous_end
+        ):
+            raise ValueError("Patch change group indexes must be ordered and inside changes.")
+        previous_end = group.description_end
 
 
 class PatchSectionResponse(BaseModel):
@@ -110,10 +136,12 @@ class PatchSectionResponse(BaseModel):
     objective_key: Literal["urn", "unstable_rift", "mid_boss"] | None = None
     objective_icon_url: str | None = Field(default=None, max_length=1000)
     changes: list[str] = Field(default_factory=list, max_length=500)
+    change_groups: list[PatchChangeGroupResponse] = Field(default_factory=list, max_length=50)
     abilities: list[PatchAbilityResponse] = Field(default_factory=list, max_length=20)
 
     @model_validator(mode="after")
     def validate_kind_metadata(self) -> "PatchSectionResponse":
+        _validate_patch_change_groups(self.changes, self.change_groups)
         if self.kind == "hero":
             if self.hero_name is None:
                 raise ValueError("Hero patch sections require hero_name.")

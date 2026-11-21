@@ -4,6 +4,7 @@ import unittest
 
 from apps.platform_api.app.services import home_content
 from apps.platform_api.app.services.patch_detail import structure_patch_detail
+from apps.platform_api.app.services.patch_translation_runtime import extract_translation_segments
 
 
 class PatchDetailParserTests(unittest.TestCase):
@@ -165,6 +166,98 @@ Bonus health reduced
         self.assertEqual(heroes[0]["changes"], ["Base health increased"])
         self.assertEqual(heroes[1]["abilities"][0]["changes"], ["Damage reduced"])
         self.assertEqual(heroes[1]["changes"], ["Base health reduced"])
+
+    def test_explicit_bold_heading_and_list_markup_projects_change_group_indexes(self) -> None:
+        groups = home_content._extract_patch_change_group_sources(
+            "[p][b]Seasonal Rank Reset[/b][/p]"
+            "[p]Ranked rules update[/p]"
+            "[p][b]Ranked Leaderboards:[/b][/p][list]"
+            "[*][p]We've reworked leaderboards.[/p][/*]"
+            "[*][p]Each season now has its own leaderboard.[/p][/*]"
+            "[*][p]A player must complete 50 matches.[/p][/*]"
+            "[*][p]A hero leaderboard requires 15 matches.[/p]"
+            "[/list]------<p>Beta Season 2 begins today!</p>"
+        )
+        self.assertEqual(
+            groups,
+            [{
+                "heading": "Ranked Leaderboards:",
+                "items": [
+                    "We've reworked leaderboards.",
+                    "Each season now has its own leaderboard.",
+                    "A player must complete 50 matches.",
+                    "A hero leaderboard requires 15 matches.",
+                ],
+            }],
+        )
+        self.assertEqual(
+            home_content._extract_patch_change_group_sources(
+                "<p><strong>Season Reset:</strong></p>"
+                "<ul><li><p>Rank reset is smaller.</p></li>"
+                "<li><p>Players keep calibration.</p></li></ul>"
+            ),
+            [{
+                "heading": "Season Reset:",
+                "items": ["Rank reset is smaller.", "Players keep calibration."],
+            }],
+        )
+
+        detail = structure_patch_detail(
+            {
+                "id": "5",
+                "title": "Patch",
+                "content": (
+                    "Ranked Leaderboards:\n"
+                    "We've reworked leaderboards.\n"
+                    "Each season now has its own leaderboard.\n"
+                    "A player must complete 50 matches.\n"
+                    "A hero leaderboard requires 15 matches.\n"
+                    "Beta Season 2 begins today!"
+                ),
+                "change_group_sources": groups,
+            },
+            {"heroes": {}, "items": {}, "objectives": {}},
+        )
+        section = detail["sections"][0]
+        self.assertEqual(
+            section["changes"],
+            [
+                "Ranked Leaderboards:",
+                "We've reworked leaderboards.",
+                "Each season now has its own leaderboard.",
+                "A player must complete 50 matches.",
+                "A hero leaderboard requires 15 matches.",
+                "Beta Season 2 begins today!",
+            ],
+        )
+        self.assertEqual(
+            section["change_groups"],
+            [{"heading_index": 0, "description_start": 1, "description_end": 5}],
+        )
+        self.assertNotIn("change_group_sources", detail)
+        self.assertEqual(
+            extract_translation_segments({"sections": [{"changes": section["changes"]}]}),
+            extract_translation_segments({"sections": [section]}),
+        )
+        home_detail = home_content._structure_patch_detail(
+            {
+                "id": "5",
+                "title": "Patch",
+                "content": (
+                    "Ranked Leaderboards:\n"
+                    "We've reworked leaderboards.\n"
+                    "Each season now has its own leaderboard.\n"
+                    "A player must complete 50 matches.\n"
+                    "A hero leaderboard requires 15 matches.\n"
+                    "Beta Season 2 begins today!"
+                ),
+                "change_group_sources": groups,
+            },
+            {"heroes": {}, "items": {}, "objectives": {}},
+        )
+        self.assertEqual(home_detail["sections"][0]["changes"], section["changes"])
+        self.assertEqual(home_detail["sections"][0]["change_groups"], section["change_groups"])
+        self.assertNotIn("change_group_sources", home_detail)
 
     def test_general_scope_routes_catalogued_hero_and_ability_headings(self) -> None:
         raw = {

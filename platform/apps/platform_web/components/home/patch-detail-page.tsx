@@ -112,7 +112,7 @@ export function PatchDetailPage({ patchId }: { patchId: string }) {
                       ) : null}
                     </div>
                   </header>
-                  {section.changes.length ? <ChangeList changes={section.changes} /> : null}
+                  {section.changes.length ? <ChangeList changes={section.changes} groups={section.change_groups} /> : null}
                   {section.abilities.length ? (
                     <div className={`patch-abilities${hasAbilityDetails(section.abilities) ? " patch-abilities-detail" : ""}`}>
                       {section.abilities.map((ability) => (
@@ -127,7 +127,7 @@ export function PatchDetailPage({ patchId }: { patchId: string }) {
                               <PatchAbilityStats ability={ability} />
                             </>
                           ) : null}
-                          {ability.changes.length ? <ChangeList changes={ability.changes} /> : null}
+                          {ability.changes.length ? <ChangeList changes={ability.changes} groups={ability.change_groups} /> : null}
                         </section>
                       ))}
                     </div>
@@ -290,22 +290,47 @@ function ObjectiveIcon({ iconUrl }: { iconUrl: string | null }) {
   );
 }
 
-function ChangeList({ changes }: { changes: string[] }) {
-  return (
-    <ul className="patch-change-list">
-      {changes.map((change, index) => steamPatchImagePattern.test(change) ? (
-        <li className="patch-inline-image" key={`${change}-${index}`}>
-          <CspImage
-            alt=""
-            height={825}
-            sizes="(max-width: 820px) calc(100vw - 48px), 1000px"
-            src={change}
-            width={1000}
-          />
+function ChangeList({ changes, groups = [] }: { changes: string[]; groups?: Array<{
+  heading_index: number;
+  description_start: number;
+  description_end: number;
+}> }) {
+  const groupByHeading = new Map(groups.map((group) => [group.heading_index, group]));
+  const rendered: React.ReactNode[] = [];
+  for (let index = 0; index < changes.length;) {
+    const group = groupByHeading.get(index);
+    if (group && group.description_start > index && group.description_end <= changes.length) {
+      rendered.push(
+        <li className="patch-change-group" key={`group-${index}`}>
+          <strong>{changes[index]}</strong>
+          <ul className="patch-change-group-list">
+            {changes.slice(group.description_start, group.description_end).map((change, itemIndex) => (
+              renderPatchChange(change, `${index}-${itemIndex}`)
+            ))}
+          </ul>
         </li>
-      ) : <li key={`${change}-${index}`}>{change}</li>)}
-    </ul>
-  );
+      );
+      index = group.description_end;
+    } else {
+      rendered.push(renderPatchChange(changes[index], String(index)));
+      index += 1;
+    }
+  }
+  return <ul className="patch-change-list">{rendered}</ul>;
+}
+
+function renderPatchChange(change: string, key: string) {
+  return steamPatchImagePattern.test(change) ? (
+    <li className="patch-inline-image" key={`${change}-${key}`}>
+      <CspImage
+        alt=""
+        height={825}
+        sizes="(max-width: 820px) calc(100vw - 48px), 1000px"
+        src={change}
+        width={1000}
+      />
+    </li>
+  ) : <li key={`${change}-${key}`}>{change}</li>;
 }
 
 function PatchPageSkeleton() {

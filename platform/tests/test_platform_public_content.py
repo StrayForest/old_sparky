@@ -2296,18 +2296,28 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
     def test_patch_section_schema_enforces_kind_specific_metadata(self) -> None:
         valid = PatchSectionResponse.model_validate(
             {
-                "kind": "objective",
-                "title": "Urn",
-                "objective_key": "urn",
-                "objective_icon_url": (
-                    "https://assets-bucket.deadlock-api.com/"
-                    "assets-api-res/icons/minimap/soul_jar_marker_psd.png"
-                ),
-                "changes": ["Urn changed"],
+                "kind": "general",
+                "title": "General",
+                "changes": ["Heading:", "One", "Two", "After group"],
+                "change_groups": [{
+                    "heading_index": 0,
+                    "description_start": 1,
+                    "description_end": 3,
+                }],
             }
         )
 
-        self.assertEqual(valid.objective_key, "urn")
+        self.assertEqual(valid.change_groups[0].description_end, 3)
+        invalid_group = {
+            "kind": "general",
+            "title": "General",
+            "changes": ["Heading:", "Description"],
+            "change_groups": [{
+                "heading_index": 0,
+                "description_start": 1,
+                "description_end": 3,
+            }],
+        }
         invalid_sections = (
             {"kind": "objective", "title": "Urn"},
             {"kind": "general", "title": "General", "objective_key": "urn"},
@@ -2321,7 +2331,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
                 "objective_icon_url": "https://example.com/icon.png",
             },
         )
-        for payload in invalid_sections:
+        for payload in (*invalid_sections, invalid_group):
             with self.subTest(payload=payload), self.assertRaises(ValidationError):
                 PatchSectionResponse.model_validate(payload)
 
@@ -2439,7 +2449,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
     def test_public_content_cache_versions_keep_home_contract_stable(self) -> None:
         self.assertEqual(home_content.HOME_CONTENT_KEY, "platform:home-content:v4")
         self.assertEqual(home_content.HOME_CONTENT_STALE_KEY, "platform:home-content:stale:v4")
-        self.assertEqual(home_content.PATCH_DETAIL_KEY_PREFIX, "platform:home-content:patch:v17:")
+        self.assertEqual(home_content.PATCH_DETAIL_KEY_PREFIX, "platform:home-content:patch:v18:")
         self.assertEqual(
             home_content.PATCH_ASSET_CATALOG_KEY,
             "platform:home-content:patch-assets:v9",
