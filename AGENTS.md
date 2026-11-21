@@ -6,7 +6,8 @@
 - Read `platform/docs/CURRENT.md`, then use `platform/docs/README.md` to route
   the task to its owner document. Keep routine context focused.
 - Follow [`platform/docs/agent-token-efficiency.md`](platform/docs/agent-token-efficiency.md)
-  for compact handoffs, bounded reads and honest token-use reporting.
+  for the single permanent checkout, temporary-worktree lifecycle, bounded
+  task-artifact cleanup, compact handoffs and bounded reads.
 - The primary agent coordinates only: delegate repository inspection, edits,
   checks and operational work to `gpt-6-luna`, selecting reasoning effort by
   task complexity. It assigns scope and reports results; it does not inspect or

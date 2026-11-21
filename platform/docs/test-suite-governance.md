@@ -41,6 +41,7 @@ Fork, mixed, unknown, sensitive, `merge_group` and `dev` push routes retain full
 | `live-user-destructive` | production operators | marked production fixtures and mandatory cleanup | explicit operator workflow |
 | `external-load` | performance operators | external generator to production origin | explicit operator workflow |
 
+Operator storage-retention behavior is owned by `test_platform_operator_storage_retention.py` in `TOOL_MODULES`/`backend-tool-contract`; unit rendering and installation/timer wiring belong to `test_platform_verification_contract` under `verification-contract`.
 
 The `web-quality` gate runs shutdown, SSR stream/heap and Next root-directory
 contracts from `shutdown-guard-contract.cjs`, `ssr-stream-diagnostics-contract.cjs`,

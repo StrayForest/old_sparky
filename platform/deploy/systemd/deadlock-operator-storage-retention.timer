@@ -1,0 +1,12 @@
+[Unit]
+Description=Run bounded Old Sparky operator storage retention daily
+
+[Timer]
+OnCalendar=*-*-* 07:00:00
+RandomizedDelaySec=30m
+Persistent=true
+AccuracySec=1m
+Unit=deadlock-operator-storage-retention.service
+
+[Install]
+WantedBy=timers.target

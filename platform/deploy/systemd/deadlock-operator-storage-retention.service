@@ -1,0 +1,21 @@
+[Unit]
+Description=Prune bounded Old Sparky operator storage artifacts
+After=deadlock-maintenance.service deadlock-offsite-backup.service
+ConditionPathIsSymbolicLink=/opt/oldsparky/platform/current
+ConditionPathExists=/opt/oldsparky/platform/current/tools/platform_operator_storage_retention.py
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/
+ExecStart=/usr/bin/python3 -I -B /opt/oldsparky/platform/current/tools/platform_operator_storage_retention.py --apply
+Nice=10
+IOSchedulingClass=idle
+CPUQuota=25%
+MemoryMax=512M
+TimeoutStartSec=30min
+UMask=0077
+ProtectSystem=full
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX

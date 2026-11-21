@@ -9,10 +9,29 @@ required evidence, review, safety checks and release gates.
 
 ## Orchestrator and delegation
 
-- The primary agent coordinates only. Delegate repository inspection, edits,
-  checks and operations to `gpt-6-luna`; do not switch models. The primary
-  assigns scope, routes findings and reports status, but does not inspect or
-  edit implementation files or run repository checks.
+- Use one canonical checkout at `/root/old_sparky` and the latest approved
+  `dev` baseline as the task source. Do not revive superseded non-main task
+  branches or preserve abandoned task changes unless the user explicitly asks
+  to retain them. Never make a second checkout or archive copy as a safety
+  backup.
+- Use one code executor by default. Add a second agent only for a concrete,
+  independent read-only review or task that cannot safely be serialized; do
+  not use parallel workers merely to increase throughput. The primary may
+  inspect, edit and run repository checks when authorized by the task and
+  repository rules; keep implementation ownership explicit and avoid
+  overlapping edits.
+- A linked worktree is temporary and requires a concrete isolation need. Its
+  owner records exact path, branch, purpose and the task-close cleanup action
+  before creation and locks it with
+  `git worktree lock <path> --reason <task-id>` while task-owned work is active.
+  Do not create a worktree for routine review, context
+  separation or as a backup. At close, integrate the intended result into the
+  canonical branch, verify the exact worktree is inactive, unlock it with
+  `git worktree unlock <path>` and remove that exact path with
+  `git worktree remove <path>`. Do not use `--force`, broad globs or
+  `git worktree prune`. Preserve unrelated user files and untracked
+  inputs; do not generalize permission to discard one task's superseded work
+  into permission to remove other unowned work.
 - Set reasoning effort to `low` for bounded research or mechanical work,
   `medium` for related multi-file changes or behavioral reasoning, and `high`
   for security, data integrity, release/recovery or broad cross-module work.
@@ -40,8 +59,10 @@ required evidence, review, safety checks and release gates.
 
 ### Reuse source worktrees and release artifacts
 
-- Continue in the existing clean worktree supplied for the task. Do not create
-  another repository copy just to build or inspect a release.
+- Continue in the existing task worktree when one has been supplied and its
+  owner is clear. Follow the single-checkout and temporary-worktree lifecycle
+  above when selecting or closing it; do not create another repository copy
+  just to build or inspect a release.
 - The release builder defaults to the primary checkout's
   `platform/dist/releases`, including when invoked from a linked worktree.
   That is the source-artifact owner path shared with maintenance retention and
@@ -85,6 +106,28 @@ required evidence, review, safety checks and release gates.
   without printing them; never copy them into Git, logs, artifacts or reports.
 - In documents and handoffs, keep only the private-file pointer; never include
   the operator input value.
+
+### Close task-owned generated artifacts
+
+- Each task owner tracks the exact generated files, directories, processes and
+  ports it creates. Keep output in a named task-owned location; do not scatter
+  outputs through the checkout, `/tmp` or Codex private state.
+- After the task and its required review/gates finish, confirm owned processes
+  have exited and no active task still uses the output. Use the owner-approved
+  cleanup procedure for the exact generated paths, then verify those paths are
+  absent. Do not use broad recursive deletion or clean another task's outputs.
+- Preserve private reports, credentials, session/history databases, and other
+  user-owned state. They are not disposable build artifacts. Do not create
+  duplicate backups of caches or whole checkouts. Remove generated artifacts
+  only through their documented owner lifecycle; if no safe owner procedure
+  exists, leave the artifact and report its exact path and owner gap.
+- In Codex state, never remove an active history database or its `-wal`/
+  `-shm` companions. Free SQLite pages are reusable by the database and are
+  not old history rows. Space reclamation must use an explicitly authorized,
+  bounded SQLite maintenance procedure with lock-aware reads, short busy
+  timeout, batch and WAL caps, a successful checkpoint, and a post-check; stop
+  on contention or a failed bound. Never truncate a live WAL or run a full
+  `VACUUM` as routine artifact cleanup.
 
 - Keep one short active state in the task handoff: verified facts, source SHA,
   relevant run IDs, owners, blocker (if any) and the single next action. Link

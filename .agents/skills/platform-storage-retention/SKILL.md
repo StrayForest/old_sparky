@@ -12,6 +12,10 @@ calling the task complete.
 
 ## Invariants
 
+- Root-owned task caches and temporary linked worktrees follow the separate
+  `platform/docs/operator-storage-retention-runbook.md`. Do not route that
+  allowlist through the production release/backup retention workflow below;
+  the two cleanup owners and locks are distinct.
 - Operate only on the canonical platform host and `platformdb`; never touch
   `sparkydb`, user data, R2 objects, TLS material, `.env` files, or arbitrary
   `/tmp` paths.

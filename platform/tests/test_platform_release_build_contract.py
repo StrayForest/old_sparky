@@ -80,6 +80,58 @@ def workflow_job(source: str, name: str) -> str:
 
 
 class PlatformReleaseBuildContractTests(unittest.TestCase):
+    def test_operator_storage_retention_units_are_installed_safely(self) -> None:
+        installer = (TOOLS_DIR / "platform_install_systemd_units.sh").read_text(
+            encoding="utf-8"
+        )
+        service = (
+            REPO_ROOT
+            / "platform/deploy/systemd/deadlock-operator-storage-retention.service"
+        ).read_text(encoding="utf-8")
+        timer = (
+            REPO_ROOT
+            / "platform/deploy/systemd/deadlock-operator-storage-retention.timer"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("deadlock-operator-storage-retention.service", installer)
+        self.assertIn("deadlock-operator-storage-retention.timer", installer)
+        reload_before_enable = installer.index(
+            'run_systemctl daemon-reload\n\nif [[ "$ENABLE_SYSTEMD_UNITS"'
+        )
+        self.assertLess(
+            installer.index('install -o root -g root -m 0644 "$SYSTEMD_SRC_DIR/$unit_name"'),
+            reload_before_enable,
+        )
+        enable_start = installer.index("run_systemctl enable --now \\")
+        enable_end = installer.index("\nfi", enable_start)
+        enable_block = installer[enable_start:enable_end]
+        self.assertLess(reload_before_enable, enable_start)
+        self.assertIn("deadlock-operator-storage-retention.timer", enable_block)
+        self.assertIn(
+            "ConditionPathExists=/opt/oldsparky/platform/current/tools/"
+            "platform_operator_storage_retention.py",
+            service,
+        )
+        self.assertIn(
+            "ExecStart=/usr/bin/python3 -I -B "
+            "/opt/oldsparky/platform/current/tools/"
+            "platform_operator_storage_retention.py --apply",
+            service,
+        )
+        self.assertIn(
+            "After=deadlock-maintenance.service deadlock-offsite-backup.service",
+            service,
+        )
+        self.assertIn("User=root", service)
+        self.assertIn("CPUQuota=25%", service)
+        self.assertIn("MemoryMax=512M", service)
+        self.assertIn("TimeoutStartSec=30min", service)
+        self.assertNotIn("PrivateTmp=", service)
+        self.assertNotIn("ProtectProc=", service)
+        self.assertIn("OnCalendar=*-*-* 07:00:00", timer)
+        self.assertIn("RandomizedDelaySec=30m", timer)
+        self.assertIn("Persistent=true", timer)
+
     def test_build_output_uses_common_checkout_and_existing_retention_owner(self) -> None:
         builder_source = BUILD_SCRIPT.read_text(encoding="utf-8")
         function_start = builder_source.index("resolve_release_output_dir() {")

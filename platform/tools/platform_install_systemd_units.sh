@@ -69,6 +69,8 @@ CURRENT_UNITS=(
   deadlock-cloudflare-ips.timer
   deadlock-health-monitor.service
   deadlock-health-monitor.timer
+  deadlock-operator-storage-retention.service
+  deadlock-operator-storage-retention.timer
 )
 
 declare -A EXPECTED_UNIT=()
@@ -871,7 +873,8 @@ if [[ "$ENABLE_SYSTEMD_UNITS" == "1" ]]; then
     deadlock-maintenance.timer \
     deadlock-logrotate.timer \
     deadlock-cloudflare-ips.timer \
-    deadlock-health-monitor.timer
+    deadlock-health-monitor.timer \
+    deadlock-operator-storage-retention.timer
 fi
 
 # Keep retired files in place until the new unit set has been installed and
