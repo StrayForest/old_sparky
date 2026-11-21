@@ -34,6 +34,7 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | Test-suite ownership and CI/live runners | [Test-suite governance](test-suite-governance.md) |
 | Automated authentication lifecycle coverage | [Auth lifecycle E2E](auth-lifecycle-e2e.md) |
 | CSP rollout / production browser and live-user QA | [CSP and live QA runbook](csp-live-qa-runbook.md) |
+| Removal of exact LiveQA credential files after successful UserQA | [Post-UserQA LiveQA cleanup](liveqa-post-userqa-cleanup.md) and [CSP/live QA runbook](csp-live-qa-runbook.md) |
 | Public QA recovery after fixture provisioning failure | [Public QA after fixture-provisioning failure](csp-live-qa-failed-provision-recovery.md) |
 | Cleanup of an expired exact LiveQA bundle roster | [Stale LiveQA bundle recovery](liveqa-stale-bundle-recovery.md) |
 | Missing immutable LiveQA engine provider | [Provider recovery runbook](liveqa-provider-recovery.md) |

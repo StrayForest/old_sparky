@@ -112,11 +112,17 @@ required evidence, review, safety checks and release gates.
 - The orchestrator resumes from the latest proven state. Reopen hypotheses
   only when a new log, source diff, run result or live observation provides a
   signal.
-- Before an expensive production-bound CI push, cheaply classify the exact
-  pending source range with the canonical classifier. Require the expected
-  full, deployable, non-fallback runtime route and artifact job; classify the
-  complete baseline-to-target range for cumulative unshipped releases. Fix a
-  no-op/missing-artifact route before CI; never bypass the guard.
+- Before an expensive production-bound push, use the packaged-LiveQA import
+  closure and test-catalog preflights in [test-suite governance](test-suite-governance.md)
+  when those source families change. Run these cheap read-only checks even
+  when a heavyweight local selector is `LOCAL GATE BLOCKED`; they supplement,
+  never replace, the canonical selectors and exact-SHA CI. Classify the exact
+  pending incremental range, then assess any non-deployable route against the
+  authenticated active-production-baseline-to-target range in the
+  [deployment runbook](deployment-runbook.md). The incremental route alone
+  grants no deployment or no-op authority. Do not synthesize baseline proof
+  locally or bypass the automatic reconciliation, backup, runtime-proof or
+  artifact gates.
 
 ## Read and report narrowly
 

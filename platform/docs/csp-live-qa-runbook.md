@@ -164,9 +164,11 @@ PLATFORM_APP_DIR=/opt/oldsparky/platform \
 platform/tools/platform_provision_live_csp_qa.sh \
   --marker liveqa-csp-candidate-<unique> \
   --bundle-path /root/.oldsparky/liveqa/csp-live-qa.json \
-  --primary-email 'REPLACE_WITH_PRIMARY_LIVE_QA_EMAIL' \
+  --primary-email 'REPLACE_WITH_APPROVED_LIVE_QA_PRIMARY_EMAIL' \
   --mailbox-helper /root/.oldsparky/liveqa/platform_live_qa_mailbox_helper.py
 ```
+
+The `--primary-email` argument is the approved QA bundle's validated base `email`, not the operator `control_email`. Read `live_qa_primary_email` from `/root/old_sparky/.local/private/operator-inputs.md` first. Only if that key is absent and the validated bundle is still retained, preserve its validated base email under that key before retiring the bundle, without printing the value. Keep the value only in that private file; never copy it into repository docs, logs or reports.
 
 For an existing bundle, release reconciliation owns the fixed mailbox helper
 alongside the supervisor and dispatcher. Automated secret-bearing workflows
@@ -176,18 +178,7 @@ never refresh it from a checkout. The dispatcher checks the fixed
 before invoking the trusted supervisor. Never bypass that check or copy a
 helper from an unrelated checkout.
 
-An explicit UserQA rerun is operator-triggered only after the public suite has
-passed. A successful production deployment's separate secret-free handoff job
-dispatches the post-deploy sequencer with `workflow_dispatch`. The parent job
-requires the completed successful production job and exact actual-deployment
-receipt, then records the acknowledged sequencer run ID in a parent-owned
-authorization artifact. The sequencer waits for the full parent workflow to
-finish successfully and revalidates the actual deployment and authorization
-before dispatching public QA; UserQA follows only after public success. A failed
-or missing handoff leaves the app deployment successful but earns no QA pass
-credit. Recovery, baseline-reconcile and preflight-only runs do not dispatch
-live QA; explicit `!cancelled()` plus production-success and `mode=deploy` guards
-are required because normal deploy skips mode-specific branches.
+A failed or missing automatic handoff earns no QA credit. Recovery, baseline-reconcile and preflight-only runs skip it; an app-bearing baseline-reconcile remains a release and requires standalone public QA, UserQA and cleanup through the workflows owned by this runbook. The [standalone public rerun procedure](csp-live-qa-failed-provision-recovery.md) applies only after fixture-provision failure. For a fresh roster use this runbook's reviewed provisioning wrapper only after its exact-state checks; `provision=true` rotation applies only when the [stale-bundle preconditions](liveqa-stale-bundle-recovery.md) hold. Never reuse a cleaned or unknown roster. A no-op creates no new release or QA obligation; a skipped handoff earns no credit. The automatic handoff still requires `!cancelled()`, production success and `mode=deploy`. For normal deploy, the separate secret-free handoff validates the exact successful production job and actual-deployment receipt, then records the acknowledged sequencer run ID in a parent-owned authorization artifact; the sequencer waits for full parent-workflow success and revalidates the actual deployment receipt plus that authorization before dispatching public QA.
 For a direct rerun, `expected_target_sha` is the current `dev` commit that the
 workflow runner will check out. The workflow separately authenticates the
 active deployed app source and its QA runtime; in a docs-only/no-op state those
@@ -560,10 +551,7 @@ sandbox: use reviewed source against the configured production origin. See
 [security runbook](security-runbook.md#live-csp-qa-and-mailbox-boundary) for
 the full boundary.
 
-After public QA and UserQA cleanup/absence pass, remove the exact root-only
-bundle and mailbox helper. If a human diagnostic ran, also remove its manual
-state/inventory after exact absence proof. Never retain, commit or log retired
-credentials.
+After successful public QA and UserQA cleanup/absence, follow the [post-UserQA credential-file cleanup](liveqa-post-userqa-cleanup.md). It binds removal to the exact successful UserQA marker digest and active app/LiveQA source and removes only the fixed bundle and mailbox helper under both canonical locks. If a human diagnostic ran, also remove its manual state/inventory only after its exact absence proof. Never retain, commit or log retired credentials.
 
 ## Post-deploy gate
 
