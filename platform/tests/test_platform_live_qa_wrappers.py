@@ -74,6 +74,77 @@ def _profile_rejections(capture_reason: str = "complete") -> dict[str, object]:
 
 
 class LiveQaWrapperContractTests(unittest.TestCase):
+    def test_private_image_inventory_evidence_is_closed_and_bounded(self) -> None:
+        complete_route = {
+            "schema": 1,
+            "route": "home",
+            "image_count": 3,
+            "missing_current_src_count": 0,
+            "unloaded_count": 0,
+            "complete": True,
+            "counts_truncated": False,
+        }
+        incomplete_stability_route = {
+            "schema": 1,
+            "route": "patch",
+            "image_count": 2,
+            "missing_current_src_count": 0,
+            "unloaded_count": 0,
+            "complete": False,
+            "counts_truncated": False,
+        }
+        captured = {
+            "image_inventory_state": "captured",
+            "image_inventory": {
+                "schema": 1,
+                "routes": [complete_route, incomplete_stability_route],
+            },
+        }
+        platform_live_qa_guard._validate_image_inventory_evidence(captured)
+        platform_live_qa_guard._validate_image_inventory_evidence({
+            "image_inventory_state": "unavailable",
+            "image_inventory": None,
+        })
+
+        invalid_records = []
+        duplicate_route = json.loads(json.dumps(captured))
+        duplicate_route["image_inventory"]["routes"].append(
+            dict(complete_route)
+        )
+        invalid_records.append(duplicate_route)
+        unknown_route = json.loads(json.dumps(captured))
+        unknown_route["image_inventory"]["routes"][0]["route"] = "private-path"
+        invalid_records.append(unknown_route)
+        boolean_count = json.loads(json.dumps(captured))
+        boolean_count["image_inventory"]["routes"][0]["image_count"] = True
+        invalid_records.append(boolean_count)
+        count_exceeds_total = json.loads(json.dumps(captured))
+        count_exceeds_total["image_inventory"]["routes"][0]["unloaded_count"] = 4
+        invalid_records.append(count_exceeds_total)
+        inconsistent_truncation = json.loads(json.dumps(captured))
+        inconsistent_truncation["image_inventory"]["routes"][0]["counts_truncated"] = True
+        invalid_records.append(inconsistent_truncation)
+        complete_without_images = json.loads(json.dumps(captured))
+        complete_without_images["image_inventory"]["routes"][0].update(
+            image_count=0,
+        )
+        invalid_records.append(complete_without_images)
+        unavailable_with_counts = {
+            "image_inventory_state": "unavailable",
+            "image_inventory": {"schema": 1, "routes": []},
+        }
+        invalid_records.append(unavailable_with_counts)
+        partial_pair = {"image_inventory_state": "captured"}
+        invalid_records.append(partial_pair)
+        unknown_key = json.loads(json.dumps(captured))
+        unknown_key["image_inventory"]["routes"][0]["source"] = "must-not-serialize"
+        invalid_records.append(unknown_key)
+
+        for record in invalid_records:
+            with self.subTest(record=record):
+                with self.assertRaises(platform_live_qa_guard.GuardError):
+                    platform_live_qa_guard._validate_image_inventory_evidence(record)
+
     def test_public_browser_counts_are_closed_owner_bound_and_partitioned(self) -> None:
         source_sha = "a" * 40
         app_sha = "b" * 40
@@ -307,7 +378,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                   for (const title of titles) {
                     const key = `${title}|${project}`;
                     const skipDescription = skips.get(key);
-                    const failed = title === "live four current patch DTOs render owner-scoped hero and ability changes"
+                    const failed = title === "live image currentSrc inventory stays inside the exact CSP hosts"
                       && project === "live-webkit-mobile";
                     const status = skipDescription ? "skipped" : failed ? "failed" : "passed";
                     const result = {
@@ -328,15 +399,29 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                       const error = new TypeError("private pageerror text and token");
                       error.stack = "TypeError: private pageerror text and token\\n"
                         + "    at render (https://old-sparky.com/_next/static/chunks/abcdefghijklm.js:12:34)";
-                      result.attachments = [Reporter.createPageErrorAttachment({
-                        pageUrl: "https://old-sparky.com/patches/12345?token=private",
-                        errors: [error],
-                        successfulScriptResponses: [{
-                          url: "https://old-sparky.com/_next/static/chunks/abcdefghijklm.js",
-                          status: 200,
-                          resourceType: "script",
-                        }],
-                      })];
+                      result.attachments = [
+                        Reporter.createPageErrorAttachment({
+                          pageUrl: "https://old-sparky.com/patches/12345?token=private",
+                          errors: [error],
+                          successfulScriptResponses: [{
+                            url: "https://old-sparky.com/_next/static/chunks/abcdefghijklm.js",
+                            status: 200,
+                            resourceType: "script",
+                          }],
+                        }),
+                        ...[
+                          { route: "home", image_count: 4, missing_current_src_count: 0,
+                            unloaded_count: 0, complete: true, counts_truncated: false },
+                          { route: "patch", image_count: 3, missing_current_src_count: 0,
+                            unloaded_count: 0, complete: true, counts_truncated: false },
+                          { route: "tournaments", image_count: 1, missing_current_src_count: 1,
+                            unloaded_count: 1, complete: false, counts_truncated: false },
+                        ].map((image) => ({
+                          name: "live-image-inventory-evidence-v1",
+                          contentType: "application/json",
+                          body: Buffer.from(JSON.stringify({ schema: 1, ...image }), "ascii"),
+                        })),
+                      ];
                     }
                     const failureResult = {
                       status: "interrupted",
@@ -350,6 +435,21 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                       }],
                       attachments: [maxAttachment],
                     };
+                    if (stress && title === "live image currentSrc inventory stays inside the exact CSP hosts") {
+                      failureResult.attachments.push({
+                        name: "live-image-inventory-evidence-v1",
+                        contentType: "application/json",
+                        body: Buffer.from(JSON.stringify({
+                          schema: 1,
+                          route: "home",
+                          image_count: 512,
+                          missing_current_src_count: 1,
+                          unloaded_count: 1,
+                          complete: false,
+                          counts_truncated: true,
+                        }), "ascii"),
+                      });
+                    }
                     const results = stress
                       ? (skipDescription ? [failureResult, result] : [failureResult])
                       : [result];
@@ -403,9 +503,9 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             self.assertEqual(count_payload["logical_pass"], 50)
             self.assertEqual(count_payload["logical_fail"], 1)
             self.assertEqual(count_payload["logical_skip"], 6)
-            self.assertEqual(failure_payload["failures"][0]["id"], "patch_owner_sections")
+            self.assertEqual(failure_payload["failures"][0]["id"], "image_csp_hosts")
             self.assertEqual(identities_payload["failures"][0], {
-                "id": "patch_owner_sections",
+                "id": "image_csp_hosts",
                 "project": "live-webkit-mobile",
                 "status": "failed",
                 "attempt": 1,
@@ -413,6 +513,40 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             self.assertEqual(failure_payload["failures"][0]["source_file"], "tests/support/live-qa-sandbox.ts")
             self.assertEqual(failure_payload["failures"][0]["source_line"], 2)
             self.assertEqual(failure_payload["failures"][0]["source_kind"], "assertion")
+            self.assertEqual(failure_payload["failures"][0]["image_inventory_state"], "captured")
+            self.assertEqual(
+                failure_payload["failures"][0]["image_inventory"]["routes"],
+                [
+                    {
+                        "schema": 1,
+                        "route": "home",
+                        "image_count": 4,
+                        "missing_current_src_count": 0,
+                        "unloaded_count": 0,
+                        "complete": True,
+                        "counts_truncated": False,
+                    },
+                    {
+                        "schema": 1,
+                        "route": "patch",
+                        "image_count": 3,
+                        "missing_current_src_count": 0,
+                        "unloaded_count": 0,
+                        "complete": True,
+                        "counts_truncated": False,
+                    },
+                    {
+                        "schema": 1,
+                        "route": "tournaments",
+                        "image_count": 1,
+                        "missing_current_src_count": 1,
+                        "unloaded_count": 1,
+                        "complete": False,
+                        "counts_truncated": False,
+                    },
+                ],
+            )
+            self.assertNotIn("image_inventory", identities_payload["failures"][0])
             self.assertEqual(
                 failure_payload["failures"][0]["page_errors"],
                 [["TypeError", "patch", "abcdefghijklm.js", 12, 34]],
@@ -994,6 +1128,34 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 self.assertEqual(private_payload["failures"][0]["source_line"], 2)
                 self.assertEqual(private_payload["failures"][0]["source_kind"], "assertion")
                 self.assertNotIn(b"assertion text", private_bytes)
+                self.assertNotIn("image_inventory", public_line)
+                platform_live_qa_guard._validate_retained_failure_report(
+                    private_report.name,
+                    private_bytes,
+                )
+                legacy_private_payload = json.loads(private_bytes)
+                del legacy_private_payload["failures"][0]["image_inventory_state"]
+                del legacy_private_payload["failures"][0]["image_inventory"]
+                platform_live_qa_guard._validate_retained_failure_report(
+                    private_report.name,
+                    (json.dumps(legacy_private_payload) + "\n").encode("ascii"),
+                )
+                invalid_retained_variants = []
+                partial_retained = json.loads(private_bytes)
+                del partial_retained["failures"][0]["image_inventory"]
+                invalid_retained_variants.append(partial_retained)
+                wrong_id_retained = json.loads(private_bytes)
+                wrong_id_retained["failures"][0]["id"] = "patch_owner_sections"
+                invalid_retained_variants.append(wrong_id_retained)
+                unknown_field_retained = json.loads(private_bytes)
+                unknown_field_retained["failures"][0]["unexpected"] = "private"
+                invalid_retained_variants.append(unknown_field_retained)
+                for invalid_retained in invalid_retained_variants:
+                    with self.assertRaises(platform_live_qa_guard.GuardError):
+                        platform_live_qa_guard._validate_retained_failure_report(
+                            private_report.name,
+                            (json.dumps(invalid_retained) + "\n").encode("ascii"),
+                        )
                 for sensitive_value in (
                     b"private pageerror text",
                     b"token=private",
@@ -1170,7 +1332,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 self.assertEqual(summary_payload["app_sha"], app_sha)
                 self.assertEqual(summary_payload["marker_sha256"], marker_sha)
                 self.assertEqual(summary_payload["failures"], [[
-                    "patch_owner_sections", "live-webkit-mobile", "failed", 1
+                    "image_csp_hosts", "live-webkit-mobile", "failed", 1
                 ]])
                 self.assertNotIn(b"private assertion text", summary_bytes)
                 with patch.object(platform_live_qa_guard, "assert_liveqa_idle"):

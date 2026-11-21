@@ -321,6 +321,8 @@ approved host-image/configuration-management authority performs provisioning
 for a reviewed `HOST_TOOLS_SHA`; the GitHub workflow must not be used as the
 installer:
 
+Before provisioning, prepare a supported official GitHub CLI attestation verifier before the admitted route begins; route (b) must do this before opening its 1,800-second AUTO readiness window. Follow the exact isolated verifier setup, artifact binding and JSON field checks in the [host-tools attestation verification procedure](production-host-tools-attestation-verification.md). A verified attestation is required in addition to the offline bundle/content checks; it does not authorize publication by itself.
+
 1. Record the successful exact-`TARGET_SHA` Security run. A successful `build-host-tools` job
    and attested bundle qualify from (a) read-only `mode=preflight` at that same merged `dev`
    SHA; (b) the exact automatic parent in its active 1,800-second pre-child readiness window,
@@ -350,11 +352,8 @@ installer:
    bundle: v3 has 16 top-level members/15 records (14 tools, capabilities and manifest); v4 has
    17 members/16 records (15 tools, capabilities and manifest). Verify that complete name set
    and each root-owned regular single-link file's mode/digest; reject extras, a missing manifest,
-   or any staged member execution. Hold the canonical release then LiveQA locks through final
-   fresh source/window checks, no-replace publication, inventory recheck and fixed self-test.
-   Immediately before publication require AUTO readiness and its shared verifier still
-   `in_progress`, with no dispatch started. The shared verifier waits for both locks and checks
-   the final inventory/capabilities/self-test under them, so AUTO cannot dispatch early.
+   or any staged member execution. Apply the exact lock-held publication and
+   route-specific freshness checks in the [attestation verification procedure](production-host-tools-attestation-verification.md#final-publication-checks).
 4. Keep the previous generation untouched. On any post-publication check, fixed self-test or
    success-evidence failure, remove or quarantine only the exact new generation inode after
    checking its fixed path and complete tree, while both locks remain held. Preserve the prior

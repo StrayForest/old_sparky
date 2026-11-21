@@ -439,12 +439,9 @@ Report `LOCAL GATE BLOCKED` when local requirements are unavailable; never spoof
 
 For full local Python gate dependencies, see [the development guide](development-guide.md#python-dependency-ownership).
 
-The privileged storage-maintenance host-contract test is catalogued with its
-GitHub-hosted Linux environment markers. The canonical verifier and runner
-check those markers before launching the contour or preparing shared test
-resources; a local run reports `LOCAL GATE BLOCKED` while the exact full
-contour remains required on the hosted Security runner. Do not spoof runner
-markers or skip the test's own host-safety assertions.
+The privileged storage-maintenance host-contract test requires its catalogued GitHub-hosted Linux markers; local runs report `LOCAL GATE BLOCKED` and hosted Security CI remains required. Never spoof markers or skip host-safety checks.
+
+For packaged LiveQA spec/support-import or `RUNTIME_SOURCE_FILES` changes, run this read-only stdlib source-closure preflight from `platform/` before pushing: `/usr/bin/python3.12 -I -B -c 'import sys; from pathlib import Path; sys.path.insert(0, "tools"); import platform_build_live_qa_runtime as r; r.validate_runtime_source_imports(Path("apps/platform_web"), r.RUNTIME_SOURCE_FILES)'`. Exit 0 with no output confirms recognized relative imports resolve to declared package members; failure blocks the push until corrected. This supplements the staged release-runtime fixture, owner gates and exact-SHA CI.
 
 ### Python CI dependency contract
 

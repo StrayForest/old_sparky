@@ -11,22 +11,22 @@ belong in the linked owner documents below.
 ## Live and pending state
 
 - Production runs application source
+  `59b6af86cc3e3215c47c03f76ff105951b4b8906` in release
+  `gha-44908202177-1-59b6af86cc3e`; `previous` is source
   `88e4154661e76e8e4a2aac89a2ac592195d1fcde` in release
-  `gha-44895292289-1-88e4154661e7`; `previous` is source
-  `ae7ab3c590b2116c3fbb3dd5de1cf0353a6915ff` in release
-  `gha-44890605729-1-ae7ab3c590b2`. Host-tools pin
-  `aa4f9e075156bd9aadb699eb3a13253e80daf79a` is current and previous under
-  manifest `production-host-tools-v4`. The active runtime manifest is v3 with
-  Node 26.3.1. Alembic current and head are both `20261115_0056` (admin
-  tournament test fixtures).
-- Source 88e415 passed exact-SHA Security run `44893846804/1` and restore,
-  Alembic and checksum-validated backup `44895005123/1`. AUTO
-  `44894896692` succeeded, followed by production deploy `44895292289`.
-  Fresh installed readiness after QA passed with API and web health 200,
-  consistency checks passed, no locks, transaction marker, plans or pending
-  jobs, maintenance timer enabled and service idle, and 7,364,411,392 bytes
-  free. The signed cleanup of the failed prior candidate completed in run
-  `44888304260`; no further retention deletion was performed.
+  `gha-44895292289-1-88e4154661e7`. Host-tools pin
+  `d0f60dc1d93a463a529592ff8c7dd59de398cead` selects installed C23
+  `23e76706728064defeff1024c48e939cd1a8f6bc` under manifest
+  `production-host-tools-v4`; the prior AA4 generation
+  `aa4f9e075156bd9aadb699eb3a13253e80daf79a` remains preserved. The active
+  runtime manifest is v3 with Node 26.3.1. Alembic current and head are both
+  `20261115_0056` (admin tournament test fixtures).
+- Source Q passed exact-SHA Security run `44901850777/1` and the
+  restore-verified source-bound backup `44902923665/1`. AUTO
+  `44902801760/2` succeeded, followed by production deploy `44908202177/1`.
+  The deployment installed Q and C23 and retained the previous app and AA4
+  generation. Use the deployment and backup runbooks for the source-bound
+  receipts and recovery procedure.
 - Installed-origin API acceptance for patch `1848664643342973` passed: the
   Russian patch detail returns 27 changes, with the leaderboard heading at
   index 21, its four descriptions at indexes 22–25, and the Beta Season 2
@@ -60,14 +60,32 @@ belong in the linked owner documents below.
 
 ## QA and cleanup gates
 
-- Production deployment and installed-origin readiness passed for source
-  88e415. Automatic QA parent `44895923361` failed its exact-public-success
-  gate. Its public live-launch child `44895941581` reported 44 passed, 3
-  failed, 10 skipped, and no flaky or interrupted cases; the sanitized failure
-  class is `browser_child_unclassified`, with no case-level attribution.
-  UserQA and its cleanup child were not dispatched. The direct public API and
-  page probes returned Cloudflare 403, so public rendering of the patch is not
-  verified. Do not treat installed-origin API acceptance as public-browser QA.
+- Deployment and installed readiness passed for Q. Automatic QA parent
+  `44908919750/1` failed its exact-public-success gate because public child
+  `44908938481/1` exited 2 during fixture provisioning, before browser tests.
+  UserQA was not dispatched. The canonical active-Q `recover-bundle` procedure
+  later completed under lock with exact cleanup and absence proof; this cleanup
+  does not change the failed sequencer result or earn QA pass credit.
+- A separate source-bound public run used `provision=false` and an empty marker:
+  `44911090229`. It did not provision or consume roster credentials. The
+  browser suite reported 46 passed, 10 skipped, 1 failed, and no flaky or
+  interrupted cases. The closed failed identity is `image_csp_hosts` on
+  `live-webkit-mobile`, attempt 1, at
+  `tests/smoke/live-launch.spec.ts:1010:67`. That assertion checks whether the
+  image inventory completed; page-error state was absent. This does not
+  establish a Cloudflare, CSP or network cause. UserQA and its cleanup child
+  have not been dispatched, and there is no passing public-browser QA result
+  yet. Do not treat installed-origin API acceptance as public-browser QA.
+- Raw HTTP probing returned Cloudflare Error 1010 (`browser_signature_banned`),
+  which is a blocked client signature rather than evidence of an application
+  route failure. Do not retry that raw probe or weaken Cloudflare protections;
+  use canonical browser QA for rendering evidence.
+- The failed gate/process and provider mount targets are absent, and the
+  installed Q guard preflight passed. The canonical read-only storage
+  diagnostic and retention preview passed; 6,947,573,760 bytes were free
+  (82.62%), with zero QA cache candidates and zero transient/browser artifacts.
+  No filesystem retention deletion was performed. The exact fixture recovery
+  is recorded above; no UserQA or public QA pass is claimed.
   Human Chrome and real Cloudflare challenge/scoring remain optional
   diagnostics; the CI Siteverify fixture does not establish production
   Cloudflare scoring.

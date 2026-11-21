@@ -265,6 +265,8 @@ LIVE_BROWSER_PAGE_ERROR_CLASSES = frozenset(
 LIVE_BROWSER_PAGE_ERROR_ROUTES = frozenset(
     {"home", "patch", "tournaments", "other", "unknown"}
 )
+LIVE_BROWSER_IMAGE_INVENTORY_ROUTES = frozenset({"home", "patch", "tournaments"})
+LIVE_BROWSER_IMAGE_INVENTORY_MAX_COUNT = 512
 LIVE_BROWSER_PAGE_ERROR_ASSET_BASENAME = re.compile(
     r"^(?:[a-z0-9][a-z0-9_-]{12}|turbopack-[a-z0-9_-]{13})\.js$"
 )
@@ -2746,6 +2748,63 @@ def _validate_page_error_evidence(record: Mapping[str, object]) -> None:
             raise GuardError("private browser page-error location is malformed")
 
 
+def _validate_image_inventory_evidence(record: Mapping[str, object]) -> None:
+    state = record.get("image_inventory_state")
+    inventory = record.get("image_inventory")
+    if state == "unavailable":
+        if inventory is not None:
+            raise GuardError("private image inventory unavailable state is malformed")
+        return
+    if state != "captured" or not isinstance(inventory, dict) or set(inventory) != {
+        "schema", "routes",
+    }:
+        raise GuardError("private image inventory evidence is malformed")
+    routes = inventory.get("routes")
+    if (
+        type(inventory.get("schema")) is not int
+        or inventory.get("schema") != 1
+        or not isinstance(routes, list)
+        or not 1 <= len(routes) <= 3
+    ):
+        raise GuardError("private image inventory schema is malformed")
+    seen_routes: set[str] = set()
+    for route in routes:
+        if not isinstance(route, dict) or set(route) != {
+            "schema", "route", "image_count", "missing_current_src_count",
+            "unloaded_count", "complete", "counts_truncated",
+        }:
+            raise GuardError("private image inventory route is malformed")
+        route_name = route.get("route")
+        image_count = route.get("image_count")
+        missing_current_src = route.get("missing_current_src_count")
+        unloaded = route.get("unloaded_count")
+        complete = route.get("complete")
+        counts_truncated = route.get("counts_truncated")
+        if (
+            type(route.get("schema")) is not int
+            or route.get("schema") != 1
+            or not isinstance(route_name, str)
+            or route_name not in LIVE_BROWSER_IMAGE_INVENTORY_ROUTES
+            or route_name in seen_routes
+            or type(image_count) is not int
+            or not 0 <= image_count <= LIVE_BROWSER_IMAGE_INVENTORY_MAX_COUNT
+            or type(missing_current_src) is not int
+            or not 0 <= missing_current_src <= LIVE_BROWSER_IMAGE_INVENTORY_MAX_COUNT
+            or type(unloaded) is not int
+            or not 0 <= unloaded <= LIVE_BROWSER_IMAGE_INVENTORY_MAX_COUNT
+            or type(complete) is not bool
+            or type(counts_truncated) is not bool
+            or missing_current_src > image_count
+            or unloaded > image_count
+            or (counts_truncated and image_count != LIVE_BROWSER_IMAGE_INVENTORY_MAX_COUNT)
+            or (complete and (
+                image_count == 0 or missing_current_src != 0 or unloaded != 0
+            ))
+        ):
+            raise GuardError("private image inventory route values are malformed")
+        seen_routes.add(route_name)
+
+
 def _validate_live_user_api_failure(value: object) -> None:
     if not isinstance(value, dict) or set(value) != {
         "kind", "operation", "method", "expected_status", "actual_status",
@@ -2999,7 +3058,15 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
             )
         if (
             not isinstance(failure, dict)
-            or set(failure) != expected_failure_keys
+            or (
+                set(failure) != expected_failure_keys
+                and not (
+                    schema == 2
+                    and failure.get("id") == "image_csp_hosts"
+                    and set(failure) == expected_failure_keys
+                    | {"image_inventory_state", "image_inventory"}
+                )
+            )
             or not isinstance(failure.get("id"), str)
             or failure["id"] not in ({"live_user_journey"} if schema == 3 else LIVE_BROWSER_FAILURE_DIAGNOSTIC_NAMES)
             or not isinstance(failure.get("project"), str)
@@ -3018,6 +3085,8 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
         seen.add(key)
         if schema == 2:
             _validate_page_error_evidence(failure)
+            if "image_inventory_state" in failure or "image_inventory" in failure:
+                _validate_image_inventory_evidence(failure)
         if schema == 4:
             continue
         if schema == 3:
@@ -3665,14 +3734,21 @@ def _read_ephemeral_failure_report(
     seen: set[tuple[str, str, int]] = set()
     failure_status_counts = {"failed": 0, "interrupted": 0, "timedOut": 0}
     for record in failures:
-        expected_record_keys = {
+        base_record_keys = {
             "id", "project", "status", "attempt", "source_file", "source_line",
             "source_column", "source_kind", "page_error_state",
             "page_errors_truncated", "page_errors",
         }
+        image_inventory_keys = {"image_inventory_state", "image_inventory"}
         if (
             not isinstance(record, dict)
-            or set(record) != expected_record_keys
+            or (
+                set(record) != base_record_keys
+                and not (
+                    record.get("id") == "image_csp_hosts"
+                    and set(record) == base_record_keys | image_inventory_keys
+                )
+            )
             or record.get("id") not in LIVE_BROWSER_FAILURE_DIAGNOSTIC_NAMES
             or record.get("project") not in {"live-desktop", "live-mobile", "live-webkit-mobile"}
             or record.get("status") not in {"failed", "timedOut", "interrupted"}
@@ -3686,6 +3762,8 @@ def _read_ephemeral_failure_report(
         seen.add(key)
         failure_status_counts[record["status"]] += 1
         _validate_page_error_evidence(record)
+        if image_inventory_keys.issubset(record):
+            _validate_image_inventory_evidence(record)
         _validate_failure_location(record, manifest)
     if failure_status_counts != {
         "failed": counts["attempt_fail"],

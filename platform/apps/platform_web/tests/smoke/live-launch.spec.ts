@@ -998,38 +998,72 @@ test("live image currentSrc inventory stays inside the exact CSP hosts", async (
   ]);
   const inventory: Array<{ host: string; path: string; route: string }> = [];
   const patchId = await currentIndexedPatchId(request);
-  for (const route of ["/", `/patches/${patchId}`, "/tournaments"]) {
-    const imageResult = await collectLiveImageInventory(page, {
-      route,
-      waitForContent: () => waitForImageRouteContent(page, route, patchId),
-      timeoutMs: 30_000,
-    });
-    allowedHosts.add(new URL(page.url()).hostname);
-    const images = imageResult.images;
-    try {
-      expect(imageResult.complete, `all images load on ${route}`).toBe(true);
-    } catch (error) {
-      await testInfo.attach(`failed-image-snapshot-${route.replaceAll("/", "-") || "root"}`, {
-        body: JSON.stringify(images.filter((image) => !image.currentSrc || !image.loaded)),
-        contentType: "application/json",
+  const routes = [
+    { path: "/", route: "home" as const },
+    { path: `/patches/${patchId}`, route: "patch" as const },
+    { path: "/tournaments", route: "tournaments" as const },
+  ];
+  const imageEvidence: Array<{
+    schema: 1;
+    route: "home" | "patch" | "tournaments";
+    image_count: number;
+    missing_current_src_count: number;
+    unloaded_count: number;
+    complete: boolean;
+    counts_truncated: boolean;
+  }> = [];
+  try {
+    for (const { path: routePath, route } of routes) {
+      const imageResult = await collectLiveImageInventory(page, {
+        route: routePath,
+        waitForContent: () => waitForImageRouteContent(page, routePath, patchId),
+        timeoutMs: 30_000,
       });
-      throw error;
-    }
-    for (const image of images) {
-      expect(image.currentSrc).toBeTruthy();
-      expect(image.loaded, `image failed on ${route}`).toBe(true);
-      const parsed = new URL(image.currentSrc);
-      expect(parsed.protocol).not.toBe("data:");
-      if (parsed.protocol !== "blob:") {
-        expect(allowedHosts.has(parsed.hostname), `unexpected image host ${parsed.hostname}`).toBe(true);
+      const images = imageResult.images;
+      const missingCurrentSrcCount = images.filter((image) => !image.currentSrc).length;
+      const unloadedCount = images.filter((image) => !image.loaded).length;
+      const countLimit = 512;
+      imageEvidence.push({
+        schema: 1,
+        route,
+        image_count: Math.min(images.length, countLimit),
+        missing_current_src_count: Math.min(missingCurrentSrcCount, countLimit),
+        unloaded_count: Math.min(unloadedCount, countLimit),
+        complete: imageResult.complete,
+        counts_truncated: images.length > countLimit
+          || missingCurrentSrcCount > countLimit
+          || unloadedCount > countLimit,
+      });
+      allowedHosts.add(new URL(page.url()).hostname);
+      expect(imageResult.complete, `all images load on ${route}`).toBe(true);
+      for (const image of images) {
+        expect(image.currentSrc).toBeTruthy();
+        expect(image.loaded, `image failed on ${route}`).toBe(true);
+        const parsed = new URL(image.currentSrc);
+        expect(parsed.protocol).not.toBe("data:");
+        if (parsed.protocol !== "blob:") {
+          expect(allowedHosts.has(parsed.hostname), `unexpected image host ${parsed.hostname}`).toBe(true);
+        }
+        inventory.push({ host: parsed.hostname, path: parsed.pathname, route: routePath });
       }
-      inventory.push({ host: parsed.hostname, path: parsed.pathname, route });
     }
+    await testInfo.attach("loaded-image-current-src-inventory", {
+      body: JSON.stringify(inventory),
+      contentType: "application/json",
+    });
+  } catch (error) {
+    for (const evidence of imageEvidence) {
+      try {
+        await testInfo.attach("live-image-inventory-evidence-v1", {
+          body: JSON.stringify(evidence),
+          contentType: "application/json",
+        });
+      } catch {
+        // Failure diagnostics cannot replace the original assertion outcome.
+      }
+    }
+    throw error;
   }
-  await testInfo.attach("loaded-image-current-src-inventory", {
-    body: JSON.stringify(inventory),
-    contentType: "application/json",
-  });
 });
 
 function responseCspNonce(response: import("@playwright/test").Response): string {

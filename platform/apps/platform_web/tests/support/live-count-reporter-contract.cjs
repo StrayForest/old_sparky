@@ -383,6 +383,21 @@ assert.deepEqual(JSON.parse(pageErrorAttachment.body.toString("ascii")), {
     column: 34,
   }],
 });
+function imageInventoryAttachment(route, values) {
+  return {
+    name: "live-image-inventory-evidence-v1",
+    contentType: "application/json",
+    body: Buffer.from(JSON.stringify({
+      schema: 1,
+      route,
+      image_count: values.image_count,
+      missing_current_src_count: values.missing_current_src_count,
+      unloaded_count: values.unloaded_count,
+      complete: values.complete,
+      counts_truncated: values.counts_truncated ?? false,
+    }), "ascii"),
+  };
+}
 assert.equal(pageErrorClass({ name: "SecurityError" }), "DOMException");
 for (const privateValue of [
   "private pageerror text",
@@ -1005,7 +1020,27 @@ try {
     title: publicTitles.at(-1),
     project: "live-webkit-mobile",
     errorLocation: { file: fixture.helper, line: 2, column: 3 },
-    attachments: [pageErrorAttachment],
+    attachments: [
+      pageErrorAttachment,
+      imageInventoryAttachment("home", {
+        image_count: 8,
+        missing_current_src_count: 0,
+        unloaded_count: 0,
+        complete: true,
+      }),
+      imageInventoryAttachment("patch", {
+        image_count: 5,
+        missing_current_src_count: 0,
+        unloaded_count: 0,
+        complete: true,
+      }),
+      imageInventoryAttachment("tournaments", {
+        image_count: 1,
+        missing_current_src_count: 1,
+        unloaded_count: 1,
+        complete: false,
+      }),
+    ],
   });
   const failurePlan = publicPlanWithFailure(failure);
   const failedSummary = summarizeRun(
@@ -1044,15 +1079,53 @@ try {
     page_error_state: "captured",
     page_errors_truncated: false,
     page_errors: [["TypeError", "patch", "abcdefghijklm.js", 12, 34]],
+    image_inventory_state: "captured",
+    image_inventory: {
+      schema: 1,
+      routes: [
+        {
+          schema: 1,
+          route: "home",
+          image_count: 8,
+          missing_current_src_count: 0,
+          unloaded_count: 0,
+          complete: true,
+          counts_truncated: false,
+        },
+        {
+          schema: 1,
+          route: "patch",
+          image_count: 5,
+          missing_current_src_count: 0,
+          unloaded_count: 0,
+          complete: true,
+          counts_truncated: false,
+        },
+        {
+          schema: 1,
+          route: "tournaments",
+          image_count: 1,
+          missing_current_src_count: 1,
+          unloaded_count: 1,
+          complete: false,
+          counts_truncated: false,
+        },
+      ],
+    },
   }]);
   assert.equal(reportBytes.includes(Buffer.from("private assertion text")), false);
   assert.equal(reportBytes.includes(Buffer.from("private-playwright-id")), false);
   assert.equal(reportBytes.includes(Buffer.from("private title")), false);
   assert.equal(reportBytes.includes(Buffer.from(failureRoot)), false);
   assert.equal(reportBytes.includes(Buffer.from("abcdefghijklm.js:12:34")), false);
+  assert.equal(reportBytes.includes(Buffer.from("https://")), false);
+  assert.equal(reportBytes.includes(Buffer.from("alt")), false);
+  assert.equal(reportBytes.includes(Buffer.from("currentSrc")), false);
 
   const unavailableFixture = diagnosticFixture(failureRoot, "c2a2b3c4");
   const unavailable = failureTest(unavailableFixture, {
+    title: publicTitles.at(-1),
+    project: "live-webkit-mobile",
     errorLocation: { file: unavailableFixture.helper, line: 2, column: 3 },
   });
   const unavailablePlan = publicPlanWithFailure(unavailable);
@@ -1074,6 +1147,14 @@ try {
     ],
     ["unavailable", false, []],
     "a missing attachment is unavailable, not an empty captured pageerror set",
+  );
+  assert.deepEqual(
+    [
+      unavailableReport.failures[0].image_inventory_state,
+      unavailableReport.failures[0].image_inventory,
+    ],
+    ["unavailable", null],
+    "a missing image attachment is unavailable, not a zero-image observation",
   );
 
   const absentFixture = diagnosticFixture(failureRoot, "c3a2b3c4");
@@ -1192,6 +1273,58 @@ try {
       ],
       ["unavailable", false, []],
       `${label} fails closed without changing failure status`,
+    );
+  }
+
+  const badImageEvidenceCases = [
+    ["duplicate route", [
+      imageInventoryAttachment("home", {
+        image_count: 1, missing_current_src_count: 0, unloaded_count: 0, complete: true,
+      }),
+      imageInventoryAttachment("home", {
+        image_count: 1, missing_current_src_count: 0, unloaded_count: 0, complete: true,
+      }),
+    ]],
+    ["oversize attachment", [{
+      name: "live-image-inventory-evidence-v1",
+      contentType: "application/json",
+      body: Buffer.alloc(513, 0x61),
+    }]],
+    ["malformed image attachment", [{
+      name: "live-image-inventory-evidence-v1",
+      contentType: "application/json",
+      body: Buffer.from("{", "ascii"),
+    }]],
+  ];
+  for (const [index, [label, attachments]] of badImageEvidenceCases.entries()) {
+    const invalidFixture = diagnosticFixture(
+      failureRoot,
+      `e${index.toString().padStart(2, "0")}2b3c4`,
+    );
+    const invalid = failureTest(invalidFixture, {
+      title: publicTitles.at(-1),
+      project: "live-webkit-mobile",
+      errorLocation: { file: invalidFixture.helper, line: 2, column: 3 },
+      attachments,
+    });
+    const invalidPlan = publicPlanWithFailure(invalid);
+    assert.equal(withRootOwnedGate(invalidFixture.gateRoot, () => writeBoundedFailureSummary(
+      invalidFixture.binding,
+      { allTests: () => invalidPlan },
+      failedSummary,
+      { gateRoot: invalidFixture.gateRoot, sourceRoot: invalidFixture.sourceRoot },
+    )), true, `${label} does not change the QA failure outcome`);
+    const invalidReport = JSON.parse(fs.readFileSync(
+      path.join(invalidFixture.results, "live-failures-v2.json"),
+      "ascii",
+    ));
+    assert.deepEqual(
+      [
+        invalidReport.failures[0].image_inventory_state,
+        invalidReport.failures[0].image_inventory,
+      ],
+      ["unavailable", null],
+      `${label} fails closed without inventing image counts`,
     );
   }
 

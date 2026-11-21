@@ -23,12 +23,14 @@ const MAX_PAGE_ERROR_EVENTS = 4;
 const MAX_PAGE_ERROR_STACK_CHARS = 16 * 1024;
 const MAX_PAGE_ERROR_STACK_LINES = 32;
 const MAX_TRACKED_NEXT_SCRIPTS = 256;
+const MAX_IMAGE_INVENTORY_COUNT = 512;
 const MAX_ATTEMPTS = 32768;
 const GATE_ROOT = "/run/oldsparky-liveqa";
 const FAILURE_REPORT_FILE = "live-failures-v2.json";
 const FAILURE_IDENTITY_REPORT_FILE = "live-failure-identities-v1.json";
 const LIVE_USER_FAILURE_REPORT_FILE = "live-user-failures-v3.json";
 const PAGE_ERROR_ATTACHMENT_NAME = "live-pageerror-evidence-v1";
+const IMAGE_INVENTORY_ATTACHMENT_NAME = "live-image-inventory-evidence-v1";
 const LIVE_USER_API_FAILURE_ATTACHMENT_NAME = "live-user-api-failure-v1";
 const RUN_STATUSES = new Set(["passed", "failed", "timedout", "interrupted"]);
 const ATTEMPT_STATUSES = new Set([
@@ -782,6 +784,83 @@ function pageErrorEvidenceForAttempt(result) {
   };
 }
 
+function normalizedImageInventoryAttachment(attachment) {
+  if (
+    attachment?.name !== IMAGE_INVENTORY_ATTACHMENT_NAME
+    || attachment.contentType !== "application/json"
+    || attachment.path !== undefined
+    || !Buffer.isBuffer(attachment.body)
+    || attachment.body.length > 512
+    || attachment.body.some((byte) => byte > 0x7f)
+  ) return null;
+  let payload;
+  try {
+    payload = JSON.parse(attachment.body.toString("ascii"));
+  } catch {
+    return null;
+  }
+  const expectedKeys = [
+    "complete",
+    "counts_truncated",
+    "image_count",
+    "missing_current_src_count",
+    "route",
+    "schema",
+    "unloaded_count",
+  ];
+  if (
+    !payload
+    || typeof payload !== "object"
+    || Array.isArray(payload)
+    || Object.keys(payload).sort().join(",") !== expectedKeys.join(",")
+    || payload.schema !== 1
+    || !["home", "patch", "tournaments"].includes(payload.route)
+    || !Number.isSafeInteger(payload.image_count)
+    || payload.image_count < 0
+    || payload.image_count > MAX_IMAGE_INVENTORY_COUNT
+    || !Number.isSafeInteger(payload.missing_current_src_count)
+    || payload.missing_current_src_count < 0
+    || payload.missing_current_src_count > MAX_IMAGE_INVENTORY_COUNT
+    || !Number.isSafeInteger(payload.unloaded_count)
+    || payload.unloaded_count < 0
+    || payload.unloaded_count > MAX_IMAGE_INVENTORY_COUNT
+    || typeof payload.complete !== "boolean"
+    || typeof payload.counts_truncated !== "boolean"
+    || payload.missing_current_src_count > payload.image_count
+    || payload.unloaded_count > payload.image_count
+    || (payload.counts_truncated && payload.image_count !== MAX_IMAGE_INVENTORY_COUNT)
+    || (payload.complete && (
+      payload.image_count === 0
+      || payload.missing_current_src_count !== 0
+      || payload.unloaded_count !== 0
+    ))
+    || attachment.body.toString("ascii") !== JSON.stringify(payload)
+  ) return null;
+  return payload;
+}
+
+function imageInventoryEvidenceForAttempt(result) {
+  const attachments = Array.isArray(result?.attachments)
+    ? result.attachments.filter(
+      (attachment) => attachment?.name === IMAGE_INVENTORY_ATTACHMENT_NAME,
+    )
+    : [];
+  if (attachments.length === 0 || attachments.length > 3) {
+    return { state: "unavailable", inventory: null };
+  }
+  const routes = [];
+  const seenRoutes = new Set();
+  for (const attachment of attachments) {
+    const route = normalizedImageInventoryAttachment(attachment);
+    if (!route || seenRoutes.has(route.route)) {
+      return { state: "unavailable", inventory: null };
+    }
+    seenRoutes.add(route.route);
+    routes.push(route);
+  }
+  return { state: "captured", inventory: { schema: 1, routes } };
+}
+
 function normalizedUserApiFailure(input) {
   const keys = input && typeof input === "object" && !Array.isArray(input)
     ? Object.keys(input).sort().join(",")
@@ -1094,7 +1173,7 @@ function failureRecordForAttempt(test, result, attempt, sourceRoot) {
     location = normalizedFailureLocation(test.location, sourceRoot, "declaration");
   }
   const pageErrorEvidence = pageErrorEvidenceForAttempt(result);
-  return {
+  const failure = {
     id,
     project,
     status: result.status,
@@ -1107,6 +1186,12 @@ function failureRecordForAttempt(test, result, attempt, sourceRoot) {
     page_errors_truncated: pageErrorEvidence.truncated,
     page_errors: pageErrorEvidence.events,
   };
+  if (id === "image_csp_hosts") {
+    const imageEvidence = imageInventoryEvidenceForAttempt(result);
+    failure.image_inventory_state = imageEvidence.state;
+    failure.image_inventory = imageEvidence.inventory;
+  }
+  return failure;
 }
 
 function boundedFailureReportBytes(payload) {
@@ -1134,6 +1219,17 @@ function boundedFailureReportBytes(payload) {
       failure.source_line = null;
       failure.source_column = null;
       failure.source_kind = "unavailable";
+      bytes = Buffer.from(`${JSON.stringify(payload)}\n`, "ascii");
+    }
+  }
+  // Route-level image diagnostics are optional private detail. If a stress
+  // failure report approaches its cap, preserve each failed test identity and
+  // mark these observations unavailable instead of dropping arbitrary fields.
+  for (const failure of [...payload.failures].reverse()) {
+    if (bytes.length <= MAX_EPHEMERAL_FAILURE_REPORT_BYTES) break;
+    if (failure.image_inventory_state === "captured") {
+      failure.image_inventory_state = "unavailable";
+      failure.image_inventory = null;
       bytes = Buffer.from(`${JSON.stringify(payload)}\n`, "ascii");
     }
   }
