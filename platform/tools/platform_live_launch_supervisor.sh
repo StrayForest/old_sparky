@@ -315,7 +315,7 @@ if browser_diagnostic="$(env -i \
 else
   browser_status=$?
 fi
-if [[ "$browser_diagnostic" =~ (^|$'\n')LIVE_QA_CHILD_DIAGNOSTIC\ schema=(1|2)\ kind=(none|playwright_cli_usage|node_module_missing|browser_executable_missing|browser_launch_error|child_timeout|cleanup_failure|failure_report_unavailable|unclassified)\ stdout_bytes=[0-9]{1,16}\ stderr_bytes=[0-9]{1,16}\ truncated=(true|false)\ child_exit=[0-9]{1,3}(\ failure_reason=(identity_summary_unavailable|private_store_unavailable)\ failure_summary=([A-Za-z0-9_-]+|none))?($|$'\n') ]]; then
+if [[ "$browser_diagnostic" =~ (^|$'\n')LIVE_QA_CHILD_DIAGNOSTIC\ schema=(1|2)\ kind=(none|playwright_cli_usage|node_module_missing|browser_executable_missing|browser_launch_error|child_timeout|cleanup_failure|failure_report_unavailable|failure_report_published|unclassified)\ stdout_bytes=[0-9]{1,16}\ stderr_bytes=[0-9]{1,16}\ truncated=(true|false)\ child_exit=[0-9]{1,3}(\ failure_reason=(identity_summary_unavailable|private_store_unavailable|private_store_available)\ failure_summary=([A-Za-z0-9_-]+|none))?($|$'\n') ]]; then
   child_failure_summary="${BASH_REMATCH[7]:-}"
   child_diagnostic="${BASH_REMATCH[0]}"
   child_diagnostic="${child_diagnostic//$'\n'/}"

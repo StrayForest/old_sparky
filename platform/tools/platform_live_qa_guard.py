@@ -58,9 +58,9 @@ LIVE_QA_CHILD_CAPTURE_BYTES = 64 * 1024
 LIVE_QA_CHILD_MARKER_RE = re.compile(
     r"LIVE_QA_CHILD_DIAGNOSTIC schema=(1|2) kind=(none|playwright_cli_usage|"
     r"node_module_missing|browser_executable_missing|browser_launch_error|"
-    r"child_timeout|cleanup_failure|failure_report_unavailable|unclassified) stdout_bytes=([0-9]{1,16}) "
+    r"child_timeout|cleanup_failure|failure_report_unavailable|failure_report_published|unclassified) stdout_bytes=([0-9]{1,16}) "
     r"stderr_bytes=([0-9]{1,16}) truncated=(true|false) child_exit=([0-9]{1,3})"
-    r"(?: failure_reason=(identity_summary_unavailable|private_store_unavailable) "
+    r"(?: failure_reason=(identity_summary_unavailable|private_store_unavailable|private_store_available) "
     r"failure_summary=([A-Za-z0-9_-]{1,16384}|none))?\n"
 )
 LIVE_QA_CGROUP = Path("/sys/fs/cgroup/system.slice") / LIVE_QA_SYSTEMD_UNIT
@@ -424,9 +424,27 @@ class BrowserFailureReportUnavailable(GuardError):
 class BrowserFailureCounts(GuardError):
     """Carry validated failed counts through the private CLI without losing the line."""
 
-    def __init__(self, count_line: str) -> None:
+    def __init__(
+        self,
+        count_line: str,
+        *,
+        failure_reason: str = "identity_summary_unavailable",
+        failure_summary_token: str | None = None,
+    ) -> None:
         super().__init__("public browser QA counts indicate failure")
         self.count_line = count_line
+        self.failure_reason = (
+            failure_reason
+            if failure_reason in {"identity_summary_unavailable", "private_store_available"}
+            else "identity_summary_unavailable"
+        )
+        self.failure_summary_token = (
+            failure_summary_token
+            if isinstance(failure_summary_token, str)
+            and len(failure_summary_token) <= LIVE_BROWSER_FAILURE_SUMMARY_MAX_TOKEN_CHARS
+            and re.fullmatch(r"[A-Za-z0-9_-]+", failure_summary_token) is not None
+            else None
+        )
 
 
 MACHINE_LOCK_PATH = _machine_lock_module.MACHINE_LOCK_PATH
@@ -3244,8 +3262,12 @@ def _encode_failure_summary_token(
     marker_sha256: str,
     counts: Mapping[str, object],
     failures: list[dict[str, object]],
+    failure_reason: str,
 ) -> str | None:
-    if len(failures) > LIVE_BROWSER_FAILURE_SUMMARY_MAX_RECORDS:
+    if (
+        failure_reason not in {"private_store_available", "private_store_unavailable"}
+        or not 1 <= len(failures) <= LIVE_BROWSER_FAILURE_SUMMARY_MAX_RECORDS
+    ):
         return None
     payload = {
         "schema": 1,
@@ -3254,7 +3276,7 @@ def _encode_failure_summary_token(
         "app_sha": app_sha,
         "marker_sha256": marker_sha256,
         "run_status": counts["run_status"],
-        "failure_reason": "private_store_unavailable",
+        "failure_reason": failure_reason,
         "failures": [
             [failure["id"], failure["project"], failure["status"], failure["attempt"]]
             for failure in failures
@@ -4136,6 +4158,7 @@ def public_browser_counts_line(
                     marker_sha256=marker_sha256,
                     counts=payload,
                     failures=identity_failures,
+                    failure_reason="private_store_unavailable",
                 )
                 if failure_summary_token is not None:
                     failure_reason = "private_store_unavailable"
@@ -4147,7 +4170,39 @@ def public_browser_counts_line(
                 failure_summary_token=failure_summary_token,
             ) from exc
     if fail_on_failure_counts and _failure_report_required(payload):
-        raise BrowserFailureCounts(line)
+        failure_reason = "identity_summary_unavailable"
+        failure_summary_token = None
+        try:
+            # The private report was successfully published above. Re-read the
+            # independent identity sidecar through its strict file, identity,
+            # and count validator before transporting only its closed fields.
+            identity_failures = _read_ephemeral_failure_identity_summary(
+                gate,
+                source_sha=source_sha,
+                app_sha=app_sha,
+                marker_sha256=marker_sha256,
+                counts=payload,
+            )
+            failure_summary_token = _encode_failure_summary_token(
+                gate,
+                source_sha=source_sha,
+                app_sha=app_sha,
+                marker_sha256=marker_sha256,
+                counts=payload,
+                failures=identity_failures,
+                failure_reason="private_store_available",
+            )
+            if failure_summary_token is not None:
+                failure_reason = "private_store_available"
+        except GuardError:
+            # Missing optional identity transport does not change the failed
+            # count or expose unvalidated report contents.
+            pass
+        raise BrowserFailureCounts(
+            line,
+            failure_reason=failure_reason,
+            failure_summary_token=failure_summary_token,
+        )
     return line
 
 
@@ -8334,6 +8389,11 @@ def main(argv: Iterable[str] | None = None) -> int:
                 return LIVE_BROWSER_FAILURE_REPORT_EXIT
             except BrowserFailureCounts as exc:
                 print(exc.count_line, end="")
+                print(
+                    "LIVE_BROWSER_FAILURE_SUMMARY schema=1 "
+                    f"reason={exc.failure_reason} "
+                    f"token={exc.failure_summary_token or 'none'}"
+                )
                 return LIVE_BROWSER_FAILURE_COUNTS_EXIT
             print(line, end="")
         elif args.command == "merge-browser-inventory":

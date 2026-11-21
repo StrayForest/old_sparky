@@ -3,6 +3,7 @@ import path from "node:path";
 import { expect, test } from "@playwright/test";
 import type { Locator } from "@playwright/test";
 import type { PlatformPatchAbilityStat, PlatformPatchDetail, PlatformPatchSection } from "../../lib/platform-types";
+import { expectRenderedPatchChangeList } from "../support/patch-change-list-assertions";
 import { patchAcceptanceIssues } from "../support/patch-acceptance";
 
 const patchIds = [
@@ -13,9 +14,7 @@ const patchIds = [
 ] as const;
 const nursePatchId = "1847920302240420";
 const nurseIntroductionPatchId = "1846651706696737";
-const sourceOwnerPrefixPattern = /^(?:Nurse|Медсестра|Mid Boss|Средний босс|Items|Heroes|Предметы|Герои)\s*:/iu;
 const rawPatchMarkupPattern = /STEAM_CLAN_LOC_IMAGE|clan\.fastly\.steamstatic\.com|\[\s*\/?\s*img\b|\[\s*url\b|\[\s*\/\s*\*\s*\]/iu;
-const separatorOnlyChangePattern = /^-{2,}$/u;
 const patchFixtures = Promise.all(patchIds.map(async (id) => (
   JSON.parse(await readFile(path.join(process.cwd(), "tests", "fixtures", "patch-details", `${id}.json`), "utf8")) as PlatformPatchDetail
 )));
@@ -27,14 +26,11 @@ function sectionHeading(section: PlatformPatchSection): string {
   return section.title;
 }
 
-async function expectChangeRows(rows: Locator, changes: string[]) {
-  await expect(rows).toHaveCount(changes.length);
-  for (const [index, change] of changes.entries()) {
-    expect(sourceOwnerPrefixPattern.test(change.trim())).toBe(false);
+function expectCleanPatchChanges(changes: string[]): void {
+  for (const change of changes) {
     expect(rawPatchMarkupPattern.test(change)).toBe(false);
-    expect(separatorOnlyChangePattern.test(change.trim())).toBe(false);
-    const row = rows.nth(index);
-    await expect(row).toHaveText(change);
+    expect(/^(?:Nurse|Медсестра|Mid Boss|Средний босс|Items|Heroes|Предметы|Герои)\s*:/iu.test(change.trim())).toBe(false);
+    expect(/^-{2,}$/u.test(change.trim())).toBe(false);
   }
 }
 
@@ -244,9 +240,11 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
       if (section.kind === "hero" && section.hero_display_name) {
         await expect(sectionCard.getByText(section.hero_display_name, { exact: true })).toHaveCount(0);
       }
-      await expectChangeRows(
-        sectionCard.locator(":scope > .patch-change-list > li"),
+      expectCleanPatchChanges(section.changes);
+      await expectRenderedPatchChangeList(
+        sectionCard.locator(":scope > .patch-change-list"),
         section.changes,
+        section.change_groups ?? [],
       );
 
       const abilityCards = sectionCard.locator(".patch-ability");
@@ -261,9 +259,11 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
         if (ability.icon_url && realIconCount === 1) {
           await expect(abilityCard.locator(".patch-ability-icon")).toHaveAttribute("src", ability.icon_url);
         }
-        await expectChangeRows(
-          abilityCard.locator(":scope > .patch-change-list > li"),
+        expectCleanPatchChanges(ability.changes);
+        await expectRenderedPatchChangeList(
+          abilityCard.locator(":scope > .patch-change-list"),
           ability.changes,
+          ability.change_groups ?? [],
         );
         if (ability.presentation_kind !== "introduction" && ability.presentation_kind !== "replacement") {
           expect(ability.description ?? "").toBe("");

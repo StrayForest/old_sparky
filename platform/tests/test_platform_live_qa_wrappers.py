@@ -2548,6 +2548,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 preflight: bool = False,
                 fd3_mode: str = "report",
                 failure_summary_line: str = "",
+                initial_kind: str | None = None,
             ):
                 fake_guard = fixture / f"guard-{status}-{browser_exit}-{int(preflight)}"
                 fake_guard.write_text(
@@ -2561,7 +2562,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 )
                 fake_guard.chmod(0o700)
                 count_output = fixture / f"counts-{status}-{browser_exit}-{int(preflight)}.txt"
-                initial_kind = "browser_launch_error" if browser_exit else "none"
+                child_kind = initial_kind or ("browser_launch_error" if browser_exit else "none")
                 script = "\n".join(
                     (
                         "set -euo pipefail",
@@ -2574,7 +2575,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                         f"SOURCE_COMMIT={'a' * 40}",
                         f"browser_status={browser_exit}",
                         "diagnostic_valid=1",
-                        f"diagnostic_kind={initial_kind}",
+                        f"diagnostic_kind={child_kind}",
                         "diagnostic_stdout_bytes=0",
                         "diagnostic_stderr_bytes=0",
                         "diagnostic_truncated=false",
@@ -2650,6 +2651,52 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             self.assertIn("failure_reason=private_store_unavailable", summarized_failure.stdout)
             self.assertIn("failure_summary=eyJzY2hlbWEiOjF9", summarized_failure.stdout)
             self.assertEqual(summarized_counts.read_text(encoding="ascii"), failed_counts_line + "\n")
+
+            available_summary = (
+                "LIVE_BROWSER_FAILURE_SUMMARY schema=1 reason=private_store_available "
+                "token=eyJzY2hlbWEiOjF9"
+            )
+            assertion_failure, assertion_counts = run_count_tail(
+                43,
+                failed_counts_line,
+                browser_exit=1,
+                failure_summary_line=available_summary,
+                initial_kind="unclassified",
+            )
+            self.assertEqual(assertion_failure.returncode, 1)
+            self.assertIn("schema=2 kind=failure_report_published", assertion_failure.stdout)
+            self.assertIn("child_exit=1 failure_reason=private_store_available", assertion_failure.stdout)
+            self.assertIn("failure_summary=eyJzY2hlbWEiOjF9", assertion_failure.stdout)
+            self.assertEqual(assertion_counts.read_text(encoding="ascii"), failed_counts_line + "\n")
+
+            summary_unavailable, _summary_unavailable_counts = run_count_tail(
+                43,
+                failed_counts_line,
+                browser_exit=1,
+                initial_kind="unclassified",
+            )
+            self.assertIn("schema=2 kind=failure_report_published", summary_unavailable.stdout)
+            self.assertIn(
+                "failure_reason=identity_summary_unavailable failure_summary=none",
+                summary_unavailable.stdout,
+            )
+
+            for priority_kind, child_status in (
+                ("child_timeout", 124),
+                ("cleanup_failure", 2),
+                ("browser_launch_error", 1),
+            ):
+                with self.subTest(priority_kind=priority_kind):
+                    priority_failure, _priority_counts = run_count_tail(
+                        43,
+                        failed_counts_line,
+                        browser_exit=child_status,
+                        failure_summary_line=available_summary,
+                        initial_kind=priority_kind,
+                    )
+                    self.assertEqual(priority_failure.returncode, child_status)
+                    self.assertIn(f"schema=1 kind={priority_kind}", priority_failure.stdout)
+                    self.assertNotIn("failure_summary=", priority_failure.stdout)
 
             bounded_summary_token = "A" * (12 * 1024)
             bounded_summary, bounded_summary_counts = run_count_tail(
@@ -3459,7 +3506,118 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 text=True,
             )
             self.assertNotEqual(rejected_summary.returncode, 0)
-            self.assertIn("status is not passed", rejected_summary.stderr)
+
+        failed_fields = {
+            **count_fields,
+            "run_status": "failed",
+            "logical_pass": 44,
+            "logical_fail": 3,
+            "attempt_pass": 44,
+            "attempt_fail": 3,
+        }
+        failed_counts_line = (
+            "LIVE_BROWSER_COUNTS schema=1 "
+            + " ".join(
+                f"{name}={failed_fields[name]}"
+                for name in (
+                    "run_status",
+                    *platform_workflow_remote_dispatch.LIVE_BROWSER_COUNT_FIELDS,
+                    "source_sha",
+                    "app_sha",
+                    "marker_sha256",
+                )
+            )
+        )
+        failed_identities = [
+            ["patch_owner_sections", project, "failed", 1]
+            for project in ("live-desktop", "live-mobile", "live-webkit-mobile")
+        ]
+        summary_payload = {
+            "schema": 1,
+            "gate": "public-live-qa.a1b2c3d4",
+            "source_sha": status_sha,
+            "app_sha": status_sha,
+            "marker_sha256": hashlib.sha256(b"liveqa-count-contract").hexdigest(),
+            "run_status": "failed",
+            "failure_reason": "private_store_available",
+            "failures": failed_identities,
+        }
+        summary_token = base64.urlsafe_b64encode(
+            json.dumps(summary_payload, separators=(",", ":")).encode("ascii")
+        ).rstrip(b"=").decode("ascii")
+        failed_diagnostic = (
+            "LIVE_QA_CHILD_DIAGNOSTIC schema=2 kind=failure_report_published "
+            "stdout_bytes=0 stderr_bytes=0 truncated=false child_exit=1 "
+            f"failure_reason=private_store_available failure_summary={summary_token}\n"
+        )
+        failed_browser_status_line = (
+            "LIVE_LAUNCH_STATUS schema=2 status=failed stage=browser_qa check=browser_qa "
+            f"child_exit=1 source_sha={status_sha}\n"
+        )
+        diagnosed_failure = sanitize_status(
+            (failed_counts_line + "\n" + failed_diagnostic + failed_browser_status_line).encode(), 1
+        )
+        self.assertEqual(diagnosed_failure["status"], "failed")
+        self.assertFalse(diagnosed_failure["success"])
+        self.assertEqual(diagnosed_failure["tests"], [])
+        self.assertEqual(
+            diagnosed_failure["browser_failure_metadata"]["failures"],
+            failed_identities,
+        )
+        with tempfile.TemporaryDirectory(prefix="live-launch-validator-failure-") as directory:
+            report_path = Path(directory) / "report.json"
+            report_path.write_text(json.dumps(diagnosed_failure), encoding="utf-8")
+            valid_failed_summary = subprocess.run(
+                [sys.executable, "-", str(report_path), status_sha],
+                input=validator_script,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                valid_failed_summary.returncode,
+                0,
+                f"{valid_failed_summary.stderr}; report={diagnosed_failure!r}",
+            )
+            invalid_failed = dict(diagnosed_failure, browser_failure_metadata=None)
+            report_path.write_text(json.dumps(invalid_failed), encoding="utf-8")
+            rejected_failed_summary = subprocess.run(
+                [sys.executable, "-", str(report_path), status_sha],
+                input=validator_script,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(rejected_failed_summary.returncode, 0)
+
+        fallback_payload = dict(summary_payload, failure_reason="private_store_unavailable")
+        fallback_token = base64.urlsafe_b64encode(
+            json.dumps(fallback_payload, separators=(",", ":")).encode("ascii")
+        ).rstrip(b"=").decode("ascii")
+        fallback_diagnostic = (
+            "LIVE_QA_CHILD_DIAGNOSTIC schema=2 kind=failure_report_unavailable "
+            "stdout_bytes=0 stderr_bytes=0 truncated=false child_exit=0 "
+            f"failure_reason=private_store_unavailable failure_summary={fallback_token}\n"
+        )
+        diagnosed_fallback = sanitize_status(
+            (failed_counts_line + "\n" + fallback_diagnostic + failed_browser_status_line).encode(), 1
+        )
+        self.assertEqual(diagnosed_fallback["status"], "failed")
+        self.assertEqual(
+            diagnosed_fallback["error_class_counts"],
+            {"browser_test_failure": 3},
+        )
+        with tempfile.TemporaryDirectory(prefix="live-launch-validator-fallback-") as directory:
+            report_path = Path(directory) / "report.json"
+            report_path.write_text(json.dumps(diagnosed_fallback), encoding="utf-8")
+            valid_fallback_summary = subprocess.run(
+                [sys.executable, "-", str(report_path), status_sha],
+                input=validator_script,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(valid_fallback_summary.returncode, 0, valid_fallback_summary.stderr)
         no_pass_fields = {
             **count_fields,
             "logical_pass": 0,
@@ -4333,6 +4491,44 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 expected_sha=source_sha,
                 expected_app_sha=app_sha,
                 expected_marker_sha256=marker_sha,
+            )
+        )
+        published_summary = dict(failure_summary, failure_reason="private_store_available")
+        published_token = base64.urlsafe_b64encode(
+            json.dumps(published_summary, separators=(",", ":")).encode("ascii")
+        ).rstrip(b"=")
+        published_diagnostic = (
+            b"LIVE_QA_CHILD_DIAGNOSTIC schema=2 kind=failure_report_published "
+            b"stdout_bytes=0 stderr_bytes=0 truncated=false child_exit=1 "
+            b"failure_reason=private_store_available failure_summary="
+            + published_token
+            + b"\n"
+        )
+        self.assertTrue(
+            platform_workflow_remote_dispatch._valid_live_qa_diagnostic(
+                published_diagnostic, 1
+            )
+        )
+        self.assertTrue(
+            platform_workflow_remote_dispatch._valid_browser_failure_summary(
+                published_diagnostic,
+                failure_counts,
+                expected_sha=source_sha,
+                expected_app_sha=app_sha,
+                expected_marker_sha256=marker_sha,
+            )
+        )
+        self.assertFalse(
+            platform_workflow_remote_dispatch._valid_live_qa_diagnostic(
+                published_diagnostic.replace(b"failure_report_published", b"unclassified"),
+                1,
+            )
+        )
+        self.assertFalse(
+            platform_workflow_remote_dispatch._valid_live_qa_diagnostic(
+                published_diagnostic.replace(b"schema=2", b"schema=1").split(b" failure_reason=", 1)[0]
+                + b"\n",
+                1,
             )
         )
         self.assertFalse(

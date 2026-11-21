@@ -380,7 +380,7 @@ LIVE_LAUNCH_FAILURE_SUMMARY_IDS = frozenset(
 LIVE_QA_DIAGNOSTIC_RE = re.compile(
     rb"LIVE_QA_CHILD_DIAGNOSTIC schema=(?P<schema>1|2) kind=(?P<kind>none|playwright_cli_usage|"
     rb"node_module_missing|browser_executable_missing|browser_launch_error|"
-    rb"child_timeout|cleanup_failure|failure_report_unavailable|unclassified|"
+    rb"child_timeout|cleanup_failure|failure_report_unavailable|failure_report_published|unclassified|"
     rb"dispatch_failure|protocol_failure)"
     rb"(?: stage=(?P<stage>validation|identity|trusted_generation|dispatch) "
     rb"check=(?P<check>input_shape|source_binding|source_binding_io|source_binding_schema|"
@@ -391,7 +391,7 @@ LIVE_QA_DIAGNOSTIC_RE = re.compile(
     rb"stdout_bytes=(?P<stdout_bytes>[0-9]{1,16}) "
     rb"stderr_bytes=(?P<stderr_bytes>[0-9]{1,16}) "
     rb"truncated=(?P<truncated>true|false) child_exit=(?P<child_exit>[0-9]{1,3})"
-    rb"(?: failure_reason=(?P<failure_reason>identity_summary_unavailable|private_store_unavailable) "
+    rb"(?: failure_reason=(?P<failure_reason>identity_summary_unavailable|private_store_unavailable|private_store_available) "
     rb"failure_summary=(?P<failure_summary>[A-Za-z0-9_-]{1,16384}|none))?\n"
 )
 LIVE_QA_DISPATCH_FAILURE_CHECKS = {
@@ -419,19 +419,39 @@ def _valid_live_qa_diagnostic(line: bytes, child_status: int) -> bool:
     schema = match.group("schema")
     reason = match.group("failure_reason")
     summary = match.group("failure_summary")
-    if schema == b"1" and (reason is not None or summary is not None):
+    if schema == b"1" and (
+        reason is not None
+        or summary is not None
+        or match.group("kind") == b"failure_report_published"
+    ):
         return False
     if schema == b"2" and (
-        match.group("kind") != b"failure_report_unavailable"
-        or reason is None
+        reason is None
         or summary is None
-        or (summary == b"none" and reason != b"identity_summary_unavailable")
-        or (summary != b"none" and reason != b"private_store_unavailable")
+        or (
+            match.group("kind") == b"failure_report_unavailable"
+            and (
+                summary == b"none" and reason != b"identity_summary_unavailable"
+                or summary != b"none" and reason != b"private_store_unavailable"
+            )
+        )
+        or (
+            match.group("kind") == b"failure_report_published"
+            and (
+                summary == b"none" and reason != b"identity_summary_unavailable"
+                or summary != b"none" and reason != b"private_store_available"
+            )
+        )
+        or match.group("kind") not in {b"failure_report_unavailable", b"failure_report_published"}
     ):
         return False
     diagnostic_child_exit = int(match.group("child_exit"))
     if diagnostic_child_exit != child_status and not (
         match.group("kind") == b"failure_report_unavailable"
+        and diagnostic_child_exit == 0
+        and child_status == 1
+    ) and not (
+        match.group("kind") == b"failure_report_published"
         and diagnostic_child_exit == 0
         and child_status == 1
     ) and not (
@@ -3028,7 +3048,25 @@ def _valid_browser_failure_summary(
     if token is None:
         return False
     if token == b"none":
-        return match.group("failure_reason") == b"identity_summary_unavailable"
+        if match.group("failure_reason") != b"identity_summary_unavailable":
+            return False
+        if match.group("kind") == b"failure_report_unavailable":
+            return True
+        return bool(
+            match.group("kind") == b"failure_report_published"
+            and counts is not None
+            and (
+                counts.get("run_status") != "passed"
+                or any(
+                    counts.get(field, 0) > 0
+                    for field in (
+                        "logical_fail", "logical_expected_fail", "logical_flaky",
+                        "logical_interrupted", "attempt_fail", "attempt_interrupted",
+                        "attempt_timedout",
+                    )
+                )
+            )
+        )
     if counts is None or len(token) > LIVE_LAUNCH_FAILURE_SUMMARY_MAX_TOKEN_CHARS:
         return False
     try:
@@ -3059,8 +3097,16 @@ def _valid_browser_failure_summary(
         or payload.get("app_sha") != expected_app_sha
         or payload.get("marker_sha256") != expected_marker_sha256
         or payload.get("run_status") != counts.get("run_status")
-        or payload.get("failure_reason") != "private_store_unavailable"
-        or match.group("failure_reason") != b"private_store_unavailable"
+        or payload.get("failure_reason") not in {"private_store_unavailable", "private_store_available"}
+        or payload.get("failure_reason") != match.group("failure_reason").decode("ascii")
+        or (
+            payload.get("failure_reason") == "private_store_unavailable"
+            and match.group("kind") != b"failure_report_unavailable"
+        )
+        or (
+            payload.get("failure_reason") == "private_store_available"
+            and match.group("kind") != b"failure_report_published"
+        )
         or not isinstance(payload.get("failures"), list)
         or not 1 <= len(payload["failures"]) <= 128
     ):

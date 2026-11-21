@@ -3,6 +3,7 @@ import type { Locator } from "@playwright/test";
 import LiveCountReporter from "../support/live-count-reporter.cjs";
 import { collectLiveImageInventory } from "../support/live-image-inventory";
 import { assertLiveQaChromiumSandbox } from "../support/live-qa-sandbox";
+import { expectRenderedPatchChangeList } from "../support/patch-change-list-assertions";
 import { patchAcceptanceIssues } from "../support/patch-acceptance";
 import type { PlatformPatchDetail, PlatformPatchSection } from "../../lib/platform-types";
 
@@ -749,10 +750,12 @@ test("live four current patch DTOs render owner-scoped hero and ability changes"
         await expectDecodedImage(objectiveImage, `${patchId} ${sectionHeading(section)} objective icon`);
       }
 
-      const sectionRows = renderedSection.locator(":scope > .patch-change-list > li");
-      await expect(sectionRows).toHaveCount(section.changes.length);
       expectCleanPatchChanges(section.changes);
-      await expect(sectionRows).toHaveText(section.changes);
+      await expectRenderedPatchChangeList(
+        renderedSection.locator(":scope > .patch-change-list"),
+        section.changes,
+        section.change_groups ?? [],
+      );
 
       const abilityCards = renderedSection.locator(".patch-ability");
       await expect(abilityCards).toHaveCount(section.abilities.length);
@@ -771,10 +774,12 @@ test("live four current patch DTOs render owner-scoped hero and ability changes"
           await expectDecodedImage(icon, `${patchId} ${ability.display_name || ability.name} ability icon`);
         }
 
-        const abilityRows = renderedAbility.locator(":scope > .patch-change-list > li");
-        await expect(abilityRows).toHaveCount(ability.changes.length);
         expectCleanPatchChanges(ability.changes);
-        await expect(abilityRows).toHaveText(ability.changes);
+        await expectRenderedPatchChangeList(
+          renderedAbility.locator(":scope > .patch-change-list"),
+          ability.changes,
+          ability.change_groups ?? [],
+        );
 
         if (ability.presentation_kind !== "introduction" && ability.presentation_kind !== "replacement") {
           expect(ability.description ?? "").toBe("");

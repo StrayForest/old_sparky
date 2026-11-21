@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-10-20
+- Last reviewed: 2026-11-21
 
 This is the special CSP/browser/live-user QA path. Normal production release
 and install-transaction recovery are owned by
@@ -23,10 +23,12 @@ interrupted rollback recovery are owned by the
 
 ## Build
 
-```bash
-cd /root/old_sparky
-platform/tools/platform_build_release.sh <release-slug>
-```
+Build and publish through the canonical GitHub Actions release chain on `dev`:
+exact-SHA `Platform security and build`, source-bound backup proof and
+automatic production deployment. Follow the current source bindings,
+preconditions and recovery steps in the
+[`deployment-runbook.md`](deployment-runbook.md). Do not build or install a
+normal production release with local release scripts.
 
 Every CSP release is built once as an immutable enforced release. There is no
 production Report-Only candidate or temporary mode switch. The build gate
@@ -49,30 +51,10 @@ repeats this check and refuses malformed archives before extraction:
 
 ## Stage and activate
 
-```bash
-cd /opt/oldsparky/platform/current
-tools/platform_release_preflight.sh \
-  --require-previous --require-verified-backup --require-edge-parity \
-  --backup-max-age-hours 24
-
-cd /root/old_sparky
-platform/tools/platform_release_deploy.sh \
-  --artifact platform/dist/releases/<release-slug>.tar.gz \
-  --app-dir /opt/oldsparky/platform \
-  --expected-csp-mode enforce
-tools/platform_release_preflight.sh \
-  --require-previous --require-verified-backup --backup-max-age-hours 24
-/opt/oldsparky/platform/shared/venv/bin/python \
-  tools/platform_deploy_smoke.py \
-  --edge-origin https://127.0.0.1 \
-  --edge-host old-sparky.com \
-  --edge-insecure-loopback \
-  --expected-csp-mode enforce
-/opt/oldsparky/platform/shared/venv/bin/python \
-  tools/platform_deploy_smoke.py \
-  --edge-origin https://old-sparky.com \
-  --expected-csp-mode enforce
-```
+The automatic release path performs install, readiness and smoke checks. Do
+not invoke low-level deploy or preflight commands for a normal release; use
+the deployment runbook's exceptional recovery path only when its exact
+conditions apply.
 
 Do not print the shared environment. Use `--skip-python-deps` only after
 dependency compatibility has been verified against the existing shared venv.
@@ -100,30 +82,16 @@ until the new web process is ready and the validated Nginx pair is active.
 The installer validates and atomically installs the vhost plus shared security
 snippet. It rolls both back on failure.
 
-```bash
-cd /opt/oldsparky/platform/current
-/opt/oldsparky/platform/shared/venv/bin/python \
-  tools/platform_install_nginx.py --apply --reload --json
-```
+Nginx policy installation and deploy smoke are part of the reviewed automatic
+release path. Do not invoke the low-level installer on a normal release; use
+the deployment runbook's exceptional recovery procedure only when its exact
+preconditions apply.
 
-Dry-run is the default. The candidate must pass its policy validator and
-`nginx -t`. For local HTTPS/SNI smoke:
-
-```bash
-/opt/oldsparky/platform/shared/venv/bin/python \
-  tools/platform_deploy_smoke.py \
-  --edge-origin https://127.0.0.1 \
-  --edge-host old-sparky.com \
-  --edge-insecure-loopback \
-  --expected-csp-mode enforce
-```
-
-`--edge-insecure-loopback` is forbidden for non-loopback origins. Public smoke
-keeps normal certificate verification. The CSP mode is mandatory and must be
-`enforce` for every production release.
+The CSP mode is mandatory and must be `enforce` for every production release.
 The loopback/SNI smoke requires ready health `200`; the public smoke requires
 the intentionally private health endpoint to return `403` with the shared
-non-document security headers.
+non-document security headers. The automatic deployment workflow owns those
+checks for a normal release.
 
 ## CSP production change
 
@@ -239,7 +207,23 @@ The complete public `live-launch.spec.ts` suite uses a separate 1,500-second inn
 The remote operation cap is 2,400 seconds, providing a 900-second planning budget beyond the child capture, within the 2,700-second workflow job. The job leaves 300 seconds for bounded handoff/report steps; pre-helper checks and setup consume time inside the remote cap. External setup/network time is not guaranteed, other action limits are unchanged, and timeout/cleanup uncertainty fails closed.
 The workflow accepts a bounded dispatcher diagnostic only when its fixed schema and child exit code agree. Early-failure `stage` and `check` values are closed enums; the sanitizer publishes no exception text, paths, environment values or stderr. Once the trusted dispatcher starts, fixed markers identify validated pre-child, helper-trust, spawn, and known live-user wrapper boundaries; a started child’s unmarked nonzero exit remains stage-free `unclassified`, timeout remains `child_timeout`, and a zero-exit child missing valid counts or its success diagnostic becomes `protocol_failure` and cannot pass. Failures before the dispatcher starts—including SSH setup—and SSH exit 255 remain unclassified. Markers preserve the original failure outcome and ordinary fixture cleanup. The direct-exec UserQA entrypoint uses `/usr/bin/env -S /usr/bin/python3.12 -I -B` so the fixed sudo command keeps isolated imports and disables bytecode writes. These diagnostics cannot establish the cause of historical runs.
 
-A failed canonical browser run writes two separately bounded, closed records beside counts. The reporter first writes an identity-only fallback with the gate/source/app/marker binding and each failed test ID, project, status and attempt; it contains no source locations or error detail. It then attempts the richer record. Under the QA lock, the guard validates IDs, projects, statuses, attempt counts and safe source locations against the immutable payload before atomically publishing `public-live-qa.<gate-id>.failure-v2.json` under `/root/.oldsparky/liveqa/diagnostics/`. Failed attempts include a closed page-error class and route; a source asset basename and bounded line/column are retained only when a stack frame matches a successfully loaded same-origin Next chunk. The afterEach hook attaches an explicit empty-or-captured result; observed empty is absent, while missing or malformed evidence is unavailable. When the rich record is missing or invalid but the identity fallback validates, the guard publishes a summary-only `failure-v4.json` with the fixed `rich_report_unavailable` reason and preserves the failed QA outcome. If the root-only store cannot publish a record, the trusted workflow diagnostic carries only the validated, capped identity summary and a fixed reason category; the workflow still fails. If the identity fallback is also unavailable, the diagnostic contains the fixed unavailable reason without guessed IDs. Raw error messages, stacks, full URLs or queries, DOM, attachment bytes, credentials and personal data are never persisted or projected. The root-only directory and regular files use `0700`/`0600`; reports are capped at 16 KiB, retained seven days and at most ten records. They are private operator records, excluded from GitHub artifacts and public counts. Gate/source/app/manifest/tree/marker digests and timestamp support workflow/ledger correlation but do not cryptographically bind a GitHub run/attempt. Existing v1 records remain readable by retention. Store preparation is best effort and cannot skip the browser suite or change a passing result; ordinary gate cleanup still runs after either diagnostic path.
+When failed browser counts accompany an ordinary Playwright result (exit 1),
+the wrapper may attach an identity summary only when the closed sidecar
+validates against the source, app, marker and counts. The diagnostic kind and
+reason distinguish a published private report from an unavailable store. The
+sanitized artifact may include only closed test ID, project, status and
+attempt tuples under `browser_failure_metadata`; `tests` remains empty and no
+assertion text is published. The QA status stays failed. Explicit launch,
+timeout and cleanup diagnostics retain priority and do not carry a failure
+summary token.
+
+A raw HTTP probe that receives Cloudflare Error 1010 (`browser_signature_banned`)
+is a blocked client signature, not evidence that the application route failed.
+Do not retry the raw probe or change Cloudflare protections. Use the canonical
+source-bound browser QA for public rendering evidence; an origin/API response
+alone does not establish that browser rendering passed.
+
+A failed canonical browser run writes two separately bounded, closed records beside counts. The reporter first writes an identity-only fallback with the gate/source/app/marker binding and each failed test ID, project, status and attempt; it contains no source locations or error detail. It then attempts the richer record. Under the QA lock, the guard validates IDs, projects, statuses, attempt counts and safe source locations against the immutable payload before atomically publishing `public-live-qa.<gate-id>.failure-v2.json` under `/root/.oldsparky/liveqa/diagnostics/`. Failed attempts include a closed page-error class and route; a source asset basename and bounded line/column are retained only when a stack frame matches a successfully loaded same-origin Next chunk. The afterEach hook attaches an explicit empty-or-captured result; observed empty is absent, while missing or malformed evidence is unavailable. When the rich record is missing or invalid but the identity fallback validates, the guard publishes a summary-only `failure-v4.json` with the fixed `rich_report_unavailable` reason and preserves the failed QA outcome. If the root-only store cannot publish a record, the trusted workflow diagnostic carries only the validated, capped identity summary and a fixed reason category; the workflow still fails. The one-day sanitized workflow artifact may project this closed identity summary, but never error text. If the identity fallback is also unavailable, the diagnostic contains the fixed unavailable reason without guessed IDs. Raw error messages, stacks, full URLs or queries, DOM, attachment bytes, credentials and personal data are never persisted or projected. The root-only directory and regular files use `0700`/`0600`; reports are capped at 16 KiB, retained seven days and at most ten records. They are private operator records, separate from the sanitized workflow summary and public counts. Gate/source/app/manifest/tree/marker digests and timestamp support workflow/ledger correlation but do not cryptographically bind a GitHub run/attempt. Existing v1 records remain readable by retention. Store preparation is best effort and cannot skip the browser suite or change a passing result; ordinary gate cleanup still runs after either diagnostic path.
 
 LiveUserQA failures use the same private store through `live-user-failures-v3.json` and are published before gate cleanup as `live-user-qa.<gate-id>.failure-v3.json`. The guard binds the record to the gate, source/app SHAs and marker, then validates it against the active immutable payload; this does not cryptographically bind a GitHub run or attempt. A record retains only the fixed journey ID/project, failure `status` (`failed`, `timedOut` or `interrupted`), matching `run_status` (`failed`, `timedout` or `interrupted`) and attempt, an allowlisted repository-relative `TestResult.errors[].location`, and a closed `apiJson` operation/method/status/error-kind tuple only when its candidate frame exactly matches the terminal error location. Missing, malformed or unmatched fields are `unavailable`; raw messages, stacks, URLs, IDs, request/response bodies and credentials are never persisted. Public counts and failure status remain unchanged; the private report is excluded from public artifacts and uses the same size and retention limits above.
 

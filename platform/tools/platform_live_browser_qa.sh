@@ -272,7 +272,7 @@ diagnostic_stdout_bytes=0
 diagnostic_stderr_bytes=0
 diagnostic_truncated=false
 diagnostic_child_exit="$browser_status"
-if [[ "$browser_diagnostic" =~ ^LIVE_QA_CHILD_DIAGNOSTIC\ schema=1\ kind=(none|playwright_cli_usage|node_module_missing|browser_executable_missing|browser_launch_error|child_timeout|cleanup_failure|failure_report_unavailable|unclassified)\ stdout_bytes=([0-9]{1,16})\ stderr_bytes=([0-9]{1,16})\ truncated=(true|false)\ child_exit=([0-9]{1,3})$ ]]; then
+if [[ "$browser_diagnostic" =~ ^LIVE_QA_CHILD_DIAGNOSTIC\ schema=1\ kind=(none|playwright_cli_usage|node_module_missing|browser_executable_missing|browser_launch_error|child_timeout|cleanup_failure|failure_report_unavailable|failure_report_published|unclassified)\ stdout_bytes=([0-9]{1,16})\ stderr_bytes=([0-9]{1,16})\ truncated=(true|false)\ child_exit=([0-9]{1,3})$ ]]; then
   diagnostic_valid=1
   diagnostic_kind="${BASH_REMATCH[1]}"
   diagnostic_stdout_bytes="${BASH_REMATCH[2]}"
@@ -328,7 +328,7 @@ if [[ "$count_line" =~ ^LIVE_BROWSER_COUNTS\ schema=1\ .+$ ]]; then
 else
   count_status=2
 fi
-if [[ "$failure_summary_line" =~ ^LIVE_BROWSER_FAILURE_SUMMARY\ schema=1\ reason=(identity_summary_unavailable|private_store_unavailable)\ token=([A-Za-z0-9_-]+|none)$ ]]; then
+if [[ "$failure_summary_line" =~ ^LIVE_BROWSER_FAILURE_SUMMARY\ schema=1\ reason=(identity_summary_unavailable|private_store_unavailable|private_store_available)\ token=([A-Za-z0-9_-]+|none)$ ]]; then
   failure_summary_reason="${BASH_REMATCH[1]}"
   failure_summary_candidate="${BASH_REMATCH[2]}"
   if ((${#failure_summary_candidate} > 16384)); then
@@ -345,11 +345,30 @@ if (( count_status == 42 )); then
   diagnostic_valid=1
   diagnostic_kind="failure_report_unavailable"
   diagnostic_child_exit="$browser_status"
-elif (( count_status == 43 && browser_status == 0 )); then
-  # Validated failed counts are a QA failure even if the Playwright child
-  # itself exited zero. The private report was published successfully.
-  browser_status=1
-  diagnostic_valid=0
+elif (( count_status == 43 )); then
+  # Failed counts can accompany Playwright's ordinary exit 1. Promote only
+  # that unclassified assertion-failure shape (or a zero-exit child with
+  # failing counts); explicit launch, timeout, and cleanup diagnostics win.
+  if [[ -z "$failure_summary_reason" ]]; then
+    failure_summary_reason="identity_summary_unavailable"
+  fi
+  if (( diagnostic_valid == 1 )) \
+    && [[ "$failure_summary_reason" == "identity_summary_unavailable" \
+      || "$failure_summary_reason" == "private_store_available" ]] \
+    && { [[ "$diagnostic_kind" == "unclassified" && "$browser_status" == "1" ]] \
+      || [[ "$diagnostic_kind" == "none" && "$browser_status" == "0" ]]; }; then
+    if [[ "$browser_status" == "0" ]]; then
+      browser_status=1
+      diagnostic_child_exit=0
+    fi
+    diagnostic_kind="failure_report_published"
+  else
+    # Do not pair a published-summary reason/token with a higher-priority
+    # child failure kind; preserve the original child classification.
+    failure_summary_line=""
+    failure_summary_reason=""
+    failure_summary_token=""
+  fi
 fi
 if (( diagnostic_valid == 1 )); then
   if [[ -n "$failure_summary_reason" ]]; then
