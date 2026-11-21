@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable
+import errno
 import hashlib
 import json
 import os
@@ -38,6 +39,7 @@ TRUSTED_ROOT = Path("/root/.oldsparky/liveqa")
 PAYLOAD_ROOT = TRUSTED_ROOT / "releases"
 ACTIVE_MANIFEST = TRUSTED_ROOT / "active-manifest.json"
 ACTIVE_POINTER = TRUSTED_ROOT / "active"
+CSP_LIVE_QA_BUNDLE_PATH = TRUSTED_ROOT / "csp-live-qa.json"
 HELPER_PATH = TRUSTED_ROOT / "platform_live_user_qa_trusted.sh"
 LAUNCH_HELPER_PATH = TRUSTED_ROOT / "platform_live_launch_trusted.sh"
 DISPATCHER_PATH = TRUSTED_ROOT / "platform_live_user_qa_dispatch.py"
@@ -1577,6 +1579,7 @@ def _runtime_provider_payload(
     _validate_payload(
         manifest,
         app_dir=app_dir,
+        allow_post_userqa_mailbox_helper_omission=True,
         allow_legacy_release_validator_omission=True,
         allow_legacy_runtime_reporter_omission=True,
         allow_legacy_machine_lock_omission=(
@@ -1685,6 +1688,7 @@ def _runtime_provider_plan(
     _validate_payload(
         active_manifest,
         app_dir=app_dir,
+        allow_post_userqa_mailbox_helper_omission=True,
         allow_legacy_release_validator_omission=True,
         allow_legacy_runtime_reporter_omission=True,
         allow_legacy_machine_lock_omission=(
@@ -2411,6 +2415,7 @@ def _validate_payload(
     *,
     app_dir: Path = APP_DIR,
     validate_provider: bool = True,
+    allow_post_userqa_mailbox_helper_omission: bool = False,
     allow_legacy_release_validator_omission: bool = False,
     allow_legacy_runtime_reporter_omission: bool = False,
     allow_legacy_machine_lock_omission: bool = False,
@@ -2588,11 +2593,36 @@ def _validate_payload(
     for path, mode, relative in required_entrypoints:
         if legacy_validator_omission and relative == release_validator_relative:
             continue
+        if (
+            allow_post_userqa_mailbox_helper_omission
+            and path == MAILBOX_HELPER_PATH
+            and _directory(TRUSTED_ROOT, mode=0o700)
+            and _path_is_truly_absent(path)
+            and _path_is_truly_absent(CSP_LIVE_QA_BUNDLE_PATH)
+        ):
+            # Successful post-UserQA cleanup removes the trusted-root copy,
+            # while this immutable payload remains its source of truth.
+            # The next candidate install recreates the fixed entrypoint from
+            # its source-bound payload. Present-but-invalid files and an
+            # extant bundle never use this omission.
+            continue
         metadata = _regular(path, mode=mode)
         if metadata.st_nlink != 1:
             raise InstallerError("trusted live-QA entrypoint is hard-linked")
         if _digest_regular(path) != manifest_files.get(relative):
             raise InstallerError("trusted live-QA entrypoint is not bound to payload")
+
+
+def _path_is_truly_absent(path: Path) -> bool:
+    """Return true only for ENOENT; dangling links and access errors fail closed."""
+
+    try:
+        path.lstat()
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            return True
+        raise
+    return False
 
 
 def _cleanup_temporary_files() -> int:

@@ -17,6 +17,15 @@ database rows. It requires the active application and immutable LiveQA payload
 to remain at the same exact source SHA, no pending release transaction, and no
 active or retained LiveQA operation. Do not reuse the removed roster.
 
+The immutable active payload retains the digest-bound mailbox helper source.
+After this procedure removes both trusted-root files, the next locked runtime
+preflight accepts only that exact closed state and validates the helper inside
+the immutable payload. A successful candidate install then restores the
+trusted-root helper from its own verified payload before switching the active
+LiveQA pointer. If either the bundle or helper remains, or the helper is
+present but invalid, preflight fails closed. Do not restore it from the
+checkout or a local copy.
+
 Set `S` to the exact installed app/payload SHA, and `MARKER_SHA` to
 `counts.marker_sha256` from the validated successful UserQA report. Do not use
 the raw marker or any credential as an argument. Run as root; the release-lock

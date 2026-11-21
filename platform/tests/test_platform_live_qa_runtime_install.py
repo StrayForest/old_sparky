@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager, redirect_stderr
 import hashlib
+import errno
 import importlib.util
 import io
 import json
@@ -2466,6 +2467,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
             "PAYLOAD_ROOT": payload_root,
             "ACTIVE_MANIFEST": trusted / "active-manifest.json",
             "ACTIVE_POINTER": trusted / "active",
+            "CSP_LIVE_QA_BUNDLE_PATH": trusted / "csp-live-qa.json",
             "HELPER_PATH": trusted / entrypoints[0],
             "LAUNCH_HELPER_PATH": trusted / entrypoints[1],
             "DISPATCHER_PATH": trusted / entrypoints[2],
@@ -2534,6 +2536,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
             "PAYLOAD_ROOT": payload_root,
             "ACTIVE_MANIFEST": trusted / "active-manifest.json",
             "ACTIVE_POINTER": trusted / "active",
+            "CSP_LIVE_QA_BUNDLE_PATH": trusted / "csp-live-qa.json",
             "HELPER_PATH": trusted / "platform_live_user_qa_trusted.sh",
             "LAUNCH_HELPER_PATH": trusted / "platform_live_launch_trusted.sh",
             "DISPATCHER_PATH": trusted / "platform_live_user_qa_dispatch.py",
@@ -2983,6 +2986,121 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                     ):
                         self.assertEqual(execute_selected(), 2)
                     execve.assert_not_called()
+
+    def test_preflight_accepts_only_completed_post_userqa_helper_cleanup(self) -> None:
+        source_sha = "a" * 40
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            with self.canonical_runtime_tree(Path(temporary), source_sha) as (
+                app_dir,
+                release,
+                trusted,
+                _payload_root,
+            ):
+                manifest = runtime.install(app_dir, release)
+                mailbox_helper = trusted / "platform_live_qa_mailbox_helper.py"
+                mailbox_helper.unlink()
+                active_pointer = os.readlink(trusted / "active")
+                payload_digest = manifest["payload_tree_sha256"]
+
+                runtime._validate_payload(
+                    manifest,
+                    app_dir=app_dir,
+                    validate_provider=False,
+                    allow_post_userqa_mailbox_helper_omission=True,
+                )
+                self.assertEqual(os.readlink(trusted / "active"), active_pointer)
+                self.assertEqual(manifest["payload_tree_sha256"], payload_digest)
+                self.assertFalse(mailbox_helper.exists())
+                original_lstat = Path.lstat
+
+                def deny_helper_stat(path: Path):
+                    if path == mailbox_helper:
+                        raise PermissionError(errno.EACCES, "test permission denial")
+                    return original_lstat(path)
+
+                with mock.patch.object(Path, "lstat", deny_helper_stat):
+                    with self.assertRaises(PermissionError):
+                        runtime._validate_payload(
+                            manifest,
+                            app_dir=app_dir,
+                            validate_provider=False,
+                            allow_post_userqa_mailbox_helper_omission=True,
+                        )
+                with self.assertRaises(runtime.InstallerError):
+                    runtime._validate_payload(
+                        manifest,
+                        app_dir=app_dir,
+                        validate_provider=False,
+                    )
+                bundle = trusted / "csp-live-qa.json"
+                bundle.write_bytes(b"")
+                with self.assertRaises(runtime.InstallerError):
+                    runtime._validate_payload(
+                        manifest,
+                        app_dir=app_dir,
+                        validate_provider=False,
+                        allow_post_userqa_mailbox_helper_omission=True,
+                    )
+                bundle.unlink()
+                bundle.symlink_to(trusted / "missing-csp-live-qa.json")
+                with self.assertRaises(runtime.InstallerError):
+                    runtime._validate_payload(
+                        manifest,
+                        app_dir=app_dir,
+                        validate_provider=False,
+                        allow_post_userqa_mailbox_helper_omission=True,
+                    )
+                bundle.unlink()
+
+                mailbox_helper.write_bytes(b"altered helper\n")
+                os.chmod(mailbox_helper, 0o500)
+                with self.assertRaises(runtime.InstallerError):
+                    runtime._validate_payload(
+                        manifest,
+                        app_dir=app_dir,
+                        validate_provider=False,
+                        allow_post_userqa_mailbox_helper_omission=True,
+                    )
+
+                mailbox_helper.unlink()
+                mailbox_helper.symlink_to(trusted / "missing-mailbox-helper.py")
+                with self.assertRaises(runtime.InstallerError):
+                    runtime._validate_payload(
+                        manifest,
+                        app_dir=app_dir,
+                        validate_provider=False,
+                        allow_post_userqa_mailbox_helper_omission=True,
+                    )
+                mailbox_helper.unlink()
+
+                restored_manifest = runtime.install(app_dir, release)
+                self.assertTrue(mailbox_helper.is_file())
+                runtime._validate_payload(
+                    restored_manifest,
+                    app_dir=app_dir,
+                    validate_provider=False,
+                )
+
+                payload_helper = (
+                    trusted
+                    / "releases"
+                    / source_sha
+                    / "platform/tools/platform_live_qa_mailbox_helper.py"
+                )
+                missing_payload_helper = payload_helper.with_name(
+                    payload_helper.name + ".missing-test"
+                )
+                payload_helper.rename(missing_payload_helper)
+                try:
+                    with self.assertRaises(runtime.InstallerError):
+                        runtime._validate_payload(
+                            manifest,
+                            app_dir=app_dir,
+                            validate_provider=False,
+                            allow_post_userqa_mailbox_helper_omission=True,
+                        )
+                finally:
+                    missing_payload_helper.rename(payload_helper)
 
     def test_install_rejects_missing_validator_before_active_generation(self) -> None:
         source_sha = "d" * 40

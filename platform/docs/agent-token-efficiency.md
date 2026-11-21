@@ -16,9 +16,11 @@ required evidence, review, safety checks and release gates.
   backup.
 - Use one code executor by default. Add a second agent only for a concrete,
   independent read-only review or task that cannot safely be serialized; do
-  not use parallel workers merely to increase throughput. The primary may
-  inspect, edit and run repository checks when authorized by the task and
-  repository rules; keep implementation ownership explicit and avoid
+  not use parallel workers merely to increase throughput. The primary
+  coordinates only: it assigns repository inspection, edits, checks and
+  operational work to a `gpt-6-luna` executor, states the owned scope and
+  reports results. It does not inspect or edit implementation files or run
+  repository checks. Keep implementation ownership explicit and avoid
   overlapping edits.
 - A linked worktree is temporary and requires a concrete isolation need. Its
   owner records exact path, branch, purpose and the task-close cleanup action
