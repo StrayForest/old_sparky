@@ -334,7 +334,7 @@ def _check_service_environment() -> dict[str, object]:
 
 
 def _check_operation_marker_and_plans() -> None:
-    operation_marker = APP_ROOT / "current" / ".release-operation.json"
+    operation_marker = APP_ROOT / "shared" / ".release-operation.json"
     if os.path.lexists(operation_marker) or any(os.path.lexists(path) for path in PLANS):
         raise ReadinessError("release marker or diagnostic plan is present")
 

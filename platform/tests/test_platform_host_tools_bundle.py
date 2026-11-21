@@ -88,6 +88,63 @@ def _release_receipt(
 
 
 class HostToolsBundleTests(unittest.TestCase):
+    def test_installed_checker_reports_closed_stage_for_remote_nonzero(self) -> None:
+        cases = (
+            ("member_digest", 255, "reason=ssh_nonzero ssh_exit_code=255"),
+            ("locked_final_check", -9, "reason=ssh_signal signal=9"),
+        )
+        for stage, returncode, detail in cases:
+            with self.subTest(stage=stage, returncode=returncode):
+                output = StringIO()
+                failure = installed_check.RemoteCommandFailure(
+                    returncode, stage=stage
+                )
+                with patch.object(
+                    installed_check,
+                    "verify_installed_generation",
+                    side_effect=failure,
+                ), redirect_stderr(output):
+                    result = installed_check.main(
+                        [
+                            "--source-sha",
+                            SOURCE_SHA,
+                            "--toolset-version",
+                            "production-host-tools-v4",
+                            "--contract-dir",
+                            "/contract-fixture",
+                        ]
+                    )
+                self.assertEqual(result, 1)
+                self.assertEqual(
+                    output.getvalue(),
+                    "HOST_TOOLS_VERIFY schema=1 status=failed "
+                    f"stage={stage} {detail}\n",
+                )
+                self.assertNotIn("/contract-fixture", output.getvalue())
+
+    def test_installed_checker_propagates_remote_stage_and_nonzero_status(self) -> None:
+        with self.assertRaises(installed_check.RemoteCommandFailure) as raised:
+            installed_check._run(
+                ["/bin/sh", "-c", "exit 27"],
+                timeout=3,
+                diagnostic_stage="member_digest",
+            )
+        self.assertEqual(raised.exception.stage, "member_digest")
+        self.assertEqual(raised.exception.returncode, 27)
+
+    def test_installed_checker_rejects_unbounded_remote_diagnostic_values(self) -> None:
+        for stage, returncode in (
+            ("/tmp/secret", 1),
+            ("member_digest", 0),
+            ("member_digest", 256),
+            ("member_digest", True),
+        ):
+            with self.subTest(stage=stage, returncode=returncode):
+                with self.assertRaises(ValueError):
+                    installed_check.RemoteCommandFailure(
+                        returncode, stage=stage
+                    )
+
     def test_installed_checker_caps_stdout_while_child_is_running(self) -> None:
         child = [
             sys.executable,
@@ -289,7 +346,9 @@ class HostToolsBundleTests(unittest.TestCase):
                 if args == ("/usr/bin/id", "-u"):
                     return b"0\n"
                 if args[:3] == ("/usr/bin/test", "-d", f"{installed_check.GENERATION_ROOT}/{SOURCE_SHA}"):
-                    raise installed_check.RemoteCommandFailure(1)
+                    raise installed_check.RemoteCommandFailure(
+                        1, stage="generation_presence"
+                    )
                 raise AssertionError("unexpected remote operation")
 
             with patch.dict(
@@ -505,7 +564,9 @@ class HostToolsBundleTests(unittest.TestCase):
                     with patch.object(
                         installed_check,
                         "_run",
-                        side_effect=installed_check.RemoteCommandFailure(returncode),
+                        side_effect=installed_check.RemoteCommandFailure(
+                            returncode, stage="locked_final_check"
+                        ),
                     ):
                         if returncode == 75:
                             self.assertFalse(
@@ -677,7 +738,9 @@ class HostToolsBundleTests(unittest.TestCase):
                     return b"0\n"
                 if args[:3] == ("/usr/bin/test", "-d", generation):
                     generation_attempts += 1
-                    raise installed_check.RemoteCommandFailure(1)
+                    raise installed_check.RemoteCommandFailure(
+                        1, stage="generation_presence"
+                    )
                 raise AssertionError("missing-generation retries must not run other remote checks")
 
             clock = iter((100.0, 100.5, 100.9, 101.1))
@@ -1701,6 +1764,22 @@ class HostToolsBundleTests(unittest.TestCase):
             with self.assertRaises(live_readiness.ReadinessError):
                 live_readiness._check_source_pin(release, "0" * 40)
 
+    def test_readiness_rejects_pending_marker_in_canonical_shared_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "current").mkdir()
+            shared = root / "shared"
+            shared.mkdir()
+            with patch.object(live_readiness, "APP_ROOT", root), patch.object(
+                live_readiness, "PLANS", ()
+            ):
+                live_readiness._check_operation_marker_and_plans()
+                marker = shared / ".release-operation.json"
+                marker.write_text("pending\n", encoding="ascii")
+                with self.assertRaises(live_readiness.ReadinessError):
+                    live_readiness._check_operation_marker_and_plans()
+                self.assertEqual(marker.read_text(encoding="ascii"), "pending\n")
+
     def test_readiness_report_separates_verifier_and_app_source_and_is_read_only(self) -> None:
         verifier_sha = "a" * 40
         app_sha = "b" * 40
@@ -1786,6 +1865,7 @@ class HostToolsBundleTests(unittest.TestCase):
             "git ls-tree",
             "git cat-file blob",
             "SHA-256",
+            "shared/.release-operation.json",
             "runtime_or_fixture_mutations_authorized",
         ):
             self.assertIn(required, runbook)
@@ -3965,7 +4045,10 @@ raise SystemExit(module.main(["host-capabilities"]))
 
     def test_shared_host_generation_verifier_has_nul_safe_closed_inventory(self) -> None:
         helper = (TOOLS_ROOT / "platform_host_tools_installed_check.py").read_text(encoding="utf-8")
-        self.assertIn('"/usr/bin/find", "--", generation, "-mindepth", "1", "-maxdepth", "1", "-print0"', helper)
+        self.assertRegex(
+            helper,
+            r'_remote\(\s*remote,\s*"/usr/bin/find",\s*"--",\s*generation,\s*"-mindepth",\s*"1",\s*"-maxdepth",\s*"1",\s*"-print0",\s*stage="inventory",\s*max_output=MAX_REMOTE_OUTPUT,\s*\)',
+        )
         self.assertIn('inventory.split(b"\\x00")', helper)
         self.assertIn("len(names) != len(expected)", helper)
         self.assertIn("set(relatives) != expected", helper)
@@ -4000,7 +4083,10 @@ raise SystemExit(module.main(["host-capabilities"]))
 
     def test_host_verifier_reuses_pinned_dispatcher_with_bounded_output(self) -> None:
         helper = (TOOLS_ROOT / "platform_host_tools_installed_check.py").read_text(encoding="utf-8")
-        self.assertIn('"/usr/bin/python3.12", "-I", "-B", dispatcher, "host-capabilities"', helper)
+        self.assertRegex(
+            helper,
+            r'_remote\(\s*remote,\s*"/usr/bin/python3\.12",\s*"-I",\s*"-B",\s*dispatcher,\s*"host-capabilities",\s*stage="capability_self_test",\s*timeout=20,\s*max_output=512,\s*\)',
+        )
         self.assertIn("max_output=512", helper)
         self.assertIn("MAX_REMOTE_OUTPUT = 16384", helper)
         self.assertIn("HOST_KEY_FINGERPRINT =", helper)

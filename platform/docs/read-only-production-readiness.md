@@ -181,9 +181,10 @@ all 15 pinned C members by digest and normalized manifest mode,
 confirm that a directory exists at the expected previous C generation path
 (presence only; it is not a verification of that prior generation's contents),
 validate the current, previous and shared-venv origin identities, and show the expected allowlisted
-service profile, HTTP 200 health, clear locks, no marker/plans/jobs, and the
-enabled maintenance timer with its service terminal and idle. The workflow's
-runner-only `host-capability-preflight` remains authoritative for its own
+service profile, HTTP 200 health, clear locks, no
+`shared/.release-operation.json` transaction marker or diagnostic plans/jobs,
+and the enabled maintenance timer with its service terminal and idle. The
+workflow's runner-only `host-capability-preflight` remains authoritative for its own
 `RUNNER_TEMP` and SSH handoff; do not run
 `platform_host_tools_installed_check.py` from the host shell. A terminal-idle
 maintenance service is not proof that maintenance succeeded; use its exact

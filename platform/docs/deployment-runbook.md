@@ -104,6 +104,21 @@ to `dev`. The chain is:
    pending status or transfer.
    Host bundle/source bind to `HOST_TOOLS_SHA`; app artifact, provenance,
    migration and receipt bind to `TARGET_SHA`. API artifact ID/name/run/source/digest and downloaded size are cross-checked by bounded canonical verification. An artifact-list `workflow_run.run_attempt` may be absent or null; exact name, run ID and head SHA remain required, any non-null attempt must match, and the source attempt is independently resolved from GitHub's authoritative attempt endpoint.
+   If the shared installed-generation verifier reports a nonzero SSH check,
+   retain its closed `HOST_TOOLS_VERIFY schema=1 status=failed` line. Its
+   `stage` identifies the fixed check (`host_identity`, `generation_presence`,
+   `generation_symlink`, `generation_metadata`, `member_metadata`,
+   `member_digest`, `root_digest`, `root_metadata`, `inventory`,
+   `capability_self_test` or `locked_final_check`); `ssh_exit_code` is the
+   bounded SSH process status, not raw remote output. Status 255 can represent
+   SSH transport failure as well as a command exit, so the code alone does not
+   prove which occurred. A signal termination reports only its bounded signal
+   number. The verifier emits no host, path, argv, stderr or secret data. Use
+   the stage to identify the failed check in the existing approved bounded
+   host-tools verification evidence. Do not manually rerun a remote command,
+   run the runner-side verifier on the host, weaken the contract, change retry
+   behavior, or treat the diagnostic as authorization to provision or deploy.
+   The automatic release chain remains the only normal deployment path.
    For installer/evidence/validator changes, follow the host-tools ADR's **C→P** sequence: backward-compatible validator C, pin-only P, exact-P CI and read-only preflight, signed bundle verification, out-of-band provisioning, installed self-test and successful exact-P preflight. If cumulative application changes cannot deploy with strict reuse, withhold P's backup so its automatic parent refuses before readiness/child dispatch; do not rerun that parent or use baseline reconciliation. A later app source enables fresh policy and follows normal Security, source-bound backup and automatic deployment. A pin or bundle is not installation proof. The ADR owns provisioning/rollback; shared-venv reuse and managed LiveQA runtime procedures are in the [CSP and live-QA runbook](csp-live-qa-runbook.md).
 
 ### Recovery-bootstrap baseline reconciliation

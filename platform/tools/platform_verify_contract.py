@@ -790,14 +790,22 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
         shared_verifier_source = (
             PLATFORM_ROOT / "tools" / "platform_host_tools_installed_check.py"
         ).read_text(encoding="utf-8")
-        for command in (
-            '_remote(remote, "/usr/bin/id", "-u")',
-            '_remote(remote, "/usr/bin/stat", "-c", "%F:%u:%g:%h:%a"',
-            '_remote(remote, "/usr/bin/sha256sum", "--"',
-            '_remote(remote, "/usr/bin/test", "-d"',
-        ):
-            if command not in shared_verifier_source:
-                issues.append(f"shared host verifier must retain fixed {command} checks")
+        fixed_remote_check_patterns = (
+            r'_remote\(remote,\s*"/usr/bin/id",\s*"-u",\s*stage="host_identity"\)',
+            r'_remote\(remote,\s*"/usr/bin/test",\s*"-d",\s*generation,\s*stage="generation_presence"\)',
+            r'_remote\(\s*remote,\s*"/usr/bin/test",\s*"!",\s*"-L",\s*generation,\s*stage="generation_symlink",?\s*\)',
+            r'_remote\(\s*remote,\s*"/usr/bin/stat",\s*"-c",\s*"%F:%u:%g:%h:%a",\s*"--",\s*generation,\s*stage="generation_metadata",?\s*\)',
+            r'_remote\(\s*remote,\s*"/usr/bin/stat",\s*"-c",\s*"%F:%u:%g:%h:%a",\s*"--",\s*path,\s*stage="member_metadata",?\s*\)',
+            r'_remote\(\s*remote,\s*"/usr/bin/stat",\s*"-c",\s*"%F:%u:%g:%h:%a",\s*"--",\s*path,\s*stage="root_metadata",?\s*\)',
+            r'_remote\(\s*remote,\s*"/usr/bin/sha256sum",\s*"--",\s*path,\s*stage="member_digest",\s*max_output=1024,\s*\)',
+            r'_remote\(\s*remote,\s*"/usr/bin/sha256sum",\s*"--",\s*path,\s*stage="root_digest",\s*max_output=1024,\s*\)',
+        )
+        for pattern in fixed_remote_check_patterns:
+            if re.search(pattern, shared_verifier_source, flags=re.DOTALL) is None:
+                issues.append(
+                    "shared host verifier must bind each fixed remote command to its closed diagnostic stage: "
+                    + pattern
+                )
         if any(marker in host_preflight for marker in ("bash -s", "python -c", "platform_host_tools_install.py")):
             issues.append("host capability preflight must not execute dynamic or self-installing code")
         shared_verifier_markers = (

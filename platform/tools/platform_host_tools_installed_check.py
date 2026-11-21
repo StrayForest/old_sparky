@@ -32,6 +32,21 @@ USER_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}\Z")
 HOST_RE = re.compile(r"[A-Za-z0-9.-]{1,253}\Z")
 MAX_CONTRACT_ROWS = 32
 MAX_REMOTE_OUTPUT = 16384
+REMOTE_DIAGNOSTIC_STAGES = frozenset(
+    {
+        "host_identity",
+        "generation_presence",
+        "generation_symlink",
+        "generation_metadata",
+        "member_metadata",
+        "member_digest",
+        "root_digest",
+        "root_metadata",
+        "inventory",
+        "capability_self_test",
+        "locked_final_check",
+    }
+)
 # The last readiness decision runs as one remote process while it owns both
 # canonical locks. This closes the window in which AUTO could observe the new
 # generation and dispatch its child before the root-console self-test finishes.
@@ -159,9 +174,14 @@ class VerificationError(RuntimeError):
 
 
 class RemoteCommandFailure(VerificationError):
-    def __init__(self, returncode: int) -> None:
+    def __init__(self, returncode: int, *, stage: str) -> None:
+        if stage not in REMOTE_DIAGNOSTIC_STAGES:
+            raise ValueError("unsupported host-tools remote diagnostic stage")
+        if type(returncode) is not int or returncode == 0 or not -255 <= returncode <= 255:
+            raise ValueError("host-tools remote command status is invalid")
         super().__init__("bounded host-tools verification command failed")
         self.returncode = returncode
+        self.stage = stage
 
 
 class GenerationAbsent(VerificationError):
@@ -227,7 +247,13 @@ def _parse_scanned_host_key(output: bytes, host: str) -> str:
     return " ".join(fields)
 
 
-def _run(argv: list[str], *, timeout: int, max_output: int = MAX_REMOTE_OUTPUT) -> bytes:
+def _run(
+    argv: list[str],
+    *,
+    timeout: int,
+    max_output: int = MAX_REMOTE_OUTPUT,
+    diagnostic_stage: str | None = None,
+) -> bytes:
     if type(timeout) is not int or timeout <= 0 or type(max_output) is not int or max_output <= 0:
         raise VerificationError("bounded host-tools verification command failed")
     process: subprocess.Popen[bytes] | None = None
@@ -269,7 +295,9 @@ def _run(argv: list[str], *, timeout: int, max_output: int = MAX_REMOTE_OUTPUT) 
         if process is not None and process.stdout is not None:
             process.stdout.close()
     if returncode != 0:
-        raise RemoteCommandFailure(returncode)
+        if diagnostic_stage is not None:
+            raise RemoteCommandFailure(returncode, stage=diagnostic_stage)
+        raise VerificationError("bounded host-tools verification command failed")
     return bytes(output)
 
 
@@ -398,8 +426,21 @@ def _remove_owned_ssh_dir(ssh_dir: Path, temp_root: Path) -> None:
     shutil.rmtree(ssh_dir)
 
 
-def _remote(remote: list[str], *fixed_args: str, timeout: int = 60, max_output: int = MAX_REMOTE_OUTPUT) -> bytes:
-    return _run([*remote, *fixed_args], timeout=timeout, max_output=max_output)
+def _remote(
+    remote: list[str],
+    *fixed_args: str,
+    stage: str,
+    timeout: int = 60,
+    max_output: int = MAX_REMOTE_OUTPUT,
+) -> bytes:
+    if stage not in REMOTE_DIAGNOSTIC_STAGES:
+        raise ValueError("unsupported host-tools remote diagnostic stage")
+    return _run(
+        [*remote, *fixed_args],
+        timeout=timeout,
+        max_output=max_output,
+        diagnostic_stage=stage,
+    )
 
 
 def _locked_final_generation_check(
@@ -434,7 +475,12 @@ def _locked_final_generation_check(
         f"import base64; exec(base64.b64decode('{code}'))", encoded,
     ))
     try:
-        output = _run([*remote, remote_command], timeout=35, max_output=1024)
+        output = _run(
+            [*remote, remote_command],
+            timeout=35,
+            max_output=1024,
+            diagnostic_stage="locked_final_check",
+        )
     except RemoteCommandFailure as exc:
         if exc.returncode == 75:
             return False
@@ -489,12 +535,12 @@ def verify_installed_generation(
     ssh_dir, remote, created = _safe_host_ssh(host, user, key, runner_temp)
     generation = f"{GENERATION_ROOT}/{sha}"
     try:
-        if _remote(remote, "/usr/bin/id", "-u").strip() != b"0":
+        if _remote(remote, "/usr/bin/id", "-u", stage="host_identity").strip() != b"0":
             raise VerificationError("production SSH identity is not root")
         deadline = time.monotonic() + wait_seconds
         while True:
             try:
-                _remote(remote, "/usr/bin/test", "-d", generation)
+                _remote(remote, "/usr/bin/test", "-d", generation, stage="generation_presence")
                 break
             except RemoteCommandFailure as exc:
                 if exc.returncode != 1:
@@ -502,9 +548,17 @@ def verify_installed_generation(
                 if time.monotonic() >= deadline:
                     raise GenerationAbsent("exact host-tools generation is not installed") from exc
                 time.sleep(min(10, max(0.0, deadline - time.monotonic())))
-        if _remote(remote, "/usr/bin/test", "!", "-L", generation) != b"":
+        if _remote(remote, "/usr/bin/test", "!", "-L", generation, stage="generation_symlink") != b"":
             raise VerificationError("host-tools generation is missing or unsafe")
-        if _remote(remote, "/usr/bin/stat", "-c", "%F:%u:%g:%h:%a", "--", generation).strip() != b"directory:0:0:2:555":
+        if _remote(
+            remote,
+            "/usr/bin/stat",
+            "-c",
+            "%F:%u:%g:%h:%a",
+            "--",
+            generation,
+            stage="generation_metadata",
+        ).strip() != b"directory:0:0:2:555":
             raise VerificationError("host-tools generation metadata is unsafe")
 
         expected: set[str] = {"manifest.json", "capabilities.txt"}
@@ -514,23 +568,65 @@ def verify_installed_generation(
             expected.add(relative)
             path = f"{generation}/{relative}"
             expected_mode = "444" if relative in {"manifest.json", "capabilities.txt"} else expected_mode
-            metadata = _remote(remote, "/usr/bin/stat", "-c", "%F:%u:%g:%h:%a", "--", path).strip()
+            metadata = _remote(
+                remote,
+                "/usr/bin/stat",
+                "-c",
+                "%F:%u:%g:%h:%a",
+                "--",
+                path,
+                stage="member_metadata",
+            ).strip()
             if metadata != f"regular file:0:0:1:{expected_mode}".encode():
                 raise VerificationError(f"host-tools payload metadata failed at row {index}")
-            output = _remote(remote, "/usr/bin/sha256sum", "--", path, max_output=1024).decode("ascii", "strict").split()
+            output = _remote(
+                remote,
+                "/usr/bin/sha256sum",
+                "--",
+                path,
+                stage="member_digest",
+                max_output=1024,
+            ).decode("ascii", "strict").split()
             if len(output) != 2 or output[0] != expected_hash or output[1] != path:
                 raise VerificationError(f"host-tools payload digest failed at row {index}")
         for relative, expected_hash in (("manifest.json", manifest_hash), ("capabilities.txt", capabilities_hash)):
             path = f"{generation}/{relative}"
-            output = _remote(remote, "/usr/bin/sha256sum", "--", path, max_output=1024).decode("ascii", "strict").split()
+            output = _remote(
+                remote,
+                "/usr/bin/sha256sum",
+                "--",
+                path,
+                stage="root_digest",
+                max_output=1024,
+            ).decode("ascii", "strict").split()
             if len(output) != 2 or output[0] != expected_hash or output[1] != path:
                 raise VerificationError("host-tools root payload digest failed")
-            if _remote(remote, "/usr/bin/stat", "-c", "%F:%u:%g:%h:%a", "--", path).strip() != b"regular file:0:0:1:444":
+            if _remote(
+                remote,
+                "/usr/bin/stat",
+                "-c",
+                "%F:%u:%g:%h:%a",
+                "--",
+                path,
+                stage="root_metadata",
+            ).strip() != b"regular file:0:0:1:444":
                 raise VerificationError("host-tools root payload metadata is unsafe")
 
         # OpenSSH preserves NUL bytes in stdout; compare exact leaf names rather
         # than line-oriented output, so names containing controls cannot hide.
-        inventory = _remote(remote, "/usr/bin/find", "--", generation, "-mindepth", "1", "-maxdepth", "1", "-print0", max_output=MAX_REMOTE_OUTPUT)
+        inventory = _remote(
+            remote,
+            "/usr/bin/find",
+            "--",
+            generation,
+            "-mindepth",
+            "1",
+            "-maxdepth",
+            "1",
+            "-print0",
+            stage="inventory",
+            max_output=MAX_REMOTE_OUTPUT,
+        )
         names = inventory.split(b"\x00")
         if names and names[-1] == b"":
             names.pop()
@@ -554,7 +650,17 @@ def verify_installed_generation(
                 "retained_load_source_binding=1 cpu_diagnostic_plan_control=1 python_isolated=1 python_bytecode_disabled=1\n"
             )
         dispatcher = f"{generation}/platform_workflow_remote_dispatch.py"
-        capability_output = _remote(remote, "/usr/bin/python3.12", "-I", "-B", dispatcher, "host-capabilities", timeout=20, max_output=512)
+        capability_output = _remote(
+            remote,
+            "/usr/bin/python3.12",
+            "-I",
+            "-B",
+            dispatcher,
+            "host-capabilities",
+            stage="capability_self_test",
+            timeout=20,
+            max_output=512,
+        )
         if capability_output != expected_capability.encode("ascii"):
             raise VerificationError("installed host-tools capability self-test failed")
         # A provisioner may publish the exact generation while holding both
@@ -605,6 +711,17 @@ def main(argv: list[str] | None = None) -> int:
         print("Exact host-tools generation is not installed yet.", file=sys.stderr)
         return 10
     except (KeyError, OSError, UnicodeError, VerificationError) as exc:
+        if isinstance(exc, RemoteCommandFailure):
+            if exc.returncode > 0:
+                detail = f"reason=ssh_nonzero ssh_exit_code={exc.returncode}"
+            else:
+                detail = f"reason=ssh_signal signal={-exc.returncode}"
+            print(
+                "HOST_TOOLS_VERIFY schema=1 status=failed "
+                f"stage={exc.stage} {detail}",
+                file=sys.stderr,
+            )
+            return 1
         if isinstance(exc, VerificationError) and exc.diagnostic_code is not None:
             print(f"{exc} [reason={exc.diagnostic_code}]", file=sys.stderr)
         else:
