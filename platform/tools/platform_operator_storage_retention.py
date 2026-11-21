@@ -529,7 +529,7 @@ def run(apply: bool) -> dict[str, object]:
     lock_info = os.fstat(descriptor)
     if (
         not stat.S_ISREG(lock_info.st_mode)
-        or lock_info.st_uid != 0
+        or lock_info.st_uid != EXPECTED_OWNER_UID
         or lock_info.st_nlink != 1
         or stat.S_IMODE(lock_info.st_mode) != 0o600
     ):

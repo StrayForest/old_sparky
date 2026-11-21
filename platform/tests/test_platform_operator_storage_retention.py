@@ -172,6 +172,17 @@ class OperatorStorageRetentionTests(unittest.TestCase):
         self.assertEqual(len(observed), 2)
         self.assertIn("node", observed[-1])
 
+    def test_lock_rejects_owner_mismatch(self) -> None:
+        self.configure_roots()
+        lock_path = self.root / "run" / "operator-retention.lock"
+        lock_path.parent.mkdir()
+        expected_owner = (self.owner_uid + 1) % (2**31)
+        self.enterContext(mock.patch.object(retention, "LOCK_PATH", lock_path))
+        self.enterContext(mock.patch.object(retention, "EXPECTED_OWNER_UID", expected_owner))
+        self.enterContext(mock.patch.object(retention.os, "geteuid", return_value=0))
+        with self.assertRaisesRegex(retention.RetentionError, "lock_metadata_unsafe"):
+            retention.run(apply=False)
+
     def test_worktree_requires_clean_attached_and_unlocked_state(self) -> None:
         self.configure_roots()
         worktree = self.root / "managed-worktree"
