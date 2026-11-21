@@ -8580,7 +8580,10 @@ cleanup
         helper = (TOOLS_DIR / "platform_host_tools_installed_check.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn('"/usr/bin/python3.12", "-I", "-B", dispatcher, "host-capabilities"', helper)
+        self.assertRegex(
+            helper,
+            r'_remote\(\s*remote,\s*"/usr/bin/python3\.12",\s*"-I",\s*"-B",\s*dispatcher,\s*"host-capabilities",\s*stage="capability_self_test",\s*timeout=20,\s*max_output=512,\s*\)',
+        )
         for capability_field in dispatcher_match.group(0)[1:-1].split():
             self.assertIn(capability_field, helper)
         self.assertIn("release_baseline=1", helper)
