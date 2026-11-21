@@ -63,6 +63,15 @@ metadata render as flat lists until refreshed.
 This parser metadata does not change translation segments, source hashes or the
 translation version.
 
+Patch-detail cache entries store the structured projection rather than raw
+Steam group markup. When an available asset catalog requires reparsing that
+cached source text, the service reconstructs group descriptors only from
+validated cached ranges and their original change strings, then reapplies them
+only when the unchanged sequence matches one destination range across all
+owners. A repeated, missing, changed or ambiguous sequence remains a flat list.
+Translation cache rows remain text-only; this catalog reparse does not require
+retranslation.
+
 Each ability carries `presentation_kind` with
 `balance`, `introduction` or `replacement`; the client displays description
 and stats only for the latter two kinds. Intro stats retain a localized

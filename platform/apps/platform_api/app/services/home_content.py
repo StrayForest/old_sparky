@@ -511,17 +511,12 @@ def _apply_patch_change_groups(
                 changes = owner.get("changes")
                 if not isinstance(changes, list):
                     continue
-                start = next(
-                    (
-                        index
-                        for index in range(len(changes) - len(expected) + 1)
-                        if changes[index:index + len(expected)] == expected
-                    ),
-                    None,
-                )
-                if start is None:
-                    continue
-                candidates.append((owner, start))
+                starts = [
+                    index
+                    for index in range(len(changes) - len(expected) + 1)
+                    if changes[index:index + len(expected)] == expected
+                ]
+                candidates.extend((owner, start) for start in starts)
         if len(candidates) == 1:
             owner, start = candidates[0]
             owner.setdefault("change_groups", []).append(

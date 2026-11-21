@@ -32,6 +32,63 @@ def _patch_lines(content: str) -> list[str]:
     return base._patch_lines(normalized)
 
 
+def _cached_change_group_sources(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    """Recover group source text from a cached structured projection safely.
+
+    Patch detail cache entries store indexed groups rather than raw Steam
+    markup. When a newer asset catalog requires reparsing the cached source
+    text, reconstruct descriptors only from valid ranges and let the shared
+    exact-match logic attach them to a unique new owner.
+    """
+
+    sections = raw.get("sections")
+    if not isinstance(sections, list):
+        return []
+
+    recovered: list[dict[str, Any]] = []
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        owners = [section]
+        abilities = section.get("abilities")
+        if isinstance(abilities, list):
+            owners.extend(ability for ability in abilities if isinstance(ability, dict))
+        for owner in owners:
+            changes = owner.get("changes")
+            groups = owner.get("change_groups")
+            if not isinstance(changes, list) or not isinstance(groups, list):
+                continue
+            for group in groups:
+                if not isinstance(group, dict):
+                    continue
+                heading_index = group.get("heading_index")
+                description_start = group.get("description_start")
+                description_end = group.get("description_end")
+                indexes = (heading_index, description_start, description_end)
+                if any(type(index) is not int for index in indexes):
+                    continue
+                if not (
+                    0 <= heading_index < description_start < description_end <= len(changes)
+                ):
+                    continue
+                heading_parts = changes[heading_index:description_start]
+                items = changes[description_start:description_end]
+                if (
+                    not heading_parts
+                    or any(not isinstance(text, str) or not text.strip() for text in heading_parts)
+                    or not items
+                    or any(not isinstance(text, str) or not text.strip() for text in items)
+                ):
+                    continue
+                source = {
+                    "heading": "\n".join(heading_parts),
+                    "items": list(items),
+                }
+                if source not in recovered:
+                    recovered.append(source)
+    return recovered
+
+
 def _match_named_line(
     line: str,
     catalog: dict[str, Any],
@@ -918,7 +975,10 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
         section.pop("_ability_map", None)
         sections.append(section)
 
-    base._apply_patch_change_groups(sections, raw.get("change_group_sources"))
+    change_group_sources = raw.get("change_group_sources")
+    if not isinstance(change_group_sources, list) or not change_group_sources:
+        change_group_sources = _cached_change_group_sources(raw)
+    base._apply_patch_change_groups(sections, change_group_sources)
 
     public_raw = {key: value for key, value in raw.items() if key != "change_group_sources"}
 

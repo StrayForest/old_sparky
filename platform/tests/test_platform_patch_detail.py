@@ -259,6 +259,30 @@ Bonus health reduced
         self.assertEqual(home_detail["sections"][0]["change_groups"], section["change_groups"])
         self.assertNotIn("change_group_sources", home_detail)
 
+    def test_duplicate_group_sequences_remain_flat(self) -> None:
+        group = home_content._extract_patch_change_group_sources(
+            "[p][b]Ranked Leaderboards:[/b][/p][list]"
+            "[*][p]We've reworked leaderboards.[/p][/list]"
+        )[0]
+        repeated_group = [group["heading"], *group["items"]]
+        detail = structure_patch_detail(
+            {
+                "id": "duplicate-groups",
+                "title": "Patch",
+                "content": "\n".join(
+                    [*repeated_group, "Separate update.", *repeated_group]
+                ),
+                "change_group_sources": [group],
+            },
+            {"heroes": {}, "items": {}, "objectives": {}},
+        )
+
+        general = next(
+            section for section in detail["sections"] if section["kind"] == "general"
+        )
+        self.assertEqual(general["changes"], [*repeated_group, "Separate update.", *repeated_group])
+        self.assertNotIn("change_groups", general)
+
     def test_general_scope_routes_catalogued_hero_and_ability_headings(self) -> None:
         raw = {
             "id": "5",

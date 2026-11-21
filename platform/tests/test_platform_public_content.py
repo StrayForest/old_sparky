@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import HTTPException, Response
@@ -20,6 +21,7 @@ from apps.platform_api.app.services import home_content_security
 from apps.platform_api.app.services import patch_detail
 from apps.platform_api.app.services import patch_detail_security
 from apps.platform_api.app.services import patch_translation
+from apps.platform_api.app.services import patch_translation_runtime
 from python_packages.platform_infra.config import PlatformSettings
 from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
@@ -1798,6 +1800,188 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
         self.assertTrue(catalog_living_ink_response.description.startswith("Виолетта"))
         self.assertFalse(catalog_violet_response.hero_metadata_pending)
         self.assertFalse(catalog_response.hero_metadata_pending)
+
+    async def test_cached_group_survives_catalog_reparse_and_old_translation_merge(self) -> None:
+        fixture_path = (
+            Path(__file__).parent
+            / "fixtures"
+            / "patch-acceptance"
+            / "steam-news-four-patches.json"
+        )
+        steam_fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        steam_item = next(
+            item
+            for item in steam_fixture["items"]
+            if item.get("gid") == "1848664643342973"
+        )
+        source_groups = home_content._extract_patch_change_group_sources(
+            steam_item["contents"]
+        )
+        leaderboard_group = next(
+            group
+            for group in source_groups
+            if group["heading"] == "Ranked Leaderboards:"
+        )
+        filler_changes = [
+            f"Prior general update {index} remains unchanged."
+            for index in range(21)
+        ]
+        content_lines = [
+            *filler_changes,
+            leaderboard_group["heading"],
+            *leaderboard_group["items"],
+            "Beta Season 2 begins today, we'll see you there!",
+            "Abrams: Health regeneration increased from 2.5 to 3.25.",
+        ]
+        patch_source = {
+            "id": "1848664643342973",
+            "title": "Ranked - Beta Season 2",
+            "published_at": "2026-11-05T00:00:00+00:00",
+            "url": "https://store.steampowered.com/news/app/1422450/view/1848664643342973",
+            "content": "\n".join(content_lines),
+            "change_group_sources": [leaderboard_group],
+        }
+        stale_catalog = {
+            "heroes": {
+                "abrams": {
+                    "name": "Abrams",
+                    "slug": "abrams",
+                    "display_name": None,
+                    "abilities": {},
+                }
+            },
+            "items": {},
+            "objectives": {},
+        }
+        current_catalog = {
+            "heroes": {
+                "abrams": {
+                    "name": "Abrams",
+                    "slug": "abrams",
+                    "display_name": "Абрамс",
+                    "abilities": {},
+                }
+            },
+            "items": {},
+            "objectives": {},
+        }
+
+        cached_v18_detail = patch_detail.structure_patch_detail(
+            patch_source,
+            stale_catalog,
+        )
+        self.assertNotIn("change_group_sources", cached_v18_detail)
+        cached_general = next(
+            section
+            for section in cached_v18_detail["sections"]
+            if section["kind"] == "general"
+        )
+        self.assertEqual(len(cached_general["changes"]), 27)
+        self.assertEqual(
+            cached_general["change_groups"],
+            [{"heading_index": 21, "description_start": 22, "description_end": 26}],
+        )
+
+        source_segments = patch_translation.extract_translation_segments(
+            cached_v18_detail
+        )
+        source_hash = patch_translation.translation_source_hash(cached_v18_detail)
+        old_cached_translation = {
+            "locale": patch_translation.PATCH_TRANSLATION_LOCALE,
+            "source_hash": source_hash,
+            "translation_version": patch_translation.PATCH_TRANSLATION_VERSION,
+            "model": "test-model",
+            "segments": [
+                {"id": segment["id"], "text": f"Перевод {index}"}
+                for index, segment in enumerate(source_segments)
+            ],
+        }
+        self.assertNotIn("change_groups", old_cached_translation)
+        old_cached_translation_by_id = {
+            segment["id"]: segment["text"]
+            for segment in old_cached_translation["segments"]
+        }
+        source_cache = _Cache(
+            {
+                home_content.PATCH_DETAIL_KEY_PREFIX
+                + "1848664643342973": json.dumps(
+                    cached_v18_detail,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            }
+        )
+
+        async def read_old_cached_translation(
+            patch_value: dict[str, object],
+            *,
+            settings: PlatformSettings | None = None,
+        ) -> dict[str, str]:
+            self.assertEqual(
+                patch_translation.translation_source_hash(patch_value),
+                old_cached_translation["source_hash"],
+            )
+            self.assertEqual(
+                [
+                    segment["id"]
+                    for segment in patch_translation.extract_translation_segments(
+                        patch_value
+                    )
+                ],
+                [segment["id"] for segment in old_cached_translation["segments"]],
+            )
+            return old_cached_translation_by_id
+
+        with (
+            patch.object(
+                patch_detail_security,
+                "redis_client",
+                return_value=source_cache,
+            ),
+            patch.object(
+                patch_detail_security,
+                "_cached_asset_catalog",
+                AsyncMock(return_value=current_catalog),
+            ),
+            patch.object(
+                patch_translation_runtime,
+                "get_cached_patch_translation",
+                read_old_cached_translation,
+            ),
+        ):
+            translated_detail = await patch_detail_security.get_patch_detail(
+                "1848664643342973"
+            )
+
+        response = PatchDetailResponse.model_validate(translated_detail)
+        general_response = next(
+            section
+            for section in response.sections
+            if section.kind == "general"
+        )
+        hero_response = next(
+            section
+            for section in response.sections
+            if section.kind == "hero"
+        )
+        self.assertEqual(hero_response.hero_display_name, "Абрамс")
+        self.assertEqual(len(general_response.changes), 27)
+        self.assertEqual(general_response.changes[21], "Перевод 21")
+        self.assertEqual(general_response.changes[22:26], [
+            "Перевод 22",
+            "Перевод 23",
+            "Перевод 24",
+            "Перевод 25",
+        ])
+        self.assertEqual(general_response.changes[26], "Перевод 26")
+        self.assertEqual(
+            [group.model_dump() for group in general_response.change_groups],
+            [{"heading_index": 21, "description_start": 22, "description_end": 26}],
+        )
+        self.assertEqual(
+            patch_translation.PATCH_TRANSLATION_VERSION,
+            old_cached_translation["translation_version"],
+        )
 
     def test_patch_detail_groups_live_urn_and_rift_scope_in_fixed_order(self) -> None:
         urn_icon = (
