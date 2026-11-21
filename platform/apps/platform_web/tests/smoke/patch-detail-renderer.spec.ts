@@ -3,8 +3,7 @@ import path from "node:path";
 import { expect, test } from "@playwright/test";
 import type { Locator } from "@playwright/test";
 import type { PlatformPatchAbilityStat, PlatformPatchDetail, PlatformPatchSection } from "../../lib/platform-types";
-import { expectRenderedPatchChangeList } from "../support/patch-change-list-assertions";
-import { patchAcceptanceIssues } from "../support/patch-acceptance";
+import { expectRenderedPatchChangeList, patchAcceptanceIssues } from "../support/patch-acceptance";
 
 const patchIds = [
   "1848664643342973",

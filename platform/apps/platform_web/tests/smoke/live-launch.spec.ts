@@ -3,8 +3,7 @@ import type { Locator } from "@playwright/test";
 import LiveCountReporter from "../support/live-count-reporter.cjs";
 import { collectLiveImageInventory } from "../support/live-image-inventory";
 import { assertLiveQaChromiumSandbox } from "../support/live-qa-sandbox";
-import { expectRenderedPatchChangeList } from "../support/patch-change-list-assertions";
-import { patchAcceptanceIssues } from "../support/patch-acceptance";
+import { expectRenderedPatchChangeList, patchAcceptanceIssues } from "../support/patch-acceptance";
 import type { PlatformPatchDetail, PlatformPatchSection } from "../../lib/platform-types";
 
 type BrowserEvidence = {

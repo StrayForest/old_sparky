@@ -1147,6 +1147,12 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             manifest = json.loads((output / "runtime-manifest.json").read_text())
+            packaged_patch_acceptance = output / "web/tests/support/patch-acceptance.ts"
+            self.assertIn(
+                "export async function expectRenderedPatchChangeList",
+                packaged_patch_acceptance.read_text(encoding="utf-8"),
+            )
+            self.assertIn("web/tests/support/patch-acceptance.ts", manifest["files"])
             self.assertIn(
                 "browsers/chromium-1228/chrome-linux64/resources.pak",
                 manifest["files"],
