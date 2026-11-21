@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-11-20
+- Last reviewed: 2026-11-21
 
 Read this page for live pins, pending release work, open QA gates and hard
 operational limits. Product contracts, procedures and detailed run evidence
@@ -11,37 +11,27 @@ belong in the linked owner documents below.
 ## Live and pending state
 
 - Production runs application source
-  `8c575dbc0a510be5cf4cf6bbd4abc312c9a7db89` in release
-  `gha-44700419645-1-8c575dbc0a51`; `previous` is source
-  `720a6ea1a90090ef9aacc76c93b2ef8d8cc40a24` in release
-  `gha-43743890016-1-720a6ea1a900`. Host-tools pin
-  `aa4f9e075156bd9aadb699eb3a13253e80daf79a` is installed
-  as manifest `production-host-tools-v4` (SHA-256
-  `8363ca5c5b90de003e0e1e3b39179852621fd1a8383c167bc8107b3efa3b73c7`). The
-  deployed source updates Next.js to patched version 16.4.6. Active runtime
-  manifest is v3 with Node 26.3.1; runtime provider v2 is bound to source 8c.
-  Alembic current and head are both `20261115_0056` (admin tournament test
-  fixtures). The shared virtual-environment origin resolves to current 8c.
-- Source 8c passed exact-SHA Security run `44694724609/1` and backup
-  `44696295210/1`. AUTO `44696145318/2` succeeded, followed by production
-  deploy `44700419645/1`. The lock-held release preflight, runtime verification
-  and loopback/public-origin smokes passed.
-- Public QA `44701659435/1` passed 47 cases, skipped 10 allowlisted cases, and
-  had zero failures. UserQA `44702730670/1` succeeded. Parent run
-  `44701610827/1` succeeded with exact UserQA cleanup. The retention preview
-  and apply protected current and previous releases, deleted one
-  eligible old release, and removed no live-QA cache. The post-apply preview
-  has no remaining eligible deletions.
-  Canonical post-QA maintenance run `44705121244/1` succeeded in apply mode,
-  creating a new restore-verified backup of 135,102,570 bytes and retaining one
-  backup; disk had 6,804,692,992 bytes free (about 83% used). The earlier
-  deploy backup run remains the exact CI-bound release backup. Final readiness
-  found source 8c current and 720 previous, all app services active, live,
-  ready and web root endpoints returning 200, no transaction, zero LiveQA
-  gates and zero retained UserQA state directories. Maintenance service is
-  inactive with successful result and its timer is active/enabled. The fresh
-  post-retention preview protects current, previous and the current venv
-  origin, with zero remaining deletion candidates.
+  `88e4154661e76e8e4a2aac89a2ac592195d1fcde` in release
+  `gha-44895292289-1-88e4154661e7`; `previous` is source
+  `ae7ab3c590b2116c3fbb3dd5de1cf0353a6915ff` in release
+  `gha-44890605729-1-ae7ab3c590b2`. Host-tools pin
+  `aa4f9e075156bd9aadb699eb3a13253e80daf79a` is current and previous under
+  manifest `production-host-tools-v4`. The active runtime manifest is v3 with
+  Node 26.3.1. Alembic current and head are both `20261115_0056` (admin
+  tournament test fixtures).
+- Source 88e415 passed exact-SHA Security run `44893846804/1` and restore,
+  Alembic and checksum-validated backup `44895005123/1`. AUTO
+  `44894896692` succeeded, followed by production deploy `44895292289`.
+  Fresh installed readiness after QA passed with API and web health 200,
+  consistency checks passed, no locks, transaction marker, plans or pending
+  jobs, maintenance timer enabled and service idle, and 7,364,411,392 bytes
+  free. The signed cleanup of the failed prior candidate completed in run
+  `44888304260`; no further retention deletion was performed.
+- Installed-origin API acceptance for patch `1848664643342973` passed: the
+  Russian patch detail returns 27 changes, with the leaderboard heading at
+  index 21, its four descriptions at indexes 22–25, and the Beta Season 2
+  announcement separately at index 26. This preserves the group through
+  catalog-driven cached-detail reparsing and translation merge.
 - The active source includes admin manual tournament fixtures and migration
   `20261115_0056_admin_tournament_test_fixtures.py`. Admins can create and
   resume a marked fixture, prepare synthetic participants, generate teams
@@ -70,11 +60,17 @@ belong in the linked owner documents below.
 
 ## QA and cleanup gates
 
-- Required production deployment, public QA, UserQA and exact UserQA cleanup
-  passed for source 8c. Post-QA readiness, exact absence and maintenance
-  retention closeout passed. Human Chrome and real Cloudflare challenge/scoring
-  remain optional diagnostics; the CI Siteverify fixture does not establish
-  production Cloudflare scoring.
+- Production deployment and installed-origin readiness passed for source
+  88e415. Automatic QA parent `44895923361` failed its exact-public-success
+  gate. Its public live-launch child `44895941581` reported 44 passed, 3
+  failed, 10 skipped, and no flaky or interrupted cases; the sanitized failure
+  class is `browser_child_unclassified`, with no case-level attribution.
+  UserQA and its cleanup child were not dispatched. The direct public API and
+  page probes returned Cloudflare 403, so public rendering of the patch is not
+  verified. Do not treat installed-origin API acceptance as public-browser QA.
+  Human Chrome and real Cloudflare challenge/scoring remain optional
+  diagnostics; the CI Siteverify fixture does not establish production
+  Cloudflare scoring.
 - The completed external HTTP matrix is not whole-site functional coverage.
   Cell 9's attribution failure and cell 7's unresolved client/origin join are
   not closed by the separate SSR diagnostics. No cause or server capacity
