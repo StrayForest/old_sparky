@@ -108,6 +108,17 @@ The route bindings are:
   child run/attempt whose only failure was the missing pinned generation
   before build.
 
+For route (a), a pre-install preflight may be overall unsuccessful only when
+its exact host-capability gate reports pinned **C** absent before build,
+transaction, transfer or protected write. The exact attempt must still have a
+successful builder job, and the attestation above must verify every route
+binding. Any other failed step, unexpected skip, ambiguous binding or
+incomplete required check makes the artifact ineligible. Downstream jobs
+skipped solely because they depend on this accepted missing-**C** gate are
+expected; any other skip is ineligible.
+After provisioning **C**, a separate fresh exact-target
+`mode=preflight` must pass in full, including installed host capability.
+
 Set `SIGNER_WORKFLOW` to `StrayForest/old_sparky/` plus the route's workflow
 path; derive `SOURCE_REF`, **Q**, run ID/attempt, **C** and bundle digest from
 the exact receipts. Do not substitute a child invocation for the signer or
@@ -124,7 +135,9 @@ fixed installed self-test. Route (b) additionally requires the same AUTO
 readiness job and shared verifier step still `in_progress` with dispatch not
 started; stop if its 1,800-second window expired or readiness completed. Do
 not reuse that artifact outside the window. Route (a) revalidates the exact
-successful read-only `mode=preflight` run/attempt at current merged `dev`.
+read-only `mode=preflight` run/attempt at current merged `dev`, successful
+builder job and sole eligible missing-**C** refusal above. Its post-install
+preflight is a separate run and must pass in full.
 Route (c) revalidates the exact completed child failure: its only failure was
 the missing pinned generation before build, pending state or production write.
 That child is not an active AUTO window. Every route preserves the builder job,

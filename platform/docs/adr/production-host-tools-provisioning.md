@@ -324,8 +324,8 @@ installer:
 Before provisioning, prepare a supported official GitHub CLI attestation verifier before the admitted route begins; route (b) must do this before opening its 1,800-second AUTO readiness window. Follow the exact isolated verifier setup, artifact binding and JSON field checks in the [host-tools attestation verification procedure](production-host-tools-attestation-verification.md). A verified attestation is required in addition to the offline bundle/content checks; it does not authorize publication by itself.
 
 1. Record the successful exact-`TARGET_SHA` Security run. A successful `build-host-tools` job
-   and attested bundle qualify from (a) read-only `mode=preflight` at that same merged `dev`
-   SHA; (b) the exact automatic parent in its active 1,800-second pre-child readiness window,
+   and attested bundle qualify from (a) a fresh read-only `workflow_dispatch`
+   `mode=preflight` at that same merged `dev` SHA, after the official verifier is ready; (b) the exact automatic parent in its active 1,800-second pre-child readiness window,
    only if `TARGET_SHA` is current `dev`, its source-bound restore-verified backup and bundle
    build/attestation/upload succeeded, and no child, app write, pending release transaction or
    competing production operation exists; or (c) the exact automatic child whose only failure
@@ -495,11 +495,11 @@ The bounded cleanup-failure diagnostics use source **C14** `314afc65d3c3d8ef88e3
 3. Require full CI success for exact merged **P**, then use the documented
    read-only `mode=preflight` run at **P** to produce the signed
    `build-host-tools` bundle. Verify its exact workflow run/attempt, successful
-   builder job, artifact ID/name/digest, inner manifest and closure. The
-   downstream capability check may stop the preflight run because **C** is
-   not yet installed. The signed bundle is evidence for provisioning, not
-   deployment authority; the pull-request candidate artifact is not the
-   provisioning source.
+   builder job, artifact ID/name/digest, inner manifest and closure. The sole
+   eligible pre-install failure is that gate's exact missing-**C** refusal
+   before build, transaction, transfer or protected write; every other failure
+   is ineligible. The signed bundle is evidence for provisioning, not
+   deployment authority; the pull-request candidate artifact is not the source.
 4. Provision and self-test `/opt/oldsparky/platform/shared/host-tools/<C>/`
    through the approved root-only console or host-image authority. Record **P**
    as `TARGET_SHA` and **C** as `HOST_TOOLS_SHA`; preserve both identities and
@@ -532,20 +532,21 @@ The bounded cleanup-failure diagnostics use source **C14** `314afc65d3c3d8ef88e3
    deployed-source proof, cumulative classifier result and lock-held host
    recheck remain mandatory.
 
-If that automatic child stopped only because **C** was absent at the
-read-only host-capability gate, do not rerun that child or only its failed
-jobs. After provisioning and self-testing **C**, run a successful read-only
-`mode=preflight` at the unchanged **P**. If **P** is still the current `dev`
-HEAD, its exact successful source-CI proof remains valid, the deployed host
-tuple is unchanged and no operation is pending, rerun **all jobs** on the exact
-completed `Platform production auto-deploy` workflow run that authorized the
-child. This preserves the original source/ref and triggering actor while
-advancing the auto-deploy attempt; its dispatch job must create a fresh
-production child bound to that new auto run ID/attempt. Verify the new auto
-and child run IDs/attempts and their exact success markers before accepting
-the release. If any precondition changed, stop and follow the normal exact-SHA
-automatic chain for the current `dev` HEAD. Never manually dispatch
-`mode=deploy` or rerun only the failed production child as a continuation.
+For route (b), the pre-child fallback applies only if the official verifier
+is unavailable at its fixed window and all other source/backup checks passed.
+Cancel that exact AUTO run before child dispatch; confirm terminal cancellation, no child, app/host write, pending transaction or competing operation, and discard its bundle. Continue only through route (a) on current **P**, with
+successful exact Security and read-only `mode=preflight` builder/attestation
+evidence and verified bindings. After provisioning/self-testing **C**, require
+fresh successful same-**P** preflight including installed host capability.
+The separate child-retry route applies only if **C** alone was missing at the
+read-only host-capability gate before build, transaction, transfer or protected
+write. For either route, require **P** current, Security/backup proofs valid,
+deployed application tuple unchanged, installed host generation exactly **C**,
+and no pending transaction or competing operation; rerun **all jobs once** on
+that same exact AUTO run. Verify the new attempt and fresh normal child. Never
+rerun child/partial jobs, use an unqualified bundle or manually dispatch
+`mode=deploy`; any other or uncertain failure requires the current exact-SHA
+automatic chain.
 
 This sequence avoids an impossible self-referential merge-SHA pin while
 ensuring the reviewed generation is built, attested, provisioned and tested

@@ -10,29 +10,32 @@ belong in the linked owner documents below.
 
 ## Live and pending state
 
-- Production runs application source
-  `f500d04ddbdee97e3fa0843a71a60573ebd27d70` in release
-  `gha-44962373348-1-f500d04ddbde`; `previous` is source
-  `91e59493901c186c0316eef912f5d9de7f7d11cb` in release
-  `gha-44919878014-1-91e59493901c`. The current `dev` source is
-  `cc78e2f5c962a235074ff49c6e6bab1749b6b731`. Host-tools pin
-  `d0f60dc1d93a463a529592ff8c7dd59de398cead` selects installed C23
-  `23e76706728064defeff1024c48e939cd1a8f6bc` under manifest
-  `production-host-tools-v4`; the prior AA4 generation
-  `aa4f9e075156bd9aadb699eb3a13253e80daf79a` remains preserved. The active
-  runtime manifest is v3 with Node 26.3.1. Alembic current and head are both
-  `20261115_0056` (admin tournament test fixtures).
-- The active app release S passed exact-SHA Security run `44960656347/1`,
-  source-bound restore-verified backup `44962121912/1`, AUTO
-  `44961874268/1`, and production deployment `44962373348/1`. The deployment
-  completed successfully; use the deployment and backup runbooks for its
-  source-bound receipts and recovery procedure.
-- Current `dev` source cc78 passed Security `44965031579/1`, source-bound
-  backup `44966253447/1`, AUTO `44965973383/1`, and production child
-  `44966535234/1`. The child was a successful authenticated `verified-noop`
-  for the full f500-to-cc78 range (`runtime_required=false`, artifact
-  `14732135289`); it did not replace the active app release S. It fixes future
-  ordinary-upgrade activation of the operator storage-retention timer.
+- Production still runs application source
+  `d7101ad3a7d07a31125370ef57c4cfc1bbefe242` in release
+  `gha-45013430287-1-d7101ad3a7d0`. Host-tools generation C
+  `da9981d6a7e97ec6aeea8501b02218f6d78fb50f` is installed and its pinned
+  `host-capabilities` self-test passed. The active runtime manifest is v3
+  with Node 26.3.1. Alembic current and head are both `20261115_0056` (admin
+  tournament test fixtures).
+- Current `dev` source Q is
+  `f8b671c8fadefff53af443f677597e53e9a00d6c`. Its exact-SHA Security run
+  `45020672563/1` and source-bound restore-verified backup `45022111071/1`
+  passed, and the full post-install Q preflight `45027305842/1` passed.
+  Automatic deployment run `45021664261/2` failed
+  during host-tools bundle attestation with the external transparency-log
+  response `InternalError: error fetching tlog entry - (404) Not Found`,
+  before readiness or app-child creation. Q is not deployed and has no
+  production QA credit; the live app remains D above. AUTO attempt 2 is the
+  final retry of that parent; no further retry is authorized. After the
+  reviewed documentation update is published, the supported path is an
+  automatic baseline-reconcile for the cumulative D-to-new-source range. The
+  documentation-only incremental range is classified as recovery-bootstrap
+  and is not deployment authority. AUTO must authenticate the cumulative
+  app-bearing range as full, deployable and runtime-sensitive, then require
+  its exact runtime proof before the baseline-reconcile production install.
+  Follow the
+  [deployment runbook](deployment-runbook.md) and host-tools ADRs for the
+  source-bound procedure.
 - Installed-origin API acceptance for patch `1848664643342973` passed: the
   Russian patch detail returns 27 changes, with the leaderboard heading at
   index 21, its four descriptions at indexes 22–25, and the Beta Season 2
@@ -66,12 +69,10 @@ belong in the linked owner documents below.
 
 ## QA and cleanup gates
 
-- Public S run `44963028353/1` passed with 47 cases passed, 10 skipped, and
-  zero failed, flaky or interrupted cases. UserQA S run `44963545588/1` passed
-  its complete 1-case contour, and automatic parent `44963009243/1` succeeded.
-  The exact QA credential files were retired through the documented owner
-  procedure. This QA evidence applies to f500; the cc78 verified-noop does
-  not receive new application QA credit.
+- Public and UserQA evidence currently applies to D, not Q. The attempt to
+  deploy Q stopped before an app child, so no Public/UserQA run or production
+  QA credit exists for Q. Any previous QA evidence and credential-retirement
+  receipts remain owned by the deployment and CSP/live-QA runbooks.
 - The operator storage-retention timer is installed, enabled and active. Its
   service completed a successful apply; the timer uses the reviewed resource
   limits of 25% CPU, 512 MiB memory and 30 minutes. Exact one-time cleanup
@@ -79,13 +80,8 @@ belong in the linked owner documents below.
   sole registered worktree. Maintenance run `44967525771` succeeded against
   active release f500 using the authenticated cc78 verified-noop binding. It
   removed five reviewed unpinned obsolete releases while protecting current
-  and previous. The fresh canonical preview is healthy with current and
-  previous protected, six releases retained, no release deletions pending,
-  one runtime cache retained and no transient candidates. Exactly one complete
-  restore-verified backup pair is retained. The filesystem is 47% used with
-  20,530,745,344 bytes available; the current/previous releases are f500/91e594,
-  services are healthy, and no release transaction is present. The retention
-  timer is active and enabled; its post-apply preview found zero candidates.
+  and previous at that time. Its accompanying preview and disk measurements
+  are historical and are not asserted as the current production snapshot.
   Human Chrome and real Cloudflare challenge/scoring remain optional
   diagnostics; the CI Siteverify fixture does not establish production
   Cloudflare scoring.

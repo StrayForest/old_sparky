@@ -125,7 +125,7 @@ to `dev`. The chain is:
    run the runner-side verifier on the host, weaken the contract, change retry
    behavior, or treat the diagnostic as authorization to provision or deploy.
    The automatic release chain remains the only normal deployment path.
-   For installer/evidence/validator changes, follow the host-tools ADR's **C→P** sequence: backward-compatible validator C, pin-only P, exact-P CI and read-only preflight, signed bundle verification, out-of-band provisioning, installed self-test and successful exact-P preflight. If cumulative application changes cannot deploy with strict reuse, withhold P's backup so its automatic parent refuses before readiness/child dispatch; do not rerun that parent or use baseline reconciliation. A later app source enables fresh policy and follows normal Security, source-bound backup and automatic deployment. A pin or bundle is not installation proof. The ADR owns provisioning/rollback; shared-venv reuse and managed LiveQA runtime procedures are in the [CSP and live-QA runbook](csp-live-qa-runbook.md).
+   For installer/evidence/validator changes, follow the host-tools ADR's **C→P** sequence: backward-compatible validator C, pin-only P, exact-P CI and read-only preflight, signed bundle verification, out-of-band provisioning, installed self-test and successful exact-P preflight. If the cumulative app range cannot deploy with strict reuse, withhold P's backup and do not retry that ineligible parent or use baseline reconciliation. The ADR separately defines the bounded verifier-not-ready pre-child cancellation and same-AUTO retry. A pin or bundle is not installation proof. The ADR owns provisioning/rollback; shared-venv reuse and managed LiveQA runtime procedures are in the [CSP and live-QA runbook](csp-live-qa-runbook.md).
 
 ### Recovery-bootstrap baseline reconciliation
 
@@ -291,12 +291,14 @@ Normally, read-only preflight at **P** builds and attests **C**. A natural bundl
 provisioned from the exact auto-parent during its active 1,800-second pre-child window, only for
 current-`dev` **P** after the source-bound restore-verified backup, parent build/attestation/upload
 and preceding host-contract checks succeed. No child, app write, pending state or competing operation may exist; provision before the deadline and bind the artifact to the exact parent run/attempt independently of the source Security attempt. The parent verifies **C** before child dispatch; see the [host-tools ADR](adr/production-host-tools-provisioning.md) for trust checks.
-The separate child-failure path remains limited to capability failure solely because **C** was missing before build, pending state, transfer or protected writes. For that path only, after self-testing **C**, rerun all jobs on the exact auto-deploy run only while **P** remains `dev`, source proof and host tuple are unchanged, and no operation is pending. This creates a fresh child; verify its run IDs/attempts and success markers. Never manually deploy/reconcile or rerun a failed child.
-
-After a verified pre-install failure, allow one all-jobs rerun only if the exact auto target remains
-current `dev`, source CI succeeds, baseline is unchanged, no transaction is pending, locks are free,
-and backup/edge/config/readiness/host checks pass. Require a fresh child; never rerun child/jobs or
-manually dispatch. Stop if it fails again or the stage is unclear.
+One all-jobs retry of the exact AUTO run is allowed for the two pre-write cases in
+the [host-tools provisioning ADR](adr/production-host-tools-provisioning.md):
+controlled terminal pre-child cancellation solely because the verifier was unavailable,
+or child failure solely because pinned **C** was missing at host capability. For either, provision/self-test **C** and require fresh full
+same-source `mode=preflight`. Before retry confirm current `dev`, valid Security/backup,
+unchanged deployed app tuple, installed SHA exactly **C**, and no transaction/lock/competitor; rerun all jobs on that AUTO once and verify its
+fresh child. Never retry a child/partial jobs or manually deploy. Other failures,
+prior writes or ambiguity require the normal exact-SHA chain.
 Do not run `platform_build_release.sh` or `platform_release_deploy.sh` directly for a normal release.
 They are workflow implementation details; direct server execution is limited to explicitly authorized recovery or rollback.
 
