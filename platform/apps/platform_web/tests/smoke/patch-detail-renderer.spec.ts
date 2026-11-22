@@ -286,8 +286,9 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
         section.change_lists ?? [],
       );
       if (patchId === "1848664643342973" && sectionIndex === 0) {
-        await expect(sectionCard.locator(":scope > .patch-change-heading")).toHaveCount(8);
-        await expect(sectionCard.locator(":scope > .patch-change-paragraph").last())
+        const changeContent = sectionCard.locator(":scope > .patch-change-content");
+        await expect(changeContent.locator(":scope > .patch-change-heading")).toHaveCount(8);
+        await expect(changeContent.locator(":scope > .patch-change-paragraph").last())
           .toHaveText(section.changes.at(-1)!);
         const leaderboard = sectionCard.locator(".patch-change-group");
         await expect(leaderboard.locator(":scope > h3")).toHaveText(section.changes[21]);
