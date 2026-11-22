@@ -10,19 +10,19 @@ belong in the linked owner documents below.
 
 ## Live and pending state
 
-- Production runs application source F
-  `a67a92e83928fb47b4658813ad560726b51be113` in release
-  `gha-45037938697-1-a67a92e83928`, deployed by automatic child
-  `45037938697/1`. Host-tools generation C
+- Production runs application source H
+  `7fd08091df9e4a442da59fe907af6302911aa839` in release
+  `gha-45047467972-1-7fd08091df9e`, deployed by automatic child
+  `45047467972/1`. Host-tools generation C
   `da9981d6a7e97ec6aeea8501b02218f6d78fb50f` is installed and its pinned
   `host-capabilities` self-test passed.
-- Current `dev` source F is
-  `a67a92e83928fb47b4658813ad560726b51be113`. Its exact-SHA Security run
-  `45036341333/1`, source-bound restore-verified backup `45037634185/1`,
-  AUTO `45037569214/1`, and production child `45037938697/1` passed. The
-  active release health check reported API, web, worker, nginx, PostgreSQL
-  and Redis active, with API live/ready and web returning 200; no release
-  operation remains pending. See the
+- Current `dev` source H is
+  `7fd08091df9e4a442da59fe907af6302911aa839`. Its exact-SHA Security run
+  `45045592748/1`, source-bound restore-verified backup `45047169182/1`,
+  AUTO `45046961891/1`, and production child `45047467972/1` passed. Final
+  health checks reported all six services active, API live/ready and web
+  returning 200; no release operation, recovery state or QA gate remains.
+  See the
   [deployment runbook](deployment-runbook.md) and host-tools ADRs for the
   source-bound procedure.
 - Installed-origin API acceptance for patch `1848664643342973` passed: the
@@ -61,33 +61,32 @@ belong in the linked owner documents below.
 - After successful roster provisioning, the deployed release includes
   automatic exact cleanup for a confirmed terminal Public failure and
   preserves the fixed browser-output protocol.
-  Public R run `45032463634/1` exercised
-  `public_failure_cleanup.status=cleaned`, proving exact roster/test-data
-  absence and recovery-state removal. Current F QA remains unpassed: parent
-  `45038678297/1` and Public child `45038706581/1` failed during provision;
-  standalone Public runs `45039012506/1` and `45041569227/1` both failed at
-  `image_csp_hosts` on `live-webkit-mobile` (57 cases: 46 passed, 10 skipped,
-  1 failed; no timeout, flaky or interruption). No UserQA or QA credit exists
-  for F. These standalone runs used `provision=false`; the retained bundle
-  and roster bound to marker `liveqa-r20261122-1435-retry1` were not changed,
-  and no post-run retention operation has completed.
+- Current H QA: automatic parent `45048265499/1` and launch child
+  `45048286058/1` failed during provisioning before browser execution. The
+  documented standalone Public run `45048858491/1` passed (57 cases: 47
+  passed, 10 skipped, none failed, flaky, timed out or interrupted), followed
+  by standalone UserQA `45049634886/1` passing 1/1. Exact roster cleanup and
+  database absence proof passed; post-UserQA credential cleanup removed the
+  fixed bundle and helper. The automatic parent did not receive ordered QA
+  credit. The new `provision=false` terminal-failure recovery path is covered
+  by tests but was not exercised by this passing Public run.
 - An anonymous HTTP check of the homepage, home API and nine unique image URLs
   found HTTP 200, permitted image hosts in the page CSP, valid image MIME
   types and successful image decoding. It did not identify the WebKit image
-  reported as unloaded or establish a cause; the browser issue remains
-  unresolved. See the CSP/live-QA runbook for the supported recovery path.
+  previously reported as unloaded or establish a cause; that intermittent
+  browser issue remains unresolved. See the CSP/live-QA runbook for the
+  supported recovery path.
 - The operator storage-retention timer is installed, enabled and active. Its
   service completed a successful apply; the timer uses the reviewed resource
-  limits of 25% CPU, 512 MiB memory and 30 minutes. Exact one-time cleanup
-  removed 69 obsolete registered worktrees; the canonical checkout is the
-  sole registered worktree. Maintenance run `44967525771` succeeded against
-  active release f500 using the authenticated cc78 verified-noop binding. It
-  removed five reviewed unpinned obsolete releases while protecting current
-  and previous at that time. Its accompanying preview and disk measurements
-  are historical and are not asserted as the current production snapshot.
-  Human Chrome and real Cloudflare challenge/scoring remain optional
-  diagnostics; the CI Siteverify fixture does not establish production
-  Cloudflare scoring.
+  limits of 25% CPU, 512 MiB memory and 30 minutes. Retention run
+  `45050481188/1` passed: it retained the current and previous releases and
+  one verified backup, removed two older backup files and three unpinned old
+  releases (847,136,876 bytes), and made no cache or transient-file deletions.
+  The retained backup `platformdb-20261122T173739Z.dump` passed checksum,
+  restore and Alembic verification across 39 tables. Final storage was 47%
+  used with 20 GB free and 18% inode use. Human Chrome and real Cloudflare
+  challenge/scoring remain optional diagnostics; the CI Siteverify fixture
+  does not establish production Cloudflare scoring.
 - The completed external HTTP matrix is not whole-site functional coverage.
   Cell 9's attribution failure and cell 7's unresolved client/origin join are
   not closed by the separate SSR diagnostics. No cause or server capacity
