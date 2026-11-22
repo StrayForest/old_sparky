@@ -60,8 +60,9 @@ an immediately following Steam list. All indexes refer to the ordered
 `changes` strings and do not change translation segments, source hashes or the
 translation version. The web renders marked headings at the detail-page
 subheading level, list ranges as ordered or unordered lists, and remaining
-changes as paragraphs. Inline bold remains inline prose and is not promoted to
-a heading.
+changes as paragraphs. Unordered patch lists have no marker dots or extra left
+indent; ordered lists retain numbering. Inline bold remains inline prose and is
+not promoted to a heading.
 
 These descriptors are extracted from original Steam BBCode/HTML before source
 normalization and are attached only when an exact sequence maps to one parsed

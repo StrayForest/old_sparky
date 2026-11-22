@@ -5827,6 +5827,11 @@ img.rank-icon,
   list-style: none;
 }
 
+ul.patch-change-list {
+  padding-left: 0;
+  list-style: none;
+}
+
 .patch-change-list li {
   position: relative;
   padding-left: 18px;
@@ -5859,12 +5864,16 @@ img.rank-icon,
   display: grid;
   gap: 7px;
   margin: 8px 0 0;
-  padding: 0 0 0 16px;
+  padding: 0;
   list-style: none;
 }
 
-.patch-change-group-list > li {
-  padding-left: 18px;
+ul.patch-change-list > li {
+  padding-left: 0;
+}
+
+ul.patch-change-list > li::before {
+  content: none;
 }
 
 .patch-change-list.patch-source-list {
