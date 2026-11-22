@@ -173,6 +173,12 @@ export type PlatformPatchChangeGroup = {
   description_end: number;
 };
 
+export type PlatformPatchChangeList = {
+  start: number;
+  end: number;
+  ordered: boolean;
+};
+
 export type PlatformPatchAbility = {
   name: string;
   display_name?: string | null;
@@ -183,6 +189,8 @@ export type PlatformPatchAbility = {
   icon_url: string | null;
   changes: string[];
   change_groups?: PlatformPatchChangeGroup[];
+  change_headings?: number[];
+  change_lists?: PlatformPatchChangeList[];
 };
 
 export type PlatformPatchSection = {
@@ -203,6 +211,8 @@ export type PlatformPatchSection = {
   objective_icon_url?: string | null;
   changes: string[];
   change_groups?: PlatformPatchChangeGroup[];
+  change_headings?: number[];
+  change_lists?: PlatformPatchChangeList[];
   abilities: PlatformPatchAbility[];
 };
 

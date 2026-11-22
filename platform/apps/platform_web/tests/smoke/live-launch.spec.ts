@@ -751,9 +751,11 @@ test("live four current patch DTOs render owner-scoped hero and ability changes"
 
       expectCleanPatchChanges(section.changes);
       await expectRenderedPatchChangeList(
-        renderedSection.locator(":scope > .patch-change-list"),
+        renderedSection.locator(":scope > .patch-change-content"),
         section.changes,
         section.change_groups ?? [],
+        section.change_headings ?? [],
+        section.change_lists ?? [],
       );
 
       const abilityCards = renderedSection.locator(".patch-ability");
@@ -775,9 +777,12 @@ test("live four current patch DTOs render owner-scoped hero and ability changes"
 
         expectCleanPatchChanges(ability.changes);
         await expectRenderedPatchChangeList(
-          renderedAbility.locator(":scope > .patch-change-list"),
+          renderedAbility.locator(":scope > .patch-change-content"),
           ability.changes,
           ability.change_groups ?? [],
+          ability.change_headings ?? [],
+          ability.change_lists ?? [],
+          4,
         );
 
         if (ability.presentation_kind !== "introduction" && ability.presentation_kind !== "replacement") {
@@ -858,7 +863,7 @@ test("live four current patch DTOs render owner-scoped hero and ability changes"
           expect.stringMatching(/Wretched Vapors|Гнусные пары/i),
           expect.stringMatching(/Healing Needles|Лечебные иглы/i),
         ]));
-        const generalRows = page.locator(".general-patch-section > .patch-change-list > li");
+        const generalRows = page.locator(".general-patch-section .patch-change-content > *");
         for (const ability of nurse!.abilities) {
           for (const change of ability.changes) {
             await expect(generalRows.getByText(change, { exact: true })).toHaveCount(0);

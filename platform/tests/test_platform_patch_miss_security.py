@@ -1044,6 +1044,7 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
             "platform:home-content:patch:v11:",
             "platform:home-content:patch:v12:",
             "platform:home-content:patch:v13:",
+            "platform:home-content:patch:v18:",
         )
         catalog = {"heroes": {}, "items": {}, "ranks": {}, "objectives": {}}
         for index, prefix in enumerate(prefixes):

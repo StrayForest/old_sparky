@@ -53,24 +53,31 @@ source-backed numeric stats. Stats come from the latest game-data catalog, not
 a historical launch snapshot, so the client labels them as current values.
 
 The patch API keeps section and ability changes as ordered strings and adds
-optional index ranges for groups backed by explicit source markup: a standalone
-bold heading immediately followed by a Steam list. The heading and list items
-remain in their existing order in `changes`; the indexes only describe their
-presentation relationship. The web nests those list items under the heading.
-Unmarked paragraphs remain ordinary changes. The patch-source cache namespace
-is versioned when parser output changes; older cache entries without group
-metadata render as flat lists until refreshed.
-This parser metadata does not change translation segments, source hashes or the
-translation version.
+source-derived presentation indexes. Standalone Steam headings are marked by
+`change_headings`; unheaded list ranges carry `start`, `end` and `ordered` in
+`change_lists`; the existing `change_groups` ties a standalone bold heading to
+an immediately following Steam list. All indexes refer to the ordered
+`changes` strings and do not change translation segments, source hashes or the
+translation version. The web renders marked headings at the detail-page
+subheading level, list ranges as ordered or unordered lists, and remaining
+changes as paragraphs. Inline bold remains inline prose and is not promoted to
+a heading.
+
+These descriptors are extracted from original Steam BBCode/HTML before source
+normalization and are attached only when an exact sequence maps to one parsed
+owner. The patch-source cache namespace is versioned when parser output
+changes. A namespace miss fetches Steam source again, so the parser can rebuild
+formatting for previously cached and translated announcements instead of
+guessing structure from already-flattened prose.
 
 Patch-detail cache entries store the structured projection rather than raw
-Steam group markup. When an available asset catalog requires reparsing that
-cached source text, the service reconstructs group descriptors only from
+Steam markup. When an available asset catalog requires reparsing cached source
+text, the service reconstructs heading, group and list descriptors only from
 validated cached ranges and their original change strings, then reapplies them
 only when the unchanged sequence matches one destination range across all
-owners. A repeated, missing, changed or ambiguous sequence remains a flat list.
-Translation cache rows remain text-only; this catalog reparse does not require
-retranslation.
+owners. A repeated, missing, changed or ambiguous sequence receives no special
+presentation metadata. Translation cache rows remain text-only; this catalog
+reparse does not require retranslation.
 
 Each ability carries `presentation_kind` with
 `balance`, `introduction` or `replacement`; the client displays description

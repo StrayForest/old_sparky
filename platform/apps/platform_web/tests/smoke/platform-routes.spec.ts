@@ -1999,20 +1999,20 @@ test("patch detail keeps objective sections, the upper cover crop, and no source
   const inlinePatchImage = page.locator(".patch-inline-image img");
   await expect(inlinePatchImage).toHaveCount(1);
   await expect(inlinePatchImage).toHaveAttribute("src", /f6a6d5724077ee5ea7b3b3701f4af907c9517df4\.png/);
-  const generalChanges = page.locator(".general-patch-section .patch-change-list > li");
+  const generalChanges = page.locator(".general-patch-section .patch-change-content > *");
   await expect(generalChanges).toHaveCount(5);
   expect(await generalChanges.nth(0).evaluate((node) => (
     node.nextElementSibling?.classList.contains("patch-inline-image") ?? false
   ))).toBe(true);
   const leaderboardGroup = page.locator(".patch-change-group").first();
   await expect(page.locator(".patch-change-group")).toHaveCount(2);
-  await expect(leaderboardGroup.locator(":scope > strong")).toHaveText("Таблицы лидеров рейтингового режима:");
+  await expect(leaderboardGroup.locator(":scope > h3")).toHaveText("Таблицы лидеров рейтингового режима:");
   await expect(leaderboardGroup.locator(":scope > .patch-change-group-list > li")).toHaveCount(4);
   await expect(leaderboardGroup.locator(":scope > .patch-change-group-list > li").first()).toHaveText(
     "Мы переработали серверную часть таблиц лидеров, чтобы исправить многочисленные ошибки."
   );
   await expect(generalChanges.nth(3)).toHaveText("Бета сезона 2 начинается сегодня — увидимся там!");
-  await expect(page.locator(".patch-change-group").nth(1).locator(":scope > strong")).toHaveText("Проверка наград:");
+  await expect(page.locator(".patch-change-group").nth(1).locator(":scope > h3")).toHaveText("Проверка наград:");
   await expect(page.locator(".patch-change-group").nth(1).locator(":scope > .patch-change-group-list > li"))
     .toHaveText(["Награды доступны после входа в игру."]);
   await expect(page.locator(".patch-change-group-list .patch-change-group")).toHaveCount(0);

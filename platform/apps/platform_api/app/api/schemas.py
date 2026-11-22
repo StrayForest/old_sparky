@@ -88,6 +88,12 @@ class PatchChangeGroupResponse(BaseModel):
     description_end: int = Field(ge=2, le=500)
 
 
+class PatchChangeListResponse(BaseModel):
+    start: int = Field(ge=0, le=499)
+    end: int = Field(ge=1, le=500)
+    ordered: bool = False
+
+
 class PatchAbilityResponse(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     display_name: str | None = Field(default=None, max_length=120)
@@ -98,10 +104,15 @@ class PatchAbilityResponse(BaseModel):
     icon_url: str | None = Field(default=None, max_length=1000)
     changes: list[str] = Field(default_factory=list, max_length=100)
     change_groups: list[PatchChangeGroupResponse] = Field(default_factory=list, max_length=50)
+    change_headings: list[int] = Field(default_factory=list, max_length=100)
+    change_lists: list[PatchChangeListResponse] = Field(default_factory=list, max_length=50)
 
     @model_validator(mode="after")
     def validate_change_groups(self) -> "PatchAbilityResponse":
         _validate_patch_change_groups(self.changes, self.change_groups)
+        _validate_patch_change_structure(
+            self.changes, self.change_groups, self.change_headings, self.change_lists
+        )
         return self
 
 
@@ -117,6 +128,39 @@ def _validate_patch_change_groups(
         ):
             raise ValueError("Patch change group indexes must be ordered and inside changes.")
         previous_end = group.description_end
+
+
+def _validate_patch_change_structure(
+    changes: list[str],
+    groups: list[PatchChangeGroupResponse],
+    headings: list[int],
+    lists: list[PatchChangeListResponse],
+) -> None:
+    if (
+        headings != sorted(set(headings))
+        or any(type(index) is not int or not 0 <= index < len(changes) for index in headings)
+    ):
+        raise ValueError("Patch change heading indexes must be unique, ordered and inside changes.")
+    if any(
+        heading == group.heading_index
+        or group.description_start <= heading < group.description_end
+        for heading in headings
+        for group in groups
+    ):
+        raise ValueError("Patch change headings cannot overlap an existing group.")
+    previous_end = -1
+    for descriptor in lists:
+        if not (descriptor.start < descriptor.end <= len(changes)) or descriptor.start < previous_end:
+            raise ValueError("Patch change list indexes must be ordered and inside changes.")
+        if any(
+            descriptor.start < group.description_end
+            and descriptor.end > group.description_start
+            for group in groups
+        ):
+            raise ValueError("Patch change lists cannot overlap grouped list descriptions.")
+        if any(descriptor.start <= heading < descriptor.end for heading in headings):
+            raise ValueError("Patch change lists cannot contain standalone headings.")
+        previous_end = descriptor.end
 
 
 class PatchSectionResponse(BaseModel):
@@ -137,11 +181,16 @@ class PatchSectionResponse(BaseModel):
     objective_icon_url: str | None = Field(default=None, max_length=1000)
     changes: list[str] = Field(default_factory=list, max_length=500)
     change_groups: list[PatchChangeGroupResponse] = Field(default_factory=list, max_length=50)
+    change_headings: list[int] = Field(default_factory=list, max_length=100)
+    change_lists: list[PatchChangeListResponse] = Field(default_factory=list, max_length=50)
     abilities: list[PatchAbilityResponse] = Field(default_factory=list, max_length=20)
 
     @model_validator(mode="after")
     def validate_kind_metadata(self) -> "PatchSectionResponse":
         _validate_patch_change_groups(self.changes, self.change_groups)
+        _validate_patch_change_structure(
+            self.changes, self.change_groups, self.change_headings, self.change_lists
+        )
         if self.kind == "hero":
             if self.hero_name is None:
                 raise ValueError("Hero patch sections require hero_name.")

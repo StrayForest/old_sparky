@@ -37,7 +37,7 @@ DEADLOCK_ASSET_BASE_URL = "https://deadlock.io"
 HOME_CONTENT_KEY = "platform:home-content:v4"
 HOME_CONTENT_STALE_KEY = "platform:home-content:stale:v4"
 HOME_CONTENT_LOCK_KEY = "platform:home-content:refresh-lock:v4"
-PATCH_DETAIL_KEY_PREFIX = "platform:home-content:patch:v18:"
+PATCH_DETAIL_KEY_PREFIX = "platform:home-content:patch:v19:"
 PATCH_ASSET_CATALOG_KEY = "platform:home-content:patch-assets:v9"
 PATCH_ASSET_CATALOG_STALE_KEY = "platform:home-content:patch-assets-stale:v3"
 PATCH_ASSET_PENDING_RETRY_KEY = "platform:home-content:patch-assets-pending-retry:v1"
@@ -145,11 +145,11 @@ class _TextExtractor(HTMLParser):
                 or source.startswith(f"{STEAM_CLAN_IMAGE_BASE_URL}/")
             ):
                 self.parts.append(f"\n{source}\n")
-        if tag in {"br", "p", "li", "h1", "h2", "h3", "h4"}:
+        if tag in {"br", "p", "li", "h1", "h2", "h3", "h4", "h5", "h6"}:
             self.parts.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
-        if tag in {"p", "li", "h1", "h2", "h3", "h4"}:
+        if tag in {"p", "li", "h1", "h2", "h3", "h4", "h5", "h6"}:
             self.parts.append("\n")
 
 
@@ -207,6 +207,73 @@ def _extract_patch_change_group_sources(value: str) -> list[dict[str, Any]]:
             if heading and items and group not in groups:
                 groups.append(group)
     return groups
+
+
+def _extract_patch_heading_sources(value: str) -> list[str]:
+    """Retain standalone Steam headings before block markup is flattened."""
+    patterns = (
+        re.compile(r"\[h[1-6]\](?P<heading>.*?)\[/h[1-6]\]", re.IGNORECASE | re.DOTALL),
+        re.compile(r"<h[1-6]\b[^>]*>(?P<heading>.*?)</h[1-6]>", re.IGNORECASE | re.DOTALL),
+        re.compile(
+            r"\[p\s*\]\s*\[b\](?P<heading>.*?)\[/b\]\s*\[/p\]",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        re.compile(
+            r"(?:^|[\r\n]|\[/p\])\s*\[b\](?P<heading>.*?)\[/b\]"
+            r"\s*(?=$|[\r\n]|\[/?p\s*\])",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        re.compile(
+            r"<p\b[^>]*>\s*<(?:b|strong)\b[^>]*>(?P<heading>.*?)</(?:b|strong)>\s*</p>",
+            re.IGNORECASE | re.DOTALL,
+        ),
+    )
+    heading_matches: list[tuple[int, str]] = []
+    grouped_headings = {
+        str(group.get("heading") or "").strip().casefold()
+        for group in _extract_patch_change_group_sources(value)
+    }
+    listed_items = {
+        item.strip().casefold()
+        for descriptor in _extract_patch_list_sources(value)
+        for item in descriptor.get("items", [])
+        if isinstance(item, str)
+    }
+    for pattern in patterns:
+        for match in pattern.finditer(value):
+            heading = _plain_text(match.group("heading"), max_length=120)
+            if not heading or heading.casefold() in grouped_headings or heading.casefold() in listed_items:
+                continue
+            if heading not in {text for _position, text in heading_matches}:
+                heading_matches.append((match.start(), heading))
+    return [heading for _position, heading in sorted(heading_matches)]
+
+
+def _extract_patch_list_sources(value: str) -> list[dict[str, Any]]:
+    """Extract ordered and unordered Steam lists before text normalization."""
+    patterns = (
+        (re.compile(r"\[olist(?:=[^\]]*)?\](?P<items>.*?)\[/olist\]", re.I | re.S), True, "bbcode"),
+        (re.compile(r"\[list(?:=[^\]]*)?\](?P<items>.*?)\[/list\]", re.I | re.S), False, "bbcode"),
+        (re.compile(r"<ol\b[^>]*>(?P<items>.*?)</ol>", re.I | re.S), True, "html"),
+        (re.compile(r"<ul\b[^>]*>(?P<items>.*?)</ul>", re.I | re.S), False, "html"),
+    )
+    matches: list[tuple[int, dict[str, Any]]] = []
+    for pattern, ordered, kind in patterns:
+        item_pattern = (
+            re.compile(r"\[\*\](?P<item>.*?)(?=\[\*\]|\[/list\]|\[/olist\]|$)", re.I | re.S)
+            if kind == "bbcode"
+            else re.compile(r"<li\b[^>]*>(?P<item>.*?)</li>", re.I | re.S)
+        )
+        for block in pattern.finditer(value):
+            items = [
+                _plain_text(match.group("item"), max_length=10000)
+                for match in item_pattern.finditer(block.group("items"))
+            ]
+            items = [item for item in items if item]
+            descriptor = {"items": items, "ordered": ordered}
+            if items and descriptor not in [item for _position, item in matches]:
+                matches.append((block.start(), descriptor))
+    return [descriptor for _position, descriptor in sorted(matches)]
 
 
 _STEAM_BBCODE_SCOPE_RE = re.compile(
@@ -525,6 +592,81 @@ def _apply_patch_change_groups(
                     "description_start": start + len(heading_chunks),
                     "description_end": start + len(expected),
                 }
+            )
+
+
+def _apply_patch_change_headings(sections: list[dict[str, Any]], sources: Any) -> None:
+    """Attach heading indexes only when source text maps to one change owner."""
+    if not isinstance(sources, list):
+        return
+    for source in sources:
+        heading = str(source or "").strip()
+        expected = _change_chunks(heading)
+        if not expected:
+            continue
+        candidates: list[tuple[dict[str, Any], int]] = []
+        for section in sections:
+            owners = [section]
+            owners.extend(
+                ability for ability in section.get("abilities", []) if isinstance(ability, dict)
+            )
+            for owner in owners:
+                changes = owner.get("changes")
+                if not isinstance(changes, list):
+                    continue
+                candidates.extend(
+                    (owner, index)
+                    for index in range(len(changes) - len(expected) + 1)
+                    if changes[index:index + len(expected)] == expected
+                )
+        if len(candidates) == 1:
+            owner, index = candidates[0]
+            indexes = owner.setdefault("change_headings", [])
+            if index not in indexes:
+                indexes.append(index)
+
+
+def _apply_patch_change_lists(sections: list[dict[str, Any]], sources: Any) -> None:
+    """Attach list ranges only when all items map to one owner and sequence."""
+    if not isinstance(sources, list):
+        return
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        items = source.get("items")
+        if not isinstance(items, list) or not items or any(not isinstance(item, str) for item in items):
+            continue
+        expected = [chunk for item in items for chunk in _change_chunks(item)]
+        if not expected:
+            continue
+        candidates: list[tuple[dict[str, Any], int]] = []
+        for section in sections:
+            owners = [section]
+            owners.extend(
+                ability for ability in section.get("abilities", []) if isinstance(ability, dict)
+            )
+            for owner in owners:
+                changes = owner.get("changes")
+                if isinstance(changes, list):
+                    candidates.extend(
+                        (owner, index)
+                        for index in range(len(changes) - len(expected) + 1)
+                        if changes[index:index + len(expected)] == expected
+                    )
+        if len(candidates) == 1:
+            owner, start = candidates[0]
+            end = start + len(expected)
+            if any(
+                isinstance(group, dict)
+                and type(group.get("description_start")) is int
+                and type(group.get("description_end")) is int
+                and start >= group["description_start"]
+                and end <= group["description_end"]
+                for group in owner.get("change_groups", [])
+            ):
+                continue
+            owner.setdefault("change_lists", []).append(
+                {"start": start, "end": end, "ordered": source.get("ordered") is True}
             )
 
 
@@ -2149,8 +2291,18 @@ def _structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dic
         section.pop("_ability_map", None)
         sections.append(section)
     _apply_patch_change_groups(sections, raw.get("change_group_sources"))
+    _apply_patch_change_headings(sections, raw.get("change_heading_sources"))
+    _apply_patch_change_lists(sections, raw.get("change_list_sources"))
     return {
-        **{key: value for key, value in raw.items() if key != "change_group_sources"},
+        **{
+            key: value
+            for key, value in raw.items()
+            if key not in {
+                "change_group_sources",
+                "change_heading_sources",
+                "change_list_sources",
+            }
+        },
         "sections": sections,
     }
 
@@ -2215,6 +2367,12 @@ async def _fetch_steam_patches(client: httpx.AsyncClient) -> tuple[list[dict[str
             "url": url,
             "content": content,
             "change_group_sources": _extract_patch_change_group_sources(
+                str(item.get("contents") or "")
+            ),
+            "change_heading_sources": _extract_patch_heading_sources(
+                str(item.get("contents") or "")
+            ),
+            "change_list_sources": _extract_patch_list_sources(
                 str(item.get("contents") or "")
             ),
         }

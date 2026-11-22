@@ -5813,6 +5813,12 @@ img.rank-icon,
   border: 1px solid rgba(214,154,45,.38);
 }
 
+.patch-change-content {
+  display: grid;
+  gap: 9px;
+  margin: 0;
+}
+
 .patch-change-list {
   display: grid;
   gap: 9px;
@@ -5829,16 +5835,22 @@ img.rank-icon,
   line-height: 1.55;
 }
 
-.patch-change-list > .patch-change-group {
-  padding-left: 0;
+.patch-change-group > .patch-change-heading,
+.patch-change-heading {
+  margin: 4px 0 0;
   color: var(--text-main);
+  font-size: 14px;
+  line-height: 1.4;
 }
 
-.patch-change-list > .patch-change-group::before {
-  content: none;
+.patch-change-paragraph {
+  margin: 0;
+  color: #c8c0b3;
+  font-size: 13px;
+  line-height: 1.6;
 }
 
-.patch-change-group > strong {
+.patch-change-group > .patch-change-heading {
   display: block;
   font-weight: 700;
 }
@@ -5853,6 +5865,23 @@ img.rank-icon,
 
 .patch-change-group-list > li {
   padding-left: 18px;
+}
+
+.patch-change-list.patch-source-list {
+  margin: 2px 0;
+}
+
+ol.patch-change-list.patch-source-list {
+  padding-left: 20px;
+  list-style: decimal;
+}
+
+ol.patch-change-list.patch-source-list > li {
+  padding-left: 0;
+}
+
+ol.patch-change-list.patch-source-list > li::before {
+  content: none;
 }
 
 .patch-change-list li::before {

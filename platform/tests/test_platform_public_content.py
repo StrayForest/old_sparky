@@ -2492,6 +2492,17 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
         )
 
         self.assertEqual(valid.change_groups[0].description_end, 3)
+        blocks = PatchSectionResponse.model_validate(
+            {
+                "kind": "general",
+                "title": "General",
+                "changes": ["Heading", "Paragraph", "First", "Second"],
+                "change_headings": [0],
+                "change_lists": [{"start": 2, "end": 4, "ordered": True}],
+            }
+        )
+        self.assertEqual(blocks.change_headings, [0])
+        self.assertTrue(blocks.change_lists[0].ordered)
         invalid_group = {
             "kind": "general",
             "title": "General",
@@ -2516,6 +2527,30 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
             },
         )
         for payload in (*invalid_sections, invalid_group):
+            with self.subTest(payload=payload), self.assertRaises(ValidationError):
+                PatchSectionResponse.model_validate(payload)
+        invalid_blocks = (
+            {
+                "kind": "general",
+                "title": "General",
+                "changes": ["Heading"],
+                "change_headings": [1],
+            },
+            {
+                "kind": "general",
+                "title": "General",
+                "changes": ["Heading"],
+                "change_headings": [-1],
+            },
+            {
+                "kind": "general",
+                "title": "General",
+                "changes": ["Heading", "Item"],
+                "change_headings": [0],
+                "change_lists": [{"start": 0, "end": 2}],
+            },
+        )
+        for payload in invalid_blocks:
             with self.subTest(payload=payload), self.assertRaises(ValidationError):
                 PatchSectionResponse.model_validate(payload)
 
@@ -2633,7 +2668,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
     def test_public_content_cache_versions_keep_home_contract_stable(self) -> None:
         self.assertEqual(home_content.HOME_CONTENT_KEY, "platform:home-content:v4")
         self.assertEqual(home_content.HOME_CONTENT_STALE_KEY, "platform:home-content:stale:v4")
-        self.assertEqual(home_content.PATCH_DETAIL_KEY_PREFIX, "platform:home-content:patch:v18:")
+        self.assertEqual(home_content.PATCH_DETAIL_KEY_PREFIX, "platform:home-content:patch:v19:")
         self.assertEqual(
             home_content.PATCH_ASSET_CATALOG_KEY,
             "platform:home-content:patch-assets:v9",

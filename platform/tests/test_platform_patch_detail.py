@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 import unittest
 
 from apps.platform_api.app.services import home_content
 from apps.platform_api.app.services.patch_detail import structure_patch_detail
-from apps.platform_api.app.services.patch_translation_runtime import extract_translation_segments
+from apps.platform_api.app.services.patch_translation_runtime import (
+    extract_translation_segments,
+    merge_translation,
+)
 
 
 class PatchDetailParserTests(unittest.TestCase):
@@ -257,7 +262,118 @@ Bonus health reduced
         )
         self.assertEqual(home_detail["sections"][0]["changes"], section["changes"])
         self.assertEqual(home_detail["sections"][0]["change_groups"], section["change_groups"])
-        self.assertNotIn("change_group_sources", home_detail)
+        self.assertFalse(
+            {"change_group_sources", "change_heading_sources", "change_list_sources"}
+            & home_detail.keys()
+        )
+
+    def test_steam_blocks_preserve_headings_paragraphs_and_unheaded_list_kinds(self) -> None:
+        source = (
+            "[General]\n[b]Operational Changes:[/b]\n"
+            "[p]First paragraph.[/p]\n"
+            "[p]A paragraph with [b]inline emphasis[/b].[/p]\n"
+            "<h5>Secondary heading</h5><p>Second paragraph.</p>\n"
+            "[list][*]First list item.[/*][*]Second list item.[/*][/list]\n"
+            "[olist][*]First ordered item.[/*][*]Second ordered item.[/*][/olist]"
+        )
+        content = home_content._plain_text(source, max_length=30000)
+        detail = structure_patch_detail(
+            {
+                "id": "blocks",
+                "title": "Block format",
+                "content": content,
+                "change_heading_sources": home_content._extract_patch_heading_sources(source),
+                "change_list_sources": home_content._extract_patch_list_sources(source),
+            },
+            {"heroes": {}, "items": {}, "objectives": {}},
+        )
+        general = detail["sections"][0]
+        self.assertEqual(
+            general["changes"],
+            [
+                "Operational Changes:",
+                "First paragraph.",
+                "A paragraph with inline emphasis.",
+                "Secondary heading",
+                "Second paragraph.",
+                "First list item.",
+                "Second list item.",
+                "First ordered item.",
+                "Second ordered item.",
+            ],
+        )
+        self.assertEqual(general["change_headings"], [0, 3])
+        self.assertEqual(
+            general["change_lists"],
+            [
+                {"start": 5, "end": 7, "ordered": False},
+                {"start": 7, "end": 9, "ordered": True},
+            ],
+        )
+
+    def test_cached_heading_and_list_ranges_survive_catalog_reparse(self) -> None:
+        cached = {
+            "id": "blocks-cached",
+            "title": "Block format",
+            "content": "[General]\nOperational Changes:\nFirst item\nSecond item",
+            "sections": [{
+                "kind": "general",
+                "title": "Общие изменения",
+                "hero_name": None,
+                "changes": ["Operational Changes:", "First item", "Second item"],
+                "change_headings": [0],
+                "change_lists": [{"start": 1, "end": 3, "ordered": True}],
+                "abilities": [],
+            }],
+        }
+        reparsed = structure_patch_detail(
+            cached, {"heroes": {}, "items": {}, "objectives": {}}
+        )["sections"][0]
+        self.assertEqual(reparsed["change_headings"], [0])
+        self.assertEqual(
+            reparsed["change_lists"],
+            [{"start": 1, "end": 3, "ordered": True}],
+        )
+
+    def test_source_fixture_preserves_all_ranked_patch_headings_and_final_paragraph(self) -> None:
+        fixture_path = Path(__file__).parent / "fixtures/patch-acceptance/steam-news-four-patches.json"
+        feed = json.loads(fixture_path.read_text(encoding="utf-8"))
+        item = next(
+            entry
+            for entry in feed["items"]
+            if "Ranked Leaderboards:" in entry["contents"]
+        )
+        source = item["contents"]
+        detail = structure_patch_detail(
+            {
+                "id": item["gid"],
+                "title": item["title"],
+                "content": home_content._plain_text(source, max_length=30000),
+                "change_group_sources": home_content._extract_patch_change_group_sources(source),
+                "change_heading_sources": home_content._extract_patch_heading_sources(source),
+                "change_list_sources": home_content._extract_patch_list_sources(source),
+            },
+            {"heroes": {}, "items": {}, "objectives": {}},
+        )
+        general = next(section for section in detail["sections"] if section["kind"] == "general")
+        self.assertEqual(general["change_headings"], [2, 4, 7, 9, 12, 15, 17, 19])
+        self.assertEqual(
+            general["change_groups"],
+            [{"heading_index": 21, "description_start": 22, "description_end": 26}],
+        )
+        self.assertNotIn("change_lists", general)
+        self.assertEqual(general["changes"][26], "Beta Season 2 begins today, we'll see you there!")
+        segments = extract_translation_segments(detail)
+        translated = merge_translation(detail, {
+            segment["id"]: f"Перевод {index}"
+            for index, segment in enumerate(segments)
+        })
+        translated_general = next(
+            section for section in translated["sections"] if section["kind"] == "general"
+        )
+        self.assertEqual(translated_general["change_headings"], [2, 4, 7, 9, 12, 15, 17, 19])
+        self.assertEqual(translated_general["change_groups"], general["change_groups"])
+        self.assertEqual(translated_general["changes"][26], "Перевод 26")
 
     def test_duplicate_group_sequences_remain_flat(self) -> None:
         group = home_content._extract_patch_change_group_sources(

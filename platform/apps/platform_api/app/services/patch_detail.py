@@ -89,6 +89,74 @@ def _cached_change_group_sources(raw: dict[str, Any]) -> list[dict[str, Any]]:
     return recovered
 
 
+def _cached_change_heading_sources(raw: dict[str, Any]) -> list[str]:
+    """Recover heading text from indexed cached projections before reparsing."""
+    sections = raw.get("sections")
+    if not isinstance(sections, list):
+        return []
+    recovered: list[str] = []
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        owners = [section]
+        abilities = section.get("abilities")
+        if isinstance(abilities, list):
+            owners.extend(item for item in abilities if isinstance(item, dict))
+        for owner in owners:
+            changes = owner.get("changes")
+            indexes = owner.get("change_headings")
+            if not isinstance(changes, list) or not isinstance(indexes, list):
+                continue
+            for index in indexes:
+                if (
+                    type(index) is int
+                    and 0 <= index < len(changes)
+                    and isinstance(changes[index], str)
+                    and changes[index].strip()
+                    and changes[index] not in recovered
+                ):
+                    recovered.append(changes[index])
+    return recovered
+
+
+def _cached_change_list_sources(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    """Recover list ranges from cached source projections before reparsing."""
+    sections = raw.get("sections")
+    if not isinstance(sections, list):
+        return []
+    recovered: list[dict[str, Any]] = []
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        owners = [section]
+        abilities = section.get("abilities")
+        if isinstance(abilities, list):
+            owners.extend(item for item in abilities if isinstance(item, dict))
+        for owner in owners:
+            changes = owner.get("changes")
+            lists = owner.get("change_lists")
+            if not isinstance(changes, list) or not isinstance(lists, list):
+                continue
+            for descriptor in lists:
+                if not isinstance(descriptor, dict):
+                    continue
+                start, end = descriptor.get("start"), descriptor.get("end")
+                if (
+                    type(start) is not int
+                    or type(end) is not int
+                    or not 0 <= start < end <= len(changes)
+                    or any(not isinstance(item, str) or not item.strip() for item in changes[start:end])
+                ):
+                    continue
+                source = {
+                    "items": list(changes[start:end]),
+                    "ordered": descriptor.get("ordered") is True,
+                }
+                if source not in recovered:
+                    recovered.append(source)
+    return recovered
+
+
 def _match_named_line(
     line: str,
     catalog: dict[str, Any],
@@ -979,8 +1047,24 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
     if not isinstance(change_group_sources, list) or not change_group_sources:
         change_group_sources = _cached_change_group_sources(raw)
     base._apply_patch_change_groups(sections, change_group_sources)
+    change_heading_sources = raw.get("change_heading_sources")
+    if not isinstance(change_heading_sources, list) or not change_heading_sources:
+        change_heading_sources = _cached_change_heading_sources(raw)
+    base._apply_patch_change_headings(sections, change_heading_sources)
+    change_list_sources = raw.get("change_list_sources")
+    if not isinstance(change_list_sources, list) or not change_list_sources:
+        change_list_sources = _cached_change_list_sources(raw)
+    base._apply_patch_change_lists(sections, change_list_sources)
 
-    public_raw = {key: value for key, value in raw.items() if key != "change_group_sources"}
+    public_raw = {
+        key: value
+        for key, value in raw.items()
+        if key not in {
+            "change_group_sources",
+            "change_heading_sources",
+            "change_list_sources",
+        }
+    }
 
     return {
         **public_raw,

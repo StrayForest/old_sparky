@@ -1,4 +1,5 @@
 import type {
+  PlatformPatchChangeList,
   PlatformPatchChangeGroup,
   PlatformPatchDetail,
   PlatformPatchSection,
@@ -264,10 +265,14 @@ export async function expectRenderedPatchChangeList(
   list: Locator,
   changes: string[],
   groups: PlatformPatchChangeGroup[] = [],
+  headings: number[] = [],
+  lists: PlatformPatchChangeList[] = [],
+  headingLevel: 3 | 4 = 3,
 ): Promise<void> {
-  const rows = list.locator(":scope > li");
+  const rows = list.locator(":scope > *");
   const orderedHeadings = groups.map((group) => group.heading_index);
   expect(orderedHeadings).toEqual([...orderedHeadings].sort((left, right) => left - right));
+  expect(headings).toEqual([...headings].sort((left, right) => left - right));
 
   let sourceIndex = 0;
   let rowIndex = 0;
@@ -283,7 +288,7 @@ export async function expectRenderedPatchChangeList(
       expect(group.description_end).toBeLessThanOrEqual(changes.length);
       const renderedGroup = rows.nth(rowIndex);
       await expect(renderedGroup).toHaveClass(/(?:^|\s)patch-change-group(?:\s|$)/u);
-      await expect(renderedGroup.locator(":scope > strong")).toHaveText(changes[sourceIndex]);
+      await expect(renderedGroup.locator(`:scope > h${headingLevel}`)).toHaveText(changes[sourceIndex]);
 
       const descriptions = changes.slice(group.description_start, group.description_end);
       const descriptionRows = renderedGroup.locator(":scope > .patch-change-group-list > li");
@@ -294,9 +299,35 @@ export async function expectRenderedPatchChangeList(
       await expect(renderedGroup.locator(".patch-change-group-list .patch-change-group")).toHaveCount(0);
       sourceIndex = group.description_end;
       groupIndex += 1;
+    } else if (headings.includes(sourceIndex)) {
+      await expect(rows.nth(rowIndex)).toHaveClass(/(?:^|\s)patch-change-heading(?:\s|$)/u);
+      await expect(rows.nth(rowIndex).evaluate((node) => node.tagName.toLowerCase()))
+        .resolves.toBe(`h${headingLevel}`);
+      await expect(rows.nth(rowIndex)).toHaveText(changes[sourceIndex]);
+      sourceIndex += 1;
+    } else if (lists.some((item) => item.start === sourceIndex)) {
+      const descriptor = lists.find((item) => item.start === sourceIndex)!;
+      expect(descriptor.end).toBeGreaterThan(descriptor.start);
+      expect(descriptor.end).toBeLessThanOrEqual(changes.length);
+      const renderedList = rows.nth(rowIndex);
+      await expect(renderedList.evaluate((node) => node.tagName.toLowerCase()))
+        .resolves.toBe(descriptor.ordered ? "ol" : "ul");
+      const itemRows = renderedList.locator(":scope > li");
+      const itemChanges = changes.slice(descriptor.start, descriptor.end);
+      await expect(itemRows).toHaveCount(itemChanges.length);
+      for (const [itemIndex, itemChange] of itemChanges.entries()) {
+        await expectRenderedPatchChangeRow(itemRows.nth(itemIndex), itemChange);
+      }
+      sourceIndex = descriptor.end;
     } else {
       if (group) expect(group.heading_index).toBeGreaterThan(sourceIndex);
-      await expectRenderedPatchChangeRow(rows.nth(rowIndex), changes[sourceIndex]);
+      if (steamPatchImagePattern.test(changes[sourceIndex])) {
+        await expect(rows.nth(rowIndex)).toHaveClass(/(?:^|\s)patch-inline-image(?:\s|$)/u);
+        await expect(rows.nth(rowIndex).locator(":scope > img")).toHaveAttribute("src", changes[sourceIndex]);
+      } else {
+        await expect(rows.nth(rowIndex)).toHaveClass(/(?:^|\s)patch-change-paragraph(?:\s|$)/u);
+        await expect(rows.nth(rowIndex)).toHaveText(changes[sourceIndex]);
+      }
       sourceIndex += 1;
     }
     rowIndex += 1;

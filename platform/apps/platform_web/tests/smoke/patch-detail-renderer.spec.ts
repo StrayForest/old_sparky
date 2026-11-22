@@ -162,7 +162,45 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
     "[Heroes]\nStreet Brawl:\nSolomon: Move Piece - Range increased\n[General]",
     ["Range increased"],
   ))).toEqual(expect.arrayContaining(["missing_street_brawl_owner", "move_piece_owner"]));
-  const fixturesById = new Map(fixtures.map((fixture) => [fixture.id, fixture]));
+  const fixturesWithBlockMetadata = fixtures.map((fixture) => fixture.id === "1848664643342973"
+    ? {
+      ...fixture,
+      sections: fixture.sections.map((section, index) => index === 0
+        ? {
+          ...section,
+          change_headings: [2, 4, 7, 9, 12, 15, 17, 19],
+          change_groups: [{ heading_index: 21, description_start: 22, description_end: 26 }],
+        }
+        : section),
+    }
+    : fixture);
+  const fixturesById = new Map(fixturesWithBlockMetadata.map((fixture) => [fixture.id, fixture]));
+  fixturesById.set("synthetic-format", {
+    ...acceptanceTemplate!,
+    id: "synthetic-format",
+    title: "Formatting contract",
+    sections: [{
+      kind: "general",
+      title: "Общие изменения",
+      hero_name: null,
+      changes: ["Emergency Response:", "A plain paragraph.", "First ordered item.", "Second ordered item."],
+      change_headings: [0],
+      change_lists: [{ start: 2, end: 4, ordered: true }],
+      abilities: [],
+    }, {
+      kind: "hero",
+      title: "Formatting Hero",
+      hero_name: "Formatting Hero",
+      hero_image_url: null,
+      changes: [],
+      abilities: [{
+        name: "Formatting Ability",
+        icon_url: null,
+        changes: ["Ability heading:", "Ability paragraph."],
+        change_headings: [0],
+      }],
+    }],
+  });
   const artifactDirectory = process.env.PLATFORM_PATCH_RENDER_ARTIFACT_DIR;
   const alternateNurseImage = "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse-card-alternate.png";
   const missingNurseImage = "https://assets-bucket.deadlock-api.com/assets-api-res/images/heroes/nurse-card-missing.webp";
@@ -241,10 +279,22 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
       }
       expectCleanPatchChanges(section.changes);
       await expectRenderedPatchChangeList(
-        sectionCard.locator(":scope > .patch-change-list"),
+        sectionCard.locator(":scope > .patch-change-content"),
         section.changes,
         section.change_groups ?? [],
+        section.change_headings ?? [],
+        section.change_lists ?? [],
       );
+      if (patchId === "1848664643342973" && sectionIndex === 0) {
+        await expect(sectionCard.locator(":scope > .patch-change-heading")).toHaveCount(8);
+        await expect(sectionCard.locator(":scope > .patch-change-paragraph").last())
+          .toHaveText(section.changes.at(-1)!);
+        const leaderboard = sectionCard.locator(".patch-change-group");
+        await expect(leaderboard.locator(":scope > h3")).toHaveText(section.changes[21]);
+        await expect(leaderboard.locator(":scope > ul > li")).toHaveCount(4);
+        await expect(leaderboard.locator(":scope > ul > li").last())
+          .not.toHaveText(section.changes.at(-1)!);
+      }
 
       const abilityCards = sectionCard.locator(".patch-ability");
       await expect(abilityCards).toHaveCount(section.abilities.length);
@@ -260,9 +310,12 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
         }
         expectCleanPatchChanges(ability.changes);
         await expectRenderedPatchChangeList(
-          abilityCard.locator(":scope > .patch-change-list"),
+          abilityCard.locator(":scope > .patch-change-content"),
           ability.changes,
           ability.change_groups ?? [],
+          ability.change_headings ?? [],
+          ability.change_lists ?? [],
+          4,
         );
         if (ability.presentation_kind !== "introduction" && ability.presentation_kind !== "replacement") {
           expect(ability.description ?? "").toBe("");
@@ -342,7 +395,7 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
     if (nurseIndex >= 0) {
       const nurse = fixture!.sections[nurseIndex];
       const nurseCard = sections.nth(nurseIndex);
-      const generalRows = page.locator(".general-patch-section > .patch-change-list > li");
+      const generalRows = page.locator(".general-patch-section .patch-change-content > *");
       await expect(generalRows.getByText(/(?:Nurse|Медсестра)\s*:/iu)).toHaveCount(0);
       const abilityNames = nurse.abilities.map((ability) => ability.display_name || ability.name);
       if (patchId === nursePatchId) {
@@ -528,6 +581,21 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
     expect(desktopTierColumns).toBe(3);
     await savePatchCardScreenshot(focusedNurse, "healing-needles-desktop.png", artifactDirectory);
   }
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/patches/synthetic-format");
+  const syntheticContent = page.locator(".patch-change-content");
+  await expect(syntheticContent.locator(":scope > h3.patch-change-heading"))
+    .toHaveText("Emergency Response:");
+  await expect(syntheticContent.locator(":scope > p.patch-change-paragraph"))
+    .toHaveText("A plain paragraph.");
+  await expect(syntheticContent.locator(":scope > ol.patch-source-list > li"))
+    .toHaveText(["First ordered item.", "Second ordered item."]);
+  await expect(syntheticContent.locator(":scope > ul.patch-source-list")).toHaveCount(0);
+  const syntheticAbilityContent = page.locator(".patch-ability .patch-change-content");
+  await expect(syntheticAbilityContent.locator(":scope > h4.patch-change-heading"))
+    .toHaveText("Ability heading:");
+  await expect(syntheticAbilityContent.locator(":scope > h3.patch-change-heading")).toHaveCount(0);
 
   expect(capturedCeleste).toBe(true);
   expect(capturedNurse).toBe(true);
