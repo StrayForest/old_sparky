@@ -233,6 +233,358 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                         marker_sha256=marker_sha,
                     )
 
+    def test_confirmed_public_failure_cleanup_requires_terminal_bound_evidence(self) -> None:
+        source_sha = "a" * 40
+        app_sha = "b" * 40
+        marker_sha = "c" * 64
+        count_values = {
+            "logical_total": 4,
+            "logical_pass": 1,
+            "logical_fail": 1,
+            "logical_expected_fail": 0,
+            "logical_flaky": 0,
+            "logical_skip": 2,
+            "logical_interrupted": 0,
+            "attempt_total": 4,
+            "attempt_pass": 1,
+            "attempt_fail": 1,
+            "attempt_skip": 2,
+            "attempt_interrupted": 0,
+            "attempt_timedout": 0,
+        }
+
+        def counts_line(status: str, values: dict[str, int] | None = None) -> str:
+            counts = count_values if values is None else values
+            return (
+                f"LIVE_BROWSER_COUNTS schema=1 run_status={status} "
+                + " ".join(
+                    f"{field}={counts[field]}"
+                    for field in platform_live_qa_guard.LIVE_BROWSER_COUNT_FIELDS
+                )
+                + f" source_sha={source_sha} app_sha={app_sha} marker_sha256={marker_sha}"
+            )
+
+        cases = (
+            (counts_line("failed"), "failure_report_published", "1", "complete", True),
+            (
+                counts_line(
+                    "passed",
+                    {
+                        **count_values,
+                        "logical_fail": 0,
+                        "logical_expected_fail": 1,
+                        "attempt_fail": 1,
+                    },
+                ),
+                "failure_report_published",
+                "0",
+                "complete",
+                True,
+            ),
+            (
+                counts_line(
+                    "timedout",
+                    {
+                        **count_values,
+                        "logical_pass": 4,
+                        "logical_fail": 0,
+                        "logical_skip": 0,
+                        "attempt_total": 6,
+                        "attempt_pass": 5,
+                        "attempt_fail": 0,
+                        "attempt_skip": 0,
+                        "attempt_timedout": 1,
+                    },
+                ),
+                "failure_report_unavailable",
+                "0",
+                "complete",
+                True,
+            ),
+            (counts_line("interrupted"), "failure_report_published", "1", "complete", False),
+            (
+                counts_line(
+                    "passed",
+                    {
+                        **count_values,
+                        "logical_pass": 2,
+                        "logical_fail": 0,
+                        "logical_skip": 2,
+                        "attempt_pass": 2,
+                        "attempt_fail": 0,
+                        "attempt_skip": 2,
+                    },
+                ),
+                "failure_report_published",
+                "0",
+                "complete",
+                False,
+            ),
+            (
+                counts_line("failed", {**count_values, "logical_interrupted": 1, "logical_pass": 0}),
+                "failure_report_published",
+                "1",
+                "complete",
+                False,
+            ),
+            (
+                counts_line(
+                    "failed",
+                    {
+                        **count_values,
+                        "logical_fail": 0,
+                        "logical_pass": 2,
+                        "logical_skip": 2,
+                        "attempt_fail": 0,
+                        "attempt_pass": 2,
+                        "attempt_skip": 2,
+                    },
+                ),
+                "failure_report_published",
+                "1",
+                "complete",
+                False,
+            ),
+            (
+                counts_line(
+                    "failed",
+                    {
+                        **count_values,
+                        "attempt_pass": 2,
+                        "attempt_fail": 0,
+                    },
+                ),
+                "failure_report_published",
+                "1",
+                "complete",
+                False,
+            ),
+            (counts_line("failed"), "child_timeout", "124", "complete", False),
+            (counts_line("failed"), "failure_report_published", "1", "failed", False),
+        )
+        for count_line_value, kind, child_exit, teardown, expected in cases:
+            with self.subTest(kind=kind, child_exit=child_exit, teardown=teardown):
+                check = platform_live_qa_guard._validate_confirmed_public_failure_counts
+                if expected:
+                    check(
+                        count_line_value,
+                        kind,
+                        child_exit,
+                        f"LIVE_PUBLIC_BROWSER_TEARDOWN schema=1 status={teardown}",
+                        expected_source_sha=source_sha,
+                        expected_app_sha=app_sha,
+                        expected_marker_sha256=marker_sha,
+                    )
+                else:
+                    with self.assertRaises(platform_live_qa_guard.GuardError):
+                        check(
+                            count_line_value,
+                            kind,
+                            child_exit,
+                            f"LIVE_PUBLIC_BROWSER_TEARDOWN schema=1 status={teardown}",
+                            expected_source_sha=source_sha,
+                            expected_app_sha=app_sha,
+                            expected_marker_sha256=marker_sha,
+                        )
+
+        with self.assertRaisesRegex(platform_live_qa_guard.GuardError, "binding"):
+            platform_live_qa_guard._validate_confirmed_public_failure_counts(
+                counts_line("failed").replace(source_sha, "d" * 40),
+                "failure_report_published",
+                "1",
+                "LIVE_PUBLIC_BROWSER_TEARDOWN schema=1 status=complete",
+                expected_source_sha=source_sha,
+                expected_app_sha=app_sha,
+                expected_marker_sha256=marker_sha,
+            )
+
+    def test_confirmed_public_failure_state_uses_existing_exact_cleanup_inventory(self) -> None:
+        marker = "liveqa-public-owned-123456"
+        marker_sha = hashlib.sha256(marker.encode("ascii")).hexdigest()
+        source_sha = "a" * 40
+        app_sha = "b" * 40
+        bundle = Path("/root/.oldsparky/liveqa/csp-live-qa.json")
+        platform_root = Path(f"/root/.oldsparky/liveqa/releases/{app_sha}/platform")
+        fingerprint = "d" * 64
+        roster_ids = tuple(f"{index:08d}-0000-4000-8000-{index:012d}" for index in range(1, 14))
+        count_line = (
+            "LIVE_BROWSER_COUNTS schema=1 run_status=failed logical_total=1 "
+            "logical_pass=0 logical_fail=1 logical_expected_fail=0 logical_flaky=0 "
+            "logical_skip=0 logical_interrupted=0 attempt_total=1 attempt_pass=0 "
+            "attempt_fail=1 attempt_skip=0 attempt_interrupted=0 attempt_timedout=0 "
+            f"source_sha={source_sha} app_sha={app_sha} marker_sha256={marker_sha}"
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "PLATFORM_LIVE_QA_RUNNER_SHA": source_sha,
+                "PLATFORM_LIVE_QA_MARKER_SHA256": marker_sha,
+            },
+            clear=False,
+        ), patch.object(platform_live_qa_guard, "_assert_release_lock_supervisor"), \
+            patch.object(platform_live_qa_guard, "assert_bundle_lock") as assert_lock, \
+            patch.object(
+                platform_live_qa_guard,
+                "_public_failure_roster_fingerprint",
+                return_value=fingerprint,
+            ), patch.object(
+                platform_live_qa_guard,
+                "assert_no_recovery_state",
+            ) as assert_no_state, patch.object(
+                platform_live_qa_guard,
+                "assert_liveqa_idle",
+            ) as assert_idle, patch.object(
+                platform_live_qa_guard,
+                "_bundle_roster_ids",
+                return_value=(marker, roster_ids),
+            ), patch.object(
+                platform_live_qa_guard,
+                "_publish_root_state",
+                return_value=Path("/root/.oldsparky/liveqa/live-user-qa.Abc123"),
+            ) as publish_state:
+            state = platform_live_qa_guard.prepare_confirmed_public_failure_cleanup_state(
+                bundle,
+                platform_root=platform_root,
+                target_sha=app_sha,
+                source_sha=source_sha,
+                marker=marker,
+                expected_roster_fingerprint=fingerprint,
+                count_line=count_line,
+                diagnostic_kind="failure_report_published",
+                diagnostic_child_exit="1",
+                teardown_line="LIVE_PUBLIC_BROWSER_TEARDOWN schema=1 status=complete",
+                lock_fd=7,
+            )
+        self.assertEqual(state, Path("/root/.oldsparky/liveqa/live-user-qa.Abc123"))
+        assert_lock.assert_called_once_with(bundle, 7)
+        assert_no_state.assert_called_once_with(bundle, include_manual=True)
+        assert_idle.assert_called_once_with()
+        publish_state.assert_called_once_with(
+            bundle,
+            marker=marker,
+            roster_ids=roster_ids,
+            public_failure_cleanup_recovery=True,
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "PLATFORM_LIVE_QA_RUNNER_SHA": source_sha,
+                "PLATFORM_LIVE_QA_MARKER_SHA256": marker_sha,
+            },
+            clear=False,
+        ), patch.object(platform_live_qa_guard, "_assert_release_lock_supervisor"), \
+            patch.object(platform_live_qa_guard, "assert_bundle_lock"), \
+            patch.object(
+                platform_live_qa_guard,
+                "_public_failure_roster_fingerprint",
+                return_value=fingerprint,
+            ), patch.object(platform_live_qa_guard, "assert_no_recovery_state"), \
+            patch.object(
+                platform_live_qa_guard,
+                "assert_liveqa_idle",
+                side_effect=platform_live_qa_guard.GuardError("active QA"),
+            ), patch.object(platform_live_qa_guard, "_bundle_roster_ids") as read_roster, \
+            patch.object(platform_live_qa_guard, "_publish_root_state") as publish_state:
+            with self.assertRaisesRegex(platform_live_qa_guard.GuardError, "active QA"):
+                platform_live_qa_guard.prepare_confirmed_public_failure_cleanup_state(
+                    bundle,
+                    platform_root=platform_root,
+                    target_sha=app_sha,
+                    source_sha=source_sha,
+                    marker=marker,
+                    expected_roster_fingerprint=fingerprint,
+                    count_line=count_line,
+                    diagnostic_kind="failure_report_published",
+                    diagnostic_child_exit="1",
+                    teardown_line="LIVE_PUBLIC_BROWSER_TEARDOWN schema=1 status=complete",
+                    lock_fd=7,
+                )
+        read_roster.assert_not_called()
+        publish_state.assert_not_called()
+
+        with tempfile.TemporaryDirectory(prefix="liveqa-public-finalizer-") as directory:
+            bundle = Path(directory) / "csp-live-qa.json"
+            output = StringIO()
+            with patch.dict(
+                os.environ,
+                {
+                    "PLATFORM_LIVE_QA_RUNNER_SHA": source_sha,
+                    "PLATFORM_LIVE_QA_MARKER_SHA256": marker_sha,
+                },
+                clear=False,
+            ), patch.object(platform_live_qa_guard, "_assert_release_lock_supervisor"), \
+                patch.object(platform_live_qa_guard, "assert_bundle_lock"), \
+                patch.object(
+                    platform_live_qa_guard,
+                    "_public_failure_roster_fingerprint",
+                    return_value=fingerprint,
+                ), patch.object(platform_live_qa_guard, "assert_no_recovery_state"), \
+                patch.object(platform_live_qa_guard, "assert_liveqa_idle"), \
+                patch.object(
+                    platform_live_qa_guard,
+                    "_bundle_roster_ids",
+                    return_value=(marker, roster_ids),
+                ), patch.object(
+                    platform_live_qa_guard,
+                    "validate_root_state",
+                    side_effect=platform_live_qa_guard.GuardError("post-publication rejection"),
+                ), redirect_stdout(output):
+                with self.assertRaisesRegex(
+                    platform_live_qa_guard.GuardError,
+                    "post-publication rejection",
+                ):
+                    platform_live_qa_guard.prepare_confirmed_public_failure_cleanup_state(
+                        bundle,
+                        platform_root=platform_root,
+                        target_sha=app_sha,
+                        source_sha=source_sha,
+                        marker=marker,
+                        expected_roster_fingerprint=fingerprint,
+                        count_line=count_line,
+                        diagnostic_kind="failure_report_published",
+                        diagnostic_child_exit="1",
+                        teardown_line="LIVE_PUBLIC_BROWSER_TEARDOWN schema=1 status=complete",
+                        lock_fd=7,
+                    )
+            state_name = output.getvalue().strip().rsplit("state=", 1)[-1]
+            self.assertRegex(state_name, r"^live-user-qa\.[A-Za-z0-9]{6}$")
+            self.assertTrue((bundle.parent / state_name / "inventory.json").is_file())
+
+    def test_failed_public_cleanup_state_publication_reports_exact_retained_path(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="liveqa-public-cleanup-state-") as directory:
+            bundle = Path(directory) / "csp-live-qa.json"
+            roster_ids = tuple(
+                f"{index:08d}-0000-4000-8000-{index:012d}"
+                for index in range(1, 14)
+            )
+            stdout = StringIO()
+            with patch.object(
+                platform_live_qa_guard,
+                "validate_root_state",
+                side_effect=platform_live_qa_guard.GuardError("synthetic post-publication validation failure"),
+            ), redirect_stdout(stdout):
+                with self.assertRaisesRegex(
+                    platform_live_qa_guard.GuardError,
+                    "synthetic post-publication validation failure",
+                ):
+                    platform_live_qa_guard._publish_root_state(
+                        bundle,
+                        marker="liveqa-public-owned-123456",
+                        roster_ids=roster_ids,
+                        public_failure_cleanup_recovery=True,
+                    )
+            retained = stdout.getvalue().strip()
+            match = re.fullmatch(
+                r"LIVE_PUBLIC_FAILURE_CLEANUP schema=1 status=recovery_required "
+                r"state=(live-user-qa\.[A-Za-z0-9]{6})",
+                retained,
+            )
+            self.assertIsNotNone(match)
+            assert match is not None
+            retained_path = bundle.parent / match.group(1)
+            self.assertTrue((retained_path / "inventory.json").is_file())
+
     @unittest.skipUnless(os.geteuid() == 0, "root-owned live-QA diagnostics contract")
     def test_private_browser_failure_report_survives_gate_cleanup_and_fails_closed(self) -> None:
         source_sha = "a" * 40
@@ -2598,9 +2950,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertIn("failure_report_unavailable", supervisor)
         self.assertIn("failure_report_unavailable", browser_wrapper)
         self.assertIn("failure_report_unavailable", user_wrapper)
-        supervisor_diagnostic_start = supervisor.index(
-            'if [[ "$browser_diagnostic" =~'
-        )
+        supervisor_diagnostic_start = supervisor.index("browser_lines=()")
         supervisor_diagnostic_end = supervisor.index(
             "if (( browser_status != 0 )); then", supervisor_diagnostic_start
         )
@@ -2614,10 +2964,12 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 "stdout_bytes=0 stderr_bytes=0 truncated=false child_exit=0 "
                 "failure_reason=private_store_unavailable failure_summary=" + token
             )
+            count_record = "LIVE_BROWSER_COUNTS schema=1 synthetic=true"
+            teardown_record = "LIVE_PUBLIC_BROWSER_TEARDOWN schema=1 status=complete"
             script = "\n".join(
                 (
                     "set -euo pipefail",
-                    f"browser_diagnostic={shlex.quote(diagnostic)}",
+                    f"browser_output={shlex.quote(count_record + chr(10) + diagnostic + chr(10) + teardown_record)}",
                     "browser_status=0",
                     "exec 3>&1",
                     supervisor_diagnostic_block,
@@ -3726,6 +4078,101 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             diagnosed_failure["browser_failure_metadata"]["failures"],
             failed_identities,
         )
+        passed_rejected_fields = {
+            **count_fields,
+            "logical_pass": 46,
+            "logical_flaky": 1,
+            "attempt_pass": 46,
+            "attempt_fail": 1,
+        }
+        passed_rejected_counts_line = (
+            "LIVE_BROWSER_COUNTS schema=1 "
+            + " ".join(
+                f"{name}={passed_rejected_fields[name]}"
+                for name in (
+                    "run_status",
+                    *platform_workflow_remote_dispatch.LIVE_BROWSER_COUNT_FIELDS,
+                    "source_sha",
+                    "app_sha",
+                    "marker_sha256",
+                )
+            )
+        )
+        passed_rejected_identity = [["patch_owner_sections", "live-desktop", "failed", 1]]
+        passed_rejected_summary = dict(
+            summary_payload,
+            run_status="passed",
+            failures=passed_rejected_identity,
+        )
+        passed_rejected_token = base64.urlsafe_b64encode(
+            json.dumps(passed_rejected_summary, separators=(",", ":")).encode("ascii")
+        ).rstrip(b"=").decode("ascii")
+        passed_rejected_diagnostic = (
+            "LIVE_QA_CHILD_DIAGNOSTIC schema=2 kind=failure_report_published "
+            "stdout_bytes=0 stderr_bytes=0 truncated=false child_exit=0 "
+            f"failure_reason=private_store_available failure_summary={passed_rejected_token}\n"
+        )
+        passed_rejected_failure = sanitize_status(
+            (
+                passed_rejected_counts_line
+                + "\n"
+                + passed_rejected_diagnostic
+                + "LIVE_PUBLIC_FAILURE_CLEANUP schema=1 status=cleaned\n"
+                + failed_browser_status_line
+            ).encode(),
+            1,
+        )
+        self.assertEqual(passed_rejected_failure["status"], "failed")
+        self.assertFalse(passed_rejected_failure["success"])
+        self.assertEqual(
+            passed_rejected_failure["public_failure_cleanup"], {"status": "cleaned"}
+        )
+        self.assertEqual(
+            passed_rejected_failure["browser_failure_metadata"]["run_status"], "passed"
+        )
+        cleaned_failure = sanitize_status(
+            (
+                failed_counts_line
+                + "\n"
+                + failed_diagnostic
+                + "LIVE_PUBLIC_FAILURE_CLEANUP schema=1 status=cleaned\n"
+                + failed_browser_status_line
+            ).encode(),
+            1,
+        )
+        self.assertEqual(cleaned_failure["status"], "failed")
+        self.assertFalse(cleaned_failure["success"])
+        self.assertEqual(cleaned_failure["stage"], "browser_qa")
+        self.assertEqual(cleaned_failure["public_failure_cleanup"], {"status": "cleaned"})
+        self.assertEqual(cleaned_failure["line_count"], 4)
+        recovery_required = sanitize_status(
+            (
+                failed_counts_line
+                + "\n"
+                + failed_diagnostic
+                + "LIVE_PUBLIC_FAILURE_CLEANUP schema=1 status=recovery_required "
+                + "state=live-user-qa.Abc123\n"
+                + failed_browser_status_line
+            ).encode(),
+            1,
+        )
+        self.assertEqual(
+            recovery_required["public_failure_cleanup"],
+            {"status": "recovery_required", "state": "live-user-qa.Abc123"},
+        )
+        invalid_cleanup = sanitize_status(
+            (
+                failed_counts_line
+                + "\n"
+                + failed_diagnostic
+                + "LIVE_PUBLIC_FAILURE_CLEANUP schema=1 status=recovery_required "
+                + "state=../bad\n"
+                + failed_browser_status_line
+            ).encode(),
+            1,
+        )
+        self.assertEqual(invalid_cleanup["status"], "unavailable")
+        self.assertIsNone(invalid_cleanup["public_failure_cleanup"])
         with tempfile.TemporaryDirectory(prefix="live-launch-validator-failure-") as directory:
             report_path = Path(directory) / "report.json"
             report_path.write_text(json.dumps(diagnosed_failure), encoding="utf-8")
@@ -5000,6 +5447,61 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 expected_marker_sha256="d" * 64,
             )
         )
+
+    def test_public_failure_cleanup_status_is_closed_and_browser_failure_bound(self) -> None:
+        source_sha = "a" * 40
+        status = (
+            "LIVE_LAUNCH_STATUS schema=2 status=failed stage=browser_qa "
+            f"check=browser_qa child_exit=1 source_sha={source_sha}\n"
+        ).encode("ascii")
+        cleanup = b"LIVE_PUBLIC_FAILURE_CLEANUP schema=1 status=cleaned\n"
+        extracted = platform_workflow_remote_dispatch._extract_live_qa_protocol_markers(
+            cleanup + status
+        )
+        self.assertEqual(extracted, (status, None, cleanup))
+        self.assertIsNone(
+            platform_workflow_remote_dispatch._extract_live_qa_protocol_markers(
+                cleanup + cleanup + status
+            )
+        )
+        self.assertIsNone(
+            platform_workflow_remote_dispatch._extract_live_qa_protocol_markers(
+                b"LIVE_PUBLIC_FAILURE_CLEANUP schema=1 status=recovery_required "
+                b"state=../unsafe\n" + status
+            )
+        )
+
+        child = (
+            "import os; os.write(1, bytes.fromhex("
+            f"{(cleanup + status).hex()!r})); raise SystemExit(1)"
+        )
+        output = StringIO()
+        with redirect_stdout(output):
+            exit_code = platform_workflow_remote_dispatch._run_bounded_child(
+                [sys.executable, "-c", child],
+                timeout_seconds=3,
+                expected_live_launch_sha=source_sha,
+            )
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(output.getvalue(), (cleanup + status).decode("ascii"))
+
+        unrelated_status = status.replace(b"stage=browser_qa", b"stage=identity").replace(
+            b"check=browser_qa", b"check=identity"
+        )
+        invalid_child = (
+            "import os; os.write(1, bytes.fromhex("
+            f"{(cleanup + unrelated_status).hex()!r})); raise SystemExit(1)"
+        )
+        invalid_output = StringIO()
+        with redirect_stdout(invalid_output):
+            invalid_exit = platform_workflow_remote_dispatch._run_bounded_child(
+                [sys.executable, "-c", invalid_child],
+                timeout_seconds=3,
+                expected_live_launch_sha=source_sha,
+            )
+        self.assertEqual(invalid_exit, 1)
+        self.assertNotIn("LIVE_PUBLIC_FAILURE_CLEANUP", invalid_output.getvalue())
+        self.assertIn("stage=trusted_entry", invalid_output.getvalue())
 
     def test_qa_child_capture_drains_both_streams_and_retains_only_safe_summary(self) -> None:
         secret = b"private-token-sentinel"

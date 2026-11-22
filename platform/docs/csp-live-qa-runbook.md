@@ -122,15 +122,26 @@ public QA does not exercise auth or Turnstile. See the [auth E2E reference](auth
 for fixture/privacy details. Use a fresh marker, avoid overlap, and run optional
 human diagnostics only after UserQA proves cleanup and absence.
 
-The sequence passes only after both child workflows and UserQA exact cleanup
-and absence succeed. If UserQA fails after provisioning—including source
-advance, dispatch outage or interruption—retain the roster and sanitized
-failure evidence; do not claim success, reprovision or reuse its marker.
-Recover through [stale-bundle recovery](liveqa-stale-bundle-recovery.md) once its
-age precondition holds, otherwise use canonical exact-state recovery below.
-Start another run only after cleanup and absence are proven.
+Both child workflows and UserQA cleanup/absence must pass for QA credit. A failed launch earns no credit; route by trusted evidence and never reuse an uncertain roster:
 
-An automatic launch that fails during fixture provisioning remains failed and earns no pass credit; see [public QA after fixture-provisioning failure](csp-live-qa-failed-provision-recovery.md) for the independent `provision=false` rerun and UserQA preflight/cleanup requirements.
+- A pre-roster provision refusal preserves the prior bundle. Use the [`provision=false` Public QA and UserQA route](csp-live-qa-failed-provision-recovery.md).
+- After provisioning, automatic cleanup requires trusted `failed/browser_qa` status, complete
+  non-interrupted counts proving a failed/timed-out attempt, a closed child diagnostic, and
+  successful trusted teardown. A count may say `run_status=passed` when its validated failure
+  predicate rejects an actual failed/timed-out attempt; rely on the sanitized outcome, not raw counts.
+  The immutable supervisor validates marker, helper, sources and locks; it never launches UserQA
+  or credits the parent. In the sanitized report, `public_failure_cleanup.status=cleaned` confirms
+  exact roster/test-data absence and state removal; bundle/helper remain until rotation. A fresh
+  marker's next `provision=true` run can replace them after its locked absence check, without
+  waiting four hours. `recovery_required` supplies the state basename for
+  [exact-state recovery](csp-live-qa-runbook.md#exact-liveqa-state-recovery). With
+  `not_attempted`, retain and recover the roster. The launch remains failed in every case.
+- For interruption, incomplete evidence, unknown publication or other ambiguity, retain exact state
+  and use [exact-state recovery](csp-live-qa-runbook.md#exact-liveqa-state-recovery). Use
+  [stale-bundle recovery](liveqa-stale-bundle-recovery.md) only when age and exact-roster
+  preconditions hold.
+
+Start another run only after cleanup/absence or canonical recovery. Public failure is never UserQA success. After successful UserQA, follow [post-UserQA cleanup](liveqa-post-userqa-cleanup.md).
 
 The credential-bearing journey never runs a candidate checkout or unverified mailbox helper. The source-only `liveqa-runtime` manifest v3 adds confined declared `engine_links` to the v2 keys (no `source_sha`); its engine-tree digest uses the typed, domain-separated `oldsparky-liveqa-engine-v2` encoding for regular-file digests and exact symlink targets. The provider manifest v2 binds `source_sha`, carries the same link map and installs candidate-owned bytes under `provider-runtime`; prior complete v1 generations remain immutable at `runtime` and may serve only when their exact engine map and package-lock digest match. Activation checks Node 26.3.1, package lock, required Playwright packages, browser roots, Chromium sandbox and the exact file/link maps under the release lock, then records the provider generation in the digest-bound payload before switching active. Missing, stale or incompatible providers fail closed; no environment or candidate-checkout path is trusted. Provider hashing stays bounded by signed member limits; release bootstrap validates the full archive before omitting only the wheelhouse and standalone web bundle from its temporary control tree. For missing-provider recovery, see the [provider recovery runbook](liveqa-provider-recovery.md).
 
@@ -410,6 +421,8 @@ tournament/media IDs recorded through atomic replacement, then proves that no
 marked row remains. Marker-only bulk deletion is forbidden. On any cleanup
 failure the root-only inventory and session file are retained for explicit
 operator recovery, and rollout progression is blocked.
+
+### Exact LiveQA state recovery
 
 Normal runs refuse any retained `live-user-qa.*` state. Recover only the exact
 path printed by the failed supervisor; do not create or edit an inventory:

@@ -25,7 +25,7 @@ if [[ -n "$TRUSTED_INSTALL_ROOT" ]]; then
 fi
 
 usage() {
-  echo "Usage: $0 | $0 recover /absolute/path/to/live-user-qa.XXXXXX | $0 recover-setup /absolute/path/to/.live-user-qa.setup-<id> | $0 recover-bundle" >&2
+  echo "Usage: $0 | $0 recover /absolute/path/to/live-user-qa.XXXXXX | $0 recover-setup /absolute/path/to/.live-user-qa.setup-<id> | $0 recover-bundle | $0 cleanup-public-failure <roster-fingerprint> <count-line> <diagnostic-kind> <child-exit> <teardown-line>" >&2
 }
 
 if [[ "$EUID" -ne 0 ]]; then
@@ -65,6 +65,17 @@ case "$#" in
   2)
     if [[ "$1" != "recover" && "$1" != "recover-setup" ]] \
       || [[ "$2" != /* ]]; then
+      usage
+      exit 2
+    fi
+    ;;
+  6)
+    if [[ "$1" != "cleanup-public-failure" \
+      || ! "$2" =~ ^[0-9a-f]{64}$ \
+      || ! "$3" =~ ^LIVE_BROWSER_COUNTS\ schema=1\ .+$ \
+      || ! "$4" =~ ^(failure_report_published|failure_report_unavailable)$ \
+      || ! "$5" =~ ^(0|1)$ \
+      || "$6" != "LIVE_PUBLIC_BROWSER_TEARDOWN schema=1 status=complete" ]]; then
       usage
       exit 2
     fi
@@ -165,6 +176,66 @@ recover_exact_state() {
     --state-dir "$recovery_state"
   echo "Automated live-user QA recovery completed with exact cleanup and absence proof."
 }
+
+if (( $# == 6 )) && [[ "$1" == "cleanup-public-failure" ]]; then
+  if (( TRUSTED_MODE != 1 )) \
+    || [[ "${PLATFORM_RELEASE_LOCK_SUPERVISED:-}" != "1" ]] \
+    || [[ ! "${PLATFORM_LIVE_QA_LOCK_FD:-}" =~ ^[0-9]+$ ]] \
+    || [[ ! "${PLATFORM_LIVE_USER_QA_MARKER:-}" =~ ^liveqa-[a-z0-9-]{6,56}$ ]] \
+    || [[ ! "${PLATFORM_LIVE_QA_RUNNER_SHA:-}" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "Confirmed public failure cleanup requires the immutable launch supervisor and both locks." >&2
+    exit 1
+  fi
+  prepare_output=""
+  prepare_status=0
+  if prepare_output="$(
+    "${GUARD[@]}" prepare-confirmed-public-failure-cleanup-state \
+      --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE" \
+      --platform-root "$PLATFORM_ROOT" \
+      --target-sha "$SOURCE_COMMIT" \
+      --source-sha "$PLATFORM_LIVE_QA_RUNNER_SHA" \
+      --marker "$PLATFORM_LIVE_USER_QA_MARKER" \
+      --expected-roster-fingerprint "$2" \
+      --count-line "$3" \
+      --diagnostic-kind "$4" \
+      --diagnostic-child-exit "$5" \
+      --teardown-line "$6" \
+      --fd "$PLATFORM_LIVE_QA_LOCK_FD"
+  )"; then
+    QA_STATE_DIR="$prepare_output"
+  else
+    prepare_status=$?
+    if [[ "$prepare_output" =~ ^LIVE_PUBLIC_FAILURE_CLEANUP\ schema=1\ status=recovery_required\ state=(live-user-qa\.[A-Za-z0-9]{6}|\.live-user-qa\.setup-[a-f0-9]{32})$ ]]; then
+      printf '%s\n' "$prepare_output"
+    else
+      printf 'LIVE_PUBLIC_FAILURE_CLEANUP schema=1 status=not_attempted\n'
+    fi
+    exit "$prepare_status"
+  fi
+  FAILED_PUBLIC_STATE_PATH="$QA_STATE_DIR"
+  failed_public_cleanup_exit() {
+    local recovery_status=$?
+    if (( recovery_status != 0 )) && [[ -d "$FAILED_PUBLIC_STATE_PATH" ]]; then
+      printf 'Live QA recovery state retained at %s\n' \
+        "$FAILED_PUBLIC_STATE_PATH" >&2
+      printf 'Run this exact recovery command after resolving the failure:\n' >&2
+      printf '  PLATFORM_APP_DIR=/opt/oldsparky/platform PLATFORM_LIVE_CSP_QA_BUNDLE=%q %q recover %q\n' \
+        "$PLATFORM_LIVE_CSP_QA_BUNDLE" "$SCRIPT_PATH" "$FAILED_PUBLIC_STATE_PATH" >&2
+      if [[ "${FAILED_PUBLIC_STATE_PATH##*/}" =~ ^live-user-qa\.[A-Za-z0-9]{6}$ ]]; then
+        printf 'LIVE_PUBLIC_FAILURE_CLEANUP schema=1 status=recovery_required state=%s\n' \
+          "${FAILED_PUBLIC_STATE_PATH##*/}"
+      fi
+    elif (( recovery_status != 0 )); then
+      printf 'LIVE_PUBLIC_FAILURE_CLEANUP schema=1 status=not_attempted\n'
+    fi
+    exit "$recovery_status"
+  }
+  trap failed_public_cleanup_exit EXIT
+  recover_exact_state "$QA_STATE_DIR" >/dev/null
+  trap - EXIT
+  printf 'LIVE_PUBLIC_FAILURE_CLEANUP schema=1 status=cleaned\n'
+  exit 0
+fi
 
 if (( $# == 1 )) && [[ "$1" == "recover-bundle" ]]; then
   if (( TRUSTED_MODE != 1 )) \

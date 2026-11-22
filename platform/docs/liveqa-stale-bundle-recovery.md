@@ -4,11 +4,14 @@
 - Owner: Production operator
 - Last reviewed: 2026-10-20
 
-Use this procedure only when the fixed CSP LiveQA bundle is older than its
-normal four-hour QA validity window and its exact 13-account roster remains.
-It performs exact cleanup through the reviewed active immutable LiveQA
-payload. It does not launch a browser, provision a bundle, change an application
-release or bypass the usual source/runtime checks.
+Use this procedure only for an ambiguous or interrupted LiveQA operation when
+the fixed CSP bundle is older than its normal four-hour QA validity window and
+its exact 13-account roster remains. It performs exact cleanup through the
+reviewed active immutable LiveQA payload. It does not launch a browser,
+provision a bundle, change an application release or bypass the usual
+source/runtime checks. Do not use it for a confirmed pre-roster provisioning
+refusal or for a Public browser failure whose exact roster cleanup completed;
+those branches are described in the [CSP/live QA runbook](csp-live-qa-runbook.md).
 
 ## Preconditions
 
@@ -52,6 +55,11 @@ QA operation, malformed bundle/roster, mismatched active payload/helper, or
 remaining data outside the existing cleanup contract. It creates no browser
 session and does not create a tournament inventory. Existing exact cleanup
 validates data relationships and proves absence before removing its inventory.
+The fixed bundle and helper remain as bounded scope metadata after cleanup. A
+later normal `provision=true` run may replace them with a fresh marker only
+after its locked replacement check proves the prior exact roster and
+marker-owned rows are absent; replacement does not require another four-hour
+wait.
 
 On any cleanup refusal or failure, keep the generated exact state path printed
 by the guard. Continue only with the ordinary `platform_live_user_qa.sh

@@ -627,6 +627,13 @@ LIVE_LAUNCH_STATUS_RE = re.compile(
     rb"child_exit=(?P<child_exit>0|[1-9][0-9]{0,2}) "
     rb"source_sha=(?P<source_sha>[0-9a-f]{40})\n"
 )
+LIVE_PUBLIC_FAILURE_CLEANUP_RE = re.compile(
+    rb"LIVE_PUBLIC_FAILURE_CLEANUP schema=1 status="
+    rb"(?P<status>cleaned|not_attempted)\n"
+    rb"|LIVE_PUBLIC_FAILURE_CLEANUP schema=1 status=recovery_required "
+    rb"state=(?P<state>live-user-qa\.[A-Za-z0-9]{6}|"
+    rb"\.live-user-qa\.setup-[a-f0-9]{32})\n"
+)
 LIVE_BROWSER_COUNTS_RE = re.compile(
     rb"LIVE_BROWSER_COUNTS schema=1 run_status="
     rb"(?P<run_status>passed|failed|timedout|interrupted) "
@@ -3139,14 +3146,34 @@ def _valid_browser_failure_summary(
 def _extract_live_qa_diagnostic(output: bytes) -> tuple[bytes, bytes | None] | None:
     """Remove one exact diagnostic marker while keeping the status protocol strict."""
 
+    extracted = _extract_live_qa_protocol_markers(output)
+    if extracted is None or extracted[2] is not None:
+        return None
+    return extracted[0], extracted[1]
+
+
+def _extract_live_qa_protocol_markers(
+    output: bytes,
+) -> tuple[bytes, bytes | None, bytes | None] | None:
+    """Remove the exact child diagnostic and optional cleanup status marker."""
+
     lines = output.splitlines(keepends=True)
     markers = [line for line in lines if line.startswith(b"LIVE_QA_CHILD_DIAGNOSTIC ")]
-    if not markers:
-        return output, None
-    if len(markers) != 1 or LIVE_QA_DIAGNOSTIC_RE.fullmatch(markers[0]) is None:
+    cleanup_markers = [
+        line for line in lines if line.startswith(b"LIVE_PUBLIC_FAILURE_CLEANUP ")
+    ]
+    if len(markers) > 1 or len(cleanup_markers) > 1:
         return None
-    remainder = b"".join(line for line in lines if line is not markers[0])
-    return remainder, markers[0]
+    diagnostic = markers[0] if markers else None
+    cleanup = cleanup_markers[0] if cleanup_markers else None
+    if diagnostic is not None and LIVE_QA_DIAGNOSTIC_RE.fullmatch(diagnostic) is None:
+        return None
+    if cleanup is not None and LIVE_PUBLIC_FAILURE_CLEANUP_RE.fullmatch(cleanup) is None:
+        return None
+    remainder = b"".join(
+        line for line in lines if line is not diagnostic and line is not cleanup
+    )
+    return remainder, diagnostic, cleanup
 
 
 def _emit_live_browser_counts(counts: dict[str, object]) -> None:
@@ -3254,11 +3281,12 @@ def _wait_for_live_launch_status(
                 source_sha=expected_sha, check="dispatch",
             )
             return 2
-        extracted = None if oversized else _extract_live_qa_diagnostic(bytes(output))
+        extracted = None if oversized else _extract_live_qa_protocol_markers(bytes(output))
         parsed = None
         child_diagnostic = None
+        public_cleanup = None
         if extracted is not None:
-            protocol_output, child_diagnostic = extracted
+            protocol_output, child_diagnostic, public_cleanup = extracted
             parsed = _parse_live_launch_protocol(
                 protocol_output,
                 child_status=child_status,
@@ -3302,6 +3330,15 @@ def _wait_for_live_launch_status(
                     )
                 ):
                     parsed = None
+        if parsed is not None and public_cleanup is not None:
+            cleanup_match = LIVE_PUBLIC_FAILURE_CLEANUP_RE.fullmatch(public_cleanup)
+            parsed_status = parsed[0]
+            if (
+                cleanup_match is None
+                or parsed_status[0] != "failed"
+                or parsed_status[1] != "browser_qa"
+            ):
+                parsed = None
         if parsed is None:
             safe_exit = child_status if 0 < child_status <= 255 else 2
             _emit_live_launch_status(
@@ -3318,6 +3355,9 @@ def _wait_for_live_launch_status(
             sys.stdout.flush()
         if counts is not None:
             _emit_live_browser_counts(counts)
+        if public_cleanup is not None:
+            sys.stdout.write(public_cleanup.decode("ascii"))
+            sys.stdout.flush()
         _emit_live_launch_status(
             status=status,
             stage=stage,

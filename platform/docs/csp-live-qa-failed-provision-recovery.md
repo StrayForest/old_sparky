@@ -1,8 +1,13 @@
-# Public QA after fixture-provisioning failure
+# Public QA after pre-roster provisioning refusal
 
-Use this documented recovery only when the automatic public launch failed in
-fixture provisioning. The sequencer remains failed and receives no pass credit.
-This procedure does not repair or retry its database operation.
+Use this route only when trusted launch status confirms that provisioning was
+refused before this invocation created or published a roster. The failed
+sequencer remains failed and receives no pass credit. This procedure does not
+repair or retry its provisioning operation, and it preserves the existing
+bundle and roster. For a Public browser failure after successful provisioning,
+follow the automatic exact-cleanup branch in the [CSP/live QA runbook](csp-live-qa-runbook.md)
+instead. For unknown or incomplete lifecycle evidence, use canonical exact-state
+recovery; do not infer that no write occurred from the bundle file alone.
 
 ## Run public QA with the retained bundle
 
@@ -40,7 +45,8 @@ then prove there are no active sessions before fixture creation. If the failed
 provision operation had an unknown publication/commit outcome, the bundle
 file alone does not prove the database roster is intact. Stop on any failed or
 ambiguous preflight and retain the exact state for canonical recovery. After
-UserQA, require its exact cleanup and absence proof before considering this
-independent follow-up complete. The failed sequencer remains failed and gets
-no pass credit. Do not reprovision, bypass bundle-age checks, invoke the
-provisioner directly or edit/delete records by marker.
+UserQA, require its exact cleanup and absence proof, then follow the documented
+[post-UserQA credential-file cleanup](liveqa-post-userqa-cleanup.md) before
+considering this independent follow-up complete. The failed sequencer remains
+failed and gets no pass credit. Do not reprovision, bypass bundle-age checks,
+invoke the provisioner directly or edit/delete records by marker.

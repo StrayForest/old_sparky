@@ -248,6 +248,7 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 LIVE_BROWSER_COUNTS_FILE = "live-counts-v1.json"
 LIVE_BROWSER_COUNTS_MAX_BYTES = 1024
+LIVE_PUBLIC_FAILURE_LOGICAL_TOTAL_MAX = 4096
 LIVE_BROWSER_FAILURES_FILE = "live-failures-v2.json"
 LIVE_BROWSER_FAILURE_IDENTITIES_FILE = "live-failure-identities-v1.json"
 LIVE_USER_FAILURES_FILE = "live-user-failures-v3.json"
@@ -2092,6 +2093,184 @@ def _bundle_roster_ids(bundle_path: Path) -> tuple[str, tuple[str, ...]]:
     return marker, tuple(ids)
 
 
+def _public_failure_roster_fingerprint(
+    bundle_path: Path,
+    *,
+    platform_root: Path,
+    target_sha: str,
+    marker: str,
+) -> str:
+    install_root = Path(os.environ.get("PLATFORM_LIVE_QA_INSTALL_ROOT", ""))
+    if (
+        bundle_path != TRUSTED_SECRET_ROOT / "csp-live-qa.json"
+        or platform_root != install_root / "platform"
+        or install_root != TRUSTED_PAYLOAD_ROOT / target_sha
+        or target_sha != install_root.name
+        or os.environ.get("PLATFORM_LIVE_QA_TARGET_SHA") != target_sha
+        or os.environ.get("PLATFORM_APP_DIR") != str(APP_DIR)
+        or os.environ.get("PLATFORM_LIVE_CSP_QA_BUNDLE") != str(bundle_path)
+        or not re.fullmatch(r"liveqa-[a-z0-9-]{6,56}", marker)
+    ):
+        raise GuardError("public failure cleanup target is not the fixed active payload")
+    _validate_installed_payload_root(install_root, target_sha=target_sha)
+    if _active_release_commit() != target_sha:
+        raise GuardError("public failure cleanup target is not the active app release")
+    bundle_marker, helper = _bundle_marker_and_helper(bundle_path)
+    expected_helper = TRUSTED_SECRET_ROOT / "platform_live_qa_mailbox_helper.py"
+    if bundle_marker != marker or helper != expected_helper:
+        raise GuardError("public failure cleanup bundle ownership does not match")
+    _verify_active_immutable_helper_binding(
+        platform_root=platform_root,
+        installed_helper=helper,
+    )
+    roster_marker, roster_ids = _bundle_roster_ids(bundle_path)
+    if roster_marker != marker or len(roster_ids) != 13:
+        raise GuardError("public failure cleanup bundle roster is invalid")
+    fingerprint_input = "\n".join((marker, str(helper), *roster_ids)).encode("ascii")
+    return hashlib.sha256(fingerprint_input).hexdigest()
+
+
+def _validate_confirmed_public_failure_counts(
+    count_line: str,
+    diagnostic_kind: str,
+    diagnostic_child_exit: str,
+    teardown_line: str,
+    *,
+    expected_source_sha: str,
+    expected_app_sha: str,
+    expected_marker_sha256: str,
+) -> None:
+    fields_pattern = " ".join(
+        rf"{field}=(?P<{field}>0|[1-9][0-9]{{0,4}})"
+        for field in LIVE_BROWSER_COUNT_FIELDS
+    )
+    match = re.fullmatch(
+        rf"LIVE_BROWSER_COUNTS schema=1 run_status=(?P<run_status>passed|failed|timedout|interrupted) "
+        rf"{fields_pattern} source_sha=(?P<source_sha>[0-9a-f]{{40}}) "
+        rf"app_sha=(?P<app_sha>[0-9a-f]{{40}}) marker_sha256=(?P<marker_sha256>[0-9a-f]{{64}})",
+        count_line,
+    )
+    if match is None or len(count_line.encode("ascii", errors="ignore")) > LIVE_BROWSER_COUNTS_MAX_BYTES:
+        raise GuardError("public failure cleanup count record is invalid")
+    if (
+        match.group("source_sha") != expected_source_sha
+        or match.group("app_sha") != expected_app_sha
+        or match.group("marker_sha256") != expected_marker_sha256
+        or match.group("run_status") not in {"passed", "failed", "timedout"}
+    ):
+        raise GuardError("public failure cleanup count binding is invalid")
+    counts = {field: int(match.group(field)) for field in LIVE_BROWSER_COUNT_FIELDS}
+    if (
+        any(value > 32768 for value in counts.values())
+        or counts["logical_total"] <= 0
+        or counts["logical_total"] > LIVE_PUBLIC_FAILURE_LOGICAL_TOTAL_MAX
+        or sum(
+            counts[field]
+            for field in (
+                "logical_pass",
+                "logical_fail",
+                "logical_expected_fail",
+                "logical_flaky",
+                "logical_skip",
+                "logical_interrupted",
+            )
+        )
+        != counts["logical_total"]
+        or sum(
+            counts[field]
+            for field in (
+                "attempt_pass",
+                "attempt_fail",
+                "attempt_skip",
+                "attempt_interrupted",
+                "attempt_timedout",
+            )
+        )
+        != counts["attempt_total"]
+        or counts["logical_interrupted"]
+        or counts["attempt_interrupted"]
+        or not _failure_report_required(
+            {"run_status": match.group("run_status"), **counts}
+        )
+        or counts["attempt_fail"] + counts["attempt_timedout"] <= 0
+        or counts["logical_fail"]
+        + counts["logical_expected_fail"]
+        + counts["logical_flaky"]
+        > counts["attempt_fail"] + counts["attempt_timedout"]
+        or match.group("run_status") == "timedout" and counts["attempt_timedout"] == 0
+    ):
+        raise GuardError("public failure cleanup count partitions are incomplete")
+
+    if (
+        diagnostic_kind
+        not in {"failure_report_published", "failure_report_unavailable"}
+        or diagnostic_child_exit not in {"0", "1"}
+        or match.group("run_status") == "passed" and diagnostic_child_exit != "0"
+    ):
+        raise GuardError("public failure cleanup child diagnostic is invalid")
+    if teardown_line != "LIVE_PUBLIC_BROWSER_TEARDOWN schema=1 status=complete":
+        raise GuardError("public failure cleanup browser teardown is incomplete")
+
+
+def prepare_confirmed_public_failure_cleanup_state(
+    bundle_path: Path,
+    *,
+    platform_root: Path,
+    target_sha: str,
+    source_sha: str,
+    marker: str,
+    expected_roster_fingerprint: str,
+    count_line: str,
+    diagnostic_kind: str,
+    diagnostic_child_exit: str,
+    teardown_line: str,
+    lock_fd: int,
+) -> Path:
+    """Prepare exact cleanup only for this terminal owned public browser run."""
+
+    _assert_release_lock_supervisor()
+    assert_bundle_lock(bundle_path, lock_fd)
+    if (
+        os.environ.get("PLATFORM_LIVE_QA_RUNNER_SHA") != source_sha
+        or not SHA1_RE.fullmatch(source_sha)
+        or not SHA1_RE.fullmatch(target_sha)
+        or os.environ.get("PLATFORM_LIVE_QA_MARKER_SHA256")
+        != hashlib.sha256(marker.encode("ascii")).hexdigest()
+    ):
+        raise GuardError("public failure cleanup source binding is invalid")
+    marker_sha256 = hashlib.sha256(marker.encode("ascii")).hexdigest()
+    _validate_confirmed_public_failure_counts(
+        count_line,
+        diagnostic_kind,
+        diagnostic_child_exit,
+        teardown_line,
+        expected_source_sha=source_sha,
+        expected_app_sha=target_sha,
+        expected_marker_sha256=marker_sha256,
+    )
+    fingerprint = _public_failure_roster_fingerprint(
+        bundle_path,
+        platform_root=platform_root,
+        target_sha=target_sha,
+        marker=marker,
+    )
+    if not SHA256_RE.fullmatch(expected_roster_fingerprint) or not secrets.compare_digest(
+        fingerprint, expected_roster_fingerprint
+    ):
+        raise GuardError("public failure cleanup roster changed during the run")
+    assert_no_recovery_state(bundle_path, include_manual=True)
+    assert_liveqa_idle()
+    current_marker, roster_ids = _bundle_roster_ids(bundle_path)
+    if current_marker != marker or len(roster_ids) != 13:
+        raise GuardError("public failure cleanup roster is not exact")
+    return _publish_root_state(
+        bundle_path,
+        marker=marker,
+        roster_ids=roster_ids,
+        public_failure_cleanup_recovery=True,
+    )
+
+
 def _validated_stale_bundle_roster(
     bundle_path: Path, *, platform_root: Path, target_sha: str
 ) -> tuple[str, tuple[str, ...]]:
@@ -2191,7 +2370,11 @@ def _validated_stale_bundle_roster(
 
 
 def _publish_root_state(
-    bundle_path: Path, *, marker: str, roster_ids: tuple[str, ...]
+    bundle_path: Path,
+    *,
+    marker: str,
+    roster_ids: tuple[str, ...],
+    public_failure_cleanup_recovery: bool = False,
 ) -> Path:
     parent = bundle_path.parent
     stage = parent / f".live-user-qa.setup-{uuid4().hex}"
@@ -2249,6 +2432,25 @@ def _publish_root_state(
                 # An interrupted publication is intentionally retained for the
                 # explicit setup-recovery command.
                 pass
+        if (
+            public_failure_cleanup_recovery
+            and stage.exists()
+            and stage.is_dir()
+            and not stage.is_symlink()
+        ):
+            try:
+                retained_stage = stage.lstat()
+                if (
+                    retained_stage.st_uid == 0
+                    and stat.S_IMODE(retained_stage.st_mode) == 0o700
+                    and SETUP_NAME_PATTERN.fullmatch(stage.name)
+                ):
+                    print(
+                        "LIVE_PUBLIC_FAILURE_CLEANUP schema=1 status=recovery_required "
+                        f"state={stage.name}"
+                    )
+            except OSError:
+                pass
         if final is not None and stage_identity is not None:
             try:
                 retained = final.lstat()
@@ -2256,10 +2458,19 @@ def _publish_root_state(
                     stat.S_ISDIR(retained.st_mode)
                     and (retained.st_dev, retained.st_ino) == stage_identity
                 ):
-                    print(
-                        f"Live QA root state retained at: {final}",
-                        file=sys.stderr,
-                    )
+                    if (
+                        public_failure_cleanup_recovery
+                        and STATE_NAME_PATTERN.fullmatch(final.name)
+                    ):
+                        print(
+                            "LIVE_PUBLIC_FAILURE_CLEANUP schema=1 status=recovery_required "
+                            f"state={final.name}"
+                        )
+                    else:
+                        print(
+                            f"Live QA root state retained at: {final}",
+                            file=sys.stderr,
+                        )
             except OSError:
                 # Do not replace the original publication failure with a
                 # secondary diagnostic error or claim an unverified path.
@@ -8222,6 +8433,27 @@ def _parser() -> argparse.ArgumentParser:
     prepare_stale_cleanup.add_argument("--platform-root", type=Path, required=True)
     prepare_stale_cleanup.add_argument("--target-sha", required=True)
     prepare_stale_cleanup.add_argument("--fd", type=int, required=True)
+    public_fingerprint = commands.add_parser(
+        "public-failure-roster-fingerprint"
+    )
+    public_fingerprint.add_argument("--bundle-path", type=Path, required=True)
+    public_fingerprint.add_argument("--platform-root", type=Path, required=True)
+    public_fingerprint.add_argument("--target-sha", required=True)
+    public_fingerprint.add_argument("--marker", required=True)
+    public_cleanup = commands.add_parser(
+        "prepare-confirmed-public-failure-cleanup-state"
+    )
+    public_cleanup.add_argument("--bundle-path", type=Path, required=True)
+    public_cleanup.add_argument("--platform-root", type=Path, required=True)
+    public_cleanup.add_argument("--target-sha", required=True)
+    public_cleanup.add_argument("--source-sha", required=True)
+    public_cleanup.add_argument("--marker", required=True)
+    public_cleanup.add_argument("--expected-roster-fingerprint", required=True)
+    public_cleanup.add_argument("--count-line", required=True)
+    public_cleanup.add_argument("--diagnostic-kind", required=True)
+    public_cleanup.add_argument("--diagnostic-child-exit", required=True)
+    public_cleanup.add_argument("--teardown-line", required=True)
+    public_cleanup.add_argument("--fd", type=int, required=True)
     asserted = commands.add_parser("assert-lock")
     asserted.add_argument("--bundle-path", type=Path, required=True)
     asserted.add_argument("--fd", type=int, required=True)
@@ -8355,6 +8587,40 @@ def main(argv: Iterable[str] | None = None) -> int:
                     args.bundle_path,
                     platform_root=args.platform_root,
                     target_sha=args.target_sha,
+                    lock_fd=args.fd,
+                )
+            )
+            return 0
+        if args.command == "public-failure-roster-fingerprint":
+            _assert_release_lock_supervisor()
+            descriptor = _open_machine_lock()
+            try:
+                assert_no_recovery_state(args.bundle_path, include_manual=True)
+                assert_liveqa_idle()
+                print(
+                    _public_failure_roster_fingerprint(
+                        args.bundle_path,
+                        platform_root=args.platform_root,
+                        target_sha=args.target_sha,
+                        marker=args.marker,
+                    )
+                )
+            finally:
+                os.close(descriptor)
+            return 0
+        if args.command == "prepare-confirmed-public-failure-cleanup-state":
+            print(
+                prepare_confirmed_public_failure_cleanup_state(
+                    args.bundle_path,
+                    platform_root=args.platform_root,
+                    target_sha=args.target_sha,
+                    source_sha=args.source_sha,
+                    marker=args.marker,
+                    expected_roster_fingerprint=args.expected_roster_fingerprint,
+                    count_line=args.count_line,
+                    diagnostic_kind=args.diagnostic_kind,
+                    diagnostic_child_exit=args.diagnostic_child_exit,
+                    teardown_line=args.teardown_line,
                     lock_fd=args.fd,
                 )
             )

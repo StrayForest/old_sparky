@@ -160,6 +160,11 @@ cleanup_gate() {
     printf '  PLATFORM_APP_DIR=/opt/oldsparky/platform PLATFORM_LIVE_CSP_QA_BUNDLE=%q %q recover %q\n' \
       "$PLATFORM_LIVE_CSP_QA_BUNDLE" "$SCRIPT_PATH" "$BROWSER_GATE" >&2
   fi
+  if (( cleanup_status == 0 )); then
+    printf 'LIVE_PUBLIC_BROWSER_TEARDOWN schema=1 status=complete\n'
+  else
+    printf 'LIVE_PUBLIC_BROWSER_TEARDOWN schema=1 status=failed\n'
+  fi
   if (( original_status != 0 )); then
     exit "$original_status"
   fi
@@ -325,6 +330,12 @@ failure_summary_token=""
 failure_summary_reason=""
 if [[ "$count_line" =~ ^LIVE_BROWSER_COUNTS\ schema=1\ .+$ ]]; then
   printf '%s\n' "$count_line" >&"$COUNT_REPORT_FD"
+  if (( TRUSTED_MODE == 1 && COUNT_REPORT_FD == 3 )) \
+    && [[ "$QA_MODE" == "public" ]]; then
+    # The immutable host supervisor also consumes the exact guard-produced
+    # record locally. FD 3 remains the unchanged remote protocol channel.
+    printf '%s\n' "$count_line"
+  fi
 else
   count_status=2
 fi

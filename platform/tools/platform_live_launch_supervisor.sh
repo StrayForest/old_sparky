@@ -293,6 +293,28 @@ if [[ "$provision" == "true" ]]; then
       --bundle-path /root/.oldsparky/liveqa/csp-live-qa.json \
       --primary-email liveqa@auth.old-sparky.com \
       --mailbox-helper /root/.oldsparky/liveqa/platform_live_qa_mailbox_helper.py
+  provisioned_here=1
+  provision_roster_fingerprint=""
+  if provision_roster_fingerprint="$(env -i \
+    HOME=/root LANG=C.UTF-8 PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    PLATFORM_APP_DIR=/opt/oldsparky/platform \
+    PLATFORM_LIVE_CSP_QA_BUNDLE="$BUNDLE" \
+    PLATFORM_LIVE_QA_INSTALL_ROOT="$INSTALL_ROOT" \
+    PLATFORM_LIVE_QA_TARGET_SHA="$app_target_sha" \
+    PLATFORM_RELEASE_LOCK_SUPERVISED=1 \
+    /usr/bin/python3.12 -I -B "$TOOLS_DIR/platform_live_qa_guard.py" \
+      public-failure-roster-fingerprint \
+      --bundle-path "$BUNDLE" \
+      --platform-root "$INSTALL_ROOT/platform" \
+      --target-sha "$app_target_sha" \
+      --marker "$marker")"; then
+    :
+  else
+    provision_roster_fingerprint=""
+  fi
+else
+  provisioned_here=0
+  provision_roster_fingerprint=""
 fi
 
 # Browser QA receives only the fixed public origin and installed generation
@@ -300,8 +322,8 @@ fi
 # not receive credentials in its environment or command line.
 launch_stage="browser_qa"
 launch_check="browser_qa"
-browser_diagnostic=""
-if browser_diagnostic="$(env -i \
+browser_output=""
+if browser_output="$(env -i \
   HOME=/root LANG=C.UTF-8 PATH=/usr/sbin:/usr/bin:/sbin:/bin \
   PLATFORM_APP_DIR=/opt/oldsparky/platform \
   PLATFORM_LIVE_CSP_QA_BUNDLE="$BUNDLE" \
@@ -315,12 +337,39 @@ if browser_diagnostic="$(env -i \
 else
   browser_status=$?
 fi
-if [[ "$browser_diagnostic" =~ (^|$'\n')LIVE_QA_CHILD_DIAGNOSTIC\ schema=(1|2)\ kind=(none|playwright_cli_usage|node_module_missing|browser_executable_missing|browser_launch_error|child_timeout|cleanup_failure|failure_report_unavailable|failure_report_published|unclassified)\ stdout_bytes=[0-9]{1,16}\ stderr_bytes=[0-9]{1,16}\ truncated=(true|false)\ child_exit=[0-9]{1,3}(\ failure_reason=(identity_summary_unavailable|private_store_unavailable|private_store_available)\ failure_summary=([A-Za-z0-9_-]+|none))?($|$'\n') ]]; then
-  child_failure_summary="${BASH_REMATCH[7]:-}"
-  child_diagnostic="${BASH_REMATCH[0]}"
-  child_diagnostic="${child_diagnostic//$'\n'/}"
-  if ((${#child_failure_summary} > 16384)); then
+browser_lines=()
+if [[ -n "$browser_output" ]]; then
+  mapfile -t browser_lines <<<"$browser_output"
+fi
+count_line=""
+child_diagnostic=""
+teardown_line=""
+diagnostic_kind=""
+diagnostic_child_exit=""
+if ((${#browser_lines[@]} == 3)) \
+  && [[ "${browser_lines[0]}" =~ ^LIVE_BROWSER_COUNTS\ schema=1\ .+$ ]] \
+  && [[ "${browser_lines[1]}" =~ ^LIVE_QA_CHILD_DIAGNOSTIC\ schema=(1|2)\ kind=(none|playwright_cli_usage|node_module_missing|browser_executable_missing|browser_launch_error|child_timeout|cleanup_failure|failure_report_unavailable|failure_report_published|unclassified)\ stdout_bytes=[0-9]{1,16}\ stderr_bytes=[0-9]{1,16}\ truncated=(true|false)\ child_exit=([0-9]{1,3})(\ failure_reason=(identity_summary_unavailable|private_store_unavailable|private_store_available)\ failure_summary=([A-Za-z0-9_-]+|none))?$ ]] \
+  && [[ "${browser_lines[2]}" =~ ^LIVE_PUBLIC_BROWSER_TEARDOWN\ schema=1\ status=(complete|failed)$ ]]; then
+  count_line="${browser_lines[0]}"
+  child_diagnostic="${browser_lines[1]}"
+  teardown_line="${browser_lines[2]}"
+  if [[ "$child_diagnostic" =~ ^LIVE_QA_CHILD_DIAGNOSTIC\ schema=(1|2)\ kind=(none|playwright_cli_usage|node_module_missing|browser_executable_missing|browser_launch_error|child_timeout|cleanup_failure|failure_report_unavailable|failure_report_published|unclassified)\ stdout_bytes=[0-9]{1,16}\ stderr_bytes=[0-9]{1,16}\ truncated=(true|false)\ child_exit=([0-9]{1,3})(\ failure_reason=(identity_summary_unavailable|private_store_unavailable|private_store_available)\ failure_summary=([A-Za-z0-9_-]+|none))?$ ]]; then
+    diagnostic_schema="${BASH_REMATCH[1]}"
+    diagnostic_kind="${BASH_REMATCH[2]}"
+    diagnostic_child_exit="${BASH_REMATCH[4]}"
+    diagnostic_summary="${BASH_REMATCH[7]:-}"
+  else
     browser_status=2
+  fi
+  if [[ "${diagnostic_kind}" == "failure_report_published" \
+    || "${diagnostic_kind}" == "failure_report_unavailable" ]]; then
+    # These are closed diagnostic records; never forward the identity summary
+    # token as a cleanup argument or emit it outside the established channel.
+    if [[ "$diagnostic_schema" != "2" || ${#diagnostic_summary} -gt 16384 ]]; then
+      browser_status=2
+    else
+      printf '%s\n' "$child_diagnostic" >&3 || true
+    fi
   else
     printf '%s\n' "$child_diagnostic" >&3 || true
   fi
@@ -328,5 +377,43 @@ else
   browser_status=2
 fi
 if (( browser_status != 0 )); then
+  cleanup_result="LIVE_PUBLIC_FAILURE_CLEANUP schema=1 status=not_attempted"
+  if [[ "$provision" == "true" && "$provisioned_here" == "1" \
+    && -n "$provision_roster_fingerprint" \
+    && "$browser_status" == "1" \
+    && "$diagnostic_kind" =~ ^(failure_report_published|failure_report_unavailable)$ \
+    && "$diagnostic_child_exit" =~ ^(0|1)$ \
+    && "$teardown_line" == "LIVE_PUBLIC_BROWSER_TEARDOWN schema=1 status=complete" ]]; then
+    cleanup_output=""
+    cleanup_status=0
+    if cleanup_output="$(env -i \
+      HOME=/root LANG=C.UTF-8 PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+      PLATFORM_APP_DIR=/opt/oldsparky/platform \
+      PLATFORM_LIVE_CSP_QA_BUNDLE="$BUNDLE" \
+      PLATFORM_LIVE_QA_INSTALL_ROOT="$INSTALL_ROOT" \
+      PLATFORM_LIVE_QA_TARGET_SHA="$app_target_sha" \
+      PLATFORM_LIVE_QA_RUNNER_SHA="$runner_sha" \
+      PLATFORM_LIVE_QA_MARKER_SHA256="$marker_sha256" \
+      PLATFORM_LIVE_USER_QA_MARKER="$marker" \
+      PLATFORM_RELEASE_LOCK_SUPERVISED=1 \
+      "$TOOLS_DIR/platform_live_user_qa.sh" cleanup-public-failure \
+      "$provision_roster_fingerprint" \
+      "$count_line" \
+      "$diagnostic_kind" \
+      "$diagnostic_child_exit" \
+      "$teardown_line")"; then
+      cleanup_status=0
+    else
+      cleanup_status=$?
+    fi
+    if (( cleanup_status == 0 )) \
+      && [[ "$cleanup_output" == "LIVE_PUBLIC_FAILURE_CLEANUP schema=1 status=cleaned" ]]; then
+      cleanup_result="$cleanup_output"
+    elif (( cleanup_status != 0 )) \
+      && [[ "$cleanup_output" =~ ^LIVE_PUBLIC_FAILURE_CLEANUP\ schema=1\ status=recovery_required\ state=(live-user-qa\.[A-Za-z0-9]{6}|\.live-user-qa\.setup-[a-f0-9]{32})$ ]]; then
+      cleanup_result="$cleanup_output"
+    fi
+  fi
+  printf '%s\n' "$cleanup_result" >&3 || true
   exit "$browser_status"
 fi

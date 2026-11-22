@@ -704,8 +704,28 @@ jobs:
               rb"(?: failure_reason=(identity_summary_unavailable|private_store_unavailable|private_store_available) "
               rb"failure_summary=([A-Za-z0-9_-]{1,16384}|none))?\n"
           )
+          cleanup_pattern = re.compile(
+              rb"LIVE_PUBLIC_FAILURE_CLEANUP schema=1 status=(cleaned|not_attempted)\n"
+              rb"|LIVE_PUBLIC_FAILURE_CLEANUP schema=1 status=recovery_required "
+              rb"state=(live-user-qa\.[A-Za-z0-9]{6}|"
+              rb"\.live-user-qa\.setup-[a-f0-9]{32})\n"
+          )
           lines = raw.splitlines(keepends=True) if raw_size <= 20 * 1024 else []
           diagnostic_lines = [line for line in lines if line.startswith(b"LIVE_QA_CHILD_DIAGNOSTIC ")]
+          cleanup_lines = [line for line in lines if line.startswith(b"LIVE_PUBLIC_FAILURE_CLEANUP ")]
+          cleanup_match = cleanup_pattern.fullmatch(cleanup_lines[0]) if len(cleanup_lines) == 1 else None
+          public_failure_cleanup = None
+          if cleanup_match is not None:
+              if cleanup_match.group(1) is not None:
+                  public_failure_cleanup = {"status": cleanup_match.group(1).decode("ascii")}
+              else:
+                  public_failure_cleanup = {
+                      "status": "recovery_required",
+                      "state": cleanup_match.group(2).decode("ascii"),
+                  }
+          cleanup_valid = not cleanup_lines or (
+              len(cleanup_lines) == 1 and cleanup_match is not None
+          )
           child_diagnostic = None
           if len(diagnostic_lines) == 1:
               diagnostic_match = child_diagnostic_pattern.fullmatch(diagnostic_lines[0])
@@ -758,7 +778,10 @@ jobs:
                   )
               )
           )
-          protocol_lines = [line for line in lines if not line.startswith(b"LIVE_QA_CHILD_DIAGNOSTIC ")]
+          protocol_lines = [
+              line for line in lines
+              if not line.startswith((b"LIVE_QA_CHILD_DIAGNOSTIC ", b"LIVE_PUBLIC_FAILURE_CLEANUP "))
+          ]
           count_values = None
           if len(protocol_lines) == 2:
               count_match = count_pattern.fullmatch(protocol_lines[0])
@@ -830,9 +853,19 @@ jobs:
                           summary.get("failure_reason") == "private_store_available"
                           and child_diagnostic.get("kind") != "failure_report_published"
                       )
-                      or summary.get("run_status") == "passed"
                       or count_values is None
                       or summary.get("run_status") != count_values.get("run_status")
+                      or (
+                          summary.get("run_status") == "passed"
+                          and not any(
+                              count_values[field] > 0
+                              for field in (
+                                  "logical_fail", "logical_expected_fail", "logical_flaky",
+                                  "logical_interrupted", "attempt_fail", "attempt_interrupted",
+                                  "attempt_timedout",
+                              )
+                          )
+                      )
                       or not isinstance(failures, list)
                       or not 1 <= len(failures) <= 128
                   ):
@@ -876,6 +909,10 @@ jobs:
                   match.group(3).decode("ascii"),
                   int(match.group(4)),
               )
+          if public_failure_cleanup is not None and not (
+              marker is not None and marker[0] == "failed" and marker[1] == "browser_qa"
+          ):
+              cleanup_valid = False
           failure_report_diagnostic_consistent = True
           if child_diagnostic is not None and child_diagnostic["kind"] in {
               "failure_report_unavailable", "failure_report_published",
@@ -901,7 +938,7 @@ jobs:
               )
               failure_report_diagnostic_consistent = failure_counts or failed_without_counts
           marker_ok = False
-          if marker is not None and diagnostic_valid and failure_report_diagnostic_consistent:
+          if marker is not None and diagnostic_valid and failure_report_diagnostic_consistent and cleanup_valid:
               marker_status, stage, check_id, child_status = marker
               if marker_status == "passed":
                   marker_ok = (
@@ -1003,8 +1040,8 @@ jobs:
               "check_id": check_id,
               "child_exit_code": child_status,
               "source_sha": expected_sha,
-              "line_count": ((2 if count_values is not None else 1) + (1 if child_diagnostic is not None else 0)) if marker_ok else 0,
-              "retained_line_count": ((2 if count_values is not None else 1) + (1 if child_diagnostic is not None else 0)) if marker_ok else 0,
+              "line_count": ((2 if count_values is not None else 1) + (1 if child_diagnostic is not None else 0) + (1 if public_failure_cleanup is not None else 0)) if marker_ok else 0,
+              "retained_line_count": ((2 if count_values is not None else 1) + (1 if child_diagnostic is not None else 0) + (1 if public_failure_cleanup is not None else 0)) if marker_ok else 0,
               "truncated": False,
               "test_count": None if count_values is None else count_values["logical_total"] - count_values["logical_skip"],
               "failed_test_count": None if count_values is None else count_values["logical_fail"],
@@ -1020,6 +1057,7 @@ jobs:
               "error_class_counts": errors,
               "child_diagnostic": child_diagnostic,
               "browser_failure_metadata": browser_failure_metadata,
+              "public_failure_cleanup": public_failure_cleanup,
           }
           destination.write_text(json.dumps(report, sort_keys=True) + "\n", encoding="utf-8")
           PY
