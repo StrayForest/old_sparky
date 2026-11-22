@@ -585,7 +585,8 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
 
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/patches/synthetic-format");
-  const syntheticContent = page.locator(".patch-change-content");
+  const syntheticGeneralSection = page.locator(".patch-section.general-patch-section");
+  const syntheticContent = syntheticGeneralSection.locator(":scope > .patch-change-content");
   await expect(syntheticContent.locator(":scope > h3.patch-change-heading"))
     .toHaveText("Emergency Response:");
   await expect(syntheticContent.locator(":scope > p.patch-change-paragraph"))
@@ -593,7 +594,7 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
   await expect(syntheticContent.locator(":scope > ol.patch-source-list > li"))
     .toHaveText(["First ordered item.", "Second ordered item."]);
   await expect(syntheticContent.locator(":scope > ul.patch-source-list")).toHaveCount(0);
-  const syntheticAbilityContent = page.locator(".patch-ability .patch-change-content");
+  const syntheticAbilityContent = page.locator(".hero-patch-section .patch-ability .patch-change-content");
   await expect(syntheticAbilityContent.locator(":scope > h4.patch-change-heading"))
     .toHaveText("Ability heading:");
   await expect(syntheticAbilityContent.locator(":scope > h3.patch-change-heading")).toHaveCount(0);
