@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-11-21
+- Last reviewed: 2026-11-22
 
 Read this page for live pins, pending release work, open QA gates and hard
 operational limits. Product contracts, procedures and detailed run evidence
@@ -11,24 +11,28 @@ belong in the linked owner documents below.
 ## Live and pending state
 
 - Production runs application source
+  `f500d04ddbdee97e3fa0843a71a60573ebd27d70` in release
+  `gha-44962373348-1-f500d04ddbde`; `previous` is source
   `91e59493901c186c0316eef912f5d9de7f7d11cb` in release
-  `gha-44919878014-1-91e59493901c`; `previous` is source
-  `59b6af86cc3e3215c47c03f76ff105951b4b8906` in release
-  `gha-44908202177-1-59b6af86cc3e`. Host-tools pin
+  `gha-44919878014-1-91e59493901c`. The current `dev` source is
+  `cc78e2f5c962a235074ff49c6e6bab1749b6b731`. Host-tools pin
   `d0f60dc1d93a463a529592ff8c7dd59de398cead` selects installed C23
   `23e76706728064defeff1024c48e939cd1a8f6bc` under manifest
   `production-host-tools-v4`; the prior AA4 generation
   `aa4f9e075156bd9aadb699eb3a13253e80daf79a` remains preserved. The active
   runtime manifest is v3 with Node 26.3.1. Alembic current and head are both
   `20261115_0056` (admin tournament test fixtures).
-- Source S passed exact-SHA Security run `44918125474/1` and the
-  restore-verified source-bound backup `44919533488/1`. AUTO
-  `44919430203/1` authenticated the cumulative Q-to-S range, verified the
-  existing C23 generation and dispatched the baseline-reconcile child
-  `44919878014/1`. The child installed S as an app-bearing release, with no
-  host-tools generation change. Its exact deployment receipt records mode
-  `baseline-reconcile`; use the deployment and backup runbooks for the
+- The active app release S passed exact-SHA Security run `44960656347/1`,
+  source-bound restore-verified backup `44962121912/1`, AUTO
+  `44961874268/1`, and production deployment `44962373348/1`. The deployment
+  completed successfully; use the deployment and backup runbooks for its
   source-bound receipts and recovery procedure.
+- Current `dev` source cc78 passed Security `44965031579/1`, source-bound
+  backup `44966253447/1`, AUTO `44965973383/1`, and production child
+  `44966535234/1`. The child was a successful authenticated `verified-noop`
+  for the full f500-to-cc78 range (`runtime_required=false`, artifact
+  `14732135289`); it did not replace the active app release S. It fixes future
+  ordinary-upgrade activation of the operator storage-retention timer.
 - Installed-origin API acceptance for patch `1848664643342973` passed: the
   Russian patch detail returns 27 changes, with the leaderboard heading at
   index 21, its four descriptions at indexes 22–25, and the Beta Season 2
@@ -62,37 +66,26 @@ belong in the linked owner documents below.
 
 ## QA and cleanup gates
 
-- The earlier automatic parent `44908919750/1` remains failed: its public child
-  `44908938481/1` exited during fixture provisioning before browser tests. The
-  old roster was later removed through the exact active-Q `recover-bundle`
-  procedure. S is an app-bearing baseline-reconcile release, so the automatic
-  post-deploy QA handoff was intentionally skipped and earns no pass credit.
-  The required standalone public and UserQA workflows were run against S.
-- Public S run `44921172350/1` passed with 47 cases passed, 10 skipped, and
-  zero failed, flaky or interrupted cases. Its sanitized report binds source
-  and app to S and records a successful child exit. The three prior
-  `patch_owner_sections` cases and the earlier image-inventory gate passed on S.
-  UserQA S run
-  `44922668026/1` passed its complete 1-case contour. The trusted EXIT cleanup
-  proved absence for its exact roster/session/tournament/media inventory and
-  removed the root-only run state; the workflow's bound success marker and
-  final summary passed. The exact root-only CSP bundle and mailbox helper were
-  retired under the release and LiveQA locks after that proof. No task-owned
-  fixture rows or credential files remain.
-- The earlier Q standalone public run `44911090229/1` failed
-  `image_csp_hosts` on `live-webkit-mobile`, at the image-inventory completion
-  assertion; its page-error state was absent and no cause was established.
-  S public QA passed that gate. Raw HTTP probing returned Cloudflare Error 1010
-  (`browser_signature_banned`), a blocked client signature rather than
-  evidence of an application route failure. Do not retry that raw probe or
-  weaken Cloudflare protections; use canonical browser QA for rendering
-  evidence.
-- Final read-only storage diagnostic `44924655082/1` passed for S. Release
-  locks were clear, services and the maintenance timer were healthy, and the
-  restore-verified backup was 0.931 hours old. The filesystem had 6,591,004,672
-  bytes free at 83.51% used, above the 5 GiB/90% limits. The LiveQA cache preview
-  had zero candidates. Seven unrelated release-retention candidates remained
-  in the preview; no general release pruning was performed.
+- Public S run `44963028353/1` passed with 47 cases passed, 10 skipped, and
+  zero failed, flaky or interrupted cases. UserQA S run `44963545588/1` passed
+  its complete 1-case contour, and automatic parent `44963009243/1` succeeded.
+  The exact QA credential files were retired through the documented owner
+  procedure. This QA evidence applies to f500; the cc78 verified-noop does
+  not receive new application QA credit.
+- The operator storage-retention timer is installed, enabled and active. Its
+  service completed a successful apply; the timer uses the reviewed resource
+  limits of 25% CPU, 512 MiB memory and 30 minutes. Exact one-time cleanup
+  removed 69 obsolete registered worktrees; the canonical checkout is the
+  sole registered worktree. Maintenance run `44967525771` succeeded against
+  active release f500 using the authenticated cc78 verified-noop binding. It
+  removed five reviewed unpinned obsolete releases while protecting current
+  and previous. The fresh canonical preview is healthy with current and
+  previous protected, six releases retained, no release deletions pending,
+  one runtime cache retained and no transient candidates. Exactly one complete
+  restore-verified backup pair is retained. The filesystem is 47% used with
+  20,530,745,344 bytes available; the current/previous releases are f500/91e594,
+  services are healthy, and no release transaction is present. The retention
+  timer is active and enabled; its post-apply preview found zero candidates.
   Human Chrome and real Cloudflare challenge/scoring remain optional
   diagnostics; the CI Siteverify fixture does not establish production
   Cloudflare scoring.
