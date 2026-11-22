@@ -72,7 +72,13 @@ to `dev`. The chain is:
    baseline's latest bot-authored deploy marker, attempt URL and successful exact
    `Deploy production` job. Legacy slugs require root validation, GitHub attempt 1
    and passing exact checks; unknown formats, reruns and ambiguity fail closed.
-   A no-backup child requires a strict docs-only incremental route plus `cumulative_no_op=true` and `runtime_required=false`, or fails before build or receipt. Recovery-bootstrap, candidate-packaging, storage and ordinary deploy routes retain the exact source-bound backup gate. The authenticated no-op receipt binds workflow SHA to active app baseline and may authorize live QA against that unchanged app; the recovery-bootstrap publisher's skip receipt is separate.
+   A no-backup child requires a strict docs-only incremental route and a canonical cumulative manifest for the full active-app-baseline-to-target range:
+   `class=docs-only`, `fallback=false`, exact `docs` and
+   `verification-contract` gates, reason `strict platform/docs-only change`,
+   paths only under `platform/docs`, `cumulative_no_op=true` and
+   `runtime_required=false`; otherwise fail before build/receipt. A prior
+   recovery-bootstrap no-op does not advance/reset the active baseline or remove
+   range paths. Any other class invalidates this route; use a separate valid route with required gates, backup and proofs. Other routes keep source-bound backup; the recovery-bootstrap skip receipt is separate from the authenticated no-op receipt for the unchanged app.
    The closed recovery-bootstrap family includes `platform/tools/platform_cpu_diagnostic_pair.py` as a runner-side diagnostic entry point; it is not imported by application packages. This exact path grants no-op treatment only when every cumulative changed path remains in the closed recovery family or documentation, and any application/runtime path keeps the deploy route.
 5. After Security, classifier and any required backup proofs pass, a secret-free prerequisite validates the exact classifier artifact before the production child builds `TARGET_SHA` once.
    The production environment then repeats that exact-SHA validation immediately
