@@ -123,7 +123,7 @@ The trusted `platform_live_browser_qa.sh public` stdout is a fixed three-line pr
 
 Both child workflows and UserQA cleanup/absence must pass for QA credit. A failed launch earns no credit; route by trusted evidence and never reuse an uncertain roster:
 
-- A pre-roster provision refusal preserves the prior bundle. Use the [`provision=false` Public QA and UserQA route](csp-live-qa-failed-provision-recovery.md).
+- A pre-roster provision refusal preserves the prior bundle. Use the [`provision=false` Public QA and UserQA route](csp-live-qa-failed-provision-recovery.md). If that read-only Public run ends in a confirmed terminal browser failure, its trusted supervisor publishes the exact retained-roster recovery inventory and reports `recovery_required`; it does not mutate database rows. Run the exact-state recovery below immediately, without waiting for stale-bundle age. The Public result stays failed and earns no QA credit.
 - After provisioning, automatic cleanup requires trusted `failed/browser_qa` status, complete
   non-interrupted counts proving a failed/timed-out attempt, a closed child diagnostic, and
   successful trusted teardown. A count may say `run_status=passed` when its validated failure
@@ -140,7 +140,7 @@ Both child workflows and UserQA cleanup/absence must pass for QA credit. A faile
   [stale-bundle recovery](liveqa-stale-bundle-recovery.md) only when age and exact-roster
   preconditions hold.
 
-Start another run only after cleanup/absence or canonical recovery. Public failure is never UserQA success. After successful UserQA, follow [post-UserQA cleanup](liveqa-post-userqa-cleanup.md).
+For confirmed `provision=false` terminal failure, exact recovery removes the 13 QA users and validated QA-owned data, proves absence, then removes the state; only the two fixed bundle/helper files remain as metadata for the next locked fresh-marker provision, which replaces them after exact absence without a four-hour wait. Those two files do not accumulate. Start another run only after cleanup/absence or canonical recovery. Public failure is never UserQA success. After successful UserQA, follow [post-UserQA cleanup](liveqa-post-userqa-cleanup.md).
 
 The credential-bearing journey never runs a candidate checkout or unverified mailbox helper. The source-only `liveqa-runtime` manifest v3 adds confined declared `engine_links` to the v2 keys (no `source_sha`); its engine-tree digest uses the typed, domain-separated `oldsparky-liveqa-engine-v2` encoding for regular-file digests and exact symlink targets. The provider manifest v2 binds `source_sha`, carries the same link map and installs candidate-owned bytes under `provider-runtime`; prior complete v1 generations remain immutable at `runtime` and may serve only when their exact engine map and package-lock digest match. Activation checks Node 26.3.1, package lock, required Playwright packages, browser roots, Chromium sandbox and the exact file/link maps under the release lock, then records the provider generation in the digest-bound payload before switching active. Missing, stale or incompatible providers fail closed; no environment or candidate-checkout path is trusted. Provider hashing stays bounded by signed member limits; release bootstrap validates the full archive before omitting only the wheelhouse and standalone web bundle from its temporary control tree. For missing-provider recovery, see the [provider recovery runbook](liveqa-provider-recovery.md).
 

@@ -10,30 +10,19 @@ belong in the linked owner documents below.
 
 ## Live and pending state
 
-- Production still runs application source
-  `d7101ad3a7d07a31125370ef57c4cfc1bbefe242` in release
-  `gha-45013430287-1-d7101ad3a7d0`. Host-tools generation C
+- Production runs application source F
+  `a67a92e83928fb47b4658813ad560726b51be113` in release
+  `gha-45037938697-1-a67a92e83928`, deployed by automatic child
+  `45037938697/1`. Host-tools generation C
   `da9981d6a7e97ec6aeea8501b02218f6d78fb50f` is installed and its pinned
-  `host-capabilities` self-test passed. The active runtime manifest is v3
-  with Node 26.3.1. Alembic current and head are both `20261115_0056` (admin
-  tournament test fixtures).
-- Current `dev` source Q is
-  `f8b671c8fadefff53af443f677597e53e9a00d6c`. Its exact-SHA Security run
-  `45020672563/1` and source-bound restore-verified backup `45022111071/1`
-  passed, and the full post-install Q preflight `45027305842/1` passed.
-  Automatic deployment run `45021664261/2` failed
-  during host-tools bundle attestation with the external transparency-log
-  response `InternalError: error fetching tlog entry - (404) Not Found`,
-  before readiness or app-child creation. Q is not deployed and has no
-  production QA credit; the live app remains D above. AUTO attempt 2 is the
-  final retry of that parent; no further retry is authorized. After the
-  reviewed documentation update is published, the supported path is an
-  automatic baseline-reconcile for the cumulative D-to-new-source range. The
-  documentation-only incremental range is classified as recovery-bootstrap
-  and is not deployment authority. AUTO must authenticate the cumulative
-  app-bearing range as full, deployable and runtime-sensitive, then require
-  its exact runtime proof before the baseline-reconcile production install.
-  Follow the
+  `host-capabilities` self-test passed.
+- Current `dev` source F is
+  `a67a92e83928fb47b4658813ad560726b51be113`. Its exact-SHA Security run
+  `45036341333/1`, source-bound restore-verified backup `45037634185/1`,
+  AUTO `45037569214/1`, and production child `45037938697/1` passed. The
+  active release health check reported API, web, worker, nginx, PostgreSQL
+  and Redis active, with API live/ready and web returning 200; no release
+  operation remains pending. See the
   [deployment runbook](deployment-runbook.md) and host-tools ADRs for the
   source-bound procedure.
 - Installed-origin API acceptance for patch `1848664643342973` passed: the
@@ -69,10 +58,24 @@ belong in the linked owner documents below.
 
 ## QA and cleanup gates
 
-- Public and UserQA evidence currently applies to D, not Q. The attempt to
-  deploy Q stopped before an app child, so no Public/UserQA run or production
-  QA credit exists for Q. Any previous QA evidence and credential-retirement
-  receipts remain owned by the deployment and CSP/live-QA runbooks.
+- After successful roster provisioning, the deployed release includes
+  automatic exact cleanup for a confirmed terminal Public failure and
+  preserves the fixed browser-output protocol.
+  Public R run `45032463634/1` exercised
+  `public_failure_cleanup.status=cleaned`, proving exact roster/test-data
+  absence and recovery-state removal. Current F QA remains unpassed: parent
+  `45038678297/1` and Public child `45038706581/1` failed during provision;
+  standalone Public runs `45039012506/1` and `45041569227/1` both failed at
+  `image_csp_hosts` on `live-webkit-mobile` (57 cases: 46 passed, 10 skipped,
+  1 failed; no timeout, flaky or interruption). No UserQA or QA credit exists
+  for F. These standalone runs used `provision=false`; the retained bundle
+  and roster bound to marker `liveqa-r20261122-1435-retry1` were not changed,
+  and no post-run retention operation has completed.
+- An anonymous HTTP check of the homepage, home API and nine unique image URLs
+  found HTTP 200, permitted image hosts in the page CSP, valid image MIME
+  types and successful image decoding. It did not identify the WebKit image
+  reported as unloaded or establish a cause; the browser issue remains
+  unresolved. See the CSP/live-QA runbook for the supported recovery path.
 - The operator storage-retention timer is installed, enabled and active. Its
   service completed a successful apply; the timer uses the reviewed resource
   limits of 25% CPU, 512 MiB memory and 30 minutes. Exact one-time cleanup

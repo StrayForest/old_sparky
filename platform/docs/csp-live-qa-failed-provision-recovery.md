@@ -37,6 +37,12 @@ suite still runs normal source, engine, recovery-state, runtime and browser
 checks and does not consume roster credentials. This standalone result does
 not change the failed sequencer outcome.
 
+If Public reaches a confirmed terminal browser failure, the trusted supervisor
+reports `public_failure_cleanup.status=recovery_required` with the exact state
+basename. Run the [exact-state recovery](csp-live-qa-runbook.md#exact-liveqa-state-recovery)
+immediately; it performs database cleanup under canonical locks without a
+stale-age wait. The Public result remains failed, and UserQA must not start.
+
 ## Gate UserQA on exact preflight
 
 Dispatch UserQA only after this public suite passes. Its canonical preflight

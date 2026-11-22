@@ -551,6 +551,303 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             self.assertRegex(state_name, r"^live-user-qa\.[A-Za-z0-9]{6}$")
             self.assertTrue((bundle.parent / state_name / "inventory.json").is_file())
 
+    def test_retained_public_failure_recovery_state_keeps_launch_and_bundle_markers_distinct(self) -> None:
+        source_sha = "a" * 40
+        app_sha = "b" * 40
+        bundle_marker = "liveqa-retained-owned-123456"
+        empty_marker_sha = hashlib.sha256(b"").hexdigest()
+        helper = Path("/root/.oldsparky/liveqa/platform_live_qa_mailbox_helper.py")
+        bundle = Path("/root/.oldsparky/liveqa/csp-live-qa.json")
+        platform_root = Path(f"/root/.oldsparky/liveqa/releases/{app_sha}/platform")
+        roster_ids = tuple(
+            f"{index:08d}-0000-4000-8000-{index:012d}"
+            for index in range(1, 14)
+        )
+        fingerprint = hashlib.sha256(
+            "\n".join((source_sha, app_sha, bundle_marker, str(helper), *roster_ids)).encode("ascii")
+        ).hexdigest()
+
+        def counts_line(status: str = "failed", *, marker_sha: str = empty_marker_sha) -> str:
+            values = {
+                "logical_total": 1,
+                "logical_pass": 0,
+                "logical_fail": 1,
+                "logical_expected_fail": 0,
+                "logical_flaky": 0,
+                "logical_skip": 0,
+                "logical_interrupted": 0,
+                "attempt_total": 1,
+                "attempt_pass": 0,
+                "attempt_fail": 1,
+                "attempt_skip": 0,
+                "attempt_interrupted": 0,
+                "attempt_timedout": 0,
+            }
+            return (
+                f"LIVE_BROWSER_COUNTS schema=1 run_status={status} "
+                + " ".join(
+                    f"{field}={values[field]}"
+                    for field in platform_live_qa_guard.LIVE_BROWSER_COUNT_FIELDS
+                )
+                + f" source_sha={source_sha} app_sha={app_sha} marker_sha256={marker_sha}"
+            )
+
+        with patch.dict(
+            os.environ,
+            {
+                "PLATFORM_LIVE_QA_RUNNER_SHA": source_sha,
+                "PLATFORM_LIVE_QA_MARKER_SHA256": empty_marker_sha,
+            },
+            clear=False,
+        ), patch.object(platform_live_qa_guard, "_assert_release_lock_supervisor"), \
+            patch.object(platform_live_qa_guard, "assert_bundle_lock") as assert_lock, \
+            patch.object(platform_live_qa_guard, "assert_no_recovery_state") as assert_no_state, \
+            patch.object(platform_live_qa_guard, "assert_liveqa_idle") as assert_idle, \
+            patch.object(
+                platform_live_qa_guard,
+                "_active_live_qa_bundle_roster",
+                return_value=(bundle_marker, helper, roster_ids),
+            ) as read_roster, patch.object(
+                platform_live_qa_guard,
+                "_publish_root_state",
+                return_value=Path("/root/.oldsparky/liveqa/live-user-qa.Abc123"),
+            ) as publish_state:
+            state = platform_live_qa_guard.prepare_confirmed_retained_public_failure_recovery_state(
+                bundle,
+                platform_root=platform_root,
+                target_sha=app_sha,
+                source_sha=source_sha,
+                expected_roster_fingerprint=fingerprint,
+                count_line=counts_line(),
+                diagnostic_kind="failure_report_published",
+                diagnostic_child_exit="1",
+                teardown_line="LIVE_PUBLIC_BROWSER_TEARDOWN schema=1 status=complete",
+                lock_fd=7,
+            )
+        self.assertEqual(state.name, "live-user-qa.Abc123")
+        assert_lock.assert_called_once_with(bundle, 7)
+        assert_no_state.assert_called_once_with(bundle, include_manual=True)
+        assert_idle.assert_called_once_with()
+        read_roster.assert_called_once_with(
+            bundle,
+            platform_root=platform_root,
+            target_sha=app_sha,
+            enforce_stale_age=False,
+        )
+        publish_state.assert_called_once_with(
+            bundle,
+            marker=bundle_marker,
+            roster_ids=roster_ids,
+            public_failure_cleanup_recovery=True,
+        )
+
+        for count_line, diagnostic, child_exit, teardown, expected in (
+            (
+                counts_line(marker_sha=hashlib.sha256(bundle_marker.encode("ascii")).hexdigest()),
+                "failure_report_published",
+                "1",
+                "complete",
+                "binding",
+            ),
+            (counts_line("interrupted"), "failure_report_published", "1", "complete", "partitions"),
+            (counts_line(), "child_timeout", "124", "complete", "diagnostic"),
+            (counts_line(), "failure_report_published", "1", "failed", "teardown"),
+        ):
+            with self.subTest(expected=expected), patch.dict(
+                os.environ,
+                {
+                    "PLATFORM_LIVE_QA_RUNNER_SHA": source_sha,
+                    "PLATFORM_LIVE_QA_MARKER_SHA256": empty_marker_sha,
+                },
+                clear=False,
+            ), patch.object(platform_live_qa_guard, "_assert_release_lock_supervisor"), \
+                patch.object(platform_live_qa_guard, "assert_bundle_lock"), \
+                patch.object(platform_live_qa_guard, "assert_no_recovery_state"), \
+                patch.object(platform_live_qa_guard, "assert_liveqa_idle"), \
+                patch.object(
+                    platform_live_qa_guard,
+                    "_active_live_qa_bundle_roster",
+                    return_value=(bundle_marker, helper, roster_ids),
+                ), patch.object(platform_live_qa_guard, "_publish_root_state") as refused_publish:
+                with self.assertRaises(platform_live_qa_guard.GuardError):
+                    platform_live_qa_guard.prepare_confirmed_retained_public_failure_recovery_state(
+                        bundle,
+                        platform_root=platform_root,
+                        target_sha=app_sha,
+                        source_sha=source_sha,
+                        expected_roster_fingerprint=fingerprint,
+                        count_line=count_line,
+                        diagnostic_kind=diagnostic,
+                        diagnostic_child_exit=child_exit,
+                        teardown_line=f"LIVE_PUBLIC_BROWSER_TEARDOWN schema=1 status={teardown}",
+                        lock_fd=7,
+                    )
+                refused_publish.assert_not_called()
+
+        for state_guard in ("assert_no_recovery_state", "assert_liveqa_idle"):
+            with self.subTest(state_guard=state_guard), patch.dict(
+                os.environ,
+                {
+                    "PLATFORM_LIVE_QA_RUNNER_SHA": source_sha,
+                    "PLATFORM_LIVE_QA_MARKER_SHA256": empty_marker_sha,
+                },
+                clear=False,
+            ), patch.object(platform_live_qa_guard, "_assert_release_lock_supervisor"), \
+                patch.object(platform_live_qa_guard, "assert_bundle_lock"), \
+                patch.object(platform_live_qa_guard, "assert_no_recovery_state") as no_state, \
+                patch.object(platform_live_qa_guard, "assert_liveqa_idle") as idle, \
+                patch.object(
+                    platform_live_qa_guard,
+                    "_active_live_qa_bundle_roster",
+                    return_value=(bundle_marker, helper, roster_ids),
+                ), patch.object(platform_live_qa_guard, "_publish_root_state") as refused_publish:
+                if state_guard == "assert_no_recovery_state":
+                    no_state.side_effect = platform_live_qa_guard.GuardError("existing state")
+                else:
+                    idle.side_effect = platform_live_qa_guard.GuardError("active QA")
+                with self.assertRaises(platform_live_qa_guard.GuardError):
+                    platform_live_qa_guard.prepare_confirmed_retained_public_failure_recovery_state(
+                        bundle,
+                        platform_root=platform_root,
+                        target_sha=app_sha,
+                        source_sha=source_sha,
+                        expected_roster_fingerprint=fingerprint,
+                        count_line=counts_line(),
+                        diagnostic_kind="failure_report_published",
+                        diagnostic_child_exit="1",
+                        teardown_line="LIVE_PUBLIC_BROWSER_TEARDOWN schema=1 status=complete",
+                        lock_fd=7,
+                    )
+                refused_publish.assert_not_called()
+
+    def test_stale_bundle_identity_validation_can_skip_age_without_weakening_stale_age(self) -> None:
+        marker = "liveqa-retained-owned-123456"
+        helper = Path("/root/.oldsparky/liveqa/platform_live_qa_mailbox_helper.py")
+        roster_ids = [
+            f"{index:08d}-0000-4000-8000-{index:012d}"
+            for index in range(1, 14)
+        ]
+        payload = {
+            "version": 1,
+            "marker": marker,
+            "created_at": platform_live_qa_guard.datetime.now(
+                platform_live_qa_guard.timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "email": "liveqa@auth.old-sparky.com",
+            "password": "valid-password-123",
+            "mailbox_helper": str(helper),
+            "roster_accounts": [
+                {
+                    "id": account_id,
+                    "email": f"qa{index}+{marker}@auth.old-sparky.com",
+                    "password": "valid-password-123",
+                }
+                for index, account_id in enumerate(roster_ids)
+            ],
+        }
+        bundle = Path("/root/.oldsparky/liveqa/csp-live-qa.json")
+        with patch.object(platform_live_qa_guard, "_bundle_marker_and_helper", return_value=(marker, helper)), \
+            patch.object(platform_live_qa_guard, "_read_private_json", return_value=payload):
+            actual_marker, actual_helper, actual_ids = platform_live_qa_guard._validated_live_qa_bundle_roster(
+                bundle,
+                enforce_stale_age=False,
+            )
+            self.assertEqual((actual_marker, actual_helper, actual_ids), (marker, helper, tuple(roster_ids)))
+            with self.assertRaisesRegex(platform_live_qa_guard.GuardError, "freshness window"):
+                platform_live_qa_guard._validated_live_qa_bundle_roster(
+                    bundle,
+                    enforce_stale_age=True,
+                )
+
+            malformed = dict(payload)
+            malformed["roster_accounts"] = [dict(account) for account in payload["roster_accounts"]]
+            malformed["roster_accounts"][0]["email"] = "unmarked@auth.old-sparky.com"
+            with patch.object(platform_live_qa_guard, "_read_private_json", return_value=malformed):
+                with self.assertRaisesRegex(platform_live_qa_guard.GuardError, "account is invalid"):
+                    platform_live_qa_guard._validated_live_qa_bundle_roster(
+                        bundle,
+                        enforce_stale_age=False,
+                    )
+
+    def test_provision_false_terminal_failure_reports_exact_recovery_state_only(self) -> None:
+        supervisor = (TOOLS_ROOT / "platform_live_launch_supervisor.sh").read_text(
+            encoding="utf-8"
+        )
+        fingerprint_at = supervisor.index("retained-public-failure-roster-fingerprint")
+        browser_at = supervisor.index('"$TOOLS_DIR/platform_live_browser_qa.sh" public')
+        self.assertLess(fingerprint_at, browser_at)
+        self.assertIn("prepare-confirmed-retained-public-failure-recovery-state", supervisor)
+
+        finalizer_start = supervisor.index("if (( browser_status != 0 )); then")
+        finalizer_end = supervisor.index('  exit "$browser_status"\nfi', finalizer_start)
+        finalizer = supervisor[finalizer_start : finalizer_end + len('  exit "$browser_status"\nfi')]
+        retained_branch_start = finalizer.index('elif [[ "$provision" == "false"')
+        retained_branch_end = finalizer.index('  fi\n  printf \'%s\\n\' "$cleanup_result"', retained_branch_start)
+        retained_branch = finalizer[retained_branch_start:retained_branch_end]
+        self.assertNotIn("cleanup-public-failure", retained_branch)
+        self.assertNotIn("platform_cleanup_live_user_qa.py", retained_branch)
+        self.assertIn("prepare-confirmed-retained-public-failure-recovery-state", retained_branch)
+
+        result = "LIVE_PUBLIC_FAILURE_CLEANUP schema=1 status=recovery_required state=live-user-qa.Abc123"
+        script = "\n".join(
+            (
+                "set -euo pipefail",
+                "provision=false",
+                "provisioned_here=0",
+                f"retained_roster_fingerprint={'d' * 64}",
+                "BUNDLE=/root/.oldsparky/liveqa/csp-live-qa.json",
+                "INSTALL_ROOT=/root/.oldsparky/liveqa/releases/" + "b" * 40,
+                "app_target_sha=" + "b" * 40,
+                "runner_sha=" + "a" * 40,
+                "marker_sha256=" + hashlib.sha256(b"").hexdigest(),
+                "TOOLS_DIR=/root/.oldsparky/liveqa/releases/" + "b" * 40 + "/platform/tools",
+                "browser_status=1",
+                "diagnostic_kind=failure_report_published",
+                "diagnostic_child_exit=1",
+                "teardown_line='LIVE_PUBLIC_BROWSER_TEARDOWN schema=1 status=complete'",
+                "count_line='LIVE_BROWSER_COUNTS schema=1 run_status=failed'",
+                f"env() {{ printf '%s\\n' {shlex.quote(result)}; return 0; }}",
+                "exec 3>&1",
+                finalizer,
+            )
+        )
+        invoked = subprocess.run(
+            ["/bin/bash", "-c", script],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=3,
+        )
+        self.assertEqual(invoked.returncode, 1)
+        self.assertEqual(invoked.stdout, result + "\n", f"stderr={invoked.stderr!r}")
+        self.assertEqual(invoked.stderr, "")
+
+        for values in (
+            ("2", "failure_report_published", "1", "complete"),
+            ("1", "child_timeout", "124", "complete"),
+            ("1", "failure_report_published", "1", "failed"),
+        ):
+            with self.subTest(values=values):
+                retry = script.replace("browser_status=1", f"browser_status={values[0]}")
+                retry = retry.replace("diagnostic_kind=failure_report_published", f"diagnostic_kind={values[1]}")
+                retry = retry.replace("diagnostic_child_exit=1", f"diagnostic_child_exit={values[2]}")
+                retry = retry.replace(
+                    "status=complete'",
+                    f"status={values[3]}'",
+                )
+                refused = subprocess.run(
+                    ["/bin/bash", "-c", retry],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=3,
+                )
+                self.assertEqual(refused.returncode, int(values[0]))
+                self.assertIn(
+                    "LIVE_PUBLIC_FAILURE_CLEANUP schema=1 status=not_attempted",
+                    refused.stdout,
+                )
+
     def test_failed_public_cleanup_state_publication_reports_exact_retained_path(self) -> None:
         with tempfile.TemporaryDirectory(prefix="liveqa-public-cleanup-state-") as directory:
             bundle = Path(directory) / "csp-live-qa.json"

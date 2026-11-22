@@ -255,6 +255,7 @@ env -i \
   PLATFORM_LIVE_QA_MARKER_SHA256="$marker_sha256" \
   "$TOOLS_DIR/platform_live_browser_qa.sh" engine-preflight
 
+retained_roster_fingerprint=""
 if [[ "$provision" == "true" ]]; then
   launch_stage="account_install"
   launch_check="account_install"
@@ -315,6 +316,28 @@ if [[ "$provision" == "true" ]]; then
 else
   provisioned_here=0
   provision_roster_fingerprint=""
+  launch_check="source_binding"
+  if retained_roster_fingerprint="$(env -i \
+    HOME=/root LANG=C.UTF-8 PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    PLATFORM_APP_DIR=/opt/oldsparky/platform \
+    PLATFORM_LIVE_CSP_QA_BUNDLE="$BUNDLE" \
+    PLATFORM_LIVE_QA_INSTALL_ROOT="$INSTALL_ROOT" \
+    PLATFORM_LIVE_QA_TARGET_SHA="$app_target_sha" \
+    PLATFORM_LIVE_QA_RUNNER_SHA="$runner_sha" \
+    PLATFORM_LIVE_QA_MARKER_SHA256="$marker_sha256" \
+    PLATFORM_RELEASE_LOCK_SUPERVISED=1 \
+    /usr/bin/python3.12 -I -B "$TOOLS_DIR/platform_live_qa_guard.py" \
+      retained-public-failure-roster-fingerprint \
+      --bundle-path "$BUNDLE" \
+      --platform-root "$INSTALL_ROOT/platform" \
+      --target-sha "$app_target_sha" \
+      --source-sha "$runner_sha")"; then
+    [[ "$retained_roster_fingerprint" =~ ^[0-9a-f]{64}$ ]] \
+      || { echo "Retained public roster fingerprint is invalid" >&2; exit 1; }
+  else
+    echo "Retained public roster identity could not be captured safely" >&2
+    exit 1
+  fi
 fi
 
 # Browser QA receives only the fixed public origin and installed generation
@@ -408,6 +431,45 @@ if (( browser_status != 0 )); then
     fi
     if (( cleanup_status == 0 )) \
       && [[ "$cleanup_output" == "LIVE_PUBLIC_FAILURE_CLEANUP schema=1 status=cleaned" ]]; then
+      cleanup_result="$cleanup_output"
+    elif (( cleanup_status != 0 )) \
+      && [[ "$cleanup_output" =~ ^LIVE_PUBLIC_FAILURE_CLEANUP\ schema=1\ status=recovery_required\ state=(live-user-qa\.[A-Za-z0-9]{6}|\.live-user-qa\.setup-[a-f0-9]{32})$ ]]; then
+      cleanup_result="$cleanup_output"
+    fi
+  elif [[ "$provision" == "false" \
+    && -n "$retained_roster_fingerprint" \
+    && "$browser_status" == "1" \
+    && "$diagnostic_kind" =~ ^(failure_report_published|failure_report_unavailable)$ \
+    && "$diagnostic_child_exit" =~ ^(0|1)$ \
+    && "$teardown_line" == "LIVE_PUBLIC_BROWSER_TEARDOWN schema=1 status=complete" ]]; then
+    cleanup_output=""
+    cleanup_status=0
+    if cleanup_output="$(env -i \
+      HOME=/root LANG=C.UTF-8 PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+      PLATFORM_APP_DIR=/opt/oldsparky/platform \
+      PLATFORM_LIVE_CSP_QA_BUNDLE="$BUNDLE" \
+      PLATFORM_LIVE_QA_INSTALL_ROOT="$INSTALL_ROOT" \
+      PLATFORM_LIVE_QA_TARGET_SHA="$app_target_sha" \
+      PLATFORM_LIVE_QA_RUNNER_SHA="$runner_sha" \
+      PLATFORM_LIVE_QA_MARKER_SHA256="$marker_sha256" \
+      PLATFORM_RELEASE_LOCK_SUPERVISED=1 \
+      /usr/bin/python3.12 -I -B "$TOOLS_DIR/platform_live_qa_guard.py" \
+      prepare-confirmed-retained-public-failure-recovery-state \
+      --bundle-path "$BUNDLE" \
+      --platform-root "$INSTALL_ROOT/platform" \
+      --target-sha "$app_target_sha" \
+      --source-sha "$runner_sha" \
+      --expected-roster-fingerprint "$retained_roster_fingerprint" \
+      --count-line "$count_line" \
+      --diagnostic-kind "$diagnostic_kind" \
+      --diagnostic-child-exit "$diagnostic_child_exit" \
+      --teardown-line "$teardown_line")"; then
+      cleanup_status=0
+    else
+      cleanup_status=$?
+    fi
+    if (( cleanup_status == 0 )) \
+      && [[ "$cleanup_output" =~ ^LIVE_PUBLIC_FAILURE_CLEANUP\ schema=1\ status=recovery_required\ state=live-user-qa\.[A-Za-z0-9]{6}$ ]]; then
       cleanup_result="$cleanup_output"
     elif (( cleanup_status != 0 )) \
       && [[ "$cleanup_output" =~ ^LIVE_PUBLIC_FAILURE_CLEANUP\ schema=1\ status=recovery_required\ state=(live-user-qa\.[A-Za-z0-9]{6}|\.live-user-qa\.setup-[a-f0-9]{32})$ ]]; then

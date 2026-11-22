@@ -2271,52 +2271,31 @@ def prepare_confirmed_public_failure_cleanup_state(
     )
 
 
-def _validated_stale_bundle_roster(
-    bundle_path: Path, *, platform_root: Path, target_sha: str
-) -> tuple[str, tuple[str, ...]]:
-    """Validate the fixed expired bundle for exact roster-only cleanup."""
-
-    install_root = Path(os.environ.get("PLATFORM_LIVE_QA_INSTALL_ROOT", ""))
-    if (
-        bundle_path != TRUSTED_SECRET_ROOT / "csp-live-qa.json"
-        or platform_root != install_root / "platform"
-        or install_root != TRUSTED_PAYLOAD_ROOT / target_sha
-        or target_sha != install_root.name
-        or os.environ.get("PLATFORM_LIVE_QA_TARGET_SHA") != target_sha
-        or os.environ.get("PLATFORM_APP_DIR") != str(APP_DIR)
-        or os.environ.get("PLATFORM_LIVE_CSP_QA_BUNDLE") != str(bundle_path)
-    ):
-        raise GuardError("stale-bundle cleanup target is not the fixed active payload")
-    _validate_installed_payload_root(install_root, target_sha=target_sha)
-    if _active_release_commit() != target_sha:
-        raise GuardError("stale-bundle cleanup target is not the active app release")
+def _validated_live_qa_bundle_roster(
+    bundle_path: Path,
+    *,
+    enforce_stale_age: bool,
+) -> tuple[str, Path, tuple[str, ...]]:
+    """Validate retained bundle identity and credentials without exposing them."""
 
     marker, helper = _bundle_marker_and_helper(bundle_path)
-    expected_helper = TRUSTED_SECRET_ROOT / "platform_live_qa_mailbox_helper.py"
-    if helper != expected_helper:
-        raise GuardError("stale bundle mailbox helper is not the active fixed helper")
-    _verify_active_immutable_helper_binding(
-        platform_root=platform_root,
-        installed_helper=helper,
-    )
-
     payload = _read_private_json(bundle_path)
     created_at = payload.get("created_at")
     if (
         not isinstance(created_at, str)
         or re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", created_at) is None
     ):
-        raise GuardError("stale bundle timestamp is invalid")
+        raise GuardError("live QA bundle timestamp is invalid")
     try:
         created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
     except ValueError as exc:
-        raise GuardError("stale bundle timestamp is invalid") from exc
+        raise GuardError("live QA bundle timestamp is invalid") from exc
     if created.tzinfo is None:
-        raise GuardError("stale bundle timestamp is invalid")
+        raise GuardError("live QA bundle timestamp is invalid")
     age_seconds = (datetime.now(timezone.utc) - created.astimezone(timezone.utc)).total_seconds()
     if age_seconds < -MAX_LIVE_QA_BUNDLE_FUTURE_SKEW_SECONDS:
-        raise GuardError("stale bundle timestamp is in the future")
-    if age_seconds <= MAX_LIVE_QA_BUNDLE_AGE_SECONDS:
+        raise GuardError("live QA bundle timestamp is in the future")
+    if enforce_stale_age and age_seconds <= MAX_LIVE_QA_BUNDLE_AGE_SECONDS:
         raise GuardError("live QA bundle is still within its normal freshness window")
 
     def validate_password(value: object) -> bool:
@@ -2336,16 +2315,16 @@ def _validated_stale_bundle_roster(
         or marker in top_email.lower()
         or not validate_password(payload.get("password"))
     ):
-        raise GuardError("stale bundle credential schema is invalid")
+        raise GuardError("live QA bundle credential schema is invalid")
 
     accounts = payload.get("roster_accounts")
     if not isinstance(accounts, list) or len(accounts) != 13:
-        raise GuardError("stale bundle roster schema is invalid")
+        raise GuardError("live QA bundle roster schema is invalid")
     ids: list[str] = []
     emails: set[str] = set()
     for account in accounts:
         if not isinstance(account, dict) or set(account) != {"id", "email", "password"}:
-            raise GuardError("stale bundle roster account schema is invalid")
+            raise GuardError("live QA bundle roster account schema is invalid")
         account_id = account.get("id")
         account_email = account.get("email")
         if (
@@ -2361,12 +2340,145 @@ def _validated_stale_bundle_roster(
             or account_email in emails
             or not validate_password(account.get("password"))
         ):
-            raise GuardError("stale bundle roster account is invalid")
+            raise GuardError("live QA bundle roster account is invalid")
         ids.append(account_id)
         emails.add(account_email)
     if len(set(ids)) != 13:
-        raise GuardError("stale bundle roster IDs are not unique")
-    return marker, tuple(ids)
+        raise GuardError("live QA bundle roster IDs are not unique")
+    return marker, helper, tuple(ids)
+
+
+def _active_live_qa_bundle_roster(
+    bundle_path: Path,
+    *,
+    platform_root: Path,
+    target_sha: str,
+    enforce_stale_age: bool,
+) -> tuple[str, Path, tuple[str, ...]]:
+    install_root = Path(os.environ.get("PLATFORM_LIVE_QA_INSTALL_ROOT", ""))
+    if (
+        bundle_path != TRUSTED_SECRET_ROOT / "csp-live-qa.json"
+        or platform_root != install_root / "platform"
+        or install_root != TRUSTED_PAYLOAD_ROOT / target_sha
+        or target_sha != install_root.name
+        or os.environ.get("PLATFORM_LIVE_QA_TARGET_SHA") != target_sha
+        or os.environ.get("PLATFORM_APP_DIR") != str(APP_DIR)
+        or os.environ.get("PLATFORM_LIVE_CSP_QA_BUNDLE") != str(bundle_path)
+    ):
+        raise GuardError("live QA cleanup target is not the fixed active payload")
+    _validate_installed_payload_root(install_root, target_sha=target_sha)
+    if _active_release_commit() != target_sha:
+        raise GuardError("live QA cleanup target is not the active app release")
+
+    marker, helper, roster_ids = _validated_live_qa_bundle_roster(
+        bundle_path,
+        enforce_stale_age=enforce_stale_age,
+    )
+    expected_helper = TRUSTED_SECRET_ROOT / "platform_live_qa_mailbox_helper.py"
+    if helper != expected_helper:
+        raise GuardError("live QA mailbox helper is not the active fixed helper")
+    _verify_active_immutable_helper_binding(
+        platform_root=platform_root,
+        installed_helper=helper,
+    )
+    return marker, helper, roster_ids
+
+
+def _retained_public_failure_roster_fingerprint(
+    bundle_path: Path,
+    *,
+    platform_root: Path,
+    target_sha: str,
+    source_sha: str,
+) -> str:
+    if (
+        os.environ.get("PLATFORM_LIVE_QA_RUNNER_SHA") != source_sha
+        or not SHA1_RE.fullmatch(source_sha)
+    ):
+        raise GuardError("retained public failure source binding is invalid")
+    marker, helper, roster_ids = _active_live_qa_bundle_roster(
+        bundle_path,
+        platform_root=platform_root,
+        target_sha=target_sha,
+        enforce_stale_age=False,
+    )
+    fingerprint_input = "\n".join(
+        (source_sha, target_sha, marker, str(helper), *roster_ids)
+    ).encode("ascii")
+    return hashlib.sha256(fingerprint_input).hexdigest()
+
+
+def prepare_confirmed_retained_public_failure_recovery_state(
+    bundle_path: Path,
+    *,
+    platform_root: Path,
+    target_sha: str,
+    source_sha: str,
+    expected_roster_fingerprint: str,
+    count_line: str,
+    diagnostic_kind: str,
+    diagnostic_child_exit: str,
+    teardown_line: str,
+    lock_fd: int,
+) -> Path:
+    """Publish exact recovery inventory without mutating retained QA rows."""
+
+    _assert_release_lock_supervisor()
+    assert_bundle_lock(bundle_path, lock_fd)
+    empty_marker_sha256 = hashlib.sha256(b"").hexdigest()
+    if (
+        os.environ.get("PLATFORM_LIVE_QA_RUNNER_SHA") != source_sha
+        or not SHA1_RE.fullmatch(source_sha)
+        or not SHA1_RE.fullmatch(target_sha)
+        or os.environ.get("PLATFORM_LIVE_QA_MARKER_SHA256") != empty_marker_sha256
+    ):
+        raise GuardError("retained public failure source binding is invalid")
+    _validate_confirmed_public_failure_counts(
+        count_line,
+        diagnostic_kind,
+        diagnostic_child_exit,
+        teardown_line,
+        expected_source_sha=source_sha,
+        expected_app_sha=target_sha,
+        expected_marker_sha256=empty_marker_sha256,
+    )
+    if not SHA256_RE.fullmatch(expected_roster_fingerprint):
+        raise GuardError("retained public failure roster fingerprint is invalid")
+    assert_no_recovery_state(bundle_path, include_manual=True)
+    assert_liveqa_idle()
+    marker, helper, roster_ids = _active_live_qa_bundle_roster(
+        bundle_path,
+        platform_root=platform_root,
+        target_sha=target_sha,
+        enforce_stale_age=False,
+    )
+    fingerprint_input = "\n".join(
+        (source_sha, target_sha, marker, str(helper), *roster_ids)
+    ).encode("ascii")
+    if not secrets.compare_digest(
+        hashlib.sha256(fingerprint_input).hexdigest(), expected_roster_fingerprint
+    ):
+        raise GuardError("retained public failure roster changed during the run")
+    return _publish_root_state(
+        bundle_path,
+        marker=marker,
+        roster_ids=roster_ids,
+        public_failure_cleanup_recovery=True,
+    )
+
+
+def _validated_stale_bundle_roster(
+    bundle_path: Path, *, platform_root: Path, target_sha: str
+) -> tuple[str, tuple[str, ...]]:
+    """Validate the fixed expired bundle for exact roster-only cleanup."""
+
+    marker, _helper, roster_ids = _active_live_qa_bundle_roster(
+        bundle_path,
+        platform_root=platform_root,
+        target_sha=target_sha,
+        enforce_stale_age=True,
+    )
+    return marker, roster_ids
 
 
 def _publish_root_state(
@@ -8440,6 +8552,13 @@ def _parser() -> argparse.ArgumentParser:
     public_fingerprint.add_argument("--platform-root", type=Path, required=True)
     public_fingerprint.add_argument("--target-sha", required=True)
     public_fingerprint.add_argument("--marker", required=True)
+    retained_public_fingerprint = commands.add_parser(
+        "retained-public-failure-roster-fingerprint"
+    )
+    retained_public_fingerprint.add_argument("--bundle-path", type=Path, required=True)
+    retained_public_fingerprint.add_argument("--platform-root", type=Path, required=True)
+    retained_public_fingerprint.add_argument("--target-sha", required=True)
+    retained_public_fingerprint.add_argument("--source-sha", required=True)
     public_cleanup = commands.add_parser(
         "prepare-confirmed-public-failure-cleanup-state"
     )
@@ -8454,6 +8573,18 @@ def _parser() -> argparse.ArgumentParser:
     public_cleanup.add_argument("--diagnostic-child-exit", required=True)
     public_cleanup.add_argument("--teardown-line", required=True)
     public_cleanup.add_argument("--fd", type=int, required=True)
+    retained_public_recovery = commands.add_parser(
+        "prepare-confirmed-retained-public-failure-recovery-state"
+    )
+    retained_public_recovery.add_argument("--bundle-path", type=Path, required=True)
+    retained_public_recovery.add_argument("--platform-root", type=Path, required=True)
+    retained_public_recovery.add_argument("--target-sha", required=True)
+    retained_public_recovery.add_argument("--source-sha", required=True)
+    retained_public_recovery.add_argument("--expected-roster-fingerprint", required=True)
+    retained_public_recovery.add_argument("--count-line", required=True)
+    retained_public_recovery.add_argument("--diagnostic-kind", required=True)
+    retained_public_recovery.add_argument("--diagnostic-child-exit", required=True)
+    retained_public_recovery.add_argument("--teardown-line", required=True)
     asserted = commands.add_parser("assert-lock")
     asserted.add_argument("--bundle-path", type=Path, required=True)
     asserted.add_argument("--fd", type=int, required=True)
@@ -8608,6 +8739,26 @@ def main(argv: Iterable[str] | None = None) -> int:
             finally:
                 os.close(descriptor)
             return 0
+        if args.command == "retained-public-failure-roster-fingerprint":
+            _assert_release_lock_supervisor()
+            if os.environ.get("PLATFORM_LIVE_QA_MARKER_SHA256") != hashlib.sha256(b"").hexdigest():
+                raise GuardError("retained public QA requires an empty launch marker")
+            descriptor = _open_bundle_lock(args.bundle_path)
+            try:
+                assert_bundle_lock(args.bundle_path, descriptor)
+                assert_no_recovery_state(args.bundle_path, include_manual=True)
+                assert_liveqa_idle()
+                print(
+                    _retained_public_failure_roster_fingerprint(
+                        args.bundle_path,
+                        platform_root=args.platform_root,
+                        target_sha=args.target_sha,
+                        source_sha=args.source_sha,
+                    )
+                )
+            finally:
+                os.close(descriptor)
+            return 0
         if args.command == "prepare-confirmed-public-failure-cleanup-state":
             print(
                 prepare_confirmed_public_failure_cleanup_state(
@@ -8624,6 +8775,29 @@ def main(argv: Iterable[str] | None = None) -> int:
                     lock_fd=args.fd,
                 )
             )
+            return 0
+        if args.command == "prepare-confirmed-retained-public-failure-recovery-state":
+            descriptor = _open_bundle_lock(args.bundle_path)
+            try:
+                assert_bundle_lock(args.bundle_path, descriptor)
+                state = prepare_confirmed_retained_public_failure_recovery_state(
+                    args.bundle_path,
+                    platform_root=args.platform_root,
+                    target_sha=args.target_sha,
+                    source_sha=args.source_sha,
+                    expected_roster_fingerprint=args.expected_roster_fingerprint,
+                    count_line=args.count_line,
+                    diagnostic_kind=args.diagnostic_kind,
+                    diagnostic_child_exit=args.diagnostic_child_exit,
+                    teardown_line=args.teardown_line,
+                    lock_fd=descriptor,
+                )
+                print(
+                    "LIVE_PUBLIC_FAILURE_CLEANUP schema=1 status=recovery_required "
+                    f"state={state.name}"
+                )
+            finally:
+                os.close(descriptor)
             return 0
         if args.command == "assert-lock":
             assert_bundle_lock(args.bundle_path, args.fd)
