@@ -401,4 +401,4 @@ if (( count_status != 0 )); then
   exit 1
 fi
 
-printf 'LIVE_BROWSER_QA_SUCCESS source_commit=%s\n' "$SOURCE_COMMIT"
+printf 'LIVE_BROWSER_QA_SUCCESS source_commit=%s\n' "$SOURCE_COMMIT" >&2

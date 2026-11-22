@@ -2984,6 +2984,29 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 timeout=3,
             )
 
+        def run_supervisor_output(
+            child_output: str, *, child_status: int = 0
+        ) -> subprocess.CompletedProcess[str]:
+            teardown_record = "LIVE_PUBLIC_BROWSER_TEARDOWN schema=1 status=complete"
+            script = "\n".join(
+                (
+                    "set -euo pipefail",
+                    f"browser_output={shlex.quote(child_output.rstrip(chr(10)) + chr(10) + teardown_record)}",
+                    f"browser_status={child_status}",
+                    "exec 3>&1",
+                    "printf '%s\\n' \"${browser_output%%$'\\n'*}\" >&3",
+                    supervisor_diagnostic_block,
+                    "printf 'RESULT=%s\\n' \"$browser_status\"",
+                )
+            )
+            return subprocess.run(
+                ["/bin/bash", "-c", script],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=3,
+            )
+
         bounded_supervisor_token = "A" * (12 * 1024)
         bounded_supervisor_diagnostic = run_supervisor_diagnostic(
             bounded_supervisor_token
@@ -3251,9 +3274,33 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 0, passing_counts_line, preflight=True
             )
             self.assertEqual(passing_after_preflight.returncode, 0)
-            self.assertIn("LIVE_BROWSER_QA_SUCCESS", passing_after_preflight.stdout)
+            self.assertNotIn("LIVE_BROWSER_QA_SUCCESS", passing_after_preflight.stdout)
+            self.assertIn("LIVE_BROWSER_QA_SUCCESS", passing_after_preflight.stderr)
             self.assertNotIn("failure_report_unavailable", passing_after_preflight.stdout)
             self.assertEqual(passing_counts.read_text(encoding="ascii"), passing_counts_line + "\n")
+            self.assertEqual(
+                passing_after_preflight.stdout.splitlines(),
+                [
+                    passing_counts_line,
+                    "LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=none "
+                    "stdout_bytes=0 stderr_bytes=0 truncated=false child_exit=0",
+                ],
+            )
+            passing_supervisor_output = run_supervisor_output(
+                passing_after_preflight.stdout
+            )
+            self.assertEqual(passing_supervisor_output.returncode, 0)
+            self.assertIn(
+                "RESULT=0\n",
+                passing_supervisor_output.stdout,
+                f"wrapper_output={passing_after_preflight.stdout!r} "
+                f"supervisor_output={passing_supervisor_output.stdout!r}",
+            )
+            self.assertIn(passing_counts_line, passing_supervisor_output.stdout)
+            self.assertIn(
+                "LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=none",
+                passing_supervisor_output.stdout,
+            )
         self.assertIn("LIVE_LAUNCH_STATUS schema=2", supervisor)
         self.assertIn('required = ("oldsparky-platform",)', supervisor)
         self.assertIn('exec 3>&1', supervisor)
@@ -3974,11 +4021,16 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             )
             + "\n"
         )
+        success_diagnostic = (
+            "LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=none "
+            "stdout_bytes=0 stderr_bytes=0 truncated=false child_exit=0\n"
+        )
         passed_report = sanitize_status(
-            (counts_line + good_status + "\n").encode(), 0
+            (counts_line + success_diagnostic + good_status + "\n").encode(), 0
         )
         self.assertEqual(passed_report["status"], "passed")
         self.assertTrue(passed_report["success"])
+        self.assertEqual(passed_report["child_diagnostic"]["kind"], "none")
         self.assertEqual(passed_report["failure_reason"], "none")
         self.assertEqual(passed_report["test_count"], 47)
         self.assertEqual(passed_report["logical_counts"]["logical_total"], 57)

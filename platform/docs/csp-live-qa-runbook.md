@@ -116,11 +116,10 @@ ownership and report limiter are in the [security runbook](security-runbook.md).
 
 ## CSP live-user gates
 
-Each release requires exact-source `npm run test:auth-lifecycle-e2e`, public
-tournament/roster/bracket QA, then authenticated UserQA. They are distinct:
-public QA does not exercise auth or Turnstile. See the [auth E2E reference](auth-lifecycle-e2e.md)
-for fixture/privacy details. Use a fresh marker, avoid overlap, and run optional
-human diagnostics only after UserQA proves cleanup and absence.
+Each release requires exact-source `npm run test:auth-lifecycle-e2e`, public tournament/roster/bracket QA,
+then authenticated UserQA; Public QA does not exercise auth or Turnstile. See the [auth E2E reference](auth-lifecycle-e2e.md) for fixture/privacy. Use a fresh marker, avoid overlap, and run optional human diagnostics only after UserQA proves cleanup and absence.
+
+The trusted `platform_live_browser_qa.sh public` stdout is a fixed three-line protocol (counts, child diagnostic, teardown); success text is stderr-only, and extra/missing lines fail closed before Public failure cleanup.
 
 Both child workflows and UserQA cleanup/absence must pass for QA credit. A failed launch earns no credit; route by trusted evidence and never reuse an uncertain roster:
 
