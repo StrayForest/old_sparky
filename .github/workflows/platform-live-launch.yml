@@ -1057,8 +1057,14 @@ jobs:
               "error_class_counts": errors,
               "child_diagnostic": child_diagnostic,
               "browser_failure_metadata": browser_failure_metadata,
-              "public_failure_cleanup": public_failure_cleanup,
           }
+          if (
+              marker_ok
+              and status == "failed"
+              and stage == "browser_qa"
+              and public_failure_cleanup is not None
+          ):
+              report["public_failure_cleanup"] = public_failure_cleanup
           destination.write_text(json.dumps(report, sort_keys=True) + "\n", encoding="utf-8")
           PY
           chmod 600 "$safe_report"

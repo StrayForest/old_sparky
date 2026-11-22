@@ -3990,6 +3990,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertEqual(passed_report["source_git_sha"], status_sha)
         self.assertEqual(passed_report["app_target_sha"], status_sha)
         self.assertIsNone(passed_report["source_binding_sha256"])
+        self.assertNotIn("public_failure_cleanup", passed_report)
         validator_match = re.search(
             r'/usr/bin/python3 - "\$RUNNER_TEMP/live-launch-report\.json" \\\s*'
             r'"\$GITHUB_SHA" <<\'PY\'\n(.*?)\n\s*PY',
@@ -4172,7 +4173,8 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             1,
         )
         self.assertEqual(invalid_cleanup["status"], "unavailable")
-        self.assertIsNone(invalid_cleanup["public_failure_cleanup"])
+        self.assertIsNone(invalid_cleanup.get("public_failure_cleanup"))
+        self.assertNotIn("public_failure_cleanup", invalid_cleanup)
         with tempfile.TemporaryDirectory(prefix="live-launch-validator-failure-") as directory:
             report_path = Path(directory) / "report.json"
             report_path.write_text(json.dumps(diagnosed_failure), encoding="utf-8")
