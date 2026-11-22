@@ -1995,6 +1995,23 @@ if [[ "$phase" == "activation-committed" ]]; then
     public_status failed systemd >&2
     exit 1
   }
+  if [[ "$INITIAL_INSTALL" -eq 0 ]]; then
+    # Upgrades install unit files without changing managed enablement. This
+    # required timer is new in the release set, so enable it only after both
+    # smoke paths and the durable activation-committed transition have passed.
+    run_systemctl enable deadlock-operator-storage-retention.timer \
+      >/dev/null 2>/dev/null || {
+      public_status failed service_state >&2
+      exit 1
+    }
+    require_unit_enabled deadlock-operator-storage-retention.timer || exit 1
+    run_systemctl start deadlock-operator-storage-retention.timer \
+      >/dev/null 2>/dev/null || {
+      public_status failed service_state >&2
+      exit 1
+    }
+    require_unit_state deadlock-operator-storage-retention.timer active || exit 1
+  fi
   verify_initial_systemd_activation || {
     public_status failed systemd >&2
     exit 1

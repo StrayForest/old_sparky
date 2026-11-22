@@ -4491,13 +4491,42 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.advance_install_state(candidate, current, phase="activation-committed")
         self.switch_pointer("previous", current)
         self.switch_pointer("current", candidate)
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api": "active",
+                "deadlock-worker": "active",
+                "deadlock-web": "active",
+                "deadlock-operator-storage-retention.timer": "inactive",
+            }
+        )
+        enabled_path = self.root / "systemd-enabled.json"
+        enabled = json.loads(enabled_path.read_text(encoding="utf-8"))
+        enabled["deadlock-operator-storage-retention.timer"] = "disabled"
+        enabled_path.write_text(json.dumps(enabled, sort_keys=True), encoding="utf-8")
 
         resume = self.copy_deploy_script_with_fault(
             "deploy-resume-activation-committed.sh",
             None,
             None,
-            self.write_fake_systemctl(),
+            systemctl,
         )
+        partial = self.run_script(
+            resume,
+            "--resume",
+            "--app-dir",
+            str(self.app_dir),
+            env={"PLATFORM_TEST_FAIL_RETENTION_START": "1"},
+            check=False,
+        )
+
+        self.assertNotEqual(partial.returncode, 0)
+        self.assertEqual(self.state_phase(), "activation-committed")
+        self.assertTrue((self.shared / STATE_NAME).exists())
+        enabled = json.loads(enabled_path.read_text(encoding="utf-8"))
+        state = json.loads((self.root / "systemd-state.json").read_text(encoding="utf-8"))
+        self.assertEqual(enabled["deadlock-operator-storage-retention.timer"], "enabled")
+        self.assertEqual(state["deadlock-operator-storage-retention.timer"], "inactive")
+
         result = self.run_script(
             resume,
             "--resume",
@@ -4505,12 +4534,29 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             str(self.app_dir),
             check=False,
         )
-
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.shared / STATE_NAME).exists())
         self.assertEqual((self.app_dir / "current").resolve(), candidate)
         self.assertEqual((self.app_dir / "previous").resolve(), current)
         self.assertNotEqual(previous, candidate)
+        activation_log = (self.root / "systemctl.log").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(
+            [
+                line
+                for line in activation_log
+                if line.endswith("deadlock-operator-storage-retention.timer")
+            ],
+            [
+                "enable deadlock-operator-storage-retention.timer",
+                "start deadlock-operator-storage-retention.timer",
+                "enable deadlock-operator-storage-retention.timer",
+                "start deadlock-operator-storage-retention.timer",
+            ],
+        )
+        enabled = json.loads(enabled_path.read_text(encoding="utf-8"))
+        state = json.loads((self.root / "systemd-state.json").read_text(encoding="utf-8"))
+        self.assertEqual(enabled["deadlock-operator-storage-retention.timer"], "enabled")
+        self.assertEqual(state["deadlock-operator-storage-retention.timer"], "active")
 
     def test_retained_recovery_retry_preserves_mixed_state_until_final_cleanup(self) -> None:
         """A post-pointer failure must leave both receipts retryable."""
@@ -8318,6 +8364,8 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             "    for unit in units:\n"
                 "        with log_path.open(\"a\", encoding=\"utf-8\") as stream:\n"
                 "            stream.write(f\"{action} {unit}\\n\")\n"
+            "        if action == \"start\" and unit == \"deadlock-operator-storage-retention.timer\" and os.getenv(\"PLATFORM_TEST_FAIL_RETENTION_START\") == \"1\":\n"
+            "            raise SystemExit(1)\n"
             "        if action == \"restart\" and unit == \"deadlock-api\" and os.getenv(\"PLATFORM_TEST_SYSTEMCTL_FAIL_RESTART\") == \"1\":\n"
             "            raise SystemExit(1)\n"
             "        key = state_unit(unit)\n"

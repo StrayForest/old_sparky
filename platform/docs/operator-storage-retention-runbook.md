@@ -7,9 +7,14 @@
 The standalone `deadlock-operator-storage-retention.timer` runs
 `deadlock-operator-storage-retention.service` daily at 07:00, after backup and
 platform maintenance. The service is separate from backup creation and
-verified-pair rotation. The normal reviewed release path installs and enables
-both units through `platform_install_systemd_units.sh` under
-`/etc/systemd/system`. The implementation owner is
+verified-pair rotation. The normal reviewed release path installs both units
+through `platform_install_systemd_units.sh` under `/etc/systemd/system`. On
+ordinary upgrades, after successful smoke checks and the durable
+`activation-committed` phase, the deploy finalizer enables and starts this
+required timer and verifies it enabled and active. This required timer is
+re-enabled if an operator disabled it; other timer states are left unchanged.
+Retries in that phase safely repeat the same operation. The implementation
+owner is
 [`platform_operator_storage_retention.py`](../tools/platform_operator_storage_retention.py).
 
 The tool accepts no root or path overrides. A bare invocation is a read-only
