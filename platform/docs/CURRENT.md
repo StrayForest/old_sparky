@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-11-22
+- Last reviewed: 2026-11-23
 
 Read this page for live pins, pending release work, open QA gates and hard
 operational limits. Product contracts, procedures and detailed run evidence
@@ -10,18 +10,24 @@ belong in the linked owner documents below.
 
 ## Live and pending state
 
-- Production runs application source H
-  `7fd08091df9e4a442da59fe907af6302911aa839` in release
-  `gha-45047467972-1-7fd08091df9e`, deployed by automatic child
-  `45047467972/1`. Host-tools generation C
-  `da9981d6a7e97ec6aeea8501b02218f6d78fb50f` is installed and its pinned
-  `host-capabilities` self-test passed.
-- Current `dev` source H is
-  `7fd08091df9e4a442da59fe907af6302911aa839`. Its exact-SHA Security run
-  `45045592748/1`, source-bound restore-verified backup `45047169182/1`,
-  AUTO `45046961891/1`, and production child `45047467972/1` passed. Final
-  health checks reported all six services active, API live/ready and web
-  returning 200; no release operation, recovery state or QA gate remains.
+- Production runs application source
+  `ee1703a14968232a02c793b3b0fc4be98bde93c4` in release
+  `gha-45131172511-1-ee1703a14968`, deployed by automatic child
+  `45131172511/1`. Exact-SHA Security `45128995964/1`, source-bound
+  restore-verified backup `45130756642/1`, and AUTO `45130690722/1` passed.
+  Host-tools generation
+  `da9981d6a7e97ec6aeea8501b02218f6d78fb50f` is unchanged and installed.
+  Deployment smoke and post-maintenance health passed; a Public QA gate is
+  failed and UserQA has not run. This CURRENT update is documentation-only and
+  does not change the active application source.
+- Active application source is
+  `ee1703a14968232a02c793b3b0fc4be98bde93c4`; previous release remains
+  `gha-45047467972-1-7fd08091df9e`. The automatic release workflow reported
+  all six services active, API live/ready and web returning 200. Local and
+  origin health checks returned 200; public homepage returned 200, while the
+  direct public API health URLs returned 403. The 403 responses are an
+  observed, unattributed boundary and do not override the successful origin
+  and deployment smoke checks. No release operation is pending.
   See the
   [deployment runbook](deployment-runbook.md) and host-tools ADRs for the
   source-bound procedure.
@@ -61,32 +67,27 @@ belong in the linked owner documents below.
 - After successful roster provisioning, the deployed release includes
   automatic exact cleanup for a confirmed terminal Public failure and
   preserves the fixed browser-output protocol.
-- Current H QA: automatic parent `45048265499/1` and launch child
-  `45048286058/1` failed during provisioning before browser execution. The
-  documented standalone Public run `45048858491/1` passed (57 cases: 47
-  passed, 10 skipped, none failed, flaky, timed out or interrupted), followed
-  by standalone UserQA `45049634886/1` passing 1/1. Exact roster cleanup and
-  database absence proof passed; post-UserQA credential cleanup removed the
-  fixed bundle and helper. The automatic parent did not receive ordered QA
-  credit. The new `provision=false` terminal-failure recovery path is covered
-  by tests but was not exercised by this passing Public run.
-- An anonymous HTTP check of the homepage, home API and nine unique image URLs
-  found HTTP 200, permitted image hosts in the page CSP, valid image MIME
-  types and successful image decoding. It did not identify the WebKit image
-  previously reported as unloaded or establish a cause; that intermittent
-  browser issue remains unresolved. See the CSP/live-QA runbook for the
-  supported recovery path.
-- The operator storage-retention timer is installed, enabled and active. Its
-  service completed a successful apply; the timer uses the reviewed resource
-  limits of 25% CPU, 512 MiB memory and 30 minutes. Retention run
-  `45050481188/1` passed: it retained the current and previous releases and
-  one verified backup, removed two older backup files and three unpinned old
-  releases (847,136,876 bytes), and made no cache or transient-file deletions.
-  The retained backup `platformdb-20261122T173739Z.dump` passed checksum,
-  restore and Alembic verification across 39 tables. Final storage was 47%
-  used with 20 GB free and 18% inode use. Human Chrome and real Cloudflare
-  challenge/scoring remain optional diagnostics; the CI Siteverify fixture
-  does not establish production Cloudflare scoring.
+- Automatic post-deploy QA sequencer `45132147425/1` failed after Public QA
+  child `45132182150/1`: 46 passed, 10 skipped, 1 failed. The failure was
+  `image_csp_hosts` on `live-webkit-mobile`; exact-source private evidence
+  showed one unloaded home image among 10, with no missing `currentSrc` and no
+  page error events. The cause is unknown. This is compatible with the
+  previously documented intermittent unloaded-WebKit-image issue, but the
+  same root cause is not established. Public failure fixture cleanup completed
+  (`public_failure_cleanup=cleaned`); UserQA was not run and receives no QA
+  credit. No CSP policy, assertion or timeout change is supported by this
+  evidence. See the [CSP/live-QA runbook](csp-live-qa-runbook.md) for the
+  evidence and recovery contract.
+- Storage diagnostics `45133282711/1` and authorized bounded maintenance
+  `45134350443/1` completed successfully for source `ee1703a`. Current and
+  previous releases were protected; one older unprotected release was removed
+  (281,836,950 bytes), and no LiveQA cache or transient files were deleted.
+  One restore- and Alembic-verified backup pair was retained across 39 tables;
+  the new archive is `platformdb-20261123T075333Z.dump` (135,104,179 bytes).
+  Final disk usage was 48.64% with 20,531,122,176 bytes free. All six services
+  were active; the maintenance timer remains enabled and waiting, and the
+  maintenance service exited successfully. The CI Siteverify fixture does
+  not establish production Cloudflare challenge/scoring.
 - The completed external HTTP matrix is not whole-site functional coverage.
   Cell 9's attribution failure and cell 7's unresolved client/origin join are
   not closed by the separate SSR diagnostics. No cause or server capacity
