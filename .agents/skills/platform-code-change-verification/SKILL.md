@@ -33,7 +33,11 @@ Select the smallest relevant verification set.
   production deployment. A retained migration/post-restart state is a
   recovery outcome, not a passing release.
 - Docs/skills-only changes use `docs`; instruction or workflow-policy changes
-  also use `verification-contract`. Do not run application gates unless
+  also use `verification-contract`. When an operational document or skill is
+  a source fixture owned by a canonical contract test, run that test's
+  canonical contour too. For example, storage-retention preview examples are
+  covered by `test_platform_maintenance_qa_evidence` in
+  `backend-tool-contract`. Do not run unrelated application gates unless
   behavior changed.
 
 Successful checks should emit only their final status line. Read the retained

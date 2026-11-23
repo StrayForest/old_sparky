@@ -45,11 +45,23 @@ calling the task complete.
    `platform/docs/retained-load-and-web-verification.md`.
 2. Admit storage work only when the shared disk threshold in
    `platform/docs/operations-runbook.md#retention-and-disk-safety`
-   passes. Use that owner procedure for exact inventory, installed-unit-bound
-   preview, timer stop/preview/resume, source-bound maintenance dispatch, and
-   report interpretation. Do not apply the full sweep unless the validated
-   shared-venv origin is protected or retained and absent from `deleted`; a
-   backup failure or failed precondition stops deletion.
+   passes. For the installed-unit-bound read-only preview, use the exact
+   service properties and validator pipeline from the owner procedure:
+
+   ```bash
+   current_release="$(readlink -f /opt/oldsparky/platform/current)"
+   systemctl show deadlock-maintenance.service --no-pager \
+     --property=FragmentPath,DropInPaths,NeedDaemonReload,ActiveState,SubState,MainPID,ExecStart,CPUQuotaPerSecUSec,MemoryMax,TimeoutStartUSec \
+     | /usr/bin/python3 -I -B "$current_release/tools/platform_maintenance_qa_evidence.py" run-retention-preview \
+       "$current_release/deploy/systemd/deadlock-maintenance.service" \
+       /etc/systemd/system/deadlock-maintenance.service
+   ```
+
+   Use the owner procedure for exact inventory, timer stop/preview/resume,
+   source-bound maintenance dispatch, and report interpretation. Do not apply
+   the full sweep unless the validated shared-venv origin is protected or
+   retained and absent from `deleted`; a backup failure or failed precondition
+   stops deletion.
 3. If the full sweep cannot create its backup because the filesystem is
    already full, first use the identity-checked production retention tool
    after an explicit operator decision and a read-only candidate review. Use
