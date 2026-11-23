@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 import pathlib
@@ -60,6 +61,8 @@ MAX_INVENTORY_IDS = {
     "media_ids": 32,
 }
 AUDIT_SCOPE_CHUNK_SIZE = 256
+LIVE_QA_STATE_ROOT = pathlib.Path("/root/.oldsparky/liveqa")
+LIVE_QA_STATE_NAME = re.compile(r"^live-user-qa\.[A-Za-z0-9]{6}$")
 
 
 @dataclass(frozen=True)
@@ -68,6 +71,7 @@ class CleanupInventory:
     user_ids: tuple[str, ...]
     tournament_ids: tuple[str, ...]
     media_ids: tuple[str, ...]
+    inventory_sha256: str = ""
 
 
 def _validated_ids(payload: object, field: str) -> tuple[str, ...]:
@@ -100,9 +104,20 @@ def load_inventory(path: pathlib.Path, *, expected_marker: str) -> CleanupInvent
     if metadata.st_size > MAX_INVENTORY_BYTES:
         raise ValueError("inventory exceeds the 64 KiB limit")
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        raw = path.read_bytes()
+        payload = json.loads(raw.decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError("inventory must contain valid UTF-8 JSON") from exc
+    after = path.lstat()
+    if (
+        stat.S_ISLNK(after.st_mode)
+        or not stat.S_ISREG(after.st_mode)
+        or after.st_uid != metadata.st_uid
+        or stat.S_IMODE(after.st_mode) != stat.S_IMODE(metadata.st_mode)
+        or after.st_size != metadata.st_size
+        or len(raw) != metadata.st_size
+    ):
+        raise ValueError("inventory changed while it was being read")
     if not isinstance(payload, dict) or set(payload) != {
         "version",
         "marker",
@@ -121,6 +136,7 @@ def load_inventory(path: pathlib.Path, *, expected_marker: str) -> CleanupInvent
         user_ids=_validated_ids(payload["user_ids"], "user_ids"),
         tournament_ids=_validated_ids(payload["tournament_ids"], "tournament_ids"),
         media_ids=_validated_ids(payload["media_ids"], "media_ids"),
+        inventory_sha256=hashlib.sha256(raw).hexdigest(),
     )
 
 
@@ -615,6 +631,198 @@ async def _validate_exact_scope(db_session, inventory: CleanupInventory) -> None
     await _validate_audit_scope(db_session, user_ids, audit_subject_ids)
 
 
+ABSENCE_COUNT_FIELDS = (
+    "users",
+    "tournaments",
+    "media",
+    "sessions",
+    "audit_logs",
+    "marker_users",
+    "marker_tournaments",
+)
+
+
+async def verify_absence(
+    db_session,
+    inventory: CleanupInventory,
+    audit_subject_ids: dict[str, set[str]],
+) -> dict[str, int]:
+    """Return zero counts from the single post-cleanup verification session."""
+
+    user_ids = list(inventory.user_ids)
+    tournament_ids = list(inventory.tournament_ids)
+    media_ids = list(inventory.media_ids)
+    await _validate_exact_scope(db_session, inventory)
+    remaining_users = await db_session.scalar(
+        select(func.count()).select_from(User).where(User.id.in_(user_ids))
+    ) if user_ids else 0
+    remaining_tournaments = await db_session.scalar(
+        select(func.count()).select_from(Tournament).where(Tournament.id.in_(tournament_ids))
+    ) if tournament_ids else 0
+    remaining_media = await db_session.scalar(
+        select(func.count()).select_from(MediaAsset).where(MediaAsset.id.in_(media_ids))
+    ) if media_ids else 0
+    remaining_sessions = await db_session.scalar(
+        select(func.count()).select_from(UserSession).where(
+            UserSession.user_id.in_(user_ids)
+        )
+    ) if user_ids else 0
+    marker_users = await db_session.scalar(
+        select(func.count()).select_from(User).where(
+            func.lower(User.email).contains(inventory.marker.lower())
+        )
+    )
+    marker_tournaments = await db_session.scalar(
+        select(func.count()).select_from(Tournament).where(
+            Tournament.description
+            == f"Accelerated live browser acceptance {inventory.marker}."
+        )
+    )
+    remaining_audit_filters = []
+    if user_ids:
+        remaining_audit_filters.append(AuditLog.actor_user_id.in_(user_ids))
+    remaining_audit_filters.extend(_audit_subject_filters(audit_subject_ids))
+    remaining_audit_logs = await db_session.scalar(
+        select(func.count())
+        .select_from(AuditLog)
+        .where(or_(*remaining_audit_filters))
+    ) if remaining_audit_filters else 0
+    counts = {
+        "users": int(remaining_users or 0),
+        "tournaments": int(remaining_tournaments or 0),
+        "media": int(remaining_media or 0),
+        "sessions": int(remaining_sessions or 0),
+        "audit_logs": int(remaining_audit_logs or 0),
+        "marker_users": int(marker_users or 0),
+        "marker_tournaments": int(marker_tournaments or 0),
+    }
+    if any(counts.values()):
+        raise RuntimeError("Live-user QA cleanup left recorded or marker-owned rows behind.")
+    return counts
+
+
+def _absence_proof_payload(
+    inventory: CleanupInventory,
+    *,
+    runner_source_sha: str,
+    app_sha: str,
+    marker_sha256: str,
+    gate_id_sha256: str,
+    zero_counts: dict[str, int],
+) -> dict[str, object]:
+    if (
+        not re.fullmatch(r"[0-9a-f]{40}", runner_source_sha)
+        or not re.fullmatch(r"[0-9a-f]{40}", app_sha)
+        or not re.fullmatch(r"[0-9a-f]{64}", marker_sha256)
+        or not re.fullmatch(r"[0-9a-f]{64}", gate_id_sha256)
+        or not re.fullmatch(r"[0-9a-f]{64}", inventory.inventory_sha256)
+        or set(zero_counts) != set(ABSENCE_COUNT_FIELDS)
+        or any(type(value) is not int or value != 0 for value in zero_counts.values())
+        or hashlib.sha256(inventory.marker.encode("ascii")).hexdigest()
+        != marker_sha256
+    ):
+        raise RuntimeError("Live-user QA absence proof binding is invalid.")
+    return {
+        "schema": 1,
+        "status": "verified_absent",
+        "runner_source_sha": runner_source_sha,
+        "app_sha": app_sha,
+        "marker_sha256": marker_sha256,
+        "gate_id_sha256": gate_id_sha256,
+        "inventory_sha256": inventory.inventory_sha256,
+        "zero_counts": zero_counts,
+    }
+
+
+def _publish_state_absence_proof(
+    state_dir: pathlib.Path,
+    inventory: CleanupInventory,
+    payload: dict[str, object],
+) -> None:
+    inventory_path = state_dir / "inventory.json"
+    metadata = state_dir.lstat()
+    inventory_metadata = inventory_path.lstat()
+    if (
+        not state_dir.is_absolute()
+        or state_dir.resolve(strict=True) != state_dir
+        or state_dir.parent != LIVE_QA_STATE_ROOT
+        or not LIVE_QA_STATE_NAME.fullmatch(state_dir.name)
+        or stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or inventory_path.is_symlink()
+        or not stat.S_ISREG(inventory_metadata.st_mode)
+        or inventory_metadata.st_uid != 0
+        or stat.S_IMODE(inventory_metadata.st_mode) != 0o600
+        or payload.get("gate_id_sha256")
+        != hashlib.sha256(state_dir.name.encode("ascii")).hexdigest()
+    ):
+        raise RuntimeError("Live-user QA absence proof target is unsafe.")
+    inventory_fd = os.open(
+        inventory_path,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        opened = os.fstat(inventory_fd)
+        raw_inventory = b""
+        while len(raw_inventory) <= MAX_INVENTORY_BYTES:
+            chunk = os.read(
+                inventory_fd,
+                min(64 * 1024, MAX_INVENTORY_BYTES + 1 - len(raw_inventory)),
+            )
+            if not chunk:
+                break
+            raw_inventory += chunk
+        after = os.fstat(inventory_fd)
+    finally:
+        os.close(inventory_fd)
+    if (
+        len(raw_inventory) > MAX_INVENTORY_BYTES
+        or opened.st_dev != inventory_metadata.st_dev
+        or opened.st_ino != inventory_metadata.st_ino
+        or opened.st_size != inventory_metadata.st_size
+        or after.st_size != opened.st_size
+        or hashlib.sha256(raw_inventory).hexdigest() != inventory.inventory_sha256
+    ):
+        raise RuntimeError("Live-user QA inventory changed before absence proof.")
+    path = state_dir / "cleanup-absence.json"
+    encoded = (json.dumps(payload, separators=(",", ":")) + "\n").encode("ascii")
+    if len(encoded) > 4096:
+        raise RuntimeError("Live-user QA absence proof exceeds its bound.")
+    if path.exists() or path.is_symlink():
+        proof_metadata = path.lstat()
+        if (
+            stat.S_ISLNK(proof_metadata.st_mode)
+            or not stat.S_ISREG(proof_metadata.st_mode)
+            or proof_metadata.st_uid != 0
+            or proof_metadata.st_nlink != 1
+            or stat.S_IMODE(proof_metadata.st_mode) != 0o600
+            or proof_metadata.st_size != len(encoded)
+            or path.read_bytes() != encoded
+        ):
+            raise RuntimeError("A different live-user QA absence proof already exists.")
+        return
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(encoded)
+            output.flush()
+            os.fsync(output.fileno())
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    directory_fd = os.open(state_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def _validate_runtime_target(settings, *, allow_test_environment: bool) -> None:
     validate_platform_settings(settings)
     environment = settings.platform_environment.strip().lower()
@@ -632,6 +840,7 @@ async def cleanup(
     inventory: CleanupInventory,
     *,
     _allow_test_environment: bool = False,
+    absence_proof_context: dict[str, object] | None = None,
 ) -> dict[str, int]:
     if os.geteuid() != 0:
         raise RuntimeError("Live-user QA cleanup must run as root.")
@@ -690,54 +899,33 @@ async def cleanup(
         await db_session.commit()
 
     async with session_factory()() as verify_session:
-        await _validate_exact_scope(verify_session, inventory)
-        remaining_users = await verify_session.scalar(
-            select(func.count()).select_from(User).where(User.id.in_(user_ids))
-        ) if user_ids else 0
-        remaining_tournaments = await verify_session.scalar(
-            select(func.count()).select_from(Tournament).where(Tournament.id.in_(tournament_ids))
-        ) if tournament_ids else 0
-        remaining_media = await verify_session.scalar(
-            select(func.count()).select_from(MediaAsset).where(MediaAsset.id.in_(media_ids))
-        ) if media_ids else 0
-        remaining_sessions = await verify_session.scalar(
-            select(func.count()).select_from(UserSession).where(
-                UserSession.user_id.in_(user_ids)
-            )
-        ) if user_ids else 0
-        marker_users = await verify_session.scalar(
-            select(func.count()).select_from(User).where(
-                func.lower(User.email).contains(inventory.marker.lower())
-            )
+        zero_counts = await verify_absence(
+            verify_session,
+            inventory,
+            audit_subject_ids,
         )
-        marker_tournaments = await verify_session.scalar(
-            select(func.count()).select_from(Tournament).where(
-                Tournament.description
-                == f"Accelerated live browser acceptance {inventory.marker}."
-            )
+    if absence_proof_context is not None:
+        required_context = {
+            "state_dir",
+            "runner_source_sha",
+            "app_sha",
+            "marker_sha256",
+            "gate_id_sha256",
+        }
+        if set(absence_proof_context) != required_context:
+            raise RuntimeError("Live-user QA absence proof context is invalid.")
+        state_dir = absence_proof_context["state_dir"]
+        if not isinstance(state_dir, pathlib.Path):
+            raise RuntimeError("Live-user QA absence proof state path is invalid.")
+        proof = _absence_proof_payload(
+            inventory,
+            runner_source_sha=str(absence_proof_context["runner_source_sha"]),
+            app_sha=str(absence_proof_context["app_sha"]),
+            marker_sha256=str(absence_proof_context["marker_sha256"]),
+            gate_id_sha256=str(absence_proof_context["gate_id_sha256"]),
+            zero_counts=zero_counts,
         )
-        remaining_audit_filters = []
-        if user_ids:
-            remaining_audit_filters.append(AuditLog.actor_user_id.in_(user_ids))
-        remaining_audit_filters.extend(_audit_subject_filters(audit_subject_ids))
-        remaining_audit_logs = await verify_session.scalar(
-            select(func.count())
-            .select_from(AuditLog)
-            .where(or_(*remaining_audit_filters))
-        ) if remaining_audit_filters else 0
-    if any(
-        int(value or 0)
-        for value in (
-            remaining_users,
-            remaining_tournaments,
-            remaining_media,
-            remaining_sessions,
-            marker_users,
-            marker_tournaments,
-            remaining_audit_logs,
-        )
-    ):
-        raise RuntimeError("Live-user QA cleanup left recorded or marker-owned rows behind.")
+        _publish_state_absence_proof(state_dir, inventory, proof)
     return {
         "tournaments": int(tournament_result.rowcount or 0) if tournament_result else 0,
         "users": int(user_result.rowcount or 0) if user_result else 0,
@@ -747,9 +935,16 @@ async def cleanup(
     }
 
 
-async def run(inventory: CleanupInventory) -> int:
+async def run(
+    inventory: CleanupInventory,
+    *,
+    absence_proof_context: dict[str, object],
+) -> int:
     try:
-        result = await cleanup(inventory)
+        result = await cleanup(
+            inventory,
+            absence_proof_context=absence_proof_context,
+        )
         print(
             "Live-user QA cleanup verified absent: "
             f"tournaments={result['tournaments']} users={result['users']} "
@@ -765,6 +960,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Clean one exact live-user QA inventory.")
     parser.add_argument("--marker", required=True)
     parser.add_argument("--inventory", type=pathlib.Path, required=True)
+    parser.add_argument("--state-dir", type=pathlib.Path, required=True)
+    parser.add_argument("--runner-source-sha", required=True)
+    parser.add_argument("--app-sha", required=True)
+    parser.add_argument("--marker-sha256", required=True)
+    parser.add_argument("--gate-id-sha256", required=True)
     parser.add_argument("--confirm", default="")
     args = parser.parse_args()
     if args.confirm != CONFIRMATION:
@@ -775,7 +975,25 @@ def main() -> int:
         inventory = load_inventory(args.inventory, expected_marker=args.marker)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
-    return asyncio.run(run(inventory))
+    try:
+        context: dict[str, object] = {
+            "state_dir": args.state_dir,
+            "runner_source_sha": args.runner_source_sha,
+            "app_sha": args.app_sha,
+            "marker_sha256": args.marker_sha256,
+            "gate_id_sha256": args.gate_id_sha256,
+        }
+        _absence_proof_payload(
+            inventory,
+            runner_source_sha=args.runner_source_sha,
+            app_sha=args.app_sha,
+            marker_sha256=args.marker_sha256,
+            gate_id_sha256=args.gate_id_sha256,
+            zero_counts={key: 0 for key in ABSENCE_COUNT_FIELDS},
+        )
+    except RuntimeError as exc:
+        parser.error(str(exc))
+    return asyncio.run(run(inventory, absence_proof_context=context))
 
 
 if __name__ == "__main__":

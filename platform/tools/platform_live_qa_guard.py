@@ -49,6 +49,10 @@ TRUSTED_PAYLOAD_ROOT = TRUSTED_SECRET_ROOT / "releases"
 TRUSTED_ACTIVE_MANIFEST = TRUSTED_SECRET_ROOT / "active-manifest.json"
 TRUSTED_ACTIVE_POINTER = TRUSTED_SECRET_ROOT / "active"
 TRUSTED_FAILURE_DIAGNOSTICS_ROOT = TRUSTED_SECRET_ROOT / "diagnostics"
+LIVE_USER_CLEANUP_ABSENCE_RECEIPT = (
+    TRUSTED_SECRET_ROOT / "live-user-cleanup-absence.json"
+)
+LIVE_USER_CLEANUP_ABSENCE_FILE = "cleanup-absence.json"
 LIVE_QA_USER = "oldsparky-liveqa"
 RUNNER_CACHE_ROOT = Path("/var/lib/oldsparky-liveqa")
 BUILD_NODE_ROOT = Path("/var/lib/oldsparky-build")
@@ -275,6 +279,36 @@ LIVE_BROWSER_IMAGE_INVENTORY_MAX_COUNT = 512
 LIVE_BROWSER_IMAGE_DIAGNOSTIC_MAX_ENTRIES = 16
 LIVE_BROWSER_IMAGE_DIAGNOSTIC_MAX_EVENTS = 64
 LIVE_BROWSER_REQUEST_FAILURE_MAX_ENTRIES = 32
+LIVE_USER_BROWSER_GATE_MAX_EVENTS = 32
+LIVE_USER_BROWSER_GATE_MAX_COUNT = 255
+LIVE_USER_BROWSER_GATE_KINDS = frozenset(
+    {"csp_violation", "csp_console", "forbidden_request", "page_error", "request_failed"}
+)
+LIVE_USER_BROWSER_GATE_COUNT_FIELDS = (
+    "csp_violation", "csp_console", "forbidden_request", "page_error", "request_failed"
+)
+LIVE_USER_BROWSER_GATE_DIRECTIVES = frozenset(
+    {
+        "base-uri", "connect-src", "default-src", "font-src", "form-action",
+        "frame-ancestors", "frame-src", "img-src", "media-src", "object-src",
+        "script-src", "style-src", "upgrade-insecure-requests", "other",
+    }
+)
+LIVE_USER_BROWSER_GATE_RESOURCE_TYPES = frozenset(
+    {"document", "image", "stylesheet", "script", "font", "media", "xhr", "fetch", "other"}
+)
+LIVE_USER_BROWSER_GATE_METHODS = frozenset(
+    {"DELETE", "GET", "HEAD", "OPTIONS", "OTHER", "PATCH", "POST", "PUT"}
+)
+LIVE_USER_BROWSER_GATE_ROUTES = frozenset(
+    {
+        "account", "api_profile", "api_session", "api_tournament", "external", "home",
+        "other", "static", "tournament", "unknown",
+    }
+)
+LIVE_USER_BROWSER_GATE_FAILURE_CLASSES = frozenset(
+    {"aborted", "cancelled", "connection", "dns", "other", "timeout", "tls"}
+)
 LIVE_BROWSER_PAGE_ERROR_ASSET_BASENAME = re.compile(
     r"^(?:[a-z0-9][a-z0-9_-]{12}|turbopack-[a-z0-9_-]{13})\.js$"
 )
@@ -2061,7 +2095,12 @@ def validate_root_state(
     }
     if (
         not entries.issubset(
-            {"inventory.json", "browser-sessions.json", STATE_PHASE_FILE}
+            {
+                "inventory.json",
+                "browser-sessions.json",
+                STATE_PHASE_FILE,
+                LIVE_USER_CLEANUP_ABSENCE_FILE,
+            }
         )
         or "inventory.json" not in entries
         or STATE_PHASE_FILE not in entries
@@ -2073,7 +2112,16 @@ def validate_root_state(
         allowed=ROOT_STATE_PHASES,
     )
     inventory = state_dir / "inventory.json"
-    _validate_inventory(_read_private_json(inventory), marker=marker)
+    inventory_payload = _read_private_json(inventory)
+    _validate_inventory(inventory_payload, marker=marker)
+    proof_path = state_dir / LIVE_USER_CLEANUP_ABSENCE_FILE
+    if proof_path.exists() or proof_path.is_symlink():
+        _validate_live_user_cleanup_absence_proof(
+            proof_path,
+            state_dir=state_dir,
+            marker=marker,
+            inventory=inventory,
+        )
     sessions = state_dir / "browser-sessions.json"
     if sessions.exists() or sessions.is_symlink():
         _validate_session_payload(_read_private_json(sessions), marker=marker)
@@ -3380,6 +3428,98 @@ def _validate_live_user_api_failure(value: object) -> None:
         raise GuardError("private UserQA API failure evidence is malformed")
 
 
+def _validate_live_user_browser_gate_evidence(record: Mapping[str, object]) -> None:
+    state = record.get("browser_gate_state")
+    evidence = record.get("browser_gate")
+    if state == "unavailable":
+        if evidence is not None:
+            raise GuardError("private UserQA browser-gate evidence is malformed")
+        return
+    if state != "captured" or not isinstance(evidence, dict):
+        raise GuardError("private UserQA browser-gate evidence is malformed")
+    if (
+        set(evidence) != {
+            "schema", "coverage", "counts", "counts_truncated", "events_truncated", "events",
+        }
+        or type(evidence.get("schema")) is not int
+        or evidence.get("schema") != 2
+        or evidence.get("coverage") != "journey_logout_before_context_close"
+        or type(evidence.get("counts_truncated")) is not bool
+        or type(evidence.get("events_truncated")) is not bool
+        or not isinstance(evidence.get("counts"), dict)
+        or set(evidence["counts"]) != set(LIVE_USER_BROWSER_GATE_COUNT_FIELDS)
+        or any(
+            type(evidence["counts"].get(field)) is not int
+            or not 0 <= evidence["counts"][field] <= LIVE_USER_BROWSER_GATE_MAX_COUNT
+            for field in LIVE_USER_BROWSER_GATE_COUNT_FIELDS
+        )
+        or not isinstance(evidence.get("events"), list)
+        or len(evidence["events"]) > LIVE_USER_BROWSER_GATE_MAX_EVENTS
+        or (
+            evidence["events_truncated"]
+            and len(evidence["events"]) != LIVE_USER_BROWSER_GATE_MAX_EVENTS
+        )
+    ):
+        raise GuardError("private UserQA browser-gate evidence is malformed")
+
+    sampled_counts = dict.fromkeys(LIVE_USER_BROWSER_GATE_COUNT_FIELDS, 0)
+    for event in evidence["events"]:
+        kind = event.get("kind") if isinstance(event, dict) else None
+        phase = event.get("phase") if isinstance(event, dict) else None
+        if (
+            not isinstance(event, dict)
+            or not isinstance(kind, str)
+            or kind not in LIVE_USER_BROWSER_GATE_KINDS
+            or not isinstance(phase, str)
+            or phase not in {"journey", "logout"}
+        ):
+            raise GuardError("private UserQA browser-gate event is malformed")
+        expected_keys = {
+            "csp_violation": {"kind", "phase", "disposition", "directive"},
+            "csp_console": {"kind", "phase"},
+            "forbidden_request": {"kind", "phase", "resource_type", "method", "route"},
+            "page_error": {"kind", "phase"},
+            "request_failed": {
+                "kind", "phase", "resource_type", "method", "route", "failure_class",
+            },
+        }[kind]
+        if set(event) != expected_keys:
+            raise GuardError("private UserQA browser-gate event has unknown fields")
+        disposition = event.get("disposition")
+        directive = event.get("directive")
+        if kind == "csp_violation" and (
+            not isinstance(disposition, str)
+            or disposition not in {"enforce", "report_only", "unknown"}
+            or not isinstance(directive, str)
+            or directive not in LIVE_USER_BROWSER_GATE_DIRECTIVES
+        ):
+            raise GuardError("private UserQA CSP event is malformed")
+        resource_type = event.get("resource_type")
+        method = event.get("method")
+        route = event.get("route")
+        if kind in {"forbidden_request", "request_failed"} and (
+            not isinstance(resource_type, str)
+            or resource_type not in LIVE_USER_BROWSER_GATE_RESOURCE_TYPES
+            or not isinstance(method, str)
+            or method not in LIVE_USER_BROWSER_GATE_METHODS
+            or not isinstance(route, str)
+            or route not in LIVE_USER_BROWSER_GATE_ROUTES
+        ):
+            raise GuardError("private UserQA browser request event is malformed")
+        failure_class = event.get("failure_class")
+        if kind == "request_failed" and (
+            not isinstance(failure_class, str)
+            or failure_class not in LIVE_USER_BROWSER_GATE_FAILURE_CLASSES
+        ):
+            raise GuardError("private UserQA browser request failure is malformed")
+        sampled_counts[kind] += 1
+    if any(
+        evidence["counts"][field] < sampled_counts[field]
+        for field in LIVE_USER_BROWSER_GATE_COUNT_FIELDS
+    ):
+        raise GuardError("private UserQA browser-gate counts are inconsistent")
+
+
 def _validate_live_user_failure_location(
     record: Mapping[str, object],
     manifest: Mapping[str, object] | None = None,
@@ -3594,6 +3734,10 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
             )
         allowed_failure_key_sets = {frozenset(expected_failure_keys)}
         failure_id = failure.get("id") if isinstance(failure, dict) else None
+        if schema == 3:
+            allowed_failure_key_sets.add(
+                frozenset(expected_failure_keys | {"browser_gate_state", "browser_gate"})
+            )
         if schema == 2 and failure_id == "image_csp_hosts":
             image_keys = {"image_inventory_state", "image_inventory"}
             request_failure_keys = {
@@ -3652,6 +3796,8 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
                 _validate_live_user_api_failure(api_failure)
             else:
                 raise GuardError("retained UserQA API evidence is invalid")
+            if "browser_gate_state" in failure or "browser_gate" in failure:
+                _validate_live_user_browser_gate_evidence(failure)
             continue
         source_file = failure.get("source_file")
         source_line = failure.get("source_line")
@@ -4002,9 +4148,13 @@ def _read_ephemeral_live_user_failure_report(
         "id", "project", "status", "attempt", "source_file", "source_line",
         "source_column", "source_kind", "api_failure_state", "api_failure",
     }
+    browser_gate_keys = {"browser_gate_state", "browser_gate"}
     if (
         not isinstance(record, dict)
-        or set(record) != expected_record_keys
+        or frozenset(record) not in {
+            frozenset(expected_record_keys),
+            frozenset(expected_record_keys | browser_gate_keys),
+        }
         or record.get("id") != "live_user_journey"
         or record.get("project") != "live-desktop"
         or not isinstance(record.get("status"), str)
@@ -4065,6 +4215,8 @@ def _read_ephemeral_live_user_failure_report(
         _validate_live_user_api_failure(api_failure)
     else:
         raise GuardError("ephemeral UserQA API evidence is malformed")
+    if browser_gate_keys.issubset(record):
+        _validate_live_user_browser_gate_evidence(record)
     return [record]
 
 
@@ -4960,6 +5112,93 @@ def merge_browser_inventory(bundle_path: Path, state_dir: Path) -> None:
     _publish_private_json(root_inventory, candidate)
 
 
+LIVE_USER_CLEANUP_ZERO_COUNTS = frozenset(
+    {
+        "users",
+        "tournaments",
+        "media",
+        "sessions",
+        "audit_logs",
+        "marker_users",
+        "marker_tournaments",
+    }
+)
+
+
+def _validate_live_user_cleanup_absence_record(
+    payload: object,
+) -> dict[str, object]:
+    required = {
+        "schema",
+        "status",
+        "runner_source_sha",
+        "app_sha",
+        "marker_sha256",
+        "gate_id_sha256",
+        "inventory_sha256",
+        "zero_counts",
+    }
+    if not isinstance(payload, dict) or set(payload) != required:
+        raise GuardError("live-user QA absence receipt schema is invalid")
+    if (
+        payload.get("schema") != 1
+        or payload.get("status") != "verified_absent"
+        or not isinstance(payload.get("runner_source_sha"), str)
+        or COMMIT_PATTERN.fullmatch(str(payload["runner_source_sha"])) is None
+        or not isinstance(payload.get("app_sha"), str)
+        or COMMIT_PATTERN.fullmatch(str(payload["app_sha"])) is None
+        or not isinstance(payload.get("marker_sha256"), str)
+        or DIGEST_PATTERN.fullmatch(str(payload["marker_sha256"])) is None
+        or not isinstance(payload.get("gate_id_sha256"), str)
+        or DIGEST_PATTERN.fullmatch(str(payload["gate_id_sha256"])) is None
+        or not isinstance(payload.get("inventory_sha256"), str)
+        or DIGEST_PATTERN.fullmatch(str(payload["inventory_sha256"])) is None
+    ):
+        raise GuardError("live-user QA absence receipt identity is invalid")
+    counts = payload.get("zero_counts")
+    if (
+        not isinstance(counts, dict)
+        or set(counts) != LIVE_USER_CLEANUP_ZERO_COUNTS
+        or any(type(value) is not int or value != 0 for value in counts.values())
+    ):
+        raise GuardError("live-user QA absence receipt counts are invalid")
+    return payload
+
+
+def _validate_live_user_cleanup_absence_proof(
+    path: Path,
+    *,
+    state_dir: Path,
+    marker: str,
+    inventory: Path,
+) -> dict[str, object]:
+    payload = _validate_live_user_cleanup_absence_record(_read_private_json(path))
+    if (
+        payload["marker_sha256"] != hashlib.sha256(marker.encode("ascii")).hexdigest()
+        or payload["gate_id_sha256"]
+        != hashlib.sha256(state_dir.name.encode("ascii")).hexdigest()
+        or payload["inventory_sha256"]
+        != _sha256_regular(inventory, expected_uid=0, expected_mode=0o600)
+    ):
+        raise GuardError("live-user QA absence receipt does not match exact state")
+    return payload
+
+
+def _publish_live_user_cleanup_absence_receipt(
+    payload: dict[str, object],
+) -> None:
+    receipt = _validate_live_user_cleanup_absence_record(payload)
+    path = LIVE_USER_CLEANUP_ABSENCE_RECEIPT
+    _validate_root_secret_parent(path)
+    if path.exists() or path.is_symlink():
+        existing = _read_private_json(path)
+        _validate_live_user_cleanup_absence_record(existing)
+        _publish_private_json(path, receipt)
+    else:
+        _write_new_private_json(path, receipt)
+        _sync_directory(TRUSTED_SECRET_ROOT)
+
+
 def remove_browser_gate(state_dir: Path) -> None:
     if state_dir.parent == RUN_GATE_ROOT:
         gate = state_dir
@@ -4996,13 +5235,36 @@ def remove_public_browser_gate(gate: Path) -> None:
 
 
 def remove_root_state(bundle_path: Path, state_dir: Path) -> None:
-    _marker, inventory, sessions = validate_root_state(bundle_path, state_dir)
+    marker, inventory, sessions = validate_root_state(bundle_path, state_dir)
     publication_temps = _validated_publication_temps(state_dir)
     if (RUN_GATE_ROOT / state_dir.name).exists() or (
         RUN_GATE_ROOT / state_dir.name
     ).is_symlink():
         raise GuardError("browser gate must be removed before recovery state")
-    for target in (sessions, inventory, state_dir / STATE_PHASE_FILE):
+    proof_path = state_dir / LIVE_USER_CLEANUP_ABSENCE_FILE
+    if not proof_path.exists() or proof_path.is_symlink():
+        raise GuardError("live-user QA absence proof is required before state removal")
+    proof = _validate_live_user_cleanup_absence_proof(
+        proof_path,
+        state_dir=state_dir,
+        marker=marker,
+        inventory=inventory,
+    )
+    app_sha = _active_release_commit()
+    if proof["app_sha"] != app_sha:
+        raise GuardError("live-user QA absence proof app binding is stale")
+    expected_runner_source_sha = os.environ.get(
+        "PLATFORM_LIVE_QA_RUNNER_SHA", app_sha
+    )
+    if proof["runner_source_sha"] != expected_runner_source_sha:
+        raise GuardError("live-user QA absence proof runner binding is stale")
+    _publish_live_user_cleanup_absence_receipt(proof)
+    for target in (
+        sessions,
+        inventory,
+        state_dir / STATE_PHASE_FILE,
+        proof_path,
+    ):
         if target is not None:
             target.unlink()
     for temporary in publication_temps:

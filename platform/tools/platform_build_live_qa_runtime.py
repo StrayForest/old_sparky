@@ -101,6 +101,7 @@ RUNTIME_SOURCE_FILES = (
     "tests/smoke/live-user-journey.spec.ts",
     "tests/support/live-qa-origin.ts",
     "tests/support/live-qa-sandbox.ts",
+    "tests/support/live-user-browser-gate.ts",
     "tests/support/live-image-inventory.ts",
     "tests/support/live-count-reporter.cjs",
     "tests/support/patch-acceptance.ts",

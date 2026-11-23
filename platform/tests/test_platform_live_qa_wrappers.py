@@ -7523,7 +7523,13 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 )
                 return result, trace.read_text(encoding="ascii")
 
-            persisted_failure, count_args = run_user_count_tail(43, 0)
+            persisted_failure, count_args = run_user_count_tail(
+                43,
+                0,
+                line
+                + "\nLIVE_BROWSER_FAILURE_SUMMARY schema=1 "
+                + "reason=private_store_available token=YWJj\n",
+            )
             self.assertEqual(
                 persisted_failure.returncode, 1,
                 f"stdout={persisted_failure.stdout!r} stderr={persisted_failure.stderr!r}",
@@ -8802,6 +8808,8 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     f"TOOLS_DIR={shlex.quote(str(tools))}",
                     f"SAFE_PYTHONPATH={shlex.quote(str(pythonpath))}",
                     f"QA_PYTHON={shlex.quote(str(python))}",
+                    f"SOURCE_COMMIT={'b' * 40}",
+                    f"LIVE_QA_RUNNER_SHA={'a' * 40}",
                     shell_function(live_user, "safe_database_python"),
                     shell_function(live_user, "reconcile_and_cleanup"),
                     "reconcile_and_cleanup liveqa-stale-marker "
@@ -8860,6 +8868,16 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     "liveqa-stale-marker",
                     "--inventory",
                     str(inventory),
+                    "--state-dir",
+                    str(root),
+                    "--runner-source-sha",
+                    "a" * 40,
+                    "--app-sha",
+                    "b" * 40,
+                    "--marker-sha256",
+                    hashlib.sha256(b"liveqa-stale-marker").hexdigest(),
+                    "--gate-id-sha256",
+                    hashlib.sha256(root.name.encode("ascii")).hexdigest(),
                     "--confirm",
                     "cleanup-live-user-qa",
                 ],
@@ -8972,12 +8990,17 @@ class LiveQaWrapperContractTests(unittest.TestCase):
 
     def test_secret_bearing_journey_refuses_auth_pages_and_turnstile(self) -> None:
         source = LIVE_USER_JOURNEY.read_text(encoding="utf-8")
-        self.assertIn('parsed.hostname === "challenges.cloudflare.com"', source)
+        gate_helper = (
+            REPO_ROOT
+            / "platform/apps/platform_web/tests/support/live-user-browser-gate.ts"
+        ).read_text(encoding="utf-8")
+        self.assertIn("installLiveUserBrowserGate", source)
+        self.assertIn('parsed.hostname === "challenges.cloudflare.com"', gate_helper)
         self.assertIn(
             '["/auth/login", "/auth/register", "/reset-password", "/verify-email"]',
-            source,
+            gate_helper,
         )
-        self.assertIn("forbidden-auth-automation", source)
+        self.assertIn("forbidden-auth-automation", gate_helper)
 
     def test_sandbox_assertion_uses_the_dedicated_systemd_cgroup(self) -> None:
         source = SANDBOX_ASSERTION.read_text(encoding="utf-8")

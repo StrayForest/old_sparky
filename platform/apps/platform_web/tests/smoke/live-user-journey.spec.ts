@@ -3,6 +3,12 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import LiveCountReporter from "../support/live-count-reporter.cjs";
+import {
+  LIVE_USER_BROWSER_GATE_ATTACHMENT_NAME,
+  createLiveUserBrowserGateCapture,
+  installLiveUserBrowserGate,
+  liveUserBrowserGateAttachment,
+} from "../support/live-user-browser-gate";
 import { validateLiveQaOrigin } from "../support/live-qa-origin";
 import { assertLiveQaChromiumSandbox } from "../support/live-qa-sandbox";
 
@@ -17,7 +23,6 @@ const origin = enabled
   })
   : (process.env.PLAYWRIGHT_LIVE_BASE_URL ?? "http://127.0.0.1").replace(/\/$/, "");
 const csrfTokens = new WeakMap<import("@playwright/test").BrowserContext, string>();
-const cspViolationConsolePrefix = "__platform_liveqa_csp_violation__:";
 type UserApiOperation = keyof typeof LiveCountReporter.USER_API_OPERATION_CONTRACTS;
 type UserApiFailureKind = "unexpected_status" | "invalid_json" | "request_error";
 type UserApiFailureCandidate = {
@@ -31,8 +36,6 @@ type UserApiFailureCandidate = {
   source_column: number | null;
 };
 let latestApiFailure: UserApiFailureCandidate | null = null;
-const reportOnlyFrameAncestorsWarning =
-  "The Content Security Policy directive 'frame-ancestors' is ignored when delivered in a report-only policy.";
 
 test.skip(!enabled, "PLATFORM_LIVE_USER_QA=1 is required.");
 test.setTimeout(600_000);
@@ -80,19 +83,22 @@ test("live player completes the accelerated tournament journey through visible c
   const playerContext = await browser.newContext();
   organizerContext.setDefaultTimeout(15_000);
   playerContext.setDefaultTimeout(15_000);
-  const browserGateFailures: string[] = [];
+  const browserGateCapture = createLiveUserBrowserGateCapture();
+  const browserGateFailures = browserGateCapture.failures;
   const confirmedBrowserMutations = new Set<string>();
   await Promise.all([
-    installBrowserGate(
+    installLiveUserBrowserGate(
       organizerContext,
       "organizer",
-      browserGateFailures,
+      origin,
+      browserGateCapture,
       confirmedBrowserMutations,
     ),
-    installBrowserGate(
+    installLiveUserBrowserGate(
       playerContext,
       "player",
-      browserGateFailures,
+      origin,
+      browserGateCapture,
       confirmedBrowserMutations,
     ),
   ]);
@@ -113,10 +119,11 @@ test("live player completes the accelerated tournament journey through visible c
       const context = await browser.newContext();
       helperContexts.push(context);
       helpers.push(context);
-      await installBrowserGate(
+      await installLiveUserBrowserGate(
         context,
         `roster-${index + 1}`,
-        browserGateFailures,
+        origin,
+        browserGateCapture,
         confirmedBrowserMutations,
       );
       authenticatedRosterContexts.push(context);
@@ -307,6 +314,7 @@ test("live player completes the accelerated tournament journey through visible c
       return tournament.status;
     }, { timeout: 10_000 }).toBe("completed");
   } finally {
+    browserGateCapture.phase = "logout";
     const logoutResults = await Promise.allSettled(
       [
         ...authenticatedRosterContexts.map((context) => (
@@ -315,18 +323,15 @@ test("live player completes the accelerated tournament journey through visible c
         logoutQaAccount(playerContext, { allowUnauthenticated: true }),
       ],
     );
-    const confirmedProfileAbort = (
-      `player:requestfailed:PUT:${origin}/api/v1/profiles/me/deadlock:net::ERR_ABORTED`
+    const browserGateSnapshot = [...browserGateFailures];
+    const browserGateAttachmentBody = JSON.stringify(
+      liveUserBrowserGateAttachment(browserGateCapture),
     );
-    const browserGateSnapshot = browserGateFailures.filter((failure) => !(
-      failure === confirmedProfileAbort
-      && confirmedBrowserMutations.has("PUT:/api/v1/profiles/me/deadlock")
-    ));
     await Promise.allSettled(helperContexts.map((context) => context.close()));
     await organizerContext.close();
     await playerContext.close();
-    await testInfo.attach("live-user-browser-gate", {
-      body: JSON.stringify({ failures: browserGateSnapshot }),
+    await testInfo.attach(LIVE_USER_BROWSER_GATE_ATTACHMENT_NAME, {
+      body: browserGateAttachmentBody,
       contentType: "application/json",
     });
     const logoutFailures = logoutResults.filter((result) => result.status === "rejected");
@@ -359,111 +364,6 @@ type QaInventory = {
   tournament_ids: string[];
   media_ids: string[];
 };
-
-async function installBrowserGate(
-  context: import("@playwright/test").BrowserContext,
-  label: string,
-  failures: string[],
-  confirmedMutations: Set<string>,
-) {
-  await context.addInitScript((prefix) => {
-    if (window.top !== window) {
-      return;
-    }
-    document.addEventListener("securitypolicyviolation", (event) => {
-      console.warn(
-        `${prefix}${event.disposition.slice(0, 16)}:${event.effectiveDirective.slice(0, 64)}`,
-      );
-    });
-  }, cspViolationConsolePrefix);
-  context.on("request", (request) => {
-    try {
-      const parsed = new URL(request.url());
-      if (
-        parsed.hostname === "challenges.cloudflare.com"
-        || (
-          parsed.origin === origin
-          && ["/auth/login", "/auth/register", "/reset-password", "/verify-email"].includes(
-            parsed.pathname,
-          )
-        )
-      ) {
-        failures.push(
-          `${label}:forbidden-auth-automation:${request.method()}:${parsed.origin}${parsed.pathname}`,
-        );
-      }
-    } catch {
-      // Other request diagnostics already normalize malformed URLs below.
-    }
-  });
-  context.on("page", (page) => {
-    page.on("console", (message) => {
-      if (message.text().startsWith(cspViolationConsolePrefix)) {
-        failures.push(`${label}:csp:${message.text().slice(cspViolationConsolePrefix.length)}`);
-        return;
-      }
-      if (
-        message.type() === "error"
-        && /content security policy|refused to (?:execute|apply|load|connect)/iu.test(
-          message.text(),
-        )
-        && message.text() !== reportOnlyFrameAncestorsWarning
-      ) {
-        failures.push(`${label}:csp-console`);
-      }
-    });
-    page.on("pageerror", (error) => {
-      failures.push(`${label}:pageerror:${error.name || "unknown"}`);
-    });
-    page.on("requestfailed", (request) => {
-      const errorText = request.failure()?.errorText ?? "failed";
-      let requestPath = "invalid";
-      try {
-        const parsed = new URL(request.url());
-        const headers = request.headers();
-        const isExpectedNextPrefetchAbort = (
-          errorText === "net::ERR_ABORTED"
-          && request.method() === "GET"
-          && parsed.origin === origin
-          && (
-            parsed.searchParams.has("_rsc")
-            || headers.rsc === "1"
-            || headers["next-router-prefetch"] === "1"
-            || headers["next-router-segment-prefetch"] === "1"
-          )
-        );
-        const isExpectedNavigationApiCancellation = (
-          errorText === "Load request cancelled"
-          && request.method() === "GET"
-          && parsed.origin === origin
-          && [
-            "/api/v1/content/support/status",
-            "/api/v1/users/me",
-          ].includes(parsed.pathname)
-        );
-        const isConfirmedMutationTeardown = (
-          errorText === "net::ERR_ABORTED"
-          && parsed.origin === origin
-          && confirmedMutations.has(`${request.method()}:${parsed.pathname}`)
-        );
-        if (
-          isExpectedNextPrefetchAbort
-          || isExpectedNavigationApiCancellation
-          || isConfirmedMutationTeardown
-        ) {
-          return;
-        }
-        requestPath = `${parsed.origin}${parsed.pathname}`;
-      } catch {
-        // Keep hostile or malformed URLs out of the test artifact.
-      }
-      const safeError = /^(?:net::[A-Z_]+|Load request cancelled)$/u.test(errorText)
-        ? errorText
-        : "failed";
-      failures.push(`${label}:requestfailed:${request.method()}:${requestPath}:${safeError}`);
-    });
-  });
-}
 
 function loadQaSessions(): QaSessions {
   const configuredPath = process.env.PLATFORM_LIVE_USER_QA_SESSIONS;

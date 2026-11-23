@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-11-23
+- Last reviewed: 2026-11-24
 
 Read this page for live pins, pending release work, open QA gates and hard
 operational limits. Product contracts, procedures and detailed run evidence
@@ -11,8 +11,8 @@ belong in the linked owner documents below.
 ## Live and pending state
 
 - Production currently runs application source
-  `35698d58c024a058986abc8c6005b183e91a13d7` in automatic release
-  `gha-45205879242-1-35698d58c024`. Exact-SHA security/build and automatic
+  `da6427ebfd9abd7288c9903c9e8f3bd286e398f5` in automatic release
+  `gha-45266015590-1-da6427ebfd9a`. Exact-SHA security/build and automatic
   release checks passed; deployment smoke and post-deploy health passed.
   See the [deployment runbook](deployment-runbook.md) for source-bound release
   procedures.
@@ -52,16 +52,19 @@ belong in the linked owner documents below.
 - After successful roster provisioning, the deployed release includes
   automatic exact cleanup for a confirmed terminal Public failure and
   preserves the fixed browser-output protocol.
-- Automatic release QA sequencer `45207445613/1` produced canonical Public QA
-  child `45207494986/1`, which failed `image_csp_hosts` on
-  `live-webkit-mobile` for source `35698d58c024a058986abc8c6005b183e91a13d7`.
-  The retained report was identity-only (`rich_report_unavailable`): a reader
-  allowlist mismatch rejected the optional request-evidence pair, so the
-  private image/request details were not retained. The WebKit failure cause
-  remains unknown. Public failure cleanup completed
-  (`public_failure_cleanup=cleaned`); UserQA was not run. Do not infer a CSP,
-  lazy-loading, decode or application cause. See the
-  [CSP/live-QA runbook](csp-live-qa-runbook.md) for evidence and recovery.
+- Automatic release QA for source
+  `da6427ebfd9abd7288c9903c9e8f3bd286e398f5` produced canonical Public QA
+  child `45271917185/1`, which passed with 47 passed, 10 skipped and 0 failed.
+  UserQA child `45273158082/1` failed `live_user_journey` at
+  `tests/smoke/live-user-journey.spec.ts:337`, where the browser-gate snapshot
+  contained browser failures. The retained v3 report was bound to the active
+  source, app and marker, but its optional event details were unavailable, so
+  the event category and historical cause remain unknown. The failed run's
+  root state and gates are absent and the QA unit/cgroup is idle; no durable
+  database-absence proof was retained, so complete cleanup is not established.
+  Do not infer a CSP, lazy-loading, decode or application cause. See the
+  [CSP/live-QA runbook](csp-live-qa-runbook.md) for the evidence contract and
+  recovery procedure.
 - Latest read-only storage diagnostics `45209278827/1` found about 18 GB free,
   healthy services, an enabled maintenance timer and no QA cache artifact
   candidates. No manual retention deletion was needed. The CI Siteverify

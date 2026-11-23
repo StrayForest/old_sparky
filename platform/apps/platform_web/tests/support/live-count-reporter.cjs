@@ -35,6 +35,9 @@ const FAILURE_REPORT_FILE = "live-failures-v2.json";
 const FAILURE_IDENTITY_REPORT_FILE = "live-failure-identities-v1.json";
 const LIVE_USER_FAILURE_REPORT_FILE = "live-user-failures-v3.json";
 const PAGE_ERROR_ATTACHMENT_NAME = "live-pageerror-evidence-v1";
+const LIVE_USER_BROWSER_GATE_ATTACHMENT_NAME = "live-user-browser-gate-v2";
+const MAX_LIVE_USER_BROWSER_GATE_ATTACHMENT_BYTES = 8 * 1024;
+const MAX_LIVE_USER_BROWSER_GATE_EVENTS = 32;
 const IMAGE_INVENTORY_ATTACHMENT_NAMES = new Set([
   "live-image-inventory-evidence-v1",
   "live-image-inventory-evidence-v2",
@@ -166,6 +169,31 @@ const LIVE_USER_API_FAILURE_MESSAGES = Object.freeze({
   request_error: "LiveUserApiRequestError: API request failed.",
 });
 const LIVE_USER_API_FAILURE_MAX_BYTES = 1024;
+const LIVE_USER_BROWSER_GATE_KINDS = new Set([
+  "csp_violation", "csp_console", "forbidden_request", "page_error", "request_failed",
+]);
+const LIVE_USER_BROWSER_GATE_COUNTS = Object.freeze([
+  "csp_violation", "csp_console", "forbidden_request", "page_error", "request_failed",
+]);
+const LIVE_USER_BROWSER_GATE_DISPOSITIONS = new Set(["enforce", "report_only", "unknown"]);
+const LIVE_USER_BROWSER_GATE_DIRECTIVES = new Set([
+  "base-uri", "connect-src", "default-src", "font-src", "form-action",
+  "frame-ancestors", "frame-src", "img-src", "media-src", "object-src",
+  "script-src", "style-src", "upgrade-insecure-requests", "other",
+]);
+const LIVE_USER_BROWSER_GATE_RESOURCE_TYPES = new Set([
+  "document", "image", "stylesheet", "script", "font", "media", "xhr", "fetch", "other",
+]);
+const LIVE_USER_BROWSER_GATE_METHODS = new Set([
+  "DELETE", "GET", "HEAD", "OPTIONS", "OTHER", "PATCH", "POST", "PUT",
+]);
+const LIVE_USER_BROWSER_GATE_ROUTES = new Set([
+  "account", "api_profile", "api_session", "api_tournament", "external", "home",
+  "other", "static", "tournament", "unknown",
+]);
+const LIVE_USER_BROWSER_GATE_FAILURE_CLASSES = new Set([
+  "aborted", "cancelled", "connection", "dns", "other", "timeout", "tls",
+]);
 const FAILURE_ATTEMPT_STATUSES = new Set(["failed", "timedOut", "interrupted"]);
 const PAGE_ERROR_CLASSES = new Set([
   "Error",
@@ -1264,6 +1292,111 @@ function liveUserApiFailureForAttempt(result, sourceRoot, failureLocation) {
   } };
 }
 
+function normalizedLiveUserBrowserGateAttachment(attachment) {
+  if (
+    attachment?.name !== LIVE_USER_BROWSER_GATE_ATTACHMENT_NAME
+    || attachment.contentType !== "application/json"
+    || attachment.path !== undefined
+    || !Buffer.isBuffer(attachment.body)
+    || attachment.body.length > MAX_LIVE_USER_BROWSER_GATE_ATTACHMENT_BYTES
+    || attachment.body.some((byte) => byte > 0x7f)
+  ) return null;
+  let payload;
+  try {
+    payload = JSON.parse(attachment.body.toString("ascii"));
+  } catch {
+    return null;
+  }
+  const countKeys = LIVE_USER_BROWSER_GATE_COUNTS;
+  if (
+    !payload
+    || typeof payload !== "object"
+    || Array.isArray(payload)
+    || Object.keys(payload).sort().join(",") !== [
+      "counts", "counts_truncated", "coverage", "events", "events_truncated", "schema",
+    ].join(",")
+    || payload.schema !== 2
+    || payload.coverage !== "journey_logout_before_context_close"
+    || typeof payload.counts_truncated !== "boolean"
+    || typeof payload.events_truncated !== "boolean"
+    || !Array.isArray(payload.events)
+    || payload.events.length > MAX_LIVE_USER_BROWSER_GATE_EVENTS
+    || (payload.events_truncated && payload.events.length !== MAX_LIVE_USER_BROWSER_GATE_EVENTS)
+    || !payload.counts
+    || typeof payload.counts !== "object"
+    || Array.isArray(payload.counts)
+    || Object.keys(payload.counts).sort().join(",") !== [...countKeys].sort().join(",")
+    || countKeys.some((key) => (
+      !Number.isSafeInteger(payload.counts[key]) || payload.counts[key] < 0 || payload.counts[key] > 255
+    ))
+    || attachment.body.toString("ascii") !== JSON.stringify(payload)
+  ) return null;
+
+  const eventCounts = Object.fromEntries(countKeys.map((key) => [key, 0]));
+  for (const event of payload.events) {
+    if (
+      !event
+      || typeof event !== "object"
+      || Array.isArray(event)
+      || !LIVE_USER_BROWSER_GATE_KINDS.has(event.kind)
+      || !["journey", "logout"].includes(event.phase)
+    ) return null;
+    const expectedKeys = {
+      csp_violation: ["directive", "disposition", "kind", "phase"],
+      csp_console: ["kind", "phase"],
+      forbidden_request: ["kind", "method", "phase", "resource_type", "route"],
+      page_error: ["kind", "phase"],
+      request_failed: [
+        "failure_class", "kind", "method", "phase", "resource_type", "route",
+      ],
+    }[event.kind];
+    if (Object.keys(event).sort().join(",") !== expectedKeys.join(",")) return null;
+    if (
+      event.kind === "csp_violation"
+      && (
+        !LIVE_USER_BROWSER_GATE_DISPOSITIONS.has(event.disposition)
+        || !LIVE_USER_BROWSER_GATE_DIRECTIVES.has(event.directive)
+      )
+    ) return null;
+    if (["forbidden_request", "request_failed"].includes(event.kind)) {
+      if (
+        !LIVE_USER_BROWSER_GATE_RESOURCE_TYPES.has(event.resource_type)
+        || !LIVE_USER_BROWSER_GATE_METHODS.has(event.method)
+        || !LIVE_USER_BROWSER_GATE_ROUTES.has(event.route)
+      ) return null;
+    }
+    if (
+      event.kind === "request_failed"
+      && !LIVE_USER_BROWSER_GATE_FAILURE_CLASSES.has(event.failure_class)
+    ) return null;
+    eventCounts[event.kind] += 1;
+  }
+  if (countKeys.some((key) => payload.counts[key] < eventCounts[key])) return null;
+  return payload;
+}
+
+function liveUserBrowserGateEvidenceForAttempt(result) {
+  const attachments = Array.isArray(result?.attachments)
+    ? result.attachments.filter(
+      (attachment) => attachment?.name === LIVE_USER_BROWSER_GATE_ATTACHMENT_NAME,
+    )
+    : [];
+  if (attachments.length !== 1) return { state: "unavailable", evidence: null };
+  const payload = normalizedLiveUserBrowserGateAttachment(attachments[0]);
+  if (!payload) return { state: "unavailable", evidence: null };
+  return {
+    state: "captured",
+    evidence: {
+      schema: payload.schema,
+      coverage: payload.coverage,
+      counts: payload.counts,
+      counts_truncated: payload.counts_truncated,
+      events_truncated: payload.events_truncated,
+      events: payload.events,
+    },
+  };
+}
+
 function liveUserFailureRecordForAttempt(test, result, attempt, sourceRoot) {
   const project = typeof test?.parent?.project === "function"
     ? test.parent.project()?.name
@@ -1289,6 +1422,7 @@ function liveUserFailureRecordForAttempt(test, result, attempt, sourceRoot) {
     ? { file: location.file, line: location.line, column: location.column }
     : null;
   const apiFailure = liveUserApiFailureForAttempt(result, sourceRoot, sourceFrame);
+  const browserGateEvidence = liveUserBrowserGateEvidenceForAttempt(result);
   return {
     id: LIVE_USER_TEST_ID,
     project,
@@ -1300,6 +1434,8 @@ function liveUserFailureRecordForAttempt(test, result, attempt, sourceRoot) {
     source_kind: location ? "test_error_location" : "unavailable",
     api_failure_state: apiFailure.state,
     api_failure: apiFailure.failure,
+    browser_gate_state: browserGateEvidence.state,
+    browser_gate: browserGateEvidence.evidence,
   };
 }
 
@@ -1878,6 +2014,7 @@ module.exports.writeBoundedFailureIdentitySummary = writeBoundedFailureIdentityS
 module.exports.publicFailureIdentityMappingIsComplete = publicFailureIdentityMappingIsComplete;
 module.exports.publicTestTitles = publicTestTitles;
 module.exports.writeBoundedLiveUserFailureSummary = writeBoundedLiveUserFailureSummary;
+module.exports.normalizedLiveUserBrowserGateAttachment = normalizedLiveUserBrowserGateAttachment;
 module.exports.createPageErrorAttachment = createPageErrorAttachment;
 module.exports.createLiveUserApiFailureAttachment = createLiveUserApiFailureAttachment;
 module.exports.userApiFailureMessage = userApiFailureMessage;

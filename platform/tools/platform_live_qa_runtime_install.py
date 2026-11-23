@@ -124,6 +124,7 @@ RUNTIME_REQUIRED_FILES = (
     "web/tests/smoke/live-user-journey.spec.ts",
     "web/tests/support/live-qa-origin.ts",
     "web/tests/support/live-qa-sandbox.ts",
+    "web/tests/support/live-user-browser-gate.ts",
     "web/tests/support/live-count-reporter.cjs",
     "web/node_modules/@playwright/test/package.json",
     "web/node_modules/playwright/package.json",
@@ -1154,6 +1155,7 @@ def _validate_runtime_source(
         "web/tests/smoke/live-user-journey.spec.ts",
         "web/tests/support/live-qa-origin.ts",
         "web/tests/support/live-qa-sandbox.ts",
+        "web/tests/support/live-user-browser-gate.ts",
     ]
     if not attested_provider_recovery:
         required.append("web/tests/smoke/live-launch.spec.ts")
@@ -1186,6 +1188,7 @@ def _validate_runtime_source(
         "web/tests/smoke/live-user-journey.spec.ts",
         "web/tests/support/live-qa-origin.ts",
         "web/tests/support/live-qa-sandbox.ts",
+        "web/tests/support/live-user-browser-gate.ts",
     }
     if not attested_provider_recovery:
         allowed_web_files.add("web/tests/smoke/live-launch.spec.ts")

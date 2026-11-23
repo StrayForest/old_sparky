@@ -2597,7 +2597,7 @@ def collect_issues() -> list[str]:
     else:
         for required in (
             'testDir: "./tests/image-inventory"',
-            'testMatch: ["live-image-inventory.spec.ts"]',
+            'testMatch: ["live-image-inventory.spec.ts", "live-user-browser-gate.spec.ts"]',
             'name: "webkit-mobile"',
             '...devices["iPhone 13"]',
             "PLATFORM_WEB_HERMETIC_BUILD_DIR",

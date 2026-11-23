@@ -5,7 +5,7 @@ const hermeticBuildDir = process.env.PLATFORM_WEB_HERMETIC_BUILD_DIR;
 
 export default defineConfig({
   testDir: "./tests/image-inventory",
-  testMatch: ["live-image-inventory.spec.ts"],
+  testMatch: ["live-image-inventory.spec.ts", "live-user-browser-gate.spec.ts"],
   outputDir: hermeticBuildDir
     ? path.join(hermeticBuildDir, "image-inventory-results")
     : "./test-results-image-inventory",

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -7,7 +9,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 
 SCRIPT_PATH = (
@@ -83,9 +85,119 @@ class CleanupLiveUserQaTests(unittest.TestCase):
         inventory = self.load()
 
         self.assertEqual(inventory.marker, MARKER)
+        self.assertEqual(
+            inventory.inventory_sha256,
+            hashlib.sha256(self.path.read_bytes()).hexdigest(),
+        )
         self.assertEqual(inventory.user_ids, (USER_ID,))
         self.assertEqual(inventory.tournament_ids, (TOURNAMENT_ID,))
         self.assertEqual(inventory.media_ids, ())
+
+    def test_cleanup_publishes_one_query_bound_zero_receipt_and_fails_closed(self) -> None:
+        class FakeSession:
+            def __init__(self) -> None:
+                self.scalar = AsyncMock(return_value=0)
+                self.execute = AsyncMock(
+                    return_value=SimpleNamespace(rowcount=0, all=lambda: [])
+                )
+                self.flush = AsyncMock()
+                self.commit = AsyncMock()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+        def exercise(*, fail_verification: bool) -> tuple[list[FakeSession], Path]:
+            with tempfile.TemporaryDirectory(dir="/root") as temporary:
+                state_root = Path(temporary) / "states"
+                state_root.mkdir(mode=0o700)
+                state_dir = state_root / "live-user-qa.Abc123"
+                state_dir.mkdir(mode=0o700)
+                inventory_payload = {
+                    "version": 1,
+                    "marker": MARKER,
+                    "user_ids": [USER_ID],
+                    "tournament_ids": [],
+                    "media_ids": [],
+                }
+                inventory_path = state_dir / "inventory.json"
+                inventory_path.write_text(json.dumps(inventory_payload), encoding="ascii")
+                inventory_path.chmod(0o600)
+                inventory = MODULE.CleanupInventory(
+                    marker=MARKER,
+                    user_ids=(USER_ID,),
+                    tournament_ids=(),
+                    media_ids=(),
+                    inventory_sha256=hashlib.sha256(inventory_path.read_bytes()).hexdigest(),
+                )
+                sessions = [FakeSession(), FakeSession()]
+                pending = iter(sessions)
+
+                def session_factory():
+                    return lambda: next(pending)
+
+                verifier = AsyncMock(
+                    side_effect=(RuntimeError("verification failed") if fail_verification else None),
+                    wraps=None if fail_verification else MODULE.verify_absence,
+                )
+                context = {
+                    "state_dir": state_dir,
+                    "runner_source_sha": "a" * 40,
+                    "app_sha": "b" * 40,
+                    "marker_sha256": hashlib.sha256(MARKER.encode("ascii")).hexdigest(),
+                    "gate_id_sha256": hashlib.sha256(state_dir.name.encode("ascii")).hexdigest(),
+                }
+                with (
+                    patch.object(MODULE, "get_settings", return_value=SimpleNamespace()),
+                    patch.object(MODULE, "_validate_runtime_target"),
+                    patch.object(MODULE, "LIVE_QA_STATE_ROOT", state_root),
+                    patch.object(MODULE, "_validate_exact_scope", new_callable=AsyncMock),
+                    patch.object(MODULE, "_audit_subject_ids_for_scope", new_callable=AsyncMock, return_value={}),
+                    patch.object(MODULE, "session_factory", side_effect=session_factory) as session_factory_mock,
+                    patch.object(MODULE, "verify_absence", verifier),
+                ):
+                    if fail_verification:
+                        with self.assertRaisesRegex(RuntimeError, "verification failed"):
+                            asyncio.run(MODULE.cleanup(
+                                inventory,
+                                _allow_test_environment=True,
+                                absence_proof_context=context,
+                            ))
+                        self.assertFalse((state_dir / "cleanup-absence.json").exists())
+                    else:
+                        result = asyncio.run(MODULE.cleanup(
+                            inventory,
+                            _allow_test_environment=True,
+                            absence_proof_context=context,
+                        ))
+                        self.assertEqual(result["users"], 0)
+                        proof_path = state_dir / "cleanup-absence.json"
+                        proof_bytes = proof_path.read_bytes()
+                        proof = json.loads(proof_bytes)
+                        self.assertEqual(proof["schema"], 1)
+                        self.assertEqual(proof["status"], "verified_absent")
+                        self.assertEqual(proof["runner_source_sha"], context["runner_source_sha"])
+                        self.assertEqual(proof["app_sha"], context["app_sha"])
+                        self.assertEqual(proof["marker_sha256"], context["marker_sha256"])
+                        self.assertEqual(proof["gate_id_sha256"], context["gate_id_sha256"])
+                        self.assertEqual(proof["inventory_sha256"], inventory.inventory_sha256)
+                        self.assertEqual(set(proof["zero_counts"].values()), {0})
+                        self.assertNotIn(USER_ID.encode("ascii"), proof_bytes)
+                        self.assertEqual(proof_path.stat().st_mode & 0o777, 0o600)
+                        self.assertEqual(proof_path.stat().st_nlink, 1)
+                    self.assertEqual(session_factory_mock.call_count, 2)
+                    self.assertEqual(verifier.await_count, 1)
+                    self.assertIs(verifier.await_args.args[0], sessions[1])
+                    if not fail_verification:
+                        self.assertEqual(sessions[1].scalar.await_count, 5)
+                # Preserve only values needed for assertions after temp teardown.
+                return sessions, state_dir
+
+        valid_sessions, _valid_state = exercise(fail_verification=False)
+        self.assertEqual(valid_sessions[1].scalar.await_count, 5)
+        exercise(fail_verification=True)
 
     def test_inventory_rejects_wrong_mode_symlink_and_relative_path(self) -> None:
         self.write_inventory()

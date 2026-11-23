@@ -451,6 +451,141 @@ test("WebKit inventories delayed offscreen lazy images after route content is re
   expect(inventory.scrollAttempts).toBe(3);
 });
 
+// This controlled viewport-gated source publisher checks scan robustness; it is
+// not a reproduction of WebKit's production lazy-loader implementation.
+test("WebKit revisits lazy images while their viewport-gated source is still pending", async ({ page }) => {
+  await page.addInitScript(() => {
+    const imageIds = new WeakMap<HTMLImageElement, string>();
+    const states = new WeakMap<HTMLImageElement, boolean>();
+    const events: Array<{ id: string; state: "initial_intersecting" | "initial_outside" | "enter" | "leave" }> = [];
+    const observe = (image: HTMLImageElement) => {
+      const id = image.dataset.imageId;
+      if (id) imageIds.set(image, id);
+      observer.observe(image);
+    };
+    const observer = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        const image = entry.target as HTMLImageElement;
+        const id = imageIds.get(image);
+        if (!id) continue;
+        const intersecting = entry.isIntersecting && entry.intersectionRatio > 0;
+        const previous = states.get(image);
+        const state = previous === undefined
+          ? intersecting ? "initial_intersecting" : "initial_outside"
+          : previous === intersecting ? null : intersecting ? "enter" : "leave";
+        states.set(image, intersecting);
+        if (state) events.push({ id, state });
+      }
+    }, { threshold: [0] });
+    const attach = (node: Node) => {
+      if (node instanceof HTMLImageElement) observe(node);
+      node.childNodes.forEach(attach);
+    };
+    new MutationObserver((records) => records.forEach((record) => record.addedNodes.forEach(attach)))
+      .observe(document, { childList: true, subtree: true });
+    Object.defineProperty(window, "__imageInventoryVisibility", {
+      value: { events },
+      configurable: false,
+    });
+  });
+  await page.route("http://image-inventory.test/**", async (route) => {
+    const { pathname } = new URL(route.request().url());
+    if (pathname === "/fixture") {
+      await route.fulfill({
+        contentType: "text/html; charset=utf-8",
+        body: `<!doctype html>
+          <html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+          <body>
+            <main id="image-content" style="padding-top: 1800px"></main>
+            <div data-testid="route-ready" data-ready="false"></div>
+            <script>
+              const pendingLoads = new WeakMap();
+              const lazySourceObserver = new IntersectionObserver((entries) => {
+                for (const entry of entries) {
+                  const image = entry.target;
+                  if (entry.isIntersecting && !image.hasAttribute("src")) {
+                    const timer = setTimeout(() => {
+                      if (image.isConnected && !image.hasAttribute("src")) {
+                        image.src = image.dataset.pendingSrc;
+                      }
+                    }, 120);
+                    pendingLoads.set(image, timer);
+                  } else if (!entry.isIntersecting) {
+                    clearTimeout(pendingLoads.get(image));
+                  }
+                }
+              }, { threshold: [0] });
+              fetch("/api/content/initial")
+                .then((response) => response.json())
+                .then((names) => {
+                  const content = document.querySelector("#image-content");
+                  for (const name of names) {
+                    const section = document.createElement("section");
+                    section.style.height = "1200px";
+                    section.style.display = "grid";
+                    section.style.placeItems = "center";
+                    const image = document.createElement("img");
+                    image.dataset.imageId = name;
+                    image.dataset.pendingSrc = "/images/" + name + ".svg";
+                    image.loading = "lazy";
+                    image.width = 32;
+                    image.height = 32;
+                    section.append(image);
+                    lazySourceObserver.observe(image);
+                    content.append(section);
+                  }
+                  document.querySelector('[data-testid="route-ready"]')
+                    .setAttribute("data-ready", "true");
+                });
+            </script>
+          </body></html>`,
+      });
+      return;
+    }
+    if (pathname === "/api/content/initial") {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify(Array.from({ length: 10 }, (_, index) => `lazy-${index + 1}`)),
+      });
+      return;
+    }
+    if (/^\/images\/lazy-(?:[1-9]|10)\.svg$/u.test(pathname)) {
+      await route.fulfill({ contentType: "image/svg+xml", body: fixtureSvg });
+      return;
+    }
+    await route.abort();
+  });
+
+  await page.goto("http://image-inventory.test/fixture", { waitUntil: "domcontentloaded" });
+  const inventory = await collectLiveImageInventory(page, {
+    route: "viewport-gated-lazy-image-fixture",
+    waitForContent: async () => {
+      await expect(page.getByTestId("route-ready")).toHaveAttribute("data-ready", "true");
+    },
+    timeoutMs: 10_000,
+  });
+
+  expect(inventory.complete).toBe(true);
+  expect(inventory.images).toHaveLength(10);
+  expect(inventory.images.every((image) => image.loaded && image.currentSrc.length > 0)).toBe(true);
+  expect(inventory.images.every((image) => (
+    image.diagnostic.requestState === "request_finished"
+    || image.diagnostic.requestState === "response_received"
+  ))).toBe(true);
+  const visibilityEvents = await page.evaluate(() => (
+    (window as Window & {
+      __imageInventoryVisibility?: { events: Array<{ id: string; state: string }> };
+    }).__imageInventoryVisibility?.events ?? []
+  ));
+  for (const image of inventory.images) {
+    const entered = visibilityEvents.some((event) => (
+      event.id === image.source.split("/").at(-1)?.replace(/\.svg$/u, "")
+      && (event.state === "initial_intersecting" || event.state === "enter")
+    ));
+    expect(entered, `lazy image ${image.diagnostic.ordinal} should actually enter the viewport`).toBe(true);
+  }
+});
+
 test("WebKit emits bounded producer evidence for ten images with one failed asset", async ({ page }) => {
   await page.route("http://image-inventory.test/**", async (route) => {
     const { pathname } = new URL(route.request().url());

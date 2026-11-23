@@ -204,6 +204,11 @@ type ImageRequestObservation = {
   failed: boolean;
 };
 
+type ImageRequestStartWaiter = {
+  urls: Set<string>;
+  resolve: () => void;
+};
+
 const MAX_IMAGE_DIAGNOSTIC_EVENTS = 64;
 const MAX_IMAGE_SOURCE_VALUE_CHARS = 2_048;
 const MAX_IMAGE_SOURCE_HISTORY = 8;
@@ -240,11 +245,15 @@ export async function collectLiveImageInventory(
   { route, waitForContent, timeoutMs = 30_000 }: CollectLiveImageInventoryOptions,
 ): Promise<LiveImageInventoryResult> {
   const requests = new Map<import("@playwright/test").Request, ImageRequestObservation>();
+  const requestStartWaiters = new Set<ImageRequestStartWaiter>();
   let networkEventsTruncated = false;
   let requestUrlBytes = 0;
   const onRequest = (request: import("@playwright/test").Request) => {
     if (request.resourceType() !== "image") return;
     const url = request.url();
+    for (const waiter of requestStartWaiters) {
+      if (waiter.urls.has(url)) waiter.resolve();
+    }
     if (
       requests.size >= MAX_IMAGE_DIAGNOSTIC_EVENTS
       || url.length > MAX_IMAGE_REQUEST_URL_CHARS
@@ -346,6 +355,94 @@ export async function collectLiveImageInventory(
     cspEventsTruncated: false,
   };
   const observedAt = () => performance.now();
+  const hasObservedRequest = (urls: string[]) => urls.some((url) => (
+    [...requests.values()].some((request) => request.url === url)
+  ));
+  const waitForImageRequestStart = (urls: string[], timeoutMs: number) => {
+    const candidates = new Set(urls.filter(Boolean));
+    if (candidates.size === 0 || hasObservedRequest([...candidates]) || timeoutMs <= 0) {
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        requestStartWaiters.delete(waiter);
+        resolve();
+      };
+      const waiter: ImageRequestStartWaiter = { urls: candidates, resolve: finish };
+      const timer = setTimeout(finish, timeoutMs);
+      requestStartWaiters.add(waiter);
+    });
+  };
+  const waitForImageSourceOrLoad = (
+    image: import("@playwright/test").ElementHandle,
+    timeoutMs: number,
+  ) => image.evaluate((element, maxWaitMs) => new Promise<void>((resolve) => {
+    const imageElement = element as HTMLImageElement;
+    let settled = false;
+    let observer: MutationObserver | null = null;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      observer?.disconnect();
+      imageElement.removeEventListener("load", finish);
+      imageElement.removeEventListener("error", finish);
+      resolve();
+    };
+    const timer = window.setTimeout(finish, maxWaitMs);
+    observer = new MutationObserver(() => {
+      if (
+        imageElement.hasAttribute("src")
+        || imageElement.hasAttribute("srcset")
+        || imageElement.currentSrc
+        || (imageElement.complete && imageElement.naturalWidth > 0)
+      ) finish();
+    });
+    observer.observe(imageElement, { attributes: true, attributeFilter: ["src", "srcset"] });
+    imageElement.addEventListener("load", finish, { once: true });
+    imageElement.addEventListener("error", finish, { once: true });
+    if (
+      imageElement.hasAttribute("src")
+      || imageElement.hasAttribute("srcset")
+      || imageElement.currentSrc
+      || (imageElement.complete && imageElement.naturalWidth > 0)
+    ) finish();
+  }), timeoutMs);
+  const waitForViewportOpportunity = (
+    image: import("@playwright/test").ElementHandle,
+    timeoutMs: number,
+  ) => image.evaluate((element, maxWaitMs) => new Promise<boolean>((resolve) => {
+      const imageElement = element as HTMLImageElement;
+      let settled = false;
+      const finish = (visible: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(visible);
+      };
+      const intersectsViewport = () => {
+        if (!imageElement.isConnected) return false;
+        const rect = imageElement.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0
+          && rect.bottom >= 0 && rect.right >= 0
+          && rect.top <= window.innerHeight && rect.left <= window.innerWidth;
+      };
+      const check = () => {
+        if (intersectsViewport()) {
+          finish(true);
+        } else if (settled) {
+          return;
+        } else {
+          requestAnimationFrame(check);
+        }
+      };
+      const timer = window.setTimeout(() => finish(false), maxWaitMs);
+      requestAnimationFrame(check);
+  }), timeoutMs);
   const captureImages = async (): Promise<LiveImageInventoryRow[]> => {
     const rawCsp = await page.evaluate(() => {
       const target = window as ImageInventoryWindow;
@@ -521,27 +618,88 @@ export async function collectLiveImageInventory(
   while (performance.now() < deadline) {
     const handles = await imageLocator.elementHandles();
     for (const imageHandle of handles) {
+      if (performance.now() >= deadline) break;
       let shouldScroll = false;
       try {
-        shouldScroll = await imageHandle.evaluate((element) => {
+        const imageState = await imageHandle.evaluate((element) => {
           const image = element as HTMLImageElement;
           const state = (window as ImageInventoryWindow).__oldsparkyLiveImageInventory;
-          if (!state) return false;
+          if (!state) return null;
           if (!state.ids.has(image)) {
             state.nextId += 1;
             state.ids.set(image, state.nextId);
           }
           const source = `${image.getAttribute("src") ?? ""}\0${image.getAttribute("srcset") ?? ""}`;
-          if (state.scrolledSources.get(image) === source) return false;
-          state.scrolledSources.set(image, source);
-          return true;
+          return {
+            source,
+            loaded: image.complete && image.naturalWidth > 0,
+            urls: [image.currentSrc, image.src].filter(Boolean),
+            sourceChanged: state.scrolledSources.get(image) !== source,
+          };
         });
+        if (!imageState) continue;
+        const requestStarted = hasObservedRequest(imageState.urls);
+        shouldScroll = imageState.sourceChanged
+          || (!imageState.loaded && !requestStarted);
         if (shouldScroll) {
+          const opportunityStartedAt = performance.now();
           await imageHandle.evaluate((element) => {
-            (element as HTMLImageElement).scrollIntoView({ block: "center", inline: "nearest" });
+            const image = element as HTMLImageElement;
+            const state = (window as ImageInventoryWindow).__oldsparkyLiveImageInventory;
+            if (!state) return;
+            state.scrolledSources.set(
+              image,
+              `${image.getAttribute("src") ?? ""}\0${image.getAttribute("srcset") ?? ""}`,
+            );
+          });
+          await imageHandle.evaluate((element) => {
+            (element as HTMLImageElement).scrollIntoView({
+              behavior: "instant",
+              block: "center",
+              inline: "nearest",
+            });
           });
           scrollAttempts += 1;
-          await page.waitForTimeout(50);
+          const opportunityMs = Math.min(
+            1_000,
+            Math.max(0, (deadline - performance.now()) / Math.max(1, handles.length)),
+          );
+          const visible = await waitForViewportOpportunity(
+            imageHandle,
+            Math.min(250, opportunityMs),
+          ).catch(() => false);
+          if (visible && !imageState.loaded) {
+            let urls = await imageHandle.evaluate((element) => {
+              const image = element as HTMLImageElement;
+              return [image.currentSrc, image.src].filter(Boolean);
+            }).catch(() => []);
+            if (urls.length === 0) {
+              await waitForImageSourceOrLoad(
+                imageHandle,
+                Math.max(
+                  0,
+                  Math.min(
+                    opportunityMs - (performance.now() - opportunityStartedAt),
+                    deadline - performance.now(),
+                  ),
+                ),
+              ).catch(() => undefined);
+              urls = await imageHandle.evaluate((element) => {
+                const image = element as HTMLImageElement;
+                return [image.currentSrc, image.src].filter(Boolean);
+              }).catch(() => []);
+            }
+            const requestWaitMs = Math.max(
+              0,
+              Math.min(
+                opportunityMs - (performance.now() - opportunityStartedAt),
+                deadline - performance.now(),
+              ),
+            );
+            if (!hasObservedRequest(urls)) {
+              await waitForImageRequestStart(urls, requestWaitMs);
+            }
+          }
         }
       } catch {
         // A replaced node is rediscovered on the next bounded pass.

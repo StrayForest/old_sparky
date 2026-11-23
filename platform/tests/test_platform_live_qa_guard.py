@@ -1393,8 +1393,20 @@ class LiveQaGuardTests(unittest.TestCase):
     @unittest.skipUnless(os.geteuid() == 0, "root-owned state contract")
     def test_root_state_has_durable_phase_and_exact_modes(self) -> None:
         with tempfile.TemporaryDirectory(dir="/root") as temporary:
-            bundle = self.make_bundle(Path(temporary) / "private")
-            with mock.patch.object(guard, "TRUSTED_SECRET_ROOT", bundle.parent):
+            root = Path(temporary)
+            bundle = self.make_bundle(root / "private")
+            gate_root = root / "run-gates"
+            gate_root.mkdir(mode=0o711)
+            runner_sha = "a" * 40
+            app_sha = "b" * 40
+            receipt_path = bundle.parent / "live-user-cleanup-absence.json"
+            with (
+                mock.patch.object(guard, "TRUSTED_SECRET_ROOT", bundle.parent),
+                mock.patch.object(guard, "LIVE_USER_CLEANUP_ABSENCE_RECEIPT", receipt_path),
+                mock.patch.object(guard, "RUN_GATE_ROOT", gate_root),
+                mock.patch.object(guard, "_active_release_commit", return_value=app_sha),
+                mock.patch.dict(os.environ, {"PLATFORM_LIVE_QA_RUNNER_SHA": runner_sha}),
+            ):
                 state = guard.prepare_root_state(bundle)
                 try:
                     marker, inventory, sessions = guard.validate_root_state(
@@ -1410,6 +1422,24 @@ class LiveQaGuardTests(unittest.TestCase):
                         stat.S_IMODE((state / guard.STATE_PHASE_FILE).stat().st_mode),
                         0o600,
                     )
+                    proof = {
+                        "schema": 1,
+                        "status": "verified_absent",
+                        "runner_source_sha": runner_sha,
+                        "app_sha": app_sha,
+                        "marker_sha256": hashlib.sha256(marker.encode("ascii")).hexdigest(),
+                        "gate_id_sha256": hashlib.sha256(state.name.encode("ascii")).hexdigest(),
+                        "inventory_sha256": hashlib.sha256(inventory.read_bytes()).hexdigest(),
+                        "zero_counts": {
+                            key: 0 for key in guard.LIVE_USER_CLEANUP_ZERO_COUNTS
+                        },
+                    }
+                    proof_path = state / guard.LIVE_USER_CLEANUP_ABSENCE_FILE
+                    proof_path.write_text(
+                        json.dumps(proof, separators=(",", ":")) + "\n",
+                        encoding="ascii",
+                    )
+                    proof_path.chmod(0o600)
                 finally:
                     guard.remove_root_state(bundle, state)
 
@@ -1597,6 +1627,11 @@ class LiveQaGuardTests(unittest.TestCase):
                             "TRUSTED_ACTIVE_POINTER",
                             secret_root / "active",
                         ),
+                        mock.patch.object(
+                            guard,
+                            "LIVE_USER_CLEANUP_ABSENCE_RECEIPT",
+                            secret_root / "live-user-cleanup-absence.json",
+                        ),
                         mock.patch.object(guard, "RUN_GATE_ROOT", gate_root),
                         mock.patch.dict(os.environ, env, clear=True),
                     )
@@ -1657,6 +1692,31 @@ class LiveQaGuardTests(unittest.TestCase):
                                 self.assertEqual(inventory["user_ids"], list(expected_ids))
                                 self.assertEqual(inventory["tournament_ids"], [])
                                 self.assertEqual(inventory["media_ids"], [])
+                                proof = {
+                                    "schema": 1,
+                                    "status": "verified_absent",
+                                    "runner_source_sha": source_sha,
+                                    "app_sha": source_sha,
+                                    "marker_sha256": hashlib.sha256(
+                                        b"liveqa-stale-guard-fixture"
+                                    ).hexdigest(),
+                                    "gate_id_sha256": hashlib.sha256(
+                                        state.name.encode("ascii")
+                                    ).hexdigest(),
+                                    "inventory_sha256": hashlib.sha256(
+                                        inventory_path.read_bytes()
+                                    ).hexdigest(),
+                                    "zero_counts": {
+                                        key: 0
+                                        for key in guard.LIVE_USER_CLEANUP_ZERO_COUNTS
+                                    },
+                                }
+                                proof_path = state / guard.LIVE_USER_CLEANUP_ABSENCE_FILE
+                                proof_path.write_text(
+                                    json.dumps(proof, separators=(",", ":")) + "\n",
+                                    encoding="ascii",
+                                )
+                                proof_path.chmod(0o600)
                             finally:
                                 guard.remove_root_state(bundle, state)
                         else:
@@ -1697,6 +1757,173 @@ class LiveQaGuardTests(unittest.TestCase):
                                 self.assertEqual(generated, [])
 
     @unittest.skipUnless(os.geteuid() == 0, "root-owned state contract")
+    @unittest.skipUnless(os.geteuid() == 0, "root-owned cleanup receipt contract")
+    def test_remove_root_state_requires_and_retains_bound_absence_receipt(self) -> None:
+        source_sha = "a" * 40
+        marker_sha = hashlib.sha256(b"liveqa-stale-guard-fixture").hexdigest()
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            (
+                bundle,
+                _install_root,
+                _payload_platform,
+                _expected_ids,
+                secret_root,
+                _payload_releases,
+                app_dir,
+            ) = self.make_stale_cleanup_bundle_fixture(root, source_sha=source_sha)
+            gate_root = root / "run-gates"
+            gate_root.mkdir(mode=0o711)
+            receipt_path = secret_root / "live-user-cleanup-absence.json"
+            env = {"PLATFORM_LIVE_QA_RUNNER_SHA": source_sha}
+
+            def state_with_proof(suffix: str) -> tuple[Path, dict[str, object], bytes]:
+                with mock.patch.object(guard.secrets, "choice", return_value=suffix):
+                    state = guard.prepare_root_state(bundle)
+                inventory_path = state / "inventory.json"
+                payload: dict[str, object] = {
+                    "schema": 1,
+                    "status": "verified_absent",
+                    "runner_source_sha": source_sha,
+                    "app_sha": source_sha,
+                    "marker_sha256": marker_sha,
+                    "gate_id_sha256": hashlib.sha256(state.name.encode("ascii")).hexdigest(),
+                    "inventory_sha256": hashlib.sha256(inventory_path.read_bytes()).hexdigest(),
+                    "zero_counts": {key: 0 for key in guard.LIVE_USER_CLEANUP_ZERO_COUNTS},
+                }
+                proof_bytes = (
+                    json.dumps(payload, separators=(",", ":")) + "\n"
+                ).encode("ascii")
+                proof_path = state / guard.LIVE_USER_CLEANUP_ABSENCE_FILE
+                proof_path.write_bytes(proof_bytes)
+                proof_path.chmod(0o600)
+                return state, payload, proof_bytes
+
+            with (
+                mock.patch.object(guard, "TRUSTED_SECRET_ROOT", secret_root),
+                mock.patch.object(guard, "LIVE_USER_CLEANUP_ABSENCE_RECEIPT", receipt_path),
+                mock.patch.object(guard, "RUN_GATE_ROOT", gate_root),
+                mock.patch.object(
+                    guard,
+                    "_active_release_commit",
+                    side_effect=lambda: guard._release_pointer_commit("current", app_dir),
+                ),
+                mock.patch.dict(os.environ, env),
+            ):
+                with mock.patch.object(guard.secrets, "choice", return_value="A"):
+                    state = guard.prepare_root_state(bundle)
+                with self.assertRaisesRegex(guard.GuardError, "absence proof is required"):
+                    guard.remove_root_state(bundle, state)
+                self.assertTrue(state.is_dir())
+                self.assertFalse(receipt_path.exists())
+
+                proof_path = state / guard.LIVE_USER_CLEANUP_ABSENCE_FILE
+                proof_path.write_text('{"unexpected":true}\n', encoding="ascii")
+                proof_path.chmod(0o600)
+                with self.assertRaises(guard.GuardError):
+                    guard.remove_root_state(bundle, state)
+                self.assertTrue(state.is_dir())
+                self.assertFalse(receipt_path.exists())
+
+                inventory_path = state / "inventory.json"
+                valid_payload: dict[str, object] = {
+                    "schema": 1,
+                    "status": "verified_absent",
+                    "runner_source_sha": source_sha,
+                    "app_sha": source_sha,
+                    "marker_sha256": marker_sha,
+                    "gate_id_sha256": hashlib.sha256(state.name.encode("ascii")).hexdigest(),
+                    "inventory_sha256": hashlib.sha256(inventory_path.read_bytes()).hexdigest(),
+                    "zero_counts": {key: 0 for key in guard.LIVE_USER_CLEANUP_ZERO_COUNTS},
+                }
+
+                def write_state_proof(payload: dict[str, object]) -> bytes:
+                    raw = (json.dumps(payload, separators=(",", ":")) + "\n").encode("ascii")
+                    proof_path.write_bytes(raw)
+                    proof_path.chmod(0o600)
+                    return raw
+
+                for field, bad_value in (
+                    ("app_sha", "e" * 40),
+                    ("runner_source_sha", "f" * 40),
+                    ("marker_sha256", "0" * 64),
+                    ("gate_id_sha256", "1" * 64),
+                    ("inventory_sha256", "2" * 64),
+                ):
+                    with self.subTest(binding=field):
+                        mismatched = dict(valid_payload)
+                        mismatched[field] = bad_value
+                        write_state_proof(mismatched)
+                        with self.assertRaises(guard.GuardError):
+                            guard.remove_root_state(bundle, state)
+                        self.assertTrue(state.is_dir())
+                        self.assertFalse(receipt_path.exists())
+
+                proof_bytes = write_state_proof(valid_payload)
+                original_rmdir = Path.rmdir
+                removed_state: list[Path] = []
+
+                def observe_state_removal(path: Path) -> None:
+                    if path == state:
+                        self.assertTrue(receipt_path.is_file())
+                        self.assertEqual(receipt_path.read_bytes(), proof_bytes)
+                        removed_state.append(path)
+                    original_rmdir(path)
+
+                with mock.patch.object(Path, "rmdir", observe_state_removal):
+                    guard.remove_root_state(bundle, state)
+                self.assertEqual(removed_state, [state])
+                self.assertFalse(state.exists())
+                first_receipt = receipt_path.read_bytes()
+                self.assertEqual(json.loads(first_receipt), valid_payload)
+                self.assertEqual(receipt_path.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(receipt_path.stat().st_nlink, 1)
+                self.assertNotIn("user_ids", first_receipt.decode("ascii"))
+                self.assertNotIn("old-sparky.com", first_receipt.decode("ascii"))
+
+                # Recreate the exact same state identity and proof to prove replay is
+                # byte-stable and leaves the durable receipt in place.
+                replay_state, replay_payload, replay_proof = state_with_proof("A")
+                self.assertEqual(replay_state, state)
+                self.assertEqual(replay_payload, valid_payload)
+                self.assertEqual(replay_proof, proof_bytes)
+                guard.remove_root_state(bundle, replay_state)
+                self.assertEqual(receipt_path.read_bytes(), first_receipt)
+                self.assertFalse(replay_state.exists())
+
+                # A new valid state may advance the single latest receipt. A bad
+                # incoming proof and a malformed prior receipt both fail closed.
+                next_state, next_payload, _next_proof = state_with_proof("B")
+                bad_next = dict(next_payload)
+                bad_next["app_sha"] = "e" * 40
+                next_proof = (json.dumps(bad_next, separators=(",", ":")) + "\n").encode("ascii")
+                next_proof_path = next_state / guard.LIVE_USER_CLEANUP_ABSENCE_FILE
+                next_proof_path.write_bytes(next_proof)
+                next_proof_path.chmod(0o600)
+                with self.assertRaisesRegex(guard.GuardError, "app binding is stale"):
+                    guard.remove_root_state(bundle, next_state)
+                self.assertTrue(next_state.is_dir())
+                self.assertEqual(receipt_path.read_bytes(), first_receipt)
+
+                next_proof_path.write_bytes(
+                    (json.dumps(next_payload, separators=(",", ":")) + "\n").encode("ascii")
+                )
+                next_proof_path.chmod(0o600)
+                guard.remove_root_state(bundle, next_state)
+                next_receipt = receipt_path.read_bytes()
+                self.assertNotEqual(next_receipt, first_receipt)
+                self.assertEqual(json.loads(next_receipt), next_payload)
+                self.assertFalse(next_state.exists())
+
+                malformed_state, malformed_payload, _malformed_proof = state_with_proof("C")
+                receipt_path.write_bytes(b"{\"malformed\":true}\n")
+                receipt_path.chmod(0o600)
+                malformed_prior = receipt_path.read_bytes()
+                with self.assertRaises(guard.GuardError):
+                    guard.remove_root_state(bundle, malformed_state)
+                self.assertTrue(malformed_state.is_dir())
+                self.assertEqual(receipt_path.read_bytes(), malformed_prior)
+
     def test_setup_recovery_accepts_only_an_exact_empty_stage(self) -> None:
         with tempfile.TemporaryDirectory(dir="/root") as temporary:
             parent = Path(temporary) / "private"
@@ -1715,9 +1942,15 @@ class LiveQaGuardTests(unittest.TestCase):
             bundle = self.make_bundle(private)
             gate_root = root / "run-gates"
             gate_root.mkdir(mode=0o711)
+            runner_sha = "a" * 40
+            app_sha = "b" * 40
+            receipt_path = private / "live-user-cleanup-absence.json"
             with (
                 mock.patch.object(guard, "TRUSTED_SECRET_ROOT", private),
+                mock.patch.object(guard, "LIVE_USER_CLEANUP_ABSENCE_RECEIPT", receipt_path),
                 mock.patch.object(guard, "RUN_GATE_ROOT", gate_root),
+                mock.patch.object(guard, "_active_release_commit", return_value=app_sha),
+                mock.patch.dict(os.environ, {"PLATFORM_LIVE_QA_RUNNER_SHA": runner_sha}),
                 mock.patch.object(guard, "assert_liveqa_idle"),
                 mock.patch.object(
                     guard, "liveqa_identity", return_value=(12345, 12345)
@@ -1748,6 +1981,24 @@ class LiveQaGuardTests(unittest.TestCase):
                 merged = guard._read_private_json(inventory)
                 self.assertEqual(merged["tournament_ids"], [tournament_id])
                 guard.remove_browser_gate(state)
+                proof = {
+                    "schema": 1,
+                    "status": "verified_absent",
+                    "runner_source_sha": runner_sha,
+                    "app_sha": app_sha,
+                    "marker_sha256": hashlib.sha256(marker.encode("ascii")).hexdigest(),
+                    "gate_id_sha256": hashlib.sha256(state.name.encode("ascii")).hexdigest(),
+                    "inventory_sha256": hashlib.sha256(inventory.read_bytes()).hexdigest(),
+                    "zero_counts": {
+                        key: 0 for key in guard.LIVE_USER_CLEANUP_ZERO_COUNTS
+                    },
+                }
+                proof_path = state / guard.LIVE_USER_CLEANUP_ABSENCE_FILE
+                proof_path.write_text(
+                    json.dumps(proof, separators=(",", ":")) + "\n",
+                    encoding="ascii",
+                )
+                proof_path.chmod(0o600)
                 guard.remove_root_state(bundle, state)
 
     @unittest.skipUnless(os.geteuid() == 0, "root-owned cache contract")

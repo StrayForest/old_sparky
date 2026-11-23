@@ -119,6 +119,13 @@ else
       --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE"
   )"
 fi
+LIVE_QA_RUNNER_SHA="${PLATFORM_LIVE_QA_RUNNER_SHA:-$SOURCE_COMMIT}"
+if [[ ! "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ \
+  || ! "$LIVE_QA_RUNNER_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "Live-user QA requires exact app and runner source identities." >&2
+  exit 1
+fi
+export PLATFORM_LIVE_QA_RUNNER_SHA="$LIVE_QA_RUNNER_SHA"
 
 EXPECTED_LIVE_ORIGIN="$(
   "$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_safe_env_exec.py" \
@@ -148,6 +155,10 @@ safe_database_python() {
 reconcile_and_cleanup() {
   local marker="$1"
   local inventory="$2"
+  local state_dir marker_sha256 gate_id_sha256
+  state_dir="$(dirname -- "$inventory")"
+  read -r marker_sha256 _ < <(printf '%s' "$marker" | /usr/bin/sha256sum)
+  read -r gate_id_sha256 _ < <(printf '%s' "${state_dir##*/}" | /usr/bin/sha256sum)
   safe_database_python "$TOOLS_DIR/platform_recover_live_user_qa.py" \
     --marker "$marker" \
     --inventory "$inventory" \
@@ -155,6 +166,11 @@ reconcile_and_cleanup() {
   safe_database_python "$TOOLS_DIR/platform_cleanup_live_user_qa.py" \
     --marker "$marker" \
     --inventory "$inventory" \
+    --state-dir "$state_dir" \
+    --runner-source-sha "$LIVE_QA_RUNNER_SHA" \
+    --app-sha "$SOURCE_COMMIT" \
+    --marker-sha256 "$marker_sha256" \
+    --gate-id-sha256 "$gate_id_sha256" \
     --confirm cleanup-live-user-qa
 }
 
@@ -439,12 +455,6 @@ if (( TRUSTED_MODE == 1 )); then
   CHROMIUM_SANDBOX="$RUNTIME_ENGINE/browsers/chromium-1228/chrome-linux64/chrome_sandbox"
 fi
 RUNTIME_NODE="$RUNTIME_ENGINE/node/bin/node"
-LIVE_QA_RUNNER_SHA="${PLATFORM_LIVE_QA_RUNNER_SHA:-$SOURCE_COMMIT}"
-if [[ ! "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ \
-  || ! "$LIVE_QA_RUNNER_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-  echo "Live-user browser counts require exact app and runner source identities." >&2
-  exit 1
-fi
 read -r LIVE_QA_MARKER_SHA256 _ < <(printf '%s' "$MARKER" | /usr/bin/sha256sum)
 if [[ ! "$LIVE_QA_MARKER_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
   echo "Live-user browser marker digest is unavailable." >&2
@@ -562,32 +572,38 @@ else
   browser_counts=""
   count_status=1
 fi
-if (( count_status == 42 )); then
-  diagnostic_valid=1
-  diagnostic_kind=failure_report_unavailable
-  diagnostic_child_exit="$browser_status"
+if (( count_status == 42 || count_status == 43 )); then
+  if (( count_status == 42 )); then
+    diagnostic_valid=1
+    diagnostic_kind=failure_report_unavailable
+    diagnostic_child_exit="$browser_status"
+  fi
   if [[ "$browser_counts" == *$'\n'* ]]; then
     failure_summary_line="${browser_counts#*$'\n'}"
     browser_counts="${browser_counts%%$'\n'*}"
     summary_shape_valid=0
-    if [[ "$failure_summary_line" =~ ^LIVE_BROWSER_FAILURE_SUMMARY\ schema=1\ reason=identity_summary_unavailable\ token=none$ ]] \
-      || { [[ "$failure_summary_line" =~ ^LIVE_BROWSER_FAILURE_SUMMARY\ schema=1\ reason=private_store_unavailable\ token=[A-Za-z0-9_-]+$ ]] \
-        && [[ ! "$failure_summary_line" =~ token=none$ ]]; }; then
-      if (( ${#failure_summary_line} <= 16640 )); then
-        summary_shape_valid=1
-      fi
+    if (( count_status == 42 )) \
+      && { [[ "$failure_summary_line" =~ ^LIVE_BROWSER_FAILURE_SUMMARY\ schema=1\ reason=identity_summary_unavailable\ token=none$ ]] \
+        || { [[ "$failure_summary_line" =~ ^LIVE_BROWSER_FAILURE_SUMMARY\ schema=1\ reason=private_store_unavailable\ token=[A-Za-z0-9_-]+$ ]] \
+          && [[ ! "$failure_summary_line" =~ token=none$ ]]; }; }; then
+      summary_shape_valid=1
+    elif (( count_status == 43 )) \
+      && { [[ "$failure_summary_line" =~ ^LIVE_BROWSER_FAILURE_SUMMARY\ schema=1\ reason=identity_summary_unavailable\ token=none$ ]] \
+        || { [[ "$failure_summary_line" =~ ^LIVE_BROWSER_FAILURE_SUMMARY\ schema=1\ reason=private_store_available\ token=[A-Za-z0-9_-]+$ ]] \
+          && [[ ! "$failure_summary_line" =~ token=none$ ]]; }; }; then
+      summary_shape_valid=1
     fi
-    if (( summary_shape_valid == 1 )); then
-      : # The bounded summary is intentionally consumed and never forwarded.
-    else
+    if (( summary_shape_valid != 1 || ${#failure_summary_line} > 16640 )); then
       browser_counts=""
       count_status=1
     fi
+    # A valid bounded summary is intentionally consumed and never forwarded.
   else
     browser_counts=""
     count_status=1
   fi
-elif (( count_status == 43 && browser_status == 0 )); then
+fi
+if (( count_status == 43 && browser_status == 0 )); then
   # Persisted failure counts are a QA failure even if the child returned zero.
   browser_status=1
   diagnostic_valid=0
