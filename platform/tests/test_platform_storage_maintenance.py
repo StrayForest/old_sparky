@@ -141,7 +141,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         )
         self.assertRegex(
             unit_source,
-            r"(?m)^ExecStart=/opt/oldsparky/platform/shared/venv/bin/python -B "
+            r"(?m)^ExecStart=/opt/oldsparky/platform/shared/venv/bin/python "
             r"/opt/oldsparky/platform/current/tools/platform_storage_maintenance\.py\b",
         )
 

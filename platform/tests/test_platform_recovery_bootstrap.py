@@ -50,6 +50,7 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         ".github/workflows/platform-production-recovery-bootstrap-publish.yml",
         ".github/workflows/platform-production-release-abort.yml",
         ".github/workflows/platform-production-release-recover.yml",
+        ".github/workflows/platform-liveqa-payload-repair.yml",
         ".github/workflows/platform-production-retained-load-abort.yml",
         "platform/contracts/host_tools_pin.json",
         "platform/alembic/env.py",
@@ -90,6 +91,7 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/tools/platform_install_systemd_units.sh",
         "platform/tools/platform_ci_classifier.py",
         "platform/tools/platform_live_qa_guard.py",
+        "platform/tools/platform_live_qa_payload_bytecode_repair.py",
         "platform/tools/platform_live_qa_runtime_install.py",
         "platform/tools/platform_production_classifier_artifact.py",
         "platform/tools/platform_recovery_bootstrap.py",
@@ -118,9 +120,9 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/python_packages/platform_infra/db.py",
     }
 )
-RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 73
+RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 75
 RECOVERY_BOOTSTRAP_PATCH_FILE_DIGEST = (
-    "3eb04607a41a8cc6ad7c3da39f1bc2fecb151681b10d40ede212b1018d9773fb"
+    "ba5063ed93ef7a120af8207b1b2cd02588d5e61b7cb07d91f58fae5afe3fb8e5"
 )
 
 # These paths are deliberately present in the recovery route allowlist but are

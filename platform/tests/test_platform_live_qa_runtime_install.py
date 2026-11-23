@@ -3,7 +3,6 @@ from __future__ import annotations
 from contextlib import contextmanager, redirect_stderr
 import hashlib
 import errno
-import importlib._bootstrap_external
 import importlib.util
 import io
 import json
@@ -269,22 +268,28 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
             ):
                 cache = cache_dir / f"{module}.cpython-312.pyc"
                 source = payload / f"platform/tools/{module}.py"
-                source_bytes = source.read_bytes()
-                source_metadata = source.stat()
-                code = compile(
-                    source_bytes,
-                    str(source),
-                    "exec",
-                    dont_inherit=True,
-                    optimize=sys.flags.optimize,
+                compile_pyc = subprocess.run(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-B",
+                        "-c",
+                        "import importlib._bootstrap_external, pathlib, sys; "
+                        "source=pathlib.Path(sys.argv[1]); output=pathlib.Path(sys.argv[2]); "
+                        "data=source.read_bytes(); metadata=source.stat(); "
+                        "code=compile(data, str(source), 'exec', dont_inherit=True, optimize=sys.flags.optimize); "
+                        "output.write_bytes(importlib._bootstrap_external._code_to_timestamp_pyc("
+                        "code, int(metadata.st_mtime), metadata.st_size))",
+                        str(source),
+                        str(cache),
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=10,
                 )
-                cache.write_bytes(
-                    importlib._bootstrap_external._code_to_timestamp_pyc(
-                        code,
-                        int(source_metadata.st_mtime),
-                        source_metadata.st_size,
-                    )
-                )
+                self.assertEqual(compile_pyc.returncode, 0, compile_pyc.stderr)
                 os.chmod(cache, 0o644)
 
             plan_root = root / "plans"
@@ -582,6 +587,7 @@ sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 module.RELEASE_LOCK_PATH = Path({json.dumps(values['release_lock'])})
 module._assert_no_active_qa = lambda *_args: None
+print(f'CHILD_ID euid={__import__("os").geteuid()} egid={__import__("os").getegid()}', file=sys.stderr)
 paths = module.RepairPaths(
     app_dir=Path({json.dumps(values['app_dir'])}),
     liveqa_root=Path({json.dumps(values['liveqa_root'])}),
@@ -598,7 +604,7 @@ print(result['status'], result['extra_file_count'])
                     [
                         "/usr/bin/flock",
                         str(fixture["release_lock_path"]),
-                        "/usr/bin/python3.12",
+                        sys.executable,
                         "-I",
                         "-B",
                         "-",
@@ -611,7 +617,11 @@ print(result['status'], result['extra_file_count'])
                     check=False,
                     timeout=30,
                 )
-                self.assertEqual(result.returncode, 0)
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    f"parent euid={os.geteuid()} egid={os.getegid()}; stderr={result.stderr}",
+                )
                 self.assertEqual(result.stdout.strip(), "prepared 2")
                 self.assertFalse(
                     any(fixture["tool_root"].rglob("__pycache__"))
@@ -774,6 +784,7 @@ paths = module.RepairPaths(
     quarantine_root=Path({json.dumps(values['quarantine_root'])}),
     tool_root=Path({json.dumps(values['tool_root'])}),
 )
+os.write(2, f'CHILD_ID euid={{os.geteuid()}} egid={{os.getegid()}}\\n'.encode('ascii'))
 module.apply_repair_plan(
     {json.dumps(values['plan_sha'])},
     {json.dumps(values['active_sha'])},
@@ -786,7 +797,7 @@ os._exit(0)
             [
                 "/usr/bin/flock",
                 str(fixture["release_lock_path"]),
-                "/usr/bin/python3.12",
+                sys.executable,
                 "-I",
                 "-B",
                 "-",
@@ -798,6 +809,22 @@ os._exit(0)
             text=True,
             check=False,
             timeout=20,
+        )
+        expected_exit = {
+            "prepared": 81,
+            "moved": 82,
+            "quarantined": 83,
+            "receipt_temp": 84,
+            "empty_qdir": 85,
+            "initial_temp": 86,
+            "rollback_gap": 87,
+            "transition_temp_partial": 88,
+            "transition_temp_zero": 89,
+        }[mode]
+        self.assertEqual(
+            completed.returncode,
+            expected_exit,
+            f"mode={mode} parent euid={os.geteuid()} egid={os.getegid()}; stderr={completed.stderr}",
         )
         self.assertEqual(completed.stdout, "")
         return completed.returncode
