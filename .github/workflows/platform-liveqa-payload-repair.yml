@@ -273,8 +273,10 @@ jobs:
             [[ "$digest" == none || "$digest" =~ ^[0-9a-f]{64}$ ]]
             [[ "$residual" =~ ^(none|unverified)$ ]]
             [[ "$bundle_residual" =~ ^(none|unverified)$ ]]
-            printf 'LIVE_QA_PAYLOAD_BYTECODE_REPAIR_OUTCOME status=%s phase=%s exit_code=%s cleanup_rc=%s helper_reason=%s operation=%s plan_sha256=%s stage_residual=%s tool_bundle_residual=%s\n' \
-              "$status" "$phase" "$exit_code" "$cleanup_code" "$reason" "$OPERATION" "$digest" "$residual" "$bundle_residual" >> "$GITHUB_STEP_SUMMARY"
+            local outcome_line
+            outcome_line="LIVE_QA_PAYLOAD_BYTECODE_REPAIR_OUTCOME status=$status phase=$phase exit_code=$exit_code cleanup_rc=$cleanup_code helper_reason=$reason operation=$OPERATION plan_sha256=$digest stage_residual=$residual tool_bundle_residual=$bundle_residual"
+            printf '%s\n' "$outcome_line"
+            printf '%s\n' "$outcome_line" >> "$GITHUB_STEP_SUMMARY"
           }
           ssh_args=(-F /dev/null -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519")
           set +e
@@ -355,17 +357,23 @@ jobs:
               echo "Remote repair transport cleanup failed identity checks" >&2
               original_rc="$cleanup_rc"
             elif (( original_rc != 0 )); then
-              step_rc="$original_rc"
               summary_residual=none
               if (( cleanup_rc != 0 )); then summary_residual=unverified; fi
-              write_outcome failed "$step_phase" "$step_rc" "$cleanup_rc" "$helper_reason" none "$summary_residual" "$tool_bundle_residual"
+              write_outcome failed "$step_phase" "$original_rc" "$cleanup_rc" "$helper_reason" none "$summary_residual" "$tool_bundle_residual"
             fi
             exit "$original_rc"
           }
           trap cleanup_remote_stage EXIT
           step_phase=upload
           step_rc=0
+          set +e
           timeout --foreground 60s scp -p "${ssh_args[@]}" "$BUNDLE" "$PROD_SSH_USER@$PROD_SSH_HOST:$remote_stage/bundle.tar" >/dev/null 2>&1
+          upload_rc=$?
+          set -e
+          if (( upload_rc != 0 )); then
+            step_rc="$upload_rc"
+            exit "$step_rc"
+          fi
           result="$RUNNER_TEMP/liveqa-payload-repair.result"
           error="$RUNNER_TEMP/liveqa-payload-repair.error"
           : > "$result"; : > "$error"; chmod 600 "$result" "$error"
@@ -475,9 +483,10 @@ jobs:
                       raise SystemExit("Existing repair bundle differs from source")
           else:
               os.mkdir(target, 0o700)
-              target_meta = target.lstat()
+              target_meta = None
               created_files = {}
               try:
+                  target_meta = target.lstat()
                   parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
                   try: os.fsync(parent_fd)
                   finally: os.close(parent_fd)
@@ -496,6 +505,8 @@ jobs:
                   finally: os.close(parent_fd)
               except BaseException:
                   try:
+                      if target_meta is None:
+                          raise RuntimeError("target identity unavailable")
                       current = target.lstat()
                       entries = {item.name for item in target.iterdir()}
                       if (current.st_dev, current.st_ino) != (target_meta.st_dev, target_meta.st_ino) or current.st_uid != 0 or stat.S_IMODE(current.st_mode) != 0o700 or not entries.issubset(created_files):
@@ -513,13 +524,13 @@ jobs:
                       parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
                       try: os.fsync(parent_fd)
                       finally: os.close(parent_fd)
-              except BaseException:
-                  cleanup_failed = True
-              else:
-                  cleanup_failed = False
-              if cleanup_failed:
-                  print(f"LIVE_QA_PAYLOAD_REPAIR_BUNDLE status=partial_cleanup_failed runner_source_sha={runner_sha}", file=__import__("sys").stderr)
-              raise
+                  except BaseException:
+                      cleanup_failed = True
+                  else:
+                      cleanup_failed = False
+                  if cleanup_failed:
+                      print(f"LIVE_QA_PAYLOAD_REPAIR_BUNDLE status=partial_cleanup_failed runner_source_sha={runner_sha}", file=__import__("sys").stderr)
+                  raise
           INSTALL
           args=("$operation" --expected-source-sha "$active_sha" --runner-source-sha "$runner_sha")
           if [[ "$operation" == apply ]]; then args+=(--plan-sha256 "$plan_sha"); fi

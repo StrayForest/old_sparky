@@ -582,6 +582,11 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
         self.assertIsNotNone(cleanup_python_match)
         cleanup_python = cleanup_python_match.group("script")
 
+        def assert_outcome_mirrored(result, summary_path):
+            summary_lines = summary_path.read_bytes().splitlines()
+            self.assertEqual(len(summary_lines), 1)
+            self.assertIn(summary_lines[0], result.stdout.splitlines())
+
         with tempfile.TemporaryDirectory(dir="/root") as temporary:
             fixture_root = Path(temporary)
             source_bundle = fixture_root / "bundle.tar"
@@ -774,6 +779,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                 + b" stage_residual=none tool_bundle_residual=none",
                 success_summary.read_bytes(),
             )
+            assert_outcome_mirrored(cleanup_ok, success_summary)
 
             cleanup_failed, failed_output, failed_summary = run_cleanup(1)
             self.assertNotEqual(cleanup_failed.returncode, 0)
@@ -794,6 +800,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                 cleanup_failed.stderr,
                 b"Remote repair transport cleanup failed identity checks\n",
             )
+            assert_outcome_mirrored(cleanup_failed, failed_summary)
 
             outer_remote_rc = workflow.index("\n          remote_rc=$?\n          set -e\n")
             remote_handler_start = workflow.index(
@@ -886,6 +893,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
             self.assertNotIn(b"private-diagnostic-sentinel", remote_known.stdout + remote_known.stderr + known_summary.read_bytes())
             self.assertNotIn(b"b" * 40, known_summary.read_bytes())
             self.assertFalse(known_error.exists())
+            assert_outcome_mirrored(remote_known, known_summary)
 
             unknown_marker = (
                 b"LIVE_QA_PAYLOAD_BYTECODE_REPAIR_REMOTE "
@@ -905,6 +913,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
             )
             self.assertNotIn(b"private-diagnostic-sentinel", remote_unknown.stdout + remote_unknown.stderr + unknown_summary.read_bytes())
             self.assertFalse(unknown_error.exists())
+            assert_outcome_mirrored(remote_unknown, unknown_summary)
 
             for name, error_text, error_present in (
                 ("oversized", b"x" * 65537, True),
@@ -966,6 +975,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                 stage_summary.read_bytes(),
             )
             self.assertEqual(stage_output.read_bytes(), b"")
+            assert_outcome_mirrored(stage_result, stage_summary)
 
             stage_command_start = workflow.index(
                 "          set +e\n          # shellcheck disable=SC2016\n          remote_stage_info="
@@ -989,6 +999,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                         outcome_function,
                         "ssh_args=()",
                         stage_command_block,
+                        "printf 'STAGE_META_ACCEPTED:%s|%s|%s|%s|%s|%s|%s\\n' \"$remote_stage\" \"$remote_stage_dev\" \"$remote_stage_ino\" \"$remote_stage_uid\" \"$remote_stage_gid\" \"$remote_stage_nlink\" \"$remote_stage_mode\"",
                     )
                 )
                 completed = subprocess.run(
@@ -1026,7 +1037,369 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                         summary.read_bytes(),
                     )
                     self.assertEqual(output.read_bytes(), b"")
+                    assert_outcome_mirrored(failed, summary)
                     self.assertNotIn(b"malformed-private-response", failed.stdout + failed.stderr + summary.read_bytes())
+
+            accepted_stage = None
+            for _ in range(8):
+                candidate = Path("/tmp") / f"oldsparky-liveqa-payload-repair.{uuid4().hex[:6]}"
+                try:
+                    os.mkdir(candidate, 0o700)
+                except FileExistsError:
+                    continue
+                accepted_stage = candidate
+                break
+            self.assertIsNotNone(accepted_stage)
+            accepted_meta = os.lstat(accepted_stage)
+            try:
+                accepted_tuple = (
+                    f"{accepted_stage}|{accepted_meta.st_dev}|{accepted_meta.st_ino}|"
+                    f"{accepted_meta.st_uid}|{accepted_meta.st_gid}|{accepted_meta.st_nlink}|"
+                    f"{stat.S_IMODE(accepted_meta.st_mode):o}"
+                )
+                accepted, accepted_summary, accepted_output = run_stage_failure(0, accepted_tuple)
+                self.assertEqual(accepted.returncode, 0, accepted.stderr.decode("utf-8", "replace"))
+                self.assertEqual(
+                    accepted.stdout,
+                    f"STAGE_META_ACCEPTED:{accepted_tuple}\n".encode("ascii"),
+                )
+                self.assertEqual(accepted_summary.read_bytes(), b"")
+                self.assertEqual(accepted_output.read_bytes(), b"")
+            finally:
+                if os.path.lexists(accepted_stage):
+                    current = os.lstat(accepted_stage)
+                    self.assertEqual((current.st_dev, current.st_ino), (accepted_meta.st_dev, accepted_meta.st_ino))
+                    self.assertEqual(os.listdir(accepted_stage), [])
+                    os.rmdir(accepted_stage)
+
+            remote_start = workflow.index("          set -Eeuo pipefail\n          umask 077", workflow.index("<<'REMOTE'\n"))
+            remote_end = workflow.index("\n          REMOTE\n          remote_rc=$?", remote_start)
+            remote_source = textwrap.dedent(workflow[remote_start:remote_end])
+            self.assertIn('Path("/root/.oldsparky/liveqa/payload-repair-tools")', remote_source)
+            self.assertIn('current=/opt/oldsparky/platform/current', remote_source)
+            active_sha = "e" * 40
+            runner_sha = "d" * 40
+            prepared_sha = "f" * 64
+            expected_helper_output = (
+                "LIVE_QA_PAYLOAD_BYTECODE_REPAIR status=prepared "
+                f"plan_sha256={prepared_sha} extra_file_count=2\n"
+            )
+
+            def run_locked_entry(
+                case_name,
+                *,
+                stage_token_ok=True,
+                stage_mode=0o700,
+                stage_uid=0,
+                bundle_mode=0o600,
+                bundle_uid=0,
+                inject_target_lstat_failure=False,
+            ):
+                case_root = fixture_root / f"remote-entry-{case_name}"
+                case_root.mkdir(mode=0o700)
+                app_root = case_root / "app"
+                release = app_root / "releases" / "active"
+                release_tools = release / "tools"
+                release_tools.mkdir(parents=True, mode=0o700)
+                (app_root / "shared").mkdir(mode=0o700)
+                (app_root / "current").symlink_to("releases/active")
+                tool_parent = case_root / "liveqa" / "payload-repair-tools"
+                tool_parent.mkdir(parents=True, mode=0o700)
+                lock_capture = case_root / "lock-argv.bin"
+                lock_script = release_tools / "platform_release_lock.sh"
+                lock_script.write_text(
+                    "#!/bin/bash\n"
+                    "if [[ \"${BASH_SOURCE[0]}\" == \"$0\" ]]; then\n"
+                    "  [[ \"${1:-}\" == --run ]] || exit 91\n"
+                    "  { printf '%s\\0' \"$0\"; printf '%s\\0' \"$@\"; } > \"$LOCK_ARGV_CAPTURE\"\n"
+                    "  shift\n"
+                    "  exec \"$@\"\n"
+                    "fi\n"
+                    "platform_release_lock_open() { :; }\n"
+                    "platform_release_lock_supervisor_holds() { :; }\n",
+                    encoding="ascii",
+                )
+                lock_script.chmod(0o700)
+
+                helper = textwrap.dedent(
+                    f"""\
+                    import sys
+                    expected = ["prepare", "--expected-source-sha", {active_sha!r}, "--runner-source-sha", {runner_sha!r}]
+                    if sys.argv[1:] != expected:
+                        raise SystemExit(42)
+                    print({expected_helper_output.strip()!r})
+                    """
+                ).encode("ascii")
+                bundle_parts = {
+                    "platform_live_qa_payload_bytecode_repair.py": helper,
+                    "platform_live_qa_machine_lock.py": b"synthetic lock member\\n",
+                    "platform_live_qa_guard.py": b"synthetic guard member\\n",
+                }
+                bundle_manifest = {
+                    "schema": 1,
+                    "runner_source_sha": runner_sha,
+                    "repair_tool_sha256": hashlib.sha256(bundle_parts["platform_live_qa_payload_bytecode_repair.py"]).hexdigest(),
+                    "machine_lock_sha256": hashlib.sha256(bundle_parts["platform_live_qa_machine_lock.py"]).hexdigest(),
+                    "guard_sha256": hashlib.sha256(bundle_parts["platform_live_qa_guard.py"]).hexdigest(),
+                }
+                bundle_parts["repair-bundle.json"] = (json.dumps(bundle_manifest, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+                archive_bytes = io.BytesIO()
+                with tarfile.open(fileobj=archive_bytes, mode="w:") as archive:
+                    for name, content in bundle_parts.items():
+                        member = tarfile.TarInfo(name)
+                        member.size = len(content)
+                        member.mode = 0o400
+                        archive.addfile(member, io.BytesIO(content))
+
+                stage = None
+                stage_stat = None
+                staged_bundle = None
+                bundle_stat = None
+                for _ in range(8):
+                    candidate = Path("/tmp") / f"oldsparky-liveqa-payload-repair.{uuid4().hex[:6]}"
+                    try:
+                        os.mkdir(candidate, 0o700)
+                    except FileExistsError:
+                        continue
+                    stage = candidate
+                    break
+                if stage is None:
+                    self.fail("could not allocate exact-format local transport stage")
+                stage_stat = os.lstat(stage)
+                try:
+                    os.chmod(stage, stage_mode)
+                    if stage_uid != 0:
+                        os.chown(stage, stage_uid, 0)
+                    staged_bundle = stage / "bundle.tar"
+                    source_bundle = case_root / "bundle.tar"
+                    source_fd = os.open(
+                        source_bundle,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600,
+                    )
+                    try:
+                        os.write(source_fd, archive_bytes.getvalue())
+                        os.fchmod(source_fd, 0o600)
+                        os.fsync(source_fd)
+                    finally:
+                        os.close(source_fd)
+                    scp_run = subprocess.run(
+                        [scp_binary, transport_line.group("preserve"), str(source_bundle), str(staged_bundle)],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                        timeout=10,
+                    )
+                    self.assertEqual(scp_run.returncode, 0, scp_run.stderr.decode("utf-8", "replace"))
+                    bundle_stat = os.lstat(staged_bundle)
+                    if bundle_uid != 0:
+                        os.chown(staged_bundle, bundle_uid, 0)
+                    if bundle_mode != 0o600:
+                        os.chmod(staged_bundle, bundle_mode)
+                    stage_arg = str(stage) if stage_token_ok else str(stage) + "/../invalid"
+                    private_tool_root = tool_parent / runner_sha
+                    script = remote_source.replace(
+                        "/opt/oldsparky/platform", str(app_root)
+                    ).replace(
+                        "/root/.oldsparky/liveqa/payload-repair-tools", str(tool_parent)
+                    )
+                    if inject_target_lstat_failure:
+                        script, replacement_count = script.replace(
+                            "target_meta = target.lstat()",
+                            "raise OSError('synthetic target identity read failure')",
+                            1,
+                        ), script.count("target_meta = target.lstat()")
+                        self.assertEqual(replacement_count, 1)
+                    command = subprocess.run(
+                        ["/bin/bash", "-s", "--", stage_arg, "prepare", active_sha, runner_sha, ""],
+                        input=script.encode("utf-8"),
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                        env={
+                            "PATH": "/usr/bin:/bin",
+                            "LANG": "C",
+                            "LC_ALL": "C",
+                            "LOCK_ARGV_CAPTURE": str(lock_capture),
+                        },
+                        timeout=20,
+                    )
+                    return command, app_root, tool_parent, private_tool_root, lock_capture, stage, stage_stat, staged_bundle, bundle_stat
+                finally:
+                    if stage is not None and stage_stat is not None and os.path.lexists(stage):
+                        current_stage = os.lstat(stage)
+                        self.assertEqual(
+                            (current_stage.st_dev, current_stage.st_ino),
+                            (stage_stat.st_dev, stage_stat.st_ino),
+                        )
+                        self.assertTrue(stat.S_ISDIR(current_stage.st_mode))
+                        os.chown(stage, 0, 0)
+                        os.chmod(stage, 0o700)
+                        if staged_bundle is not None and os.path.lexists(staged_bundle):
+                            current_bundle = os.lstat(staged_bundle)
+                            self.assertTrue(stat.S_ISREG(current_bundle.st_mode))
+                            if bundle_stat is not None:
+                                self.assertEqual(
+                                    (current_bundle.st_dev, current_bundle.st_ino, current_bundle.st_size, current_bundle.st_nlink),
+                                    (bundle_stat.st_dev, bundle_stat.st_ino, bundle_stat.st_size, bundle_stat.st_nlink),
+                                )
+                            os.chown(staged_bundle, 0, 0)
+                            os.chmod(staged_bundle, 0o600)
+                            os.unlink(staged_bundle)
+                        self.assertEqual(list(os.scandir(stage)), [])
+                        os.rmdir(stage)
+
+            entry_ok = run_locked_entry("valid")
+            command, app_root, tool_parent, installed_bundle, lock_capture, stage, _, _, _ = entry_ok
+            self.assertEqual(command.returncode, 0, command.stderr.decode("utf-8", "replace"))
+            self.assertEqual(command.stdout, expected_helper_output.encode("ascii"))
+            self.assertEqual(command.stderr, b"")
+            self.assertEqual(
+                lock_capture.read_bytes().split(b"\0")[:-1],
+                [
+                    str(app_root / "current/tools/platform_release_lock.sh").encode(),
+                    b"--run",
+                    b"/bin/bash",
+                    b"-s",
+                    b"--",
+                    str(stage).encode(),
+                    b"prepare",
+                    active_sha.encode(),
+                    runner_sha.encode(),
+                    b"",
+                ],
+            )
+            self.assertEqual(
+                sorted(path.name for path in installed_bundle.iterdir()),
+                sorted(
+                    (
+                        "platform_live_qa_payload_bytecode_repair.py",
+                        "platform_live_qa_machine_lock.py",
+                        "platform_live_qa_guard.py",
+                        "repair-bundle.json",
+                    )
+                ),
+            )
+            self.assertEqual(stat.S_IMODE(installed_bundle.stat().st_mode), 0o700)
+            for installed_file in installed_bundle.iterdir():
+                metadata = installed_file.lstat()
+                self.assertTrue(stat.S_ISREG(metadata.st_mode))
+                self.assertEqual((metadata.st_uid, metadata.st_nlink, stat.S_IMODE(metadata.st_mode)), (0, 1, 0o400))
+
+            for case_name, options, expect_lock in (
+                ("bad_stage_token", {"stage_token_ok": False}, False),
+                ("bad_stage_mode", {"stage_mode": 0o755}, True),
+                ("bad_stage_owner", {"stage_uid": 65534}, True),
+                ("bad_bundle_mode", {"bundle_mode": 0o644}, True),
+                ("bad_bundle_owner", {"bundle_uid": 65534}, True),
+            ):
+                with self.subTest(remote_entry_case=case_name):
+                    rejected, rejected_app, _, rejected_bundle, rejected_lock, _, _, _, _ = run_locked_entry(case_name, **options)
+                    self.assertNotEqual(rejected.returncode, 0)
+                    self.assertEqual(rejected.stdout, b"")
+                    self.assertNotIn(expected_helper_output.encode("ascii"), rejected.stderr)
+                    self.assertFalse(rejected_bundle.exists())
+                    self.assertEqual(rejected_lock.exists(), expect_lock)
+                    if rejected_lock.exists():
+                        captured = rejected_lock.read_bytes().split(b"\0")[:-1]
+                        self.assertEqual(captured[0], str(rejected_app / "current/tools/platform_release_lock.sh").encode())
+
+            partial, _, _, partial_bundle, _, _, _, _, _ = run_locked_entry(
+                "target_lstat_failure", inject_target_lstat_failure=True
+            )
+            self.assertNotEqual(partial.returncode, 0)
+            self.assertEqual(partial.stdout, b"")
+            self.assertNotIn(expected_helper_output.encode("ascii"), partial.stdout)
+            expected_partial_marker = (
+                f"LIVE_QA_PAYLOAD_REPAIR_BUNDLE status=partial_cleanup_failed runner_source_sha={runner_sha}"
+            ).encode("ascii")
+            self.assertIn(expected_partial_marker, partial.stderr)
+            self.assertIn(b"LIVE_QA_PAYLOAD_BYTECODE_REPAIR_REMOTE phase=locked_install exit_code=1 helper_reason=none", partial.stderr)
+            partial_meta = os.lstat(partial_bundle)
+            self.assertTrue(stat.S_ISDIR(partial_meta.st_mode))
+            self.assertEqual((partial_meta.st_uid, stat.S_IMODE(partial_meta.st_mode)), (0, 0o700))
+            self.assertEqual(os.listdir(partial_bundle), [])
+            partial_bundle.rmdir()
+
+            upload_start = workflow.index("          step_phase=upload\n")
+            upload_end = workflow.index(
+                "\n          result=\"$RUNNER_TEMP/liveqa-payload-repair.result\"",
+                upload_start,
+            )
+            upload_block = textwrap.dedent(workflow[upload_start:upload_end])
+            upload_bundle = fixture_root / "upload-failure-bundle.tar"
+            upload_bundle.write_bytes(b"synthetic scp failure fixture")
+            upload_bundle.chmod(0o600)
+            upload_summary = fixture_root / "github-summary-upload-failure"
+            upload_output = fixture_root / "github-output-upload-failure"
+            scp_capture = fixture_root / "scp-argv.bin"
+            upload_summary.write_bytes(b"")
+            upload_output.write_bytes(b"")
+            failing_scp = mock_bin / "scp"
+            failing_scp.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\0' \"$@\" > \"$SCP_ARGV_CAPTURE\"\n"
+                "echo private-upload-sentinel >&2\n"
+                "exit 7\n",
+                encoding="ascii",
+            )
+            failing_scp.chmod(0o700)
+            upload_script = "\n".join(
+                (
+                    "set -euo pipefail",
+                    "OPERATION=prepare",
+                    "step_phase=stage_create",
+                    "step_rc=0",
+                    "helper_reason=none",
+                    "plan_sha=none",
+                    "tool_bundle_residual=none",
+                    "operation_result_line=",
+                    outcome_function,
+                    "ssh_args=()",
+                    "remote_stage=/tmp/oldsparky-liveqa-payload-repair.ABC123",
+                    "remote_stage_dev=1",
+                    "remote_stage_ino=2",
+                    "remote_stage_uid=0",
+                    "remote_stage_gid=0",
+                    "remote_stage_nlink=2",
+                    "remote_stage_mode=700",
+                    cleanup_function,
+                    "trap cleanup_remote_stage EXIT",
+                    upload_block,
+                )
+            )
+            upload_result = subprocess.run(
+                ["/bin/bash", "-c", upload_script],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                env={
+                    "PATH": f"{mock_bin}:/usr/bin:/bin",
+                    "LANG": "C",
+                    "LC_ALL": "C",
+                    "MOCK_SSH_EXIT": "0",
+                    "SCP_ARGV_CAPTURE": str(scp_capture),
+                    "PROD_SSH_USER": "fixture",
+                    "PROD_SSH_HOST": "fixture.invalid",
+                    "RUNNER_TEMP": str(fixture_root),
+                    "BUNDLE": str(upload_bundle),
+                    "GITHUB_OUTPUT": str(upload_output),
+                    "GITHUB_STEP_SUMMARY": str(upload_summary),
+                },
+                timeout=10,
+            )
+            self.assertEqual(upload_result.returncode, 7)
+            self.assertEqual(upload_output.read_bytes(), b"")
+            self.assertIn(
+                b"status=failed phase=upload exit_code=7 cleanup_rc=0 helper_reason=none operation=prepare plan_sha256=none stage_residual=none tool_bundle_residual=none",
+                upload_summary.read_bytes(),
+            )
+            assert_outcome_mirrored(upload_result, upload_summary)
+            self.assertNotIn(b"private-upload-sentinel", upload_result.stdout + upload_result.stderr + upload_summary.read_bytes())
+            self.assertEqual(upload_result.stderr, b"")
+            self.assertEqual(scp_capture.read_bytes().split(b"\0")[0], b"-p")
 
     def test_payload_bytecode_repair_uses_inherited_release_flock_under_stdin(self) -> None:
         with tempfile.TemporaryDirectory(dir="/root") as temporary:
