@@ -106,6 +106,96 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             "image_inventory": None,
         })
 
+        incomplete_image = {
+            "ordinal": 2,
+            "generation": 1,
+            "src_present": True,
+            "srcset_present": False,
+            "complete": False,
+            "natural_width_positive": False,
+            "current_src_present": True,
+            "loading": "lazy",
+            "viewport_state": "intersecting",
+            "scroll_attempted": True,
+            "request_state": "not_observed",
+            "response_received": False,
+            "response_status_class": "none",
+            "request_finished": False,
+            "request_failed": False,
+            "request_failure_class": "none",
+            "csp_state": "not_observed",
+            "csp_image_block_count": 0,
+            "terminal_duration_bucket": "not_observed",
+        }
+        diagnostic_route = {
+            "schema": 2,
+            "route": "home",
+            "image_count": 10,
+            "missing_current_src_count": 0,
+            "unloaded_count": 7,
+            "complete": False,
+            "counts_truncated": False,
+            "image_entries_truncated": True,
+            "coverage": {
+                "network_state": "captured",
+                "csp_state": "captured",
+                "unmatched_csp_count": 0,
+                "csp_events_truncated": False,
+            },
+            "images": [incomplete_image],
+        }
+        diagnostic = {
+            "image_inventory_state": "captured",
+            "image_inventory": {"schema": 2, "routes": [diagnostic_route]},
+        }
+        platform_live_qa_guard._validate_image_inventory_evidence(diagnostic)
+        response_then_failure = json.loads(json.dumps(diagnostic))
+        response_then_failure["image_inventory"]["routes"][0]["images"][0].update({
+            "request_state": "request_failed",
+            "response_received": True,
+            "response_status_class": "2xx",
+            "request_failed": True,
+            "request_failure_class": "connection",
+            "terminal_duration_bucket": "<1s",
+        })
+        platform_live_qa_guard._validate_image_inventory_evidence(response_then_failure)
+        response_pending = json.loads(json.dumps(diagnostic))
+        response_pending["image_inventory"]["routes"][0]["images"][0].update({
+            "request_state": "response_received",
+            "response_received": True,
+            "response_status_class": "2xx",
+            "terminal_duration_bucket": ">=5s",
+        })
+        platform_live_qa_guard._validate_image_inventory_evidence(response_pending)
+        matched_csp = json.loads(json.dumps(diagnostic))
+        matched_csp["image_inventory"]["routes"][0]["coverage"]["unmatched_csp_count"] = 1
+        matched_csp["image_inventory"]["routes"][0]["images"][0].update({
+            "csp_state": "matched",
+            "csp_image_block_count": 1,
+        })
+        platform_live_qa_guard._validate_image_inventory_evidence(matched_csp)
+        ambiguous_join = json.loads(json.dumps(diagnostic))
+        ambiguous_join["image_inventory"]["routes"][0]["images"][0].update({
+            "request_state": "ambiguous",
+            "response_received": None,
+            "response_status_class": "ambiguous",
+            "request_finished": None,
+            "request_failed": None,
+            "request_failure_class": "ambiguous",
+            "terminal_duration_bucket": "ambiguous",
+            "csp_state": "ambiguous",
+        })
+        platform_live_qa_guard._validate_image_inventory_evidence(ambiguous_join)
+        max_detail = json.loads(json.dumps(diagnostic))
+        max_route = max_detail["image_inventory"]["routes"][0]
+        max_route["image_count"] = 20
+        max_route["unloaded_count"] = 7
+        max_route["images"] = [
+            dict(incomplete_image, ordinal=ordinal)
+            for ordinal in range(1, platform_live_qa_guard.LIVE_BROWSER_IMAGE_DIAGNOSTIC_MAX_ENTRIES + 1)
+        ]
+        platform_live_qa_guard._validate_image_inventory_evidence(max_detail)
+
         invalid_records = []
         duplicate_route = json.loads(json.dumps(captured))
         duplicate_route["image_inventory"]["routes"].append(
@@ -139,6 +229,46 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         unknown_key = json.loads(json.dumps(captured))
         unknown_key["image_inventory"]["routes"][0]["source"] = "must-not-serialize"
         invalid_records.append(unknown_key)
+        raw_image_source = json.loads(json.dumps(diagnostic))
+        raw_image_source["image_inventory"]["routes"][0]["images"][0]["source"] = "https://private.example/image.webp"
+        invalid_records.append(raw_image_source)
+        invalid_lifecycle = json.loads(json.dumps(diagnostic))
+        invalid_lifecycle["image_inventory"]["routes"][0]["images"][0].update({
+            "request_state": "pending",
+            "response_received": True,
+            "response_status_class": "2xx",
+            "terminal_duration_bucket": "not_observed",
+        })
+        invalid_records.append(invalid_lifecycle)
+        invalid_ambiguous = json.loads(json.dumps(diagnostic))
+        invalid_ambiguous["image_inventory"]["routes"][0]["images"][0].update({
+            "request_state": "ambiguous",
+            "response_received": False,
+            "response_status_class": "none",
+            "request_finished": False,
+            "request_failed": False,
+            "request_failure_class": "none",
+            "terminal_duration_bucket": "ambiguous",
+        })
+        invalid_records.append(invalid_ambiguous)
+        invalid_image_cap = json.loads(json.dumps(diagnostic))
+        invalid_image_cap["image_inventory"]["routes"][0]["image_entries_truncated"] = False
+        invalid_image_cap["image_inventory"]["routes"][0]["images"] = [
+            dict(incomplete_image, ordinal=ordinal)
+            for ordinal in range(1, platform_live_qa_guard.LIVE_BROWSER_IMAGE_DIAGNOSTIC_MAX_ENTRIES + 2)
+        ]
+        invalid_records.append(invalid_image_cap)
+        inconsistent_csp_count = json.loads(json.dumps(diagnostic))
+        inconsistent_csp_count["image_inventory"]["routes"][0]["images"][0].update({
+            "csp_state": "matched",
+            "csp_image_block_count": 0,
+        })
+        invalid_records.append(inconsistent_csp_count)
+        over_csp_cap = json.loads(json.dumps(diagnostic))
+        over_csp_cap["image_inventory"]["routes"][0]["coverage"]["unmatched_csp_count"] = (
+            platform_live_qa_guard.LIVE_BROWSER_IMAGE_DIAGNOSTIC_MAX_EVENTS + 1
+        )
+        invalid_records.append(over_csp_cap)
 
         for record in invalid_records:
             with self.subTest(record=record):

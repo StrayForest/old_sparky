@@ -398,6 +398,63 @@ function imageInventoryAttachment(route, values) {
     }), "ascii"),
   };
 }
+function imageInventoryV2Image(overrides = {}) {
+  return {
+    ordinal: 1,
+    generation: 1,
+    src_present: true,
+    srcset_present: false,
+    complete: true,
+    natural_width_positive: true,
+    current_src_present: true,
+    loading: "eager",
+    viewport_state: "intersecting",
+    scroll_attempted: true,
+    request_state: "request_finished",
+    response_received: true,
+    response_status_class: "2xx",
+    request_finished: true,
+    request_failed: false,
+    request_failure_class: "none",
+    csp_state: "not_observed",
+    csp_image_block_count: 0,
+    terminal_duration_bucket: "<1s",
+    ...overrides,
+  };
+}
+function imageInventoryV2Payload(route, values) {
+  return {
+    schema: 2,
+    route,
+    image_count: values.image_count ?? values.images.length,
+    missing_current_src_count: values.missing_current_src_count ?? 0,
+    unloaded_count: values.unloaded_count ?? 0,
+    complete: values.complete ?? false,
+    counts_truncated: values.counts_truncated ?? false,
+    image_entries_truncated: values.image_entries_truncated ?? false,
+    coverage: values.coverage ?? {
+      network_state: "captured",
+      csp_state: "captured",
+      unmatched_csp_count: 0,
+      csp_events_truncated: false,
+    },
+    images: values.images,
+  };
+}
+function imageInventoryV2Attachment(route, values) {
+  return {
+    name: "live-image-inventory-evidence-v2",
+    contentType: "application/json",
+    body: Buffer.from(JSON.stringify(imageInventoryV2Payload(route, values)), "ascii"),
+  };
+}
+function rawImageInventoryV2Attachment(payload) {
+  return {
+    name: "live-image-inventory-evidence-v2",
+    contentType: "application/json",
+    body: Buffer.from(JSON.stringify(payload), "ascii"),
+  };
+}
 assert.equal(pageErrorClass({ name: "SecurityError" }), "DOMException");
 for (const privateValue of [
   "private pageerror text",
@@ -1121,6 +1178,447 @@ try {
   assert.equal(reportBytes.includes(Buffer.from("https://")), false);
   assert.equal(reportBytes.includes(Buffer.from("alt")), false);
   assert.equal(reportBytes.includes(Buffer.from("currentSrc")), false);
+
+  const v2Images = [
+    imageInventoryV2Image({
+      ordinal: 1,
+      complete: false,
+      natural_width_positive: false,
+      loading: "lazy",
+      request_state: "pending",
+      response_received: false,
+      response_status_class: "none",
+      request_finished: false,
+      request_failed: false,
+      request_failure_class: "none",
+      terminal_duration_bucket: "<100ms",
+    }),
+    imageInventoryV2Image({
+      ordinal: 2,
+      complete: false,
+      natural_width_positive: false,
+      loading: "lazy",
+      request_state: "pending",
+      response_received: false,
+      response_status_class: "none",
+      request_finished: false,
+      request_failed: false,
+      request_failure_class: "none",
+      terminal_duration_bucket: "<1s",
+    }),
+    imageInventoryV2Image({
+      ordinal: 3,
+      complete: false,
+      natural_width_positive: false,
+      loading: "lazy",
+      viewport_state: "outside",
+      request_state: "pending",
+      response_received: false,
+      response_status_class: "none",
+      request_finished: false,
+      request_failed: false,
+      request_failure_class: "none",
+      terminal_duration_bucket: "<5s",
+    }),
+    imageInventoryV2Image({
+      ordinal: 4,
+      complete: false,
+      natural_width_positive: false,
+      loading: "unknown",
+      request_state: "pending",
+      response_received: false,
+      response_status_class: "none",
+      request_finished: false,
+      request_failed: false,
+      request_failure_class: "none",
+      terminal_duration_bucket: ">=5s",
+    }),
+    imageInventoryV2Image({
+      ordinal: 5,
+      complete: false,
+      natural_width_positive: false,
+      loading: "lazy",
+      request_state: "response_received",
+      response_received: true,
+      response_status_class: "2xx",
+      request_finished: false,
+      request_failed: false,
+      request_failure_class: "none",
+      terminal_duration_bucket: "<1s",
+    }),
+    imageInventoryV2Image({
+      ordinal: 6,
+      complete: false,
+      natural_width_positive: false,
+      loading: "lazy",
+      request_state: "request_failed",
+      response_received: true,
+      response_status_class: "2xx",
+      request_finished: false,
+      request_failed: true,
+      request_failure_class: "connection",
+      terminal_duration_bucket: "<5s",
+    }),
+    imageInventoryV2Image({
+      ordinal: 7,
+      complete: false,
+      natural_width_positive: false,
+      current_src_present: false,
+      loading: "lazy",
+      viewport_state: "unknown",
+      request_state: "ambiguous",
+      response_received: null,
+      response_status_class: "ambiguous",
+      request_finished: null,
+      request_failed: null,
+      request_failure_class: "ambiguous",
+      csp_state: "ambiguous",
+      csp_image_block_count: 0,
+      terminal_duration_bucket: "ambiguous",
+    }),
+    imageInventoryV2Image({
+      ordinal: 8,
+      complete: false,
+      natural_width_positive: false,
+      loading: "lazy",
+      request_state: "not_observed",
+      response_received: false,
+      response_status_class: "none",
+      request_finished: false,
+      request_failed: false,
+      request_failure_class: "none",
+      csp_state: "matched",
+      csp_image_block_count: 1,
+      terminal_duration_bucket: "not_observed",
+    }),
+  ];
+  const v2Values = {
+    image_count: 8,
+    missing_current_src_count: 1,
+    unloaded_count: 8,
+    complete: false,
+    images: v2Images,
+    coverage: {
+      network_state: "captured",
+      csp_state: "captured",
+      unmatched_csp_count: 1,
+      csp_events_truncated: false,
+    },
+  };
+  const v2Fixture = diagnosticFixture(failureRoot, "v2a2b3c4");
+  const v2Attachment = imageInventoryV2Attachment("home", v2Values);
+  const v2Failure = failureTest(v2Fixture, {
+    title: publicTitles.at(-1),
+    project: "live-webkit-mobile",
+    errorLocation: { file: v2Fixture.helper, line: 2, column: 3 },
+    attachments: [pageErrorAttachment, v2Attachment],
+  });
+  const v2Plan = publicPlanWithFailure(v2Failure);
+  const v2Summary = summarizeRun({ allTests: () => v2Plan }, "failed", { publicGate: true });
+  assert.equal(withRootOwnedGate(v2Fixture.gateRoot, () => writeBoundedFailureSummary(
+    v2Fixture.binding,
+    { allTests: () => v2Plan },
+    v2Summary,
+    { gateRoot: v2Fixture.gateRoot, sourceRoot: v2Fixture.sourceRoot },
+  )), true, "the closed per-image v2 attachment is retained for a failed image test");
+  const v2ReportPath = path.join(v2Fixture.results, "live-failures-v2.json");
+  const v2ReportBytes = fs.readFileSync(v2ReportPath);
+  const v2Report = JSON.parse(v2ReportBytes.toString("ascii"));
+  const v2FailureRecord = v2Report.failures[0];
+  assert.equal(v2FailureRecord.image_inventory_state, "captured");
+  assert.deepEqual(v2FailureRecord.image_inventory, {
+    schema: 2,
+    routes: [imageInventoryV2Payload("home", v2Values)],
+  });
+  assert.deepEqual(
+    v2FailureRecord.image_inventory.routes[0].images.map((image) => image.terminal_duration_bucket),
+    ["<100ms", "<1s", "<5s", ">=5s", "<1s", "<5s", "ambiguous", "not_observed"],
+    "pending age is stored only in the four closed coarse buckets",
+  );
+  assert.equal(v2FailureRecord.image_inventory.routes[0].images[5].response_status_class, "2xx");
+  assert.equal(v2FailureRecord.image_inventory.routes[0].images[5].request_failed, true);
+  assert.equal(v2FailureRecord.image_inventory.routes[0].images[5].request_failure_class, "connection");
+  assert.equal(v2FailureRecord.image_inventory.routes[0].images[6].request_state, "ambiguous");
+  assert.equal(v2FailureRecord.image_inventory.routes[0].images[7].csp_state, "matched");
+  for (const privateValue of [
+    "https://", "private.host", "private-alt", "private-src", "private-source",
+  ]) {
+    assert.equal(v2ReportBytes.includes(Buffer.from(privateValue)), false);
+  }
+
+  const v2PublicCountsPath = path.join(v2Fixture.results, "live-counts-v1.json");
+  assert.equal(withRootOwnedGate(v2Fixture.gateRoot, () => writeBoundedSummary(
+    v2Fixture.binding,
+    v2Summary,
+    { gateRoot: v2Fixture.gateRoot },
+  )), true);
+  const v2PublicCountsBytes = fs.readFileSync(v2PublicCountsPath);
+  const v2PublicCounts = JSON.parse(v2PublicCountsBytes.toString("ascii"));
+  assert.equal(v2PublicCounts.run_status, "failed");
+  assert.deepEqual(Object.keys(v2PublicCounts).sort(), [
+    "app_sha", "attempt_fail", "attempt_interrupted", "attempt_pass",
+    "attempt_skip", "attempt_timedout", "attempt_total", "logical_fail",
+    "logical_expected_fail", "logical_flaky", "logical_interrupted", "logical_pass",
+    "logical_skip", "logical_total", "marker_sha256", "run_status", "schema", "source_sha",
+  ].sort());
+  for (const privateValue of [
+    "image_inventory", "request_state", "csp_image_block_count", "lazy", "connection",
+  ]) {
+    assert.equal(v2PublicCountsBytes.includes(Buffer.from(privateValue)), false);
+  }
+
+  const prioritizedOrdinals = [2, 1, ...Array.from({ length: 14 }, (_, index) => index + 3)];
+  const prioritizedImages = prioritizedOrdinals.map((ordinal) => {
+    const failed = ordinal === 2;
+    return imageInventoryV2Image({
+      ordinal,
+      complete: !failed,
+      natural_width_positive: !failed,
+      loading: "lazy",
+      request_state: "unavailable",
+      response_received: null,
+      response_status_class: "unavailable",
+      request_finished: null,
+      request_failed: null,
+      request_failure_class: "unavailable",
+      csp_state: "unavailable",
+      csp_image_block_count: 0,
+      terminal_duration_bucket: "unavailable",
+    });
+  });
+  const priorityAttachment = imageInventoryV2Attachment("home", {
+    image_count: 512,
+    missing_current_src_count: 0,
+    unloaded_count: 1,
+    complete: false,
+    counts_truncated: true,
+    image_entries_truncated: true,
+    coverage: {
+      network_state: "truncated",
+      csp_state: "truncated",
+      unmatched_csp_count: 64,
+      csp_events_truncated: true,
+    },
+    images: prioritizedImages,
+  });
+  assert.ok(priorityAttachment.body.length <= 8 * 1024);
+  const priorityFixture = diagnosticFixture(failureRoot, "v2p2b3c4");
+  const priorityFailure = failureTest(priorityFixture, {
+    title: publicTitles.at(-1),
+    project: "live-webkit-mobile",
+    errorLocation: { file: priorityFixture.helper, line: 2, column: 3 },
+    attachments: [priorityAttachment],
+  });
+  const priorityPlan = publicPlanWithFailure(priorityFailure);
+  assert.equal(withRootOwnedGate(priorityFixture.gateRoot, () => writeBoundedFailureSummary(
+    priorityFixture.binding,
+    { allTests: () => priorityPlan },
+    summarizeRun({ allTests: () => priorityPlan }, "failed", { publicGate: true }),
+    { gateRoot: priorityFixture.gateRoot, sourceRoot: priorityFixture.sourceRoot },
+  )), true);
+  const priorityReport = JSON.parse(fs.readFileSync(
+    path.join(priorityFixture.results, "live-failures-v2.json"),
+    "ascii",
+  ));
+  assert.equal(priorityReport.failures[0].image_inventory_state, "captured");
+  assert.equal(priorityReport.failures[0].image_inventory.routes[0].images.length, 16);
+  assert.equal(priorityReport.failures[0].image_inventory.routes[0].images[0].ordinal, 2);
+  assert.equal(priorityReport.failures[0].image_inventory.routes[0].images[0].complete, false);
+  assert.equal(priorityReport.failures[0].image_inventory.routes[0].images[0].natural_width_positive, false);
+  assert.equal(priorityReport.failures[0].image_inventory.routes[0].images[0].request_state, "unavailable");
+  assert.equal(priorityReport.failures[0].image_inventory.routes[0].image_entries_truncated, true);
+
+  const capImages = Array.from({ length: 16 }, (_, index) => imageInventoryV2Image({
+    ordinal: index + 1,
+    complete: false,
+    natural_width_positive: false,
+    loading: "lazy",
+    request_state: "pending",
+    response_received: false,
+    response_status_class: "none",
+    request_finished: false,
+    request_failed: false,
+    request_failure_class: "none",
+    terminal_duration_bucket: ">=5s",
+  }));
+  const capAttachments = ["home", "patch", "tournaments"].map((route) => (
+    imageInventoryV2Attachment(route, {
+      image_count: 16,
+      unloaded_count: 16,
+      complete: false,
+      images: capImages,
+    })
+  ));
+  assert.ok(capAttachments.every((attachment) => attachment.body.length <= 8 * 1024));
+  const capFixture = diagnosticFixture(failureRoot, "v2c2b3c4");
+  const capFailure = failureTest(capFixture, {
+    title: publicTitles.at(-1),
+    project: "live-webkit-mobile",
+    errorLocation: { file: capFixture.helper, line: 2, column: 3 },
+    attachments: capAttachments,
+  });
+  const capPlan = publicPlanWithFailure(capFailure);
+  assert.equal(withRootOwnedGate(capFixture.gateRoot, () => writeBoundedFailureSummary(
+    capFixture.binding,
+    { allTests: () => capPlan },
+    summarizeRun({ allTests: () => capPlan }, "failed", { publicGate: true }),
+    { gateRoot: capFixture.gateRoot, sourceRoot: capFixture.sourceRoot },
+  )), true, "an oversized optional image inventory does not discard the failed test identity");
+  const capReportBytes = fs.readFileSync(
+    path.join(capFixture.results, "live-failures-v2.json"),
+  );
+  const capReport = JSON.parse(capReportBytes.toString("ascii"));
+  assert.ok(capReportBytes.length <= 16 * 1024 - 256);
+  assert.equal(capReport.failures.length, 1);
+  assert.equal(capReport.failures[0].id, "image_csp_hosts");
+  assert.equal(capReport.failures[0].status, "failed");
+  assert.deepEqual(
+    [capReport.failures[0].image_inventory_state, capReport.failures[0].image_inventory],
+    ["unavailable", null],
+    "the 16 KiB compaction removes optional per-image detail as one unavailable unit",
+  );
+
+  const invalidImageEvidence = [
+    ["unknown private fields", {
+      ...imageInventoryV2Payload("home", { images: [imageInventoryV2Image()] }),
+      coverage: {
+        network_state: "captured", csp_state: "captured", unmatched_csp_count: 0,
+        csp_events_truncated: false, private_host: "private.host",
+      },
+      images: [imageInventoryV2Image({
+        url: "https://private.host/private-src",
+        host: "private.host",
+        src: "private-src",
+        srcset: "private-srcset",
+        currentSrc: "private-current-src",
+        alt: "private-alt",
+        unknown_key: "private-value",
+      })],
+    }],
+    ["inconsistent pending response", imageInventoryV2Payload("home", {
+      image_count: 1,
+      unloaded_count: 1,
+      images: [imageInventoryV2Image({
+        complete: false, natural_width_positive: false, loading: "lazy",
+        request_state: "pending", response_received: false,
+        response_status_class: "2xx", request_finished: false,
+        request_failed: false, request_failure_class: "none",
+        terminal_duration_bucket: "<1s",
+      })],
+    })],
+    ["invalid ambiguous join", imageInventoryV2Payload("home", {
+      image_count: 1,
+      unloaded_count: 1,
+      images: [imageInventoryV2Image({
+        complete: false, natural_width_positive: false,
+        request_state: "ambiguous", response_received: false,
+        response_status_class: "ambiguous", request_finished: null,
+        request_failed: null, request_failure_class: "ambiguous",
+        terminal_duration_bucket: "ambiguous",
+      })],
+    })],
+    ["precise duration rejected", imageInventoryV2Payload("home", {
+      image_count: 1,
+      images: [imageInventoryV2Image({ terminal_duration_bucket: "537ms" })],
+    })],
+    ["unavailable network coverage requires unavailable joins", imageInventoryV2Payload("home", {
+      image_count: 1,
+      coverage: {
+        network_state: "unavailable", csp_state: "captured", unmatched_csp_count: 0,
+        csp_events_truncated: false,
+      },
+      images: [imageInventoryV2Image()],
+    })],
+    ["unavailable CSP coverage requires unavailable image state", imageInventoryV2Payload("home", {
+      image_count: 1,
+      coverage: {
+        network_state: "captured", csp_state: "unavailable", unmatched_csp_count: 0,
+        csp_events_truncated: false,
+      },
+      images: [imageInventoryV2Image()],
+    })],
+    ["truncated CSP coverage cannot claim no observation", imageInventoryV2Payload("home", {
+      image_count: 1,
+      coverage: {
+        network_state: "captured", csp_state: "truncated", unmatched_csp_count: 0,
+        csp_events_truncated: true,
+      },
+      images: [imageInventoryV2Image()],
+    })],
+    ["entry cap exceeded", imageInventoryV2Payload("home", {
+      image_count: 512,
+      unloaded_count: 1,
+      counts_truncated: true,
+      image_entries_truncated: true,
+      images: Array.from({ length: 17 }, () => null),
+    })],
+  ];
+  for (const [index, [label, payload]] of invalidImageEvidence.entries()) {
+    const invalidV2Fixture = diagnosticFixture(failureRoot, `v2i${index}2b3c`);
+    const invalidV2Attachment = rawImageInventoryV2Attachment(payload);
+    if (label === "entry cap exceeded") {
+      assert.ok(invalidV2Attachment.body.length <= 8 * 1024, "the rejected route stays inside the attachment byte cap");
+    }
+    const invalidV2Failure = failureTest(invalidV2Fixture, {
+      title: publicTitles.at(-1),
+      project: "live-webkit-mobile",
+      errorLocation: { file: invalidV2Fixture.helper, line: 2, column: 3 },
+      attachments: [invalidV2Attachment],
+    });
+    const invalidV2Plan = publicPlanWithFailure(invalidV2Failure);
+    assert.equal(withRootOwnedGate(invalidV2Fixture.gateRoot, () => writeBoundedFailureSummary(
+      invalidV2Fixture.binding,
+      { allTests: () => invalidV2Plan },
+      summarizeRun({ allTests: () => invalidV2Plan }, "failed", { publicGate: true }),
+      { gateRoot: invalidV2Fixture.gateRoot, sourceRoot: invalidV2Fixture.sourceRoot },
+    )), true, `${label} fails closed without dropping the public failure outcome`);
+    const invalidV2Bytes = fs.readFileSync(
+      path.join(invalidV2Fixture.results, "live-failures-v2.json"),
+    );
+    const invalidV2Report = JSON.parse(invalidV2Bytes.toString("ascii"));
+    assert.deepEqual(
+      [invalidV2Report.failures[0].image_inventory_state, invalidV2Report.failures[0].image_inventory],
+      ["unavailable", null],
+      `${label} is unavailable rather than partially guessed`,
+    );
+    for (const privateValue of [
+      "https://private.host", "private.host", "private-src", "private-srcset",
+      "private-current-src", "private-alt", "private-value",
+    ]) {
+      assert.equal(invalidV2Bytes.includes(Buffer.from(privateValue)), false);
+    }
+  }
+
+  const oversizedEvidence = imageInventoryV2Payload("home", {
+    image_count: 1,
+    images: [imageInventoryV2Image()],
+  });
+  oversizedEvidence.unused = "x".repeat(9 * 1024);
+  const oversizedAttachment = rawImageInventoryV2Attachment(oversizedEvidence);
+  assert.ok(oversizedAttachment.body.length > 8 * 1024);
+  const oversizedFixture = diagnosticFixture(failureRoot, "v2o2b3c4");
+  const oversizedFailure = failureTest(oversizedFixture, {
+    title: publicTitles.at(-1),
+    project: "live-webkit-mobile",
+    errorLocation: { file: oversizedFixture.helper, line: 2, column: 3 },
+    attachments: [oversizedAttachment],
+  });
+  const oversizedPlan = publicPlanWithFailure(oversizedFailure);
+  assert.equal(withRootOwnedGate(oversizedFixture.gateRoot, () => writeBoundedFailureSummary(
+    oversizedFixture.binding,
+    { allTests: () => oversizedPlan },
+    summarizeRun({ allTests: () => oversizedPlan }, "failed", { publicGate: true }),
+    { gateRoot: oversizedFixture.gateRoot, sourceRoot: oversizedFixture.sourceRoot },
+  )), true, "an oversized attachment is rejected while preserving failure identity");
+  const oversizedBytes = fs.readFileSync(
+    path.join(oversizedFixture.results, "live-failures-v2.json"),
+  );
+  const oversizedReport = JSON.parse(oversizedBytes.toString("ascii"));
+  assert.deepEqual(
+    [oversizedReport.failures[0].image_inventory_state, oversizedReport.failures[0].image_inventory],
+    ["unavailable", null],
+  );
+  assert.equal(oversizedBytes.includes(Buffer.from("unused")), false);
 
   const unavailableFixture = diagnosticFixture(failureRoot, "c2a2b3c4");
   const unavailable = failureTest(unavailableFixture, {

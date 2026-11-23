@@ -268,6 +268,8 @@ LIVE_BROWSER_PAGE_ERROR_ROUTES = frozenset(
 )
 LIVE_BROWSER_IMAGE_INVENTORY_ROUTES = frozenset({"home", "patch", "tournaments"})
 LIVE_BROWSER_IMAGE_INVENTORY_MAX_COUNT = 512
+LIVE_BROWSER_IMAGE_DIAGNOSTIC_MAX_ENTRIES = 16
+LIVE_BROWSER_IMAGE_DIAGNOSTIC_MAX_EVENTS = 64
 LIVE_BROWSER_PAGE_ERROR_ASSET_BASENAME = re.compile(
     r"^(?:[a-z0-9][a-z0-9_-]{12}|turbopack-[a-z0-9_-]{13})\.js$"
 )
@@ -3082,20 +3084,27 @@ def _validate_image_inventory_evidence(record: Mapping[str, object]) -> None:
         "schema", "routes",
     }:
         raise GuardError("private image inventory evidence is malformed")
+    schema = inventory.get("schema")
     routes = inventory.get("routes")
     if (
-        type(inventory.get("schema")) is not int
-        or inventory.get("schema") != 1
+        type(schema) is not int
+        or schema not in {1, 2}
         or not isinstance(routes, list)
         or not 1 <= len(routes) <= 3
     ):
         raise GuardError("private image inventory schema is malformed")
     seen_routes: set[str] = set()
     for route in routes:
-        if not isinstance(route, dict) or set(route) != {
+        if not isinstance(route, dict):
+            raise GuardError("private image inventory route is malformed")
+        legacy_keys = {
             "schema", "route", "image_count", "missing_current_src_count",
             "unloaded_count", "complete", "counts_truncated",
-        }:
+        }
+        expected_keys = legacy_keys if schema == 1 else legacy_keys | {
+            "coverage", "image_entries_truncated", "images",
+        }
+        if set(route) != expected_keys:
             raise GuardError("private image inventory route is malformed")
         route_name = route.get("route")
         image_count = route.get("image_count")
@@ -3105,7 +3114,7 @@ def _validate_image_inventory_evidence(record: Mapping[str, object]) -> None:
         counts_truncated = route.get("counts_truncated")
         if (
             type(route.get("schema")) is not int
-            or route.get("schema") != 1
+            or route.get("schema") != schema
             or not isinstance(route_name, str)
             or route_name not in LIVE_BROWSER_IMAGE_INVENTORY_ROUTES
             or route_name in seen_routes
@@ -3125,7 +3134,152 @@ def _validate_image_inventory_evidence(record: Mapping[str, object]) -> None:
             ))
         ):
             raise GuardError("private image inventory route values are malformed")
+        if schema == 2:
+            _validate_image_inventory_route_v2(
+                route, image_count=image_count,
+            )
         seen_routes.add(route_name)
+
+
+def _validate_image_inventory_route_v2(
+    route: Mapping[str, object],
+    *,
+    image_count: int,
+) -> None:
+    coverage = route.get("coverage")
+    images = route.get("images")
+    if (
+        not isinstance(coverage, dict)
+        or set(coverage) != {
+            "network_state", "csp_state", "unmatched_csp_count", "csp_events_truncated",
+        }
+        or not isinstance(coverage.get("network_state"), str)
+        or coverage.get("network_state") not in {"captured", "truncated", "unavailable"}
+        or not isinstance(coverage.get("csp_state"), str)
+        or coverage.get("csp_state") not in {"captured", "truncated", "unavailable"}
+        or type(coverage.get("unmatched_csp_count")) is not int
+        or not 0 <= coverage["unmatched_csp_count"] <= LIVE_BROWSER_IMAGE_DIAGNOSTIC_MAX_EVENTS
+        or type(coverage.get("csp_events_truncated")) is not bool
+        or (coverage["csp_events_truncated"] and coverage["csp_state"] != "truncated")
+        or not isinstance(images, list)
+        or len(images) > LIVE_BROWSER_IMAGE_DIAGNOSTIC_MAX_ENTRIES
+        or type(route.get("image_entries_truncated")) is not bool
+        or (route["image_entries_truncated"] and len(images) >= image_count)
+        or (not route["image_entries_truncated"] and len(images) != image_count)
+    ):
+        raise GuardError("private image inventory coverage is malformed")
+
+    seen_ordinals: set[int] = set()
+    for image in images:
+        if not isinstance(image, dict) or set(image) != {
+            "ordinal", "generation", "src_present", "srcset_present", "complete",
+            "natural_width_positive", "current_src_present", "loading", "viewport_state",
+            "scroll_attempted", "request_state", "response_received",
+            "response_status_class", "request_finished", "request_failed",
+            "request_failure_class", "csp_state", "csp_image_block_count",
+            "terminal_duration_bucket",
+        }:
+            raise GuardError("private image inventory image is malformed")
+        ordinal = image.get("ordinal")
+        generation = image.get("generation")
+        boolean_fields = (
+            "src_present", "srcset_present", "complete", "natural_width_positive",
+            "current_src_present", "scroll_attempted",
+        )
+        if (
+            type(ordinal) is not int
+            or not 1 <= ordinal <= LIVE_BROWSER_IMAGE_INVENTORY_MAX_COUNT
+            or ordinal in seen_ordinals
+            or ordinal > image_count
+            or type(generation) is not int
+            or not 1 <= generation <= 1024
+            or any(type(image.get(field)) is not bool for field in boolean_fields)
+            or not isinstance(image.get("loading"), str)
+            or image.get("loading") not in {"lazy", "eager", "unknown"}
+            or not isinstance(image.get("viewport_state"), str)
+            or image.get("viewport_state") not in {"intersecting", "outside", "unknown"}
+            or not isinstance(image.get("request_state"), str)
+            or image.get("request_state") not in {
+                "not_observed", "pending", "response_received", "request_finished",
+                "request_failed", "ambiguous", "unavailable",
+            }
+            or (
+                image.get("response_received") is not None
+                and type(image.get("response_received")) is not bool
+            )
+            or not isinstance(image.get("response_status_class"), str)
+            or image.get("response_status_class") not in {
+                "none", "2xx", "3xx", "4xx", "5xx", "other", "ambiguous", "unavailable",
+            }
+            or (
+                image.get("request_finished") is not None
+                and type(image.get("request_finished")) is not bool
+            )
+            or (
+                image.get("request_failed") is not None
+                and type(image.get("request_failed")) is not bool
+            )
+            or not isinstance(image.get("request_failure_class"), str)
+            or image.get("request_failure_class") not in {
+                "none", "dns", "connection", "timeout", "tls", "aborted", "other",
+                "ambiguous", "unavailable",
+            }
+            or not isinstance(image.get("csp_state"), str)
+            or image.get("csp_state") not in {"matched", "not_observed", "ambiguous", "unavailable"}
+            or type(image.get("csp_image_block_count")) is not int
+            or not 0 <= image["csp_image_block_count"] <= LIVE_BROWSER_IMAGE_DIAGNOSTIC_MAX_EVENTS
+            or not isinstance(image.get("terminal_duration_bucket"), str)
+            or image.get("terminal_duration_bucket") not in {
+                "<100ms", "<1s", "<5s", ">=5s", "not_observed", "ambiguous", "unavailable",
+            }
+        ):
+            raise GuardError("private image inventory image values are malformed")
+
+        state = image["request_state"]
+        response = image["response_received"]
+        status = image["response_status_class"]
+        finished = image["request_finished"]
+        failed = image["request_failed"]
+        failure_class = image["request_failure_class"]
+        duration = image["terminal_duration_bucket"]
+        if (
+            (state == "not_observed" and (
+                response is not False or status != "none" or finished is not False
+                or failed is not False or failure_class != "none" or duration != "not_observed"
+            ))
+            or (state == "pending" and (
+                response is not False or status != "none"
+                or finished is not False or failed is not False or failure_class != "none"
+                or duration not in {"<100ms", "<1s", "<5s", ">=5s"}
+            ))
+            or (state == "response_received" and (
+                response is not True or finished is not False or failed is not False
+                or status in {"none", "ambiguous", "unavailable"}
+                or duration not in {"<100ms", "<1s", "<5s", ">=5s"}
+            ))
+            or (state == "request_finished" and (
+                finished is not True or failed is not False or failure_class != "none"
+                or duration not in {"<100ms", "<1s", "<5s", ">=5s"}
+            ))
+            or (state == "request_failed" and (
+                failed is not True or finished is not False or failure_class == "none"
+                or duration not in {"<100ms", "<1s", "<5s", ">=5s"}
+            ))
+            or (state in {"ambiguous", "unavailable"} and (
+                response is not None or status != state or finished is not None
+                or failed is not None or failure_class != state or duration != state
+            ))
+            or ((response is False) != (status == "none"))
+            or (response is True and status in {"none", "ambiguous", "unavailable"})
+            or (finished is True and failed is True)
+            or ((image["csp_state"] == "matched") != (image["csp_image_block_count"] > 0))
+            or (image["csp_state"] == "not_observed" and image["csp_image_block_count"] != 0)
+            or (coverage["network_state"] != "captured" and state != "unavailable")
+            or (coverage["csp_state"] == "unavailable" and image["csp_state"] != "unavailable")
+            or (coverage["csp_state"] == "truncated" and image["csp_state"] == "not_observed")
+        ):
+            raise GuardError("private image inventory lifecycle is malformed")
+        seen_ordinals.add(ordinal)
 
 
 def _validate_live_user_api_failure(value: object) -> None:

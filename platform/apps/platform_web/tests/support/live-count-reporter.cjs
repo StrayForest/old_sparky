@@ -24,13 +24,19 @@ const MAX_PAGE_ERROR_STACK_CHARS = 16 * 1024;
 const MAX_PAGE_ERROR_STACK_LINES = 32;
 const MAX_TRACKED_NEXT_SCRIPTS = 256;
 const MAX_IMAGE_INVENTORY_COUNT = 512;
+const MAX_IMAGE_INVENTORY_ATTACHMENT_BYTES = 8 * 1024;
+const MAX_IMAGE_DIAGNOSTIC_ENTRIES = 16;
+const MAX_IMAGE_DIAGNOSTIC_EVENTS = 64;
 const MAX_ATTEMPTS = 32768;
 const GATE_ROOT = "/run/oldsparky-liveqa";
 const FAILURE_REPORT_FILE = "live-failures-v2.json";
 const FAILURE_IDENTITY_REPORT_FILE = "live-failure-identities-v1.json";
 const LIVE_USER_FAILURE_REPORT_FILE = "live-user-failures-v3.json";
 const PAGE_ERROR_ATTACHMENT_NAME = "live-pageerror-evidence-v1";
-const IMAGE_INVENTORY_ATTACHMENT_NAME = "live-image-inventory-evidence-v1";
+const IMAGE_INVENTORY_ATTACHMENT_NAMES = new Set([
+  "live-image-inventory-evidence-v1",
+  "live-image-inventory-evidence-v2",
+]);
 const LIVE_USER_API_FAILURE_ATTACHMENT_NAME = "live-user-api-failure-v1";
 const RUN_STATUSES = new Set(["passed", "failed", "timedout", "interrupted"]);
 const ATTEMPT_STATUSES = new Set([
@@ -786,11 +792,11 @@ function pageErrorEvidenceForAttempt(result) {
 
 function normalizedImageInventoryAttachment(attachment) {
   if (
-    attachment?.name !== IMAGE_INVENTORY_ATTACHMENT_NAME
+    !IMAGE_INVENTORY_ATTACHMENT_NAMES.has(attachment?.name)
     || attachment.contentType !== "application/json"
     || attachment.path !== undefined
     || !Buffer.isBuffer(attachment.body)
-    || attachment.body.length > 512
+    || attachment.body.length > MAX_IMAGE_INVENTORY_ATTACHMENT_BYTES
     || attachment.body.some((byte) => byte > 0x7f)
   ) return null;
   let payload;
@@ -799,7 +805,7 @@ function normalizedImageInventoryAttachment(attachment) {
   } catch {
     return null;
   }
-  const expectedKeys = [
+  const versionOneKeys = [
     "complete",
     "counts_truncated",
     "image_count",
@@ -808,12 +814,26 @@ function normalizedImageInventoryAttachment(attachment) {
     "schema",
     "unloaded_count",
   ];
+  const versionTwoKeys = [
+    "complete",
+    "counts_truncated",
+    "coverage",
+    "image_count",
+    "image_entries_truncated",
+    "images",
+    "missing_current_src_count",
+    "route",
+    "schema",
+    "unloaded_count",
+  ];
+  const schema = payload?.schema;
+  const expectedKeys = schema === 1 ? versionOneKeys : schema === 2 ? versionTwoKeys : [];
   if (
     !payload
     || typeof payload !== "object"
     || Array.isArray(payload)
+    || expectedKeys.length === 0
     || Object.keys(payload).sort().join(",") !== expectedKeys.join(",")
-    || payload.schema !== 1
     || !["home", "patch", "tournaments"].includes(payload.route)
     || !Number.isSafeInteger(payload.image_count)
     || payload.image_count < 0
@@ -834,15 +854,169 @@ function normalizedImageInventoryAttachment(attachment) {
       || payload.missing_current_src_count !== 0
       || payload.unloaded_count !== 0
     ))
+    || (schema === 2 && !normalizedImageInventoryV2(payload))
     || attachment.body.toString("ascii") !== JSON.stringify(payload)
   ) return null;
   return payload;
 }
 
+function normalizedImageInventoryV2(payload) {
+  const coverage = payload.coverage;
+  const images = payload.images;
+  if (
+    !coverage
+    || typeof coverage !== "object"
+    || Array.isArray(coverage)
+    || Object.keys(coverage).sort().join(",") !== [
+      "csp_events_truncated",
+      "csp_state",
+      "network_state",
+      "unmatched_csp_count",
+    ].join(",")
+    || !["captured", "truncated", "unavailable"].includes(coverage.network_state)
+    || !["captured", "truncated", "unavailable"].includes(coverage.csp_state)
+    || !Number.isSafeInteger(coverage.unmatched_csp_count)
+    || coverage.unmatched_csp_count < 0
+    || coverage.unmatched_csp_count > MAX_IMAGE_DIAGNOSTIC_EVENTS
+    || typeof coverage.csp_events_truncated !== "boolean"
+    || (coverage.csp_events_truncated && coverage.csp_state !== "truncated")
+    || !Array.isArray(images)
+    || images.length > MAX_IMAGE_DIAGNOSTIC_ENTRIES
+    || typeof payload.image_entries_truncated !== "boolean"
+    || (payload.image_entries_truncated && images.length >= payload.image_count)
+    || (!payload.image_entries_truncated && images.length !== payload.image_count)
+  ) return false;
+
+  const seenOrdinals = new Set();
+  for (const image of images) {
+    const expectedImageKeys = [
+      "complete",
+      "csp_image_block_count",
+      "csp_state",
+      "current_src_present",
+      "generation",
+      "natural_width_positive",
+      "loading",
+      "ordinal",
+      "request_failure_class",
+      "request_failed",
+      "request_finished",
+      "request_state",
+      "response_received",
+      "response_status_class",
+      "scroll_attempted",
+      "src_present",
+      "srcset_present",
+      "terminal_duration_bucket",
+      "viewport_state",
+    ];
+    if (
+      !image
+      || typeof image !== "object"
+      || Array.isArray(image)
+      || Object.keys(image).sort().join(",") !== expectedImageKeys.sort().join(",")
+      || !Number.isSafeInteger(image.ordinal)
+      || image.ordinal < 1
+      || image.ordinal > MAX_IMAGE_INVENTORY_COUNT
+      || seenOrdinals.has(image.ordinal)
+      || !Number.isSafeInteger(image.generation)
+      || image.generation < 1
+      || image.generation > 1024
+      || [
+        image.src_present,
+        image.srcset_present,
+        image.complete,
+        image.natural_width_positive,
+        image.current_src_present,
+        image.scroll_attempted,
+      ].some((value) => typeof value !== "boolean")
+      || !["lazy", "eager", "unknown"].includes(image.loading)
+      || !["intersecting", "outside", "unknown"].includes(image.viewport_state)
+      || ![
+        "not_observed", "pending", "response_received", "request_finished",
+        "request_failed", "ambiguous", "unavailable",
+      ].includes(image.request_state)
+      || ![true, false, null].includes(image.response_received)
+      || ![
+        "none", "2xx", "3xx", "4xx", "5xx", "other", "ambiguous", "unavailable",
+      ].includes(image.response_status_class)
+      || ![true, false, null].includes(image.request_finished)
+      || ![true, false, null].includes(image.request_failed)
+      || ![
+        "none", "dns", "connection", "timeout", "tls", "aborted", "other",
+        "ambiguous", "unavailable",
+      ].includes(image.request_failure_class)
+      || !["matched", "not_observed", "ambiguous", "unavailable"].includes(image.csp_state)
+      || !Number.isSafeInteger(image.csp_image_block_count)
+      || image.csp_image_block_count < 0
+      || image.csp_image_block_count > MAX_IMAGE_DIAGNOSTIC_EVENTS
+      || ![
+        "<100ms", "<1s", "<5s", ">=5s", "not_observed", "ambiguous", "unavailable",
+      ].includes(image.terminal_duration_bucket)
+    ) return false;
+
+    if (
+      (image.request_state === "not_observed" && (
+        image.response_received !== false
+        || image.response_status_class !== "none"
+        || image.request_finished !== false
+        || image.request_failed !== false
+        || image.request_failure_class !== "none"
+        || image.terminal_duration_bucket !== "not_observed"
+      ))
+      || (image.request_state === "pending" && (
+        image.response_received !== false
+        || image.response_status_class !== "none"
+        || image.request_finished !== false
+        || image.request_failed !== false
+        || image.request_failure_class !== "none"
+        || !["<100ms", "<1s", "<5s", ">=5s"].includes(image.terminal_duration_bucket)
+      ))
+      || (image.request_state === "response_received" && (
+        image.response_received !== true
+        || ["none", "ambiguous", "unavailable"].includes(image.response_status_class)
+        || image.request_finished !== false
+        || image.request_failed !== false
+        || !["<100ms", "<1s", "<5s", ">=5s"].includes(image.terminal_duration_bucket)
+      ))
+      || (image.request_state === "request_finished" && (
+        image.request_finished !== true
+        || image.request_failed !== false
+        || image.request_failure_class !== "none"
+        || !["<100ms", "<1s", "<5s", ">=5s"].includes(image.terminal_duration_bucket)
+      ))
+      || (image.request_state === "request_failed" && (
+        image.request_failed !== true
+        || image.request_finished !== false
+        || image.request_failure_class === "none"
+        || !["<100ms", "<1s", "<5s", ">=5s"].includes(image.terminal_duration_bucket)
+      ))
+      || (["ambiguous", "unavailable"].includes(image.request_state) && (
+        image.response_received !== null
+        || image.response_status_class !== image.request_state
+        || image.request_finished !== null
+        || image.request_failed !== null
+        || image.request_failure_class !== image.request_state
+        || image.terminal_duration_bucket !== image.request_state
+      ))
+      || ((image.response_received === false) !== (image.response_status_class === "none"))
+      || (image.response_received === true && ["none", "ambiguous", "unavailable"].includes(image.response_status_class))
+      || (image.request_finished === true && image.request_failed === true)
+      || (image.csp_state === "matched") !== (image.csp_image_block_count > 0)
+      || (image.csp_state === "not_observed" && image.csp_image_block_count !== 0)
+      || (coverage.network_state !== "captured" && image.request_state !== "unavailable")
+      || (coverage.csp_state === "unavailable" && image.csp_state !== "unavailable")
+      || (coverage.csp_state === "truncated" && image.csp_state === "not_observed")
+    ) return false;
+    seenOrdinals.add(image.ordinal);
+  }
+  return true;
+}
+
 function imageInventoryEvidenceForAttempt(result) {
   const attachments = Array.isArray(result?.attachments)
     ? result.attachments.filter(
-      (attachment) => attachment?.name === IMAGE_INVENTORY_ATTACHMENT_NAME,
+      (attachment) => IMAGE_INVENTORY_ATTACHMENT_NAMES.has(attachment?.name),
     )
     : [];
   if (attachments.length === 0 || attachments.length > 3) {
@@ -850,15 +1024,17 @@ function imageInventoryEvidenceForAttempt(result) {
   }
   const routes = [];
   const seenRoutes = new Set();
+  let schema = null;
   for (const attachment of attachments) {
     const route = normalizedImageInventoryAttachment(attachment);
-    if (!route || seenRoutes.has(route.route)) {
+    if (!route || seenRoutes.has(route.route) || (schema !== null && schema !== route.schema)) {
       return { state: "unavailable", inventory: null };
     }
+    schema = route.schema;
     seenRoutes.add(route.route);
     routes.push(route);
   }
-  return { state: "captured", inventory: { schema: 1, routes } };
+  return { state: "captured", inventory: { schema, routes } };
 }
 
 function normalizedUserApiFailure(input) {

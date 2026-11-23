@@ -286,15 +286,14 @@ test.beforeEach(async ({ page, browserName }) => {
       }) => Promise<void>;
       __platformCspViolations?: Array<{
         blockedURI: string;
-        disposition: string;
         effectiveDirective: string;
-        documentURI: string;
-        sourceFile: string;
-        lineNumber: number;
-        columnNumber: number;
       }>;
+      __platformCspViolationsTruncated?: boolean;
+      __platformCspViolationChars?: number;
     };
     target.__platformCspViolations = [];
+    target.__platformCspViolationsTruncated = false;
+    target.__platformCspViolationChars = 0;
     document.addEventListener("securitypolicyviolation", (event) => {
       const summarizeLocation = (value: string) => {
         try {
@@ -322,7 +321,25 @@ test.beforeEach(async ({ page, browserName }) => {
         lineNumber: event.lineNumber,
         columnNumber: event.columnNumber,
       };
-      target.__platformCspViolations?.push(violation);
+      if (
+        (violation.effectiveDirective === "img-src" || violation.effectiveDirective === "default-src")
+        && violation.blockedURI.length <= 2_048
+        && (target.__platformCspViolationChars ?? 0) + violation.blockedURI.length <= 32 * 1024
+        && (target.__platformCspViolations?.length ?? 0) < 64
+      ) {
+        target.__platformCspViolations?.push({
+          blockedURI: violation.blockedURI,
+          effectiveDirective: violation.effectiveDirective,
+        });
+        target.__platformCspViolationChars = (
+          target.__platformCspViolationChars ?? 0
+        ) + violation.blockedURI.length;
+      } else if (
+        violation.effectiveDirective === "img-src"
+        || violation.effectiveDirective === "default-src"
+      ) {
+        target.__platformCspViolationsTruncated = true;
+      }
       void target.__platformRecordCspViolation?.(violation);
     });
   });
@@ -1009,13 +1026,41 @@ test("live image currentSrc inventory stays inside the exact CSP hosts", async (
     { path: "/tournaments", route: "tournaments" as const },
   ];
   const imageEvidence: Array<{
-    schema: 1;
+    schema: 2;
     route: "home" | "patch" | "tournaments";
     image_count: number;
     missing_current_src_count: number;
     unloaded_count: number;
     complete: boolean;
     counts_truncated: boolean;
+    image_entries_truncated: boolean;
+    coverage: {
+      network_state: "captured" | "truncated" | "unavailable";
+      csp_state: "captured" | "truncated" | "unavailable";
+      unmatched_csp_count: number;
+      csp_events_truncated: boolean;
+    };
+    images: Array<{
+      ordinal: number;
+      generation: number;
+      src_present: boolean;
+      srcset_present: boolean;
+      complete: boolean;
+      natural_width_positive: boolean;
+      current_src_present: boolean;
+      loading: "lazy" | "eager" | "unknown";
+      viewport_state: "intersecting" | "outside" | "unknown";
+      scroll_attempted: boolean;
+      request_state: string;
+      response_received: boolean | null;
+      response_status_class: string;
+      request_finished: boolean | null;
+      request_failed: boolean | null;
+      request_failure_class: string;
+      csp_state: string;
+      csp_image_block_count: number;
+      terminal_duration_bucket: string;
+    }>;
   }> = [];
   try {
     for (const { path: routePath, route } of routes) {
@@ -1028,8 +1073,39 @@ test("live image currentSrc inventory stays inside the exact CSP hosts", async (
       const missingCurrentSrcCount = images.filter((image) => !image.currentSrc).length;
       const unloadedCount = images.filter((image) => !image.loaded).length;
       const countLimit = 512;
+      const diagnosticLimit = 16;
+      const boundedImages = images.filter((image) => image.diagnostic.ordinal <= countLimit);
+      const imageEntriesTruncated = images.length > diagnosticLimit
+        || boundedImages.length !== images.length;
+      const selectedDiagnostics = [...boundedImages]
+        .sort((left, right) => (
+          Number(!right.currentSrc || !right.loaded) - Number(!left.currentSrc || !left.loaded)
+          || left.diagnostic.ordinal - right.diagnostic.ordinal
+        ))
+        .slice(0, diagnosticLimit)
+        .map(({ diagnostic }) => ({
+          ordinal: diagnostic.ordinal,
+          generation: diagnostic.generation,
+          src_present: diagnostic.srcPresent,
+          srcset_present: diagnostic.srcSetPresent,
+          complete: diagnostic.complete,
+          natural_width_positive: diagnostic.naturalWidthPositive,
+          current_src_present: diagnostic.currentSrcPresent,
+          loading: diagnostic.loading,
+          viewport_state: diagnostic.viewportState,
+          scroll_attempted: diagnostic.scrollAttempted,
+          request_state: diagnostic.requestState,
+          response_received: diagnostic.responseReceived,
+          response_status_class: diagnostic.responseStatusClass,
+          request_finished: diagnostic.requestFinished,
+          request_failed: diagnostic.requestFailed,
+          request_failure_class: diagnostic.requestFailureClass,
+          csp_state: diagnostic.cspState,
+          csp_image_block_count: diagnostic.cspImageBlockCount,
+          terminal_duration_bucket: diagnostic.terminalDurationBucket,
+        }));
       imageEvidence.push({
-        schema: 1,
+        schema: 2,
         route,
         image_count: Math.min(images.length, countLimit),
         missing_current_src_count: Math.min(missingCurrentSrcCount, countLimit),
@@ -1038,6 +1114,14 @@ test("live image currentSrc inventory stays inside the exact CSP hosts", async (
         counts_truncated: images.length > countLimit
           || missingCurrentSrcCount > countLimit
           || unloadedCount > countLimit,
+        image_entries_truncated: imageEntriesTruncated,
+        coverage: {
+          network_state: imageResult.observationCoverage.networkState,
+          csp_state: imageResult.observationCoverage.cspState,
+          unmatched_csp_count: imageResult.observationCoverage.unmatchedCspCount,
+          csp_events_truncated: imageResult.observationCoverage.cspEventsTruncated,
+        },
+        images: selectedDiagnostics,
       });
       allowedHosts.add(new URL(page.url()).hostname);
       expect(imageResult.complete, `all images load on ${route}`).toBe(true);
@@ -1059,7 +1143,7 @@ test("live image currentSrc inventory stays inside the exact CSP hosts", async (
   } catch (error) {
     for (const evidence of imageEvidence) {
       try {
-        await testInfo.attach("live-image-inventory-evidence-v1", {
+        await testInfo.attach("live-image-inventory-evidence-v2", {
           body: JSON.stringify(evidence),
           contentType: "application/json",
         });
