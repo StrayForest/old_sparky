@@ -2,7 +2,7 @@
 
 - Status: Active backlog and priority map
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-01
+- Last reviewed: 2026-11-23
 
 For the production baseline and immediate engineering target, read [`CURRENT.md`](CURRENT.md). This file deliberately omits release diaries and detailed audit evidence.
 

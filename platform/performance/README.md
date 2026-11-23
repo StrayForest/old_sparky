@@ -2,7 +2,11 @@
 
 - Status: Active reference
 - Owner: Platform performance
-- Last reviewed: 2026-11-05
+- Last reviewed: 2026-11-23
+
+[`docs/CURRENT.md`](../docs/CURRENT.md) owns the live production disposition
+and open performance gates. This reference owns profile contracts and detailed
+measurement evidence; dated checkpoints are historical evidence.
 
 The top-level JSON files in `profiles/` are the only authored canonical load
 contracts (schema 2). `tools/platform_load.py` validates, fingerprints and
@@ -1134,15 +1138,15 @@ abort `34186422087` and exact cleanup `34186465537` passed with 20,000 users,
 `3d7aca0e832bac3c79e1b391e7817b74e5695b03`. The root component-tree
 diagnostic is archived in
 [the measured root component-tree report](../docs/archive/performance-authenticated-html-ttfb-root-component-tree-2026-09-08.md).
-The root render/flush boundary candidate
-[`active-authenticated-html-ttfb-root-render-flush-2026-09-09.md`](active-authenticated-html-ttfb-root-render-flush-2026-09-09.md)
+The root render/flush boundary proposal
+[`proposed-authenticated-html-ttfb-root-render-flush-2026-09-09.md`](proposed-authenticated-html-ttfb-root-render-flush-2026-09-09.md)
 is frozen pending transport evidence; no capacity-setting change is
 authorized. The reviewed transport-observability package is deployed at
 source SHA `1d25ae335f3eb749ce36b4fe97f868d5f357803c` through production deploy
 [`34325036735`](https://github.com/StrayForest/old_sparky/actions/runs/34325036735).
 Its Nginx policy, Node event-loop/CPU/GC diagnostics and bounded hop probe are
 diagnostic instrumentation only until the unchanged authenticated external
-control is rerun. The active next step is the
+control is rerun. At that checkpoint, the documented follow-up was the
 [`authenticated HTML transport runbook`](../docs/performance-transport-runbook.md).
 The source also exposes the isolated operator profile
 `web-ssr-native-transport`, which changes only the trusted loopback auth GET
@@ -1184,8 +1188,10 @@ candidate is archived in
 [`performance-authenticated-html-ttfb-detail-footer-2026-09-08.md`](../docs/archive/performance-authenticated-html-ttfb-detail-footer-2026-09-08.md).
 Its exact load `34230327945` reached the full 20k/40 fixture but failed closed
 on a client `IncompleteRead` before producing a TTFB report; exact cleanup
-passed with zero remnants. The active diagnostic work order above remains the
-only next performance step; no capacity-setting change is authorized.
+passed with zero remnants. At that checkpoint, the frozen root render/flush
+proposal was the only remaining TTFB work order; no capacity-setting change
+was authorized. The current performance disposition and any open follow-up are
+in [`CURRENT.md`](../docs/CURRENT.md).
 The execution record remains available in
 [the archived 2026-09-07 work order](../docs/archive/performance-stage-request-2026-09-07.md), now closed
 with that explicit follow-up.

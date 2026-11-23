@@ -1,9 +1,10 @@
-# Performance stage request — 2026-09-06
+# Historical performance-stage request — 2026-09-06
 
-This file preserves the user's complete performance-stage request so the
-working objective survives context compression. It is an active work order;
-completed evidence belongs in a dated archive report and the current
-conclusion belongs in `platform/docs/CURRENT.md`.
+This archived file preserves the request that scoped the completed stage in
+[`performance-stage-2026-09-06.md`](performance-stage-2026-09-06.md). It is not
+an active work order. The current production status and any open follow-up are
+owned by [`CURRENT.md`](../CURRENT.md) and the current performance contract in
+[`platform/performance/README.md`](../../performance/README.md).
 
 ## Task
 

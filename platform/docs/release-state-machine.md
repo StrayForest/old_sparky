@@ -2,11 +2,12 @@
 
 - Status: Active release design
 - Owner: Production operator and platform maintainers
-- Last reviewed: 2026-10-16
+- Last reviewed: 2026-11-23
 
-This document owns the end-to-end release transaction. The normal production
-path is `tools/platform_release_deploy.sh`; the low-level installer is a
-filesystem primitive and must not be called directly by CI or an operator.
+This document owns the end-to-end release transaction. Normal production
+releases start through the exact-SHA GitHub Actions chain. The low-level
+installer is a filesystem primitive; direct server execution is limited to
+explicitly authorized recovery or rollback under the deployment runbook.
 
 ## State flow
 
@@ -273,8 +274,10 @@ the original transaction and evidence and follow the documented recovery path.
   the old runtime and only units that were active before quiesce when the
   original pointers and release identities still match, but it never downgrades
   the database and never clears the receipt. An operator must check the
-  database and either resume with `platform_release_deploy.sh --resume` or
-  perform an explicit compatibility review before code/runtime rollback. The
+  database and use the matching phase-specific recovery in the
+  [deployment runbook](deployment-runbook.md#release-state-activation-and-recovery).
+  Do not treat this state description as authorization for a generic resume
+  command; code/runtime rollback requires an explicit compatibility review. The
   explicit abort path is:
 
   ```bash
@@ -370,22 +373,22 @@ identity is detected. Receipts from an older schema are not guessed or
 rewritten: production migration and recovery fail closed and require the
 documented recovery bundle/operator review.
 
-## Operator command
+## Normal production path and recovery
 
-```bash
-cd /opt/oldsparky/platform/current
-tools/platform_release_deploy.sh \
-  --artifact /path/to/<release-slug>.tar.gz \
-  --app-dir /opt/oldsparky/platform \
-  --expected-csp-mode enforce
-```
+Normal production releases start from a reviewed push to `dev` and pass through
+the exact-SHA Security gate and automatic production chain. Follow the
+[deployment runbook](deployment-runbook.md); do not invoke the release installer
+or resume command directly for a normal release. Direct server execution is
+limited to explicitly authorized recovery or rollback under the
+[deployment recovery procedure](deployment-runbook.md#release-state-activation-and-recovery)
+and [production rollback runbook](production-rollback-runbook.md). The manual
+workflow fallback is a GitHub Actions path and does not authorize direct shell
+execution.
 
-If the command reports a retained transaction, inspect the phase and database
-revision, then resume only the same transaction:
-
-```bash
-tools/platform_release_deploy.sh --resume --app-dir /opt/oldsparky/platform
-```
+When an installer retains a transaction receipt, inspect the exact receipt
+phase and database revision, then follow the matching guarded recovery path
+below. Do not resume by running a generic shell command: migration phases,
+receipt schema and systemd state determine which recovery workflow is valid.
 
 For an install receipt in a non-migration-uncertain phase such as
 `nginx-applied`, an operator may perform the explicit recovery through GitHub

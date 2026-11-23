@@ -2,7 +2,7 @@
 
 - Status: Active
 - Owner: Platform maintainers
-- Last reviewed: 2026-10-25
+- Last reviewed: 2026-11-23
 
 Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current production state and next engineering priority. Open deeper documents only when the task requires them.
 
@@ -64,6 +64,7 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | Private tournament bearer reads | [Private bearer read boundary](adr/private-tournament-bearer-read-boundary.md) |
 | Ready Check / bracket boundary | [Timing and bracket ADR](adr/ready-check-and-bracket-boundary.md) |
 | Public standalone Draft / Cloudflare edge boundary | [Public Draft edge ADR](adr/public-draft-edge-boundary.md) and [completion without result links](adr/public-draft-completion-without-result-links.md) |
+| Standalone Draft implementation and Cloudflare deployment | [`platform/apps/platform_draft/README.md`](../apps/platform_draft/README.md) and its [path-specific agent guide](../apps/platform_draft/AGENTS.md) |
 
 ## Token-efficient reading contract
 

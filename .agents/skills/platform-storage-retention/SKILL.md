@@ -38,129 +38,19 @@ calling the task complete.
    its final report, use the matching retained-load abort/recovery workflow
    or `platform-production-retained-load-cleanup.yml` with the exact run ID
    and control account. Never replace exact cleanup with a marker-wide or
-   historical database deletion.
-2. Collect a bounded storage inventory before filesystem deletion:
-
-   ```bash
-   gh workflow run platform-production-storage-diagnostics.yml \
-     --repo StrayForest/old_sparky --ref dev \
-     -f expected_sha=<exact-source-sha-currently-deployed>
-   ```
-
-   On the production host, confirm `current`, `previous`, absence of
-   `.release-operation.json`, active service state, and the candidate list.
-   Validate the installed maintenance `ExecStart` against the active release,
-   then run its exact arguments for the read-only preview:
-
-   ```bash
-   current_release="$(readlink -f /opt/oldsparky/platform/current)"
-   systemctl show deadlock-maintenance.service \
-     --property=FragmentPath,DropInPaths,NeedDaemonReload,ActiveState,SubState,MainPID,ExecStart,CPUQuotaPerSecUSec,MemoryMax,TimeoutStartUSec \
-     --no-pager \
-     | /usr/bin/python3 -I -B "$current_release/tools/platform_maintenance_qa_evidence.py" \
-       run-retention-preview \
-       "$current_release/deploy/systemd/deadlock-maintenance.service" \
-       /etc/systemd/system/deadlock-maintenance.service
-   ```
-
-   Record the `current`/`previous` roles and every explicit
-   `--protected-release` value in the validated installed `ExecStart`. The
-   canonical retention plan also resolves the shared-venv origin through the
-   active release's `platform_verify_venv_reuse.py` and adds it to the
-   protected set. A fresh-venv `snapshot` transition resolves to the current
-   release; an `unchanged` chain or receipt resolves to its validated older
-   origin. Missing or invalid lineage fails the plan before backup or
-   deletion. Apply a full sweep only when its fresh preview shows the
-   validated shared-venv origin in `production_releases.protected` or
-   `retained`, and absent from `deleted`. When the origin is the `current` or
-   `previous` pointer, it belongs in `protected`; otherwise it must be in
-   `retained`.
-
-   Run the resolver from the exact active release. It prints only the validated
-   origin slug; it fails closed if the active release lacks the CLI option or
-   any identity check fails:
-
-   ```bash
-   set -euo pipefail
-   current_release="$(readlink -f /opt/oldsparky/platform/current)"
-   origin_slug="$(/opt/oldsparky/platform/shared/venv/bin/python -I -B \
-     "$current_release/tools/platform_verify_venv_reuse.py" \
-     --resolve-shared-venv-origin \
-     --app /opt/oldsparky/platform \
-     --current "$current_release" \
-     --venv /opt/oldsparky/platform/shared/venv)"
-   test -n "$origin_slug"
-   ```
-
-   If an older active-release validator rejects the required `MainPID`
-   property, fail closed and retry after a reviewed release installs the
-   updated validator; see `platform/docs/operations-runbook.md`. Do not remove
-   the property or edit the immutable release.
-
-3. Apply the bounded sweep through the installed service only when the fresh
-   exact preview confirms the validated shared-venv origin is protected or
-   retained and not deleted. If origin validation fails or the preview lists it
-   in `deleted`,
-   do not apply the full sweep; use step 4's release-only procedure or keep
-   retention read-only until the origin is protected. When the precondition
-   passes, use the reviewed
-   production workflow. It creates a fresh restore-verified backup before
-   deleting release candidates, source build artifacts, bounded browser
-   artifacts, screenshots, and stale live-QA runtime caches:
-
-   ```bash
-   gh workflow run platform-production-storage-maintenance.yml \
-     --repo StrayForest/old_sparky --ref dev \
-     -f confirmation=APPLY-PRODUCTION-STORAGE-MAINTENANCE \
-     -f expected_sha=<exact-source-sha-currently-deployed>
-   gh run watch <maintenance-run-id> --repo StrayForest/old_sparky --exit-status
-   ```
-
-   Keep the workflow ref at `dev`; `expected_sha` is the active deployed app
-   SHA. The verifier and both QA artifacts bind to the exact `dev` runner SHA,
-   while both reports must name `expected_sha` as their app target. If runner
-   and app SHAs differ, each report must carry the authenticated
-   `verified-noop` source-binding digest. Never dispatch from an arbitrary SHA
-   ref or treat `expected_sha` as the workflow source.
-
-   The workflow verifies the active release and starts
-   `deadlock-maintenance.service`; the installed service holds the release
-   then retained-load locks while applying the sweep and publishing bounded
-   evidence. Its backup policy retains one pair: after the new pair passes
-   checksum, isolated
-   restore and Alembic verification, it retains exactly that one pair and
-   removes every other complete old pair, including former manifest-listed
-   pairs. The manifest is an audit input. Backup-only uses the same rotation;
-   verify-existing never prunes. A malformed, unmatched or staged partial
-   backup file fails closed instead of being counted as a retained pair.
-   Diagnostics only sample retained-lock state at one point
-   in time; they do not hold that lock during collection.
-
-   Its report is bound to that service invocation. If a valid report confirms
-   a restore-verified backup but maintenance exits nonzero because disk
-   thresholds still fail, the workflow publishes the bounded result and keeps
-   the failure status. Do not infer that no deletion occurred or call cleanup
-   successful from an artifact upload alone.
-
-   Read-only diagnostics may upload a bounded partial inventory plus a closed
-   stage/outcome when collection fails. Use those fields to distinguish
-   transport or producer failure from a disk-threshold result; raw host report
-   content and command output remain private.
-
-   The service keeps five newest production releases plus `current`,
-   `previous`, the shared-venv origin, and configured pins; it retains one
-   live-QA runtime cache and applies age/pattern bounds to other known artifact
-   directories. For a paused timer, use the stop, preview, and resume procedure
-   in `platform/docs/operations-runbook.md`.
-
-   If a prior exact retained-load cleanup committed `PreprodTestRun` as
-   `cleaned` but lost only the final filesystem removal, rerun the exact-ID
-   cleanup workflow for that load run. The supervisor verifies the durable
-   cleanup identity, confirms the synthetic fixture boundary is empty, and
-  removes only that run's root and matching external export directory; mixed or
-  incomplete state remains fail-closed.
-
-4. If the full sweep cannot create its backup because the filesystem is
+   historical database deletion. If the exact cleanup committed its
+   `PreprodTestRun` row as `cleaned` but lost only final filesystem removal,
+   rerun that exact-ID cleanup workflow; it removes only the verified run root
+   and matching external export directory. See
+   `platform/docs/retained-load-and-web-verification.md`.
+2. Admit storage work only when the shared disk threshold in
+   `platform/docs/operations-runbook.md#retention-and-disk-safety`
+   passes. Use that owner procedure for exact inventory, installed-unit-bound
+   preview, timer stop/preview/resume, source-bound maintenance dispatch, and
+   report interpretation. Do not apply the full sweep unless the validated
+   shared-venv origin is protected or retained and absent from `deleted`; a
+   backup failure or failed precondition stops deletion.
+3. If the full sweep cannot create its backup because the filesystem is
    already full, first use the identity-checked production retention tool
    after an explicit operator decision and a read-only candidate review. Use
    every `--protected-release` value from the validated installed `ExecStart`
@@ -256,7 +146,7 @@ PY
    retains the validated origin and excludes it from `deleted`; otherwise keep
    the full sweep read-only. Do not use `--skip-backup` for the full sweep.
 
-5. Verify and record the result before another run:
+4. Verify and record the result before another run:
 
    ```bash
    df -hT /
@@ -290,7 +180,7 @@ PY
 
 ## Source of truth
 
-Use `platform/docs/operations-runbook.md` for the operator procedure,
+Use `platform/docs/operations-runbook.md#retention-and-disk-safety` for the operator procedure,
 `platform_storage_maintenance.py` for the bounded combined sweep,
 `platform_release_retention.py` for the emergency release-only staging step,
 and `platform-production-storage-diagnostics.yml` for read-only remote

@@ -2,7 +2,7 @@
 
 - Status: Active design reference
 - Owner: Platform web
-- Last reviewed: 2026-09-01
+- Last reviewed: 2026-11-23
 
 ## Product objective
 
@@ -92,9 +92,10 @@ Tournaments is the owner of lifecycle and incident operations.
   - `Roster`: current authoritative team state and safe domain commands.
   - `Bracket`: stable team identity, current match counts and a link to the
     public bracket.
-  - `Audit`: evidence for the selected resource in the global audit surface.
   - `Recovery`: status/visibility override and deletion, only when the server
     capability model allows it.
+- Audit evidence is available from the separate global Audit surface; tournament
+  detail does not have an Audit tab.
 - No automatic bracket regeneration or silent result reset is offered by the
   UI.
 

@@ -107,7 +107,7 @@ separate edge/origin timing population and is not substituted for client TTFB.
 
 The next separately reviewed A/B is the narrow root response
 serialization/flush-boundary candidate in
-[`active-authenticated-html-ttfb-root-render-flush-2026-09-09.md`](../../performance/active-authenticated-html-ttfb-root-render-flush-2026-09-09.md).
+[`proposed-authenticated-html-ttfb-root-render-flush-2026-09-09.md`](../../performance/proposed-authenticated-html-ttfb-root-render-flush-2026-09-09.md).
 It must preserve the authoritative auth bootstrap, authenticated header and
 no-JavaScript behavior while changing only the root response scheduling
 boundary around the already-client detail subtree. It must use the same

@@ -2,9 +2,8 @@
 
 Status: completed with explicit follow-up items. This is the evidence log for
 the performance stage requested in
-[`active-stage-request-2026-09-06.md`](../../performance/active-stage-request-2026-09-06.md).
-The request file is retained verbatim in the repository so the scope survives
-context compression.
+[`performance-stage-request-2026-09-06.md`](performance-stage-request-2026-09-06.md),
+preserved alongside this report as historical context.
 
 ## Scope and invariants
 
@@ -394,7 +393,7 @@ The repeatable measurements support these operating conclusions:
   and production build). The earlier parallel duplicate backend invocation
   was invalidated because it shared the test database with a second backend
   gate and produced fixture collisions; its result is not used.
-- The saved request remains at
-  [`active-stage-request-2026-09-06.md`](../../performance/active-stage-request-2026-09-06.md)
-  for context recovery. This report is the completed historical record for the
-  stage; only the listed follow-up items remain active.
+- The original request is preserved at
+  [`performance-stage-request-2026-09-06.md`](performance-stage-request-2026-09-06.md).
+  This report is the completed historical record for the stage; only its
+  explicitly listed follow-up items remain active.

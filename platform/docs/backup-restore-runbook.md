@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-11-04
+- Last reviewed: 2026-11-23
 
 ## Ephemeral synthetic restore diagnostic
 
@@ -29,16 +29,14 @@ verification in-process, avoiding a second Python interpreter during the
 memory-intensive restore drill. The standalone helper CLI remains available
 for local diagnostics and checks. Do not run its mutating mode directly on the
 production host because it does not acquire the host-wide operation locks.
-Create production backups through the lock-aware backup-only mode. The candidate maintenance unit pins `disk_ext4_image_v1`, while the CLI/workflow defaults remain `tmpfs_v1`; create operations accept an explicit backend, but verify/probe stay tmpfs. The installed unit changes only after paired synthetic proof and exact Security, source-bound backup and deployment gates. A read-only full-maintenance preview retains the unit's disk choice without `--apply` and creates no image or backup. The hosted disk diagnostic prepares only missing fixed image-parent directories before allocation and removes only invocation-created empty directories after verified unit, mount and loop teardown.
-
-```bash
-cd /opt/oldsparky/platform/current
-/opt/oldsparky/platform/shared/venv/bin/python \
-  tools/platform_storage_maintenance.py \
-  --app-dir /opt/oldsparky/platform \
-  --backup-max-age-hours 24 \
-  --backup-only --apply --json
-```
+Create production backups through the source-bound GitHub Actions procedure in
+[Production backup for a normal release](#production-backup-for-a-normal-release).
+The candidate unit pins `disk_ext4_image_v1`; other CLI/workflow defaults stay
+`tmpfs_v1` (verify/probe use tmpfs). This unit changes only after paired
+synthetic proof and exact Security, source-bound backup, and deployment gates.
+A read-only preview creates no image or backup. The hosted disk diagnostic
+creates only missing fixed image-parent directories, then removes only its
+empty directories after verified unit, mount and loop teardown.
 
 The drill checks disk availability before starting `pg_dump` and monitors the root
 filesystem while dump and restore children run. Its stop threshold is the larger
@@ -225,6 +223,8 @@ pre-delete identities, sidecar claims, reason and falsey restore-status class
 where applicable. It does not hash dump payloads. Drift fails closed, but
 pruning that already began is not transactional. Public
 summaries omit manifest names, paths and proof digests.
+
+## Production backup for a normal release
 
 For a normal reviewed `dev` release, the operator owns backup dispatch;
 auto-deploy only checks its exact proof. Use this order:

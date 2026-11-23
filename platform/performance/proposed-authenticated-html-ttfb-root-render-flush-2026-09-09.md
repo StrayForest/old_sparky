@@ -1,6 +1,7 @@
-# Active authenticated HTML/TTFB candidate — root render/flush boundary — 2026-09-09
+# Proposed authenticated HTML/TTFB candidate — root render/flush boundary — 2026-09-09
 
-Status: proposed A/B; no implementation. Owner: Platform maintainers.
+Status: proposed A/B, frozen pending transport evidence; no implementation.
+Owner: Platform maintainers.
 
 The production baseline is now Next.js `16.3.4` after the security
 maintenance release. The unchanged control is

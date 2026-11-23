@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform web
-- Last reviewed: 2026-09-11
+- Last reviewed: 2026-11-23
 
 ## Ownership
 

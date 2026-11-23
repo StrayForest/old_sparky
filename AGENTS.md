@@ -28,13 +28,15 @@
 
 ## Instruction and skill hierarchy
 
-- Root rules apply globally. More specific `platform/AGENTS.md` and
-  `platform/apps/platform_web/AGENTS.md` add path-specific rules.
+- Root rules apply globally. More specific `platform/AGENTS.md`,
+  `platform/apps/platform_web/AGENTS.md` and
+  `platform/apps/platform_draft/AGENTS.md` add path-specific rules.
 - For docs, AGENTS or skills, use `$platform-documentation-maintenance` and
   read `platform/docs/documentation-governance.md`.
 - Use `$openai-knowledge` for OpenAI/Codex/API/model/prompt documentation;
   `$platform-implementation-strategy` before platform API, schema, permission,
   workflow, runtime, release or cross-module changes;
+  `$deadlock-backend-production` for platform backend work;
   `$deadlock-workflow-guardrails` before Deadlock workflow changes;
   `$frontend-ux-polish` for meaningful web UI changes;
   `$platform-performance-monitoring` for performance/observability work;
@@ -75,8 +77,9 @@
 - GitHub Actions is the release authority. A reviewed push to `dev` must pass
   exact-SHA `Platform security and build`, then the automatic production
   chain; do not manually dispatch normal production deployment or call low-
-  level release installers directly. Follow `deployment-runbook.md` for the
-  exceptional recovery/fallback paths.
+  level release installers directly. Follow
+  [`platform/docs/deployment-runbook.md`](platform/docs/deployment-runbook.md)
+  for the exceptional recovery/fallback paths.
 - Substantive work is complete only after applicable checks, stale-artifact
   cleanup, a coherent commit, push to the matching branch, and a post-push
   fetch proving local `HEAD == origin/<branch>`. Never force-push automatically.
