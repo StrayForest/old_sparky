@@ -24,7 +24,9 @@ from tools.platform_ci_classifier import (
     DOCS_PREFIX,
     FULL_GATE_IDS,
     PROJECT_GUIDANCE_REASON,
+    PROJECT_GUIDANCE_FILES,
     PROJECT_GUIDANCE_RUNTIME_REASON,
+    PROJECT_GUIDANCE_RUNTIME_FILES,
     RECOVERY_BOOTSTRAP_FILES,
     RECOVERY_BOOTSTRAP_REASON,
     STORAGE_OPERATIONS_FILES,
@@ -73,6 +75,23 @@ BASELINE_KEYS = frozenset(
         "pending_operation",
     }
 )
+
+
+def _is_runtime_guidance_reconcile_union(files: Sequence[str]) -> bool:
+    """Recognize the closed runtime-guidance plus verified tooling no-op family."""
+
+    route_files = route_files_without_root_guide(files)
+    tooling_files = RECOVERY_BOOTSTRAP_FILES | CANDIDATE_PACKAGING_FILES
+    guidance_files = PROJECT_GUIDANCE_FILES | PROJECT_GUIDANCE_RUNTIME_FILES
+    allowed_files = tooling_files | guidance_files
+    return bool(
+        any(path in PROJECT_GUIDANCE_RUNTIME_FILES for path in route_files)
+        and any(path in tooling_files for path in route_files)
+        and all(
+            path in allowed_files or path.startswith(DOCS_PREFIX)
+            for path in route_files
+        )
+    )
 RELEASE_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
 HEX_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 ATTEMPT_PATH_RE = re.compile(
@@ -579,7 +598,14 @@ def classify_cumulative_baseline(
                 for path in cumulative_route_files
             )
         )
+        runtime_guidance_reconcile_no_op = bool(
+            cumulative.get("reason") == RECOVERY_BOOTSTRAP_REASON
+            and cumulative.get("runtime_sensitive") is True
+            and _is_runtime_guidance_reconcile_union(cumulative_route_files)
+        )
         if storage_recovery_no_op:
+            return {"manifest": cumulative, "no_op": True}
+        if runtime_guidance_reconcile_no_op:
             return {"manifest": cumulative, "no_op": True}
         if recovery_no_op != candidate_no_op:
             return {"manifest": cumulative, "no_op": True}
@@ -695,6 +721,12 @@ def validate_cumulative_reconcile_route(route: object) -> dict[str, bool]:
             and manifest["runtime_sensitive"] is True
             and _is_project_guidance_runtime_only(route_files)
         )
+        runtime_guidance_reconcile_family = bool(
+            manifest.get("reason") == RECOVERY_BOOTSTRAP_REASON
+            and manifest.get("runtime_sensitive") is True
+            and manifest.get("deployable") is False
+            and _is_runtime_guidance_reconcile_union(route_files)
+        )
         storage_recovery_family = bool(
             any(path in RECOVERY_BOOTSTRAP_FILES for path in route_files)
             and any(path in STORAGE_OPERATIONS_TRIGGER_FILES for path in route_files)
@@ -706,9 +738,22 @@ def validate_cumulative_reconcile_route(route: object) -> dict[str, bool]:
             )
             and manifest["runtime_sensitive"] is True
         )
-        if sum((docs_family, recovery_family, candidate_family, storage_recovery_family, project_guidance_family)) != 1:
+        no_op_families = (
+            docs_family,
+            recovery_family,
+            candidate_family,
+            storage_recovery_family,
+            project_guidance_family,
+            runtime_guidance_reconcile_family,
+        )
+        if sum(no_op_families) != 1:
             raise ProvenanceError("cumulative no-op route is outside the exact authorized file families")
-        return {"no_op": True, "runtime_required": project_guidance_runtime_family}
+        return {
+            "no_op": True,
+            "runtime_required": (
+                project_guidance_runtime_family or runtime_guidance_reconcile_family
+            ),
+        }
     if docs_only_manifest or project_guidance_manifest:
         raise ProvenanceError("non-deployable cumulative route cannot authorize an application release")
     if manifest["deployable"] is not True:

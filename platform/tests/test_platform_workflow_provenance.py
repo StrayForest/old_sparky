@@ -71,6 +71,7 @@ from tools.platform_ci_classifier import (  # noqa: E402
     CANDIDATE_PACKAGING_FILES,
     CANDIDATE_PACKAGING_REASON,
     DOCS_ONLY_GATE_IDS,
+    FULL_GATE_IDS,
     RECOVERY_BOOTSTRAP_FILES,
     RECOVERY_BOOTSTRAP_REASON,
     RUNTIME_SENSITIVE_FILES,
@@ -1393,6 +1394,87 @@ class WorkflowProvenanceTests(unittest.TestCase):
         )
         self.assertFalse(mixed_candidate["no_op"])
         self.assertTrue(mixed_candidate["manifest"]["deployable"])
+
+    def test_runtime_guidance_and_release_tooling_cumulative_union_is_a_runtime_noop(self) -> None:
+        incremental_paths = [
+            ".github/workflows/platform-production-autodeploy.yml",
+            ".github/workflows/platform-production-recovery-bootstrap-build.yml",
+            ".github/workflows/platform-production-recovery-bootstrap-publish.yml",
+            "platform/docs/test-suite-governance.md",
+            "platform/tests/test_platform_ci_classifier.py",
+            "platform/tools/platform_ci_classifier.py",
+            "platform/tools/platform_deploy_baseline.py",
+            "platform/tools/platform_production_classifier_artifact.py",
+            "platform/tools/platform_test_catalog.py",
+        ]
+        incremental = classify(
+            incremental_paths,
+            event="push",
+            branch="dev",
+            target_sha=self.SHA,
+        )
+        self.assertEqual(incremental["reason"], RECOVERY_BOOTSTRAP_REASON)
+        self.assertTrue(incremental["runtime_sensitive"])
+        self.assertFalse(incremental["deployable"])
+
+        # Exact `git diff --name-only -z --no-renames` first-parent path set
+        # from production baseline 7fd08091 to reviewed target 5d9f2e08.
+        cumulative_paths = [
+            ".agents/skills/deadlock-backend-production/SKILL.md",
+            ".agents/skills/platform-code-change-verification/SKILL.md",
+            ".agents/skills/platform-implementation-strategy/SKILL.md",
+            ".agents/skills/platform-storage-retention/SKILL.md",
+            ".github/workflows/platform-production-autodeploy.yml",
+            ".github/workflows/platform-production-recovery-bootstrap-build.yml",
+            ".github/workflows/platform-production-recovery-bootstrap-publish.yml",
+            "AGENTS.md",
+            "platform/docs/CURRENT.md",
+            "platform/docs/README.md",
+            "platform/docs/admin-console-information-architecture.md",
+            "platform/docs/adr/production-host-tools-provisioning.md",
+            "platform/docs/archive/performance-authenticated-html-ttfb-root-component-tree-2026-09-08.md",
+            "platform/docs/archive/performance-stage-2026-09-06.md",
+            "platform/docs/archive/performance-stage-request-2026-09-06.md",
+            "platform/docs/backup-restore-runbook.md",
+            "platform/docs/platform-roadmap.md",
+            "platform/docs/platform-visual-theme.md",
+            "platform/docs/release-state-machine.md",
+            "platform/docs/test-suite-governance.md",
+            "platform/performance/README.md",
+            "platform/performance/active-authenticated-html-ttfb-root-render-flush-2026-09-09.md",
+            "platform/performance/active-stage-request-2026-09-06.md",
+            "platform/performance/proposed-authenticated-html-ttfb-root-render-flush-2026-09-09.md",
+            "platform/tests/test_platform_ci_classifier.py",
+            "platform/tools/platform_ci_classifier.py",
+            "platform/tools/platform_deploy_baseline.py",
+            "platform/tools/platform_production_classifier_artifact.py",
+            "platform/tools/platform_test_catalog.py",
+        ]
+        self.assertEqual(len(cumulative_paths), 29)
+        cumulative = classify_cumulative_baseline(
+            incremental,
+            cumulative_paths,
+            expected_target_sha=self.SHA,
+        )
+        self.assertTrue(cumulative["no_op"])
+        self.assertEqual(cumulative["manifest"]["reason"], RECOVERY_BOOTSTRAP_REASON)
+        self.assertEqual(
+            cumulative["manifest"]["expected_gates"], list(FULL_GATE_IDS)
+        )
+        self.assertTrue(cumulative["manifest"]["runtime_sensitive"])
+        self.assertFalse(cumulative["manifest"]["deployable"])
+        self.assertFalse(cumulative["manifest"]["fallback"])
+        self.assertEqual(
+            validate_cumulative_reconcile_route(cumulative),
+            {"no_op": True, "runtime_required": True},
+        )
+
+        with self.assertRaises(ProvenanceError):
+            classify_cumulative_baseline(
+                incremental,
+                [*cumulative_paths, "platform/performance/unowned-evidence.md"],
+                expected_target_sha=self.SHA,
+            )
 
     def test_candidate_packaging_reconcile_source_is_closed_and_cumulative(self) -> None:
         candidate_path = ".github/workflows/platform-host-tools-candidate.yml"

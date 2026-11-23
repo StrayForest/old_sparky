@@ -173,6 +173,11 @@ PROJECT_GUIDANCE_FILES = frozenset(
         ".agents/skills/release-handoff-summary/references/template.md",
         "platform/performance/README.md",
         "platform/performance/proposed-authenticated-html-ttfb-root-render-flush-2026-09-09.md",
+        # Exact rename sources surfaced by the no-renames first-parent
+        # baseline extractor; these historical evidence files were renamed
+        # under platform/docs/archive or proposed-*.
+        "platform/performance/active-authenticated-html-ttfb-root-render-flush-2026-09-09.md",
+        "platform/performance/active-stage-request-2026-09-06.md",
     }
 )
 PROJECT_GUIDANCE_REASON = (
