@@ -2,7 +2,7 @@
 
 - Status: Active how-to and reference
 - Owner: Production operator
-- Last reviewed: 2026-11-02
+- Last reviewed: 2026-11-23
 
 ## Runtime checks
 
@@ -202,7 +202,7 @@ Do not increase Gunicorn/Celery workers, add PgBouncer, install exporters or
 introduce a cache/schema rewrite without retained evidence. If both VPS cores
 remain saturated after unnecessary work is removed, classify a capacity limit
 instead of hiding it with more local workers.
-Use the [tmpfs allocation diagnostic](../performance/README.md#host-tmpfs-allocation-diagnosis)
+Use the [tmpfs allocation diagnostic](host-tmpfs-allocation-diagnostic.md#host-tmpfs-allocation-diagnosis)
 only in an authorized window; require its documented `COMPLETE_METADATA`
 receipt criteria. Counters, names and totals do not prove ownership or permit
 cleanup; obtain separate owner/lease and dependency evidence first. It has no
@@ -223,6 +223,7 @@ criteria, and abort/cleanup commands. It sends the control account through
 stdin; do not pass it in command arguments or environment variables. For all
 retained-load operations, keep hosted-runner source and active app source
 separate and satisfy the [retained-load cleanup contract](retained-load-and-web-verification.md).
+Runner containment, deadlines, observer and evidence rules: [external-load safety](performance-external-load-safety.md).
 
 To locate the concurrency knee, select `read-mix-concurrency-ramp-v1`. It
 repeats the full 20,000-user route mix at concurrency 16, 32, 48, 64, 80, 96,
@@ -236,9 +237,9 @@ authenticated-read shedding is counted separately from unexpected errors. Run
 it only in the approved window and complete exact cleanup. Accept a Ready
 Check knee only when all eight state guards pass with 40/40 active cohorts and
 positive per-response deadline headroom; HTTP success alone is insufficient.
-Rerun only cell 9 after exact-SHA CI, automatic app deployment and its single
-source-bound backup; then obtain FULL readiness as described in the
-[performance matrix](../performance/README.md#current-11-profile-production-matrix).
+For a cell 9 repeat in the current task, rerun only after exact-SHA CI,
+automatic app deployment and its single source-bound backup. Obtain FULL
+readiness from the [performance matrix](../performance/README.md#current-11-profile-production-matrix); [`CURRENT.md`](CURRENT.md) owns pending status.
 
 The SSR dependency graph has a hermetic browser contract in the platform web
 smoke suite: an authenticated tournament page must call `/auth/bootstrap` and

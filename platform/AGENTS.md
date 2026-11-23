@@ -35,6 +35,9 @@
 - Read `docs/CURRENT.md`, then use `docs/README.md` to select only task-relevant documents.
 - For docs, AGENTS or skills, also read `docs/documentation-governance.md` and
   use `$platform-documentation-maintenance`.
+- For behavior or architecture changes, use `$platform-implementation-strategy`
+  and update the affected owner documents under the rule in
+  `docs/documentation-governance.md`.
 - Prefer focused reads and quiet verification output.
 - Completed substantive work must be committed and pushed to the matching GitHub branch; verify local `HEAD` equals `origin/<branch>` after push.
 - Never force-push automatically.

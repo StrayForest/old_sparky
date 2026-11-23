@@ -17,10 +17,13 @@ Use this workflow for a documentation or agent-guidance change package.
    tests, workflow YAML, deployment state or an explicitly linked external
    report. Search for the old term, command, path, status and release ID across
    the repository before editing.
-4. Assign each fact one owner. Keep current state in `CURRENT.md`, navigation
-   in `docs/README.md`, procedures in runbooks, stable contracts in reference
-   docs, decisions in ADRs and completed evidence in `archive/`. Link to the
-   owner instead of copying policy into multiple files.
+4. Assign each fact one owner using `platform/docs/documentation-governance.md`.
+   Keep current state in `CURRENT.md`, navigation in `docs/README.md`,
+   procedures in runbooks, stable contracts in reference docs, decisions in
+   ADRs and completed evidence in `archive/`. Link to the owner instead of
+   copying policy into multiple files. For semantic behavior or architecture
+   changes, update affected owner docs in the same package; record briefly in
+   the handoff when no documentation edit is needed.
 5. Keep persistent instructions short and imperative. Put path-specific or
    multi-step guidance in the nearest nested `AGENTS.md`, a skill, or a
    reference document. Do not add a second instruction system merely to mirror
@@ -41,8 +44,8 @@ Use this workflow for a documentation or agent-guidance change package.
 Run the repository-owned checks from `platform/`:
 
 ```bash
-.venv_platform/bin/python tools/platform_verify.py docs
-.venv_platform/bin/python tools/platform_verify.py verification-contract
+tools/platform_run_quiet.sh "Platform docs gate" -- .venv_platform/bin/python tools/platform_verify.py docs
+tools/platform_run_quiet.sh "Platform verification contract gate" -- .venv_platform/bin/python tools/platform_verify.py verification-contract
 git diff --check
 ```
 

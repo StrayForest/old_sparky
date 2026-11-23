@@ -2,7 +2,7 @@
 
 - Status: Active reference and maintenance how-to
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-01
+- Last reviewed: 2026-11-23
 
 This document defines where platform facts belong and how to keep the
 repository's documentation, agent instructions and project skills coherent.
@@ -13,9 +13,12 @@ repository's documentation, agent instructions and project skills coherent.
 | --- | --- |
 | Current production state, verified release evidence and next priority | [`CURRENT.md`](CURRENT.md) |
 | Document routing and reading contract | [`README.md`](README.md) |
-| Product, role and workflow contracts | [`product-reference.md`](product-reference.md) |
-| Components, data flow, trust boundaries and deployment topology | [`production-architecture.md`](production-architecture.md) |
-| Repeatable operational procedures | The relevant runbook in [`docs/`](.) |
+| Product behavior, user roles, permissions and workflow contracts | [`product-reference.md`](product-reference.md) |
+| Components, data ownership and flow, trust boundaries and deployment topology | [`production-architecture.md`](production-architecture.md) |
+| Repeatable operator actions and recovery procedures | The task-specific runbook in [`docs/`](.) |
+| Test placement, verification gates and CI route contracts | [`test-suite-governance.md`](test-suite-governance.md) |
+| Performance profiles and matrix | [`platform/performance/README.md`](../performance/README.md) |
+| External-load runner safety and evidence boundaries | [`performance-external-load-safety.md`](performance-external-load-safety.md) |
 | One accepted architectural decision | The relevant record in [`adr/`](adr/) |
 | Prior implementation evidence and superseded checkpoints | [`archive/`](archive/) |
 | Prioritized future work | [`platform-roadmap.md`](platform-roadmap.md) |
@@ -57,8 +60,17 @@ For a code, workflow, deployment, instruction or skill change:
 
 1. Read `CURRENT.md` and `README.md`, then the relevant owner documents.
 2. Trace changed facts to code, migrations, tests, workflow YAML, deployment
-   evidence or a dated external/operator report.
-3. Update the owner, navigation and directly affected cross-links together.
+   evidence or a dated external/operator report. Identify whether the change
+   alters product behavior, permissions/workflow, data ownership/flow, a trust
+   boundary, runtime/deployment/recovery, a verification gate or an operator
+   procedure; use the source-of-truth map above to select each affected owner.
+3. Update each affected owner and its navigation or directly affected links in
+   the same package. Architecture and contract changes must leave their owner
+   documents accurate before the change is complete. A refactor, formatting or
+   test-only change that changes no owned behavior does not need a documentation
+   edit; state briefly in the handoff why the relevant owner documents remain
+   accurate. This is a semantic review, not a rule that every code diff needs a
+   documentation diff.
 4. Move completed plans and dated checkpoints to `archive/`; label them as
    historical and remove “latest/current” language from active navigation.
 5. Remove obsolete commands, paths, statuses, duplicate copies and personal
@@ -83,21 +95,26 @@ work moving when the documentation repair does not block it.
 From `platform/`, run:
 
 ```bash
-.venv_platform/bin/python tools/platform_verify.py docs
-.venv_platform/bin/python tools/platform_verify.py verification-contract
+tools/platform_run_quiet.sh "Platform docs gate" -- .venv_platform/bin/python tools/platform_verify.py docs
+tools/platform_run_quiet.sh "Platform verification contract gate" -- .venv_platform/bin/python tools/platform_verify.py verification-contract
 git diff --check
 ```
 
 The docs gate checks document shape, repository-local links and project skill
-metadata. For a newly created skill, also run the system skill creator's
+metadata. It does not infer semantic consistency between changed code and its
+owner documents; reviewers verify that relationship using the source-of-truth
+map and the change handoff. For a newly created skill, also run the system skill creator's
 `quick_validate.py` when available. A local gate blocked by a missing safe
 dependency is not a pass; report it as `LOCAL GATE BLOCKED`.
 
 ## External orientation
 
-The maintenance rules are aligned with current guidance from [OpenAI's Codex
-engineering guide](https://openai.com/business/guides-and-resources/how-openai-uses-codex/),
-[Anthropic's memory guidance](https://code.claude.com/docs/en/memory),
-[GitHub's custom-instructions model](https://docs.github.com/en/copilot/concepts/prompting/response-customization),
-[Google's code-review practices](https://google.github.io/eng-practices/review/reviewer/looking-for.html),
-and the [Diátaxis documentation framework](https://diataxis.fr/).
+Keep always-applied agent instructions focused and route deeper context to
+task-specific documents, following [OpenAI's Codex guidance on skills and
+prompts](https://developers.openai.com/blog/rethinking-skills-and-prompts-for-gpt-6-astra).
+Use [skill metadata to select reusable workflows](https://developers.openai.com/plugins/concepts/skills),
+and keep repository-wide and path-specific guidance scoped to the files it
+governs, as described by [GitHub's custom-instructions model](https://docs.github.com/en/copilot/concepts/prompting-and-context/custom-instructions).
+Use [Diátaxis](https://diataxis.fr/) as a lightweight way to distinguish
+procedures, reference, learning and explanatory context, not as a reason to
+create extra document layers.

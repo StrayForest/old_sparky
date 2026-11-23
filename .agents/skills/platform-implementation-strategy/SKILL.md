@@ -27,6 +27,9 @@ Use before editing platform behavior or data flow.
 - For replace-all collections such as dream slots, serialize the owning row;
   add optimistic revision semantics when clients need conflict detection.
 - Define behavior, data/schema impact, permissions, tests, rollback risk, and legacy-bot boundary.
+- For behavior or architecture changes, identify affected documentation owners
+  using `platform/docs/documentation-governance.md` and keep their contracts
+  accurate in the same change package.
 - For platform backend changes, also follow the repository-owned backend production skill at `.agents/skills/deadlock-backend-production/SKILL.md`; it owns the OldSparky authorization overlay and current API/persistence boundaries.
 - For release/runtime changes, model the whole candidate → migration decision →
   activation → readiness/smoke state machine. Keep a durable recovery receipt

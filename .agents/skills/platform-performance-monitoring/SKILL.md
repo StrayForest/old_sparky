@@ -28,6 +28,11 @@ waterfalls.
    - QA `performance.system` for CPU, RAM, swap, load average, nginx
      connections, gunicorn workers, PostgreSQL CPU/connections;
    - `pg_stat_statements` and bounded `EXPLAIN` for DB-heavy paths.
+   Use owner references on demand: `platform/docs/performance-external-load-safety.md`
+   for production external-runner deadlines, containment, observer and evidence
+   boundaries; `platform/docs/host-tmpfs-allocation-diagnostic.md` for the
+   read-only `/dev/shm` inventory procedure. Ordinary request profiling does
+   not require reading either document.
 4. Treat repeated UI polling, duplicated SSR/API reads, JSONB deserialization,
    serialization, and large list payloads as first-class bottlenecks even when
    SQL count is already low.

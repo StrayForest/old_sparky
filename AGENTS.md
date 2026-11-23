@@ -33,6 +33,9 @@
   `platform/apps/platform_draft/AGENTS.md` add path-specific rules.
 - For docs, AGENTS or skills, use `$platform-documentation-maintenance` and
   read `platform/docs/documentation-governance.md`.
+- For behavior or architecture changes, use `$platform-implementation-strategy`
+  to identify affected owner docs; keep the owner map and closeout rule in
+  `platform/docs/documentation-governance.md`.
 - Use `$openai-knowledge` for OpenAI/Codex/API/model/prompt documentation;
   `$platform-implementation-strategy` before platform API, schema, permission,
   workflow, runtime, release or cross-module changes;
