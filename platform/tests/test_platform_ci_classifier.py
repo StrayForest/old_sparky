@@ -26,6 +26,9 @@ from tools.platform_ci_classifier import (
     DOCS_ONLY_REASON,
     FULL_GATE_IDS,
     OUT_OF_SCOPE_GATE_IDS,
+    PROJECT_GUIDANCE_FILES,
+    PROJECT_GUIDANCE_REASON,
+    PROJECT_GUIDANCE_RUNTIME_REASON,
     RECOVERY_BOOTSTRAP_FILES,
     RECOVERY_BOOTSTRAP_REASON,
     RUNTIME_SENSITIVE_FILES,
@@ -191,6 +194,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     "--allow-docs-only",
                     "--allow-candidate-packaging",
                     "--allow-out-of-scope",
+                    "--allow-project-guidance",
                     "--emit-manifest-base64",
                 ],
                 check=False,
@@ -250,6 +254,224 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertFalse(manifest["fallback"])
         validate_manifest(manifest, expected_target_sha=self.TARGET_SHA)
         self.assertEqual(manifest["digest"], manifest_digest(manifest))
+
+    def test_project_guidance_route_is_closed_full_verified_and_nondeployable(self) -> None:
+        files = sorted(
+            {*PROJECT_GUIDANCE_FILES, "platform/docs/test-suite-governance.md"}
+        )
+        manifest = classify(
+            files,
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(manifest["class"], "full")
+        self.assertEqual(manifest["expected_gates"], list(FULL_GATE_IDS))
+        self.assertEqual(manifest["reason"], PROJECT_GUIDANCE_REASON)
+        self.assertFalse(manifest["runtime_sensitive"])
+        self.assertFalse(manifest["deployable"])
+        self.assertFalse(manifest["fallback"])
+        validate_manifest(manifest, expected_target_sha=self.TARGET_SHA)
+
+        unknown = classify(
+            [*files, ".agents/skills/unowned/SKILL.md"],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertTrue(unknown["fallback"])
+        self.assertFalse(unknown["deployable"])
+        self.assertNotEqual(unknown["reason"], PROJECT_GUIDANCE_REASON)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = self._write_production_classifier_archive(root, manifest)
+            with self.assertRaises(ClassifierArtifactError):
+                validate_production_classifier_manifest(
+                    archive,
+                    target_sha=self.TARGET_SHA,
+                )
+            self.assertEqual(
+                validate_production_classifier_manifest(
+                    archive,
+                    target_sha=self.TARGET_SHA,
+                    allow_project_guidance=True,
+                ),
+                manifest,
+            )
+            self.assertEqual(
+                validate_production_classifier_manifest(
+                    archive,
+                    target_sha=self.TARGET_SHA,
+                    require_project_guidance=True,
+                ),
+                manifest,
+            )
+
+        auto_route = self._run_auto_deploy_manifest_contract(manifest)
+        self.assertEqual(auto_route["route_class"], "full")
+        self.assertEqual(auto_route["route_deployable"], "false")
+        self.assertEqual(auto_route["route_project_guidance_only"], "true")
+        self.assertEqual(auto_route["route_fallback"], "false")
+
+        no_op = classify_cumulative_baseline(
+            manifest,
+            files,
+            expected_target_sha=self.TARGET_SHA,
+        )
+        self.assertEqual(
+            validate_cumulative_reconcile_route(no_op),
+            {"no_op": True, "runtime_required": False},
+        )
+
+        audited_701_files = sorted(
+            {
+                ".agents/skills/deadlock-backend-production/SKILL.md",
+                ".agents/skills/platform-implementation-strategy/SKILL.md",
+                ".agents/skills/platform-storage-retention/SKILL.md",
+                "AGENTS.md",
+                "platform/docs/README.md",
+                "platform/docs/admin-console-information-architecture.md",
+                "platform/docs/adr/production-host-tools-provisioning.md",
+                "platform/docs/archive/performance-authenticated-html-ttfb-root-component-tree-2026-09-08.md",
+                "platform/docs/archive/performance-stage-2026-09-06.md",
+                "platform/docs/archive/performance-stage-request-2026-09-06.md",
+                "platform/docs/backup-restore-runbook.md",
+                "platform/docs/platform-roadmap.md",
+                "platform/docs/platform-visual-theme.md",
+                "platform/docs/release-state-machine.md",
+                "platform/performance/README.md",
+                "platform/performance/proposed-authenticated-html-ttfb-root-render-flush-2026-09-09.md",
+            }
+        )
+        audited_701_manifest = classify(
+            audited_701_files,
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(audited_701_manifest["expected_gates"], list(FULL_GATE_IDS))
+        self.assertEqual(audited_701_manifest["reason"], PROJECT_GUIDANCE_RUNTIME_REASON)
+        self.assertTrue(audited_701_manifest["runtime_sensitive"])
+        self.assertFalse(audited_701_manifest["deployable"])
+        self.assertFalse(audited_701_manifest["fallback"])
+        validate_manifest(audited_701_manifest, expected_target_sha=self.TARGET_SHA)
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = self._write_production_classifier_archive(
+                Path(temporary), audited_701_manifest
+            )
+            self.assertEqual(
+                validate_production_classifier_manifest(
+                    archive,
+                    target_sha=self.TARGET_SHA,
+                    allow_project_guidance=True,
+                ),
+                audited_701_manifest,
+            )
+            self.assertEqual(
+                validate_production_classifier_manifest(
+                    archive,
+                    target_sha=self.TARGET_SHA,
+                    require_project_guidance=True,
+                    require_runtime_sensitive=True,
+                ),
+                audited_701_manifest,
+            )
+        audited_701_auto = self._run_auto_deploy_manifest_contract(audited_701_manifest)
+        self.assertEqual(audited_701_auto["route_project_guidance_only"], "false")
+        self.assertEqual(
+            audited_701_auto["route_project_guidance_runtime_only"], "true"
+        )
+        self.assertEqual(audited_701_auto["route_deployable"], "false")
+        audited_701_no_op = classify_cumulative_baseline(
+            audited_701_manifest,
+            audited_701_files,
+            expected_target_sha=self.TARGET_SHA,
+        )
+        self.assertEqual(
+            validate_cumulative_reconcile_route(audited_701_no_op),
+            {"no_op": True, "runtime_required": True},
+        )
+
+        ff256f_files = sorted(
+            {
+                ".agents/skills/platform-code-change-verification/SKILL.md",
+                ".agents/skills/platform-storage-retention/SKILL.md",
+                "platform/docs/test-suite-governance.md",
+            }
+        )
+        ff256f_manifest = classify(
+            ff256f_files,
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(
+            ff256f_manifest["reason"], PROJECT_GUIDANCE_RUNTIME_REASON
+        )
+        self.assertTrue(ff256f_manifest["runtime_sensitive"])
+        self.assertFalse(ff256f_manifest["deployable"])
+        self.assertFalse(ff256f_manifest["fallback"])
+        ff256f_no_op = classify_cumulative_baseline(
+            ff256f_manifest,
+            ff256f_files,
+            expected_target_sha=self.TARGET_SHA,
+        )
+        self.assertEqual(
+            validate_cumulative_reconcile_route(ff256f_no_op),
+            {"no_op": True, "runtime_required": True},
+        )
+
+        audited_701_with_tool = classify(
+            [*audited_701_files, "platform/tools/platform_verify.py"],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertTrue(audited_701_with_tool["deployable"])
+        self.assertTrue(audited_701_with_tool["runtime_sensitive"])
+        self.assertFalse(audited_701_with_tool["fallback"])
+        audited_701_unknown = classify(
+            [*audited_701_files, ".agents/skills/unowned/SKILL.md"],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertTrue(audited_701_unknown["fallback"])
+        self.assertFalse(audited_701_unknown["deployable"])
+        unknown_performance = classify(
+            [*audited_701_files, "platform/performance/unreviewed-report.md"],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertTrue(unknown_performance["fallback"])
+        self.assertFalse(unknown_performance["deployable"])
+
+        app_path = "platform/apps/platform_api/app/main.py"
+        app_route = classify(
+            [*files, app_path],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertTrue(app_route["deployable"])
+        self.assertFalse(app_route["fallback"])
+        mixed_unknown = classify(
+            [*files, app_path, ".agents/skills/unowned/SKILL.md"],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertTrue(mixed_unknown["fallback"])
+        self.assertFalse(mixed_unknown["deployable"])
+
+        cumulative_release = classify_cumulative_baseline(
+            manifest,
+            [*files, app_path],
+            expected_target_sha=self.TARGET_SHA,
+        )
+        self.assertFalse(cumulative_release["no_op"])
+        self.assertTrue(cumulative_release["manifest"]["deployable"])
 
     def test_full_dev_push_is_the_only_deployable_route(self) -> None:
         manifest = classify(
@@ -887,7 +1109,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
         with self.assertRaises(ClassifierError):
             validate_manifest(tampered)
 
-    def test_reviewed_skill_companions_require_an_app_source_full_route(self) -> None:
+    def test_project_guidance_companions_and_guide_only_route_are_closed(self) -> None:
         skill_paths = (
             ".agents/skills/code-cleanup-after-changes/SKILL.md",
             ".agents/skills/platform-code-change-verification/SKILL.md",
@@ -919,8 +1141,9 @@ class PlatformCiClassifierTests(unittest.TestCase):
             target_sha=self.TARGET_SHA,
             branch="dev",
         )
-        self.assertEqual(skill_only["class"], "out-of-scope")
-        self.assertEqual(skill_only["expected_gates"], list(OUT_OF_SCOPE_GATE_IDS))
+        self.assertEqual(skill_only["class"], "full")
+        self.assertEqual(skill_only["expected_gates"], list(FULL_GATE_IDS))
+        self.assertEqual(skill_only["reason"], PROJECT_GUIDANCE_REASON)
         self.assertFalse(skill_only["fallback"])
         self.assertFalse(skill_only["deployable"])
 
@@ -947,7 +1170,8 @@ class PlatformCiClassifierTests(unittest.TestCase):
             )
             self.assertEqual(docs_with_skills["class"], "full")
             self.assertEqual(docs_with_skills["expected_gates"], list(FULL_GATE_IDS))
-            self.assertTrue(docs_with_skills["fallback"])
+            self.assertEqual(docs_with_skills["reason"], PROJECT_GUIDANCE_REASON)
+            self.assertFalse(docs_with_skills["fallback"])
             self.assertFalse(docs_with_skills["deployable"])
 
         non_app_platform = classify(
@@ -957,8 +1181,8 @@ class PlatformCiClassifierTests(unittest.TestCase):
             branch="dev",
         )
         self.assertEqual(non_app_platform["class"], "full")
-        self.assertTrue(non_app_platform["fallback"])
-        self.assertFalse(non_app_platform["deployable"])
+        self.assertFalse(non_app_platform["fallback"])
+        self.assertTrue(non_app_platform["deployable"])
 
         unknown_agent = classify(
             [app_path, *skill_paths, ".agents/skills/unreviewed/SKILL.md"],
@@ -1018,8 +1242,9 @@ class PlatformCiClassifierTests(unittest.TestCase):
             target_sha=self.TARGET_SHA,
             branch="dev",
         )
-        self.assertEqual(guide_only["class"], "out-of-scope")
-        self.assertEqual(guide_only["expected_gates"], list(OUT_OF_SCOPE_GATE_IDS))
+        self.assertEqual(guide_only["class"], "full")
+        self.assertEqual(guide_only["expected_gates"], list(FULL_GATE_IDS))
+        self.assertEqual(guide_only["reason"], PROJECT_GUIDANCE_REASON)
         self.assertFalse(guide_only["fallback"])
         self.assertFalse(guide_only["deployable"])
         with tempfile.TemporaryDirectory() as temporary:
@@ -1030,7 +1255,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 validate_production_classifier_manifest(
                     guide_archive,
                     target_sha=self.TARGET_SHA,
-                    allow_out_of_scope=True,
+                    allow_project_guidance=True,
                 ),
                 guide_only,
             )
@@ -3958,7 +4183,10 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 "ROUTE_RECOVERY_BOOTSTRAP_ONLY": "false",
                 "ROUTE_CANDIDATE_PACKAGING_ONLY": "false",
                 "ROUTE_STORAGE_OPERATIONS_ONLY": "true",
+                "ROUTE_PROJECT_GUIDANCE_ONLY": "false",
+                "ROUTE_PROJECT_GUIDANCE_RUNTIME_ONLY": "false",
                 "ROUTE_OUT_OF_SCOPE_ONLY": "false",
+                "ROUTE_FALLBACK": "false",
             }
             completed = subprocess.run(
                 ["bash", "-euo", "pipefail", "-c", gate_script],
@@ -3998,6 +4226,72 @@ class PlatformCiClassifierTests(unittest.TestCase):
             self.assertIn("no application deployment or baseline reconciliation", out_of_scope_gate.stdout)
             self.assertEqual(output.read_text(encoding="utf-8").strip(), "deploy=false")
             self.assertEqual(len(curl_calls.read_text(encoding="utf-8").splitlines()), 1)
+
+            output.write_text("", encoding="utf-8")
+            curl_calls.write_text("", encoding="utf-8")
+            environment.update(
+                {
+                    "ROUTE_CLASS": "full",
+                    "ROUTE_DEPLOYABLE": "false",
+                    "ROUTE_STORAGE_OPERATIONS_ONLY": "false",
+                    "ROUTE_PROJECT_GUIDANCE_ONLY": "true",
+                    "ROUTE_PROJECT_GUIDANCE_RUNTIME_ONLY": "false",
+                    "ROUTE_OUT_OF_SCOPE_ONLY": "false",
+                    "ROUTE_FALLBACK": "false",
+                }
+            )
+            project_guidance_gate = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", gate_script],
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(
+                project_guidance_gate.returncode,
+                0,
+                project_guidance_gate.stderr,
+            )
+            self.assertIn(
+                "Project-guidance route validated",
+                project_guidance_gate.stdout,
+            )
+            self.assertEqual(output.read_text(encoding="utf-8").strip(), "deploy=false")
+            calls = curl_calls.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(calls), 1)
+            self.assertIn("/branches/dev", calls[0])
+            self.assertNotIn("/workflows/platform-production-deploy.yml/dispatches", calls[0])
+
+            output.write_text("", encoding="utf-8")
+            curl_calls.write_text("", encoding="utf-8")
+            environment.update(
+                {
+                    "ROUTE_CLASS": "full",
+                    "ROUTE_DEPLOYABLE": "false",
+                    "ROUTE_STORAGE_OPERATIONS_ONLY": "false",
+                    "ROUTE_PROJECT_GUIDANCE_ONLY": "false",
+                    "ROUTE_PROJECT_GUIDANCE_RUNTIME_ONLY": "true",
+                    "ROUTE_OUT_OF_SCOPE_ONLY": "false",
+                    "ROUTE_FALLBACK": "false",
+                }
+            )
+            runtime_guidance_gate = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", gate_script],
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(
+                runtime_guidance_gate.returncode,
+                0,
+                runtime_guidance_gate.stderr,
+            )
+            self.assertIn("Project-guidance route validated", runtime_guidance_gate.stdout)
+            self.assertEqual(output.read_text(encoding="utf-8").strip(), "deploy=false")
+            calls = curl_calls.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(calls), 1)
+            self.assertNotIn("/workflows/platform-production-deploy.yml/dispatches", calls[0])
 
     def test_recovery_producer_storage_route_emits_bound_receipt_inputs(self) -> None:
         blocks = _workflow_python_blocks(
@@ -4089,6 +4383,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
         recovery_workflow = RECOVERY_BUILD_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("--allow-out-of-scope", recovery_workflow)
         self.assertIn("--allow-candidate-packaging", recovery_workflow)
+        self.assertIn("--allow-project-guidance", recovery_workflow)
         route_blocks = _workflow_python_blocks(
             RECOVERY_BUILD_WORKFLOW,
             "Download and validate exact security route artifact",
@@ -4275,6 +4570,88 @@ class PlatformCiClassifierTests(unittest.TestCase):
             )
             self.assertEqual(stat.S_IMODE(candidate_receipt_path.stat().st_mode), 0o600)
 
+            project_guidance_manifest = classify(
+                [
+                    ".agents/skills/platform-code-change-verification/SKILL.md",
+                    ".agents/skills/platform-storage-retention/SKILL.md",
+                    "platform/docs/test-suite-governance.md",
+                ],
+                event="push",
+                target_sha=self.TARGET_SHA,
+                branch="dev",
+            )
+            project_guidance_encoded = base64.b64encode(
+                json.dumps(
+                    project_guidance_manifest,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).decode("ascii")
+            trusted_tools = root / "trusted-source" / "platform" / "tools"
+            trusted_tools.parent.mkdir(parents=True)
+            trusted_tools.symlink_to(REPO_ROOT / "platform" / "tools", target_is_directory=True)
+            project_guidance_output = root / "project-guidance-output"
+            project_guidance_run = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-",
+                    project_guidance_encoded,
+                    str(project_guidance_output),
+                    self.TARGET_SHA,
+                ],
+                input=route_blocks[0],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(
+                project_guidance_run.returncode, 0, project_guidance_run.stderr
+            )
+            project_guidance_values = dict(
+                line.split("=", 1)
+                for line in project_guidance_output.read_text().splitlines()
+            )
+            self.assertEqual(project_guidance_values["route_skip"], "true")
+            self.assertEqual(
+                project_guidance_values["route_family"], "project-guidance-runtime-sensitive"
+            )
+            project_guidance_receipt_path = root / "project-guidance-receipt.json"
+            project_guidance_env = {
+                **os.environ,
+                "SOURCE_SHA": self.TARGET_SHA,
+                "SECURITY_RUN_ID": "77",
+                "SECURITY_RUN_ATTEMPT": "3",
+                "RECOVERY_BUILD_RUN_ID": "401",
+                "RECOVERY_BUILD_RUN_ATTEMPT": "2",
+                "ROUTE_FAMILY": "project-guidance-runtime-sensitive",
+                "CLASSIFIER_DIGEST": project_guidance_values["classifier_digest"],
+                "ROUTE_FILES_SHA256": project_guidance_values["route_files_sha256"],
+            }
+            project_guidance_receipt_run = subprocess.run(
+                [sys.executable, "-I", "-", str(project_guidance_receipt_path)],
+                input=receipt_blocks[0],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=project_guidance_env,
+            )
+            self.assertEqual(
+                project_guidance_receipt_run.returncode,
+                0,
+                project_guidance_receipt_run.stderr,
+            )
+            project_guidance_receipt = json.loads(
+                project_guidance_receipt_path.read_text(encoding="ascii")
+            )
+            self.assertEqual(
+                project_guidance_receipt["route_family"], "project-guidance-runtime-sensitive"
+            )
+            self.assertEqual(
+                stat.S_IMODE(project_guidance_receipt_path.stat().st_mode), 0o600
+            )
+
             workflow = yaml.safe_load(RECOVERY_BUILD_WORKFLOW.read_text(encoding="utf-8"))
             steps = workflow["jobs"]["build"]["steps"]
             for name in (
@@ -4293,6 +4670,14 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 self.assertEqual(step["if"], "steps.route.outputs.route_skip == 'true'")
             self.assertIn(
                 "--allow-candidate-packaging",
+                next(
+                    step["run"]
+                    for step in steps
+                    if step.get("name") == "Download and validate exact security route artifact"
+                ),
+            )
+            self.assertIn(
+                "--allow-project-guidance",
                 next(
                     step["run"]
                     for step in steps
@@ -4424,6 +4809,21 @@ class PlatformCiClassifierTests(unittest.TestCase):
             self.assertIn(
                 "route_family=candidate-packaging", output.read_text(encoding="ascii")
             )
+            project_guidance_receipt_row = json.loads(json.dumps(receipt_row))
+            project_guidance_receipt_row["name"] = receipt_name.replace(
+                "skip-storage-operations-", "skip-project-guidance-"
+            )
+            output.write_text("", encoding="ascii")
+            project_guidance_selected = select([project_guidance_receipt_row])
+            self.assertEqual(
+                project_guidance_selected.returncode,
+                0,
+                project_guidance_selected.stderr,
+            )
+            self.assertIn(
+                "route_family=project-guidance",
+                output.read_text(encoding="ascii"),
+            )
             wrong_attempt_name = json.loads(json.dumps(receipt_row))
             wrong_attempt_name["name"] = wrong_attempt_name["name"].rsplit("-", 1)[0] + "-3.json"
             self.assertNotEqual(select([wrong_attempt_name]).returncode, 0)
@@ -4495,6 +4895,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
         )
         self.assertIn("--require-out-of-scope", recovery_publisher_workflow)
         self.assertIn("--require-candidate-packaging", recovery_publisher_workflow)
+        self.assertIn("--require-project-guidance", recovery_publisher_workflow)
         blocks = _workflow_python_blocks(
             RECOVERY_PUBLISH_WORKFLOW,
             "Authenticate route skip receipt and parent classifier proof",
@@ -4533,15 +4934,21 @@ class PlatformCiClassifierTests(unittest.TestCase):
             root = Path(temporary)
             output = root / "output"
             output.touch()
-            def receipt_check(payload: dict[str, object]) -> subprocess.CompletedProcess[str]:
+            def receipt_check(
+                payload: dict[str, object],
+                *,
+                family: str = "storage-operations",
+                name: str | None = None,
+            ) -> subprocess.CompletedProcess[str]:
+                expected_name = name or receipt_name
                 zip_path = root / "receipt.zip"
-                info = zipfile.ZipInfo(receipt_name)
+                info = zipfile.ZipInfo(expected_name)
                 info.create_system = 3
                 info.external_attr = (stat.S_IFREG | 0o600) << 16
                 with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as archive:
                     archive.writestr(info, json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
                 return subprocess.run(
-                    [sys.executable, "-I", "-", str(zip_path), receipt_name, "401", "2", "storage-operations", str(output)],
+                    [sys.executable, "-I", "-", str(zip_path), expected_name, "401", "2", family, str(output)],
                     input=blocks[0], text=True, capture_output=True, check=False,
                 )
             accepted = receipt_check(receipt)
@@ -4574,6 +4981,93 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 input=blocks[2], text=True, capture_output=True, check=False, env=environment,
             )
             self.assertNotEqual(rejected.returncode, 0)
+
+            project_guidance_manifest = classify(
+                [
+                    ".agents/skills/platform-code-change-verification/SKILL.md",
+                    ".agents/skills/platform-storage-retention/SKILL.md",
+                    "platform/docs/test-suite-governance.md",
+                ],
+                event="push",
+                target_sha=self.TARGET_SHA,
+                branch="dev",
+            )
+            project_guidance_receipt = {
+                **receipt,
+                "route_family": "project-guidance-runtime-sensitive",
+                "classifier_digest": project_guidance_manifest["digest"],
+                "route_files_sha256": hashlib.sha256(
+                    json.dumps(
+                        sorted(project_guidance_manifest["files"]),
+                        separators=(",", ":"),
+                    ).encode()
+                ).hexdigest(),
+            }
+            project_guidance_name = (
+                f"platform-recovery-bootstrap-skip-project-guidance-runtime-sensitive-{self.TARGET_SHA}-77-3-401-2.json"
+            )
+            (root / "trusted-source" / "platform").mkdir(parents=True)
+            (root / "trusted-source" / "platform" / "tools").symlink_to(
+                REPO_ROOT / "platform" / "tools",
+                target_is_directory=True,
+            )
+            project_receipt_accepted = receipt_check(
+                project_guidance_receipt,
+                family="project-guidance-runtime-sensitive",
+                name=project_guidance_name,
+            )
+            self.assertEqual(
+                project_receipt_accepted.returncode,
+                0,
+                project_receipt_accepted.stderr,
+            )
+            project_encoded = base64.b64encode(
+                json.dumps(
+                    project_guidance_manifest,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).decode("ascii")
+            project_environment = {
+                **os.environ,
+                "SOURCE_SHA": self.TARGET_SHA,
+                "ROUTE_FAMILY": "project-guidance-runtime-sensitive",
+                "CLASSIFIER_DIGEST": str(project_guidance_receipt["classifier_digest"]),
+                "ROUTE_FILES_SHA256": str(project_guidance_receipt["route_files_sha256"]),
+            }
+            project_proof = subprocess.run(
+                [sys.executable, "-I", "-", project_encoded, str(output), "project-guidance-runtime-sensitive"],
+                input=blocks[2],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=False,
+                env=project_environment,
+            )
+            self.assertEqual(project_proof.returncode, 0, project_proof.stderr)
+            tampered_project = dict(project_guidance_manifest)
+            tampered_project["files"] = [
+                *tampered_project["files"],
+                ".agents/skills/unowned/SKILL.md",
+            ]
+            tampered_project["digest"] = manifest_digest(tampered_project)
+            tampered_project_encoded = base64.b64encode(
+                json.dumps(
+                    tampered_project,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).decode("ascii")
+            rejected_project = subprocess.run(
+                [sys.executable, "-I", "-", tampered_project_encoded, str(output), "project-guidance-runtime-sensitive"],
+                input=blocks[2],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=False,
+                env=project_environment,
+            )
+            self.assertNotEqual(rejected_project.returncode, 0)
 
             docs_manifest = classify(
                 ["platform/docs/operations-runbook.md"],

@@ -168,7 +168,7 @@ jobs:
             --header 'X-GitHub-Api-Version: 2022-11-28' "$GITHUB_API_URL/repos/$REPOSITORY/actions/artifacts/$ROUTE_ARTIFACT_ID/zip" \
             --output "$route_archive"
           test "$(sha256sum "$route_archive" | awk '{print $1}')" = "$ROUTE_ARTIFACT_SHA256"
-          route_manifest="$(env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 -I -B trusted-source/platform/tools/platform_production_classifier_artifact.py manifest "$route_archive" --target-sha "$SOURCE_SHA" --allow-docs-only --allow-out-of-scope --allow-candidate-packaging --emit-manifest-base64)"
+          route_manifest="$(env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 -I -B trusted-source/platform/tools/platform_production_classifier_artifact.py manifest "$route_archive" --target-sha "$SOURCE_SHA" --allow-docs-only --allow-out-of-scope --allow-candidate-packaging --allow-project-guidance --emit-manifest-base64)"
           /usr/bin/python3 -I -B - "$route_manifest" "$GITHUB_OUTPUT" "$SOURCE_SHA" <<'PY'
           import base64
           import hashlib
@@ -249,18 +249,55 @@ jobs:
               and files == sorted(set(files))
               and manifest.get("target_sha") == sys.argv[3]
           )
+          project_guidance_only = False
+          project_guidance_reason = "project guidance change requires full verification and is non-deployable"
+          project_guidance_runtime_only = False
+          project_guidance_runtime_reason = "runtime-sensitive project guidance change requires full verification and is non-deployable"
+          if manifest.get("reason") in {project_guidance_reason, project_guidance_runtime_reason}:
+              sys.path.insert(0, str(Path("trusted-source/platform/tools").resolve()))
+              from platform_ci_classifier import _is_project_guidance_only, _is_project_guidance_runtime_only
+              project_guidance_only = (
+                  manifest.get("reason") == project_guidance_reason
+                  and manifest.get("class") == "full"
+                  and manifest.get("expected_gates") == ["backend", "python-quality", "security", "migration", "docs", "web-quality", "web-hermetic", "verification-contract"]
+                  and manifest.get("runtime_sensitive") is False
+                  and manifest.get("deployable") is False
+                  and manifest.get("fallback") is False
+                  and isinstance(files, list)
+                  and files == sorted(set(files))
+                  and _is_project_guidance_only(files)
+                  and manifest.get("target_sha") == sys.argv[3]
+              )
+              project_guidance_runtime_only = (
+                  manifest.get("reason") == project_guidance_runtime_reason
+                  and manifest.get("class") == "full"
+                  and manifest.get("expected_gates") == ["backend", "python-quality", "security", "migration", "docs", "web-quality", "web-hermetic", "verification-contract"]
+                  and manifest.get("runtime_sensitive") is True
+                  and manifest.get("deployable") is False
+                  and manifest.get("fallback") is False
+                  and isinstance(files, list)
+                  and files == sorted(set(files))
+                  and _is_project_guidance_runtime_only(files)
+                  and manifest.get("target_sha") == sys.argv[3]
+              )
           if manifest.get("class") == "docs-only" and not docs_only:
               raise SystemExit("docs-only classifier proof is inconsistent")
           if manifest.get("class") == "out-of-scope" and not out_of_scope_only:
               raise SystemExit("out-of-scope classifier proof is inconsistent")
           if manifest.get("reason") == "trusted candidate-packaging change requires full verification and is non-deployable" and not candidate_packaging_only:
               raise SystemExit("candidate-packaging classifier proof is inconsistent")
-          route_skip = storage_only or docs_only or out_of_scope_only or candidate_packaging_only
+          if manifest.get("reason") == project_guidance_reason and not project_guidance_only:
+              raise SystemExit("project-guidance classifier proof is inconsistent")
+          if manifest.get("reason") == project_guidance_runtime_reason and not project_guidance_runtime_only:
+              raise SystemExit("runtime-sensitive project-guidance classifier proof is inconsistent")
+          route_skip = storage_only or docs_only or out_of_scope_only or candidate_packaging_only or project_guidance_only or project_guidance_runtime_only
           route_family = (
               "storage-operations" if storage_only
               else "docs-only" if docs_only
               else "out-of-scope" if out_of_scope_only
               else "candidate-packaging" if candidate_packaging_only
+              else "project-guidance" if project_guidance_only
+              else "project-guidance-runtime-sensitive" if project_guidance_runtime_only
               else ""
           )
           digest = manifest.get("digest")
@@ -327,7 +364,7 @@ jobs:
               "classifier_digest": os.environ["CLASSIFIER_DIGEST"],
               "route_files_sha256": os.environ["ROUTE_FILES_SHA256"],
           }
-          if fields["route_family"] not in {"storage-operations", "docs-only", "out-of-scope", "candidate-packaging"}:
+          if fields["route_family"] not in {"storage-operations", "docs-only", "out-of-scope", "candidate-packaging", "project-guidance", "project-guidance-runtime-sensitive"}:
               raise SystemExit("skip receipt route family is invalid")
           for key in ("source_sha",):
               if re.fullmatch(r"[0-9a-f]{40}", fields[key]) is None:

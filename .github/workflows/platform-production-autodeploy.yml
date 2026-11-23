@@ -286,6 +286,7 @@ jobs:
             --allow-docs-only \
             --allow-candidate-packaging \
             --allow-out-of-scope \
+            --allow-project-guidance \
             --emit-manifest-base64)"
           (( ${#manifest_b64} > 0 && ${#manifest_b64} <= 350000 ))
           [[ "$manifest_b64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]
@@ -298,9 +299,13 @@ jobs:
           sys.path.insert(0, "platform/tools")
           from platform_ci_classifier import (
               CANDIDATE_PACKAGING_REASON,
+              PROJECT_GUIDANCE_REASON,
+              PROJECT_GUIDANCE_RUNTIME_REASON,
               RECOVERY_BOOTSTRAP_REASON,
               STORAGE_OPERATIONS_REASON,
               _is_candidate_packaging_only,
+              _is_project_guidance_only,
+              _is_project_guidance_runtime_only,
               _is_recovery_bootstrap_only,
               _is_storage_operations_only,
           )
@@ -324,10 +329,17 @@ jobs:
           storage_operations_only = (
               reason == STORAGE_OPERATIONS_REASON and _is_storage_operations_only(files)
           )
+          project_guidance_only = (
+              reason == PROJECT_GUIDANCE_REASON and _is_project_guidance_only(files)
+          )
+          project_guidance_runtime_only = (
+              reason == PROJECT_GUIDANCE_RUNTIME_REASON
+              and _is_project_guidance_runtime_only(files)
+          )
           docs_only = route_class == "docs-only"
           out_of_scope_only = route_class == "out-of-scope"
           if route_class == "full" and manifest["deployable"] is False and not (
-              recovery_bootstrap_only or candidate_packaging_only or storage_operations_only
+              recovery_bootstrap_only or candidate_packaging_only or storage_operations_only or project_guidance_only or project_guidance_runtime_only
           ):
               raise SystemExit("full non-deployable classifier route is not recognized")
           if route_class == "docs-only" and (
@@ -342,6 +354,10 @@ jobs:
               or manifest["fallback"] is not False
           ):
               raise SystemExit("out-of-scope classifier route fields are inconsistent")
+          if reason == PROJECT_GUIDANCE_REASON and not project_guidance_only:
+              raise SystemExit("project-guidance classifier route is inconsistent")
+          if reason == PROJECT_GUIDANCE_RUNTIME_REASON and not project_guidance_runtime_only:
+              raise SystemExit("runtime-sensitive project-guidance classifier route is inconsistent")
           with Path(output_path).open("a", encoding="utf-8") as output:
               output.write(f"route_class={route_class}\n")
               output.write(f"route_deployable={'true' if manifest['deployable'] else 'false'}\n")
@@ -349,6 +365,8 @@ jobs:
               output.write(f"route_candidate_packaging_only={'true' if candidate_packaging_only else 'false'}\n")
               output.write(f"route_docs_only={'true' if docs_only else 'false'}\n")
               output.write(f"route_storage_operations_only={'true' if storage_operations_only else 'false'}\n")
+              output.write(f"route_project_guidance_only={'true' if project_guidance_only else 'false'}\n")
+              output.write(f"route_project_guidance_runtime_only={'true' if project_guidance_runtime_only else 'false'}\n")
               output.write(f"route_out_of_scope_only={'true' if out_of_scope_only else 'false'}\n")
               output.write(f"route_fallback={'true' if manifest['fallback'] else 'false'}\n")
               output.write(f"route_digest={manifest['digest']}\n")
@@ -366,6 +384,8 @@ jobs:
           ROUTE_CANDIDATE_PACKAGING_ONLY: ${{ steps.route.outputs.route_candidate_packaging_only }}
           ROUTE_DOCS_ONLY: ${{ steps.route.outputs.route_docs_only }}
           ROUTE_STORAGE_OPERATIONS_ONLY: ${{ steps.route.outputs.route_storage_operations_only }}
+          ROUTE_PROJECT_GUIDANCE_ONLY: ${{ steps.route.outputs.route_project_guidance_only }}
+          ROUTE_PROJECT_GUIDANCE_RUNTIME_ONLY: ${{ steps.route.outputs.route_project_guidance_runtime_only }}
           ROUTE_OUT_OF_SCOPE_ONLY: ${{ steps.route.outputs.route_out_of_scope_only }}
           ROUTE_FALLBACK: ${{ steps.route.outputs.route_fallback }}
         run: |
@@ -408,6 +428,16 @@ jobs:
               exit 1
             }
             echo "Out-of-scope route validated; no application deployment or baseline reconciliation required."
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$ROUTE_PROJECT_GUIDANCE_ONLY" == "true" || "$ROUTE_PROJECT_GUIDANCE_RUNTIME_ONLY" == "true" ]]; then
+            [[ "$ROUTE_CLASS" == "full" && "$ROUTE_DEPLOYABLE" == "false" && "$ROUTE_FALLBACK" == "false" ]] || {
+              echo "Refusing inconsistent project-guidance route fields." >&2
+              exit 1
+            }
+            echo "Project-guidance route validated; full verification passed and no application deployment is required."
             echo "deploy=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi

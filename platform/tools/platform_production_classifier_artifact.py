@@ -32,8 +32,12 @@ if __package__:
         DOCS_ONLY_GATE_IDS,
         DOCS_ONLY_REASON,
         OUT_OF_SCOPE_GATE_IDS,
+        PROJECT_GUIDANCE_REASON,
+        PROJECT_GUIDANCE_RUNTIME_REASON,
         STORAGE_OPERATIONS_REASON,
         _is_out_of_scope,
+        _is_project_guidance_only,
+        _is_project_guidance_runtime_only,
         _is_storage_operations_only,
         route_files_without_root_guide,
     )
@@ -58,8 +62,12 @@ else:  # Executed as a script under Python isolated mode on a runner.
     DOCS_ONLY_GATE_IDS = _CI_CLASSIFIER_MODULE.DOCS_ONLY_GATE_IDS
     DOCS_ONLY_REASON = _CI_CLASSIFIER_MODULE.DOCS_ONLY_REASON
     OUT_OF_SCOPE_GATE_IDS = _CI_CLASSIFIER_MODULE.OUT_OF_SCOPE_GATE_IDS
+    PROJECT_GUIDANCE_REASON = _CI_CLASSIFIER_MODULE.PROJECT_GUIDANCE_REASON
+    PROJECT_GUIDANCE_RUNTIME_REASON = _CI_CLASSIFIER_MODULE.PROJECT_GUIDANCE_RUNTIME_REASON
     STORAGE_OPERATIONS_REASON = _CI_CLASSIFIER_MODULE.STORAGE_OPERATIONS_REASON
     _is_out_of_scope = _CI_CLASSIFIER_MODULE._is_out_of_scope
+    _is_project_guidance_only = _CI_CLASSIFIER_MODULE._is_project_guidance_only
+    _is_project_guidance_runtime_only = _CI_CLASSIFIER_MODULE._is_project_guidance_runtime_only
     _is_storage_operations_only = _CI_CLASSIFIER_MODULE._is_storage_operations_only
     route_files_without_root_guide = _CI_CLASSIFIER_MODULE.route_files_without_root_guide
 
@@ -538,6 +546,8 @@ def validate_manifest(
     allow_out_of_scope: bool = False,
     require_out_of_scope: bool = False,
     require_candidate_packaging: bool = False,
+    allow_project_guidance: bool = False,
+    require_project_guidance: bool = False,
 ) -> dict[str, Any]:
     if SHA_RE.fullmatch(target_sha) is None:
         raise _fail("provenance")
@@ -585,6 +595,9 @@ def validate_manifest(
     recovery_bootstrap_only = _is_recovery_bootstrap_only(files)
     candidate_packaging_only = _is_candidate_packaging_only(files)
     storage_operations_only = _is_storage_operations_only(files)
+    project_guidance_only = _is_project_guidance_only(files)
+    project_guidance_runtime_only = _is_project_guidance_runtime_only(files)
+    project_guidance_route = project_guidance_only or project_guidance_runtime_only
     docs_only = manifest.get("class") == "docs-only"
     out_of_scope_only = manifest.get("class") == "out-of-scope"
     if (
@@ -594,9 +607,15 @@ def validate_manifest(
         or type(allow_out_of_scope) is not bool
         or type(require_out_of_scope) is not bool
         or type(require_candidate_packaging) is not bool
+        or type(allow_project_guidance) is not bool
+        or type(require_project_guidance) is not bool
     ):
         raise _fail("manifest")
     if type(require_recovery_bootstrap) is not bool:
+        raise _fail("manifest")
+    if require_project_guidance and not project_guidance_route:
+        raise _fail("manifest")
+    if project_guidance_route and not (allow_project_guidance or require_project_guidance):
         raise _fail("manifest")
     if type(require_reconcile_source) is not bool or (
         require_recovery_bootstrap and require_reconcile_source
@@ -733,9 +752,33 @@ def validate_manifest(
             or manifest.get("reason") != STORAGE_OPERATIONS_REASON
         ):
             raise _fail("manifest")
+    elif project_guidance_only:
+        if (
+            manifest.get("event") != "push"
+            or manifest["deployable"] is not False
+            or manifest["runtime_sensitive"] is not False
+            or manifest.get("reason") != PROJECT_GUIDANCE_REASON
+            or manifest.get("fallback") is not False
+            or files != sorted(set(files))
+        ):
+            raise _fail("manifest")
+    elif project_guidance_runtime_only:
+        if (
+            manifest.get("event") != "push"
+            or manifest["deployable"] is not False
+            or manifest["runtime_sensitive"] is not True
+            or manifest.get("reason") != PROJECT_GUIDANCE_RUNTIME_REASON
+            or manifest.get("fallback") is not False
+            or files != sorted(set(files))
+        ):
+            raise _fail("manifest")
     elif manifest["deployable"] is not True:
         raise _fail("manifest")
     if manifest.get("reason") == STORAGE_OPERATIONS_REASON and not storage_operations_only:
+        raise _fail("manifest")
+    if manifest.get("reason") == PROJECT_GUIDANCE_REASON and not project_guidance_only:
+        raise _fail("manifest")
+    if manifest.get("reason") == PROJECT_GUIDANCE_RUNTIME_REASON and not project_guidance_runtime_only:
         raise _fail("manifest")
     if require_reconcile_source and not (recovery_bootstrap_only or candidate_packaging_only):
         raise _fail("manifest")
@@ -774,6 +817,9 @@ def _build_parser() -> argparse.ArgumentParser:
     docs_mode.add_argument("--require-docs-only", action="store_true")
     manifest.add_argument("--allow-candidate-packaging", action="store_true")
     manifest.add_argument("--require-candidate-packaging", action="store_true")
+    project_guidance_mode = manifest.add_mutually_exclusive_group()
+    project_guidance_mode.add_argument("--allow-project-guidance", action="store_true")
+    project_guidance_mode.add_argument("--require-project-guidance", action="store_true")
     out_of_scope_mode = manifest.add_mutually_exclusive_group()
     out_of_scope_mode.add_argument("--allow-out-of-scope", action="store_true")
     out_of_scope_mode.add_argument("--require-out-of-scope", action="store_true")
@@ -820,6 +866,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 allow_out_of_scope=arguments.allow_out_of_scope,
                 require_out_of_scope=arguments.require_out_of_scope,
                 require_candidate_packaging=arguments.require_candidate_packaging,
+                allow_project_guidance=arguments.allow_project_guidance,
+                require_project_guidance=arguments.require_project_guidance,
             )
             if arguments.emit_manifest_base64:
                 encoded = base64.b64encode(

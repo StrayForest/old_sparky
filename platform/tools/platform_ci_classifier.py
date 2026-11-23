@@ -2,9 +2,11 @@
 """Classify a repository change for the deterministic platform CI router.
 
 The classifier is deliberately conservative.  Only a complete, explicit list
-of files under ``platform/docs`` is allowed to use the docs-only route.  Any
-missing repository state, unknown event/path, malformed input or merge queue
-event falls back to the full deterministic suite and is never deployable.
+of files under ``platform/docs`` is allowed to use the docs-only route. A
+separate closed project-guidance route receives full deterministic verification
+without production authority. Any missing repository state, unknown event/path,
+malformed input or merge queue event falls back to the full suite and is never
+deployable.
 
 The JSON manifest is an artifact contract between the security workflow and
 the production workflows.  Its digest covers every decision-bearing field so
@@ -145,11 +147,42 @@ OUT_OF_SCOPE_PREFIXES = (
 )
 FULL_PREFIXES = (".github/", "platform/")
 DOCS_PREFIX = "platform/docs/"
-FULL_ROUTE_SKILL_COMPANION_FILES = frozenset(
+PROJECT_GUIDANCE_FILES = frozenset(
     {
+        "AGENTS.md",
+        "platform/AGENTS.md",
+        "platform/apps/platform_draft/AGENTS.md",
+        "platform/apps/platform_web/AGENTS.md",
         ".agents/skills/code-cleanup-after-changes/SKILL.md",
+        ".agents/skills/code-cleanup-after-changes/agents/openai.yaml",
+        ".agents/skills/deadlock-backend-production/SKILL.md",
+        ".agents/skills/deadlock-workflow-guardrails/SKILL.md",
+        ".agents/skills/deadlock-workflow-guardrails/references/invariants.md",
+        ".agents/skills/frontend-ux-polish/SKILL.md",
+        ".agents/skills/openai-knowledge/SKILL.md",
         ".agents/skills/platform-code-change-verification/SKILL.md",
+        ".agents/skills/platform-documentation-maintenance/SKILL.md",
+        ".agents/skills/platform-documentation-maintenance/agents/openai.yaml",
+        ".agents/skills/platform-implementation-strategy/SKILL.md",
+        ".agents/skills/platform-launch-qa/SKILL.md",
+        ".agents/skills/platform-launch-qa/references/checklist.md",
+        ".agents/skills/platform-performance-monitoring/SKILL.md",
+        ".agents/skills/platform-performance-monitoring/agents/openai.yaml",
+        ".agents/skills/platform-storage-retention/agents/openai.yaml",
+        ".agents/skills/release-handoff-summary/SKILL.md",
+        ".agents/skills/release-handoff-summary/references/template.md",
+        "platform/performance/README.md",
+        "platform/performance/proposed-authenticated-html-ttfb-root-render-flush-2026-09-09.md",
     }
+)
+PROJECT_GUIDANCE_REASON = (
+    "project guidance change requires full verification and is non-deployable"
+)
+PROJECT_GUIDANCE_RUNTIME_REASON = (
+    "runtime-sensitive project guidance change requires full verification and is non-deployable"
+)
+PROJECT_GUIDANCE_RUNTIME_FILES = frozenset(
+    {".agents/skills/platform-storage-retention/SKILL.md"}
 )
 
 # Trusted build-only companion packages receive the complete deterministic CI
@@ -445,20 +478,17 @@ def route_files_without_root_guide(files: Sequence[str]) -> list[str]:
     return list(files)
 
 
-def route_files_with_app_skill_companions(files: Sequence[str]) -> list[str]:
-    """Ignore the two reviewed skill companions only beside an app source route."""
+def route_files_with_project_guidance_companions(files: Sequence[str]) -> list[str]:
+    """Remove only exact project guidance files beside a recognized full route."""
 
     route_files = route_files_without_root_guide(files)
-    companions = [
-        path for path in route_files if path in FULL_ROUTE_SKILL_COMPANION_FILES
-    ]
+    guidance_files = PROJECT_GUIDANCE_FILES | PROJECT_GUIDANCE_RUNTIME_FILES
+    companions = [path for path in route_files if path in guidance_files]
     if not companions:
         return route_files
 
-    remaining = [
-        path for path in route_files if path not in FULL_ROUTE_SKILL_COMPANION_FILES
-    ]
-    if not any(path.startswith("platform/apps/") for path in remaining):
+    remaining = [path for path in route_files if path not in guidance_files]
+    if not remaining:
         return route_files
 
     route_class, _, _, fallback = _route_for_files(remaining)
@@ -506,9 +536,58 @@ def _is_storage_operations_only(files: Sequence[str]) -> bool:
     )
 
 
+def _is_project_guidance_only(files: Sequence[str]) -> bool:
+    """Return whether files are from the closed project guidance set plus docs."""
+
+    files = route_files_without_root_guide(files)
+    return bool(
+        any(path in PROJECT_GUIDANCE_FILES for path in files)
+        and not any(path in PROJECT_GUIDANCE_RUNTIME_FILES for path in files)
+        and not (
+            _is_recovery_bootstrap_only(files)
+            or _is_candidate_packaging_only(files)
+            or _is_storage_operations_only(files)
+        )
+        and all(
+            path in PROJECT_GUIDANCE_FILES or path.startswith(DOCS_PREFIX)
+            for path in files
+        )
+    )
+
+
+def _is_project_guidance_runtime_only(files: Sequence[str]) -> bool:
+    """Return whether runtime-sensitive project guidance and docs form an exact route."""
+
+    files = route_files_without_root_guide(files)
+    allowed = PROJECT_GUIDANCE_FILES | PROJECT_GUIDANCE_RUNTIME_FILES
+    return bool(
+        any(path in PROJECT_GUIDANCE_RUNTIME_FILES for path in files)
+        and all(path in allowed or path.startswith(DOCS_PREFIX) for path in files)
+        and not (
+            _is_recovery_bootstrap_only(files)
+            or _is_candidate_packaging_only(files)
+            or _is_storage_operations_only(files)
+        )
+    )
+
+
+def _is_project_guidance_route(files: Sequence[str]) -> bool:
+    return _is_project_guidance_only(files) or _is_project_guidance_runtime_only(files)
+
+
 def _route_for_files(files: Sequence[str]) -> tuple[str, tuple[str, ...], str, bool]:
     """Return class, gates, reason and whether the path set is a fallback."""
 
+    if any(
+        path.startswith("platform/performance/") and path not in PROJECT_GUIDANCE_FILES
+        for path in files
+    ):
+        return (
+            "full",
+            FULL_GATE_IDS,
+            "unknown performance evidence path requires fail-closed full verification",
+            True,
+        )
     if _is_recovery_bootstrap_only(files):
         return (
             "full",
@@ -521,6 +600,20 @@ def _route_for_files(files: Sequence[str]) -> tuple[str, tuple[str, ...], str, b
             "docs-only",
             DOCS_ONLY_GATE_IDS,
             DOCS_ONLY_REASON,
+            False,
+        )
+    if _is_project_guidance_only(files):
+        return (
+            "full",
+            FULL_GATE_IDS,
+            PROJECT_GUIDANCE_REASON,
+            False,
+        )
+    if _is_project_guidance_runtime_only(files):
+        return (
+            "full",
+            FULL_GATE_IDS,
+            PROJECT_GUIDANCE_RUNTIME_REASON,
             False,
         )
     if all(_is_out_of_scope(path) for path in files):
@@ -696,17 +789,30 @@ def classify(
             runtime_sensitive=runtime_sensitive,
         )
 
-    # The root agent guide is a non-artifact companion. Classify the remaining
-    # paths first so it cannot turn an otherwise recognized recovery,
-    # candidate-packaging, storage or docs route into an ordinary deployable
-    # full route. Unknown paths in the remaining set still take the usual
-    # fail-closed fallback.
-    route_files = route_files_with_app_skill_companions(normalised)
-    route_class, expected_gates, reason, fallback = _route_for_files(route_files)
+    # Exact project-owned guidance files are ignored only beside another known
+    # full route. Guidance-only plus platform docs has its own non-deployable
+    # route; any unknown path remains on the fail-closed fallback.
+    project_guidance_only = _is_project_guidance_only(normalised)
+    project_guidance_runtime_only = _is_project_guidance_runtime_only(normalised)
+    if project_guidance_only or project_guidance_runtime_only:
+        route_files = normalised
+        route_class = "full"
+        expected_gates = FULL_GATE_IDS
+        reason = (
+            PROJECT_GUIDANCE_RUNTIME_REASON
+            if project_guidance_runtime_only
+            else PROJECT_GUIDANCE_REASON
+        )
+        fallback = False
+    else:
+        route_files = route_files_with_project_guidance_companions(normalised)
+        route_class, expected_gates, reason, fallback = _route_for_files(route_files)
     runtime_sensitive = runtime_sensitive or fallback
     candidate_packaging_only = _is_candidate_packaging_only(route_files)
     recovery_bootstrap_only = _is_recovery_bootstrap_only(route_files)
     storage_operations_only = _is_storage_operations_only(route_files)
+    project_guidance_only = _is_project_guidance_only(route_files)
+    project_guidance_runtime_only = _is_project_guidance_runtime_only(route_files)
     if storage_operations_only:
         route_class = "full"
         expected_gates = FULL_GATE_IDS
@@ -717,6 +823,10 @@ def classify(
         reason = CANDIDATE_PACKAGING_REASON
     elif storage_operations_only:
         reason = STORAGE_OPERATIONS_REASON
+    elif project_guidance_only:
+        reason = PROJECT_GUIDANCE_REASON
+    elif project_guidance_runtime_only:
+        reason = PROJECT_GUIDANCE_RUNTIME_REASON
     if (
         event == "pull_request"
         and same_repository_dev_pr
@@ -725,6 +835,7 @@ def classify(
         and not candidate_packaging_only
         and not recovery_bootstrap_only
         and not storage_operations_only
+        and not project_guidance_only
         and normalised
         and all(path.startswith(WEB_PR_PREFIX) for path in normalised)
     ):
@@ -745,6 +856,8 @@ def classify(
             candidate_packaging_only
             or recovery_bootstrap_only
             or storage_operations_only
+            or project_guidance_only
+            or project_guidance_runtime_only
         ),
     )
 
@@ -829,6 +942,8 @@ def validate_manifest(
         raise ClassifierError("web-only PR route does not match its exact file family")
     recovery_bootstrap_only = _is_recovery_bootstrap_only(files)
     storage_operations_only = _is_storage_operations_only(files)
+    project_guidance_only = _is_project_guidance_only(files)
+    project_guidance_runtime_only = _is_project_guidance_runtime_only(files)
     expected_runtime_sensitive = (
         manifest["fallback"]
         or event not in {"pull_request", "push"}
@@ -853,6 +968,8 @@ def validate_manifest(
             _is_candidate_packaging_only(files)
             or recovery_bootstrap_only
             or storage_operations_only
+            or project_guidance_only
+            or project_guidance_runtime_only
         )
         and manifest["deployable"]
     ):
@@ -861,6 +978,23 @@ def validate_manifest(
         raise ClassifierError("storage-operations route reason is inconsistent")
     if manifest.get("reason") == STORAGE_OPERATIONS_REASON and not storage_operations_only:
         raise ClassifierError("storage-operations route does not match its exact file family")
+    if project_guidance_only and (
+        manifest.get("reason") != PROJECT_GUIDANCE_REASON
+        or manifest["deployable"]
+        or manifest["fallback"]
+    ):
+        raise ClassifierError("project-guidance route fields are inconsistent")
+    if manifest.get("reason") == PROJECT_GUIDANCE_REASON and not project_guidance_only:
+        raise ClassifierError("project-guidance route does not match its exact file family")
+    if project_guidance_runtime_only and (
+        manifest.get("reason") != PROJECT_GUIDANCE_RUNTIME_REASON
+        or manifest["deployable"]
+        or manifest["fallback"]
+        or not runtime_sensitive
+    ):
+        raise ClassifierError("runtime-sensitive project-guidance route fields are inconsistent")
+    if manifest.get("reason") == PROJECT_GUIDANCE_RUNTIME_REASON and not project_guidance_runtime_only:
+        raise ClassifierError("runtime-sensitive project-guidance route does not match its exact file family")
     if expected_target_sha is not None and target_sha != expected_target_sha:
         raise ClassifierError("classifier target_sha does not match the release SHA")
     if require_deployable:

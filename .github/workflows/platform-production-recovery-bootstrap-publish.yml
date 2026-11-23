@@ -121,7 +121,7 @@ jobs:
               or not 0 <= artifacts["total_count"] <= 100 or artifacts["total_count"] != len(rows)):
               raise SystemExit("producer artifact inventory is incomplete")
           receipt_prefix = "platform-recovery-bootstrap-skip-"
-          receipt_pattern = re.compile(r"^platform-recovery-bootstrap-skip-(docs-only|storage-operations|out-of-scope|candidate-packaging)-([0-9a-f]{40})-([1-9][0-9]{0,31})-([1-9][0-9]{0,31})-([1-9][0-9]{0,31})-([1-9][0-9]{0,31})\.json$")
+          receipt_pattern = re.compile(r"^platform-recovery-bootstrap-skip-(docs-only|storage-operations|out-of-scope|candidate-packaging|project-guidance|project-guidance-runtime-sensitive)-([0-9a-f]{40})-([1-9][0-9]{0,31})-([1-9][0-9]{0,31})-([1-9][0-9]{0,31})-([1-9][0-9]{0,31})\.json$")
           receipt_rows = []
           for row in rows:
               if not isinstance(row, dict) or not isinstance(row.get("name"), str) or not row["name"].startswith(receipt_prefix):
@@ -138,7 +138,7 @@ jobs:
               if len(receipt_rows) != 1 or bundles:
                   raise SystemExit("route skip receipt inventory is ambiguous")
               row = receipt_rows[0]
-              pattern = re.compile(rf"^platform-recovery-bootstrap-skip-(docs-only|storage-operations|out-of-scope|candidate-packaging)-([0-9a-f]{{40}})-([1-9][0-9]{{0,31}})-([1-9][0-9]{{0,31}})-{producer_id}-{producer_attempt}\.json$")
+              pattern = re.compile(rf"^platform-recovery-bootstrap-skip-(docs-only|storage-operations|out-of-scope|candidate-packaging|project-guidance|project-guidance-runtime-sensitive)-([0-9a-f]{{40}})-([1-9][0-9]{{0,31}})-([1-9][0-9]{{0,31}})-{producer_id}-{producer_attempt}\.json$")
               match = pattern.fullmatch(row.get("name", ""))
               workflow_run = row.get("workflow_run")
               digest = row.get("digest")
@@ -230,7 +230,7 @@ jobs:
           if not isinstance(receipt, dict) or set(receipt) != expected:
               raise SystemExit("route skip receipt schema is invalid")
           if (receipt["schema"] != 2 or receipt["kind"] != "platform-recovery-bootstrap-skip" or receipt["route_family"] != route_family
-              or route_family not in {"docs-only", "storage-operations", "out-of-scope", "candidate-packaging"}
+              or route_family not in {"docs-only", "storage-operations", "out-of-scope", "candidate-packaging", "project-guidance", "project-guidance-runtime-sensitive"}
               or receipt["producer_run_id"] != producer_id or receipt["producer_run_attempt"] != attempt):
               raise SystemExit("route skip receipt identity is invalid")
           if re.fullmatch(r"[0-9a-f]{40}", str(receipt.get("source_sha", ""))) is None:
@@ -312,6 +312,10 @@ jobs:
             route_validation_args+=(--require-out-of-scope)
           elif [[ "$ROUTE_FAMILY" == "candidate-packaging" ]]; then
             route_validation_args+=(--require-candidate-packaging)
+          elif [[ "$ROUTE_FAMILY" == "project-guidance" ]]; then
+            route_validation_args+=(--require-project-guidance)
+          elif [[ "$ROUTE_FAMILY" == "project-guidance-runtime-sensitive" ]]; then
+            route_validation_args+=(--require-project-guidance --require-runtime-sensitive)
           fi
           route_manifest="$(env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 -I -B trusted-source/platform/tools/platform_production_classifier_artifact.py manifest "$artifact_dir/security-route.zip" --target-sha "$SOURCE_SHA" "${route_validation_args[@]}" --emit-manifest-base64)"
           /usr/bin/python3 -I -B - "$route_manifest" "$GITHUB_OUTPUT" "$ROUTE_FAMILY" <<'PY'
@@ -335,6 +339,14 @@ jobs:
           elif route_family == "candidate-packaging":
               candidate_files = {".github/workflows/platform-host-tools-candidate.yml", ".github/workflows/platform-codex-archive-retention-build.yml", ".github/workflows/platform-production-autodeploy.yml", ".github/workflows/platform-security.yml", "platform/tests/test_platform_ci_classifier.py", "platform/tools/platform_host_tools_candidate.py", "platform/tools/platform_ci_classifier.py", "platform/tests/test_platform_host_tools_bundle.py", "platform/tools/platform_test_catalog.py", "platform/tools/platform_verify_contract.py", "platform/tools/codex_archive_retention/__init__.py", "platform/tools/codex_archive_retention/cleanup.py", "platform/tools/codex_archive_retention/capture_pr_association.py", "platform/tools/codex_archive_retention/verify_artifact.py", "platform/tools/codex_archive_retention/codex-source.lock.json", "platform/tools/codex_archive_retention/codex-archive-retention.service", "platform/tools/codex_archive_retention/codex-archive-retention.timer", "platform/tools/codex_archive_retention/patches/codex-0.166.0.patch", "platform/tests/test_platform_codex_archive_retention.py"}
               exact = (manifest.get("reason") == "trusted candidate-packaging change requires full verification and is non-deployable" and manifest.get("class") == "full" and manifest.get("expected_gates") == ["backend", "python-quality", "security", "migration", "docs", "web-quality", "web-hermetic", "verification-contract"] and manifest.get("runtime_sensitive") is False and manifest.get("deployable") is False and manifest.get("fallback") is False and isinstance(files, list) and files and files == sorted(set(files)) and any(path in candidate_files for path in files) and all(path in candidate_files or path.startswith("platform/docs/") for path in files))
+          elif route_family == "project-guidance":
+              sys.path.insert(0, str(Path("trusted-source/platform/tools").resolve()))
+              from platform_ci_classifier import PROJECT_GUIDANCE_REASON, _is_project_guidance_only
+              exact = (manifest.get("reason") == PROJECT_GUIDANCE_REASON and manifest.get("class") == "full" and manifest.get("expected_gates") == ["backend", "python-quality", "security", "migration", "docs", "web-quality", "web-hermetic", "verification-contract"] and manifest.get("runtime_sensitive") is False and manifest.get("deployable") is False and manifest.get("fallback") is False and isinstance(files, list) and files and files == sorted(set(files)) and _is_project_guidance_only(files))
+          elif route_family == "project-guidance-runtime-sensitive":
+              sys.path.insert(0, str(Path("trusted-source/platform/tools").resolve()))
+              from platform_ci_classifier import PROJECT_GUIDANCE_RUNTIME_REASON, _is_project_guidance_runtime_only
+              exact = (manifest.get("reason") == PROJECT_GUIDANCE_RUNTIME_REASON and manifest.get("class") == "full" and manifest.get("expected_gates") == ["backend", "python-quality", "security", "migration", "docs", "web-quality", "web-hermetic", "verification-contract"] and manifest.get("runtime_sensitive") is True and manifest.get("deployable") is False and manifest.get("fallback") is False and isinstance(files, list) and files and files == sorted(set(files)) and _is_project_guidance_runtime_only(files))
           else:
               exact = False
           exact = (exact and manifest.get("target_sha") == os.environ["SOURCE_SHA"] and manifest.get("digest") == os.environ["CLASSIFIER_DIGEST"] and hashlib.sha256(json.dumps(sorted(files), separators=(",", ":")).encode("utf-8")).hexdigest() == os.environ["ROUTE_FILES_SHA256"])

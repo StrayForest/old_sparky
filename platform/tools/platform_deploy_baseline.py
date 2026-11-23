@@ -23,6 +23,8 @@ from tools.platform_ci_classifier import (
     DOCS_ONLY_REASON,
     DOCS_PREFIX,
     FULL_GATE_IDS,
+    PROJECT_GUIDANCE_REASON,
+    PROJECT_GUIDANCE_RUNTIME_REASON,
     RECOVERY_BOOTSTRAP_FILES,
     RECOVERY_BOOTSTRAP_REASON,
     STORAGE_OPERATIONS_FILES,
@@ -30,6 +32,8 @@ from tools.platform_ci_classifier import (
     ClassifierError,
     classify,
     classify_cumulative_baseline_paths,
+    _is_project_guidance_only,
+    _is_project_guidance_runtime_only,
     route_files_without_root_guide,
     validate_manifest,
 )
@@ -392,7 +396,28 @@ def classify_cumulative_baseline(
         )
         and incremental_manifest.get("reason") == CANDIDATE_PACKAGING_REASON
     )
-    reconcile_family_count = sum((docs_only_source, recovery_bootstrap_only, candidate_packaging_only))
+    project_guidance_source = bool(
+        incremental_manifest.get("class") == "full"
+        and incremental_manifest.get("expected_gates") == list(FULL_GATE_IDS)
+        and incremental_manifest.get("fallback") is False
+        and incremental_manifest.get("runtime_sensitive") is False
+        and incremental_manifest.get("deployable") is False
+        and incremental_manifest.get("reason") == PROJECT_GUIDANCE_REASON
+        and _is_project_guidance_only(incremental_files)
+    )
+    project_guidance_runtime_source = bool(
+        incremental_manifest.get("class") == "full"
+        and incremental_manifest.get("expected_gates") == list(FULL_GATE_IDS)
+        and incremental_manifest.get("fallback") is False
+        and incremental_manifest.get("runtime_sensitive") is True
+        and incremental_manifest.get("deployable") is False
+        and incremental_manifest.get("reason") == PROJECT_GUIDANCE_RUNTIME_REASON
+        and _is_project_guidance_runtime_only(incremental_files)
+    )
+    reconcile_family_count = sum(
+        (docs_only_source, recovery_bootstrap_only, candidate_packaging_only,
+         project_guidance_source, project_guidance_runtime_source)
+    )
     if reconcile_family_count != 1:
         raise ProvenanceError("incremental manifest is not one exact reconcile source family")
     if docs_only_source:
@@ -410,6 +435,32 @@ def classify_cumulative_baseline(
             raise ProvenanceError("incremental docs-only manifest cannot be reclassified") from exc
         if canonical_incremental != dict(incremental_manifest):
             raise ProvenanceError("incremental docs-only manifest is not the canonical path classification")
+    if project_guidance_source:
+        try:
+            canonical_incremental = classify(
+                incremental_files,
+                event="push",
+                branch="dev",
+                target_sha=expected_target_sha,
+                repository_ready=True,
+            )
+        except ClassifierError as exc:
+            raise ProvenanceError("incremental project-guidance manifest cannot be reclassified") from exc
+        if canonical_incremental != dict(incremental_manifest):
+            raise ProvenanceError("incremental project-guidance manifest is not canonical")
+    if project_guidance_runtime_source:
+        try:
+            canonical_incremental = classify(
+                incremental_files,
+                event="push",
+                branch="dev",
+                target_sha=expected_target_sha,
+                repository_ready=True,
+            )
+        except ClassifierError as exc:
+            raise ProvenanceError("incremental runtime-sensitive project-guidance manifest cannot be reclassified") from exc
+        if canonical_incremental != dict(incremental_manifest):
+            raise ProvenanceError("incremental runtime-sensitive project-guidance manifest is not canonical")
     if candidate_packaging_only and incremental_manifest.get("runtime_sensitive") is not False:
         raise ProvenanceError("candidate-packaging reconcile source is runtime-sensitive")
     if (
@@ -455,6 +506,32 @@ def classify_cumulative_baseline(
             raise ProvenanceError(
                 "docs-only incremental source does not cover an exact cumulative docs-only route"
             )
+        return {"manifest": cumulative, "no_op": True}
+    project_guidance_no_op = bool(
+        project_guidance_source
+        and cumulative.get("class") == "full"
+        and cumulative.get("expected_gates") == list(FULL_GATE_IDS)
+        and cumulative.get("fallback") is False
+        and cumulative.get("runtime_sensitive") is False
+        and cumulative.get("deployable") is False
+        and cumulative.get("reason") == PROJECT_GUIDANCE_REASON
+        and isinstance(cumulative_files, list)
+        and _is_project_guidance_only(cumulative_route_files)
+    )
+    project_guidance_runtime_no_op = bool(
+        project_guidance_runtime_source
+        and cumulative.get("class") == "full"
+        and cumulative.get("expected_gates") == list(FULL_GATE_IDS)
+        and cumulative.get("fallback") is False
+        and cumulative.get("runtime_sensitive") is True
+        and cumulative.get("deployable") is False
+        and cumulative.get("reason") == PROJECT_GUIDANCE_RUNTIME_REASON
+        and isinstance(cumulative_files, list)
+        and _is_project_guidance_runtime_only(cumulative_route_files)
+    )
+    if project_guidance_no_op:
+        return {"manifest": cumulative, "no_op": True}
+    if project_guidance_runtime_no_op:
         return {"manifest": cumulative, "no_op": True}
     storage_recovery_no_op = bool(
         recovery_bootstrap_only
@@ -533,6 +610,25 @@ def validate_cumulative_reconcile_route(route: object) -> dict[str, bool]:
         and manifest.get("deployable") is False
         and manifest.get("reason") == DOCS_ONLY_REASON
     )
+    project_guidance_manifest = bool(
+        manifest.get("class") == "full"
+        and manifest.get("expected_gates") == list(FULL_GATE_IDS)
+        and manifest.get("fallback") is False
+        and manifest.get("deployable") is False
+        and isinstance(manifest.get("files"), list)
+        and (
+            (
+                manifest.get("runtime_sensitive") is False
+                and manifest.get("reason") == PROJECT_GUIDANCE_REASON
+                and _is_project_guidance_only(manifest["files"])
+            )
+            or (
+                manifest.get("runtime_sensitive") is True
+                and manifest.get("reason") == PROJECT_GUIDANCE_RUNTIME_REASON
+                and _is_project_guidance_runtime_only(manifest["files"])
+            )
+        )
+    )
     full_manifest = bool(
         manifest.get("class") == "full"
         and manifest.get("expected_gates") == list(FULL_GATE_IDS)
@@ -587,6 +683,18 @@ def validate_cumulative_reconcile_route(route: object) -> dict[str, bool]:
             and manifest["runtime_sensitive"] is False
             and manifest["deployable"] is False
         )
+        project_guidance_family = bool(
+            project_guidance_manifest
+            and (
+                _is_project_guidance_only(route_files)
+                or _is_project_guidance_runtime_only(route_files)
+            )
+        )
+        project_guidance_runtime_family = bool(
+            project_guidance_manifest
+            and manifest["runtime_sensitive"] is True
+            and _is_project_guidance_runtime_only(route_files)
+        )
         storage_recovery_family = bool(
             any(path in RECOVERY_BOOTSTRAP_FILES for path in route_files)
             and any(path in STORAGE_OPERATIONS_TRIGGER_FILES for path in route_files)
@@ -598,11 +706,11 @@ def validate_cumulative_reconcile_route(route: object) -> dict[str, bool]:
             )
             and manifest["runtime_sensitive"] is True
         )
-        if sum((docs_family, recovery_family, candidate_family, storage_recovery_family)) != 1:
+        if sum((docs_family, recovery_family, candidate_family, storage_recovery_family, project_guidance_family)) != 1:
             raise ProvenanceError("cumulative no-op route is outside the exact authorized file families")
-        return {"no_op": True, "runtime_required": False}
-    if docs_only_manifest:
-        raise ProvenanceError("docs-only cumulative route cannot authorize an application release")
+        return {"no_op": True, "runtime_required": project_guidance_runtime_family}
+    if docs_only_manifest or project_guidance_manifest:
+        raise ProvenanceError("non-deployable cumulative route cannot authorize an application release")
     if manifest["deployable"] is not True:
         raise ProvenanceError("cumulative non-no-op route is not deployable")
     files = manifest.get("files")
