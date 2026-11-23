@@ -396,29 +396,28 @@ test is explicit test debt with an owner, not a reason to weaken a gate.
 
 ### Web hermetic ownership
 
-The web package has three explicit deterministic owners. The
-`test:source-contract` runner owns source assertions only; its
-[`playwright.source-contract.config.ts`](../apps/platform_web/playwright.source-contract.config.ts)
-must not define `webServer` or boot an API/browser server. The
-[`platform_web_hermetic.sh`](../tools/platform_web_hermetic.sh)
-runner performs Playwright `--list` discovery, builds the standalone Next
-artifact once, then runs source-contract, required auth lifecycle E2E, smoke
-and participant suites from that build. Auth precedes smoke; smoke and
-participant are separate runs with fresh API/web processes and
-`reuseExistingServer: false`, so no ambient server/browser/database is reused; it then invokes the isolated `test:image-inventory:webkit` project with the same pinned browser root, no server/API/database/external image requests, and output under the run-private build directory removed on exit.
+The web package has three deterministic owners: source contracts, full hermetic suites and the isolated image-inventory
+WebKit fixture. `test:source-contract` owns source assertions; [`playwright.source-contract.config.ts`](../apps/platform_web/playwright.source-contract.config.ts)
+must not define `webServer`. [`platform_web_hermetic.sh`](../tools/platform_web_hermetic.sh) discovers and builds standalone
+Next once, then runs source-contract, auth lifecycle, smoke, participant, SSR diagnostics and image-inventory. Auth
+precedes smoke; smoke and participant use fresh API/web processes (`reuseExistingServer: false`). The image fixture
+uses no server/API/database/external images; its output and pinned browsers stay in the private build directory.
 
-The responsive smoke project owns `desktop`, `wide-1300`, `tablet-820` and
-`mobile-layout` viewports. Responsive specs run in that matrix; the explicit
-desktop-only list in the
-[`playwright.config.ts`](../apps/platform_web/playwright.config.ts)
-is owned only by the `desktop` project. The participant-progressive suite has
-its own sequential one-worker contour and explicit desktop/mobile projects in
-[`playwright.participant.config.ts`](../apps/platform_web/playwright.participant.config.ts).
-Do not infer viewport ownership from a test name or silently add an exclusion;
-update the owning config and its contract test when the matrix changes.
+When hosted-services preflight blocks `web-hermetic`, run the focused image-helper contract locally from `platform/`:
 
-The `platform-routes.spec.ts` suite owns raw SSR (`page.goto()`), SPA URL/DOM,
-and password-login Turnstile coverage: pending login stays alert-free; rejected retries keep actionable errors visible.
+```bash
+TASK_WEBKIT_DIR="$(mktemp -d /tmp/oldsparky-image-inventory.XXXXXX)"
+trap 'python3 -c "import shutil,sys; shutil.rmtree(sys.argv[1], ignore_errors=True)" "$TASK_WEBKIT_DIR"' EXIT
+python3 tools/platform_web_hermetic_browsers.py --web-root apps/platform_web --output "$TASK_WEBKIT_DIR/browsers"
+(cd apps/platform_web && PLAYWRIGHT_BROWSERS_PATH="$TASK_WEBKIT_DIR/browsers" ../../tools/platform_run_quiet.sh "WebKit image inventory contract" -- ../../tools/platform_web_npm.sh run test:image-inventory:webkit)
+```
+
+This exercises only the fixture and image helper; exact-SHA `web-hermetic` CI remains required.
+
+The responsive smoke project owns `desktop`, `wide-1300`, `tablet-820` and `mobile-layout`; the explicit desktop-only list
+in [`playwright.config.ts`](../apps/platform_web/playwright.config.ts) is owned only by `desktop`. The participant-progressive suite owns a sequential one-worker contour and explicit desktop/mobile projects in [`playwright.participant.config.ts`](../apps/platform_web/playwright.participant.config.ts). Do not infer viewport ownership from a test name or silently add exclusions; update the owning config and contract test with matrix changes.
+
+The `platform-routes.spec.ts` suite owns raw SSR (`page.goto()`), SPA URL/DOM and password-login Turnstile: pending login stays alert-free; rejected retries keep actionable errors visible.
 
 ## Local and GitHub verification
 

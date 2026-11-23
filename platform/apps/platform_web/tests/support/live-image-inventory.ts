@@ -437,7 +437,7 @@ export async function collectLiveImageInventory(
       }
     }
 
-    snapshot = await imageLocator.evaluateAll((elements) => {
+    snapshot = await imageLocator.evaluateAll((elements, limits) => {
       const state = (window as ImageInventoryWindow).__oldsparkyLiveImageInventory;
       return elements.map((element) => {
         const image = element as HTMLImageElement;
@@ -463,11 +463,11 @@ export async function collectLiveImageInventory(
           }
           const historyBytes = signature.length + image.currentSrc.length;
           if (
-            signature.length > MAX_IMAGE_SOURCE_VALUE_CHARS
-            || image.currentSrc.length > MAX_IMAGE_SOURCE_VALUE_CHARS
-            || signatureHistory.size >= MAX_IMAGE_SOURCE_HISTORY
-            || currentSrcHistory.size >= MAX_IMAGE_SOURCE_HISTORY
-            || state.sourceHistoryBytes + historyBytes > MAX_IMAGE_SOURCE_HISTORY_BYTES
+            signature.length > limits.maxValueChars
+            || image.currentSrc.length > limits.maxValueChars
+            || signatureHistory.size >= limits.maxHistoryEntries
+            || currentSrcHistory.size >= limits.maxHistoryEntries
+            || state.sourceHistoryBytes + historyBytes > limits.maxHistoryBytes
           ) {
             if (!signatureHistory.has(signature) || !currentSrcHistory.has(image.currentSrc)) {
               sourceHistoryTruncated = true;
@@ -513,6 +513,10 @@ export async function collectLiveImageInventory(
           scrollAttempted: state?.scrolledSources.get(image) === `${image.getAttribute("src") ?? ""}\0${image.getAttribute("srcset") ?? ""}`,
         };
       });
+    }, {
+      maxValueChars: MAX_IMAGE_SOURCE_VALUE_CHARS,
+      maxHistoryEntries: MAX_IMAGE_SOURCE_HISTORY,
+      maxHistoryBytes: MAX_IMAGE_SOURCE_HISTORY_BYTES,
     });
     const signature = snapshot.map((image) => (
       `${image.id}\0${image.source}\0${image.sourceSet}\0${image.currentSrc}\0${image.loaded}`
