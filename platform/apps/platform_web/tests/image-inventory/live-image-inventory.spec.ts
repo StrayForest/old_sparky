@@ -83,8 +83,12 @@ function writePrivateProducerBytes(name: string, body: Buffer) {
   if (!buildDir || !path.isAbsolute(buildDir)) {
     throw new Error("image inventory fixture output directory is unavailable");
   }
+  const currentUid = process.getuid?.();
+  if (currentUid === undefined) {
+    throw new Error("image inventory fixture output owner cannot be verified");
+  }
   const directory = fs.lstatSync(buildDir);
-  if (!directory.isDirectory() || directory.isSymbolicLink() || directory.uid !== process.getuid()) {
+  if (!directory.isDirectory() || directory.isSymbolicLink() || directory.uid !== currentUid) {
     throw new Error("image inventory fixture output directory identity is unsafe");
   }
   const output = path.join(buildDir, name);
@@ -96,7 +100,7 @@ function writePrivateProducerBytes(name: string, body: Buffer) {
   );
   try {
     const metadata = fs.fstatSync(fd);
-    if (!metadata.isFile() || metadata.uid !== process.getuid() || (metadata.mode & 0o777) !== 0o600) {
+    if (!metadata.isFile() || metadata.uid !== currentUid || (metadata.mode & 0o777) !== 0o600) {
       throw new Error("image inventory producer fixture identity is unsafe");
     }
     fs.writeFileSync(fd, body);
@@ -599,7 +603,9 @@ test("WebKit lifecycle attachments survive independent verification", async () =
     const filename = path.join(buildDir, name);
     const metadata = fs.lstatSync(filename);
     expect(metadata.isFile() && !metadata.isSymbolicLink()).toBe(true);
-    expect(metadata.uid).toBe(process.getuid());
+    const currentUid = process.getuid?.();
+    expect(currentUid).not.toBeUndefined();
+    expect(metadata.uid).toBe(currentUid);
     expect(metadata.mode & 0o777).toBe(0o600);
     return JSON.parse(fs.readFileSync(filename, "ascii"));
   };
@@ -681,7 +687,9 @@ test("browser request-failure evidence stays below its 4 KiB cap", async () => {
   let caught: unknown;
   try {
     await finalizeBrowserFailureEvidence({
-      attach: async (name, { body }) => attachments.push({ name, body }),
+      attach: async (name, { body }) => {
+        attachments.push({ name, body });
+      },
       state,
       runAssertions: () => { throw originalError; },
       bodyFailureState: "passed",
