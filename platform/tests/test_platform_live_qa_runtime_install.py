@@ -8,6 +8,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import stat
@@ -553,6 +554,479 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                     )
                     self.assertNotEqual(rejected.returncode, 0)
                     self.assertEqual(rejected.stdout, b"")
+
+        transport_line = re.search(
+            r'(?m)^\s*timeout --foreground 60s scp (?P<preserve>-p) "\$\{ssh_args\[@\]\}" '
+            r'"\$BUNDLE" "\$PROD_SSH_USER@\$PROD_SSH_HOST:\$remote_stage/bundle\.tar"',
+            workflow,
+        )
+        self.assertIsNotNone(transport_line)
+        scp_binary = shutil.which("scp")
+        self.assertIsNotNone(scp_binary)
+
+        outcome_start = workflow.index("          write_outcome() {")
+        outcome_end = workflow.index("          ssh_args=", outcome_start)
+        outcome_function = textwrap.dedent(workflow[outcome_start:outcome_end])
+        cleanup_start = workflow.index("          cleanup_remote_stage() {")
+        cleanup_end = workflow.index(
+            "          trap cleanup_remote_stage EXIT", cleanup_start
+        )
+        cleanup_function = textwrap.dedent(workflow[cleanup_start:cleanup_end])
+        self.assertIn("stat.S_IMODE(file_meta.st_mode) != 0o600", workflow)
+        self.assertIn("file_meta.st_nlink != 1", workflow)
+        cleanup_python_match = re.search(
+            r"/usr/bin/python3\.12 -I -B - .*?<<'PY'\n(?P<script>.*?)\nPY\nCLEANUP",
+            cleanup_function,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(cleanup_python_match)
+        cleanup_python = cleanup_python_match.group("script")
+
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            fixture_root = Path(temporary)
+            source_bundle = fixture_root / "bundle.tar"
+            destination_bundle = fixture_root / "remote-bundle.tar"
+            source_bundle.write_bytes(b"bounded transport mode fixture")
+            source_bundle.chmod(0o600)
+            scp_run = subprocess.run(
+                [scp_binary, transport_line.group("preserve"), str(source_bundle), str(destination_bundle)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(scp_run.returncode, 0, scp_run.stderr.decode("utf-8", "replace"))
+            self.assertEqual(stat.S_IMODE(destination_bundle.stat().st_mode), 0o600)
+
+            def run_remote_cleanup(*, bundle_mode=0o600, expected_inode_delta=0):
+                for _ in range(8):
+                    stage = Path("/tmp") / f"oldsparky-liveqa-payload-repair.{uuid4().hex[:6]}"
+                    try:
+                        os.mkdir(stage, 0o700)
+                    except FileExistsError:
+                        continue
+                    break
+                else:
+                    self.fail("could not allocate unique private cleanup fixture")
+                os.chmod(stage, 0o700)
+                stage_stat = os.lstat(stage)
+                bundle = stage / "bundle.tar"
+                fd = os.open(
+                    bundle,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                )
+                try:
+                    os.fchmod(fd, bundle_mode)
+                    os.write(fd, b"owned cleanup fixture")
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                bundle_stat = os.lstat(bundle)
+                expected = (
+                    stage_stat.st_dev,
+                    stage_stat.st_ino + expected_inode_delta,
+                    stage_stat.st_uid,
+                    stage_stat.st_gid,
+                    stage_stat.st_nlink,
+                    f"{stat.S_IMODE(stage_stat.st_mode):o}",
+                )
+                try:
+                    result = subprocess.run(
+                        [
+                            "/usr/bin/python3.12",
+                            "-I",
+                            "-B",
+                            "-",
+                            str(stage),
+                            str(expected[0]),
+                            str(expected[1]),
+                            str(expected[2]),
+                            str(expected[3]),
+                            str(expected[4]),
+                            expected[5],
+                        ],
+                        input=cleanup_python.encode("utf-8"),
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                        timeout=10,
+                    )
+                    return result, stage, stage_stat, bundle, bundle_stat
+                except BaseException:
+                    current = os.lstat(stage)
+                    if (current.st_dev, current.st_ino) == (stage_stat.st_dev, stage_stat.st_ino):
+                        if os.path.lexists(bundle):
+                            os.chmod(bundle, 0o600)
+                            os.unlink(bundle)
+                        os.rmdir(stage)
+                    raise
+
+            def remove_owned_cleanup_fixture(stage, stage_stat, bundle, bundle_stat):
+                if not os.path.lexists(stage):
+                    return
+                current = os.lstat(stage)
+                self.assertEqual((current.st_dev, current.st_ino), (stage_stat.st_dev, stage_stat.st_ino))
+                self.assertTrue(stat.S_ISDIR(current.st_mode))
+                self.assertEqual((current.st_uid, stat.S_IMODE(current.st_mode)), (stage_stat.st_uid, 0o700))
+                current_bundle = os.lstat(bundle)
+                self.assertEqual(
+                    (current_bundle.st_dev, current_bundle.st_ino, current_bundle.st_uid, current_bundle.st_nlink, current_bundle.st_size),
+                    (bundle_stat.st_dev, bundle_stat.st_ino, bundle_stat.st_uid, bundle_stat.st_nlink, bundle_stat.st_size),
+                )
+                self.assertTrue(stat.S_ISREG(current_bundle.st_mode))
+                os.chmod(bundle, 0o600)
+                os.unlink(bundle)
+                os.rmdir(stage)
+
+            valid_cleanup, valid_stage, valid_stage_stat, valid_bundle, valid_bundle_stat = run_remote_cleanup()
+            try:
+                self.assertEqual(valid_cleanup.returncode, 0, valid_cleanup.stderr.decode("utf-8", "replace"))
+                self.assertFalse(os.path.lexists(valid_stage))
+            finally:
+                remove_owned_cleanup_fixture(valid_stage, valid_stage_stat, valid_bundle, valid_bundle_stat)
+
+            for name, kwargs in (
+                ("bad_bundle_mode", {"bundle_mode": 0o644}),
+                ("wrong_stage_identity", {"expected_inode_delta": 1}),
+            ):
+                with self.subTest(cleanup_case=name):
+                    refused, stage, stage_stat, bundle, bundle_stat = run_remote_cleanup(**kwargs)
+                    try:
+                        self.assertNotEqual(refused.returncode, 0)
+                        current = os.lstat(stage)
+                        self.assertEqual((current.st_dev, current.st_ino), (stage_stat.st_dev, stage_stat.st_ino))
+                        self.assertTrue(bundle.exists())
+                        self.assertEqual(stat.S_IMODE(bundle.stat().st_mode), kwargs.get("bundle_mode", 0o600))
+                    finally:
+                        remove_owned_cleanup_fixture(stage, stage_stat, bundle, bundle_stat)
+
+            mock_bin = fixture_root / "bin"
+            mock_bin.mkdir(mode=0o700)
+            ssh_stub = mock_bin / "ssh"
+            ssh_stub.write_text(
+                "#!/bin/sh\n"
+                "if [ -n \"${MOCK_SSH_OUTPUT:-}\" ]; then printf '%s' \"$MOCK_SSH_OUTPUT\"; fi\n"
+                "exit \"${MOCK_SSH_EXIT:-0}\"\n",
+                encoding="ascii",
+            )
+            ssh_stub.chmod(0o700)
+
+            def run_cleanup(exit_code: int):
+                output_path = fixture_root / f"github-output-{exit_code}"
+                summary_path = fixture_root / f"github-summary-{exit_code}"
+                output_path.write_bytes(b"")
+                summary_path.write_bytes(b"")
+                script = "\n".join(
+                    (
+                        "set -euo pipefail",
+                        "OPERATION=prepare",
+                        "step_phase=complete",
+                        "step_rc=0",
+                        "step_cleanup_rc=none",
+                        "helper_reason=none",
+                        "plan_sha=none",
+                        "tool_bundle_residual=none",
+                        "operation_result_line=",
+                        outcome_function,
+                        f"plan_sha={'a' * 64}",
+                        f"operation_result_line='LIVE_QA_PAYLOAD_BYTECODE_REPAIR status=prepared plan_sha256={'a' * 64} extra_file_count=2'",
+                        "ssh_args=()",
+                        "remote_stage=/tmp/oldsparky-liveqa-payload-repair.ABC123",
+                        "remote_stage_dev=1",
+                        "remote_stage_ino=2",
+                        "remote_stage_uid=0",
+                        "remote_stage_gid=0",
+                        "remote_stage_nlink=2",
+                        "remote_stage_mode=700",
+                        cleanup_function,
+                        "cleanup_remote_stage",
+                    )
+                )
+                env = {
+                    "PATH": f"{mock_bin}:/usr/bin:/bin",
+                    "LANG": "C",
+                    "LC_ALL": "C",
+                    "MOCK_SSH_EXIT": str(exit_code),
+                    "PROD_SSH_USER": "fixture",
+                    "PROD_SSH_HOST": "fixture.invalid",
+                    "GITHUB_OUTPUT": str(output_path),
+                    "GITHUB_STEP_SUMMARY": str(summary_path),
+                }
+                result = subprocess.run(
+                    ["/bin/bash", "-c", script],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    env=env,
+                    timeout=10,
+                )
+                return result, output_path, summary_path
+
+            cleanup_ok, success_output, success_summary = run_cleanup(0)
+            self.assertEqual(cleanup_ok.returncode, 0, cleanup_ok.stderr.decode("utf-8", "replace"))
+            self.assertIn(b"plan_sha256=" + b"a" * 64, success_output.read_bytes())
+            self.assertIn(
+                b"status=completed phase=complete exit_code=0 cleanup_rc=0 helper_reason=none operation=prepare plan_sha256="
+                + b"a" * 64
+                + b" stage_residual=none tool_bundle_residual=none",
+                success_summary.read_bytes(),
+            )
+
+            cleanup_failed, failed_output, failed_summary = run_cleanup(1)
+            self.assertNotEqual(cleanup_failed.returncode, 0)
+            self.assertEqual(failed_output.read_bytes(), b"")
+            self.assertIn(
+                b"status=failed phase=cleanup exit_code=1 cleanup_rc=1",
+                failed_summary.read_bytes(),
+                failed_summary.read_bytes().decode("utf-8", "replace")
+                + cleanup_failed.stderr.decode("utf-8", "replace"),
+            )
+            self.assertIn(
+                b"helper_reason=none operation=prepare plan_sha256="
+                + b"a" * 64
+                + b" stage_residual=unverified tool_bundle_residual=none",
+                failed_summary.read_bytes(),
+            )
+            self.assertEqual(
+                cleanup_failed.stderr,
+                b"Remote repair transport cleanup failed identity checks\n",
+            )
+
+            outer_remote_rc = workflow.index("\n          remote_rc=$?\n          set -e\n")
+            remote_handler_start = workflow.index(
+                "          if (( remote_rc != 0 )); then", outer_remote_rc
+            )
+            remote_handler_end = workflow.index(
+                "\n          step_phase=result_validation", remote_handler_start
+            )
+            remote_handler = textwrap.dedent(
+                workflow[remote_handler_start:remote_handler_end]
+            )
+
+            def run_remote_failure(error_text: bytes, *, error_present: bool = True):
+                output_path = fixture_root / "github-output-remote-failure"
+                summary_path = fixture_root / "github-summary-remote-failure"
+                result_path = fixture_root / "remote-result"
+                error_path = fixture_root / "remote-error"
+                output_path.write_bytes(b"")
+                summary_path.write_bytes(b"")
+                result_path.write_bytes(b"")
+                if error_present:
+                    error_path.write_bytes(error_text)
+                elif error_path.exists():
+                    error_path.unlink()
+                script = "\n".join(
+                    (
+                        "set -euo pipefail",
+                        "OPERATION=prepare",
+                        outcome_function,
+                        "step_phase=locked_install",
+                        "step_rc=0",
+                        "helper_reason=none",
+                        "plan_sha=none",
+                        "tool_bundle_residual=none",
+                        "remote_rc=9",
+                        f"RUNNER_SOURCE_SHA={'b' * 40}",
+                        f"RUNNER_TEMP={shlex.quote(str(fixture_root))}",
+                        f"result={shlex.quote(str(result_path))}",
+                        f"error={shlex.quote(str(error_path))}",
+                        "ssh_args=()",
+                        "remote_stage=/tmp/oldsparky-liveqa-payload-repair.ABC123",
+                        "remote_stage_dev=1",
+                        "remote_stage_ino=2",
+                        "remote_stage_uid=0",
+                        "remote_stage_gid=0",
+                        "remote_stage_nlink=2",
+                        "remote_stage_mode=700",
+                        cleanup_function,
+                        "trap cleanup_remote_stage EXIT",
+                        remote_handler,
+                    )
+                )
+                env = {
+                    "PATH": f"{mock_bin}:/usr/bin:/bin",
+                    "LANG": "C",
+                    "LC_ALL": "C",
+                    "MOCK_SSH_EXIT": "0",
+                    "PROD_SSH_USER": "fixture",
+                    "PROD_SSH_HOST": "fixture.invalid",
+                    "GITHUB_OUTPUT": str(output_path),
+                    "GITHUB_STEP_SUMMARY": str(summary_path),
+                }
+                completed = subprocess.run(
+                    ["/bin/bash", "-c", script],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    env=env,
+                    timeout=10,
+                )
+                return completed, output_path, summary_path, error_path
+
+            closed_marker = (
+                b"LIVE_QA_PAYLOAD_BYTECODE_REPAIR_REMOTE "
+                b"phase=helper exit_code=9 helper_reason=pointer_mismatch\n"
+            )
+            remote_known, known_output, known_summary, known_error = run_remote_failure(
+                closed_marker
+                + b"LIVE_QA_PAYLOAD_REPAIR_BUNDLE status=partial_cleanup_failed runner_source_sha="
+                + b"b" * 40
+                + b"\nprivate-diagnostic-sentinel\n"
+            )
+            self.assertEqual(remote_known.returncode, 9, remote_known.stderr.decode("utf-8", "replace"))
+            self.assertEqual(known_output.read_bytes(), b"")
+            self.assertEqual(
+                known_summary.read_bytes(),
+                b"LIVE_QA_PAYLOAD_BYTECODE_REPAIR_OUTCOME status=failed phase=helper exit_code=9 cleanup_rc=0 helper_reason=pointer_mismatch operation=prepare plan_sha256=none stage_residual=none tool_bundle_residual=unverified\n",
+            )
+            self.assertNotIn(b"private-diagnostic-sentinel", remote_known.stdout + remote_known.stderr + known_summary.read_bytes())
+            self.assertNotIn(b"b" * 40, known_summary.read_bytes())
+            self.assertFalse(known_error.exists())
+
+            unknown_marker = (
+                b"LIVE_QA_PAYLOAD_BYTECODE_REPAIR_REMOTE "
+                b"phase=helper exit_code=9 helper_reason=unknown_private_value\n"
+            )
+            remote_unknown, unknown_output, unknown_summary, unknown_error = run_remote_failure(
+                unknown_marker
+                + b"LIVE_QA_PAYLOAD_REPAIR_BUNDLE status=partial_cleanup_failed runner_source_sha="
+                + b"c" * 40
+                + b"\nprivate-diagnostic-sentinel\n"
+            )
+            self.assertEqual(remote_unknown.returncode, 9)
+            self.assertEqual(unknown_output.read_bytes(), b"")
+            self.assertIn(
+                b"status=failed phase=remote_command exit_code=9 cleanup_rc=0 helper_reason=none operation=prepare plan_sha256=none stage_residual=none tool_bundle_residual=none",
+                unknown_summary.read_bytes(),
+            )
+            self.assertNotIn(b"private-diagnostic-sentinel", remote_unknown.stdout + remote_unknown.stderr + unknown_summary.read_bytes())
+            self.assertFalse(unknown_error.exists())
+
+            for name, error_text, error_present in (
+                ("oversized", b"x" * 65537, True),
+                ("unreadable", b"", False),
+            ):
+                with self.subTest(remote_diagnostic=name):
+                    unobservable, unobservable_output, unobservable_summary, unobservable_error = run_remote_failure(
+                        error_text, error_present=error_present
+                    )
+                    self.assertEqual(unobservable.returncode, 9)
+                    self.assertEqual(unobservable_output.read_bytes(), b"")
+                    self.assertIn(
+                        b"status=failed phase=remote_command exit_code=9 cleanup_rc=0 helper_reason=none operation=prepare plan_sha256=none stage_residual=none tool_bundle_residual=unverified",
+                        unobservable_summary.read_bytes(),
+                    )
+                    self.assertNotIn(b"x" * 256, unobservable.stdout + unobservable.stderr + unobservable_summary.read_bytes())
+                    self.assertFalse(unobservable_error.exists())
+
+            stage_failure_block_start = workflow.index(
+                "          if (( stage_create_rc != 0 )); then"
+            )
+            stage_failure_block_end = workflow.index(
+                "\n          IFS='|' read -r remote_stage", stage_failure_block_start
+            )
+            stage_failure_block = textwrap.dedent(
+                workflow[stage_failure_block_start:stage_failure_block_end]
+            )
+            stage_summary = fixture_root / "github-summary-stage-failure"
+            stage_output = fixture_root / "github-output-stage-failure"
+            stage_summary.write_bytes(b"")
+            stage_output.write_bytes(b"")
+            stage_script = "\n".join(
+                (
+                    "set -euo pipefail",
+                    "OPERATION=prepare",
+                    outcome_function,
+                    "stage_create_rc=7",
+                    stage_failure_block,
+                )
+            )
+            stage_result = subprocess.run(
+                ["/bin/bash", "-c", stage_script],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "LANG": "C",
+                    "LC_ALL": "C",
+                    "GITHUB_OUTPUT": str(stage_output),
+                    "GITHUB_STEP_SUMMARY": str(stage_summary),
+                },
+                timeout=10,
+            )
+            self.assertEqual(stage_result.returncode, 7)
+            self.assertIn(
+                b"status=failed phase=stage_create exit_code=7 cleanup_rc=none helper_reason=none operation=prepare plan_sha256=none stage_residual=unverified tool_bundle_residual=none",
+                stage_summary.read_bytes(),
+            )
+            self.assertEqual(stage_output.read_bytes(), b"")
+
+            stage_command_start = workflow.index(
+                "          set +e\n          # shellcheck disable=SC2016\n          remote_stage_info="
+            )
+            stage_command_end = workflow.index(
+                "\n          cleanup_remote_stage() {", stage_command_start
+            )
+            stage_command_block = textwrap.dedent(
+                workflow[stage_command_start:stage_command_end]
+            )
+
+            def run_stage_failure(ssh_exit: int, ssh_output: str):
+                summary = fixture_root / f"stage-summary-{ssh_exit}-{len(ssh_output)}"
+                output = fixture_root / f"stage-output-{ssh_exit}-{len(ssh_output)}"
+                summary.write_bytes(b"")
+                output.write_bytes(b"")
+                script = "\n".join(
+                    (
+                        "set -euo pipefail",
+                        "OPERATION=prepare",
+                        outcome_function,
+                        "ssh_args=()",
+                        stage_command_block,
+                    )
+                )
+                completed = subprocess.run(
+                    ["/bin/bash", "-c", script],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    env={
+                        "PATH": f"{mock_bin}:/usr/bin:/bin",
+                        "LANG": "C",
+                        "LC_ALL": "C",
+                        "MOCK_SSH_EXIT": str(ssh_exit),
+                        "MOCK_SSH_OUTPUT": ssh_output,
+                        "PROD_SSH_USER": "fixture",
+                        "PROD_SSH_HOST": "fixture.invalid",
+                        "GITHUB_OUTPUT": str(output),
+                        "GITHUB_STEP_SUMMARY": str(summary),
+                    },
+                    timeout=10,
+                )
+                return completed, summary, output
+
+            for case, ssh_exit, ssh_output, expected_exit in (
+                ("ssh_failed", 7, "", 7),
+                ("invalid_tuple", 0, "malformed-private-response", 1),
+            ):
+                with self.subTest(stage_create_case=case):
+                    failed, summary, output = run_stage_failure(ssh_exit, ssh_output)
+                    self.assertEqual(failed.returncode, expected_exit, failed.stderr.decode("utf-8", "replace"))
+                    self.assertIn(
+                        b"status=failed phase=stage_create exit_code="
+                        + str(expected_exit).encode("ascii")
+                        + b" cleanup_rc=none helper_reason=none operation=prepare plan_sha256=none stage_residual=unverified tool_bundle_residual=none",
+                        summary.read_bytes(),
+                    )
+                    self.assertEqual(output.read_bytes(), b"")
+                    self.assertNotIn(b"malformed-private-response", failed.stdout + failed.stderr + summary.read_bytes())
 
     def test_payload_bytecode_repair_uses_inherited_release_flock_under_stdin(self) -> None:
         with tempfile.TemporaryDirectory(dir="/root") as temporary:

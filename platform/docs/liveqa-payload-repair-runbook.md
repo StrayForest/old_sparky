@@ -70,13 +70,18 @@ root-private runner bundle. It does not import the damaged LiveQA payload.
    Apply repeats every binding under both locks and atomically renames the
    whole cache directory with no-replace semantics. It then runs the strict
    active-payload verifier. Only `status=validated` means the cache is
-   quarantined and the manifest validates. On a timeout or lost SSH response,
-   rerun apply only with the same plan SHA; its closed receipt resumes a
-   prepared/quarantined transition or confirms an already validated result.
-   If an interrupted rollback restored the cache, apply verifies it, marks the
-   old plan spent and refuses reuse; prepare a new plan only after that exact
-   restoration is confirmed. A changed plan, malformed receipt or unexpected
-   filesystem state fails closed.
+   quarantined and the manifest validates. Read the workflow step summary's
+   closed outcome line; command text in the Actions log is not evidence that an
+   operation ran. A failed result with a plan SHA is not success: verify the
+   exact source-bound plan/receipt and residual state through the root-private
+   owner path before reusing that SHA. If no SHA was emitted, prove there is no
+   existing plan before another prepare. Never dispatch a duplicate prepare or
+   guess a plan SHA. Only after those checks, resume apply with the same plan
+   SHA; its closed receipt resumes a prepared/quarantined transition or
+   confirms an already validated result. If an interrupted rollback restored
+   the cache, apply verifies it, marks the old plan spent and refuses reuse;
+   prepare a new plan only after that exact restoration is confirmed. A changed
+   plan, malformed receipt or unexpected filesystem state fails closed.
 4. Leave the root-private quarantine, plan and receipts in place. Immediately
    create or verify the single restore-verified backup bound to the same
    Security run/attempt/SHA using the [backup procedure](backup-restore-runbook.md#local-verified-backup).
@@ -89,6 +94,19 @@ root-private runner bundle. It does not import the damaged LiveQA payload.
    This repair workflow does not prune its own evidence.
 
 ## Failure handling
+
+The workflow step summary is the operation handoff. A successful operation
+must report `status=completed`, `phase=complete`, `exit_code=0`, and
+`cleanup_rc=0`; a plan SHA is usable only when that summary and the step output
+both report success. On failure, `phase`, `exit_code`, `cleanup_rc`,
+`helper_reason`, `stage_residual` and `tool_bundle_residual` are closed values;
+raw SSH/helper stderr and transport paths are suppressed. `phase=cleanup` with
+a plan SHA means the operation may have produced a durable plan/receipt while
+transport cleanup failed; confirm that exact record and residual before
+applying. `stage_residual=unverified` or
+`tool_bundle_residual=unverified` requires bounded root-private inspection of
+the exact run-bound state before retry. Do not remove a staging directory or
+bundle by a guessed path.
 
 The helper accepts only the two fixed cache paths and refuses any other tree
 delta, symlink, ownership/mode change, pointer/manifest/provider drift, lock
