@@ -108,8 +108,8 @@ RUNTIME_SOURCE_FILES = (
     "package-lock.json",
 )
 RUNTIME_IMPORT_RE = re.compile(
-    r"^\s*import\s+(?!type\b).*?\sfrom\s+[\"'](\.{1,2}/[^\"']+)[\"']"
-    r"|^\s*export\s+.*?\sfrom\s+[\"'](\.{1,2}/[^\"']+)[\"']"
+    r"^\s*import\s+(?!type\b)[^;]*?\sfrom\s+[\"'](\.{1,2}/[^\"']+)[\"']"
+    r"|^\s*export\s+[^;]*?\sfrom\s+[\"'](\.{1,2}/[^\"']+)[\"']"
     r"|\brequire\(\s*[\"'](\.{1,2}/[^\"']+)[\"']\s*\)",
     re.MULTILINE,
 )
