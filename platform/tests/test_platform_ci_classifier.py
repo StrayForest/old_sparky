@@ -241,7 +241,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
 
     def test_docs_only_route_is_nondeployable_and_digest_bound(self) -> None:
         manifest = classify(
-            ["platform/docs/deployment-runbook.md", "platform/docs/test-suite-governance.md"],
+            ["platform/docs/CURRENT.md", "platform/docs/test-suite-governance.md"],
             event="push",
             target_sha=self.TARGET_SHA,
             branch="dev",
@@ -1047,9 +1047,9 @@ class PlatformCiClassifierTests(unittest.TestCase):
         for path, expected_class, expected_fallback, expected_gates in (
             (
                 "platform/docs/deployment-runbook.md",
-                "docs-only",
+                "full",
                 False,
-                DOCS_ONLY_GATE_IDS,
+                FULL_GATE_IDS,
             ),
             (
                 "unknown-root-config.toml",
@@ -1148,7 +1148,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertFalse(skill_only["deployable"])
 
         docs_only = classify(
-            ["platform/docs/deployment-runbook.md"],
+            ["platform/docs/CURRENT.md"],
             event="push",
             target_sha=self.TARGET_SHA,
             branch="dev",
@@ -1163,7 +1163,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
             (skill_paths[0],),
         ):
             docs_with_skills = classify(
-                ["platform/docs/deployment-runbook.md", *companion_paths],
+                ["platform/docs/CURRENT.md", *companion_paths],
                 event="push",
                 target_sha=self.TARGET_SHA,
                 branch="dev",
@@ -2081,6 +2081,23 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertEqual(adr_outputs["route_candidate_packaging_only"], "false")
         self.assertEqual(adr_outputs["route_docs_only"], "false")
 
+        release_runbook = "platform/docs/deployment-runbook.md"
+        runbook_route = classify(
+            [release_runbook],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(runbook_route["class"], "full")
+        self.assertEqual(runbook_route["expected_gates"], list(FULL_GATE_IDS))
+        self.assertEqual(runbook_route["reason"], RECOVERY_BOOTSTRAP_REASON)
+        self.assertFalse(runbook_route["runtime_sensitive"])
+        self.assertFalse(runbook_route["fallback"])
+        self.assertFalse(runbook_route["deployable"])
+        runbook_outputs = self._run_auto_deploy_manifest_contract(runbook_route)
+        self.assertEqual(runbook_outputs["route_recovery_bootstrap_only"], "true")
+        self.assertEqual(runbook_outputs["route_docs_only"], "false")
+
         adr_pr = classify(
             [host_tools_adr],
             event="pull_request",
@@ -2126,7 +2143,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self._run_auto_deploy_manifest_contract(unknown_non_deployable, expect_success=False)
 
         docs_only = classify(
-            ["platform/docs/deployment-runbook.md"],
+            ["platform/docs/CURRENT.md"],
             event="push",
             target_sha=self.TARGET_SHA,
             branch="dev",
@@ -3871,7 +3888,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
 
     def test_storage_operations_classifier_and_artifact_route_are_exact(self) -> None:
         files = sorted(
-            STORAGE_OPERATIONS_FILES | {"platform/docs/deployment-runbook.md"}
+            STORAGE_OPERATIONS_FILES | {"platform/docs/CURRENT.md"}
         )
         manifest = classify(
             files,

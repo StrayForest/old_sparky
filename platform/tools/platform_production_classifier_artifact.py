@@ -105,6 +105,9 @@ RECOVERY_BOOTSTRAP_FILES = frozenset(
         ".github/workflows/platform-production-release-recover.yml",
         ".github/workflows/platform-production-autodeploy.yml",
         "platform/tools/platform_recovery_bootstrap.py",
+        # Keep the release-authority owner runbook on authenticated full-gate
+        # reconciliation rather than the strict docs-only no-backup route.
+        "platform/docs/deployment-runbook.md",
         "platform/tools/platform_ssr_capacity_diagnostic.py",
         "platform/tools/platform_cpu_diagnostic_pair.py",
         "platform/performance/README.md",

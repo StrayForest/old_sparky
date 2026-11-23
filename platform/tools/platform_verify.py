@@ -657,6 +657,7 @@ _IMPACT_SOURCE_ROUTES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("platform/tools/platform_test_catalog.py", ("verification-contract", "backend-tool-contract")),
     ("platform/tools/platform_test_runner.py", ("verification-contract", "backend-tool-contract", "backend-privileged")),
     ("platform/tools/platform_ci_classifier.py", ("verification-contract", "backend-tool-contract")),
+    ("platform/tools/platform_production_classifier_artifact.py", ("verification-contract", "backend-tool-contract")),
     (".github/workflows/platform-security.yml", ("verification-contract", "backend-tool-contract", "backend-privileged")),
     (".github/workflows/platform-live-launch.yml", ("backend-privileged", "backend-tool-contract")),
     (".github/workflows/platform-live-user-qa.yml", ("backend-privileged", "backend-tool-contract")),
@@ -700,6 +701,12 @@ def impact_plan(changed_paths: Sequence[str]) -> dict[str, object]:
     for case in cases:
         module_to_contours.setdefault(case.module, set()).add(case.contour)
     for path in normalized:
+        if path == "platform/docs/deployment-runbook.md":
+            # Release-authority policy changes follow the same full verification
+            # contract as their exact CI recovery-bootstrap classifier route.
+            selected_gates.update(CI_GATE_IDS)
+            selected_contours.update(catalog.BACKEND_CONTOURS)
+            continue
         if path.startswith("platform/docs/"):
             selected_gates.add("docs")
             selected_contours.add("verification-contract")

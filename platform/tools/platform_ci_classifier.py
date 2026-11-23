@@ -222,10 +222,11 @@ CANDIDATE_PACKAGING_REASON = (
 )
 
 # Recovery-bootstrap changes are intentionally a full-CI route with no
-# production authority.  Keep this set closed: adding a new recovery helper,
-# workflow or contract file requires an explicit classifier review.  Docs may
-# accompany the set without changing the route.  An application/runtime path
-# mixed into the set remains an ordinary deployable full route.
+# production authority. Keep this set closed: adding a recovery helper, owner
+# runbook, workflow or contract file requires an explicit classifier review.
+# Other docs may accompany the set without changing its route. An
+# application/runtime path mixed into the set remains an ordinary deployable
+# full route.
 RECOVERY_BOOTSTRAP_FILES = frozenset(
     {
         ".github/workflows/platform-production-recovery-bootstrap-build.yml",
@@ -237,6 +238,10 @@ RECOVERY_BOOTSTRAP_FILES = frozenset(
         ".github/workflows/platform-production-release-recover.yml",
         ".github/workflows/platform-production-autodeploy.yml",
         "platform/tools/platform_recovery_bootstrap.py",
+        # This production route owner must use full-gate authenticated
+        # reconciliation when its policy changes; a docs-only no-backup run
+        # cannot safely absorb an earlier unreconciled full-gate range.
+        "platform/docs/deployment-runbook.md",
         "platform/tools/platform_abort_retained_load.py",
         "platform/tools/platform_noop_source_binding.py",
         "platform/tools/platform_ssr_capacity_diagnostic.py",

@@ -3241,6 +3241,7 @@ except lock.VerificationLockError as exc:
             "platform/tools/platform_verify.py",
             "platform/tools/platform_verify_contract.py",
             "platform/tools/platform_test_catalog.py",
+            "platform/tools/platform_production_classifier_artifact.py",
         ):
             with self.subTest(source_path=source_path):
                 owner_plan = impact_plan([source_path])
@@ -3261,6 +3262,17 @@ except lock.VerificationLockError as exc:
         docs_plan = impact_plan(["platform/docs/test-suite-governance.md"])
         self.assertIn("docs", docs_plan["required_gates"])
         self.assertIn("test_platform_verification_contract", docs_plan["owner_modules"])
+
+        deployment_runbook_plan = impact_plan(
+            ["platform/docs/deployment-runbook.md"]
+        )
+        self.assertEqual(deployment_runbook_plan["status"], "routed")
+        self.assertEqual(deployment_runbook_plan["required_gates"], sorted(CI_GATE_IDS))
+        self.assertEqual(
+            deployment_runbook_plan["owner_contours"],
+            sorted(BACKEND_CONTOURS),
+        )
+        self.assertFalse(deployment_runbook_plan["skip_authority"])
 
         test_owner = impact_plan(["platform/tests/test_platform_live_qa_wrappers.py"])
         self.assertEqual(test_owner["owner_contours"], ["backend-privileged"])
