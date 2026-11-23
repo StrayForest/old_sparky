@@ -116,6 +116,35 @@ def _scratch_allocation_attribution() -> dict:
 
 
 class PlatformStorageMaintenanceTests(unittest.TestCase):
+    def test_production_maintenance_imports_disable_bytecode_caches(self) -> None:
+        tools_root = Path(__file__).resolve().parents[1] / "tools"
+        maintenance_source = (tools_root / "platform_storage_maintenance.py").read_text(
+            encoding="utf-8"
+        )
+        guard_source = (tools_root / "platform_live_qa_guard.py").read_text(
+            encoding="utf-8"
+        )
+        unit_source = (
+            Path(__file__).resolve().parents[1]
+            / "deploy"
+            / "systemd"
+            / "deadlock-maintenance.service"
+        ).read_text(encoding="utf-8")
+
+        self.assertLess(
+            maintenance_source.index("sys.dont_write_bytecode = True"),
+            maintenance_source.index("import platform_live_qa_machine_lock"),
+        )
+        self.assertLess(
+            guard_source.index("sys.dont_write_bytecode = True"),
+            guard_source.index("importlib.import_module(_machine_lock_name)"),
+        )
+        self.assertRegex(
+            unit_source,
+            r"(?m)^ExecStart=/opt/oldsparky/platform/shared/venv/bin/python -B "
+            r"/opt/oldsparky/platform/current/tools/platform_storage_maintenance\.py\b",
+        )
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)

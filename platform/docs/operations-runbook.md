@@ -118,7 +118,7 @@ For emergency release-only staging, follow the [storage-retention skill](../../.
 Preview live-QA runtime cache retention (also machine-locked and idle-gated):
 
 ```bash
-/usr/bin/python3 -I \
+/usr/bin/python3 -I -B \
   /opt/oldsparky/platform/current/tools/platform_live_qa_guard.py \
   prune-runtime-cache --keep 1
 ```

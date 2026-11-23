@@ -237,7 +237,9 @@ RECOVERY_BOOTSTRAP_FILES = frozenset(
         ".github/workflows/platform-production-release-abort.yml",
         ".github/workflows/platform-production-release-recover.yml",
         ".github/workflows/platform-production-autodeploy.yml",
+        ".github/workflows/platform-liveqa-payload-repair.yml",
         "platform/tools/platform_recovery_bootstrap.py",
+        "platform/tools/platform_live_qa_payload_bytecode_repair.py",
         # This production route owner must use full-gate authenticated
         # reconciliation when its policy changes; a docs-only no-backup run
         # cannot safely absorb an earlier unreconciled full-gate range.

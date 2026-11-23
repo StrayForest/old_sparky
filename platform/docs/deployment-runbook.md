@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-11-04
+- Last reviewed: 2026-11-23
 
 Use this document for the normal immutable release path. CSP mode changes and production browser/live-user evidence are intentionally isolated in [`csp-live-qa-runbook.md`](csp-live-qa-runbook.md); do not load that document for routine releases.
 
@@ -347,10 +347,7 @@ and conclusion, then requires the `platform-security-build` status to point to
 the same run URL; a missing, stale or mixed-attempt pair is rejected.
 
 The web mode above does not change the active release, database, Redis, Nginx configuration or application data. Failures emit only a closed `RECOVERY_FAILURE` stage and optional fixed class; raw remote stdout/stderr are deleted by the runner.
-Use that bounded marker with the retained transaction receipt and systemd journal; do not retry or weaken preflight until the exact failure stage is verified.
-
-For API/worker-only recovery on the current immutable release, follow the
-[service recovery runbook](service-recovery-runbook.md).
+Use that bounded marker with the retained transaction receipt and systemd journal; do not retry or weaken preflight until the exact failure stage is verified. For API/worker-only recovery on the current immutable release, follow the [service recovery runbook](service-recovery-runbook.md). For exact, source-bound bytecode-only drift in the active LiveQA payload, use the [payload repair runbook](liveqa-payload-repair-runbook.md); normal AUTO, backup, deployment and canonical Public QA remain required.
 
 ## Release state, activation and recovery
 

@@ -26,6 +26,10 @@ import stat
 # Every subprocess call below uses a fixed executable, component argv, and no shell.
 import subprocess  # nosec B404
 import sys
+# Trusted QA tools are loaded from an immutable payload.  Prevent dynamic
+# sibling imports below from creating bytecode inside that payload, even when
+# a caller forgets Python's -B flag.
+sys.dont_write_bytecode = True
 import tarfile
 import tempfile
 import time

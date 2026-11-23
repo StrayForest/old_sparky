@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager, redirect_stderr
 import hashlib
 import errno
+import importlib._bootstrap_external
 import importlib.util
 import io
 import json
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import textwrap
 import unittest
 from unittest import mock
 from uuid import uuid4
@@ -197,6 +199,1600 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                 if directory.is_dir():
                     directory.chmod(0o755)
         return source
+
+    @contextmanager
+    def _payload_bytecode_repair_fixture(self, root: Path):
+        """Build a valid active payload plus exactly the two observed bytecode extras."""
+
+        source_sha = "a" * 40
+        runner_sha = "b" * 40
+        with self.canonical_runtime_tree(root, source_sha) as (
+            app_dir,
+            release,
+            trusted,
+            payload_root,
+        ):
+            (app_dir / "shared").mkdir(mode=0o700)
+            previous_sha = "c" * 40
+            previous_release = app_dir / "releases" / f"release-{previous_sha[:8]}"
+            previous_release.mkdir(mode=0o755)
+            (previous_release / "RELEASE.json").write_text(
+                json.dumps(
+                    {
+                        "source_git_commit": previous_sha,
+                        "release_slug": previous_release.name,
+                    }
+                )
+                + "\n",
+                encoding="ascii",
+            )
+            os.chmod(previous_release / "RELEASE.json", 0o444)
+            (app_dir / "previous").symlink_to(previous_release)
+
+            release_lock_path = root / "release.lock"
+            lock_fd = os.open(
+                release_lock_path,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            os.fchown(lock_fd, 0, 0)
+            os.fchmod(lock_fd, 0o600)
+            os.close(lock_fd)
+            installer_source = release / "tools/platform_live_qa_runtime_install.py"
+            installer_bytes = installer_source.read_bytes()
+            replacements = (
+                (
+                    b'TRUSTED_ROOT = Path("/root/.oldsparky/liveqa")',
+                    f"TRUSTED_ROOT = Path({str(trusted)!r})".encode("ascii"),
+                ),
+                (
+                    b'RELEASE_LOCK_PATH = Path("/run/lock/oldsparky-platform-release.lock")',
+                    f"RELEASE_LOCK_PATH = Path({str(release_lock_path)!r})".encode("ascii"),
+                ),
+            )
+            for old, new in replacements:
+                self.assertEqual(installer_bytes.count(old), 1)
+                installer_bytes = installer_bytes.replace(old, new)
+            os.chmod(installer_source, 0o644)
+            installer_source.write_bytes(installer_bytes)
+            os.chmod(installer_source, 0o444)
+
+            manifest = runtime.install(app_dir, release)
+            payload = payload_root / source_sha
+            self.assertEqual(manifest["source_sha"], source_sha)
+            self.assertEqual(os.readlink(trusted / "active"), f"releases/{source_sha}")
+            cache_dir = payload / "platform/tools/__pycache__"
+            cache_dir.mkdir(mode=0o755)
+            for module in (
+                "platform_live_qa_guard",
+                "platform_live_qa_machine_lock",
+            ):
+                cache = cache_dir / f"{module}.cpython-312.pyc"
+                source = payload / f"platform/tools/{module}.py"
+                source_bytes = source.read_bytes()
+                source_metadata = source.stat()
+                code = compile(
+                    source_bytes,
+                    str(source),
+                    "exec",
+                    dont_inherit=True,
+                    optimize=sys.flags.optimize,
+                )
+                cache.write_bytes(
+                    importlib._bootstrap_external._code_to_timestamp_pyc(
+                        code,
+                        int(source_metadata.st_mtime),
+                        source_metadata.st_size,
+                    )
+                )
+                os.chmod(cache, 0o644)
+
+            plan_root = root / "plans"
+            quarantine_root = root / "quarantine"
+            tool_root = root / "repair-tools"
+            machine_lock_path = root / "machine.lock"
+            plan_root.mkdir(mode=0o700)
+            quarantine_root.mkdir(mode=0o700)
+            tool_root.mkdir(mode=0o700)
+            repair_tool = SCRIPT.with_name("platform_live_qa_payload_bytecode_repair.py")
+            machine_lock = SCRIPT.with_name("platform_live_qa_machine_lock.py")
+            guard_script = SCRIPT.with_name("platform_live_qa_guard.py")
+            repair_bytes = repair_tool.read_bytes()
+            machine_lock_bytes = machine_lock.read_bytes().replace(
+                b'Path("/run/lock/oldsparky-liveqa.lock")',
+                f"Path({str(machine_lock_path)!r})".encode("ascii"),
+            )
+            self.assertNotEqual(machine_lock_bytes, machine_lock.read_bytes())
+            guard_bytes = guard_script.read_bytes()
+            (tool_root / repair_tool.name).write_bytes(repair_bytes)
+            (tool_root / machine_lock.name).write_bytes(machine_lock_bytes)
+            (tool_root / guard_script.name).write_bytes(guard_bytes)
+            os.chmod(tool_root / repair_tool.name, 0o444)
+            os.chmod(tool_root / machine_lock.name, 0o444)
+            os.chmod(tool_root / guard_script.name, 0o444)
+            bundle_manifest = {
+                "schema": 1,
+                "runner_source_sha": runner_sha,
+                "repair_tool_sha256": hashlib.sha256(repair_bytes).hexdigest(),
+                "machine_lock_sha256": hashlib.sha256(machine_lock_bytes).hexdigest(),
+                "guard_sha256": hashlib.sha256(guard_bytes).hexdigest(),
+            }
+            (tool_root / "repair-bundle.json").write_text(
+                json.dumps(bundle_manifest, sort_keys=True) + "\n",
+                encoding="ascii",
+            )
+            os.chmod(tool_root / "repair-bundle.json", 0o444)
+            yield {
+                "app_dir": app_dir,
+                "active_source_sha": source_sha,
+                "runner_source_sha": runner_sha,
+                "cache_dir": cache_dir,
+                "manifest": manifest,
+                "payload": payload,
+                "payload_root": payload_root,
+                "plan_root": plan_root,
+                "quarantine_root": quarantine_root,
+                "machine_lock_path": machine_lock_path,
+                "release_lock_path": release_lock_path,
+                "tool_root": tool_root,
+                "trusted": trusted,
+            }
+
+    @staticmethod
+    def _payload_bytecode_repair_module():
+        helper_path = SCRIPT.with_name("platform_live_qa_payload_bytecode_repair.py")
+        spec = importlib.util.spec_from_file_location(
+            "platform_live_qa_payload_bytecode_repair_tested", helper_path
+        )
+        if spec is None or spec.loader is None:
+            raise AssertionError("payload bytecode repair helper is unavailable")
+        existing = sys.modules.get(spec.name)
+        if existing is not None:
+            return existing
+        previous = sys.dont_write_bytecode
+        sys.dont_write_bytecode = True
+        try:
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+            return module
+        except BaseException:
+            sys.modules.pop(spec.name, None)
+            raise
+        finally:
+            sys.dont_write_bytecode = previous
+
+    @staticmethod
+    def _payload_bytecode_repair_paths(helper, fixture):
+        return helper.RepairPaths(
+            app_dir=fixture["app_dir"],
+            liveqa_root=fixture["trusted"],
+            plan_root=fixture["plan_root"],
+            quarantine_root=fixture["quarantine_root"],
+            tool_root=fixture["tool_root"],
+        )
+
+    def _assert_payload_repair_refusal(self, helper, reason: str, operation) -> None:
+        with self.assertRaises(helper.RepairError) as raised:
+            operation()
+        self.assertEqual(raised.exception.reason, reason)
+
+    def test_payload_bytecode_repair_stdin_uses_fixed_source_bundle_root(self) -> None:
+        helper = self._payload_bytecode_repair_module()
+        runner_sha = "b" * 40
+        args = helper._parser().parse_args(
+            [
+                "prepare",
+                "--expected-source-sha",
+                "a" * 40,
+                "--runner-source-sha",
+                runner_sha,
+            ]
+        )
+        self.assertEqual(
+            set(vars(args)),
+            {"operation", "expected_source_sha", "runner_source_sha"},
+        )
+        self.assertEqual(
+            helper._bundle_root(helper.DEFAULT_PATHS, runner_sha),
+            helper.TOOL_ROOT / runner_sha,
+        )
+
+        source = SCRIPT.with_name("platform_live_qa_payload_bytecode_repair.py").read_text(
+            encoding="utf-8"
+        )
+        previous_cwd = Path.cwd()
+        previous_bytecode = sys.dont_write_bytecode
+        try:
+            with tempfile.TemporaryDirectory(dir="/root") as temporary:
+                os.chdir(temporary)
+                sys.dont_write_bytecode = True
+                module_name = "platform_live_qa_payload_bytecode_repair_stdin_test"
+                module = type(sys)(module_name)
+                module.__file__ = "<stdin>"
+                sys.modules[module_name] = module
+                try:
+                    exec(compile(source, "<stdin>", "exec"), module.__dict__)
+                    self.assertEqual(
+                        module._bundle_root(module.DEFAULT_PATHS, runner_sha),
+                        Path("/root/.oldsparky/liveqa/payload-repair-tools") / runner_sha,
+                    )
+                finally:
+                    sys.modules.pop(module_name, None)
+        finally:
+            os.chdir(previous_cwd)
+            sys.dont_write_bytecode = previous_bytecode
+
+    def test_payload_bytecode_repair_workflow_is_narrow_and_source_bound(self) -> None:
+        workflow_path = (
+            Path(__file__).resolve().parents[2]
+            / ".github/workflows/platform-liveqa-payload-repair.yml"
+        )
+        workflow = workflow_path.read_text(encoding="utf-8")
+
+        for fragment in (
+            "name: Platform LiveQA payload bytecode repair",
+            "  workflow_dispatch:",
+            "          - prepare",
+            "          - apply",
+            "group: platform-liveqa-payload-repair-${{ inputs.security_run_id }}-${{ inputs.security_run_attempt }}",
+            '"platform_live_qa_payload_bytecode_repair.py"',
+            '"platform_live_qa_machine_lock.py"',
+            '"platform_live_qa_guard.py"',
+            '"repair-bundle.json"',
+            'Path("/root/.oldsparky/liveqa/payload-repair-tools")',
+            '"$lock" --run /bin/bash -s --',
+            '/usr/bin/python3.12 -I -B - "$stage/bundle.tar" "$runner_sha"',
+            '/usr/bin/python3.12 -I -B - "${args[@]}" < "/root/.oldsparky/liveqa/payload-repair-tools/$runner_sha/platform_live_qa_payload_bytecode_repair.py"',
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, workflow)
+
+        self.assertEqual(workflow.count("workflow_dispatch:"), 1)
+        self.assertNotIn("actions/upload-artifact", workflow)
+        self.assertNotIn("platform-deploy.yml", workflow)
+
+        heredoc_start = (
+            'runner_sha="$(/usr/bin/python3 -I -B - "$run_json" '
+            '"$workflow_json" "$branch_json" "$SECURITY_RUN_ID" <<\'PY\'\n'
+        )
+        self.assertEqual(workflow.count(heredoc_start), 1)
+        verifier = workflow.split(heredoc_start, 1)[1].split("\n          PY\n          )\"", 1)[0]
+        verifier = textwrap.dedent(verifier)
+
+        valid_run = {
+            "id": 12345,
+            "head_sha": "a" * 40,
+            "run_attempt": 3,
+            "workflow_id": 77,
+            "path": ".github/workflows/platform-security.yml",
+            "name": "Platform security and build",
+            "event": "push",
+            "head_branch": "dev",
+            "status": "completed",
+            "conclusion": "success",
+            "head_repository": {"full_name": "StrayForest/old_sparky"},
+            "repository": {"full_name": "StrayForest/old_sparky"},
+        }
+        valid_workflow = {
+            "id": 77,
+            "path": ".github/workflows/platform-security.yml",
+            "state": "active",
+        }
+        valid_branch = {"commit": {"sha": "a" * 40}}
+
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            fixture_root = Path(temporary)
+
+            def execute(run, workflow_record, branch, *, attempt="3"):
+                records = (run, workflow_record, branch)
+                record_paths = []
+                for name, record in zip(("run", "workflow", "branch"), records):
+                    path = fixture_root / f"{name}.json"
+                    path.write_text(json.dumps(record), encoding="ascii")
+                    record_paths.append(str(path))
+                return subprocess.run(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-B",
+                        "-c",
+                        verifier,
+                        *record_paths,
+                        "12345",
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    env={"SECURITY_RUN_ATTEMPT": attempt},
+                    timeout=5,
+                )
+
+            valid = execute(valid_run, valid_workflow, valid_branch)
+            self.assertEqual(valid.returncode, 0)
+            self.assertEqual(valid.stdout, ("a" * 40 + "\n").encode("ascii"))
+            self.assertEqual(valid.stderr, b"")
+
+            rejected_fixtures = (
+                (
+                    "wrong_repository",
+                    {**valid_run, "repository": {"full_name": "untrusted/repo"}},
+                    valid_workflow,
+                    valid_branch,
+                    "3",
+                ),
+                (
+                    "wrong_workflow",
+                    valid_run,
+                    {**valid_workflow, "path": ".github/workflows/other.yml"},
+                    valid_branch,
+                    "3",
+                ),
+                ("wrong_attempt", valid_run, valid_workflow, valid_branch, "4"),
+                (
+                    "stale_dev_head",
+                    valid_run,
+                    valid_workflow,
+                    {"commit": {"sha": "b" * 40}},
+                    "3",
+                ),
+            )
+            for name, run, workflow_record, branch, attempt in rejected_fixtures:
+                with self.subTest(case=name):
+                    rejected = execute(
+                        run,
+                        workflow_record,
+                        branch,
+                        attempt=attempt,
+                    )
+                    self.assertNotEqual(rejected.returncode, 0)
+                    self.assertEqual(rejected.stdout, b"")
+
+    def test_payload_bytecode_repair_uses_inherited_release_flock_under_stdin(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            with self._payload_bytecode_repair_fixture(Path(temporary)) as fixture:
+                unrelated_cwd = Path(temporary) / "unrelated"
+                unrelated_cwd.mkdir(mode=0o700)
+                paths = self._payload_bytecode_repair_paths(
+                    self._payload_bytecode_repair_module(), fixture
+                )
+                values = {
+                    "helper_path": str(
+                        SCRIPT.with_name("platform_live_qa_payload_bytecode_repair.py")
+                    ),
+                    "app_dir": str(paths.app_dir),
+                    "liveqa_root": str(paths.liveqa_root),
+                    "plan_root": str(paths.plan_root),
+                    "quarantine_root": str(paths.quarantine_root),
+                    "tool_root": str(paths.tool_root),
+                    "release_lock": str(fixture["release_lock_path"]),
+                    "active_sha": fixture["active_source_sha"],
+                    "runner_sha": fixture["runner_source_sha"],
+                }
+                script = f"""
+import importlib.util, json, sys
+from pathlib import Path
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location(
+    'bytecode_repair_stdin_child', {json.dumps(values['helper_path'])}
+)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+module.RELEASE_LOCK_PATH = Path({json.dumps(values['release_lock'])})
+module._assert_no_active_qa = lambda *_args: None
+paths = module.RepairPaths(
+    app_dir=Path({json.dumps(values['app_dir'])}),
+    liveqa_root=Path({json.dumps(values['liveqa_root'])}),
+    plan_root=Path({json.dumps(values['plan_root'])}),
+    quarantine_root=Path({json.dumps(values['quarantine_root'])}),
+    tool_root=Path({json.dumps(values['tool_root'])}),
+)
+result = module.prepare_repair_plan(
+    {json.dumps(values['active_sha'])}, {json.dumps(values['runner_sha'])}, paths
+)
+print(result['status'], result['extra_file_count'])
+"""
+                result = subprocess.run(
+                    [
+                        "/usr/bin/flock",
+                        str(fixture["release_lock_path"]),
+                        "/usr/bin/python3.12",
+                        "-I",
+                        "-B",
+                        "-",
+                    ],
+                    input=script,
+                    cwd=unrelated_cwd,
+                    env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=30,
+                )
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stdout.strip(), "prepared 2")
+                self.assertFalse(
+                    any(fixture["tool_root"].rglob("__pycache__"))
+                )
+
+    @contextmanager
+    def _isolated_payload_repair_locks(self, helper, fixture):
+        order: list[str] = []
+
+        def release_lock() -> None:
+            order.append("release")
+
+        def machine_lock(_paths, _runner_source_sha) -> int:
+            order.append("qa")
+            return os.open(
+                fixture["machine_lock_path"],
+                os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+
+        with mock.patch.object(
+            helper,
+            "_require_release_lock",
+            side_effect=release_lock,
+        ), mock.patch.object(
+            helper,
+            "_open_machine_lock",
+            side_effect=machine_lock,
+        ), mock.patch.object(
+            helper,
+            "_assert_no_active_qa",
+            return_value=None,
+        ):
+            yield order
+
+    @contextmanager
+    def _test_flocked_payload_validator(self, helper, fixture):
+        real_run = subprocess.run
+
+        def run_under_private_release_lock(command, *args, **kwargs):
+            if (
+                isinstance(command, (list, tuple))
+                and len(command) >= 3
+                and tuple(command[:3]) == ("/usr/bin/python3.12", "-I", "-B")
+            ):
+                command = [
+                    "/usr/bin/flock",
+                    str(fixture["release_lock_path"]),
+                    *command,
+                ]
+            return real_run(command, *args, **kwargs)
+
+        with mock.patch.object(
+            helper.subprocess,
+            "run",
+            side_effect=run_under_private_release_lock,
+        ):
+            yield
+
+    def _interrupt_payload_repair_subprocess(self, fixture, plan, mode: str) -> int:
+        values = {
+            "helper_path": str(SCRIPT.with_name("platform_live_qa_payload_bytecode_repair.py")),
+            "app_dir": str(fixture["app_dir"]),
+            "liveqa_root": str(fixture["trusted"]),
+            "plan_root": str(fixture["plan_root"]),
+            "quarantine_root": str(fixture["quarantine_root"]),
+            "tool_root": str(fixture["tool_root"]),
+            "release_lock": str(fixture["release_lock_path"]),
+            "active_sha": fixture["active_source_sha"],
+            "runner_sha": fixture["runner_source_sha"],
+            "plan_sha": plan["plan_sha256"],
+            "mode": mode,
+        }
+        script = f"""
+import importlib.util, json, os, sys
+from pathlib import Path
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location(
+    'bytecode_repair_interrupt_child', {json.dumps(values['helper_path'])}
+)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+module.RELEASE_LOCK_PATH = Path({json.dumps(values['release_lock'])})
+module._assert_no_pending_operations = lambda *_args: None
+module._assert_no_active_qa = lambda *_args: None
+module._validate_active_payload = lambda *_args: None
+interrupt_mode = {json.dumps(mode)}
+real_rename = module._rename_noreplace
+real_write_receipt = module._write_receipt
+real_write_exclusive = module._write_exclusive
+real_publish_initial = module._publish_initial_receipt
+real_replace = os.replace
+rename_count = 0
+def interrupt_rename(*args, **kwargs):
+    if interrupt_mode == 'prepared':
+        os._exit(81)
+    global rename_count
+    result = real_rename(*args, **kwargs)
+    rename_count += 1
+    if interrupt_mode == 'rollback_gap' and rename_count == 2:
+        os._exit(87)
+    return result
+def interrupt_receipt(path, value, expected_parent_identity):
+    if interrupt_mode == 'moved' and value.get('phase') == 'quarantined':
+        os._exit(82)
+    result = real_write_receipt(path, value, expected_parent_identity)
+    if interrupt_mode == 'quarantined' and value.get('phase') == 'quarantined':
+        os._exit(83)
+    return result
+def interrupt_write_exclusive(path, raw, **kwargs):
+    mode_bits = kwargs.get('mode', 0o600)
+    if interrupt_mode == 'initial_temp' and Path(path).name.startswith('.intent.json.'):
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode_bits)
+        try:
+            os.write(fd, raw[:max(1, len(raw) // 3)])
+            os.fchown(fd, 0, 0)
+            os.fchmod(fd, mode_bits)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os._exit(86)
+    if (
+        interrupt_mode in {'transition_temp_partial', 'transition_temp_zero'}
+        and Path(path).name.startswith('.intent.json.')
+        and json.loads(raw.decode('ascii')).get('phase') == 'quarantined'
+    ):
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode_bits)
+        try:
+            if interrupt_mode == 'transition_temp_partial':
+                os.write(fd, raw[:max(1, len(raw) // 3)])
+            os.fchown(fd, 0, 0)
+            os.fchmod(fd, mode_bits)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os._exit(88 if interrupt_mode == 'transition_temp_partial' else 89)
+    return real_write_exclusive(path, raw, **kwargs)
+def interrupt_initial_publish(path, value, expected_parent_identity):
+    if interrupt_mode == 'empty_qdir':
+        os._exit(85)
+    return real_publish_initial(path, value, expected_parent_identity)
+def fail_validation(*_args):
+    raise module.RepairError('validation_failed')
+def interrupt_replace(source, destination, *args, **kwargs):
+    if interrupt_mode == 'receipt_temp' and Path(source).name.startswith('.intent.json.') and Path(source).name.endswith('.tmp'):
+        os._exit(84)
+    return real_replace(source, destination, *args, **kwargs)
+module._rename_noreplace = interrupt_rename
+module._write_receipt = interrupt_receipt
+module._write_exclusive = interrupt_write_exclusive
+module._publish_initial_receipt = interrupt_initial_publish
+if interrupt_mode == 'rollback_gap':
+    module._validate_active_payload = fail_validation
+os.replace = interrupt_replace
+paths = module.RepairPaths(
+    app_dir=Path({json.dumps(values['app_dir'])}),
+    liveqa_root=Path({json.dumps(values['liveqa_root'])}),
+    plan_root=Path({json.dumps(values['plan_root'])}),
+    quarantine_root=Path({json.dumps(values['quarantine_root'])}),
+    tool_root=Path({json.dumps(values['tool_root'])}),
+)
+module.apply_repair_plan(
+    {json.dumps(values['plan_sha'])},
+    {json.dumps(values['active_sha'])},
+    {json.dumps(values['runner_sha'])},
+    paths,
+)
+os._exit(0)
+"""
+        completed = subprocess.run(
+            [
+                "/usr/bin/flock",
+                str(fixture["release_lock_path"]),
+                "/usr/bin/python3.12",
+                "-I",
+                "-B",
+                "-",
+            ],
+            input=script,
+            cwd="/",
+            env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+        self.assertEqual(completed.stdout, "")
+        return completed.returncode
+
+    def test_payload_bytecode_repair_roundtrip_preserves_payload(self) -> None:
+        helper = self._payload_bytecode_repair_module()
+
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            with self._payload_bytecode_repair_fixture(Path(temporary)) as fixture:
+                paths = self._payload_bytecode_repair_paths(helper, fixture)
+                expected = fixture["active_source_sha"]
+                runner = fixture["runner_source_sha"]
+                manifest_path = fixture["trusted"] / "active-manifest.json"
+                active_manifest_before = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+                pointers_before = tuple(
+                    (path.lstat().st_ino, os.readlink(path))
+                    for path in (
+                        fixture["app_dir"] / "current",
+                        fixture["app_dir"] / "previous",
+                        fixture["trusted"] / "active",
+                    )
+                )
+                original_bytes = {
+                    path.name: path.read_bytes()
+                    for path in fixture["cache_dir"].iterdir()
+                }
+                with (
+                    self._isolated_payload_repair_locks(helper, fixture) as lock_order,
+                    self._test_flocked_payload_validator(helper, fixture),
+                ):
+                    plan = helper.prepare_repair_plan(expected, runner, paths)
+                    plan_file = fixture["plan_root"] / f"{plan['plan_sha256']}.json"
+                    plan_stat = plan_file.lstat()
+                    self.assertEqual(stat.S_IMODE(plan_stat.st_mode), 0o600)
+                    self.assertEqual(
+                        (plan_stat.st_uid, plan_stat.st_gid, plan_stat.st_nlink),
+                        (0, 0, 1),
+                    )
+                    self.assertLessEqual(plan_stat.st_size, helper.MAX_PLAN_BYTES)
+                    plan_raw = plan_file.read_bytes()
+                    self.assertNotIn(str(Path(temporary)).encode(), plan_raw)
+                    plan_envelope = json.loads(plan_raw.decode("ascii"))
+                    self.assertEqual(set(plan_envelope), {"plan", "plan_sha256"})
+                    self.assertEqual(
+                        set(plan_envelope["plan"]),
+                        {
+                            "schema",
+                            "runner_source_sha",
+                            "active_source_sha",
+                            "current_release",
+                            "previous_release",
+                            "active_manifest_sha256",
+                            "payload_tree_sha256",
+                            "cache_dir",
+                            "extra_files",
+                        },
+                    )
+                    self.assertEqual(
+                        [
+                            entry["relative_path"]
+                            for entry in plan_envelope["plan"]["extra_files"]
+                        ],
+                        sorted(helper.EXTRA_FILE_RELATIVES),
+                    )
+                    self.assertEqual(
+                        plan,
+                        {
+                            "status": "prepared",
+                            "plan_sha256": plan["plan_sha256"],
+                            "extra_file_count": 2,
+                        },
+                    )
+                    result = helper.apply_repair_plan(
+                        plan["plan_sha256"], expected, runner, paths
+                    )
+                self.assertEqual(lock_order, ["release", "qa", "release", "qa"])
+
+                self.assertEqual(
+                    result,
+                    {
+                        "status": "validated",
+                        "plan_sha256": plan["plan_sha256"],
+                        "quarantined_file_count": 2,
+                    },
+                )
+                self.assertFalse(fixture["cache_dir"].exists())
+                quarantined = list(fixture["quarantine_root"].rglob("*.pyc"))
+                self.assertEqual(
+                    {path.name: path.read_bytes() for path in quarantined},
+                    original_bytes,
+                )
+                self.assertEqual(
+                    hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+                    active_manifest_before,
+                )
+                self.assertEqual(
+                    tuple(
+                        (path.lstat().st_ino, os.readlink(path))
+                        for path in (
+                            fixture["app_dir"] / "current",
+                            fixture["app_dir"] / "previous",
+                            fixture["trusted"] / "active",
+                        )
+                    ),
+                    pointers_before,
+                )
+                runtime._validate_payload(
+                    fixture["manifest"],
+                    app_dir=fixture["app_dir"],
+                    validate_provider=False,
+                )
+                quarantine = fixture["quarantine_root"] / plan["plan_sha256"]
+                before_retry = {
+                    path.relative_to(quarantine).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in quarantine.rglob("*")
+                    if path.is_file()
+                }
+                quarantine_identity_before_retry = (
+                    quarantine.lstat().st_dev,
+                    quarantine.lstat().st_ino,
+                    quarantine.lstat().st_mtime_ns,
+                    quarantine.lstat().st_ctime_ns,
+                )
+                with (
+                    self._isolated_payload_repair_locks(helper, fixture),
+                    self._test_flocked_payload_validator(helper, fixture),
+                ):
+                    retry = helper.apply_repair_plan(
+                        plan["plan_sha256"], expected, runner, paths
+                    )
+                self.assertEqual(retry, result)
+                self.assertEqual(
+                    {
+                        path.relative_to(quarantine).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                        for path in quarantine.rglob("*")
+                        if path.is_file()
+                    },
+                    before_retry,
+                )
+                quarantine_after_retry = quarantine.lstat()
+                self.assertEqual(
+                    (
+                        quarantine_after_retry.st_dev,
+                        quarantine_after_retry.st_ino,
+                        quarantine_after_retry.st_mtime_ns,
+                        quarantine_after_retry.st_ctime_ns,
+                    ),
+                    quarantine_identity_before_retry,
+                )
+                self.assertFalse(
+                    any((fixture["payload"] / "platform/tools").rglob("__pycache__"))
+                )
+
+    def test_payload_bytecode_repair_resumes_persisted_crash_boundaries(self) -> None:
+        helper = self._payload_bytecode_repair_module()
+
+        for mode, exit_code, phase, cache_in_quarantine in (
+            ("prepared", 81, "prepared", False),
+            ("moved", 82, "prepared", True),
+            ("quarantined", 83, "quarantined", True),
+            ("receipt_temp", 84, "prepared", True),
+            ("transition_temp_partial", 88, "prepared", True),
+            ("transition_temp_zero", 89, "prepared", True),
+            ("empty_qdir", 85, None, False),
+            ("initial_temp", 86, None, False),
+            ("rollback_gap", 87, "quarantined", False),
+        ):
+            with self.subTest(interruption=mode), tempfile.TemporaryDirectory(dir="/root") as temporary:
+                with self._payload_bytecode_repair_fixture(Path(temporary)) as fixture:
+                    paths = self._payload_bytecode_repair_paths(helper, fixture)
+                    expected = fixture["active_source_sha"]
+                    runner = fixture["runner_source_sha"]
+                    with self._isolated_payload_repair_locks(helper, fixture):
+                        plan = helper.prepare_repair_plan(expected, runner, paths)
+
+                    self.assertEqual(
+                        self._interrupt_payload_repair_subprocess(fixture, plan, mode),
+                        exit_code,
+                    )
+                    quarantine = fixture["quarantine_root"] / plan["plan_sha256"]
+                    receipt_path = quarantine / "intent.json"
+                    if phase is None:
+                        self.assertFalse(receipt_path.exists())
+                        if mode in {"initial_temp", "transition_temp_partial", "transition_temp_zero"}:
+                            temps = list(quarantine.glob(".intent.json.*.tmp"))
+                            self.assertEqual(len(temps), 1)
+                            if mode == "transition_temp_zero":
+                                self.assertEqual(temps[0].stat().st_size, 0)
+                            else:
+                                self.assertGreater(temps[0].stat().st_size, 0)
+                                self.assertLess(temps[0].stat().st_size, 200)
+                        else:
+                            self.assertEqual(list(quarantine.iterdir()), [])
+                        with (
+                            self._isolated_payload_repair_locks(helper, fixture),
+                            self._test_flocked_payload_validator(helper, fixture),
+                        ):
+                            result = helper.apply_repair_plan(
+                                plan["plan_sha256"], expected, runner, paths
+                            )
+                        self.assertEqual(result["status"], "validated")
+                        self.assertFalse(fixture["cache_dir"].exists())
+                        self.assertEqual(
+                            {entry.name for entry in quarantine.iterdir()},
+                            {"intent.json", "bytecode-cache"},
+                        )
+                        self.assertEqual(
+                            json.loads(receipt_path.read_text(encoding="ascii"))["phase"],
+                            "validated",
+                        )
+                        self.assertTrue((quarantine / "bytecode-cache").is_dir())
+                        continue
+
+                    if mode == "rollback_gap":
+                        self.assertFalse((quarantine / "bytecode-cache").exists())
+                        self.assertTrue(fixture["cache_dir"].is_dir())
+                        with self._isolated_payload_repair_locks(helper, fixture):
+                            self._assert_payload_repair_refusal(
+                                helper,
+                                "plan_mismatch",
+                                lambda: helper.apply_repair_plan(
+                                    plan["plan_sha256"], expected, runner, paths
+                                ),
+                            )
+                        repaired_receipt = json.loads(
+                            receipt_path.read_text(encoding="ascii")
+                        )
+                        self.assertEqual(repaired_receipt["phase"], "rolled_back")
+                        with (
+                            self._isolated_payload_repair_locks(helper, fixture),
+                            self._test_flocked_payload_validator(helper, fixture),
+                        ):
+                            fresh_plan = helper.prepare_repair_plan(expected, runner, paths)
+                            result = helper.apply_repair_plan(
+                                fresh_plan["plan_sha256"], expected, runner, paths
+                            )
+                        self.assertNotEqual(fresh_plan["plan_sha256"], plan["plan_sha256"])
+                        self.assertEqual(result["status"], "validated")
+                        continue
+
+                    receipt = json.loads(receipt_path.read_text(encoding="ascii"))
+                    self.assertEqual(
+                        set(receipt),
+                        {"schema", "plan_sha256", "phase", "quarantine_identity"},
+                    )
+                    self.assertEqual(receipt["phase"], phase)
+                    self.assertEqual(receipt["plan_sha256"], plan["plan_sha256"])
+                    if mode == "receipt_temp":
+                        temporary_receipts = list(quarantine.glob(".intent.json.*.tmp"))
+                        self.assertEqual(len(temporary_receipts), 1)
+                    self.assertEqual(
+                        (fixture["cache_dir"].exists(), (quarantine / "bytecode-cache").exists()),
+                        (not cache_in_quarantine, cache_in_quarantine),
+                    )
+
+                    with (
+                        self._isolated_payload_repair_locks(helper, fixture),
+                        self._test_flocked_payload_validator(helper, fixture),
+                    ):
+                        result = helper.apply_repair_plan(
+                            plan["plan_sha256"], expected, runner, paths
+                        )
+                    self.assertEqual(result["status"], "validated")
+                    self.assertFalse(fixture["cache_dir"].exists())
+                    self.assertTrue((quarantine / "bytecode-cache").is_dir())
+                    final_receipt = json.loads(receipt_path.read_text(encoding="ascii"))
+                    self.assertEqual(final_receipt["phase"], "validated")
+                    self.assertEqual(list(quarantine.glob(".intent.json.*.tmp")), [])
+                    runtime._validate_payload(
+                        fixture["manifest"],
+                        app_dir=fixture["app_dir"],
+                        validate_provider=False,
+                    )
+
+    def test_payload_bytecode_repair_refuses_ambiguous_and_spent_resume_states(self) -> None:
+        helper = self._payload_bytecode_repair_module()
+
+        def prepare(fixture, paths):
+            with self._isolated_payload_repair_locks(helper, fixture):
+                return helper.prepare_repair_plan(
+                    fixture["active_source_sha"], fixture["runner_source_sha"], paths
+                )
+
+        def apply(fixture, paths, plan):
+            return helper.apply_repair_plan(
+                plan["plan_sha256"],
+                fixture["active_source_sha"],
+                fixture["runner_source_sha"],
+                paths,
+            )
+
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            with self._payload_bytecode_repair_fixture(Path(temporary)) as fixture:
+                paths = self._payload_bytecode_repair_paths(helper, fixture)
+                plan = prepare(fixture, paths)
+                self.assertEqual(
+                    self._interrupt_payload_repair_subprocess(fixture, plan, "moved"),
+                    82,
+                )
+                fixture["cache_dir"].mkdir(mode=0o755)
+                with self._isolated_payload_repair_locks(helper, fixture):
+                    self._assert_payload_repair_refusal(
+                        helper,
+                        "quarantine_exists",
+                        lambda: apply(fixture, paths, plan),
+                    )
+
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            with self._payload_bytecode_repair_fixture(Path(temporary)) as fixture:
+                paths = self._payload_bytecode_repair_paths(helper, fixture)
+                plan = prepare(fixture, paths)
+                self.assertEqual(
+                    self._interrupt_payload_repair_subprocess(fixture, plan, "initial_temp"),
+                    86,
+                )
+                quarantine = fixture["quarantine_root"] / plan["plan_sha256"]
+                partial_temp = next(quarantine.glob(".intent.json.*.tmp"))
+                external_link = fixture["quarantine_root"] / "external-temp-link"
+                os.link(partial_temp, external_link)
+                with self._isolated_payload_repair_locks(helper, fixture):
+                    self._assert_payload_repair_refusal(
+                        helper,
+                        "manifest_mismatch",
+                        lambda: apply(fixture, paths, plan),
+                    )
+                self.assertTrue(partial_temp.exists())
+                self.assertTrue(external_link.exists())
+
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            with self._payload_bytecode_repair_fixture(Path(temporary)) as fixture:
+                paths = self._payload_bytecode_repair_paths(helper, fixture)
+                plan = prepare(fixture, paths)
+                self.assertEqual(
+                    self._interrupt_payload_repair_subprocess(
+                        fixture, plan, "transition_temp_partial"
+                    ),
+                    88,
+                )
+                quarantine = fixture["quarantine_root"] / plan["plan_sha256"]
+                partial_temp = next(quarantine.glob(".intent.json.*.tmp"))
+                partial_temp.write_bytes(b"not a canonical transition prefix")
+                with self._isolated_payload_repair_locks(helper, fixture):
+                    self._assert_payload_repair_refusal(
+                        helper,
+                        "quarantine_exists",
+                        lambda: apply(fixture, paths, plan),
+                    )
+                self.assertTrue(partial_temp.exists())
+
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            with self._payload_bytecode_repair_fixture(Path(temporary)) as fixture:
+                paths = self._payload_bytecode_repair_paths(helper, fixture)
+                plan = prepare(fixture, paths)
+                self.assertEqual(
+                    self._interrupt_payload_repair_subprocess(fixture, plan, "prepared"),
+                    81,
+                )
+                receipt_path = (
+                    fixture["quarantine_root"] / plan["plan_sha256"] / "intent.json"
+                )
+                receipt = json.loads(receipt_path.read_text(encoding="ascii"))
+                receipt["quarantine_identity"]["inode"] += 1
+                receipt_path.write_text(
+                    json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n",
+                    encoding="ascii",
+                )
+                os.chmod(receipt_path, 0o600)
+                with self._isolated_payload_repair_locks(helper, fixture):
+                    self._assert_payload_repair_refusal(
+                        helper,
+                        "quarantine_exists",
+                        lambda: apply(fixture, paths, plan),
+                    )
+
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            with self._payload_bytecode_repair_fixture(Path(temporary)) as fixture:
+                paths = self._payload_bytecode_repair_paths(helper, fixture)
+                plan = prepare(fixture, paths)
+                self.assertEqual(
+                    self._interrupt_payload_repair_subprocess(fixture, plan, "moved"),
+                    82,
+                )
+                quarantine = fixture["quarantine_root"] / plan["plan_sha256"]
+                (quarantine / "unexpected-state").write_text("x", encoding="ascii")
+                with self._isolated_payload_repair_locks(helper, fixture):
+                    self._assert_payload_repair_refusal(
+                        helper,
+                        "quarantine_exists",
+                        lambda: apply(fixture, paths, plan),
+                    )
+
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            with self._payload_bytecode_repair_fixture(Path(temporary)) as fixture:
+                paths = self._payload_bytecode_repair_paths(helper, fixture)
+                plan = prepare(fixture, paths)
+                self.assertEqual(
+                    self._interrupt_payload_repair_subprocess(fixture, plan, "prepared"),
+                    81,
+                )
+                shutil.rmtree(fixture["cache_dir"])
+                with self._isolated_payload_repair_locks(helper, fixture):
+                    self._assert_payload_repair_refusal(
+                        helper,
+                        "quarantine_exists",
+                        lambda: apply(fixture, paths, plan),
+                    )
+
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            with self._payload_bytecode_repair_fixture(Path(temporary)) as fixture:
+                paths = self._payload_bytecode_repair_paths(helper, fixture)
+                expected = fixture["active_source_sha"]
+                runner = fixture["runner_source_sha"]
+                plan = prepare(fixture, paths)
+                with (
+                    self._isolated_payload_repair_locks(helper, fixture),
+                    mock.patch.object(
+                        helper,
+                        "_validate_active_payload",
+                        side_effect=helper.RepairError("validation_failed"),
+                    ),
+                ):
+                    self._assert_payload_repair_refusal(
+                        helper,
+                        "validation_failed",
+                        lambda: apply(fixture, paths, plan),
+                    )
+                quarantine = fixture["quarantine_root"] / plan["plan_sha256"]
+                receipt = json.loads((quarantine / "intent.json").read_text(encoding="ascii"))
+                self.assertEqual(receipt["phase"], "rolled_back")
+                self.assertTrue(fixture["cache_dir"].is_dir())
+                with self._isolated_payload_repair_locks(helper, fixture):
+                    self._assert_payload_repair_refusal(
+                        helper,
+                        "plan_mismatch",
+                        lambda: apply(fixture, paths, plan),
+                    )
+                    fresh_plan = helper.prepare_repair_plan(expected, runner, paths)
+                self.assertNotEqual(fresh_plan["plan_sha256"], plan["plan_sha256"])
+                with (
+                    self._isolated_payload_repair_locks(helper, fixture),
+                    self._test_flocked_payload_validator(helper, fixture),
+                ):
+                    fresh_result = helper.apply_repair_plan(
+                        fresh_plan["plan_sha256"], expected, runner, paths
+                    )
+                self.assertEqual(fresh_result["status"], "validated")
+
+    def test_payload_bytecode_repair_rechecks_plan_payload_and_pointer_identity(self) -> None:
+        helper = self._payload_bytecode_repair_module()
+
+        def exercise(
+            case: str,
+            expected_reason: str,
+            mutate_before,
+            mutate_after=None,
+            apply_operation=None,
+        ) -> None:
+            with self.subTest(case=case), tempfile.TemporaryDirectory(dir="/root") as temporary:
+                with self._payload_bytecode_repair_fixture(Path(temporary)) as fixture:
+                    paths = self._payload_bytecode_repair_paths(helper, fixture)
+                    expected = fixture["active_source_sha"]
+                    runner = fixture["runner_source_sha"]
+                    with self._isolated_payload_repair_locks(helper, fixture):
+                        plan = None
+                        if mutate_after is not None or apply_operation is not None:
+                            plan = helper.prepare_repair_plan(expected, runner, paths)
+                            if mutate_after is not None:
+                                mutate_after(fixture, plan)
+                            operation = (
+                                apply_operation(fixture, plan, paths)
+                                if apply_operation is not None
+                                else lambda: helper.apply_repair_plan(
+                                    plan["plan_sha256"], expected, runner, paths
+                                )
+                            )
+                        else:
+                            mutate_before(fixture)
+
+                            def operation():
+                                return helper.prepare_repair_plan(expected, runner, paths)
+                        self._assert_payload_repair_refusal(
+                            helper,
+                            expected_reason,
+                            operation,
+                        )
+
+        def remove_expected(fixture) -> None:
+            next(fixture["cache_dir"].glob("platform_live_qa_guard.*.pyc")).unlink()
+
+        def add_file(fixture) -> None:
+            (fixture["cache_dir"] / "unexpected.pyc").write_bytes(b"extra\n")
+
+        def add_directory(fixture) -> None:
+            (fixture["cache_dir"] / "nested").mkdir()
+
+        def add_top_level_empty_directory(fixture) -> None:
+            (fixture["payload"] / "unexpected-empty").mkdir(mode=0o755)
+
+        def add_symlink(fixture) -> None:
+            (fixture["cache_dir"] / "unexpected.pyc").symlink_to(
+                "platform_live_qa_guard.cpython-312.pyc"
+            )
+
+        def add_hardlink(fixture) -> None:
+            cache = next(fixture["cache_dir"].glob("platform_live_qa_guard.*.pyc"))
+            outside = fixture["cache_dir"].parent / "linked-bytecode"
+            outside.write_bytes(cache.read_bytes())
+            cache.unlink()
+            os.link(outside, cache)
+
+        def change_mode(fixture) -> None:
+            cache = next(fixture["cache_dir"].glob("platform_live_qa_guard.*.pyc"))
+            os.chmod(cache, 0o600)
+
+        def change_owner(fixture) -> None:
+            cache = next(fixture["cache_dir"].glob("platform_live_qa_guard.*.pyc"))
+            os.chown(cache, 65534, 65534)
+
+        def change_expected_file(fixture, _plan) -> None:
+            cache = next(fixture["cache_dir"].glob("platform_live_qa_guard.*.pyc"))
+            cache.write_bytes(b"replaced after planning\n")
+
+        def change_pointer(fixture, _plan) -> None:
+            pointer = fixture["app_dir"] / "current"
+            pointer.unlink()
+            pointer.symlink_to(fixture["app_dir"] / "releases" / "release-missing")
+
+        def change_manifest(fixture, _plan) -> None:
+            manifest = fixture["trusted"] / "active-manifest.json"
+            os.chmod(manifest, 0o644)
+            manifest.write_bytes(manifest.read_bytes() + b" ")
+            os.chmod(manifest, 0o444)
+
+        def change_previous_pointer(fixture, _plan) -> None:
+            previous_release = fixture["app_dir"] / "releases" / "release-dddddddd"
+            previous_release.mkdir(mode=0o755)
+            (previous_release / "RELEASE.json").write_text(
+                json.dumps(
+                    {
+                        "source_git_commit": "d" * 40,
+                        "release_slug": previous_release.name,
+                    }
+                )
+                + "\n",
+                encoding="ascii",
+            )
+            os.chmod(previous_release / "RELEASE.json", 0o444)
+            pointer = fixture["app_dir"] / "previous"
+            pointer.unlink()
+            pointer.symlink_to(previous_release)
+
+        def change_plan(fixture, _plan) -> None:
+            plan_files = list(fixture["plan_root"].iterdir())
+            self.assertEqual(len(plan_files), 1)
+            envelope = json.loads(plan_files[0].read_text(encoding="ascii"))
+            envelope["plan"]["runner_source_sha"] = "e" * 40
+            plan_files[0].write_text(
+                json.dumps(envelope, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="ascii",
+            )
+
+        def replace_cache_directory(fixture, _plan) -> None:
+            original = fixture["cache_dir"]
+            backup = fixture["payload"].parent / "__cache_backup"
+            original.rename(backup)
+            original.mkdir(mode=0o755)
+            for entry in backup.iterdir():
+                destination = original / entry.name
+                destination.write_bytes(entry.read_bytes())
+                os.chmod(destination, 0o644)
+
+        def occupy_quarantine(fixture, plan) -> None:
+            quarantine = fixture["quarantine_root"] / plan["plan_sha256"]
+            quarantine.mkdir(mode=0o700)
+            (quarantine / "unrecognized").write_text("x", encoding="ascii")
+
+        def apply_wrong_source(fixture, plan, paths):
+            return lambda: helper.apply_repair_plan(
+                plan["plan_sha256"],
+                "d" * 40,
+                fixture["runner_source_sha"],
+                paths,
+            )
+
+        def apply_wrong_runner(fixture, plan, paths):
+            return lambda: helper.apply_repair_plan(
+                plan["plan_sha256"],
+                fixture["active_source_sha"],
+                "e" * 40,
+                paths,
+            )
+
+        cases = (
+            ("missing_expected", "unexpected_tree", remove_expected, None),
+            ("third_file", "unexpected_tree", add_file, None),
+            ("third_directory", "manifest_mismatch", add_directory, None),
+            (
+                "top_level_empty_directory",
+                "manifest_mismatch",
+                add_top_level_empty_directory,
+                None,
+            ),
+            ("symlink", "unexpected_tree", add_symlink, None),
+            ("hardlink", "manifest_mismatch", add_hardlink, None),
+            ("mode_drift", "extra_identity_mismatch", change_mode, None),
+            ("owner_drift", "manifest_mismatch", change_owner, None),
+            ("post_plan_file_change", "extra_identity_mismatch", None, change_expected_file),
+            ("pointer_change", "pointer_mismatch", None, change_pointer),
+            ("manifest_change", "plan_mismatch", None, change_manifest),
+            ("previous_pointer_change", "plan_mismatch", None, change_previous_pointer),
+            ("plan_change", "plan_mismatch", None, change_plan),
+            (
+                "cache_directory_replacement",
+                "extra_identity_mismatch",
+                None,
+                replace_cache_directory,
+            ),
+            ("quarantine_collision", "quarantine_exists", None, occupy_quarantine),
+            ("wrong_active_sha_on_apply", "plan_mismatch", None, None, apply_wrong_source),
+            (
+                "wrong_runner_sha_on_apply",
+                "source_bundle_mismatch",
+                None,
+                None,
+                apply_wrong_runner,
+            ),
+        )
+        for case_entry in cases:
+            case, reason, before, after = case_entry[:4]
+            apply_operation = case_entry[4] if len(case_entry) == 5 else None
+            exercise(case, reason, before, after, apply_operation)
+
+    def test_payload_bytecode_repair_binds_requested_sources_and_refuses_busy_state(self) -> None:
+        helper = self._payload_bytecode_repair_module()
+
+        for guard_name, reason in (
+            ("_assert_no_pending_operations", "pending_operation"),
+            ("_assert_no_active_qa", "qa_busy"),
+        ):
+            with (
+                self.subTest(guard=guard_name),
+                tempfile.TemporaryDirectory(dir="/root") as temporary,
+            ):
+                with self._payload_bytecode_repair_fixture(Path(temporary)) as fixture:
+                    paths = self._payload_bytecode_repair_paths(helper, fixture)
+                    with self._isolated_payload_repair_locks(helper, fixture), mock.patch.object(
+                        helper,
+                        guard_name,
+                        side_effect=helper.RepairError(reason),
+                    ):
+                        self._assert_payload_repair_refusal(
+                            helper,
+                            reason,
+                            lambda: helper.prepare_repair_plan(
+                                fixture["active_source_sha"],
+                                fixture["runner_source_sha"],
+                                paths,
+                            ),
+                        )
+
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            with self._payload_bytecode_repair_fixture(Path(temporary)) as fixture:
+                paths = self._payload_bytecode_repair_paths(helper, fixture)
+                with mock.patch.object(
+                    helper,
+                    "_require_release_lock",
+                    side_effect=helper.RepairError("lock_unavailable"),
+                ):
+                    self._assert_payload_repair_refusal(
+                        helper,
+                        "lock_unavailable",
+                        lambda: helper.prepare_repair_plan(
+                            fixture["active_source_sha"],
+                            fixture["runner_source_sha"],
+                            paths,
+                        ),
+                    )
+
+    def test_payload_bytecode_repair_uses_verified_guard_and_fails_closed_on_stale_qa(self) -> None:
+        helper = self._payload_bytecode_repair_module()
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            with self._payload_bytecode_repair_fixture(Path(temporary)) as fixture:
+                paths = self._payload_bytecode_repair_paths(helper, fixture)
+                expected = fixture["active_source_sha"]
+                runner = fixture["runner_source_sha"]
+                namespace = helper._load_verified_guard(paths, runner)
+                self.assertIn("assert_liveqa_idle", namespace)
+                self.assertIn("_assert_runtime_unit_collected", namespace)
+                self.assertFalse(
+                    any(fixture["tool_root"].rglob("__pycache__"))
+                )
+
+                # Exercise the real guard's conjunction with injected closed
+                # process inventories, without reading production cgroup or
+                # UID state from this test process.
+                namespace["_assert_runtime_unit_collected"] = lambda: None
+                for probe_name in (
+                    "_liveqa_cgroup_process_ids",
+                    "_liveqa_process_ids",
+                ):
+                    with self.subTest(stale_boundary=probe_name):
+                        namespace["_liveqa_cgroup_process_ids"] = lambda: ()
+                        namespace["_liveqa_process_ids"] = lambda: ()
+                        namespace[probe_name] = lambda: (4242,)
+                        with mock.patch.object(
+                            helper,
+                            "_load_verified_guard",
+                            return_value=namespace,
+                        ):
+                            self._assert_payload_repair_refusal(
+                                helper,
+                                "qa_busy",
+                                lambda: helper._assert_no_active_qa(paths, runner),
+                            )
+
+                namespace["_liveqa_cgroup_process_ids"] = lambda: ()
+                namespace["_liveqa_process_ids"] = lambda: ()
+
+                def transient_unit_present() -> None:
+                    raise RuntimeError("closed test refusal")
+
+                namespace["_assert_runtime_unit_collected"] = transient_unit_present
+                with mock.patch.object(
+                    helper,
+                    "_load_verified_guard",
+                    return_value=namespace,
+                ):
+                    self._assert_payload_repair_refusal(
+                        helper,
+                        "qa_busy",
+                        lambda: helper._assert_no_active_qa(paths, runner),
+                    )
+
+                with self._isolated_payload_repair_locks(helper, fixture), mock.patch.object(
+                    helper,
+                    "_assert_no_active_qa",
+                    return_value=None,
+                ):
+                    self.assertEqual(
+                        helper.prepare_repair_plan(expected, runner, paths)["status"],
+                        "prepared",
+                    )
+
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            with self._payload_bytecode_repair_fixture(Path(temporary)) as fixture:
+                paths = self._payload_bytecode_repair_paths(helper, fixture)
+                expected = fixture["active_source_sha"]
+                runner = fixture["runner_source_sha"]
+                with self._isolated_payload_repair_locks(helper, fixture):
+                    self._assert_payload_repair_refusal(
+                        helper,
+                        "pointer_mismatch",
+                        lambda: helper.prepare_repair_plan("d" * 40, runner, paths),
+                    )
+                    plan = helper.prepare_repair_plan(expected, runner, paths)
+                    self._assert_payload_repair_refusal(
+                        helper,
+                        "plan_mismatch",
+                        lambda: helper.apply_repair_plan(
+                            plan["plan_sha256"], "d" * 40, runner, paths
+                        ),
+                    )
+                    self._assert_payload_repair_refusal(
+                        helper,
+                        "source_bundle_mismatch",
+                        lambda: helper.apply_repair_plan(
+                            plan["plan_sha256"], expected, "e" * 40, paths
+                        ),
+                    )
+                    self._assert_payload_repair_refusal(
+                        helper,
+                        "runner_mismatch",
+                        lambda: helper.apply_repair_plan(
+                            plan["plan_sha256"], expected, "invalid", paths
+                        ),
+                    )
+
+    def test_payload_bytecode_repair_restores_exact_cache_on_postcheck_failure(self) -> None:
+        helper = self._payload_bytecode_repair_module()
+
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            with self._payload_bytecode_repair_fixture(Path(temporary)) as fixture:
+                paths = self._payload_bytecode_repair_paths(helper, fixture)
+                expected = fixture["active_source_sha"]
+                runner = fixture["runner_source_sha"]
+                before_identity = fixture["cache_dir"].lstat().st_ino
+                before_bytes = {
+                    path.name: path.read_bytes()
+                    for path in fixture["cache_dir"].iterdir()
+                }
+                with self._isolated_payload_repair_locks(helper, fixture):
+                    plan = helper.prepare_repair_plan(expected, runner, paths)
+                    with mock.patch.object(
+                        helper,
+                        "_validate_active_payload",
+                        side_effect=helper.RepairError("validation_failed"),
+                    ):
+                        self._assert_payload_repair_refusal(
+                            helper,
+                            "validation_failed",
+                            lambda: helper.apply_repair_plan(
+                                plan["plan_sha256"], expected, runner, paths
+                            ),
+                        )
+
+                self.assertEqual(fixture["cache_dir"].lstat().st_ino, before_identity)
+                self.assertEqual(
+                    {path.name: path.read_bytes() for path in fixture["cache_dir"].iterdir()},
+                    before_bytes,
+                )
+                self.assertFalse(
+                    any(fixture["quarantine_root"].rglob("*.pyc"))
+                )
+
+    def test_payload_bytecode_repair_receipt_failures_follow_commit_boundary(self) -> None:
+        helper = self._payload_bytecode_repair_module()
+        for failure_phase in ("intent", "quarantined", "validated"):
+            with (
+                self.subTest(receipt_phase=failure_phase),
+                tempfile.TemporaryDirectory(dir="/root") as temporary,
+            ):
+                with self._payload_bytecode_repair_fixture(Path(temporary)) as fixture:
+                    paths = self._payload_bytecode_repair_paths(helper, fixture)
+                    expected = fixture["active_source_sha"]
+                    runner = fixture["runner_source_sha"]
+                    cache_dir = fixture["cache_dir"]
+                    cache_inode = cache_dir.lstat().st_ino
+                    original_bytes = {
+                        path.name: path.read_bytes() for path in cache_dir.iterdir()
+                    }
+                    with self._isolated_payload_repair_locks(helper, fixture):
+                        plan = helper.prepare_repair_plan(expected, runner, paths)
+                        if failure_phase == "intent":
+                            def fail_intent(_path, _value, _parent_identity):
+                                raise helper.RepairError("plan_unavailable")
+
+                            with mock.patch.object(
+                                helper,
+                                "_publish_initial_receipt",
+                                side_effect=fail_intent,
+                            ):
+                                self._assert_payload_repair_refusal(
+                                    helper,
+                                    "plan_unavailable",
+                                    lambda: helper.apply_repair_plan(
+                                        plan["plan_sha256"], expected, runner, paths
+                                    ),
+                                )
+                            self.assertEqual(cache_dir.lstat().st_ino, cache_inode)
+                            self.assertEqual(
+                                {path.name: path.read_bytes() for path in cache_dir.iterdir()},
+                                original_bytes,
+                            )
+                            self.assertEqual(list(fixture["quarantine_root"].iterdir()), [])
+                            with self._test_flocked_payload_validator(helper, fixture):
+                                result = helper.apply_repair_plan(
+                                    plan["plan_sha256"], expected, runner, paths
+                                )
+                            self.assertEqual(result["status"], "validated")
+                            continue
+
+                        write_receipt = helper._write_receipt
+
+                        def fail_receipt(path, value, expected_parent_identity):
+                            if value.get("phase") == failure_phase:
+                                raise helper.RepairError("receipt_write_failed")
+                            return write_receipt(path, value, expected_parent_identity)
+
+                        validator = mock.patch.object(
+                            helper,
+                            "_validate_active_payload",
+                            wraps=helper._validate_active_payload,
+                        )
+                        with (
+                            mock.patch.object(
+                                helper,
+                                "_write_receipt",
+                                side_effect=fail_receipt,
+                            ),
+                            validator as validate_payload,
+                            self._test_flocked_payload_validator(helper, fixture),
+                        ):
+                            self._assert_payload_repair_refusal(
+                                helper,
+                                "receipt_write_failed",
+                                lambda: helper.apply_repair_plan(
+                                    plan["plan_sha256"], expected, runner, paths
+                                ),
+                            )
+
+                        quarantine_dir = fixture["quarantine_root"] / plan["plan_sha256"]
+                        if failure_phase == "quarantined":
+                            self.assertEqual(validate_payload.call_count, 0)
+                            self.assertEqual(cache_dir.lstat().st_ino, cache_inode)
+                            self.assertEqual(
+                                {path.name: path.read_bytes() for path in cache_dir.iterdir()},
+                                original_bytes,
+                            )
+                            self.assertFalse(
+                                any(quarantine_dir.rglob("*.pyc"))
+                            )
+                            receipt = json.loads(
+                                (quarantine_dir / "intent.json").read_text(encoding="ascii")
+                            )
+                            self.assertEqual(receipt["phase"], "rolled_back")
+                        else:
+                            self.assertEqual(validate_payload.call_count, 1)
+                            self.assertFalse(cache_dir.exists())
+                            self.assertEqual(
+                                {path.name: path.read_bytes() for path in quarantine_dir.rglob("*.pyc")},
+                                original_bytes,
+                            )
+                            runtime._validate_payload(
+                                fixture["manifest"],
+                                app_dir=fixture["app_dir"],
+                                validate_provider=False,
+                            )
+                            self.assertFalse(
+                                any(
+                                    (fixture["payload"] / "platform/tools").rglob("__pycache__")
+                                )
+                            )
+
+    def test_payload_bytecode_repair_no_replace_and_rollback_collisions(self) -> None:
+        helper = self._payload_bytecode_repair_module()
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            source_parent = root / "source-parent"
+            destination_parent = root / "destination-parent"
+            source_parent.mkdir(mode=0o700)
+            destination_parent.mkdir(mode=0o700)
+            source = source_parent / "cache"
+            destination = destination_parent / "cache"
+            source.mkdir(mode=0o700)
+            destination.mkdir(mode=0o700)
+            (source / "source-marker").write_bytes(b"source\n")
+            (destination / "destination-marker").write_bytes(b"destination\n")
+            source_identity = helper._identity(source.lstat())
+            destination_inode = destination.lstat().st_ino
+            with self.assertRaises(helper.RepairError) as raised:
+                helper._rename_noreplace(
+                    source_parent,
+                    source.name,
+                    destination_parent,
+                    destination.name,
+                    source_identity,
+                    failure_reason="extra_identity_mismatch",
+                )
+            self.assertEqual(raised.exception.reason, "quarantine_exists")
+            self.assertEqual(source.lstat().st_ino, source_identity["inode"])
+            self.assertEqual(destination.lstat().st_ino, destination_inode)
+            self.assertEqual((destination / "destination-marker").read_bytes(), b"destination\n")
+
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            with self._payload_bytecode_repair_fixture(Path(temporary)) as fixture:
+                paths = self._payload_bytecode_repair_paths(helper, fixture)
+                expected = fixture["active_source_sha"]
+                runner = fixture["runner_source_sha"]
+                cache_dir = fixture["cache_dir"]
+                original_inode = cache_dir.lstat().st_ino
+                original_bytes = {
+                    path.name: path.read_bytes() for path in cache_dir.iterdir()
+                }
+
+                def inject_rollback_collision(_paths, _source_sha) -> None:
+                    cache_dir.mkdir(mode=0o755)
+                    (cache_dir / "racer-marker").write_bytes(b"racer\n")
+                    raise helper.RepairError("validation_failed")
+
+                with self._isolated_payload_repair_locks(helper, fixture):
+                    plan = helper.prepare_repair_plan(expected, runner, paths)
+                    with mock.patch.object(
+                        helper,
+                        "_validate_active_payload",
+                        side_effect=inject_rollback_collision,
+                    ):
+                        self._assert_payload_repair_refusal(
+                            helper,
+                            "rollback_failed",
+                            lambda: helper.apply_repair_plan(
+                                plan["plan_sha256"], expected, runner, paths
+                            ),
+                        )
+
+                self.assertNotEqual(cache_dir.lstat().st_ino, original_inode)
+                self.assertEqual((cache_dir / "racer-marker").read_bytes(), b"racer\n")
+                quarantined = (
+                    fixture["quarantine_root"]
+                    / plan["plan_sha256"]
+                    / "bytecode-cache"
+                )
+                self.assertEqual(
+                    {path.name: path.read_bytes() for path in quarantined.iterdir()},
+                    original_bytes,
+                )
 
     def test_source_tree_cache_projection_omits_paired_bytecode_and_cache_only_directories(self) -> None:
         with tempfile.TemporaryDirectory(dir="/root") as temporary:

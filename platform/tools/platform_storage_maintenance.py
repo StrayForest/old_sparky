@@ -20,6 +20,9 @@ import shutil
 import stat
 import subprocess
 import sys
+# This tool may load helpers from the immutable active release.  Do not let
+# those imports create unmanifested bytecode beside the trusted source files.
+sys.dont_write_bytecode = True
 from typing import Any, Callable, Iterator, Mapping, NamedTuple
 from urllib.parse import urlsplit
 

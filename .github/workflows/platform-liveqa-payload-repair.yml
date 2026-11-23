@@ -1,0 +1,460 @@
+name: Platform LiveQA payload bytecode repair
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: "Prepare a source-bound plan, then separately apply its reviewed SHA-256"
+        required: true
+        type: choice
+        options:
+          - prepare
+          - apply
+        default: prepare
+      expected_active_source_sha:
+        description: "Exact source SHA currently installed as production current"
+        required: true
+        type: string
+      security_run_id:
+        description: "Exact successful Platform security and build workflow run ID"
+        required: true
+        type: string
+      security_run_attempt:
+        description: "Exact attempt number of that successful run"
+        required: true
+        type: string
+      plan_sha256:
+        description: "Required for apply: plan SHA-256 emitted by prepare"
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: platform-liveqa-payload-repair-${{ inputs.security_run_id }}-${{ inputs.security_run_attempt }}
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    name: Prepare or apply exact LiveQA payload repair
+    if: ${{ github.ref == 'refs/heads/dev' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    env:
+      OPERATION: ${{ inputs.operation }}
+      EXPECTED_ACTIVE_SOURCE_SHA: ${{ inputs.expected_active_source_sha }}
+      SECURITY_RUN_ID: ${{ inputs.security_run_id }}
+      SECURITY_RUN_ATTEMPT: ${{ inputs.security_run_attempt }}
+      PLAN_SHA256: ${{ inputs.plan_sha256 }}
+
+    steps:
+      - name: Validate bounded repair inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          test "$GITHUB_SERVER_URL" = "https://github.com"
+          test "$GITHUB_REF" = "refs/heads/dev"
+          [[ "$EXPECTED_ACTIVE_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SECURITY_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+          [[ "$SECURITY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,5}$ ]]
+          case "$OPERATION" in
+            prepare) test -z "$PLAN_SHA256" ;;
+            apply) [[ "$PLAN_SHA256" =~ ^[0-9a-f]{64}$ ]] ;;
+            *) exit 1 ;;
+          esac
+
+      - name: Authenticate exact successful Security source attempt
+        id: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          provenance_dir="$RUNNER_TEMP/platform-liveqa-payload-repair-provenance"
+          test ! -e "$provenance_dir" && test ! -L "$provenance_dir"
+          install -d -m 700 "$provenance_dir"
+          run_json="$provenance_dir/security-attempt.json"
+          workflow_json="$provenance_dir/security-workflow.json"
+          branch_json="$provenance_dir/dev-branch.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SECURITY_RUN_ID/attempts/$SECURITY_RUN_ATTEMPT" > "$run_json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/platform-security.yml" > "$workflow_json"
+          gh api "repos/$GITHUB_REPOSITORY/branches/dev" > "$branch_json"
+          runner_sha="$(/usr/bin/python3 -I -B - "$run_json" "$workflow_json" "$branch_json" "$SECURITY_RUN_ID" <<'PY'
+          import json, re, sys
+          from pathlib import Path
+
+          run, workflow, branch = (json.loads(Path(name).read_text(encoding="utf-8")) for name in sys.argv[1:4])
+          sha = run.get("head_sha")
+          if (
+              run.get("id") is None
+              or str(run["id"]) != sys.argv[4]
+              or not isinstance(sha, str)
+              or re.fullmatch(r"[0-9a-f]{40}", sha) is None
+              or run.get("run_attempt") != int(__import__("os").environ["SECURITY_RUN_ATTEMPT"])
+              or run.get("workflow_id") != workflow.get("id")
+              or run.get("path") != ".github/workflows/platform-security.yml"
+              or run.get("name") != "Platform security and build"
+              or workflow.get("path") != ".github/workflows/platform-security.yml"
+              or workflow.get("state") != "active"
+              or run.get("event") != "push"
+              or run.get("head_branch") != "dev"
+              or run.get("status") != "completed"
+              or run.get("conclusion") != "success"
+              or (run.get("head_repository") or {}).get("full_name") != "StrayForest/old_sparky"
+              or (run.get("repository") or {}).get("full_name") != "StrayForest/old_sparky"
+              or (branch.get("commit") or {}).get("sha") != sha
+          ):
+              raise SystemExit("Exact Security attempt is not a current successful dev source")
+          print(sha)
+          PY
+          )"
+          [[ "$runner_sha" =~ ^[0-9a-f]{40}$ ]]
+          printf 'runner_source_sha=%s\n' "$runner_sha" >> "$GITHUB_OUTPUT"
+          rm -rf -- "$provenance_dir"
+
+      - name: Checkout exact Security-passed runner source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ steps.source.outputs.runner_source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Build closed source bundle
+        id: bundle
+        shell: bash
+        env:
+          RUNNER_SOURCE_SHA: ${{ steps.source.outputs.runner_source_sha }}
+        run: |
+          set -euo pipefail
+          checked_out_sha="$(/usr/bin/git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
+          test "$checked_out_sha" = "$RUNNER_SOURCE_SHA"
+          test -z "$(/usr/bin/git -C "$GITHUB_WORKSPACE" status --porcelain --untracked-files=all)"
+          bundle="$RUNNER_TEMP/liveqa-payload-repair.tar"
+          /usr/bin/python3 -I -B - "$GITHUB_WORKSPACE" "$RUNNER_TEMP" "$RUNNER_SOURCE_SHA" <<'PY'
+          import hashlib, io, json, os, stat, sys, tarfile
+          from pathlib import Path
+
+          workspace, temp, source = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+          names = (
+              "platform_live_qa_payload_bytecode_repair.py",
+              "platform_live_qa_machine_lock.py",
+              "platform_live_qa_guard.py",
+          )
+          files = {}
+          for name in names:
+              path = workspace / "platform/tools" / name
+              meta = path.lstat()
+              if not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1:
+                  raise SystemExit("Source bundle member is not a regular checkout file")
+              data = path.read_bytes()
+              if not data or len(data) > 2 * 1024 * 1024:
+                  raise SystemExit("Source bundle member has invalid size")
+              files[name] = data
+          manifest = {
+              "schema": 1,
+              "runner_source_sha": source,
+              "repair_tool_sha256": hashlib.sha256(files[names[0]]).hexdigest(),
+              "machine_lock_sha256": hashlib.sha256(files[names[1]]).hexdigest(),
+              "guard_sha256": hashlib.sha256(files[names[2]]).hexdigest(),
+          }
+          files["repair-bundle.json"] = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+          output = temp / "liveqa-payload-repair.tar"
+          with tarfile.open(output, "w", format=tarfile.USTAR_FORMAT) as archive:
+              for name in sorted(files):
+                  info = tarfile.TarInfo(name)
+                  info.size = len(files[name])
+                  info.mode = 0o400
+                  info.uid = info.gid = 0
+                  info.uname = info.gname = "root"
+                  archive.addfile(info, io.BytesIO(files[name]))
+          os.chmod(output, 0o600)
+          PY
+          test -f "$bundle" && test ! -L "$bundle"
+
+      - name: Validate production SSH inputs
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${PROD_SSH_HOST:-}"
+          test -n "${PROD_SSH_USER:-}"
+          test -n "${PROD_SSH_KEY:-}"
+
+      - name: Configure pinned production SSH identity
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          ssh_dir="$RUNNER_TEMP/platform-liveqa-payload-repair-ssh"
+          test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
+          install -d -m 700 "$ssh_dir"
+          printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
+          chmod 600 "$ssh_dir/id_ed25519"
+          scan="$ssh_dir/known_hosts.scan"
+          if ! timeout --foreground 4s ssh-keyscan -T 3 -t ed25519 "$PROD_SSH_HOST" > "$scan" 2>/dev/null \
+            || ! awk -v host="$PROD_SSH_HOST" '/^[[:space:]]*($|#)/ { next } { records++; if (NF == 3 && $1 == host && $2 == "ssh-ed25519") valid=1; else invalid=1 } END { exit !(records == 1 && valid && !invalid) }' "$scan" \
+            || test "$(ssh-keygen -lf "$scan" -E sha256 2>/dev/null | awk 'NR == 1 {print $2}')" != "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y"; then
+            rm -f -- "$scan"
+            echo "Pinned production SSH host-key verification failed" >&2
+            exit 1
+          fi
+          install -m 600 "$scan" "$ssh_dir/known_hosts"
+          rm -f -- "$scan"
+          printf 'SSH_DIR=%s\n' "$ssh_dir" >> "$GITHUB_ENV"
+
+      - name: Run one source-bound repair operation
+        id: repair
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          RUNNER_SOURCE_SHA: ${{ steps.source.outputs.runner_source_sha }}
+          BUNDLE: ${{ runner.temp }}/liveqa-payload-repair.tar
+        run: |
+          set -euo pipefail
+          umask 077
+          ssh_args=(-F /dev/null -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519")
+          # shellcheck disable=SC2016
+          remote_stage_info="$(timeout --foreground 30s ssh "${ssh_args[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" 'set -eu; umask 077; test "$(id -u)" -eq 0; stage=$(mktemp -d --tmpdir=/tmp oldsparky-liveqa-payload-repair.XXXXXX); printf "%s|" "$stage"; stat -c "%d|%i|%u|%g|%h|%a" "$stage"')"
+          IFS='|' read -r remote_stage remote_stage_dev remote_stage_ino remote_stage_uid remote_stage_gid remote_stage_nlink remote_stage_mode <<< "$remote_stage_info"
+          [[ "$remote_stage" =~ ^/tmp/oldsparky-liveqa-payload-repair\.[A-Za-z0-9]{6}$ ]]
+          [[ "$remote_stage_dev" =~ ^[0-9]+$ && "$remote_stage_ino" =~ ^[1-9][0-9]*$ && "$remote_stage_uid" == 0 && "$remote_stage_gid" == 0 && "$remote_stage_nlink" == 2 && "$remote_stage_mode" == 700 ]]
+          cleanup_remote_stage() {
+            local original_rc=$? cleanup_rc=0
+            trap - EXIT
+            set +e
+            timeout --foreground 30s ssh "${ssh_args[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" \
+              "bash -s -- '$remote_stage' '$remote_stage_dev' '$remote_stage_ino' '$remote_stage_uid' '$remote_stage_gid' '$remote_stage_nlink' '$remote_stage_mode'" >/dev/null 2>&1 <<'CLEANUP'
+          set -eu
+          stage="${1:-}"; expected_dev="${2:-}"; expected_ino="${3:-}"; expected_uid="${4:-}"; expected_gid="${5:-}"; expected_nlink="${6:-}"; expected_mode="${7:-}"
+          [[ "$stage" =~ ^/tmp/oldsparky-liveqa-payload-repair\.[A-Za-z0-9]{6}$ ]]
+          [[ "$expected_dev" =~ ^[0-9]+$ && "$expected_ino" =~ ^[1-9][0-9]*$ && "$expected_uid" == 0 && "$expected_gid" == 0 && "$expected_nlink" == 2 && "$expected_mode" == 700 ]]
+          /usr/bin/python3.12 -I -B - "$stage" "$expected_dev" "$expected_ino" "$expected_uid" "$expected_gid" "$expected_nlink" "$expected_mode" <<'PY'
+          import os, re, stat, sys
+          from pathlib import Path
+          stage = Path(sys.argv[1])
+          if re.fullmatch(r"/tmp/oldsparky-liveqa-payload-repair\.[A-Za-z0-9]{6}", str(stage)) is None:
+              raise SystemExit(1)
+          meta = stage.lstat()
+          if not stat.S_ISDIR(meta.st_mode) or (meta.st_dev, meta.st_ino, meta.st_uid, meta.st_gid, meta.st_nlink, stat.S_IMODE(meta.st_mode)) != (int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6]), int(sys.argv[7], 8)):
+              raise SystemExit(1)
+          entries = {item.name for item in stage.iterdir()}
+          if entries not in (set(), {"bundle.tar"}):
+              raise SystemExit(1)
+          if entries:
+              bundle = stage / "bundle.tar"
+              file_meta = bundle.lstat()
+              if not stat.S_ISREG(file_meta.st_mode) or file_meta.st_uid != 0 or file_meta.st_nlink != 1 or stat.S_IMODE(file_meta.st_mode) != 0o600:
+                  raise SystemExit(1)
+              bundle.unlink()
+          final_meta = stage.lstat()
+          if (final_meta.st_dev, final_meta.st_ino, final_meta.st_uid, final_meta.st_gid, final_meta.st_nlink, stat.S_IMODE(final_meta.st_mode)) != (int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6]), int(sys.argv[7], 8)) or {item.name for item in stage.iterdir()}:
+              raise SystemExit(1)
+          stage.rmdir()
+          parent_fd = os.open("/tmp", os.O_RDONLY | os.O_DIRECTORY)
+          try: os.fsync(parent_fd)
+          finally: os.close(parent_fd)
+          PY
+          CLEANUP
+            cleanup_rc=$?
+            set -e
+            if (( original_rc == 0 && cleanup_rc != 0 )); then
+              echo "Remote repair transport cleanup failed identity checks" >&2
+              original_rc=1
+            fi
+            exit "$original_rc"
+          }
+          trap cleanup_remote_stage EXIT
+          timeout --foreground 60s scp "${ssh_args[@]}" "$BUNDLE" "$PROD_SSH_USER@$PROD_SSH_HOST:$remote_stage/bundle.tar" >/dev/null 2>&1
+          result="$RUNNER_TEMP/liveqa-payload-repair.result"
+          error="$RUNNER_TEMP/liveqa-payload-repair.error"
+          : > "$result"; : > "$error"; chmod 600 "$result" "$error"
+          set +e
+          timeout --foreground 600s ssh "${ssh_args[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            "bash -s -- '$remote_stage' '$OPERATION' '$EXPECTED_ACTIVE_SOURCE_SHA' '$RUNNER_SOURCE_SHA' '$PLAN_SHA256'" > "$result" 2> "$error" <<'REMOTE'
+          set -Eeuo pipefail
+          umask 077
+          stage="${1:-}"; operation="${2:-}"; active_sha="${3:-}"; runner_sha="${4:-}"; plan_sha="${5:-}"
+          [[ "$stage" =~ ^/tmp/oldsparky-liveqa-payload-repair\.[A-Za-z0-9]{6}$ ]]
+          [[ "$active_sha" =~ ^[0-9a-f]{40}$ && "$runner_sha" =~ ^[0-9a-f]{40}$ ]]
+          case "$operation" in
+            prepare) test -z "$plan_sha" ;;
+            apply) [[ "$plan_sha" =~ ^[0-9a-f]{64}$ ]] ;;
+            *) exit 1 ;;
+          esac
+          test "$(id -u)" -eq 0
+          test -d "$stage" && test ! -L "$stage"
+          test -f "$stage/bundle.tar" && test ! -L "$stage/bundle.tar"
+          current=/opt/oldsparky/platform/current
+          lock="$current/tools/platform_release_lock.sh"
+          test -f "$lock" && test ! -L "$lock" && test -x "$lock"
+          "$lock" --run /bin/bash -s -- "$stage" "$operation" "$active_sha" "$runner_sha" "$plan_sha" <<'LOCKED'
+          set -Eeuo pipefail
+          stage="$1"; operation="$2"; active_sha="$3"; runner_sha="$4"; plan_sha="$5"
+          current=/opt/oldsparky/platform/current
+          source "$current/tools/platform_release_lock.sh"
+          platform_release_lock_open && platform_release_lock_supervisor_holds
+          test ! -e /opt/oldsparky/platform/shared/.release-operation.json
+          /usr/bin/python3.12 -I -B - "$stage/bundle.tar" "$runner_sha" <<'INSTALL'
+          import hashlib, io, json, os, stat, tarfile
+          from pathlib import Path
+          archive_path, runner_sha = Path(__import__("sys").argv[1]), __import__("sys").argv[2]
+          stage_meta = archive_path.parent.lstat()
+          archive_meta = archive_path.lstat()
+          if not stat.S_ISDIR(stage_meta.st_mode) or stage_meta.st_uid != 0 or stat.S_IMODE(stage_meta.st_mode) != 0o700 or not stat.S_ISREG(archive_meta.st_mode) or archive_meta.st_uid != 0 or archive_meta.st_nlink != 1 or stat.S_IMODE(archive_meta.st_mode) != 0o600 or archive_meta.st_size > 8 * 1024 * 1024:
+              raise SystemExit("Unsafe repair transport stage")
+          archive_fd = os.open(archive_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+          opened = os.fstat(archive_fd)
+          if (opened.st_dev, opened.st_ino, opened.st_size) != (archive_meta.st_dev, archive_meta.st_ino, archive_meta.st_size):
+              os.close(archive_fd)
+              raise SystemExit("Repair transport changed while opening")
+          expected = {
+              "platform_live_qa_payload_bytecode_repair.py",
+              "platform_live_qa_machine_lock.py",
+              "platform_live_qa_guard.py",
+              "repair-bundle.json",
+          }
+          with os.fdopen(archive_fd, "rb") as archive_stream, tarfile.open(fileobj=archive_stream, mode="r:") as archive:
+              members = archive.getmembers()
+              if len(members) != len(expected) or {m.name for m in members} != expected or any(not m.isreg() or m.size <= 0 or m.size > 2 * 1024 * 1024 for m in members):
+                  raise SystemExit("Invalid closed repair bundle")
+              content = {}
+              for member in members:
+                  stream = archive.extractfile(member)
+                  if stream is None:
+                      raise SystemExit("Invalid repair bundle member")
+                  content[member.name] = stream.read(2 * 1024 * 1024 + 1)
+          manifest = json.loads(content["repair-bundle.json"].decode("ascii"))
+          if set(manifest) != {"schema", "runner_source_sha", "repair_tool_sha256", "machine_lock_sha256", "guard_sha256"} or manifest.get("schema") != 1 or manifest.get("runner_source_sha") != runner_sha:
+              raise SystemExit("Invalid repair bundle manifest")
+          hashes = {
+              "platform_live_qa_payload_bytecode_repair.py": manifest.get("repair_tool_sha256"),
+              "platform_live_qa_machine_lock.py": manifest.get("machine_lock_sha256"),
+              "platform_live_qa_guard.py": manifest.get("guard_sha256"),
+          }
+          if any(not isinstance(value, str) or hashlib.sha256(content[name]).hexdigest() != value for name, value in hashes.items()):
+              raise SystemExit("Repair bundle digest mismatch")
+          parent = Path("/root/.oldsparky/liveqa/payload-repair-tools")
+          if not parent.exists():
+              os.mkdir(parent, 0o700)
+          meta = parent.lstat()
+          if not stat.S_ISDIR(meta.st_mode) or meta.st_uid != 0 or stat.S_IMODE(meta.st_mode) != 0o700:
+              raise SystemExit("Unsafe repair bundle root")
+          target = parent / runner_sha
+          if os.path.lexists(target):
+              meta = target.lstat()
+              if not stat.S_ISDIR(meta.st_mode) or meta.st_uid != 0 or stat.S_IMODE(meta.st_mode) != 0o700 or {p.name for p in target.iterdir()} != expected:
+                  raise SystemExit("Existing repair bundle is not exact")
+              for name, data in content.items():
+                  path = target / name; item = path.lstat()
+                  if not stat.S_ISREG(item.st_mode) or item.st_uid != 0 or item.st_nlink != 1 or stat.S_IMODE(item.st_mode) != 0o400 or path.read_bytes() != data:
+                      raise SystemExit("Existing repair bundle differs from source")
+          else:
+              os.mkdir(target, 0o700)
+              target_meta = target.lstat()
+              created_files = {}
+              try:
+                  parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+                  try: os.fsync(parent_fd)
+                  finally: os.close(parent_fd)
+                  for name, data in content.items():
+                      fd = os.open(target / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+                      opened = os.fstat(fd)
+                      created_files[name] = (opened.st_dev, opened.st_ino)
+                      with os.fdopen(fd, "wb") as output:
+                          output.write(data); output.flush(); os.fsync(output.fileno())
+                      os.chown(target / name, 0, 0)
+                  descriptor = os.open(target, os.O_RDONLY | os.O_DIRECTORY)
+                  try: os.fsync(descriptor)
+                  finally: os.close(descriptor)
+                  parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+                  try: os.fsync(parent_fd)
+                  finally: os.close(parent_fd)
+              except BaseException:
+                  try:
+                      current = target.lstat()
+                      entries = {item.name for item in target.iterdir()}
+                      if (current.st_dev, current.st_ino) != (target_meta.st_dev, target_meta.st_ino) or current.st_uid != 0 or stat.S_IMODE(current.st_mode) != 0o700 or not entries.issubset(created_files):
+                          raise RuntimeError("target identity changed")
+                      for name in sorted(entries):
+                          path = target / name
+                          item = path.lstat()
+                          if not stat.S_ISREG(item.st_mode) or item.st_uid != 0 or item.st_nlink != 1 or stat.S_IMODE(item.st_mode) != 0o400 or (item.st_dev, item.st_ino) != created_files[name]:
+                              raise RuntimeError("created member identity changed")
+                          path.unlink()
+                      current = target.lstat()
+                      if (current.st_dev, current.st_ino) != (target_meta.st_dev, target_meta.st_ino) or {item.name for item in target.iterdir()}:
+                          raise RuntimeError("target contents changed")
+                      target.rmdir()
+                      parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+                      try: os.fsync(parent_fd)
+                      finally: os.close(parent_fd)
+              except BaseException:
+                  cleanup_failed = True
+              else:
+                  cleanup_failed = False
+              if cleanup_failed:
+                  print(f"LIVE_QA_PAYLOAD_REPAIR_BUNDLE status=partial_cleanup_failed runner_source_sha={runner_sha}", file=__import__("sys").stderr)
+              raise
+          INSTALL
+          args=("$operation" --expected-source-sha "$active_sha" --runner-source-sha "$runner_sha")
+          if [[ "$operation" == apply ]]; then args+=(--plan-sha256 "$plan_sha"); fi
+          /usr/bin/python3.12 -I -B - "${args[@]}" < "/root/.oldsparky/liveqa/payload-repair-tools/$runner_sha/platform_live_qa_payload_bytecode_repair.py"
+          LOCKED
+          REMOTE
+          remote_rc=$?
+          set -e
+          rm -f -- "$RUNNER_TEMP/liveqa-payload-repair.tar"
+          if (( remote_rc != 0 )); then
+            residual_marker="LIVE_QA_PAYLOAD_REPAIR_BUNDLE status=partial_cleanup_failed runner_source_sha=$RUNNER_SOURCE_SHA"
+            if grep -Fxq "$residual_marker" "$error"; then
+              printf '%s\n' "$residual_marker" >&2
+            fi
+            rm -f -- "$result" "$error"
+            echo "Source-bound LiveQA payload repair failed closed; remote details were suppressed" >&2
+            exit "$remote_rc"
+          fi
+          /usr/bin/python3 -I -B - "$result" "$OPERATION" <<'CHECK'
+          import re, sys
+          from pathlib import Path
+          lines = Path(sys.argv[1]).read_text(encoding="ascii").splitlines()
+          operation = sys.argv[2]
+          if len(lines) != 1:
+              raise SystemExit("Remote repair returned an invalid bounded status")
+          pattern = (r"LIVE_QA_PAYLOAD_BYTECODE_REPAIR status=prepared plan_sha256=([0-9a-f]{64}) extra_file_count=2" if operation == "prepare" else r"LIVE_QA_PAYLOAD_BYTECODE_REPAIR status=validated plan_sha256=([0-9a-f]{64}) quarantined_file_count=2")
+          match = re.fullmatch(pattern, lines[0])
+          if match is None:
+              raise SystemExit("Remote repair returned an invalid bounded status")
+          print(lines[0])
+          print("plan_sha256=" + match.group(1))
+          CHECK
+          plan_sha="$(/usr/bin/python3 -I -B - "$result" "$OPERATION" <<'CHECK'
+          import re, sys
+          from pathlib import Path
+          line = Path(sys.argv[1]).read_text(encoding="ascii").splitlines()
+          p = r"LIVE_QA_PAYLOAD_BYTECODE_REPAIR status=prepared plan_sha256=([0-9a-f]{64}) extra_file_count=2" if sys.argv[2] == "prepare" else r"LIVE_QA_PAYLOAD_BYTECODE_REPAIR status=validated plan_sha256=([0-9a-f]{64}) quarantined_file_count=2"
+          m = re.fullmatch(p, line[0]) if len(line) == 1 else None
+          if m is None: raise SystemExit(1)
+          print(m.group(1))
+          CHECK
+          )"
+          printf 'plan_sha256=%s\n' "$plan_sha" >> "$GITHUB_OUTPUT"
+          rm -f -- "$result" "$error"
+
+      - name: Remove local repair material
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f -- "$RUNNER_TEMP/liveqa-payload-repair.tar" "$RUNNER_TEMP/liveqa-payload-repair.result" "$RUNNER_TEMP/liveqa-payload-repair.error"
+          rm -rf -- "$RUNNER_TEMP/platform-liveqa-payload-repair-ssh" "$RUNNER_TEMP/platform-liveqa-payload-repair-provenance"

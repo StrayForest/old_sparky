@@ -43,6 +43,7 @@ for the task. Open deeper references only when the task needs them.
 | Task | Owner document |
 | --- | --- |
 | Normal production release and exceptional recovery paths | [Deployment runbook](deployment-runbook.md) |
+| Exact LiveQA bytecode-only payload repair | [LiveQA payload integrity repair](liveqa-payload-repair-runbook.md) |
 | Release transaction and recovery | [Release state machine](release-state-machine.md) |
 | Production application rollback | [Production rollback runbook](production-rollback-runbook.md) |
 | Production web/API/worker service recovery | [Service recovery](service-recovery-runbook.md) |

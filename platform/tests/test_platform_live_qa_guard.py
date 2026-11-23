@@ -14,6 +14,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -595,6 +596,51 @@ class LiveQaGuardTests(unittest.TestCase):
                         (lock_path.stat().st_dev, lock_path.stat().st_ino),
                         (path_metadata.st_dev, path_metadata.st_ino),
                     )
+
+    def test_guard_diagnostic_import_does_not_change_immutable_tool_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            tools_root = Path(temporary) / "tools"
+            tools_root.mkdir()
+            guard_path = tools_root / "platform_live_qa_guard.py"
+            lock_path = tools_root / "platform_live_qa_machine_lock.py"
+            shutil.copyfile(SCRIPT_PATH, guard_path)
+            shutil.copyfile(
+                Path(__file__).resolve().parents[1]
+                / "tools"
+                / "platform_live_qa_machine_lock.py",
+                lock_path,
+            )
+            guard_path.chmod(0o555)
+            lock_path.chmod(0o444)
+            before = {
+                path.relative_to(tools_root).as_posix(): (
+                    path.stat().st_size,
+                    hashlib.sha256(path.read_bytes()).hexdigest(),
+                )
+                for path in tools_root.rglob("*")
+                if path.is_file()
+            }
+
+            completed = subprocess.run(
+                [sys.executable, "-I", str(guard_path), "--help"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=10,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+            self.assertFalse(list(tools_root.rglob("__pycache__")))
+            after = {
+                path.relative_to(tools_root).as_posix(): (
+                    path.stat().st_size,
+                    hashlib.sha256(path.read_bytes()).hexdigest(),
+                )
+                for path in tools_root.rglob("*")
+                if path.is_file()
+            }
+            self.assertEqual(after, before)
 
     def test_locked_exec_rejects_non_trusted_wrapper(self) -> None:
         with self.assertRaisesRegex(guard.GuardError, "not a reviewed"):
