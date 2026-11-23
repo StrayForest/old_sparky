@@ -396,23 +396,24 @@ test is explicit test debt with an owner, not a reason to weaken a gate.
 
 ### Web hermetic ownership
 
-The web package has three deterministic owners: source contracts, full hermetic suites and the isolated image-inventory
-WebKit fixture. `test:source-contract` owns source assertions; [`playwright.source-contract.config.ts`](../apps/platform_web/playwright.source-contract.config.ts)
-must not define `webServer`. [`platform_web_hermetic.sh`](../tools/platform_web_hermetic.sh) discovers and builds standalone
-Next once, then runs source-contract, auth lifecycle, smoke, participant, SSR diagnostics and image-inventory. Auth
-precedes smoke; smoke and participant use fresh API/web processes (`reuseExistingServer: false`). The image fixture
-uses no server/API/database/external images; its output and pinned browsers stay in the private build directory.
+The web package has three deterministic owners: source contracts, full hermetic suites and the isolated image-inventory WebKit fixture. `test:source-contract` owns source assertions; [`playwright.source-contract.config.ts`](../apps/platform_web/playwright.source-contract.config.ts) must not define `webServer`. [`platform_web_hermetic.sh`](../tools/platform_web_hermetic.sh) builds standalone Next once, then runs source-contract, auth lifecycle, smoke, participant, SSR diagnostics and image-inventory. After WebKit it validates generated body-only, hook-only and combined failure payloads through the reporter before cleanup; missing fixtures fail. Auth precedes smoke; smoke and participant use fresh API/web processes (`reuseExistingServer: false`). The image fixture uses no server/API/database/external images.
 
-When hosted-services preflight blocks `web-hermetic`, run the focused image-helper contract locally from `platform/`:
+When hosted-services preflight blocks `web-hermetic`, run the focused WebKit producer and reporter/guard roundtrip from `platform/`:
 
 ```bash
 TASK_WEBKIT_DIR="$(mktemp -d /tmp/oldsparky-image-inventory.XXXXXX)"
 trap 'python3 -c "import shutil,sys; shutil.rmtree(sys.argv[1], ignore_errors=True)" "$TASK_WEBKIT_DIR"' EXIT
+mkdir -m 700 "$TASK_WEBKIT_DIR/build"
 python3 tools/platform_web_hermetic_browsers.py --web-root apps/platform_web --output "$TASK_WEBKIT_DIR/browsers"
-(cd apps/platform_web && PLAYWRIGHT_BROWSERS_PATH="$TASK_WEBKIT_DIR/browsers" ../../tools/platform_run_quiet.sh "WebKit image inventory contract" -- ../../tools/platform_web_npm.sh run test:image-inventory:webkit)
+(cd apps/platform_web && PLAYWRIGHT_BROWSERS_PATH="$TASK_WEBKIT_DIR/browsers" PLATFORM_WEB_HERMETIC_BUILD_DIR="$TASK_WEBKIT_DIR/build" ../../tools/platform_run_quiet.sh "WebKit image inventory contract" -- ../../tools/platform_web_npm.sh run test:image-inventory:webkit)
+(cd apps/platform_web && \
+  PLATFORM_WEB_IMAGE_INVENTORY_BODY_FIXTURE="$TASK_WEBKIT_DIR/build/producer-image-inventory-body-v2.json" PLATFORM_WEB_IMAGE_INVENTORY_BODY_REQUEST_FIXTURE="$TASK_WEBKIT_DIR/build/producer-browser-request-failures-body-v1.json" \
+  PLATFORM_WEB_IMAGE_INVENTORY_HOOK_FIXTURE="$TASK_WEBKIT_DIR/build/producer-image-inventory-hook-v2.json" PLATFORM_WEB_IMAGE_INVENTORY_REQUEST_FAILURE_FIXTURE="$TASK_WEBKIT_DIR/build/producer-browser-request-failures-hook-v1.json" \
+  PLATFORM_WEB_IMAGE_INVENTORY_BOTH_FIXTURE="$TASK_WEBKIT_DIR/build/producer-image-inventory-both-v2.json" PLATFORM_WEB_IMAGE_INVENTORY_BOTH_REQUEST_FIXTURE="$TASK_WEBKIT_DIR/build/producer-browser-request-failures-both-v1.json" \
+  ../../tools/platform_run_quiet.sh "Live count reporter contract" -- ../../tools/platform_node.sh tests/support/live-count-reporter-contract.cjs)
 ```
 
-This exercises only the fixture and image helper; exact-SHA `web-hermetic` CI remains required.
+This covers the helper, afterEach finalizer and reporter-to-guard boundary without production services; exact-SHA `web-hermetic` CI remains required.
 
 The responsive smoke project owns `desktop`, `wide-1300`, `tablet-820` and `mobile-layout`; the explicit desktop-only list
 in [`playwright.config.ts`](../apps/platform_web/playwright.config.ts) is owned only by `desktop`. The participant-progressive suite owns a sequential one-worker contour and explicit desktop/mobile projects in [`playwright.participant.config.ts`](../apps/platform_web/playwright.participant.config.ts). Do not infer viewport ownership from a test name or silently add exclusions; update the owning config and contract test with matrix changes.

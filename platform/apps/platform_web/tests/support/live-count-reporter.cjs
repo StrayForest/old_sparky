@@ -27,6 +27,8 @@ const MAX_IMAGE_INVENTORY_COUNT = 512;
 const MAX_IMAGE_INVENTORY_ATTACHMENT_BYTES = 8 * 1024;
 const MAX_IMAGE_DIAGNOSTIC_ENTRIES = 16;
 const MAX_IMAGE_DIAGNOSTIC_EVENTS = 64;
+const MAX_BROWSER_REQUEST_FAILURE_ATTACHMENT_BYTES = 4 * 1024;
+const MAX_BROWSER_REQUEST_FAILURE_EVENTS = 32;
 const MAX_ATTEMPTS = 32768;
 const GATE_ROOT = "/run/oldsparky-liveqa";
 const FAILURE_REPORT_FILE = "live-failures-v2.json";
@@ -37,6 +39,7 @@ const IMAGE_INVENTORY_ATTACHMENT_NAMES = new Set([
   "live-image-inventory-evidence-v1",
   "live-image-inventory-evidence-v2",
 ]);
+const BROWSER_REQUEST_FAILURE_ATTACHMENT_NAME = "live-browser-request-failures-v1";
 const LIVE_USER_API_FAILURE_ATTACHMENT_NAME = "live-user-api-failure-v1";
 const RUN_STATUSES = new Set(["passed", "failed", "timedout", "interrupted"]);
 const ATTEMPT_STATUSES = new Set([
@@ -860,6 +863,86 @@ function normalizedImageInventoryAttachment(attachment) {
   return payload;
 }
 
+function normalizedBrowserRequestFailureAttachment(attachment) {
+  if (
+    attachment?.name !== BROWSER_REQUEST_FAILURE_ATTACHMENT_NAME
+    || attachment.contentType !== "application/json"
+    || attachment.path !== undefined
+    || !Buffer.isBuffer(attachment.body)
+    || attachment.body.length > MAX_BROWSER_REQUEST_FAILURE_ATTACHMENT_BYTES
+    || attachment.body.some((byte) => byte > 0x7f)
+  ) return null;
+  let payload;
+  try {
+    payload = JSON.parse(attachment.body.toString("ascii"));
+  } catch {
+    return null;
+  }
+  if (
+    !payload
+    || typeof payload !== "object"
+    || Array.isArray(payload)
+    || Object.keys(payload).sort().join(",") !== [
+      "coverage", "events", "failure_phase", "schema", "truncated",
+    ].join(",")
+    || payload.schema !== 1
+    || payload.coverage !== "since_before_each"
+    || !["body", "hook", "both", "unknown"].includes(payload.failure_phase)
+    || typeof payload.truncated !== "boolean"
+    || !Array.isArray(payload.events)
+    || payload.events.length > MAX_BROWSER_REQUEST_FAILURE_EVENTS
+    || (payload.truncated && payload.events.length === 0)
+    || attachment.body.toString("ascii") !== JSON.stringify(payload)
+  ) return null;
+  const resourceTypes = new Set([
+    "document", "image", "stylesheet", "script", "font", "media", "xhr", "fetch", "other", "unknown",
+  ]);
+  const routeScopes = new Set(["home", "patch", "tournaments", "other", "unknown"]);
+  const failureClasses = new Set(["dns", "connection", "timeout", "tls", "aborted", "cancelled", "other"]);
+  const durationBuckets = new Set(["<100ms", "<1s", "<5s", ">=5s", "unavailable"]);
+  for (let index = 0; index < payload.events.length; index += 1) {
+    const event = payload.events[index];
+    if (
+      !event
+      || typeof event !== "object"
+      || Array.isArray(event)
+      || Object.keys(event).sort().join(",") !== [
+        "duration_bucket", "failure_class", "navigation_relation", "ordinal",
+        "resource_type", "route_scope",
+      ].join(",")
+      || !Number.isSafeInteger(event.ordinal)
+      || event.ordinal !== index + 1
+      || !resourceTypes.has(event.resource_type)
+      || !routeScopes.has(event.route_scope)
+      || !["same", "changed", "unknown"].includes(event.navigation_relation)
+      || !failureClasses.has(event.failure_class)
+      || !durationBuckets.has(event.duration_bucket)
+    ) return null;
+  }
+  return payload;
+}
+
+function browserRequestFailureEvidenceForAttempt(result) {
+  const attachments = Array.isArray(result?.attachments)
+    ? result.attachments.filter(
+      (attachment) => attachment?.name === BROWSER_REQUEST_FAILURE_ATTACHMENT_NAME,
+    )
+    : [];
+  if (attachments.length === 0) return { present: false, state: "unavailable", evidence: null };
+  if (attachments.length !== 1) return { present: true, state: "unavailable", evidence: null };
+  const payload = normalizedBrowserRequestFailureAttachment(attachments[0]);
+  if (!payload) return { present: true, state: "unavailable", evidence: null };
+  return {
+    present: true,
+    state: payload.truncated ? "truncated" : "captured",
+    evidence: {
+      failure_phase: payload.failure_phase,
+      truncated: payload.truncated,
+      events: payload.events,
+    },
+  };
+}
+
 function normalizedImageInventoryV2(payload) {
   const coverage = payload.coverage;
   const images = payload.images;
@@ -1364,8 +1447,13 @@ function failureRecordForAttempt(test, result, attempt, sourceRoot) {
   };
   if (id === "image_csp_hosts") {
     const imageEvidence = imageInventoryEvidenceForAttempt(result);
+    const requestFailureEvidence = browserRequestFailureEvidenceForAttempt(result);
     failure.image_inventory_state = imageEvidence.state;
     failure.image_inventory = imageEvidence.inventory;
+    if (requestFailureEvidence.present) {
+      failure.browser_request_failure_state = requestFailureEvidence.state;
+      failure.browser_request_failures = requestFailureEvidence.evidence;
+    }
   }
   return failure;
 }
@@ -1373,6 +1461,54 @@ function failureRecordForAttempt(test, result, attempt, sourceRoot) {
 function boundedFailureReportBytes(payload) {
   let bytes = Buffer.from(`${JSON.stringify(payload)}\n`, "ascii");
   if (bytes.length <= MAX_EPHEMERAL_FAILURE_REPORT_BYTES) return bytes;
+
+  const imageRows = () => payload.failures.flatMap((failure) => (
+    failure.image_inventory_state === "captured"
+    && failure.image_inventory?.schema === 2
+      ? failure.image_inventory.routes.flatMap((route) => route.images.map((image) => ({ route, image })))
+      : []
+  ));
+  const compactableRows = () => imageRows().sort((left, right) => {
+    const priority = (image) => (
+      image.complete
+      && image.natural_width_positive
+      && image.current_src_present
+      && image.request_state !== "request_failed"
+      && image.csp_image_block_count === 0
+        ? 0
+        : image.request_state === "request_failed" || image.csp_image_block_count > 0
+          ? 2
+          : 1
+    );
+    return priority(left.image) - priority(right.image)
+      || right.image.ordinal - left.image.ordinal;
+  });
+  const dropImageRow = ({ route, image }) => {
+    const index = route.images.indexOf(image);
+    if (index === -1) return false;
+    route.images.splice(index, 1);
+    route.image_entries_truncated = true;
+    bytes = Buffer.from(`${JSON.stringify(payload)}\n`, "ascii");
+    return true;
+  };
+
+  // Prefer route aggregates and failed-image records over successful samples.
+  // The route's counts and coverage survive each per-image entry removal.
+  for (const row of compactableRows()) {
+    if (bytes.length <= MAX_EPHEMERAL_FAILURE_REPORT_BYTES) break;
+    dropImageRow(row);
+  }
+
+  // If the image aggregates and retained per-image rows still need more room,
+  // request event details are the next optional diagnostic to compact.
+  for (const failure of [...payload.failures].reverse()) {
+    if (bytes.length <= MAX_EPHEMERAL_FAILURE_REPORT_BYTES) break;
+    if (failure.browser_request_failure_state !== "unavailable") {
+      delete failure.browser_request_failure_state;
+      delete failure.browser_request_failures;
+      bytes = Buffer.from(`${JSON.stringify(payload)}\n`, "ascii");
+    }
+  }
 
   // Keep one event per failed attempt before retaining additional detail.
   for (const failure of [...payload.failures].reverse()) {
@@ -1385,9 +1521,8 @@ function boundedFailureReportBytes(payload) {
       bytes = Buffer.from(`${JSON.stringify(payload)}\n`, "ascii");
     }
   }
-  // If bounded events are not enough, retain each failed test identity,
-  // project, status and attempt while dropping later optional source locations
-  // as an all-null tuple accepted by the closed consumer contract.
+  // If events and request details are not enough, retain each failed test
+  // identity, project, status and attempt while dropping source locations.
   for (const failure of [...payload.failures].reverse()) {
     if (bytes.length <= MAX_EPHEMERAL_FAILURE_REPORT_BYTES) break;
     if (failure.source_file !== null || failure.source_line !== null || failure.source_column !== null) {
@@ -1398,9 +1533,16 @@ function boundedFailureReportBytes(payload) {
       bytes = Buffer.from(`${JSON.stringify(payload)}\n`, "ascii");
     }
   }
-  // Route-level image diagnostics are optional private detail. If a stress
-  // failure report approaches its cap, preserve each failed test identity and
-  // mark these observations unavailable instead of dropping arbitrary fields.
+  // Only after route aggregates, page errors and sources have been compacted do
+  // we remove remaining image rows. Keep the aggregate route record if it fits.
+  for (const row of compactableRows()) {
+    if (bytes.length <= MAX_EPHEMERAL_FAILURE_REPORT_BYTES) break;
+    dropImageRow(row);
+  }
+
+  // A pathological report may still exceed the cap after all optional event
+  // rows are gone. In that case keep test identity and mark image detail
+  // unavailable as one closed unit.
   for (const failure of [...payload.failures].reverse()) {
     if (bytes.length <= MAX_EPHEMERAL_FAILURE_REPORT_BYTES) break;
     if (failure.image_inventory_state === "captured") {
@@ -1409,9 +1551,9 @@ function boundedFailureReportBytes(payload) {
       bytes = Buffer.from(`${JSON.stringify(payload)}\n`, "ascii");
     }
   }
-  // Keep at least one event globally for durable diagnostics. Earlier passes
-  // reduce each attempt to one event; this pass removes later events only if
-  // source compaction still leaves the report over the cap.
+  // Keep at least one page error globally for durable diagnostics. Earlier
+  // passes reduce each attempt to one event; remove later events only if still
+  // over the cap.
   let retainedPageErrorEvents = payload.failures.reduce(
     (total, failure) => total + failure.page_errors.length,
     0,
@@ -1424,6 +1566,32 @@ function boundedFailureReportBytes(payload) {
       failure.page_errors_truncated = true;
       if (failure.page_errors.length === 0) failure.page_error_state = "unavailable";
       bytes = Buffer.from(`${JSON.stringify(payload)}\n`, "ascii");
+    }
+  }
+  // The durable record must never lose a failed-attempt identity. If a
+  // pathological collection still exceeds the cap, retain the closed identity
+  // records and drop all remaining optional page/request detail.
+  if (bytes.length > MAX_EPHEMERAL_FAILURE_REPORT_BYTES) {
+    for (const failure of [...payload.failures].reverse()) {
+      failure.page_errors = [];
+      failure.page_errors_truncated = true;
+      failure.page_error_state = "unavailable";
+      if (
+        failure.id === "image_csp_hosts"
+        && (
+          Object.hasOwn(failure, "browser_request_failure_state")
+          || Object.hasOwn(failure, "browser_request_failures")
+        )
+      ) {
+        failure.browser_request_failure_state = "unavailable";
+        failure.browser_request_failures = null;
+      }
+      if (failure.image_inventory_state === "captured") {
+        failure.image_inventory_state = "unavailable";
+        failure.image_inventory = null;
+      }
+      bytes = Buffer.from(`${JSON.stringify(payload)}\n`, "ascii");
+      if (bytes.length <= MAX_EPHEMERAL_FAILURE_REPORT_BYTES) break;
     }
   }
   return bytes.length <= MAX_EPHEMERAL_FAILURE_REPORT_BYTES ? bytes : null;

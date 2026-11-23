@@ -455,6 +455,41 @@ function rawImageInventoryV2Attachment(payload) {
     body: Buffer.from(JSON.stringify(payload), "ascii"),
   };
 }
+function browserRequestFailureAttachment({
+  failure_phase = "hook",
+  truncated = false,
+  events = [],
+} = {}) {
+  return {
+    name: "live-browser-request-failures-v1",
+    contentType: "application/json",
+    body: Buffer.from(JSON.stringify({
+      schema: 1,
+      coverage: "since_before_each",
+      failure_phase,
+      truncated,
+      events,
+    }), "ascii"),
+  };
+}
+function browserRequestFailureEvent(overrides = {}) {
+  return {
+    ordinal: 1,
+    resource_type: "fetch",
+    route_scope: "home",
+    navigation_relation: "same",
+    failure_class: "other",
+    duration_bucket: "<1s",
+    ...overrides,
+  };
+}
+function rawBrowserRequestFailureAttachment(payload) {
+  return {
+    name: "live-browser-request-failures-v1",
+    contentType: "application/json",
+    body: Buffer.from(JSON.stringify(payload), "ascii"),
+  };
+}
 assert.equal(pageErrorClass({ name: "SecurityError" }), "DOMException");
 for (const privateValue of [
   "private pageerror text",
@@ -1056,6 +1091,123 @@ function publicPlanWithFailure(failure) {
   return selected;
 }
 
+function assertProducerRoundTrip({
+  root,
+  suffix,
+  imageFixturePath,
+  requestFixturePath,
+  expectedUnloaded,
+  expectedFailurePhase,
+}) {
+  const imageMetadata = fs.lstatSync(imageFixturePath);
+  assert.ok(imageMetadata.isFile() && !imageMetadata.isSymbolicLink());
+  assert.equal(imageMetadata.uid, process.geteuid());
+  assert.equal(imageMetadata.mode & 0o777, 0o600);
+  const imageBody = fs.readFileSync(imageFixturePath);
+  assert.ok(imageBody.length > 0 && imageBody.length <= 8 * 1024);
+  const imagePayload = JSON.parse(imageBody.toString("ascii"));
+  assert.equal(imagePayload.schema, 2);
+  assert.equal(imagePayload.route, "home");
+  assert.equal(imagePayload.image_count, 10);
+  assert.equal(imagePayload.unloaded_count, expectedUnloaded);
+  assert.equal(imagePayload.images.length, 10);
+  assert.equal(imagePayload.images.filter((image) => (
+    !image.complete || !image.natural_width_positive
+  )).length, expectedUnloaded);
+
+  const attachments = [{
+    name: "live-image-inventory-evidence-v2",
+    contentType: "application/json",
+    body: imageBody,
+  }];
+  if (requestFixturePath) {
+    const requestMetadata = fs.lstatSync(requestFixturePath);
+    assert.ok(requestMetadata.isFile() && !requestMetadata.isSymbolicLink());
+    assert.equal(requestMetadata.uid, process.geteuid());
+    assert.equal(requestMetadata.mode & 0o777, 0o600);
+    const requestBody = fs.readFileSync(requestFixturePath);
+    assert.ok(requestBody.length > 0 && requestBody.length <= 4 * 1024);
+    const requestPayload = JSON.parse(requestBody.toString("ascii"));
+    assert.equal(requestPayload.failure_phase, expectedFailurePhase);
+    attachments.push({
+      name: "live-browser-request-failures-v1",
+      contentType: "application/json",
+      body: requestBody,
+    });
+  }
+
+  const fixture = diagnosticFixture(root, suffix);
+  const failure = failureTest(fixture, {
+    title: publicTitles.at(-1),
+    project: "live-webkit-mobile",
+    errorLocation: { file: fixture.helper, line: 2, column: 3 },
+    attachments,
+  });
+  const plan = publicPlanWithFailure(failure);
+  const runSummary = summarizeRun({ allTests: () => plan }, "failed", { publicGate: true });
+  assert.equal(withRootOwnedGate(fixture.gateRoot, () => writeBoundedFailureSummary(
+    fixture.binding,
+    { allTests: () => plan },
+    runSummary,
+    { gateRoot: fixture.gateRoot, sourceRoot: fixture.sourceRoot },
+  )), true);
+  const reportPath = path.join(fixture.results, "live-failures-v2.json");
+  const reportBytes = fs.readFileSync(reportPath);
+  const report = JSON.parse(reportBytes.toString("ascii"));
+  const record = report.failures[0];
+  assert.equal(record.image_inventory_state, "captured");
+  assert.deepEqual(record.image_inventory, { schema: 2, routes: [imagePayload] });
+  if (requestFixturePath) {
+    assert.equal(record.browser_request_failure_state, "captured");
+  } else {
+    assert.equal(Object.hasOwn(record, "browser_request_failure_state"), false);
+    assert.equal(Object.hasOwn(record, "browser_request_failures"), false);
+  }
+  if (requestFixturePath) {
+    assert.equal(record.browser_request_failures.failure_phase, expectedFailurePhase);
+    assert.equal(
+      record.browser_request_failures.events.length,
+      ["hook", "both"].includes(expectedFailurePhase) ? 1 : 0,
+    );
+  }
+  assert.ok(reportBytes.length <= 16 * 1024 - 256);
+  for (const privateValue of ["https://", "private.host", "private-alt", "private-src"]) {
+    assert.equal(reportBytes.includes(Buffer.from(privateValue)), false);
+  }
+  const guardValidation = validateRetainedBrowserReportThroughGuard(reportPath);
+  assert.equal(guardValidation.status, 0, guardValidation.stderr);
+}
+
+function validateRetainedBrowserReportThroughGuard(reportPath) {
+  const guardPath = path.resolve(__dirname, "../../../../tools/platform_live_qa_guard.py");
+  const python = [
+    "import importlib.util, json, pathlib, sys",
+    "guard_path = pathlib.Path(sys.argv[1])",
+    "sys.path.insert(0, str(guard_path.parent))",
+    "spec = importlib.util.spec_from_file_location('platform_live_qa_guard', guard_path)",
+    "guard = importlib.util.module_from_spec(spec)",
+    "sys.modules[spec.name] = guard",
+    "spec.loader.exec_module(guard)",
+    "ephemeral = json.loads(pathlib.Path(sys.argv[2]).read_bytes())",
+    "retained = {",
+    "    'schema': 2, 'gate': ephemeral['gate'],",
+    "    'source_sha': ephemeral['source_sha'], 'app_sha': ephemeral['app_sha'],",
+    "    'marker_sha256': ephemeral['marker_sha256'],",
+    "    'payload_manifest_sha256': 'd' * 64, 'payload_tree_sha256': 'e' * 64,",
+    "    'observed_at': '2026-11-23T00:00:00Z',",
+    "    'run_status': ephemeral['run_status'], 'failures': ephemeral['failures'],",
+    "}",
+    "guard._validate_retained_failure_report(",
+    "    f\"{ephemeral['gate']}.failure-v2.json\",",
+    "    json.dumps(retained, separators=(',', ':')).encode('ascii'),",
+    ")",
+  ].join("\n");
+  return spawnSync("python3", ["-I", "-B", "-c", python, guardPath, reportPath], {
+    encoding: "utf8",
+    timeout: 5_000,
+  });
+}
+
 const failureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "live-failure-contract-"));
 try {
   const successFixture = diagnosticFixture(failureRoot, "c1a2b3c4");
@@ -1346,6 +1498,45 @@ try {
     assert.equal(v2ReportBytes.includes(Buffer.from(privateValue)), false);
   }
 
+  const bodyImageFixture = process.env.PLATFORM_WEB_IMAGE_INVENTORY_BODY_FIXTURE;
+  const bodyRequestFixture = process.env.PLATFORM_WEB_IMAGE_INVENTORY_BODY_REQUEST_FIXTURE;
+  if (bodyImageFixture) {
+    assertProducerRoundTrip({
+      root: failureRoot,
+      suffix: "r1a2b3c4",
+      imageFixturePath: bodyImageFixture,
+      requestFixturePath: bodyRequestFixture,
+      expectedUnloaded: 1,
+      expectedFailurePhase: "body",
+    });
+  }
+  const hookImageFixture = process.env.PLATFORM_WEB_IMAGE_INVENTORY_HOOK_FIXTURE;
+  const hookRequestFixture = process.env.PLATFORM_WEB_IMAGE_INVENTORY_REQUEST_FAILURE_FIXTURE;
+  if (hookImageFixture) {
+    assert.ok(hookRequestFixture, "the hook-only fixture requires its request-failure attachment");
+    assertProducerRoundTrip({
+      root: failureRoot,
+      suffix: "r2a2b3c4",
+      imageFixturePath: hookImageFixture,
+      requestFixturePath: hookRequestFixture,
+      expectedUnloaded: 0,
+      expectedFailurePhase: "hook",
+    });
+  }
+  const bothImageFixture = process.env.PLATFORM_WEB_IMAGE_INVENTORY_BOTH_FIXTURE;
+  const bothRequestFixture = process.env.PLATFORM_WEB_IMAGE_INVENTORY_BOTH_REQUEST_FIXTURE;
+  if (bothImageFixture) {
+    assert.ok(bothRequestFixture, "the combined-failure fixture requires its request-failure attachment");
+    assertProducerRoundTrip({
+      root: failureRoot,
+      suffix: "r3a2b3c4",
+      imageFixturePath: bothImageFixture,
+      requestFixturePath: bothRequestFixture,
+      expectedUnloaded: 1,
+      expectedFailurePhase: "both",
+    });
+  }
+
   const v2PublicCountsPath = path.join(v2Fixture.results, "live-counts-v1.json");
   assert.equal(withRootOwnedGate(v2Fixture.gateRoot, () => writeBoundedSummary(
     v2Fixture.binding,
@@ -1472,11 +1663,19 @@ try {
   assert.equal(capReport.failures.length, 1);
   assert.equal(capReport.failures[0].id, "image_csp_hosts");
   assert.equal(capReport.failures[0].status, "failed");
+  assert.equal(capReport.failures[0].image_inventory_state, "captured");
   assert.deepEqual(
-    [capReport.failures[0].image_inventory_state, capReport.failures[0].image_inventory],
-    ["unavailable", null],
-    "the 16 KiB compaction removes optional per-image detail as one unavailable unit",
+    capReport.failures[0].image_inventory.routes.map((route) => [
+      route.route,
+      route.image_count,
+      route.unloaded_count,
+    ]),
+    [["home", 16, 16], ["patch", 16, 16], ["tournaments", 16, 16]],
+    "byte compaction preserves all route aggregates",
   );
+  assert.ok(capReport.failures[0].image_inventory.routes.every(
+    (route) => route.image_entries_truncated && route.images.length < route.image_count,
+  ));
 
   const invalidImageEvidence = [
     ["unknown private fields", {
@@ -1586,6 +1785,65 @@ try {
       "private-current-src", "private-alt", "private-value",
     ]) {
       assert.equal(invalidV2Bytes.includes(Buffer.from(privateValue)), false);
+    }
+  }
+
+  const validImageForRequestTests = imageInventoryV2Attachment("home", {
+    image_count: 1,
+    images: [imageInventoryV2Image()],
+  });
+  const invalidRequestFailurePayloads = [
+    ["unknown request evidence key", {
+      schema: 1,
+      coverage: "since_before_each",
+      failure_phase: "hook",
+      truncated: false,
+      events: [browserRequestFailureEvent({ url: "https://private.host/private-path" })],
+    }],
+    ["unknown failure phase", {
+      schema: 1,
+      coverage: "since_before_each",
+      failure_phase: "private failure text",
+      truncated: false,
+      events: [],
+    }],
+    ["noncontiguous request ordinals", {
+      schema: 1,
+      coverage: "since_before_each",
+      failure_phase: "hook",
+      truncated: false,
+      events: [browserRequestFailureEvent({ ordinal: 2 })],
+    }],
+  ];
+  for (const [index, [label, payload]] of invalidRequestFailurePayloads.entries()) {
+    const invalidRequestFixture = diagnosticFixture(failureRoot, `rq${index}2b3c4`);
+    const invalidRequestFailure = failureTest(invalidRequestFixture, {
+      title: publicTitles.at(-1),
+      project: "live-webkit-mobile",
+      errorLocation: { file: invalidRequestFixture.helper, line: 2, column: 3 },
+      attachments: [validImageForRequestTests, rawBrowserRequestFailureAttachment(payload)],
+    });
+    const invalidRequestPlan = publicPlanWithFailure(invalidRequestFailure);
+    assert.equal(withRootOwnedGate(invalidRequestFixture.gateRoot, () => writeBoundedFailureSummary(
+      invalidRequestFixture.binding,
+      { allTests: () => invalidRequestPlan },
+      summarizeRun({ allTests: () => invalidRequestPlan }, "failed", { publicGate: true }),
+      { gateRoot: invalidRequestFixture.gateRoot, sourceRoot: invalidRequestFixture.sourceRoot },
+    )), true, `${label} preserves the failed test identity`);
+    const invalidRequestBytes = fs.readFileSync(
+      path.join(invalidRequestFixture.results, "live-failures-v2.json"),
+    );
+    const invalidRequestReport = JSON.parse(invalidRequestBytes.toString("ascii"));
+    assert.equal(invalidRequestReport.failures[0].image_inventory_state, "captured");
+    assert.deepEqual(
+      [
+        invalidRequestReport.failures[0].browser_request_failure_state,
+        invalidRequestReport.failures[0].browser_request_failures,
+      ],
+      ["unavailable", null],
+    );
+    for (const privateValue of ["https://private.host", "private.host", "private-path", "private failure text"]) {
+      assert.equal(invalidRequestBytes.includes(Buffer.from(privateValue)), false);
     }
   }
 
@@ -1949,10 +2207,26 @@ try {
     path.join(sizeFixture.results, "live-failures-v2.json"),
   );
   const maximumReport = JSON.parse(maximumReportBytes.toString("ascii"));
+  const maximumGuardValidation = validateRetainedBrowserReportThroughGuard(
+    path.join(sizeFixture.results, "live-failures-v2.json"),
+  );
+  assert.equal(
+    maximumGuardValidation.status,
+    0,
+    maximumGuardValidation.stderr,
+    "mixed maximum-size report remains valid under the full closed guard schema",
+  );
   assert.ok(maximumReportBytes.length <= 16 * 1024);
   assert.ok(maximumReportBytes.length <= 16 * 1024 - 256);
   assert.equal(maximumReport.failures.length, 57);
   assert.ok(maximumReport.failures.every((failure) => failure.status === "interrupted"));
+  assert.ok(maximumReport.failures.every((failure) => (
+    failure.id === "image_csp_hosts"
+    || (
+      !Object.hasOwn(failure, "browser_request_failure_state")
+      && !Object.hasOwn(failure, "browser_request_failures")
+    )
+  )), "request evidence fields stay within the image gate's closed schema");
   assert.ok(maximumReport.failures.every((failure) => (
     (failure.source_file === "tests/support/live-qa-sandbox.ts"
       && failure.source_line === 10_000

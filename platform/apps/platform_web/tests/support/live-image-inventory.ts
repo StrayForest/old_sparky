@@ -1,5 +1,116 @@
 import type { Page } from "@playwright/test";
 
+type FailureAttachmentOptions = {
+  body: Buffer;
+  contentType: "application/json";
+};
+
+export type BrowserRequestFailureEvidence = {
+  schema: 1;
+  coverage: "since_before_each";
+  failure_phase: "body" | "hook" | "both" | "unknown";
+  truncated: boolean;
+  events: Array<{
+    ordinal: number;
+    resource_type:
+      | "document"
+      | "image"
+      | "stylesheet"
+      | "script"
+      | "font"
+      | "media"
+      | "xhr"
+      | "fetch"
+      | "other"
+      | "unknown";
+    route_scope: "home" | "patch" | "tournaments" | "other" | "unknown";
+    navigation_relation: "same" | "changed" | "unknown";
+    failure_class: "dns" | "connection" | "timeout" | "tls" | "aborted" | "cancelled" | "other";
+    duration_bucket: "<100ms" | "<1s" | "<5s" | ">=5s" | "unavailable";
+  }>;
+};
+
+export type BrowserFailureAttachmentState = {
+  imageInventoryRoutes: unknown[];
+  attachedImageInventoryRoutes: Set<string>;
+  requestFailureEvidence: BrowserRequestFailureEvidence;
+  requestFailureEvidenceAttached: boolean;
+};
+
+export async function attachBrowserFailureEvidence(
+  attach: (name: string, options: FailureAttachmentOptions) => Promise<void>,
+  state: BrowserFailureAttachmentState,
+): Promise<void> {
+  for (const value of state.imageInventoryRoutes) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    const route = value as Record<string, unknown>;
+    const routeName = route.route;
+    if (typeof routeName !== "string" || state.attachedImageInventoryRoutes.has(routeName)) continue;
+    try {
+      await attach("live-image-inventory-evidence-v2", {
+        body: Buffer.from(JSON.stringify(route), "ascii"),
+        contentType: "application/json",
+      });
+      state.attachedImageInventoryRoutes.add(routeName);
+    } catch {
+      // Optional failure diagnostics must never replace the original assertion.
+    }
+  }
+
+  if (!state.requestFailureEvidenceAttached) {
+    try {
+      const boundedEvidence = {
+        ...state.requestFailureEvidence,
+        events: [...state.requestFailureEvidence.events],
+      };
+      let body = Buffer.from(JSON.stringify(boundedEvidence), "ascii");
+      while (body.length > 4 * 1024 && boundedEvidence.events.length > 0) {
+        boundedEvidence.events.pop();
+        boundedEvidence.truncated = true;
+        body = Buffer.from(JSON.stringify(boundedEvidence), "ascii");
+      }
+      state.requestFailureEvidence = boundedEvidence;
+      await attach("live-browser-request-failures-v1", {
+        body,
+        contentType: "application/json",
+      });
+      state.requestFailureEvidenceAttached = true;
+    } catch {
+      // Optional failure diagnostics must never replace the original assertion.
+    }
+  }
+}
+
+export async function finalizeBrowserFailureEvidence(
+  {
+    attach,
+    state,
+    runAssertions,
+    bodyFailureState,
+  }: {
+    attach: (name: string, options: FailureAttachmentOptions) => Promise<void>;
+    state: BrowserFailureAttachmentState;
+    runAssertions: () => void;
+    bodyFailureState: "failed" | "passed" | "unknown";
+  },
+): Promise<void> {
+  try {
+    runAssertions();
+  } catch (error) {
+    state.requestFailureEvidence.failure_phase = bodyFailureState === "failed"
+      ? "both"
+      : bodyFailureState === "passed"
+        ? "hook"
+        : "unknown";
+    await attachBrowserFailureEvidence(attach, state);
+    throw error;
+  }
+  if (bodyFailureState !== "passed") {
+    state.requestFailureEvidence.failure_phase = bodyFailureState === "failed" ? "body" : "unknown";
+    await attachBrowserFailureEvidence(attach, state);
+  }
+}
+
 export type LiveImageInventoryRow = {
   alt: string;
   currentSrc: string;

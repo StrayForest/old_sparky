@@ -196,6 +196,80 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         ]
         platform_live_qa_guard._validate_image_inventory_evidence(max_detail)
 
+        request_failure = {
+            "browser_request_failure_state": "captured",
+            "browser_request_failures": {
+                "failure_phase": "hook",
+                "truncated": False,
+                "events": [{
+                    "ordinal": 1,
+                    "resource_type": "fetch",
+                    "route_scope": "home",
+                    "navigation_relation": "changed",
+                    "failure_class": "other",
+                    "duration_bucket": "<1s",
+                }],
+            },
+        }
+        platform_live_qa_guard._validate_browser_request_failure_evidence(request_failure)
+        platform_live_qa_guard._validate_browser_request_failure_evidence({
+            "browser_request_failure_state": "unavailable",
+            "browser_request_failures": None,
+        })
+        max_request_failures = json.loads(json.dumps(request_failure))
+        max_request_failures["browser_request_failure_state"] = "truncated"
+        max_request_failures["browser_request_failures"]["truncated"] = True
+        max_request_failures["browser_request_failures"]["events"] = [
+            {
+                "ordinal": ordinal,
+                "resource_type": "stylesheet",
+                "route_scope": "tournaments",
+                "navigation_relation": "same",
+                "failure_class": "cancelled",
+                "duration_bucket": ">=5s",
+            }
+            for ordinal in range(1, platform_live_qa_guard.LIVE_BROWSER_REQUEST_FAILURE_MAX_ENTRIES + 1)
+        ]
+        platform_live_qa_guard._validate_browser_request_failure_evidence(max_request_failures)
+
+        invalid_request_failures = []
+        unknown_request_field = json.loads(json.dumps(request_failure))
+        unknown_request_field["browser_request_failures"]["private_host"] = "private.example"
+        invalid_request_failures.append(unknown_request_field)
+        invalid_request_event = json.loads(json.dumps(request_failure))
+        invalid_request_event["browser_request_failures"]["events"][0]["url"] = (
+            "https://private.example/image.webp"
+        )
+        invalid_request_failures.append(invalid_request_event)
+        invalid_request_phase = json.loads(json.dumps(request_failure))
+        invalid_request_phase["browser_request_failures"]["failure_phase"] = "private stack text"
+        invalid_request_failures.append(invalid_request_phase)
+        invalid_navigation_relation = json.loads(json.dumps(request_failure))
+        invalid_navigation_relation["browser_request_failures"]["events"][0][
+            "navigation_relation"
+        ] = "private navigation url"
+        invalid_request_failures.append(invalid_navigation_relation)
+        invalid_request_ordinal = json.loads(json.dumps(request_failure))
+        invalid_request_ordinal["browser_request_failures"]["events"][0]["ordinal"] = 2
+        invalid_request_failures.append(invalid_request_ordinal)
+        request_over_cap = json.loads(json.dumps(request_failure))
+        request_over_cap["browser_request_failures"]["events"] = [
+            {
+                "ordinal": ordinal,
+                "resource_type": "fetch",
+                "route_scope": "home",
+                "navigation_relation": "same",
+                "failure_class": "other",
+                "duration_bucket": "<1s",
+            }
+            for ordinal in range(1, platform_live_qa_guard.LIVE_BROWSER_REQUEST_FAILURE_MAX_ENTRIES + 2)
+        ]
+        invalid_request_failures.append(request_over_cap)
+        for record in invalid_request_failures:
+            with self.subTest(request_failure_record=record):
+                with self.assertRaises(platform_live_qa_guard.GuardError):
+                    platform_live_qa_guard._validate_browser_request_failure_evidence(record)
+
         invalid_records = []
         duplicate_route = json.loads(json.dumps(captured))
         duplicate_route["image_inventory"]["routes"].append(

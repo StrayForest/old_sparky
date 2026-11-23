@@ -10,27 +10,12 @@ belong in the linked owner documents below.
 
 ## Live and pending state
 
-- Production runs application source
-  `ee1703a14968232a02c793b3b0fc4be98bde93c4` in release
-  `gha-45131172511-1-ee1703a14968`, deployed by automatic child
-  `45131172511/1`. Exact-SHA Security `45128995964/1`, source-bound
-  restore-verified backup `45130756642/1`, and AUTO `45130690722/1` passed.
-  Host-tools generation
-  `da9981d6a7e97ec6aeea8501b02218f6d78fb50f` is unchanged and installed.
-  Deployment smoke and post-maintenance health passed; a Public QA gate is
-  failed and UserQA has not run. This CURRENT update is documentation-only and
-  does not change the active application source.
-- Active application source is
-  `ee1703a14968232a02c793b3b0fc4be98bde93c4`; previous release remains
-  `gha-45047467972-1-7fd08091df9e`. The automatic release workflow reported
-  all six services active, API live/ready and web returning 200. Local and
-  origin health checks returned 200; public homepage returned 200, while the
-  direct public API health URLs returned 403. The 403 responses are an
-  observed, unattributed boundary and do not override the successful origin
-  and deployment smoke checks. No release operation is pending.
-  See the
-  [deployment runbook](deployment-runbook.md) and host-tools ADRs for the
-  source-bound procedure.
+- Production currently runs application source
+  `1e73d0cbc5ac999d4adc6c76e7f8fc9616f26023` in automatic release
+  `gha-45186048927-1-1e73d0cbc5ac`. Exact-SHA security/build and automatic
+  release checks passed; deployment smoke and post-deploy health passed.
+  See the [deployment runbook](deployment-runbook.md) for source-bound release
+  procedures.
 - Installed-origin API acceptance for patch `1848664643342973` passed: the
   Russian patch detail returns 27 changes, with the leaderboard heading at
   index 21, its four descriptions at indexes 22–25, and the Beta Season 2
@@ -67,27 +52,17 @@ belong in the linked owner documents below.
 - After successful roster provisioning, the deployed release includes
   automatic exact cleanup for a confirmed terminal Public failure and
   preserves the fixed browser-output protocol.
-- Automatic post-deploy QA sequencer `45132147425/1` failed after Public QA
-  child `45132182150/1`: 46 passed, 10 skipped, 1 failed. The failure was
-  `image_csp_hosts` on `live-webkit-mobile`; exact-source private evidence
-  showed one unloaded home image among 10, with no missing `currentSrc` and no
-  page error events. The cause is unknown. This is compatible with the
-  previously documented intermittent unloaded-WebKit-image issue, but the
-  same root cause is not established. Public failure fixture cleanup completed
-  (`public_failure_cleanup=cleaned`); UserQA was not run and receives no QA
-  credit. No CSP policy, assertion or timeout change is supported by this
-  evidence. See the [CSP/live-QA runbook](csp-live-qa-runbook.md) for the
-  evidence and recovery contract.
-- Storage diagnostics `45133282711/1` and authorized bounded maintenance
-  `45134350443/1` completed successfully for source `ee1703a`. Current and
-  previous releases were protected; one older unprotected release was removed
-  (281,836,950 bytes), and no LiveQA cache or transient files were deleted.
-  One restore- and Alembic-verified backup pair was retained across 39 tables;
-  the new archive is `platformdb-20261123T075333Z.dump` (135,104,179 bytes).
-  Final disk usage was 48.64% with 20,531,122,176 bytes free. All six services
-  were active; the maintenance timer remains enabled and waiting, and the
-  maintenance service exited successfully. The CI Siteverify fixture does
-  not establish production Cloudflare challenge/scoring.
+- Automatic release QA sequencer `45186048927/1` passed its release checks;
+  canonical Public QA child `45187504668/1` failed `image_csp_hosts` on
+  `live-webkit-mobile`. Its source-bound private record had unavailable image
+  inventory, so the failure cause remains unknown. Public failure cleanup
+  completed (`public_failure_cleanup=cleaned`); UserQA was not run. Do not infer
+  a CSP, lazy-loading, decode or application cause. See the
+  [CSP/live-QA runbook](csp-live-qa-runbook.md) for evidence and recovery.
+- Latest read-only storage diagnostics `45189933837/1` found 19.4 GB free,
+  healthy services, an enabled maintenance timer and no QA artifact candidates.
+  No manual retention deletion was needed. The CI Siteverify fixture does not
+  establish production Cloudflare challenge/scoring.
 - The completed external HTTP matrix is not whole-site functional coverage.
   Cell 9's attribution failure and cell 7's unresolved client/origin join are
   not closed by the separate SSR diagnostics. No cause or server capacity

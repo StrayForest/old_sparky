@@ -270,6 +270,7 @@ LIVE_BROWSER_IMAGE_INVENTORY_ROUTES = frozenset({"home", "patch", "tournaments"}
 LIVE_BROWSER_IMAGE_INVENTORY_MAX_COUNT = 512
 LIVE_BROWSER_IMAGE_DIAGNOSTIC_MAX_ENTRIES = 16
 LIVE_BROWSER_IMAGE_DIAGNOSTIC_MAX_EVENTS = 64
+LIVE_BROWSER_REQUEST_FAILURE_MAX_ENTRIES = 32
 LIVE_BROWSER_PAGE_ERROR_ASSET_BASENAME = re.compile(
     r"^(?:[a-z0-9][a-z0-9_-]{12}|turbopack-[a-z0-9_-]{13})\.js$"
 )
@@ -3282,6 +3283,60 @@ def _validate_image_inventory_route_v2(
         seen_ordinals.add(ordinal)
 
 
+def _validate_browser_request_failure_evidence(record: Mapping[str, object]) -> None:
+    state = record.get("browser_request_failure_state")
+    evidence = record.get("browser_request_failures")
+    if state == "unavailable":
+        if evidence is not None:
+            raise GuardError("private browser request-failure evidence is malformed")
+        return
+    if not isinstance(state, str) or state not in {"captured", "truncated"} or not isinstance(evidence, dict) or set(evidence) != {
+        "failure_phase", "truncated", "events",
+    }:
+        raise GuardError("private browser request-failure evidence is malformed")
+    events = evidence.get("events")
+    truncated = evidence.get("truncated")
+    if (
+        not isinstance(evidence.get("failure_phase"), str)
+        or evidence.get("failure_phase") not in {"body", "hook", "both", "unknown"}
+        or type(truncated) is not bool
+        or state != ("truncated" if truncated else "captured")
+        or not isinstance(events, list)
+        or len(events) > LIVE_BROWSER_REQUEST_FAILURE_MAX_ENTRIES
+    ):
+        raise GuardError("private browser request-failure evidence is malformed")
+    for index, event in enumerate(events):
+        if not isinstance(event, dict) or set(event) != {
+            "ordinal", "resource_type", "route_scope", "navigation_relation",
+            "failure_class", "duration_bucket",
+        }:
+            raise GuardError("private browser request-failure event is malformed")
+        if (
+            type(event.get("ordinal")) is not int
+            or event["ordinal"] != index + 1
+            or not isinstance(event.get("resource_type"), str)
+            or event.get("resource_type") not in {
+                "document", "image", "stylesheet", "script", "font", "media",
+                "xhr", "fetch", "other", "unknown",
+            }
+            or not isinstance(event.get("route_scope"), str)
+            or event.get("route_scope") not in {
+                "home", "patch", "tournaments", "other", "unknown",
+            }
+            or not isinstance(event.get("navigation_relation"), str)
+            or event.get("navigation_relation") not in {"same", "changed", "unknown"}
+            or not isinstance(event.get("failure_class"), str)
+            or event.get("failure_class") not in {
+                "dns", "connection", "timeout", "tls", "aborted", "cancelled", "other",
+            }
+            or not isinstance(event.get("duration_bucket"), str)
+            or event.get("duration_bucket") not in {
+                "<100ms", "<1s", "<5s", ">=5s", "unavailable",
+            }
+        ):
+            raise GuardError("private browser request-failure event is malformed")
+
+
 def _validate_live_user_api_failure(value: object) -> None:
     if not isinstance(value, dict) or set(value) != {
         "kind", "operation", "method", "expected_status", "actual_status",
@@ -3533,17 +3588,20 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
             expected_failure_keys.update(
                 {"api_failure_state", "api_failure"}
             )
+        allowed_failure_key_sets = {frozenset(expected_failure_keys)}
+        failure_id = failure.get("id") if isinstance(failure, dict) else None
+        if schema == 2 and failure_id == "image_csp_hosts":
+            image_keys = {"image_inventory_state", "image_inventory"}
+            request_failure_keys = {
+                "browser_request_failure_state", "browser_request_failures",
+            }
+            allowed_failure_key_sets.update({
+                frozenset(expected_failure_keys | image_keys),
+                frozenset(expected_failure_keys | image_keys | request_failure_keys),
+            })
         if (
             not isinstance(failure, dict)
-            or (
-                set(failure) != expected_failure_keys
-                and not (
-                    schema == 2
-                    and failure.get("id") == "image_csp_hosts"
-                    and set(failure) == expected_failure_keys
-                    | {"image_inventory_state", "image_inventory"}
-                )
-            )
+            or frozenset(failure) not in allowed_failure_key_sets
             or not isinstance(failure.get("id"), str)
             or failure["id"] not in ({"live_user_journey"} if schema == 3 else LIVE_BROWSER_FAILURE_DIAGNOSTIC_NAMES)
             or not isinstance(failure.get("project"), str)
@@ -3564,6 +3622,10 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
             _validate_page_error_evidence(failure)
             if "image_inventory_state" in failure or "image_inventory" in failure:
                 _validate_image_inventory_evidence(failure)
+            if "browser_request_failure_state" in failure or "browser_request_failures" in failure:
+                if failure.get("id") != "image_csp_hosts":
+                    raise GuardError("private browser request-failure evidence is bound to the wrong test")
+                _validate_browser_request_failure_evidence(failure)
         if schema == 4:
             continue
         if schema == 3:

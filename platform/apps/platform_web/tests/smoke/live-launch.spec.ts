@@ -1,7 +1,12 @@
 import { expect, test } from "@playwright/test";
 import type { Locator } from "@playwright/test";
 import LiveCountReporter from "../support/live-count-reporter.cjs";
-import { collectLiveImageInventory } from "../support/live-image-inventory";
+import {
+  collectLiveImageInventory,
+  finalizeBrowserFailureEvidence,
+  type BrowserFailureAttachmentState,
+  type BrowserRequestFailureEvidence,
+} from "../support/live-image-inventory";
 import { assertLiveQaChromiumSandbox } from "../support/live-qa-sandbox";
 import { expectRenderedPatchChangeList, patchAcceptanceIssues } from "../support/patch-acceptance";
 import type { PlatformPatchDetail, PlatformPatchSection } from "../../lib/platform-types";
@@ -24,6 +29,17 @@ type BrowserEvidence = {
   nextScriptResponses: Array<{ url: string; status: number; resourceType: string }>;
   nextScriptPaths: Set<string>;
   requestFailures: string[];
+  requestFailureStarts: WeakMap<import("@playwright/test").Request, {
+    startedAt: number;
+    routeScope: BrowserRequestFailureEvidence["events"][number]["route_scope"];
+    navigationEpoch: number;
+  }>;
+  requestFailureEvents: BrowserRequestFailureEvidence["events"];
+  requestFailureEventsTruncated: boolean;
+  imageInventoryRoutes: unknown[];
+  attachedImageInventoryRoutes: Set<string>;
+  requestFailureEvidenceAttached: boolean;
+  imageBodyFailureObserved: boolean;
   unexpectedAuthAutomationRequests: string[];
 };
 
@@ -43,6 +59,58 @@ const expectedWebKitPrefetchCancellationPaths = new Set([
   "/terms",
   "/profile/me",
 ]);
+const MAX_BROWSER_REQUEST_FAILURE_EVENTS = 32;
+
+function browserRequestRouteScope(
+  value: string,
+): BrowserRequestFailureEvidence["events"][number]["route_scope"] {
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "unknown";
+    const pathname = parsed.pathname;
+    if (pathname === "/") return "home";
+    if (/^\/patches\/[^/]+(?:\/|$)/u.test(pathname)) return "patch";
+    if (pathname === "/tournaments" || pathname.startsWith("/tournaments/")) {
+      return "tournaments";
+    }
+    return "other";
+  } catch {
+    return "unknown";
+  }
+}
+
+function browserRequestResourceType(
+  value: string,
+): BrowserRequestFailureEvidence["events"][number]["resource_type"] {
+  if (["document", "image", "stylesheet", "script", "font", "media", "xhr", "fetch"].includes(value)) {
+    return value as BrowserRequestFailureEvidence["events"][number]["resource_type"];
+  }
+  return value ? "other" : "unknown";
+}
+
+function browserRequestFailureClass(
+  value: string,
+): BrowserRequestFailureEvidence["events"][number]["failure_class"] {
+  if (/ERR_NAME_NOT_RESOLVED|ERR_DNS/iu.test(value)) return "dns";
+  if (/ERR_CONNECTION|ERR_ADDRESS_UNREACHABLE|ERR_NETWORK_CHANGED/iu.test(value)) return "connection";
+  if (/ERR_TIMED_OUT|ERR_CONNECTION_TIMEOUT/iu.test(value)) return "timeout";
+  if (/ERR_CERT|ERR_SSL|ERR_TLS/iu.test(value)) return "tls";
+  if (/ERR_ABORTED|NS_BINDING_ABORTED|Operation was aborted/iu.test(value)) return "aborted";
+  if (/Load request cancelled|cancelled/iu.test(value)) return "cancelled";
+  return "other";
+}
+
+function browserRequestDurationBucket(
+  durationMs: number | undefined,
+): BrowserRequestFailureEvidence["events"][number]["duration_bucket"] {
+  if (durationMs === undefined || !Number.isFinite(durationMs) || durationMs < 0) {
+    return "unavailable";
+  }
+  if (durationMs < 100) return "<100ms";
+  if (durationMs < 1_000) return "<1s";
+  if (durationMs < 5_000) return "<5s";
+  return ">=5s";
+}
 async function attachPageErrorEvidence(
   page: import("@playwright/test").Page,
   testInfo: import("@playwright/test").TestInfo,
@@ -166,10 +234,32 @@ test.beforeEach(async ({ page, browserName }) => {
     nextScriptResponses: [],
     nextScriptPaths: new Set(),
     requestFailures: [],
+    requestFailureStarts: new WeakMap(),
+    requestFailureEvents: [],
+    requestFailureEventsTruncated: false,
+    imageInventoryRoutes: [],
+    attachedImageInventoryRoutes: new Set(),
+    requestFailureEvidenceAttached: false,
+    imageBodyFailureObserved: false,
     unexpectedAuthAutomationRequests: [],
   };
   browserEvidence.set(page, evidence);
+  let mainFrameNavigationEpoch = 0;
+  page.on("framenavigated", (frame) => {
+    if (frame === page.mainFrame()) mainFrameNavigationEpoch += 1;
+  });
   page.on("request", (request) => {
+    let routeScope: BrowserRequestFailureEvidence["events"][number]["route_scope"] = "unknown";
+    try {
+      routeScope = browserRequestRouteScope(request.frame().url());
+    } catch {
+      // Requests without an attached frame keep an explicit unknown scope.
+    }
+    evidence.requestFailureStarts.set(request, {
+      startedAt: performance.now(),
+      routeScope,
+      navigationEpoch: mainFrameNavigationEpoch,
+    });
     const parsed = new URL(request.url());
     if (
       parsed.hostname === "challenges.cloudflare.com"
@@ -269,6 +359,23 @@ test.beforeEach(async ({ page, browserName }) => {
     evidence.requestFailures.push(
       `${request.method()} ${parsed.origin}${parsed.pathname} ${errorText}`,
     );
+    const start = evidence.requestFailureStarts.get(request);
+    if (evidence.requestFailureEvents.length >= MAX_BROWSER_REQUEST_FAILURE_EVENTS) {
+      evidence.requestFailureEventsTruncated = true;
+      return;
+    }
+    evidence.requestFailureEvents.push({
+      ordinal: evidence.requestFailureEvents.length + 1,
+      resource_type: browserRequestResourceType(request.resourceType()),
+      route_scope: start?.routeScope ?? "unknown",
+      navigation_relation: start
+        ? start.navigationEpoch === mainFrameNavigationEpoch ? "same" : "changed"
+        : "unknown",
+      failure_class: browserRequestFailureClass(errorText),
+      duration_bucket: browserRequestDurationBucket(
+        start ? performance.now() - start.startedAt : undefined,
+      ),
+    });
   });
   await page.exposeBinding("__platformRecordCspViolation", (_source, violation) => {
     evidence.cspViolations.push(violation as BrowserEvidence["cspViolations"][number]);
@@ -351,14 +458,49 @@ test.afterEach(async ({ page }, testInfo) => {
   if (testInfo.annotations.some((annotation) => annotation.type === "expected-csp-violations")) {
     return;
   }
-  expect(evidence?.cspViolations ?? [], "SecurityPolicyViolationEvent entries").toEqual([]);
-  expect(evidence?.consoleCspErrors ?? [], "CSP console errors").toEqual([]);
-  expect(evidence?.pageErrors ?? [], "uncaught page errors").toEqual([]);
-  expect(evidence?.requestFailures ?? [], "failed browser requests").toEqual([]);
-  expect(
-    evidence?.unexpectedAuthAutomationRequests ?? [],
-    "auth documents and Turnstile belong to the separate human gate",
-  ).toEqual([]);
+  if (!evidence) {
+    expect([], "SecurityPolicyViolationEvent entries").toEqual([]);
+    expect([], "CSP console errors").toEqual([]);
+    expect([], "uncaught page errors").toEqual([]);
+    expect([], "failed browser requests").toEqual([]);
+    expect([], "auth documents and Turnstile belong to the separate human gate").toEqual([]);
+    return;
+  }
+  const attachFailureEvidence = async () => {
+    const state: BrowserFailureAttachmentState = {
+      imageInventoryRoutes: evidence.imageInventoryRoutes,
+      attachedImageInventoryRoutes: evidence.attachedImageInventoryRoutes,
+      requestFailureEvidence: {
+        schema: 1,
+        coverage: "since_before_each",
+        failure_phase: "unknown",
+        truncated: evidence.requestFailureEventsTruncated,
+        events: evidence.requestFailureEvents,
+      },
+      requestFailureEvidenceAttached: evidence.requestFailureEvidenceAttached,
+    };
+    await finalizeBrowserFailureEvidence({
+      attach: (name, options) => testInfo.attach(name, options),
+      state,
+      runAssertions: () => {
+        expect(evidence.cspViolations, "SecurityPolicyViolationEvent entries").toEqual([]);
+        expect(evidence.consoleCspErrors, "CSP console errors").toEqual([]);
+        expect(evidence.pageErrors, "uncaught page errors").toEqual([]);
+        expect(evidence.requestFailures, "failed browser requests").toEqual([]);
+        expect(
+          evidence.unexpectedAuthAutomationRequests,
+          "auth documents and Turnstile belong to the separate human gate",
+        ).toEqual([]);
+      },
+      bodyFailureState: evidence.imageBodyFailureObserved
+        ? "failed"
+        : testInfo.errors.length === 0 && testInfo.status === testInfo.expectedStatus
+          ? "passed"
+          : "unknown",
+    });
+    evidence.requestFailureEvidenceAttached = state.requestFailureEvidenceAttached;
+  };
+  await attachFailureEvidence();
 });
 
 const routes = [
@@ -1062,6 +1204,8 @@ test("live image currentSrc inventory stays inside the exact CSP hosts", async (
       terminal_duration_bucket: string;
     }>;
   }> = [];
+  const pageEvidence = browserEvidence.get(page);
+  if (pageEvidence) pageEvidence.imageInventoryRoutes = imageEvidence;
   try {
     for (const { path: routePath, route } of routes) {
       const imageResult = await collectLiveImageInventory(page, {
@@ -1074,7 +1218,10 @@ test("live image currentSrc inventory stays inside the exact CSP hosts", async (
       const unloadedCount = images.filter((image) => !image.loaded).length;
       const countLimit = 512;
       const diagnosticLimit = 16;
-      const boundedImages = images.filter((image) => image.diagnostic.ordinal <= countLimit);
+      const boundedImages = images.slice(0, countLimit);
+      const routeOrdinals = new Map(
+        images.map((image, index) => [image.diagnostic.ordinal, index + 1]),
+      );
       const imageEntriesTruncated = images.length > diagnosticLimit
         || boundedImages.length !== images.length;
       const selectedDiagnostics = [...boundedImages]
@@ -1084,7 +1231,7 @@ test("live image currentSrc inventory stays inside the exact CSP hosts", async (
         ))
         .slice(0, diagnosticLimit)
         .map(({ diagnostic }) => ({
-          ordinal: diagnostic.ordinal,
+          ordinal: routeOrdinals.get(diagnostic.ordinal) ?? diagnostic.ordinal,
           generation: diagnostic.generation,
           src_present: diagnostic.srcPresent,
           srcset_present: diagnostic.srcSetPresent,
@@ -1141,16 +1288,7 @@ test("live image currentSrc inventory stays inside the exact CSP hosts", async (
       contentType: "application/json",
     });
   } catch (error) {
-    for (const evidence of imageEvidence) {
-      try {
-        await testInfo.attach("live-image-inventory-evidence-v2", {
-          body: JSON.stringify(evidence),
-          contentType: "application/json",
-        });
-      } catch {
-        // Failure diagnostics cannot replace the original assertion outcome.
-      }
-    }
+    if (pageEvidence) pageEvidence.imageBodyFailureObserved = true;
     throw error;
   }
 });
