@@ -3388,7 +3388,13 @@ os._exit(0)
                     runtime.install(app_dir, legacy_release)
                     runtime.verify(app_dir, legacy_sha)
 
-                def make_candidate(candidate_sha: str, *, lock_bytes: bytes = b"lock\n") -> Path:
+                def make_candidate(
+                    candidate_sha: str,
+                    *,
+                    lock_bytes: bytes = b"lock\n",
+                    browser_gate_import: bool = True,
+                    include_browser_gate_helper: bool = True,
+                ) -> Path:
                     release = app_dir / "releases" / f"release-{candidate_sha[:8]}"
                     release.mkdir(mode=0o755)
                     tools = release / "tools"
@@ -3415,12 +3421,25 @@ os._exit(0)
                         "web/package-lock.json": lock_bytes,
                         "web/playwright.live.config.ts": b"config\n",
                         "web/tests/smoke/live-launch.spec.ts": b"launch\n",
-                        "web/tests/smoke/live-user-journey.spec.ts": b"journey\n",
+                        "web/tests/smoke/live-user-journey.spec.ts": (
+                            b'import { createLiveUserBrowserGateCapture } from '
+                            b'"../support/live-user-browser-gate";\n'
+                            b"void createLiveUserBrowserGateCapture;\n"
+                            if browser_gate_import
+                            else b"journey\n"
+                        ),
                         "web/tests/support/live-qa-origin.ts": b"origin\n",
                         "web/tests/support/live-qa-sandbox.ts": b"sandbox\n",
                         "web/tests/support/live-count-reporter.cjs": b"reporter\n",
                         "web/tests/support/live-engine-preflight.cjs": b"preflight\n",
                     }
+                    if include_browser_gate_helper:
+                        suite_content[
+                            "web/tests/support/live-user-browser-gate.ts"
+                        ] = (
+                            SCRIPT.parents[1]
+                            / "apps/platform_web/tests/support/live-user-browser-gate.ts"
+                        ).read_bytes()
                     for relative, content in suite_content.items():
                         target = source_runtime / relative
                         target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
@@ -3451,6 +3470,124 @@ os._exit(0)
                     runtime._normalize_tree(source_runtime)
                     return release
 
+                incomplete_candidate = make_candidate(
+                    "7" * 40,
+                    browser_gate_import=True,
+                    include_browser_gate_helper=False,
+                )
+                with mock.patch.object(
+                    runtime,
+                    "_validate_runtime_source",
+                    new=ORIGINAL_VALIDATE_RUNTIME_SOURCE,
+                ), self.assertRaises(runtime.InstallerError):
+                    runtime._candidate_source_plan(
+                        app_dir, incomplete_candidate, "7" * 40
+                    )
+
+                unreferenced_helper_candidate = make_candidate(
+                    "8" * 40,
+                    browser_gate_import=False,
+                    include_browser_gate_helper=True,
+                )
+                with (
+                    mock.patch.object(
+                        runtime,
+                        "_validate_runtime_source",
+                        new=ORIGINAL_VALIDATE_RUNTIME_SOURCE,
+                    ),
+                    self.assertRaisesRegex(
+                        runtime.InstallerError,
+                        "live-QA runtime contains an unreviewed web member",
+                    ),
+                ):
+                    runtime._candidate_source_plan(
+                        app_dir, unreferenced_helper_candidate, "8" * 40
+                    )
+
+                importless_v3_candidate = make_candidate(
+                    "6" * 40,
+                    browser_gate_import=False,
+                    include_browser_gate_helper=False,
+                )
+                with mock.patch.object(
+                    runtime,
+                    "_validate_runtime_source",
+                    new=ORIGINAL_VALIDATE_RUNTIME_SOURCE,
+                ):
+                    importless_manifest, _provider, _provider_source = (
+                        runtime._candidate_source_plan(
+                            app_dir, importless_v3_candidate, "6" * 40
+                        )
+                    )
+                self.assertEqual(importless_manifest["version"], 3)
+                self.assertNotIn(
+                    "web/tests/support/live-user-browser-gate.ts",
+                    importless_manifest["suite_files"],
+                )
+
+                # Full legacy providers keep the old importless suite. An extra
+                # helper is rejected until the suite imports it; once referenced,
+                # the same immutable provider tree is accepted.
+                full_provider, full_files, full_lock_sha = self._engine_provider_fixture(
+                    root / "full-provider"
+                )
+                full_sandbox = full_provider / runtime.RUNTIME_SANDBOX_RELATIVE
+                full_sandbox_sha = runtime._digest_regular(
+                    full_sandbox, allow_sandbox=True
+                )
+                helper_relative = "web/tests/support/live-user-browser-gate.ts"
+                full_journey = full_provider / "web/tests/smoke/live-user-journey.spec.ts"
+                full_helper = full_provider / helper_relative
+
+                def validate_full_provider() -> None:
+                    runtime._validate_engine_root(
+                        full_provider,
+                        expected_files=full_files,
+                        engine_sha256=runtime._engine_digest(
+                            full_files,
+                            node_version="26.3.1",
+                            package_lock_sha256=full_lock_sha,
+                        ),
+                        node_version="26.3.1",
+                        package_lock_sha256=full_lock_sha,
+                    )
+
+                with mock.patch.multiple(
+                    runtime,
+                    CHROMIUM_SANDBOX_SIZE=full_sandbox.stat().st_size,
+                    CHROMIUM_SANDBOX_SHA256=full_sandbox_sha,
+                ):
+                    validate_full_provider()
+                    os.chmod(full_provider, 0o755)
+                    os.chmod(full_journey, 0o644)
+                    os.chmod(full_helper.parent, 0o755)
+                    full_helper.write_bytes(
+                        (
+                            SCRIPT.parents[1]
+                            / "apps/platform_web/tests/support/live-user-browser-gate.ts"
+                        ).read_bytes()
+                    )
+                    full_helper.chmod(0o444)
+                    os.chmod(full_helper.parent, 0o555)
+                    os.chmod(full_journey, 0o444)
+                    os.chmod(full_provider, 0o555)
+                    with self.assertRaisesRegex(
+                        runtime.InstallerError,
+                        "runtime provider dependency tree contains an unreviewed file",
+                    ):
+                        validate_full_provider()
+
+                    os.chmod(full_provider, 0o755)
+                    os.chmod(full_journey, 0o644)
+                    full_journey.write_bytes(
+                        b'import { createLiveUserBrowserGateCapture } from '
+                        b'"../support/live-user-browser-gate";\n'
+                        b"void createLiveUserBrowserGateCapture;\n"
+                    )
+                    os.chmod(full_journey, 0o444)
+                    os.chmod(full_provider, 0o555)
+                    validate_full_provider()
+
                 repaired_release = make_candidate(repaired_sha)
                 # X's deployed installer predates typed-provider rebinding.
                 # Keep that immutable target binary in the fixture so the
@@ -3469,7 +3606,23 @@ os._exit(0)
                 os.chmod(old_installer_path, 0o444)
                 with mock.patch.object(runtime, "_validate_runtime_source", new=ORIGINAL_VALIDATE_RUNTIME_SOURCE):
                     # Provider planning consumes the already-published legacy
-                    # generation and installer publication creates the v2 one.
+                    # importless generation and installer publication creates
+                    # the new candidate generation with its imported helper.
+                    legacy_active_runtime = payload_root / legacy_sha / "runtime"
+                    legacy_journey = (
+                        legacy_active_runtime
+                        / "web/tests/smoke/live-user-journey.spec.ts"
+                    )
+                    self.assertFalse(
+                        (
+                            legacy_active_runtime
+                            / "web/tests/support/live-user-browser-gate.ts"
+                        ).exists()
+                    )
+                    self.assertNotIn(
+                        runtime.LIVE_USER_BROWSER_GATE_IMPORT,
+                        legacy_journey.read_bytes(),
+                    )
                     runtime.install(app_dir, repaired_release)
                     (app_dir / "current").unlink()
                     (app_dir / "current").symlink_to(repaired_release)

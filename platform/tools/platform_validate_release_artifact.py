@@ -707,6 +707,20 @@ def _validate_liveqa_runtime(
         raise ArtifactError("liveqa-runtime launch spec is truncated")
     requires_patch_acceptance = b"../support/patch-acceptance" in launch_spec
     requires_live_image_inventory = b"../support/live-image-inventory" in launch_spec
+    user_journey_name = f"{prefix}/web/tests/smoke/live-user-journey.spec.ts"
+    user_journey_member = by_name[user_journey_name]
+    if user_journey_member.size > MAX_LIVE_QA_LAUNCH_SPEC_BYTES:
+        raise ArtifactError("liveqa-runtime user journey spec is too large")
+    user_journey_file = archive.extractfile(user_journey_member)
+    if user_journey_file is None:
+        raise ArtifactError("liveqa-runtime user journey spec is unavailable")
+    with user_journey_file:
+        user_journey = user_journey_file.read(MAX_LIVE_QA_LAUNCH_SPEC_BYTES + 1)
+    if len(user_journey) != user_journey_member.size:
+        raise ArtifactError("liveqa-runtime user journey spec is truncated")
+    requires_live_user_browser_gate = (
+        b"../support/live-user-browser-gate" in user_journey
+    )
     if requires_patch_acceptance:
         helper_member = by_name.get(
             f"{prefix}/web/tests/support/patch-acceptance.ts"
@@ -725,6 +739,15 @@ def _validate_liveqa_runtime(
                 "liveqa-runtime is missing required file: "
                 "web/tests/support/live-image-inventory.ts"
             )
+    if requires_live_user_browser_gate:
+        helper_member = by_name.get(
+            f"{prefix}/web/tests/support/live-user-browser-gate.ts"
+        )
+        if helper_member is None or not helper_member.isfile():
+            raise ArtifactError(
+                "liveqa-runtime is missing required file: "
+                "web/tests/support/live-user-browser-gate.ts"
+            )
     runtime_prefix = f"{prefix}/"
     allowed_top = {"node", "web", "browsers", "runtime-manifest.json"}
     allowed_web_files = {
@@ -738,6 +761,8 @@ def _validate_liveqa_runtime(
         "web/tests/support/patch-acceptance.ts",
         "web/tests/support/live-engine-preflight.cjs",
     }
+    if requires_live_user_browser_gate:
+        allowed_web_files.add("web/tests/support/live-user-browser-gate.ts")
     if requires_live_image_inventory:
         allowed_web_files.add("web/tests/support/live-image-inventory.ts")
     allowed_package_roots = {

@@ -124,7 +124,6 @@ RUNTIME_REQUIRED_FILES = (
     "web/tests/smoke/live-user-journey.spec.ts",
     "web/tests/support/live-qa-origin.ts",
     "web/tests/support/live-qa-sandbox.ts",
-    "web/tests/support/live-user-browser-gate.ts",
     "web/tests/support/live-count-reporter.cjs",
     "web/node_modules/@playwright/test/package.json",
     "web/node_modules/playwright/package.json",
@@ -132,6 +131,7 @@ RUNTIME_REQUIRED_FILES = (
     "browsers/chromium-1228/chrome-linux64/chrome_sandbox",
 )
 LIVE_IMAGE_INVENTORY_IMPORT = b"../support/live-image-inventory"
+LIVE_USER_BROWSER_GATE_IMPORT = b"../support/live-user-browser-gate"
 
 # All executable/source files used by the trusted wrapper.  The API source
 # and platform package trees are copied into the payload so DB fixture tools
@@ -1155,7 +1155,6 @@ def _validate_runtime_source(
         "web/tests/smoke/live-user-journey.spec.ts",
         "web/tests/support/live-qa-origin.ts",
         "web/tests/support/live-qa-sandbox.ts",
-        "web/tests/support/live-user-browser-gate.ts",
     ]
     if not attested_provider_recovery:
         required.append("web/tests/smoke/live-launch.spec.ts")
@@ -1172,12 +1171,24 @@ def _validate_runtime_source(
         and launch_spec_path.is_file()
         and LIVE_IMAGE_INVENTORY_IMPORT in launch_spec_path.read_bytes()
     )
+    user_journey_path = root / "web/tests/smoke/live-user-journey.spec.ts"
+    needs_live_user_browser_gate = False
+    if not attested_provider_recovery:
+        user_journey_metadata = _regular(user_journey_path, mode=0o444)
+        needs_live_user_browser_gate = LIVE_USER_BROWSER_GATE_IMPORT in _read_bounded_regular(
+            user_journey_path,
+            metadata=user_journey_metadata,
+            maximum=MAX_FILE_BYTES,
+            mode=0o444,
+        )
     if not legacy_reporter_runtime and not attested_provider_recovery:
         required.append("web/tests/support/live-count-reporter.cjs")
     if needs_patch_acceptance:
         required.append("web/tests/support/patch-acceptance.ts")
     if needs_live_image_inventory:
         required.append("web/tests/support/live-image-inventory.ts")
+    if needs_live_user_browser_gate:
+        required.append("web/tests/support/live-user-browser-gate.ts")
     for relative in required:
         path = root / relative
         _regular(path, allow_sandbox=relative == RUNTIME_SANDBOX_RELATIVE.as_posix())
@@ -1188,7 +1199,6 @@ def _validate_runtime_source(
         "web/tests/smoke/live-user-journey.spec.ts",
         "web/tests/support/live-qa-origin.ts",
         "web/tests/support/live-qa-sandbox.ts",
-        "web/tests/support/live-user-browser-gate.ts",
     }
     if not attested_provider_recovery:
         allowed_web_files.add("web/tests/smoke/live-launch.spec.ts")
@@ -1198,6 +1208,8 @@ def _validate_runtime_source(
         allowed_web_files.add("web/tests/support/patch-acceptance.ts")
     if needs_live_image_inventory:
         allowed_web_files.add("web/tests/support/live-image-inventory.ts")
+    if needs_live_user_browser_gate:
+        allowed_web_files.add("web/tests/support/live-user-browser-gate.ts")
     if not attested_provider_recovery:
         allowed_web_files.add("web/tests/support/live-engine-preflight.cjs")
     allowed_package_roots = (
@@ -1383,6 +1395,10 @@ def _validate_runtime_source(
             root / "web/tests/smoke/live-launch.spec.ts"
         ).read_bytes():
             required_suite.add("web/tests/support/live-image-inventory.ts")
+        if LIVE_USER_BROWSER_GATE_IMPORT in (
+            root / "web/tests/smoke/live-user-journey.spec.ts"
+        ).read_bytes():
+            required_suite.add("web/tests/support/live-user-browser-gate.ts")
         if not legacy_reporter_runtime:
             required_suite.add("web/tests/support/live-count-reporter.cjs")
         if source_only_v3:
@@ -1402,10 +1418,14 @@ def _validate_runtime_source(
     else:
         launch_spec_path = root / "web/tests/smoke/live-launch.spec.ts"
         _regular(launch_spec_path)
+        user_journey_path = root / "web/tests/smoke/live-user-journey.spec.ts"
+        _regular(user_journey_path)
         if b"../support/patch-acceptance" in launch_spec_path.read_bytes():
             required_runtime_files.add("web/tests/support/patch-acceptance.ts")
         if LIVE_IMAGE_INVENTORY_IMPORT in launch_spec_path.read_bytes():
             required_runtime_files.add("web/tests/support/live-image-inventory.ts")
+        if LIVE_USER_BROWSER_GATE_IMPORT in user_journey_path.read_bytes():
+            required_runtime_files.add("web/tests/support/live-user-browser-gate.ts")
     for relative in required_runtime_files:
         _regular(root / relative, allow_sandbox=relative == RUNTIME_SANDBOX_RELATIVE.as_posix())
     for browser_root in RUNTIME_BROWSER_ROOTS:
@@ -1496,6 +1516,20 @@ def _validate_engine_root(
                 mode=0o444,
             ):
                 allowed_web_files.add("web/tests/support/live-image-inventory.ts")
+        user_journey_path = root / "web/tests/smoke/live-user-journey.spec.ts"
+        try:
+            user_journey_metadata = user_journey_path.lstat()
+        except FileNotFoundError:
+            user_journey_metadata = None
+        if user_journey_metadata is not None:
+            user_journey_metadata = _regular(user_journey_path, mode=0o444)
+            if LIVE_USER_BROWSER_GATE_IMPORT in _read_bounded_regular(
+                user_journey_path,
+                metadata=user_journey_metadata,
+                maximum=MAX_FILE_BYTES,
+                mode=0o444,
+            ):
+                allowed_web_files.add("web/tests/support/live-user-browser-gate.ts")
         allowed_web_directories.update(
             {"web/tests", "web/tests/smoke", "web/tests/support"}
         )

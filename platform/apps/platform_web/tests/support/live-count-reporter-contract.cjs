@@ -849,6 +849,8 @@ try {
     source_line: 2,
     source_column: 3,
     source_kind: "test_error_location",
+    browser_gate_state: "unavailable",
+    browser_gate: null,
     api_failure_state: "captured",
     api_failure: {
       kind: "unexpected_status",

@@ -827,6 +827,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             "tests/smoke/live-user-journey.spec.ts",
             "tests/support/live-qa-origin.ts",
             "tests/support/live-qa-sandbox.ts",
+            "tests/support/live-user-browser-gate.ts",
             "tests/support/live-image-inventory.ts",
             "tests/support/live-count-reporter.cjs",
             "tests/support/patch-acceptance.ts",
@@ -834,12 +835,20 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             "package-lock.json",
         ):
             source = REPO_ROOT / "platform/apps/platform_web" / relative
-            payload = (
-                source.read_bytes()
-                if relative == "tests/smoke/live-launch.spec.ts"
+            if (
+                relative == "tests/smoke/live-launch.spec.ts"
                 or relative.startswith("tests/support/")
-                else relative.encode("ascii")
-            )
+            ):
+                payload = source.read_bytes()
+            elif relative == "tests/smoke/live-user-journey.spec.ts":
+                payload = (
+                    b'import { createLiveUserBrowserGateCapture } from '
+                    b'"../support/live-user-browser-gate";\n'
+                    b"void createLiveUserBrowserGateCapture;\n"
+                    b"test('live', () => {});\n"
+                )
+            else:
+                payload = relative.encode("ascii")
             cls._write_fixture_file(web / relative, payload)
         for package in ("@playwright/test", "playwright", "playwright-core"):
             cls._write_fixture_file(

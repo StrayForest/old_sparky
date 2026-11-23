@@ -155,7 +155,12 @@ class ArchiveBuilder:
                 b"void collectLiveImageInventory;\n"
                 b"test('launch', () => {});\n"
             ),
-            "web/tests/smoke/live-user-journey.spec.ts": b"test('live', () => {});\n",
+            "web/tests/smoke/live-user-journey.spec.ts": (
+                b'import { createLiveUserBrowserGateCapture } from '
+                b'"../support/live-user-browser-gate";\n'
+                b"void createLiveUserBrowserGateCapture;\n"
+                b"test('live', () => {});\n"
+            ),
             "web/tests/support/live-qa-origin.ts": b"export {};\n",
             "web/tests/support/live-qa-sandbox.ts": b"export {};\n",
             "web/tests/support/live-count-reporter.cjs": (
@@ -169,6 +174,10 @@ class ArchiveBuilder:
             "web/tests/support/live-image-inventory.ts": (
                 REPO_ROOT
                 / "platform/apps/platform_web/tests/support/live-image-inventory.ts"
+            ).read_bytes(),
+            "web/tests/support/live-user-browser-gate.ts": (
+                REPO_ROOT
+                / "platform/apps/platform_web/tests/support/live-user-browser-gate.ts"
             ).read_bytes(),
             "web/tests/support/live-engine-preflight.cjs": (
                 REPO_ROOT
@@ -853,6 +862,9 @@ class PlatformReleaseArtifactValidationTests(unittest.TestCase):
         launch_spec_name = (
             f"{RELEASE_SLUG}/liveqa-runtime/web/tests/smoke/live-launch.spec.ts"
         )
+        user_journey_spec_name = (
+            f"{RELEASE_SLUG}/liveqa-runtime/web/tests/smoke/live-user-journey.spec.ts"
+        )
         helper_name = (
             f"{RELEASE_SLUG}/liveqa-runtime/"
             "web/tests/support/patch-acceptance.ts"
@@ -861,20 +873,34 @@ class PlatformReleaseArtifactValidationTests(unittest.TestCase):
             f"{RELEASE_SLUG}/liveqa-runtime/"
             "web/tests/support/live-image-inventory.ts"
         )
+        user_browser_gate_helper_name = (
+            f"{RELEASE_SLUG}/liveqa-runtime/"
+            "web/tests/support/live-user-browser-gate.ts"
+        )
         historical_launch_spec = b"test('historical launch', () => {});\n"
+        historical_user_journey = b"test('historical user journey', () => {});\n"
         historical_importless.entries = [
             (member, content)
             for member, content in historical_importless.entries
-            if member.name not in {helper_name, image_inventory_helper_name}
+            if member.name
+            not in {
+                helper_name,
+                image_inventory_helper_name,
+                user_browser_gate_helper_name,
+            }
         ]
         for member, _content in historical_importless.entries:
             if member.name == launch_spec_name:
                 member.size = len(historical_launch_spec)
+            elif member.name == user_journey_spec_name:
+                member.size = len(historical_user_journey)
         historical_importless.entries = [
             (
                 member,
                 historical_launch_spec
                 if member.name == launch_spec_name
+                else historical_user_journey
+                if member.name == user_journey_spec_name
                 else content,
             )
             for member, content in historical_importless.entries
@@ -911,6 +937,22 @@ class PlatformReleaseArtifactValidationTests(unittest.TestCase):
         ):
             validator.validate_archive(
                 missing_image_helper.write(), release_slug=RELEASE_SLUG
+            )
+
+        missing_user_browser_gate = ArchiveBuilder(
+            self.root / "missing-user-browser-gate.tar.gz"
+        )
+        missing_user_browser_gate.entries = [
+            (member, content)
+            for member, content in missing_user_browser_gate.entries
+            if member.name != user_browser_gate_helper_name
+        ]
+        with self.assertRaisesRegex(
+            validator.ArtifactError,
+            "missing required file: web/tests/support/live-user-browser-gate.ts",
+        ):
+            validator.validate_archive(
+                missing_user_browser_gate.write(), release_slug=RELEASE_SLUG
             )
 
         with tarfile.open(artifact, "r:gz") as archive:
