@@ -4279,6 +4279,9 @@ def _read_ephemeral_failure_report(
             "page_errors_truncated", "page_errors",
         }
         image_inventory_keys = {"image_inventory_state", "image_inventory"}
+        browser_request_failure_keys = {
+            "browser_request_failure_state", "browser_request_failures",
+        }
         if (
             not isinstance(record, dict)
             or (
@@ -4286,6 +4289,10 @@ def _read_ephemeral_failure_report(
                 and not (
                     record.get("id") == "image_csp_hosts"
                     and set(record) == base_record_keys | image_inventory_keys
+                )
+                and not (
+                    record.get("id") == "image_csp_hosts"
+                    and set(record) == base_record_keys | image_inventory_keys | browser_request_failure_keys
                 )
             )
             or record.get("id") not in LIVE_BROWSER_FAILURE_DIAGNOSTIC_NAMES
@@ -4303,6 +4310,8 @@ def _read_ephemeral_failure_report(
         _validate_page_error_evidence(record)
         if image_inventory_keys.issubset(record):
             _validate_image_inventory_evidence(record)
+        if browser_request_failure_keys.issubset(record):
+            _validate_browser_request_failure_evidence(record)
         _validate_failure_location(record, manifest)
     if failure_status_counts != {
         "failed": counts["attempt_fail"],

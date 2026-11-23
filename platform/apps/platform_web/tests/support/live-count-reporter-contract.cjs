@@ -1061,7 +1061,14 @@ try {
 
 function failureTest(
   fixture,
-  { title = publicTitles[6], project = "live-desktop", errorLocation, attachments, results } = {},
+  {
+    title = publicTitles[6],
+    project = "live-desktop",
+    errorLocation,
+    omitSourceLocation = false,
+    attachments,
+    results,
+  } = {},
 ) {
   return {
     title,
@@ -1073,7 +1080,7 @@ function failureTest(
       attachments,
     }],
     outcome: () => "unexpected",
-    location: { file: fixture.spec, line: 1, column: 1 },
+    location: omitSourceLocation ? undefined : { file: fixture.spec, line: 1, column: 1 },
   };
 }
 
@@ -1140,11 +1147,16 @@ function assertProducerRoundTrip({
   const failure = failureTest(fixture, {
     title: publicTitles.at(-1),
     project: "live-webkit-mobile",
-    errorLocation: { file: fixture.helper, line: 2, column: 3 },
+    omitSourceLocation: true,
     attachments,
   });
   const plan = publicPlanWithFailure(failure);
   const runSummary = summarizeRun({ allTests: () => plan }, "failed", { publicGate: true });
+  assert.equal(withRootOwnedGate(fixture.gateRoot, () => writeBoundedSummary(
+    fixture.binding,
+    runSummary,
+    { gateRoot: fixture.gateRoot },
+  )), true, "the normal public-count writer records the matching failure totals");
   assert.equal(withRootOwnedGate(fixture.gateRoot, () => writeBoundedFailureSummary(
     fixture.binding,
     { allTests: () => plan },
@@ -1174,8 +1186,123 @@ function assertProducerRoundTrip({
   for (const privateValue of ["https://", "private.host", "private-alt", "private-src"]) {
     assert.equal(reportBytes.includes(Buffer.from(privateValue)), false);
   }
-  const guardValidation = validateRetainedBrowserReportThroughGuard(reportPath);
+  const guardValidation = validateEphemeralAndRetainedBrowserReportThroughGuard(reportPath);
   assert.equal(guardValidation.status, 0, guardValidation.stderr);
+}
+
+function validateEphemeralAndRetainedBrowserReportThroughGuard(reportPath) {
+  const guardPath = path.resolve(__dirname, "../../../../tools/platform_live_qa_guard.py");
+  const countsPath = path.join(path.dirname(reportPath), "live-counts-v1.json");
+  const python = [
+    "import copy, importlib.util, json, os, pathlib, shutil, stat, sys, tempfile, types",
+    "guard_path = pathlib.Path(sys.argv[1])",
+    "sys.path.insert(0, str(guard_path.parent))",
+    "spec = importlib.util.spec_from_file_location('platform_live_qa_guard', guard_path)",
+    "guard = importlib.util.module_from_spec(spec)",
+    "sys.modules[spec.name] = guard",
+    "spec.loader.exec_module(guard)",
+    "guard.liveqa_identity = lambda: (os.geteuid(), os.getegid())",
+    "report_path = pathlib.Path(sys.argv[2])",
+    "ephemeral = json.loads(report_path.read_bytes())",
+    "counts = json.loads(pathlib.Path(sys.argv[3]).read_bytes())",
+    "gate = report_path.parent.parent",
+    "assert gate.name == ephemeral['gate']",
+    "guard.RUN_GATE_ROOT = gate.parent",
+    "original_path_lstat = pathlib.Path.lstat",
+    "original_os_open, original_os_fstat, original_os_stat, original_os_fchown = os.open, os.fstat, os.stat, os.fchown",
+    "private_store = pathlib.Path(tempfile.mkdtemp(prefix='live-qa-private-store-', dir=gate.parent))",
+    "private_store.chmod(0o700)",
+    "private_store_fd = original_os_open(private_store, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))",
+    "private_file_fds = set()",
+    "def same_private_store(fd):",
+    "    try:",
+    "        return original_os_fstat(fd).st_ino == original_os_fstat(private_store_fd).st_ino",
+    "    except OSError:",
+    "        return False",
+    "def contract_os_open(path, flags, mode=0o777, *, dir_fd=None):",
+    "    fd = original_os_open(path, flags, mode, dir_fd=dir_fd)",
+    "    if dir_fd is not None and same_private_store(dir_fd) and flags & os.O_CREAT:",
+    "        private_file_fds.add(fd)",
+    "    return fd",
+    "def contract_os_fstat(fd):",
+    "    value = original_os_fstat(fd)",
+    "    if fd in private_file_fds:",
+    "        return types.SimpleNamespace(st_mode=value.st_mode, st_uid=0, st_gid=0, st_nlink=value.st_nlink, st_size=value.st_size)",
+    "    return value",
+    "def contract_os_stat(path, *, dir_fd=None, follow_symlinks=True):",
+    "    value = original_os_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)",
+    "    if dir_fd is not None and same_private_store(dir_fd) and str(path).endswith('.failure-v2.json'):",
+    "        return types.SimpleNamespace(st_mode=value.st_mode, st_uid=0, st_gid=0, st_nlink=value.st_nlink, st_size=value.st_size)",
+    "    return value",
+    "def contract_path_lstat(self, *args, **kwargs):",
+    "    if self == guard.RUN_GATE_ROOT:",
+    "        return types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o711, st_uid=0, st_gid=0)",
+    "    return original_path_lstat(self, *args, **kwargs)",
+    "guard._read_active_failure_manifest = lambda _sha: {'manifest_sha256': 'd' * 64, 'payload_tree_sha256': 'e' * 64}",
+    "guard._failure_report_store_directory = lambda create: os.dup(private_store_fd)",
+    "guard._assert_failure_report_name_unused = lambda _gate: None",
+    "guard._prune_browser_failure_diagnostics = lambda reserve_slots: None",
+    "os.open, os.fstat, os.stat, os.fchown = contract_os_open, contract_os_fstat, contract_os_stat, lambda _fd, _uid, _gid: None",
+    "pathlib.Path.lstat = contract_path_lstat",
+    "try:",
+    "    public_counts_line = guard.public_browser_counts_line(",
+    "        gate, source_sha=ephemeral['source_sha'], app_sha=ephemeral['app_sha'],",
+    "        marker_sha256=ephemeral['marker_sha256'], persist_failure_report=True,",
+    "    )",
+    "    assert 'run_status=failed' in public_counts_line and 'attempt_fail=1' in public_counts_line",
+    "    retained_path = private_store / (gate.name + '.failure-v2.json')",
+    "    assert retained_path.is_file() and not (private_store / (gate.name + '.failure-v4.json')).exists()",
+    "    retained_bytes = retained_path.read_bytes()",
+    "    guard._validate_retained_failure_report(gate.name + '.failure-v2.json', retained_bytes)",
+    "    retained = json.loads(retained_bytes)",
+    "    assert retained['schema'] == 2",
+    "    assert retained['failures'][0]['id'] == 'image_csp_hosts'",
+    "    assert retained['failures'][0]['image_inventory'] == ephemeral['failures'][0]['image_inventory']",
+    "    assert retained['failures'][0]['browser_request_failures'] == ephemeral['failures'][0]['browser_request_failures']",
+    "    assert retained['failures'][0]['image_inventory_state'] == 'captured'",
+    "finally:",
+    "    pathlib.Path.lstat = original_path_lstat",
+    "    os.open, os.fstat, os.stat, os.fchown = original_os_open, original_os_fstat, original_os_stat, original_os_fchown",
+    "    os.close(private_store_fd)",
+    "    shutil.rmtree(private_store)",
+    "manifest = {}",
+    "guard.liveqa_identity = lambda: (os.geteuid(), os.getegid())",
+    "bad_cases = {",
+    "    'wrong_gate': lambda record: record.update({'id': 'csp_negative_probes'}),",
+    "    'missing_pair_member': lambda record: record.pop('browser_request_failures'),",
+    "    'malformed_pair': lambda record: record['browser_request_failures'].update({'extra': True}),",
+    "}",
+    "temporary_gates = []",
+    "try:",
+    "    for label, mutate in bad_cases.items():",
+    "        bad_gate = gate.parent / ('public-live-qa.' + label + '1234abcd')",
+    "        temporary_gates.append(bad_gate)",
+    "        bad_results = bad_gate / 'test-results'",
+    "        bad_results.mkdir(parents=True, mode=0o700)",
+    "        bad_gate.chmod(0o700)",
+    "        bad_payload = copy.deepcopy(ephemeral)",
+    "        bad_payload['gate'] = bad_gate.name",
+    "        mutate(bad_payload['failures'][0])",
+    "        target = bad_results / guard.LIVE_BROWSER_FAILURES_FILE",
+    "        target.write_text(json.dumps(bad_payload, separators=(',', ':')) + '\\n', encoding='ascii')",
+    "        target.chmod(0o600)",
+    "        try:",
+    "            guard._read_ephemeral_failure_report(",
+    "                bad_gate, source_sha=ephemeral['source_sha'], app_sha=ephemeral['app_sha'],",
+    "                marker_sha256=ephemeral['marker_sha256'], counts=counts, manifest=manifest,",
+    "            )",
+    "        except guard.GuardError:",
+    "            pass",
+    "        else:",
+    "            raise AssertionError('ephemeral request evidence accepted invalid case: ' + label)",
+    "finally:",
+    "    for bad_gate in temporary_gates:",
+    "        shutil.rmtree(bad_gate, ignore_errors=True)",
+  ].join("\n");
+  return spawnSync("python3", ["-I", "-B", "-c", python, guardPath, reportPath, countsPath], {
+    encoding: "utf8",
+    timeout: 5_000,
+  });
 }
 
 function validateRetainedBrowserReportThroughGuard(reportPath) {

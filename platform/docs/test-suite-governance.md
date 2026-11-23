@@ -396,7 +396,7 @@ test is explicit test debt with an owner, not a reason to weaken a gate.
 
 ### Web hermetic ownership
 
-The web package has three deterministic owners: source contracts, full hermetic suites and the isolated image-inventory WebKit fixture. `test:source-contract` owns source assertions; [`playwright.source-contract.config.ts`](../apps/platform_web/playwright.source-contract.config.ts) must not define `webServer`. [`platform_web_hermetic.sh`](../tools/platform_web_hermetic.sh) builds standalone Next once, then runs source-contract, auth lifecycle, smoke, participant, SSR diagnostics and image-inventory. After WebKit it validates generated body-only, hook-only and combined failure payloads through the reporter before cleanup; missing fixtures fail. Auth precedes smoke; smoke and participant use fresh API/web processes (`reuseExistingServer: false`). The image fixture uses no server/API/database/external images.
+The web package has three deterministic owners: source contracts, full hermetic suites and the isolated image-inventory WebKit fixture. `test:source-contract` owns source assertions; [`playwright.source-contract.config.ts`](../apps/platform_web/playwright.source-contract.config.ts) must not define `webServer`. [`platform_web_hermetic.sh`](../tools/platform_web_hermetic.sh) builds standalone Next once, then runs source-contract, auth lifecycle, smoke, participant, SSR diagnostics and image-inventory. After WebKit it passes generated body-only, hook-only and combined producer payloads through the reporter, ephemeral guard reader, actual `public_browser_counts_line` publisher and retained-report validator before cleanup; missing fixtures fail. Auth precedes smoke; smoke and participant use fresh API/web processes (`reuseExistingServer: false`). The image fixture uses no server/API/database/external images.
 
 When hosted-services preflight blocks `web-hermetic`, run the focused WebKit producer and reporter/guard roundtrip from `platform/`:
 
@@ -413,7 +413,7 @@ python3 tools/platform_web_hermetic_browsers.py --web-root apps/platform_web --o
   ../../tools/platform_run_quiet.sh "Live count reporter contract" -- ../../tools/platform_node.sh tests/support/live-count-reporter-contract.cjs)
 ```
 
-This covers the helper, afterEach finalizer and reporter-to-guard boundary without production services; exact-SHA `web-hermetic` CI remains required.
+This covers the helper, afterEach finalizer and full producer-to-reporter-to-ephemeral-reader-to-publisher-to-retained-validator path without production services; exact-SHA `web-hermetic` CI remains required.
 
 The responsive smoke project owns `desktop`, `wide-1300`, `tablet-820` and `mobile-layout`; the explicit desktop-only list
 in [`playwright.config.ts`](../apps/platform_web/playwright.config.ts) is owned only by `desktop`. The participant-progressive suite owns a sequential one-worker contour and explicit desktop/mobile projects in [`playwright.participant.config.ts`](../apps/platform_web/playwright.participant.config.ts). Do not infer viewport ownership from a test name or silently add exclusions; update the owning config and contract test with matrix changes.

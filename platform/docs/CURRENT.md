@@ -11,8 +11,8 @@ belong in the linked owner documents below.
 ## Live and pending state
 
 - Production currently runs application source
-  `1e73d0cbc5ac999d4adc6c76e7f8fc9616f26023` in automatic release
-  `gha-45186048927-1-1e73d0cbc5ac`. Exact-SHA security/build and automatic
+  `35698d58c024a058986abc8c6005b183e91a13d7` in automatic release
+  `gha-45205879242-1-35698d58c024`. Exact-SHA security/build and automatic
   release checks passed; deployment smoke and post-deploy health passed.
   See the [deployment runbook](deployment-runbook.md) for source-bound release
   procedures.
@@ -52,17 +52,20 @@ belong in the linked owner documents below.
 - After successful roster provisioning, the deployed release includes
   automatic exact cleanup for a confirmed terminal Public failure and
   preserves the fixed browser-output protocol.
-- Automatic release QA sequencer `45186048927/1` passed its release checks;
-  canonical Public QA child `45187504668/1` failed `image_csp_hosts` on
-  `live-webkit-mobile`. Its source-bound private record had unavailable image
-  inventory, so the failure cause remains unknown. Public failure cleanup
-  completed (`public_failure_cleanup=cleaned`); UserQA was not run. Do not infer
-  a CSP, lazy-loading, decode or application cause. See the
+- Automatic release QA sequencer `45207445613/1` produced canonical Public QA
+  child `45207494986/1`, which failed `image_csp_hosts` on
+  `live-webkit-mobile` for source `35698d58c024a058986abc8c6005b183e91a13d7`.
+  The retained report was identity-only (`rich_report_unavailable`): a reader
+  allowlist mismatch rejected the optional request-evidence pair, so the
+  private image/request details were not retained. The WebKit failure cause
+  remains unknown. Public failure cleanup completed
+  (`public_failure_cleanup=cleaned`); UserQA was not run. Do not infer a CSP,
+  lazy-loading, decode or application cause. See the
   [CSP/live-QA runbook](csp-live-qa-runbook.md) for evidence and recovery.
-- Latest read-only storage diagnostics `45189933837/1` found 19.4 GB free,
-  healthy services, an enabled maintenance timer and no QA artifact candidates.
-  No manual retention deletion was needed. The CI Siteverify fixture does not
-  establish production Cloudflare challenge/scoring.
+- Latest read-only storage diagnostics `45209278827/1` found about 18 GB free,
+  healthy services, an enabled maintenance timer and no QA cache artifact
+  candidates. No manual retention deletion was needed. The CI Siteverify
+  fixture does not establish production Cloudflare challenge/scoring.
 - The completed external HTTP matrix is not whole-site functional coverage.
   Cell 9's attribution failure and cell 7's unresolved client/origin join are
   not closed by the separate SSR diagnostics. No cause or server capacity
