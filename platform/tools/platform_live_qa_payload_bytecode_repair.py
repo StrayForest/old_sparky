@@ -9,7 +9,6 @@ import ctypes
 from dataclasses import dataclass
 import errno
 import hashlib
-import importlib._bootstrap_external
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -491,22 +490,38 @@ def _pyc_is_for_source(payload: Path, relative: str, data: bytes) -> bool:
     ).as_posix()
     source_path = payload / source_relative
     try:
-        source, source_metadata = _read_regular(source_path)
-        code = compile(
-            source,
-            str(source_path),
-            "exec",
-            dont_inherit=True,
-            optimize=sys.flags.optimize,
+        source, source_metadata = _read_regular(
+            source_path, maximum=2 * 1024 * 1024
         )
-        expected = importlib._bootstrap_external._code_to_timestamp_pyc(
-            code,
-            int(source_metadata.st_mtime),
-            source_metadata.st_size,
+        compiled = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-c",
+                "import importlib._bootstrap_external as _external, sys; "
+                "source=sys.stdin.buffer.read(); "
+                "code=compile(source, sys.argv[1], 'exec', dont_inherit=True, "
+                "optimize=int(sys.argv[4])); "
+                "expected=_external._code_to_timestamp_pyc("
+                "code, int(sys.argv[2]), int(sys.argv[3])); "
+                "len(expected) <= int(sys.argv[5]) or sys.exit(1); "
+                "sys.stdout.buffer.write(expected)",
+                str(source_path),
+                str(int(source_metadata.st_mtime)),
+                str(source_metadata.st_size),
+                str(sys.flags.optimize),
+                str(len(data)),
+            ],
+            input=source,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=10,
         )
-    except (OSError, SyntaxError, ValueError, TypeError):
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
         return False
-    return data == expected
+    return compiled.returncode == 0 and compiled.stdout == data
 
 
 def _extra_records(
