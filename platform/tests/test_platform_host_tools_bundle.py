@@ -425,8 +425,11 @@ class HostToolsBundleTests(unittest.TestCase):
     def test_operator_gh_binary_download_streams_exact_bytes_without_output_flag(self) -> None:
         with tempfile.TemporaryDirectory(prefix="host-tools-gh-output-") as temporary:
             root = Path(temporary)
-            gh = root / "bin/gh"
-            gh.parent.mkdir(mode=0o755)
+            gh_root = root / "gh-root"
+            gh_root.mkdir(mode=0o700)
+            gh_directory = gh_root / "bin"
+            gh_directory.mkdir(mode=0o700)
+            gh = gh_directory / "gh"
             gh.write_text(
                 "#!/bin/sh\n"
                 "for arg do [ \"$arg\" = --output ] && { echo unsupported >&2; exit 90; }; done\n"
@@ -434,7 +437,9 @@ class HostToolsBundleTests(unittest.TestCase):
                 encoding="ascii",
             )
             gh.chmod(0o700)
-            destination = root / "download.zip"
+            output_scratch = root / "output-scratch"
+            output_scratch.mkdir(mode=0o700)
+            destination = output_scratch / "download.zip"
             args = ["api", "--hostname", "github.com", "repos/StrayForest/old_sparky/actions/artifacts/123/zip"]
             real_writer = operator_provisioner._run_bounded_output_to_file
             invoked: list[list[str]] = []
@@ -447,7 +452,7 @@ class HostToolsBundleTests(unittest.TestCase):
 
             def root_owned_gh(path: Path) -> SimpleNamespace | os.stat_result:
                 metadata = real_lstat(path)
-                if path in {gh, gh.parent, root}:
+                if path in {gh, gh.parent, gh_root}:
                     return SimpleNamespace(
                         st_mode=metadata.st_mode, st_uid=0, st_gid=0, st_nlink=metadata.st_nlink,
                         st_size=metadata.st_size, st_dev=metadata.st_dev, st_ino=metadata.st_ino,
@@ -658,7 +663,21 @@ class HostToolsBundleTests(unittest.TestCase):
                 output.chmod(0o600)
                 return b""
 
-            with patch.object(operator_provisioner, "call_gh", side_effect=write_step_response):
+            real_lstat = Path.lstat
+
+            def root_owned_step_log(path: Path) -> SimpleNamespace | os.stat_result:
+                metadata = real_lstat(path)
+                if path == scratch / "failed-step.log":
+                    return SimpleNamespace(
+                        st_mode=metadata.st_mode, st_uid=0, st_gid=0, st_nlink=metadata.st_nlink,
+                        st_size=metadata.st_size, st_dev=metadata.st_dev, st_ino=metadata.st_ino,
+                        st_mtime_ns=metadata.st_mtime_ns, st_ctime_ns=metadata.st_ctime_ns,
+                    )
+                return metadata
+
+            with patch.object(Path, "lstat", autospec=True, side_effect=root_owned_step_log), patch.object(
+                operator_provisioner, "call_gh", side_effect=write_step_response,
+            ):
                 raw = operator_provisioner.fetch_failed_step_log(
                     Path("/pinned/gh"), scratch,
                     job_id=result["failed_job_id"], step_number=result["failed_step_number"],
@@ -681,12 +700,10 @@ class HostToolsBundleTests(unittest.TestCase):
                 output.chmod(0o600)
                 return b""
 
-            with patch.object(operator_provisioner, "call_gh", side_effect=write_oversized_step_response), self.assertRaisesRegex(
-                operator_provisioner.ProvisionError, "input_file_metadata",
-            ):
-                operator_provisioner.fetch_failed_step_log(
-                    Path("/pinned/gh"), scratch, job_id=3, step_number=5,
-                )
+            with patch.object(Path, "lstat", autospec=True, side_effect=root_owned_step_log), patch.object(
+                operator_provisioner, "call_gh", side_effect=write_oversized_step_response,
+            ), self.assertRaisesRegex(operator_provisioner.ProvisionError, "input_file_metadata"):
+                operator_provisioner.fetch_failed_step_log(Path("/pinned/gh"), scratch, job_id=3, step_number=5)
 
         with self.assertRaisesRegex(operator_provisioner.ProvisionError, "preflight_mode_not_proven"):
             operator_provisioner.verify_preflight_job_set(jobs, mode="deploy")
