@@ -831,6 +831,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             "tests/support/live-image-inventory.ts",
             "tests/support/live-count-reporter.cjs",
             "tests/support/patch-acceptance.ts",
+            "tests/support/objective-screenshot-diagnostic.ts",
             "tests/support/live-engine-preflight.cjs",
             "package-lock.json",
         ):
@@ -995,6 +996,10 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
                 "web/tests/support/live-image-inventory.ts", manifest["suite_files"]
             )
             self.assertIn(
+                "web/tests/support/objective-screenshot-diagnostic.ts",
+                manifest["suite_files"],
+            )
+            self.assertIn(
                 "web/tests/support/live-engine-preflight.cjs", manifest["suite_files"]
             )
             self.assertIn(
@@ -1003,6 +1008,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             for missing_helper in (
                 "tests/support/patch-acceptance.ts",
                 "tests/support/live-image-inventory.ts",
+                "tests/support/objective-screenshot-diagnostic.ts",
             ):
                 with self.subTest(missing_helper=missing_helper), self.assertRaises(
                     platform_build_live_qa_runtime.RuntimeBuildError

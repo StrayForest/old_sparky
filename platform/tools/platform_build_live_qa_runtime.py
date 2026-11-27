@@ -103,6 +103,7 @@ RUNTIME_SOURCE_FILES = (
     "tests/support/live-qa-sandbox.ts",
     "tests/support/live-user-browser-gate.ts",
     "tests/support/live-image-inventory.ts",
+    "tests/support/objective-screenshot-diagnostic.ts",
     "tests/support/live-count-reporter.cjs",
     "tests/support/patch-acceptance.ts",
     "tests/support/live-engine-preflight.cjs",

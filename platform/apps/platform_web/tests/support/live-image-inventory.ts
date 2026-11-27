@@ -6,7 +6,7 @@ type FailureAttachmentOptions = {
 };
 
 export type BrowserRequestFailureEvidence = {
-  schema: 1;
+  schema: 1 | 2;
   coverage: "since_before_each";
   failure_phase: "body" | "hook" | "both" | "unknown";
   truncated: boolean;
@@ -27,8 +27,151 @@ export type BrowserRequestFailureEvidence = {
     navigation_relation: "same" | "changed" | "unknown";
     failure_class: "dns" | "connection" | "timeout" | "tls" | "aborted" | "cancelled" | "other";
     duration_bucket: "<100ms" | "<1s" | "<5s" | ">=5s" | "unavailable";
+  } | {
+    ordinal: number;
+    method: "DELETE" | "GET" | "HEAD" | "OPTIONS" | "OTHER" | "PATCH" | "POST" | "PUT";
+    resource_type:
+      | "document"
+      | "image"
+      | "stylesheet"
+      | "script"
+      | "font"
+      | "media"
+      | "xhr"
+      | "fetch"
+      | "other"
+      | "unknown";
+    route_scope: "home" | "patch" | "tournaments" | "other" | "unknown";
+    failure_route_scope: "home" | "patch" | "tournaments" | "other" | "unknown";
+    endpoint_family:
+      | "api_content"
+      | "api_patch_content"
+      | "api_tournaments"
+      | "api_users"
+      | "api_other"
+      | "same_origin_other"
+      | "external"
+      | "unknown";
+    navigation_relation: "same" | "changed" | "unknown";
+    navigation_phase: "none" | "pending_same_route" | "pending_route_change" | "unknown";
+    failure_class: "dns" | "connection" | "timeout" | "tls" | "aborted" | "cancelled" | "other";
+    duration_bucket: "<100ms" | "<1s" | "<5s" | ">=5s" | "unavailable";
   }>;
 };
+export type BrowserRequestFailureEventV2 = Extract<
+  BrowserRequestFailureEvidence["events"][number],
+  { method: string }
+>;
+
+export function classifyBrowserRequestFailure(
+  value: string,
+): BrowserRequestFailureEvidence["events"][number]["failure_class"] {
+  if (/ERR_NAME_NOT_RESOLVED|ERR_DNS/iu.test(value)) return "dns";
+  if (/ERR_CONNECTION|ERR_ADDRESS_UNREACHABLE|ERR_NETWORK_CHANGED/iu.test(value)) return "connection";
+  if (/ERR_TIMED_OUT|ERR_CONNECTION_TIMEOUT/iu.test(value)) return "timeout";
+  if (/ERR_CERT|ERR_SSL|ERR_TLS/iu.test(value)) return "tls";
+  if (/ERR_ABORTED|NS_BINDING_ABORTED|Operation was aborted/iu.test(value)) return "aborted";
+  if (/Load request cancelled|cancelled/iu.test(value)) return "cancelled";
+  return "other";
+}
+
+export type BrowserNavigationIntent = {
+  token: number;
+  startedAt: number;
+  sourceDocument: string | null;
+  sourcePath: string;
+  sourceNavigationEpoch: number;
+  targetDocument: string;
+  targetPath: string;
+  committed: boolean;
+  responseStatus: number | null;
+  finalDocument: string | null;
+  finalPath: string | null;
+};
+
+export type BrowserNavigationCancellation = {
+  intentToken: number;
+  method: string;
+  resourceType: string;
+  failureClass: BrowserRequestFailureEvidence["events"][number]["failure_class"];
+  sameOrigin: boolean;
+  mainFrameAtStart: boolean;
+  navigationRequest: boolean;
+  requestStartedAt: number | null;
+  failedAt: number;
+  sourceDocument: string | null;
+  sourceNavigationEpoch: number | null;
+};
+
+export function browserNavigationDocument(value: string): string | null {
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    return `${parsed.origin}${parsed.pathname}${parsed.search}`;
+  } catch {
+    return null;
+  }
+}
+
+export function browserNavigationPath(value: string): string | null {
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    return parsed.pathname;
+  } catch {
+    return null;
+  }
+}
+
+export function isPotentialNavigationTeardownCancellation(
+  cancellation: BrowserNavigationCancellation,
+  intent: BrowserNavigationIntent | null,
+): boolean {
+  if (!intent) return false;
+  let sameDocumentOrigin = false;
+  if (intent.sourceDocument) {
+    try {
+      sameDocumentOrigin = new URL(intent.sourceDocument).origin === new URL(intent.targetDocument).origin;
+    } catch {
+      sameDocumentOrigin = false;
+    }
+  }
+  return (
+    sameDocumentOrigin
+    && cancellation.sameOrigin
+    && cancellation.mainFrameAtStart
+    && !cancellation.navigationRequest
+    && cancellation.method === "GET"
+    && (cancellation.resourceType === "fetch" || cancellation.resourceType === "xhr")
+    && (cancellation.failureClass === "aborted" || cancellation.failureClass === "cancelled")
+    && cancellation.intentToken === intent.token
+    && cancellation.requestStartedAt !== null
+    && cancellation.requestStartedAt <= intent.startedAt
+    && cancellation.failedAt >= intent.startedAt
+    && cancellation.failedAt - intent.startedAt <= 1_000
+    && cancellation.sourceDocument !== null
+    && cancellation.sourceDocument === intent.sourceDocument
+    && cancellation.sourceNavigationEpoch === intent.sourceNavigationEpoch
+    && intent.sourceDocument !== intent.targetDocument
+    && intent.sourcePath !== intent.targetPath
+  );
+}
+
+export function isCausallyBoundNavigationTeardownCancellation(
+  cancellation: BrowserNavigationCancellation,
+  intent: BrowserNavigationIntent | null,
+): boolean {
+  return (
+    isPotentialNavigationTeardownCancellation(cancellation, intent)
+    && intent !== null
+    && intent.committed
+    && intent.responseStatus !== null
+    && intent.responseStatus >= 200
+    && intent.responseStatus < 300
+    && intent.finalDocument === intent.targetDocument
+    && intent.finalPath === intent.targetPath
+  );
+}
 
 export type BrowserFailureAttachmentState = {
   imageInventoryRoutes: unknown[];
@@ -70,7 +213,7 @@ export async function attachBrowserFailureEvidence(
         body = Buffer.from(JSON.stringify(boundedEvidence), "ascii");
       }
       state.requestFailureEvidence = boundedEvidence;
-      await attach("live-browser-request-failures-v1", {
+      await attach(`live-browser-request-failures-v${boundedEvidence.schema}`, {
         body,
         contentType: "application/json",
       });

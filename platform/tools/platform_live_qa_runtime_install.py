@@ -132,6 +132,7 @@ RUNTIME_REQUIRED_FILES = (
 )
 LIVE_IMAGE_INVENTORY_IMPORT = b"../support/live-image-inventory"
 LIVE_USER_BROWSER_GATE_IMPORT = b"../support/live-user-browser-gate"
+OBJECTIVE_SCREENSHOT_DIAGNOSTIC_IMPORT = b"../support/objective-screenshot-diagnostic"
 
 # All executable/source files used by the trusted wrapper.  The API source
 # and platform package trees are copied into the payload so DB fixture tools
@@ -1171,6 +1172,11 @@ def _validate_runtime_source(
         and launch_spec_path.is_file()
         and LIVE_IMAGE_INVENTORY_IMPORT in launch_spec_path.read_bytes()
     )
+    needs_objective_screenshot_diagnostic = (
+        not attested_provider_recovery
+        and launch_spec_path.is_file()
+        and OBJECTIVE_SCREENSHOT_DIAGNOSTIC_IMPORT in launch_spec_path.read_bytes()
+    )
     user_journey_path = root / "web/tests/smoke/live-user-journey.spec.ts"
     needs_live_user_browser_gate = False
     if not attested_provider_recovery:
@@ -1187,6 +1193,8 @@ def _validate_runtime_source(
         required.append("web/tests/support/patch-acceptance.ts")
     if needs_live_image_inventory:
         required.append("web/tests/support/live-image-inventory.ts")
+    if needs_objective_screenshot_diagnostic:
+        required.append("web/tests/support/objective-screenshot-diagnostic.ts")
     if needs_live_user_browser_gate:
         required.append("web/tests/support/live-user-browser-gate.ts")
     for relative in required:
@@ -1208,6 +1216,8 @@ def _validate_runtime_source(
         allowed_web_files.add("web/tests/support/patch-acceptance.ts")
     if needs_live_image_inventory:
         allowed_web_files.add("web/tests/support/live-image-inventory.ts")
+    if needs_objective_screenshot_diagnostic:
+        allowed_web_files.add("web/tests/support/objective-screenshot-diagnostic.ts")
     if needs_live_user_browser_gate:
         allowed_web_files.add("web/tests/support/live-user-browser-gate.ts")
     if not attested_provider_recovery:
@@ -1395,6 +1405,10 @@ def _validate_runtime_source(
             root / "web/tests/smoke/live-launch.spec.ts"
         ).read_bytes():
             required_suite.add("web/tests/support/live-image-inventory.ts")
+        if OBJECTIVE_SCREENSHOT_DIAGNOSTIC_IMPORT in (
+            root / "web/tests/smoke/live-launch.spec.ts"
+        ).read_bytes():
+            required_suite.add("web/tests/support/objective-screenshot-diagnostic.ts")
         if LIVE_USER_BROWSER_GATE_IMPORT in (
             root / "web/tests/smoke/live-user-journey.spec.ts"
         ).read_bytes():
@@ -1424,6 +1438,8 @@ def _validate_runtime_source(
             required_runtime_files.add("web/tests/support/patch-acceptance.ts")
         if LIVE_IMAGE_INVENTORY_IMPORT in launch_spec_path.read_bytes():
             required_runtime_files.add("web/tests/support/live-image-inventory.ts")
+        if OBJECTIVE_SCREENSHOT_DIAGNOSTIC_IMPORT in launch_spec_path.read_bytes():
+            required_runtime_files.add("web/tests/support/objective-screenshot-diagnostic.ts")
         if LIVE_USER_BROWSER_GATE_IMPORT in user_journey_path.read_bytes():
             required_runtime_files.add("web/tests/support/live-user-browser-gate.ts")
     for relative in required_runtime_files:
@@ -1516,6 +1532,13 @@ def _validate_engine_root(
                 mode=0o444,
             ):
                 allowed_web_files.add("web/tests/support/live-image-inventory.ts")
+            if OBJECTIVE_SCREENSHOT_DIAGNOSTIC_IMPORT in _read_bounded_regular(
+                launch_spec,
+                metadata=launch_metadata,
+                maximum=MAX_FILE_BYTES,
+                mode=0o444,
+            ):
+                allowed_web_files.add("web/tests/support/objective-screenshot-diagnostic.ts")
         user_journey_path = root / "web/tests/smoke/live-user-journey.spec.ts"
         try:
             user_journey_metadata = user_journey_path.lstat()

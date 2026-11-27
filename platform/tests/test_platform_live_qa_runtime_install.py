@@ -3394,6 +3394,8 @@ os._exit(0)
                     lock_bytes: bytes = b"lock\n",
                     browser_gate_import: bool = True,
                     include_browser_gate_helper: bool = True,
+                    screenshot_diagnostic_import: bool = False,
+                    include_screenshot_diagnostic_helper: bool = False,
                 ) -> Path:
                     release = app_dir / "releases" / f"release-{candidate_sha[:8]}"
                     release.mkdir(mode=0o755)
@@ -3420,7 +3422,13 @@ os._exit(0)
                     suite_content = {
                         "web/package-lock.json": lock_bytes,
                         "web/playwright.live.config.ts": b"config\n",
-                        "web/tests/smoke/live-launch.spec.ts": b"launch\n",
+                        "web/tests/smoke/live-launch.spec.ts": (
+                            b'import { takeObjectiveScreenshotWithDiagnostics } from '
+                            b'"../support/objective-screenshot-diagnostic";\n'
+                            b"void takeObjectiveScreenshotWithDiagnostics;\n"
+                            if screenshot_diagnostic_import
+                            else b"launch\n"
+                        ),
                         "web/tests/smoke/live-user-journey.spec.ts": (
                             b'import { createLiveUserBrowserGateCapture } from '
                             b'"../support/live-user-browser-gate";\n'
@@ -3439,6 +3447,13 @@ os._exit(0)
                         ] = (
                             SCRIPT.parents[1]
                             / "apps/platform_web/tests/support/live-user-browser-gate.ts"
+                        ).read_bytes()
+                    if include_screenshot_diagnostic_helper:
+                        suite_content[
+                            "web/tests/support/objective-screenshot-diagnostic.ts"
+                        ] = (
+                            SCRIPT.parents[1]
+                            / "apps/platform_web/tests/support/objective-screenshot-diagnostic.ts"
                         ).read_bytes()
                     for relative, content in suite_content.items():
                         target = source_runtime / relative
@@ -3484,6 +3499,20 @@ os._exit(0)
                         app_dir, incomplete_candidate, "7" * 40
                     )
 
+                incomplete_screenshot_candidate = make_candidate(
+                    "9" * 40,
+                    screenshot_diagnostic_import=True,
+                    include_screenshot_diagnostic_helper=False,
+                )
+                with mock.patch.object(
+                    runtime,
+                    "_validate_runtime_source",
+                    new=ORIGINAL_VALIDATE_RUNTIME_SOURCE,
+                ), self.assertRaises(runtime.InstallerError):
+                    runtime._candidate_source_plan(
+                        app_dir, incomplete_screenshot_candidate, "9" * 40
+                    )
+
                 unreferenced_helper_candidate = make_candidate(
                     "8" * 40,
                     browser_gate_import=False,
@@ -3502,6 +3531,26 @@ os._exit(0)
                 ):
                     runtime._candidate_source_plan(
                         app_dir, unreferenced_helper_candidate, "8" * 40
+                    )
+
+                unreferenced_screenshot_candidate = make_candidate(
+                    "a" * 40,
+                    screenshot_diagnostic_import=False,
+                    include_screenshot_diagnostic_helper=True,
+                )
+                with (
+                    mock.patch.object(
+                        runtime,
+                        "_validate_runtime_source",
+                        new=ORIGINAL_VALIDATE_RUNTIME_SOURCE,
+                    ),
+                    self.assertRaisesRegex(
+                        runtime.InstallerError,
+                        "live-QA runtime contains an unreviewed web member",
+                    ),
+                ):
+                    runtime._candidate_source_plan(
+                        app_dir, unreferenced_screenshot_candidate, "a" * 40
                     )
 
                 importless_v3_candidate = make_candidate(

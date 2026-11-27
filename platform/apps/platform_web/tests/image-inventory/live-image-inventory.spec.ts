@@ -1,11 +1,19 @@
 import { expect, test } from "@playwright/test";
 import type { Page, Request, TestInfo } from "@playwright/test";
 import fs from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import path from "node:path";
 import {
+  browserNavigationDocument,
+  browserNavigationPath,
+  classifyBrowserRequestFailure,
   collectLiveImageInventory,
   finalizeBrowserFailureEvidence,
+  isCausallyBoundNavigationTeardownCancellation,
   type BrowserFailureAttachmentState,
+  type BrowserNavigationCancellation,
+  type BrowserNavigationIntent,
   type BrowserRequestFailureEvidence,
 } from "../support/live-image-inventory";
 
@@ -439,6 +447,193 @@ function observeRequestFailure(page: Page, expectedPath: string) {
     page.on("requestfailed", onRequestFailed);
   });
 }
+
+test("WebKit binds a pre-navigation fetch cancellation to an explicit successful target commit", async ({ page }) => {
+  const server = createServer((request, response) => {
+    const pathname = new URL(request.url ?? "/", `http://${request.headers.host ?? "127.0.0.1"}`).pathname;
+    if (pathname === "/home") {
+      response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      response.end(`<!doctype html><html><body><script>
+        void fetch("/api/slow").catch(() => {});
+      </script></body></html>`);
+      return;
+    }
+    if (pathname === "/api/slow") {
+      const fallback = setTimeout(() => {
+        if (!response.destroyed) {
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end("{}");
+        }
+      }, 5_000);
+      response.on("close", () => clearTimeout(fallback));
+      request.on("aborted", () => clearTimeout(fallback));
+      return;
+    }
+    if (pathname === "/patch") {
+      response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      response.end("<!doctype html><html><body><main>patch target</main></body></html>");
+      return;
+    }
+    response.writeHead(404);
+    response.end();
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("local WebKit fixture failed to bind");
+  const origin = `http://127.0.0.1:${(address as AddressInfo).port}`;
+  const eventOrder: string[] = [];
+  type NavigationFetchStart = {
+    startedAt: number;
+    sourceDocument: string | null;
+    sourceNavigationEpoch: number;
+    mainFrameAtStart: boolean;
+  };
+  const requestStarts = new WeakMap<Request, NavigationFetchStart>();
+  let mainFrameNavigationEpoch = 0;
+  let intent: BrowserNavigationIntent | null = null;
+  let resolveFetchStart!: (value: NavigationFetchStart) => void;
+  const fetchStarted = new Promise<NavigationFetchStart>((resolve) => {
+    resolveFetchStart = resolve;
+  });
+  let resolveCancellation!: (value: BrowserNavigationCancellation) => void;
+  const cancellationPromise = new Promise<BrowserNavigationCancellation>((resolve) => {
+    resolveCancellation = resolve;
+  });
+  const recordRequest = (request: Request) => {
+    const url = new URL(request.url());
+    if (url.pathname === "/api/slow") {
+      const frame = request.frame();
+      const startedAt = performance.now();
+      const start = {
+        startedAt,
+        sourceDocument: browserNavigationDocument(frame.url()),
+        sourceNavigationEpoch: mainFrameNavigationEpoch,
+        mainFrameAtStart: frame === page.mainFrame(),
+      };
+      requestStarts.set(request, start);
+      eventOrder.push("fetch_start");
+      resolveFetchStart(start);
+    }
+    if (url.pathname === "/patch" && request.isNavigationRequest()) {
+      eventOrder.push("navigation_request");
+    }
+  };
+  const recordFailure = (request: Request) => {
+    if (new URL(request.url()).pathname !== "/api/slow") return;
+    const start = requestStarts.get(request);
+    const errorText = request.failure()?.errorText ?? "failed";
+    eventOrder.push("fetch_failed");
+    resolveCancellation({
+      intentToken: intent?.token ?? -1,
+      method: request.method(),
+      resourceType: request.resourceType(),
+      failureClass: classifyBrowserRequestFailure(errorText),
+      sameOrigin: new URL(request.url()).origin === origin,
+      mainFrameAtStart: start?.mainFrameAtStart ?? false,
+      navigationRequest: request.isNavigationRequest(),
+      requestStartedAt: start?.startedAt ?? null,
+      failedAt: performance.now(),
+      sourceDocument: start?.sourceDocument ?? null,
+      sourceNavigationEpoch: start?.sourceNavigationEpoch ?? null,
+    });
+  };
+  const recordFrameNavigation = (frame: import("@playwright/test").Frame) => {
+    if (frame !== page.mainFrame()) return;
+    mainFrameNavigationEpoch += 1;
+    if (new URL(frame.url()).pathname === "/patch") eventOrder.push("frame_committed");
+  };
+  page.on("request", recordRequest);
+  page.on("requestfailed", recordFailure);
+  page.on("framenavigated", recordFrameNavigation);
+
+  try {
+    await page.goto(`${origin}/home`);
+    const requestStart = await fetchStarted;
+    expect(requestStart.sourceDocument).toBe(`${origin}/home`);
+    expect(requestStart.mainFrameAtStart).toBe(true);
+
+    const target = `${origin}/patch`;
+    const targetDocument = browserNavigationDocument(target);
+    const targetPath = browserNavigationPath(target);
+    expect(targetDocument).not.toBeNull();
+    expect(targetPath).not.toBeNull();
+    intent = {
+      token: 1,
+      startedAt: performance.now(),
+      sourceDocument: browserNavigationDocument(page.url()),
+      sourcePath: browserNavigationPath(page.url()) ?? "",
+      sourceNavigationEpoch: mainFrameNavigationEpoch,
+      targetDocument: targetDocument!,
+      targetPath: targetPath!,
+      committed: false,
+      responseStatus: null,
+      finalDocument: null,
+      finalPath: null,
+    };
+    const response = await page.goto(target);
+    const currentDocument = browserNavigationDocument(page.url());
+    const currentPath = browserNavigationPath(page.url());
+    intent.responseStatus = response?.status() ?? null;
+    intent.finalDocument = currentDocument;
+    intent.finalPath = currentPath;
+    intent.committed = intent.responseStatus !== null
+      && intent.responseStatus >= 200
+      && intent.responseStatus < 300
+      && currentDocument === intent.targetDocument
+      && currentPath === intent.targetPath;
+
+    const cancellation = await cancellationPromise;
+    expect(cancellation.failureClass === "aborted" || cancellation.failureClass === "cancelled").toBe(true);
+    expect(cancellation.requestStartedAt).toBeLessThan(intent.startedAt);
+    expect(cancellation.failedAt).toBeGreaterThanOrEqual(intent.startedAt);
+    expect(eventOrder.indexOf("fetch_failed")).toBeLessThan(eventOrder.indexOf("navigation_request"));
+    expect(eventOrder.indexOf("navigation_request")).toBeLessThan(eventOrder.indexOf("frame_committed"));
+    expect(isCausallyBoundNavigationTeardownCancellation(cancellation, intent)).toBe(true);
+
+    const rejectedCancellation = (change: Partial<BrowserNavigationCancellation>) => (
+      isCausallyBoundNavigationTeardownCancellation({ ...cancellation, ...change }, intent)
+    );
+    const rejectedIntent = (change: Partial<BrowserNavigationIntent>) => (
+      isCausallyBoundNavigationTeardownCancellation(cancellation, { ...intent!, ...change })
+    );
+    expect(isCausallyBoundNavigationTeardownCancellation(cancellation, null)).toBe(false);
+    expect(rejectedCancellation({ intentToken: cancellation.intentToken + 1 })).toBe(false);
+    expect(rejectedCancellation({ mainFrameAtStart: false })).toBe(false);
+    expect(rejectedCancellation({ sameOrigin: false })).toBe(false);
+    expect(rejectedCancellation({ navigationRequest: true })).toBe(false);
+    expect(rejectedCancellation({ method: "POST" })).toBe(false);
+    expect(rejectedCancellation({ resourceType: "image" })).toBe(false);
+    expect(rejectedCancellation({ failureClass: "connection" })).toBe(false);
+    expect(rejectedCancellation({ requestStartedAt: intent.startedAt + 1 })).toBe(false);
+    expect(rejectedCancellation({ failedAt: intent.startedAt + 1_001 })).toBe(false);
+    expect(rejectedCancellation({ sourceDocument: `${origin}/other` })).toBe(false);
+    expect(rejectedCancellation({ sourceNavigationEpoch: intent.sourceNavigationEpoch + 1 })).toBe(false);
+    expect(rejectedIntent({ committed: false })).toBe(false);
+    expect(rejectedIntent({ responseStatus: 500 })).toBe(false);
+    expect(rejectedIntent({ finalDocument: `${origin}/wrong-target` })).toBe(false);
+    expect(rejectedIntent({
+      targetDocument: "https://other.example/patch",
+      finalDocument: "https://other.example/patch",
+    })).toBe(false);
+    expect(rejectedIntent({ targetDocument: intent.sourceDocument!, targetPath: intent.sourcePath })).toBe(false);
+  } finally {
+    page.off("request", recordRequest);
+    page.off("requestfailed", recordFailure);
+    page.off("framenavigated", recordFrameNavigation);
+    await page.goto("about:blank").catch(() => {});
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+      server.closeAllConnections();
+    });
+  }
+});
 
 test.afterEach(async ({ page }, testInfo) => {
   const scenario = hookFailureScenarios.get(page);

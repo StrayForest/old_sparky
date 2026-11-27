@@ -11,11 +11,12 @@ belong in the linked owner documents below.
 ## Live and pending state
 
 - Production currently runs application source
-  `b6cb531ef05eda17c38a04e6a24f33d2b6bb606e` in automatic release
-  `gha-45965332588-1-b6cb531ef05e`; exact-SHA Security run `45958781985/1`,
-  the signed preflight, restore verification, deployment and post-deploy health
-  passed. The separately installed shared host-tools generation is
-  `ec2506d0099f788d210b84e3ad3001431bfeeced`, with installed receipt digest
+  `9cc0f9676709552f68b6ad9c15bf5b66f663c71c` in automatic release
+  `gha-45999843320-1-9cc0f9676709`; exact-SHA Security run `45997206430/1`,
+  source-bound backup `45999314416/1` with restore verification, deployment
+  and post-deploy health passed. The separately installed shared host-tools
+  generation is `ec2506d0099f788d210b84e3ad3001431bfeeced`, with installed
+  receipt digest
   `1c1958ec5799180c88743932f9344145cd1c29d3db07a237380f2b85dc5516f5`.
   The host-tools pin and app release are separate identities. See the
   [host-tools provisioning ADR](adr/production-host-tools-provisioning.md) and
@@ -46,32 +47,31 @@ belong in the linked owner documents below.
 - After successful roster provisioning, the deployed release includes
   automatic exact cleanup for a confirmed terminal Public failure and
   preserves the fixed browser-output protocol.
-- Automatic release QA for source
-  `b6cb531ef05eda17c38a04e6a24f33d2b6bb606e` produced Public child
-  `45966461244/1`: 42 passed, 5 failed, 10 skipped, 0 flaky and 0 timed out.
-  The failed assertions include the desktop `objective_icons` screenshot,
-  `patch_owner_sections` translation acceptance, and mobile
-  `image_csp_hosts` completeness. The retained report did not preserve enough
-  detail to establish the historical screenshot exception or a unique image
-  failure cause; the screenshot diagnostic remains pending. The exact public
-  cleanup receipt says `cleaned`; this records
-  cleanup completion only, not a QA pass or proof of historical database
-  absence. UserQA was not dispatched after the Public failure. Current fixes
-  are under validation: patch translation acceptance now uses catalog-backed
-  entity names, and the image inventory tracks responsive source generations
-  and bounded request-start coverage while retaining strict completeness.
-  Candidate image inventory and translation fixes remain under validation; no
-  unique historical image cause is established. Rerun Public and UserQA only
-  after the candidate source is released. See the [CSP/live-QA runbook](csp-live-qa-runbook.md)
+- Standalone Public QA for source
+  `9cc0f9676709552f68b6ad9c15bf5b66f663c71c` run `46001343837/1` completed
+  with 42 passed, 5 failed, 10 skipped, 0 flaky and 0 timed out. Its cleanup
+  receipt is `cleaned`; this records cleanup completion only, not a QA pass or
+  proof of historical database absence. UserQA remains pending until Public
+  passes. The retained private report shows all 128 patch images loaded and
+  zero unmatched CSP violations. In the failed run's immutable 9cc0
+  `live-launch.spec.ts:489`, the `image_csp_hosts` afterEach assertion recorded
+  a cancelled same-navigation `fetch`; the retained evidence does not identify
+  its endpoint. `patch_owner_sections` at 9cc0 `:989` failed on desktop, mobile and WebKit mobile
+  because the assertion expected two Solomon `Move Piece` changes, while the
+  retained public DTO has one source row and one owner change. The test's
+  expected count is stale. Desktop `objective_icons` failed at 9cc0 `:842`; the
+  report does not preserve the screenshot exception. A focused local screenshot
+  of the latest DTO completed within the test timeout, but the historical
+  exception remains unknown. See the [CSP/live-QA runbook](csp-live-qa-runbook.md)
   for the evidence contract and recovery procedure.
-- Latest read-only storage diagnostics `45984612377/1` bound to the active b6
-  source found 59% disk use (about 14.8 GiB free), an unlocked storage lock,
-  healthy API/worker/web services, an enabled maintenance timer matching its
-  installed unit, a restore-verified backup and no LiveQA cache candidates or
-  tombstones. The report-only retention dry-run passed; its four generic
-  release candidates are not an apply set. No manual deletion was needed. The
-  CI Siteverify fixture does not establish production Cloudflare
-  challenge/scoring.
+- Read-only storage diagnostics `46006095877/1` are bound to active source
+  `9cc0f9676709552f68b6ad9c15bf5b66f663c71c`: disk use is 61% with about
+  13.96 GiB free, the storage lock is unlocked, API/worker/web services are
+  healthy, the maintenance timer is enabled and matches its installed unit,
+  and the latest backup is restore-verified. The LiveQA cache preview found
+  no candidates or tombstones. The generic release preview is report-only and
+  is not an apply set; no retention cleanup was performed. The CI Siteverify
+  fixture does not establish production Cloudflare challenge/scoring.
 - The 11-cell production matrix is complete, but cell 9 failed its stress
   contract with unknown capacity attribution; no server capacity ceiling is
   certified. Cell 7's client/origin request join remains unresolved. A recent

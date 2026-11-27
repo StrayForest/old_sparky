@@ -59,6 +59,8 @@ fi
 "$TOOLS_DIR/platform_node.sh" \
   "$WEB_ROOT/tests/support/live-count-reporter-contract.cjs"
 "$TOOLS_DIR/platform_node.sh" \
+  "$WEB_ROOT/tests/support/objective-screenshot-diagnostic-contract.mjs"
+"$TOOLS_DIR/platform_node.sh" \
   "$WEB_ROOT/tests/support/auth-e2e-contract.mjs"
 # Ask the pinned Playwright runner to load and enumerate the exact auth spec
 # before the standalone build. This is a discovery preflight only: the normal

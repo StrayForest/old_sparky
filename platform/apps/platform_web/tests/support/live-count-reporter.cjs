@@ -35,6 +35,8 @@ const FAILURE_REPORT_FILE = "live-failures-v2.json";
 const FAILURE_IDENTITY_REPORT_FILE = "live-failure-identities-v1.json";
 const LIVE_USER_FAILURE_REPORT_FILE = "live-user-failures-v3.json";
 const PAGE_ERROR_ATTACHMENT_NAME = "live-pageerror-evidence-v1";
+const OBJECTIVE_SCREENSHOT_ATTACHMENT_NAME = "objective-screenshot-error-v1";
+const MAX_OBJECTIVE_SCREENSHOT_ATTACHMENT_BYTES = 2 * 1024;
 const LIVE_USER_BROWSER_GATE_ATTACHMENT_NAME = "live-user-browser-gate-v2";
 const MAX_LIVE_USER_BROWSER_GATE_ATTACHMENT_BYTES = 8 * 1024;
 const MAX_LIVE_USER_BROWSER_GATE_EVENTS = 32;
@@ -42,7 +44,10 @@ const IMAGE_INVENTORY_ATTACHMENT_NAMES = new Set([
   "live-image-inventory-evidence-v1",
   "live-image-inventory-evidence-v2",
 ]);
-const BROWSER_REQUEST_FAILURE_ATTACHMENT_NAME = "live-browser-request-failures-v1";
+const BROWSER_REQUEST_FAILURE_ATTACHMENT_NAMES = new Set([
+  "live-browser-request-failures-v1",
+  "live-browser-request-failures-v2",
+]);
 const LIVE_USER_API_FAILURE_ATTACHMENT_NAME = "live-user-api-failure-v1";
 const RUN_STATUSES = new Set(["passed", "failed", "timedout", "interrupted"]);
 const ATTEMPT_STATUSES = new Set([
@@ -821,6 +826,64 @@ function pageErrorEvidenceForAttempt(result) {
   };
 }
 
+function objectiveScreenshotEvidenceForAttempt(result) {
+  const attachments = Array.isArray(result?.attachments)
+    ? result.attachments.filter((attachment) => attachment?.name === OBJECTIVE_SCREENSHOT_ATTACHMENT_NAME)
+    : [];
+  if (attachments.length === 0) return { present: false, state: "unavailable", evidence: null };
+  if (attachments.length !== 1) return { present: true, state: "unavailable", evidence: null };
+  const attachment = attachments[0];
+  if (
+    attachment.contentType !== "application/json"
+    || attachment.path !== undefined
+    || !Buffer.isBuffer(attachment.body)
+    || attachment.body.length > MAX_OBJECTIVE_SCREENSHOT_ATTACHMENT_BYTES
+    || attachment.body.some((byte) => byte > 0x7f)
+  ) return { present: true, state: "unavailable", evidence: null };
+  let payload;
+  try {
+    payload = JSON.parse(attachment.body.toString("ascii"));
+  } catch {
+    return { present: true, state: "unavailable", evidence: null };
+  }
+  const categories = new Set([
+    "capture_timeout", "test_timeout", "browser_closed_or_crashed", "capture_unavailable",
+    "page_navigating", "invalid_geometry", "output_eacces", "output_erofs", "output_enospc",
+    "output_efbig", "output_enoent", "other",
+  ]);
+  const heightBuckets = new Set(["unavailable", "<10k", "10k-30k", "30k-60k", ">=60k"]);
+  const elapsedBuckets = new Set(["<100ms", "<1s", "<5s", "<30s", ">=30s"]);
+  const viewport = payload?.viewport;
+  if (
+    !payload
+    || typeof payload !== "object"
+    || Array.isArray(payload)
+    || Object.keys(payload).sort().join(",") !== [
+      "browser_connected", "category", "crash_observed", "document_height_bucket",
+      "elapsed_bucket", "error_name", "page_closed", "phase", "schema", "viewport",
+    ].join(",")
+    || payload.schema !== 1
+    || !categories.has(payload.category)
+    || !["TimeoutError", "TargetClosedError", "Error", "unknown"].includes(payload.error_name)
+    || payload.phase !== "capture"
+    || !heightBuckets.has(payload.document_height_bucket)
+    || !elapsedBuckets.has(payload.elapsed_bucket)
+    || typeof payload.page_closed !== "boolean"
+    || typeof payload.browser_connected !== "boolean"
+    || typeof payload.crash_observed !== "boolean"
+    || !viewport
+    || typeof viewport !== "object"
+    || Array.isArray(viewport)
+    || Object.keys(viewport).sort().join(",") !== "height,width"
+    || !["width", "height"].every((key) => (
+      viewport[key] === null
+      || (Number.isSafeInteger(viewport[key]) && viewport[key] >= 1 && viewport[key] <= 10_000)
+    ))
+    || attachment.body.toString("ascii") !== JSON.stringify(payload)
+  ) return { present: true, state: "unavailable", evidence: null };
+  return { present: true, state: "captured", evidence: payload };
+}
+
 function normalizedImageInventoryAttachment(attachment) {
   if (
     !IMAGE_INVENTORY_ATTACHMENT_NAMES.has(attachment?.name)
@@ -893,7 +956,7 @@ function normalizedImageInventoryAttachment(attachment) {
 
 function normalizedBrowserRequestFailureAttachment(attachment) {
   if (
-    attachment?.name !== BROWSER_REQUEST_FAILURE_ATTACHMENT_NAME
+    !BROWSER_REQUEST_FAILURE_ATTACHMENT_NAMES.has(attachment?.name)
     || attachment.contentType !== "application/json"
     || attachment.path !== undefined
     || !Buffer.isBuffer(attachment.body)
@@ -913,7 +976,8 @@ function normalizedBrowserRequestFailureAttachment(attachment) {
     || Object.keys(payload).sort().join(",") !== [
       "coverage", "events", "failure_phase", "schema", "truncated",
     ].join(",")
-    || payload.schema !== 1
+    || ![1, 2].includes(payload.schema)
+    || attachment.name !== `live-browser-request-failures-v${payload.schema}`
     || payload.coverage !== "since_before_each"
     || !["body", "hook", "both", "unknown"].includes(payload.failure_phase)
     || typeof payload.truncated !== "boolean"
@@ -928,20 +992,35 @@ function normalizedBrowserRequestFailureAttachment(attachment) {
   const routeScopes = new Set(["home", "patch", "tournaments", "other", "unknown"]);
   const failureClasses = new Set(["dns", "connection", "timeout", "tls", "aborted", "cancelled", "other"]);
   const durationBuckets = new Set(["<100ms", "<1s", "<5s", ">=5s", "unavailable"]);
+  const methods = new Set(["DELETE", "GET", "HEAD", "OPTIONS", "OTHER", "PATCH", "POST", "PUT"]);
+  const endpointFamilies = new Set([
+    "api_content", "api_patch_content", "api_tournaments", "api_users", "api_other",
+    "same_origin_other", "external", "unknown",
+  ]);
   for (let index = 0; index < payload.events.length; index += 1) {
     const event = payload.events[index];
     if (
       !event
       || typeof event !== "object"
       || Array.isArray(event)
-      || Object.keys(event).sort().join(",") !== [
+      || Object.keys(event).sort().join(",") !== (payload.schema === 1 ? [
         "duration_bucket", "failure_class", "navigation_relation", "ordinal",
         "resource_type", "route_scope",
-      ].join(",")
+      ] : [
+        "duration_bucket", "endpoint_family", "failure_class", "failure_route_scope",
+        "method", "navigation_phase", "navigation_relation", "ordinal", "resource_type",
+        "route_scope",
+      ]).join(",")
       || !Number.isSafeInteger(event.ordinal)
       || event.ordinal !== index + 1
       || !resourceTypes.has(event.resource_type)
       || !routeScopes.has(event.route_scope)
+      || (payload.schema === 2 && (
+        !methods.has(event.method)
+        || !routeScopes.has(event.failure_route_scope)
+        || !endpointFamilies.has(event.endpoint_family)
+        || !["none", "pending_same_route", "pending_route_change", "unknown"].includes(event.navigation_phase)
+      ))
       || !["same", "changed", "unknown"].includes(event.navigation_relation)
       || !failureClasses.has(event.failure_class)
       || !durationBuckets.has(event.duration_bucket)
@@ -953,7 +1032,7 @@ function normalizedBrowserRequestFailureAttachment(attachment) {
 function browserRequestFailureEvidenceForAttempt(result) {
   const attachments = Array.isArray(result?.attachments)
     ? result.attachments.filter(
-      (attachment) => attachment?.name === BROWSER_REQUEST_FAILURE_ATTACHMENT_NAME,
+      (attachment) => BROWSER_REQUEST_FAILURE_ATTACHMENT_NAMES.has(attachment?.name),
     )
     : [];
   if (attachments.length === 0) return { present: false, state: "unavailable", evidence: null };
@@ -964,6 +1043,7 @@ function browserRequestFailureEvidenceForAttempt(result) {
     present: true,
     state: payload.truncated ? "truncated" : "captured",
     evidence: {
+      ...(payload.schema === 2 ? { schema: 2 } : {}),
       failure_phase: payload.failure_phase,
       truncated: payload.truncated,
       events: payload.events,
@@ -1591,6 +1671,13 @@ function failureRecordForAttempt(test, result, attempt, sourceRoot) {
       failure.browser_request_failures = requestFailureEvidence.evidence;
     }
   }
+  if (id === "objective_icons") {
+    const screenshotEvidence = objectiveScreenshotEvidenceForAttempt(result);
+    if (screenshotEvidence.present) {
+      failure.objective_screenshot_state = screenshotEvidence.state;
+      failure.objective_screenshot = screenshotEvidence.evidence;
+    }
+  }
   return failure;
 }
 
@@ -1725,6 +1812,10 @@ function boundedFailureReportBytes(payload) {
       if (failure.image_inventory_state === "captured") {
         failure.image_inventory_state = "unavailable";
         failure.image_inventory = null;
+      }
+      if (failure.objective_screenshot_state === "captured") {
+        failure.objective_screenshot_state = "unavailable";
+        failure.objective_screenshot = null;
       }
       bytes = Buffer.from(`${JSON.stringify(payload)}\n`, "ascii");
       if (bytes.length <= MAX_EPHEMERAL_FAILURE_REPORT_BYTES) break;

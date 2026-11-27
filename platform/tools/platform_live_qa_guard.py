@@ -3126,6 +3126,53 @@ def _validate_page_error_evidence(record: Mapping[str, object]) -> None:
             raise GuardError("private browser page-error location is malformed")
 
 
+def _validate_objective_screenshot_evidence(record: Mapping[str, object]) -> None:
+    state = record.get("objective_screenshot_state")
+    evidence = record.get("objective_screenshot")
+    if state == "unavailable":
+        if evidence is not None:
+            raise GuardError("private objective screenshot unavailable state is malformed")
+        return
+    if state != "captured" or not isinstance(evidence, dict) or set(evidence) != {
+        "schema", "category", "error_name", "phase", "viewport",
+        "document_height_bucket", "elapsed_bucket", "page_closed",
+        "browser_connected", "crash_observed",
+    }:
+        raise GuardError("private objective screenshot evidence is malformed")
+    viewport = evidence.get("viewport")
+    if (
+        type(evidence.get("schema")) is not int
+        or evidence["schema"] != 1
+        or not isinstance(evidence.get("category"), str)
+        or evidence.get("category") not in {
+            "capture_timeout", "test_timeout", "browser_closed_or_crashed",
+            "capture_unavailable", "page_navigating", "invalid_geometry",
+            "output_eacces", "output_erofs", "output_enospc", "output_efbig",
+            "output_enoent", "other",
+        }
+        or not isinstance(evidence.get("error_name"), str)
+        or evidence.get("error_name") not in {"TimeoutError", "TargetClosedError", "Error", "unknown"}
+        or evidence.get("phase") != "capture"
+        or not isinstance(evidence.get("document_height_bucket"), str)
+        or evidence.get("document_height_bucket") not in {
+            "unavailable", "<10k", "10k-30k", "30k-60k", ">=60k",
+        }
+        or not isinstance(evidence.get("elapsed_bucket"), str)
+        or evidence.get("elapsed_bucket") not in {"<100ms", "<1s", "<5s", "<30s", ">=30s"}
+        or type(evidence.get("page_closed")) is not bool
+        or type(evidence.get("browser_connected")) is not bool
+        or type(evidence.get("crash_observed")) is not bool
+        or not isinstance(viewport, dict)
+        or set(viewport) != {"width", "height"}
+        or any(
+            value is not None
+            and (type(value) is not int or not 1 <= value <= 10_000)
+            for value in viewport.values()
+        )
+    ):
+        raise GuardError("private objective screenshot evidence is malformed")
+
+
 def _validate_image_inventory_evidence(record: Mapping[str, object]) -> None:
     state = record.get("image_inventory_state")
     inventory = record.get("image_inventory")
@@ -3342,9 +3389,13 @@ def _validate_browser_request_failure_evidence(record: Mapping[str, object]) -> 
         if evidence is not None:
             raise GuardError("private browser request-failure evidence is malformed")
         return
-    if not isinstance(state, str) or state not in {"captured", "truncated"} or not isinstance(evidence, dict) or set(evidence) != {
-        "failure_phase", "truncated", "events",
-    }:
+    if not isinstance(state, str) or state not in {"captured", "truncated"} or not isinstance(evidence, dict):
+        raise GuardError("private browser request-failure evidence is malformed")
+    schema = evidence.get("schema", 1)
+    expected_evidence_keys = {"failure_phase", "truncated", "events"}
+    if schema == 2:
+        expected_evidence_keys.add("schema")
+    if type(schema) is not int or schema not in {1, 2} or set(evidence) != expected_evidence_keys:
         raise GuardError("private browser request-failure evidence is malformed")
     events = evidence.get("events")
     truncated = evidence.get("truncated")
@@ -3358,10 +3409,15 @@ def _validate_browser_request_failure_evidence(record: Mapping[str, object]) -> 
     ):
         raise GuardError("private browser request-failure evidence is malformed")
     for index, event in enumerate(events):
-        if not isinstance(event, dict) or set(event) != {
+        expected_event_keys = {
             "ordinal", "resource_type", "route_scope", "navigation_relation",
             "failure_class", "duration_bucket",
-        }:
+        }
+        if schema == 2:
+            expected_event_keys.update({
+                "method", "failure_route_scope", "endpoint_family", "navigation_phase",
+            })
+        if not isinstance(event, dict) or set(event) != expected_event_keys:
             raise GuardError("private browser request-failure event is malformed")
         if (
             type(event.get("ordinal")) is not int
@@ -3384,6 +3440,26 @@ def _validate_browser_request_failure_evidence(record: Mapping[str, object]) -> 
             or not isinstance(event.get("duration_bucket"), str)
             or event.get("duration_bucket") not in {
                 "<100ms", "<1s", "<5s", ">=5s", "unavailable",
+            }
+        ):
+            raise GuardError("private browser request-failure event is malformed")
+        if schema == 2 and (
+            not isinstance(event.get("method"), str)
+            or event.get("method") not in {
+                "DELETE", "GET", "HEAD", "OPTIONS", "OTHER", "PATCH", "POST", "PUT",
+            }
+            or not isinstance(event.get("failure_route_scope"), str)
+            or event.get("failure_route_scope") not in {
+                "home", "patch", "tournaments", "other", "unknown",
+            }
+            or not isinstance(event.get("endpoint_family"), str)
+            or event.get("endpoint_family") not in {
+                "api_content", "api_patch_content", "api_tournaments", "api_users",
+                "api_other", "same_origin_other", "external", "unknown",
+            }
+            or not isinstance(event.get("navigation_phase"), str)
+            or event.get("navigation_phase") not in {
+                "none", "pending_same_route", "pending_route_change", "unknown",
             }
         ):
             raise GuardError("private browser request-failure event is malformed")
@@ -3747,6 +3823,9 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
                 frozenset(expected_failure_keys | image_keys),
                 frozenset(expected_failure_keys | image_keys | request_failure_keys),
             })
+        if schema == 2 and failure_id == "objective_icons":
+            screenshot_keys = {"objective_screenshot_state", "objective_screenshot"}
+            allowed_failure_key_sets.add(frozenset(expected_failure_keys | screenshot_keys))
         if (
             not isinstance(failure, dict)
             or frozenset(failure) not in allowed_failure_key_sets
@@ -3768,6 +3847,10 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
         seen.add(key)
         if schema == 2:
             _validate_page_error_evidence(failure)
+            if "objective_screenshot_state" in failure or "objective_screenshot" in failure:
+                if failure.get("id") != "objective_icons":
+                    raise GuardError("private objective screenshot evidence is bound to the wrong test")
+                _validate_objective_screenshot_evidence(failure)
             if "image_inventory_state" in failure or "image_inventory" in failure:
                 _validate_image_inventory_evidence(failure)
             if "browser_request_failure_state" in failure or "browser_request_failures" in failure:
@@ -4438,6 +4521,9 @@ def _read_ephemeral_failure_report(
         browser_request_failure_keys = {
             "browser_request_failure_state", "browser_request_failures",
         }
+        objective_screenshot_keys = {
+            "objective_screenshot_state", "objective_screenshot",
+        }
         if (
             not isinstance(record, dict)
             or (
@@ -4449,6 +4535,10 @@ def _read_ephemeral_failure_report(
                 and not (
                     record.get("id") == "image_csp_hosts"
                     and set(record) == base_record_keys | image_inventory_keys | browser_request_failure_keys
+                )
+                and not (
+                    record.get("id") == "objective_icons"
+                    and set(record) == base_record_keys | objective_screenshot_keys
                 )
             )
             or record.get("id") not in LIVE_BROWSER_FAILURE_DIAGNOSTIC_NAMES
@@ -4468,6 +4558,10 @@ def _read_ephemeral_failure_report(
             _validate_image_inventory_evidence(record)
         if browser_request_failure_keys.issubset(record):
             _validate_browser_request_failure_evidence(record)
+        if objective_screenshot_keys.issubset(record):
+            if record.get("id") != "objective_icons":
+                raise GuardError("ephemeral objective screenshot evidence is bound to the wrong test")
+            _validate_objective_screenshot_evidence(record)
         _validate_failure_location(record, manifest)
     if failure_status_counts != {
         "failed": counts["attempt_fail"],

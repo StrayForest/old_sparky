@@ -456,15 +456,16 @@ function rawImageInventoryV2Attachment(payload) {
   };
 }
 function browserRequestFailureAttachment({
+  schema = 1,
   failure_phase = "hook",
   truncated = false,
   events = [],
 } = {}) {
   return {
-    name: "live-browser-request-failures-v1",
+    name: `live-browser-request-failures-v${schema}`,
     contentType: "application/json",
     body: Buffer.from(JSON.stringify({
-      schema: 1,
+      schema,
       coverage: "since_before_each",
       failure_phase,
       truncated,
@@ -483,11 +484,45 @@ function browserRequestFailureEvent(overrides = {}) {
     ...overrides,
   };
 }
+function browserRequestFailureEventV2(overrides = {}) {
+  return {
+    ordinal: 1,
+    method: "GET",
+    resource_type: "fetch",
+    route_scope: "home",
+    failure_route_scope: "home",
+    endpoint_family: "api_content",
+    navigation_relation: "same",
+    navigation_phase: "none",
+    failure_class: "cancelled",
+    duration_bucket: "<1s",
+    ...overrides,
+  };
+}
 function rawBrowserRequestFailureAttachment(payload) {
   return {
-    name: "live-browser-request-failures-v1",
+    name: `live-browser-request-failures-v${payload.schema ?? 1}`,
     contentType: "application/json",
     body: Buffer.from(JSON.stringify(payload), "ascii"),
+  };
+}
+function objectiveScreenshotAttachment(overrides = {}) {
+  return {
+    name: "objective-screenshot-error-v1",
+    contentType: "application/json",
+    body: Buffer.from(JSON.stringify({
+      schema: 1,
+      category: "capture_timeout",
+      error_name: "TimeoutError",
+      phase: "capture",
+      viewport: { width: 1430, height: 1000 },
+      document_height_bucket: "10k-30k",
+      elapsed_bucket: ">=30s",
+      page_closed: false,
+      browser_connected: true,
+      crash_observed: false,
+      ...overrides,
+    }), "ascii"),
   };
 }
 assert.equal(pageErrorClass({ name: "SecurityError" }), "DOMException");
@@ -1258,10 +1293,9 @@ function validateEphemeralAndRetainedBrowserReportThroughGuard(reportPath) {
     "    guard._validate_retained_failure_report(gate.name + '.failure-v2.json', retained_bytes)",
     "    retained = json.loads(retained_bytes)",
     "    assert retained['schema'] == 2",
-    "    assert retained['failures'][0]['id'] == 'image_csp_hosts'",
-    "    assert retained['failures'][0]['image_inventory'] == ephemeral['failures'][0]['image_inventory']",
-    "    assert retained['failures'][0]['browser_request_failures'] == ephemeral['failures'][0]['browser_request_failures']",
-    "    assert retained['failures'][0]['image_inventory_state'] == 'captured'",
+    "    assert retained['failures'][0]['id'] == ephemeral['failures'][0]['id']",
+    "    for key in ('image_inventory_state', 'image_inventory', 'browser_request_failure_state', 'browser_request_failures', 'objective_screenshot_state', 'objective_screenshot'):",
+    "        if key in ephemeral['failures'][0]: assert retained['failures'][0][key] == ephemeral['failures'][0][key]",
     "finally:",
     "    pathlib.Path.lstat = original_path_lstat",
     "    os.open, os.fstat, os.stat, os.fchown = original_os_open, original_os_fstat, original_os_stat, original_os_fchown",
@@ -1269,11 +1303,17 @@ function validateEphemeralAndRetainedBrowserReportThroughGuard(reportPath) {
     "    shutil.rmtree(private_store)",
     "manifest = {}",
     "guard.liveqa_identity = lambda: (os.geteuid(), os.getegid())",
-    "bad_cases = {",
-    "    'wrong_gate': lambda record: record.update({'id': 'csp_negative_probes'}),",
-    "    'missing_pair_member': lambda record: record.pop('browser_request_failures'),",
-    "    'malformed_pair': lambda record: record['browser_request_failures'].update({'extra': True}),",
-    "}",
+    "if 'browser_request_failures' in ephemeral['failures'][0]:",
+    "    bad_pair = 'browser_request_failures'",
+    "elif 'objective_screenshot' in ephemeral['failures'][0]:",
+    "    bad_pair = 'objective_screenshot'",
+    "else:",
+    "    bad_pair = None",
+    "bad_cases = {'wrong_gate': lambda record: record.update({'id': 'csp_negative_probes'})}",
+    "if bad_pair == 'browser_request_failures':",
+    "    bad_cases.update({'missing_pair_member': lambda record: record.pop(bad_pair), 'malformed_pair': lambda record: record[bad_pair].update({'extra': True})})",
+    "elif bad_pair == 'objective_screenshot':",
+    "    bad_cases.update({'missing_pair_member': lambda record: record.pop(bad_pair), 'malformed_pair': lambda record: record.update({'objective_screenshot_state': 'invalid'})})",
     "temporary_gates = []",
     "try:",
     "    for label, mutate in bad_cases.items():",
@@ -1296,7 +1336,7 @@ function validateEphemeralAndRetainedBrowserReportThroughGuard(reportPath) {
     "        except guard.GuardError:",
     "            pass",
     "        else:",
-    "            raise AssertionError('ephemeral request evidence accepted invalid case: ' + label)",
+    "            raise AssertionError('ephemeral browser evidence accepted invalid case: ' + label + ' / ' + str(bad_pair) + ' / ' + ','.join(sorted(bad_payload['failures'][0])))",
     "finally:",
     "    for bad_gate in temporary_gates:",
     "        shutil.rmtree(bad_gate, ignore_errors=True)",
@@ -1943,6 +1983,13 @@ try {
       truncated: false,
       events: [browserRequestFailureEvent({ ordinal: 2 })],
     }],
+    ["unknown v2 endpoint family", {
+      schema: 2,
+      coverage: "since_before_each",
+      failure_phase: "hook",
+      truncated: false,
+      events: [browserRequestFailureEventV2({ endpoint_family: "private-path" })],
+    }],
   ];
   for (const [index, [label, payload]] of invalidRequestFailurePayloads.entries()) {
     const invalidRequestFixture = diagnosticFixture(failureRoot, `rq${index}2b3c4`);
@@ -1975,6 +2022,135 @@ try {
       assert.equal(invalidRequestBytes.includes(Buffer.from(privateValue)), false);
     }
   }
+
+  const v2RequestFixture = diagnosticFixture(failureRoot, "rqv2b3c4");
+  const v2RequestPayload = {
+    schema: 2,
+    coverage: "since_before_each",
+    failure_phase: "hook",
+    truncated: false,
+    events: [browserRequestFailureEventV2({
+      route_scope: "home",
+      failure_route_scope: "patch",
+      endpoint_family: "api_patch_content",
+      navigation_phase: "pending_route_change",
+    })],
+  };
+  const v2RequestFailure = failureTest(v2RequestFixture, {
+    title: publicTitles.at(-1),
+    project: "live-webkit-mobile",
+    omitSourceLocation: true,
+    attachments: [
+      validImageForRequestTests,
+      rawBrowserRequestFailureAttachment(v2RequestPayload),
+    ],
+  });
+  const v2RequestPlan = publicPlanWithFailure(v2RequestFailure);
+  const v2RequestSummary = summarizeRun({ allTests: () => v2RequestPlan }, "failed", { publicGate: true });
+  assert.equal(withRootOwnedGate(v2RequestFixture.gateRoot, () => writeBoundedSummary(
+    v2RequestFixture.binding,
+    v2RequestSummary,
+    { gateRoot: v2RequestFixture.gateRoot },
+  )), true);
+  assert.equal(withRootOwnedGate(v2RequestFixture.gateRoot, () => writeBoundedFailureSummary(
+    v2RequestFixture.binding,
+    { allTests: () => v2RequestPlan },
+    v2RequestSummary,
+    { gateRoot: v2RequestFixture.gateRoot, sourceRoot: v2RequestFixture.sourceRoot },
+  )), true, "v2 request diagnostics preserve the public failure identity");
+  const v2RequestBytes = fs.readFileSync(
+    path.join(v2RequestFixture.results, "live-failures-v2.json"),
+  );
+  const v2RequestReport = JSON.parse(v2RequestBytes.toString("ascii"));
+  assert.deepEqual(v2RequestReport.failures[0].browser_request_failures, {
+    schema: 2,
+    failure_phase: "hook",
+    truncated: false,
+    events: v2RequestPayload.events,
+  });
+  const v2RequestGuard = validateEphemeralAndRetainedBrowserReportThroughGuard(
+    path.join(v2RequestFixture.results, "live-failures-v2.json"),
+  );
+  assert.equal(v2RequestGuard.status, 0, v2RequestGuard.stderr);
+  for (const privateValue of ["https://", "private-path", "private.host"]) {
+    assert.equal(v2RequestBytes.includes(Buffer.from(privateValue)), false);
+  }
+
+  const screenshotFixture = diagnosticFixture(failureRoot, "scv1b3c4");
+  const objectiveScreenshotTitle = "live current patch route and objective source icons remain available";
+  const screenshotFailure = failureTest(screenshotFixture, {
+    title: objectiveScreenshotTitle,
+    project: "live-desktop",
+    omitSourceLocation: true,
+    attachments: [objectiveScreenshotAttachment()],
+  });
+  const screenshotPlan = publicPlanWithFailure(screenshotFailure);
+  const screenshotSummary = summarizeRun({ allTests: () => screenshotPlan }, "failed", { publicGate: true });
+  assert.equal(withRootOwnedGate(screenshotFixture.gateRoot, () => writeBoundedSummary(
+    screenshotFixture.binding,
+    screenshotSummary,
+    { gateRoot: screenshotFixture.gateRoot },
+  )), true);
+  assert.equal(withRootOwnedGate(screenshotFixture.gateRoot, () => writeBoundedFailureSummary(
+    screenshotFixture.binding,
+    { allTests: () => screenshotPlan },
+    screenshotSummary,
+    { gateRoot: screenshotFixture.gateRoot, sourceRoot: screenshotFixture.sourceRoot },
+  )), true, "closed screenshot diagnostics preserve the objective_icons failure");
+  const screenshotBytes = fs.readFileSync(
+    path.join(screenshotFixture.results, "live-failures-v2.json"),
+  );
+  const screenshotReport = JSON.parse(screenshotBytes.toString("ascii"));
+  assert.equal(screenshotReport.failures[0].objective_screenshot_state, "captured");
+  assert.equal(screenshotReport.failures[0].objective_screenshot.category, "capture_timeout");
+  assert.deepEqual(screenshotReport.failures[0].objective_screenshot.viewport, {
+    width: 1430,
+    height: 1000,
+  });
+  const screenshotGuard = validateEphemeralAndRetainedBrowserReportThroughGuard(
+    path.join(screenshotFixture.results, "live-failures-v2.json"),
+  );
+  assert.equal(screenshotGuard.status, 0, screenshotGuard.stderr);
+  for (const privateValue of ["https://", "/private", "private message", "cookie=secret"]) {
+    assert.equal(screenshotBytes.includes(Buffer.from(privateValue)), false);
+  }
+  assert.equal(screenshotBytes.length <= 16 * 1024 - 256, true);
+
+  const invalidScreenshotFixture = diagnosticFixture(failureRoot, "siv1b3c4");
+  const invalidScreenshotFailure = failureTest(invalidScreenshotFixture, {
+    title: objectiveScreenshotTitle,
+    project: "live-desktop",
+    omitSourceLocation: true,
+    attachments: [objectiveScreenshotAttachment({ category: "private-path" })],
+  });
+  const invalidScreenshotPlan = publicPlanWithFailure(invalidScreenshotFailure);
+  const invalidScreenshotSummary = summarizeRun(
+    { allTests: () => invalidScreenshotPlan }, "failed", { publicGate: true },
+  );
+  assert.equal(withRootOwnedGate(invalidScreenshotFixture.gateRoot, () => writeBoundedSummary(
+    invalidScreenshotFixture.binding,
+    invalidScreenshotSummary,
+    { gateRoot: invalidScreenshotFixture.gateRoot },
+  )), true);
+  assert.equal(withRootOwnedGate(invalidScreenshotFixture.gateRoot, () => writeBoundedFailureSummary(
+    invalidScreenshotFixture.binding,
+    { allTests: () => invalidScreenshotPlan },
+    invalidScreenshotSummary,
+    { gateRoot: invalidScreenshotFixture.gateRoot, sourceRoot: invalidScreenshotFixture.sourceRoot },
+  )), true, "malformed screenshot evidence preserves the objective_icons failure");
+  const invalidScreenshotBytes = fs.readFileSync(
+    path.join(invalidScreenshotFixture.results, "live-failures-v2.json"),
+  );
+  const invalidScreenshotReport = JSON.parse(invalidScreenshotBytes.toString("ascii"));
+  assert.deepEqual([
+    invalidScreenshotReport.failures[0].objective_screenshot_state,
+    invalidScreenshotReport.failures[0].objective_screenshot,
+  ], ["unavailable", null]);
+  assert.equal(invalidScreenshotBytes.includes(Buffer.from("private-path")), false);
+  const invalidScreenshotGuard = validateEphemeralAndRetainedBrowserReportThroughGuard(
+    path.join(invalidScreenshotFixture.results, "live-failures-v2.json"),
+  );
+  assert.equal(invalidScreenshotGuard.status, 0, invalidScreenshotGuard.stderr);
 
   const oversizedEvidence = imageInventoryV2Payload("home", {
     image_count: 1,
