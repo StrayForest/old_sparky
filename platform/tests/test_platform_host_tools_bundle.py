@@ -2005,6 +2005,36 @@ class HostToolsBundleTests(unittest.TestCase):
         return generation
 
     def _operator_lock_bootstrap_fixture(self, root: Path) -> tuple[Path, Path, Path, str, str]:
+        source_root = root / "source-checkout"
+        source_tools = source_root / "platform/tools"
+        source_tools.mkdir(parents=True)
+        for name in ("platform_host_tools_pin.py", "platform_host_tools_bundle.py"):
+            shutil.copy2(TOOLS_ROOT / name, source_tools / name)
+        subprocess.run(["/usr/bin/git", "-C", str(source_root), "init", "--quiet"], check=True)
+        subprocess.run(
+            ["/usr/bin/git", "-C", str(source_root), "config", "user.name", "Host-tools fixture"], check=True,
+        )
+        subprocess.run(
+            ["/usr/bin/git", "-C", str(source_root), "config", "user.email", "fixture@example.invalid"], check=True,
+        )
+        subprocess.run(["/usr/bin/git", "-C", str(source_root), "add", "platform/tools"], check=True)
+        subprocess.run(
+            ["/usr/bin/git", "-C", str(source_root), "commit", "--quiet", "-m", "fixture source"], check=True,
+        )
+        source_sha = subprocess.run(
+            ["/usr/bin/git", "-C", str(source_root), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        (source_root / "fixture-target.txt").write_text("target commit\n", encoding="ascii")
+        subprocess.run(["/usr/bin/git", "-C", str(source_root), "add", "fixture-target.txt"], check=True)
+        subprocess.run(
+            ["/usr/bin/git", "-C", str(source_root), "commit", "--quiet", "-m", "fixture target"], check=True,
+        )
+        target_sha = subprocess.run(
+            ["/usr/bin/git", "-C", str(source_root), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
         app = root / "app"
         releases = app / "releases"
         release = releases / "active-release"
@@ -2013,7 +2043,7 @@ class HostToolsBundleTests(unittest.TestCase):
         shutil.copytree(flattened / "tools", release / "tools")
         shutil.copytree(flattened / "contracts", release / "contracts")
         (release / "contracts/host_tools_pin.json").chmod(0o444)
-        receipt = {"artifact_format_version": 1, "release_slug": release.name, "source_git_commit": SOURCE_SHA}
+        receipt = {"artifact_format_version": 1, "release_slug": release.name, "source_git_commit": source_sha}
         (release / "RELEASE.json").write_text(
             json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii",
         )
@@ -2026,19 +2056,17 @@ class HostToolsBundleTests(unittest.TestCase):
         staged = self._installed_generation_fixture(staged_root)
         shutil.copytree(staged, generation_root / PIN_SHA, copy_function=shutil.copy2)
         (generation_root / PIN_SHA).chmod(0o555)
-        target_sha = subprocess.run(
-            ["/usr/bin/git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
-            check=True, capture_output=True, text=True,
-        ).stdout.strip()
-        return REPO_ROOT, app, generation_root, target_sha, "a" * 40
+        return source_root, app, generation_root, target_sha, "a" * 40
 
     @contextmanager
-    def _operator_root_owner_fixture(self, app: Path, *, owner_drift: Path | None = None):
+    def _operator_root_owner_fixture(
+        self, source_root: Path, app: Path, *, owner_drift: Path | None = None,
+    ):
         """Model root-owned release metadata while keeping bundle checks real."""
         real_lstat = Path.lstat
         trusted_sources = {
-            REPO_ROOT / "platform/tools/platform_host_tools_pin.py",
-            REPO_ROOT / "platform/tools/platform_host_tools_bundle.py",
+            source_root / "platform/tools/platform_host_tools_pin.py",
+            source_root / "platform/tools/platform_host_tools_bundle.py",
         }
         real_loader = operator_provisioner._load_trusted_source_module
 
@@ -2120,7 +2148,7 @@ class HostToolsBundleTests(unittest.TestCase):
                         source_root, target_sha=target_sha, target_host_tools_sha=target_host_sha, app_root=app,
                         generation_root=generation_root,
                     )
-            with self._operator_root_owner_fixture(app, owner_drift=app):
+            with self._operator_root_owner_fixture(source_root, app, owner_drift=app):
                 with self.assertRaisesRegex(
                     operator_provisioner.ProvisionError, "active_lock_bootstrap_directory_metadata",
                 ):
@@ -2128,7 +2156,7 @@ class HostToolsBundleTests(unittest.TestCase):
                         source_root, target_sha=target_sha, target_host_tools_sha=target_host_sha, app_root=app,
                         generation_root=generation_root,
                     )
-            with self._operator_root_owner_fixture(app):
+            with self._operator_root_owner_fixture(source_root, app):
                 snapshot = operator_provisioner.active_lock_bootstrap(
                     source_root, target_sha=target_sha, target_host_tools_sha=target_host_sha, app_root=app,
                     generation_root=generation_root,
@@ -2149,17 +2177,57 @@ class HostToolsBundleTests(unittest.TestCase):
     def test_operator_lock_bootstrap_rejects_active_source_and_helper_drift(self) -> None:
         with tempfile.TemporaryDirectory(prefix="host-tools-lock-bootstrap-drift-") as temporary:
             source_root, app, generation_root, target_sha, target_host_sha = self._operator_lock_bootstrap_fixture(Path(temporary))
-            with self._operator_root_owner_fixture(app):
+            with self._operator_root_owner_fixture(source_root, app):
                 snapshot = operator_provisioner.active_lock_bootstrap(
                     source_root, target_sha=target_sha, target_host_tools_sha=target_host_sha, app_root=app,
                     generation_root=generation_root,
                 )
+
+                tree_sha = subprocess.run(
+                    ["/usr/bin/git", "-C", str(source_root), "rev-parse", f"{target_sha}^{{tree}}"],
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip()
+                unrelated_sha = subprocess.run(
+                    [
+                        "/usr/bin/git", "-C", str(source_root), "-c", "user.name=Host-tools fixture",
+                        "-c", "user.email=fixture@example.invalid", "commit-tree", tree_sha,
+                        "-m", "unrelated source commit",
+                    ],
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip()
+                source_drift = app / "releases/source-drift"
+                shutil.copytree(app / "releases/active-release", source_drift, copy_function=shutil.copy2)
+                source_receipt = source_drift / "RELEASE.json"
+                source_receipt.chmod(0o644)
+                source_receipt.write_text(
+                    json.dumps({
+                        "artifact_format_version": 1, "release_slug": "source-drift",
+                        "source_git_commit": unrelated_sha,
+                    }, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii",
+                )
+                source_receipt.chmod(0o444)
+                source_replacement = app / "source-drift-current"
+                source_replacement.symlink_to(source_drift)
+                source_replacement.replace(app / "current")
+                with self.assertRaisesRegex(
+                    operator_provisioner.ProvisionError, "active_release_source_not_in_target_history",
+                ):
+                    operator_provisioner.active_lock_bootstrap(
+                        source_root, target_sha=target_sha, target_host_tools_sha=target_host_sha, app_root=app,
+                        generation_root=generation_root,
+                    )
+                (app / "current").unlink()
+                (app / "current").symlink_to(app / "releases/active-release")
+
                 alternate = app / "releases/alternate"
                 shutil.copytree(app / "releases/active-release", alternate, copy_function=shutil.copy2)
                 (alternate / "RELEASE.json").chmod(0o644)
+                alternate_receipt = {
+                    "artifact_format_version": 1, "release_slug": "alternate",
+                    "source_git_commit": snapshot["active_release_source_sha"],
+                }
                 (alternate / "RELEASE.json").write_text(
-                    json.dumps({"artifact_format_version": 1, "release_slug": "alternate", "source_git_commit": SOURCE_SHA},
-                               sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii",
+                    json.dumps(alternate_receipt, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii",
                 )
                 (alternate / "RELEASE.json").chmod(0o444)
                 replacement = app / "replacement-current"
