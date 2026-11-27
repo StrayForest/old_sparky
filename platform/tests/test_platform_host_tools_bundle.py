@@ -21,6 +21,7 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
+import warnings
 import zipfile
 from unittest.mock import patch
 
@@ -582,6 +583,125 @@ class HostToolsBundleTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(operator_provisioner.ProvisionError, "artifact_owner_partial_account"):
                 operator_provisioner.validate_account_contract("b" * 40)
+
+    def test_operator_suppresses_only_the_known_spwd_deprecation(self) -> None:
+        module = object()
+        exact = "'spwd' is deprecated and slated for removal in Python 3.13"
+
+        def warn_exact(name: str) -> object:
+            self.assertEqual(name, "spwd")
+            warnings.warn(exact, DeprecationWarning)
+            return module
+
+        stderr = StringIO()
+        with redirect_stderr(stderr), patch.object(
+            operator_provisioner.importlib, "import_module", side_effect=warn_exact,
+        ):
+            self.assertIs(operator_provisioner._import_spwd_module(), module)
+        self.assertEqual(stderr.getvalue(), "")
+
+        def warn_other(name: str) -> object:
+            self.assertEqual(name, "spwd")
+            warnings.warn("unrelated account warning", DeprecationWarning)
+            return module
+
+        stderr = StringIO()
+        with warnings.catch_warnings(), redirect_stderr(stderr), patch.object(
+            operator_provisioner.importlib, "import_module", side_effect=warn_other,
+        ):
+            warnings.simplefilter("always")
+            self.assertIs(operator_provisioner._import_spwd_module(), module)
+        self.assertIn("unrelated account warning", stderr.getvalue())
+
+    def test_operator_sudo_denial_requires_exact_closed_output(self) -> None:
+        user_name = "oldsparky-load-artifacts"
+        hostname = "fixture-host.example"
+        short_hostname = hostname.split(".", 1)[0]
+        denial = f"User {user_name} is not allowed to run sudo on {short_hostname}.\n".encode("ascii")
+        with patch.object(operator_provisioner.socket, "gethostname", return_value=hostname):
+            for returncode in (0, 1):
+                with self.subTest(returncode=returncode):
+                    self.assertTrue(operator_provisioner._sudo_denial_is_closed(
+                        SimpleNamespace(returncode=returncode, stdout=denial, stderr=b""), user_name,
+                    ))
+
+            rejected = (
+                (0, denial.replace(user_name.encode(), b"another-user"), b""),
+                (0, denial.replace(short_hostname.encode(), b"other-host"), b""),
+                (0, f"User {user_name} is not allowed to run sudo on {hostname}.\n".encode("ascii"), b""),
+                (0, denial + b"Additional status\n", b""),
+                (0, denial.rstrip(b"\n"), b""),
+                (0, denial.replace(b".\n", b".\r\n"), b""),
+                (0, b"User " + user_name.encode() + b" may run the following commands:\n", b""),
+                (0, denial, b"sudo diagnostic\n"),
+                (2, denial, b""),
+            )
+            for returncode, stdout, stderr in rejected:
+                with self.subTest(returncode=returncode, stdout=stdout, stderr=stderr):
+                    self.assertFalse(operator_provisioner._sudo_denial_is_closed(
+                        SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr), user_name,
+                    ))
+
+        with patch.object(operator_provisioner.socket, "gethostname", return_value="bad\nhost"):
+            self.assertFalse(operator_provisioner._sudo_denial_is_closed(
+                SimpleNamespace(
+                    returncode=0,
+                    stdout=f"User {user_name} is not allowed to run sudo on bad.\n".encode("ascii"),
+                    stderr=b"",
+                ), user_name,
+            ))
+
+    def test_operator_parent_accepts_only_exact_locked_receipt_result(self) -> None:
+        args = SimpleNamespace(
+            target_sha="a" * 40,
+            source_root="/tmp/source",
+            gh="/tmp/gh",
+            security_run_id="1",
+            security_run_attempt="1",
+            preflight_run_id="2",
+            preflight_run_attempt="1",
+            bundle_artifact_id="3",
+            dispatch_input_artifact_id="4",
+            operator_change_id="fixture-change",
+        )
+        host_tools_sha = "b" * 40
+        output = (
+            f"HOST_TOOLS_PROVISION status=passed target_sha={args.target_sha} "
+            f"host_tools_sha={host_tools_sha} generation_inode=12:34 self_test=passed "
+            f"receipt_sha256={'c' * 64} "
+            "receipt_path=/root/.oldsparky/host-tools-provision-2-1/provisioning-receipt.json\n"
+        ).encode("ascii")
+        bootstrap = {"lock_helper_path": "/opt/oldsparky/shared/release-lock"}
+
+        def call_provision(stderr: bytes) -> tuple[int | None, str, str | None]:
+            stdout = StringIO()
+            with (
+                patch.object(operator_provisioner.os, "geteuid", return_value=0),
+                patch.object(operator_provisioner.os, "umask"),
+                patch.object(operator_provisioner, "validate_source", return_value=host_tools_sha),
+                patch.object(operator_provisioner, "active_lock_bootstrap", return_value=bootstrap),
+                patch.object(operator_provisioner, "verify_gh"),
+                patch.object(operator_provisioner, "gh_auth_environment", return_value={}),
+                patch.object(
+                    operator_provisioner, "safe_run",
+                    return_value=SimpleNamespace(returncode=0, stdout=output, stderr=stderr),
+                ),
+                redirect_stdout(stdout),
+            ):
+                try:
+                    return operator_provisioner.provision(args), stdout.getvalue(), None
+                except operator_provisioner.ProvisionError as exc:
+                    return None, stdout.getvalue(), str(exc)
+
+        status, printed, refusal = call_provision(b"")
+        self.assertEqual(status, 0)
+        self.assertEqual(printed, output.decode("ascii"))
+        self.assertIsNone(refusal)
+
+        status, printed, refusal = call_provision(b"unexpected child stderr\n")
+        self.assertIsNone(status)
+        self.assertEqual(printed, "")
+        self.assertEqual(refusal, "locked_operator_stderr")
 
     def test_operator_preflight_accepts_only_closed_mode_specific_skips(self) -> None:
         jobs = self._preflight_jobs_fixture()

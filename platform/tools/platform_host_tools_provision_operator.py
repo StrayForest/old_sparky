@@ -26,11 +26,12 @@ import re
 import selectors
 import signal
 import shutil
-import spwd
+import socket
 import stat
 import subprocess
 import tempfile
 import time
+import warnings
 import zipfile
 from typing import Any, Callable
 
@@ -39,6 +40,7 @@ REPOSITORY = "StrayForest/old_sparky"
 TARGET_RE = re.compile(r"^[0-9a-f]{40}$")
 ID_RE = re.compile(r"^[1-9][0-9]{0,31}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+SUDO_HOST_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 APP = Path("/opt/oldsparky/platform")
 SHARED = APP / "shared"
 GENERATIONS = SHARED / "host-tools"
@@ -82,6 +84,27 @@ class ProvisionError(Exception):
 
 def stop(stage: str) -> None:
     raise ProvisionError(stage)
+
+
+def _import_spwd_module() -> Any:
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"^'spwd' is deprecated and slated for removal in Python 3\.13$",
+            category=DeprecationWarning,
+        )
+        return importlib.import_module("spwd")
+
+
+def _sudo_denial_is_closed(result: Any, user_name: str) -> bool:
+    if result.returncode not in {0, 1} or result.stderr:
+        return False
+    try:
+        hostname = socket.gethostname().split(".", 1)[0]
+        expected = f"User {user_name} is not allowed to run sudo on {hostname}.\n".encode("ascii")
+    except (OSError, UnicodeError):
+        return False
+    return bool(SUDO_HOST_LABEL_RE.fullmatch(hostname) and result.stdout == expected)
 
 
 def sha256(data: bytes) -> str:
@@ -1096,13 +1119,13 @@ def validate_account_contract(old_host_tools_sha: str) -> tuple[str, str]:
     ):
         stop("artifact_owner_existing_contract_invalid")
     try:
-        shadow = spwd.getspnam(user_name)
+        shadow = _import_spwd_module().getspnam(user_name)
     except (KeyError, PermissionError):
         stop("artifact_owner_password_state_unavailable")
     if not shadow.sp_pwd or shadow.sp_pwd[0] not in {"!", "*"}:
         stop("artifact_owner_password_unlocked")
     sudo = safe_run(["/usr/bin/sudo", "-n", "-l", "-U", user_name], output_limit=65536)
-    if sudo.returncode == 0 or b"not allowed" not in sudo.stdout.lower():
+    if not _sudo_denial_is_closed(sudo, user_name):
         stop("artifact_owner_sudo_policy_invalid")
     reserved_users = {"oldsparky", "oldsparky-api", "oldsparky-web", "oldsparky-worker", "oldsparky-liveqa"}
     reserved_uids: set[int] = set()
