@@ -5,7 +5,7 @@ import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
-from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from io import BytesIO, StringIO
 from pathlib import Path
 import re
@@ -274,10 +274,10 @@ class HostToolsBundleTests(unittest.TestCase):
             self.assertEqual((target / "unexpected-member").read_bytes(), b"unknown bytes\n")
             self.assertFalse((root / (".failed-" + "a" * 40 + "-12350")).exists())
             self.assertEqual(sentinel.read_bytes(), b"old generation remains\n")
+            target.chmod(0o700)
             for child in target.iterdir():
                 child.chmod(0o600)
                 child.unlink()
-            target.chmod(0o700)
             target.rmdir()
             prior.chmod(0o700)
 
@@ -2032,6 +2032,56 @@ class HostToolsBundleTests(unittest.TestCase):
         ).stdout.strip()
         return REPO_ROOT, app, generation_root, target_sha, "a" * 40
 
+    @contextmanager
+    def _operator_root_owner_fixture(self, app: Path, *, owner_drift: Path | None = None):
+        """Model root-owned release metadata while keeping bundle checks real."""
+        real_lstat = Path.lstat
+        trusted_sources = {
+            REPO_ROOT / "platform/tools/platform_host_tools_pin.py",
+            REPO_ROOT / "platform/tools/platform_host_tools_bundle.py",
+        }
+        real_loader = operator_provisioner._load_trusted_source_module
+
+        def fixture_lstat(path: Path) -> SimpleNamespace | os.stat_result:
+            metadata = real_lstat(path)
+            if path != app and app not in path.parents and path not in trusted_sources:
+                return metadata
+            wrong_owner = path == owner_drift
+            uid = (os.geteuid() or 65534) if wrong_owner else 0
+            gid = (os.getegid() or 65534) if wrong_owner else 0
+            return SimpleNamespace(
+                st_mode=metadata.st_mode, st_uid=uid, st_gid=gid, st_nlink=metadata.st_nlink,
+                st_size=metadata.st_size, st_dev=metadata.st_dev, st_ino=metadata.st_ino,
+                st_mtime_ns=metadata.st_mtime_ns, st_ctime_ns=metadata.st_ctime_ns,
+            )
+
+        def load_trusted(name: str, path: Path):
+            module = real_loader(name, path)
+            if name == "trusted_operator_host_tools_bundle":
+                verify_generation = module.verify_installed_generation
+
+                def verify_fixture_generation(
+                    generation: Path, *, expected_source_sha: str, expected_toolset_version: str,
+                ):
+                    # Keep the verifier's real lstat/fstat identity and digest checks,
+                    # using the actual owner of this temporary fixture.
+                    with patch.object(Path, "lstat", new=real_lstat):
+                        return verify_generation(
+                            generation, expected_source_sha=expected_source_sha,
+                            expected_toolset_version=expected_toolset_version,
+                            expected_uid=os.geteuid(), expected_gid=os.getegid(),
+                        )
+
+                module.verify_installed_generation = verify_fixture_generation
+            return module
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(Path, "lstat", autospec=True, side_effect=fixture_lstat))
+            stack.enter_context(
+                patch.object(operator_provisioner, "_load_trusted_source_module", side_effect=load_trusted)
+            )
+            yield
+
     def _verify_installed_fixture(self, generation: Path) -> dict[str, object]:
         return bundle.verify_installed_generation(
             generation,
@@ -2062,10 +2112,27 @@ class HostToolsBundleTests(unittest.TestCase):
     def test_operator_lock_bootstrap_binds_active_pin_and_immutable_generation(self) -> None:
         with tempfile.TemporaryDirectory(prefix="host-tools-lock-bootstrap-") as temporary:
             source_root, app, generation_root, target_sha, target_host_sha = self._operator_lock_bootstrap_fixture(Path(temporary))
-            snapshot = operator_provisioner.active_lock_bootstrap(
-                source_root, target_sha=target_sha, target_host_tools_sha=target_host_sha, app_root=app,
-                generation_root=generation_root,
-            )
+            if (os.geteuid(), os.getegid()) != (0, 0):
+                with self.assertRaisesRegex(
+                    operator_provisioner.ProvisionError, "active_lock_bootstrap_directory_metadata",
+                ):
+                    operator_provisioner.active_lock_bootstrap(
+                        source_root, target_sha=target_sha, target_host_tools_sha=target_host_sha, app_root=app,
+                        generation_root=generation_root,
+                    )
+            with self._operator_root_owner_fixture(app, owner_drift=app):
+                with self.assertRaisesRegex(
+                    operator_provisioner.ProvisionError, "active_lock_bootstrap_directory_metadata",
+                ):
+                    operator_provisioner.active_lock_bootstrap(
+                        source_root, target_sha=target_sha, target_host_tools_sha=target_host_sha, app_root=app,
+                        generation_root=generation_root,
+                    )
+            with self._operator_root_owner_fixture(app):
+                snapshot = operator_provisioner.active_lock_bootstrap(
+                    source_root, target_sha=target_sha, target_host_tools_sha=target_host_sha, app_root=app,
+                    generation_root=generation_root,
+                )
             self.assertEqual(snapshot["active_pin_sha"], PIN_SHA)
             self.assertEqual(
                 Path(snapshot["lock_helper_path"]), generation_root / PIN_SHA / "platform_release_lock.sh",
@@ -2082,51 +2149,53 @@ class HostToolsBundleTests(unittest.TestCase):
     def test_operator_lock_bootstrap_rejects_active_source_and_helper_drift(self) -> None:
         with tempfile.TemporaryDirectory(prefix="host-tools-lock-bootstrap-drift-") as temporary:
             source_root, app, generation_root, target_sha, target_host_sha = self._operator_lock_bootstrap_fixture(Path(temporary))
-            snapshot = operator_provisioner.active_lock_bootstrap(
-                source_root, target_sha=target_sha, target_host_tools_sha=target_host_sha, app_root=app,
-                generation_root=generation_root,
-            )
-            alternate = app / "releases/alternate"
-            shutil.copytree(app / "releases/active-release", alternate, copy_function=shutil.copy2)
-            (alternate / "RELEASE.json").write_text(
-                json.dumps({"artifact_format_version": 1, "release_slug": "alternate", "source_git_commit": SOURCE_SHA},
-                           sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii",
-            )
-            (alternate / "RELEASE.json").chmod(0o444)
-            replacement = app / "replacement-current"
-            replacement.symlink_to(alternate)
-            replacement.replace(app / "current")
-            with self.assertRaisesRegex(operator_provisioner.ProvisionError, "active_lock_bootstrap_changed"):
-                operator_provisioner.revalidate_active_lock_bootstrap(
-                    source_root, target_sha=target_sha, target_host_tools_sha=target_host_sha, expected=snapshot,
-                    app_root=app, generation_root=generation_root,
+            with self._operator_root_owner_fixture(app):
+                snapshot = operator_provisioner.active_lock_bootstrap(
+                    source_root, target_sha=target_sha, target_host_tools_sha=target_host_sha, app_root=app,
+                    generation_root=generation_root,
                 )
+                alternate = app / "releases/alternate"
+                shutil.copytree(app / "releases/active-release", alternate, copy_function=shutil.copy2)
+                (alternate / "RELEASE.json").chmod(0o644)
+                (alternate / "RELEASE.json").write_text(
+                    json.dumps({"artifact_format_version": 1, "release_slug": "alternate", "source_git_commit": SOURCE_SHA},
+                               sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii",
+                )
+                (alternate / "RELEASE.json").chmod(0o444)
+                replacement = app / "replacement-current"
+                replacement.symlink_to(alternate)
+                replacement.replace(app / "current")
+                with self.assertRaisesRegex(operator_provisioner.ProvisionError, "active_lock_bootstrap_changed"):
+                    operator_provisioner.revalidate_active_lock_bootstrap(
+                        source_root, target_sha=target_sha, target_host_tools_sha=target_host_sha, expected=snapshot,
+                        app_root=app, generation_root=generation_root,
+                    )
 
-            (app / "current").unlink()
-            (app / "current").symlink_to(app / "releases/active-release")
-            pin_path = app / "releases/active-release/contracts/host_tools_pin.json"
-            active_pin = json.loads(pin_path.read_text(encoding="ascii"))
-            active_pin["host_tools_sha"] = target_host_sha
-            os.chmod(pin_path, 0o644)
-            pin_path.write_text(json.dumps(active_pin, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
-            os.chmod(pin_path, 0o444)
-            with self.assertRaisesRegex(operator_provisioner.ProvisionError, "active_pin_target_mismatch"):
-                operator_provisioner.revalidate_active_lock_bootstrap(
-                    source_root, target_sha=target_sha, target_host_tools_sha=target_host_sha, expected=snapshot,
-                    app_root=app, generation_root=generation_root,
-                )
-            os.chmod(pin_path, 0o644)
-            pin_path.write_text(json.dumps(pin._read_pin(REPO_ROOT), sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
-            os.chmod(pin_path, 0o444)
-            lock_helper = generation_root / PIN_SHA / "platform_release_lock.sh"
-            os.chmod(lock_helper, 0o644)
-            lock_helper.write_bytes(lock_helper.read_bytes() + b"\n# drift\n")
-            os.chmod(lock_helper, 0o555)
-            with self.assertRaisesRegex(operator_provisioner.ProvisionError, "active_host_generation_validation"):
-                operator_provisioner.revalidate_active_lock_bootstrap(
-                    source_root, target_sha=target_sha, target_host_tools_sha=target_host_sha, expected=snapshot,
-                    app_root=app, generation_root=generation_root,
-                )
+                (app / "current").unlink()
+                (app / "current").symlink_to(app / "releases/active-release")
+                pin_path = app / "releases/active-release/contracts/host_tools_pin.json"
+                active_pin = json.loads(pin_path.read_text(encoding="ascii"))
+                active_pin["host_tools_sha"] = target_host_sha
+                os.chmod(pin_path, 0o644)
+                pin_path.write_text(json.dumps(active_pin, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
+                os.chmod(pin_path, 0o444)
+                with self.assertRaisesRegex(operator_provisioner.ProvisionError, "active_pin_target_mismatch"):
+                    operator_provisioner.revalidate_active_lock_bootstrap(
+                        source_root, target_sha=target_sha, target_host_tools_sha=target_host_sha, expected=snapshot,
+                        app_root=app, generation_root=generation_root,
+                    )
+                os.chmod(pin_path, 0o644)
+                pin_path.write_text(json.dumps(pin._read_pin(REPO_ROOT), sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
+                os.chmod(pin_path, 0o444)
+                lock_helper = generation_root / PIN_SHA / "platform_release_lock.sh"
+                os.chmod(lock_helper, 0o644)
+                lock_helper.write_bytes(lock_helper.read_bytes() + b"\n# drift\n")
+                os.chmod(lock_helper, 0o555)
+                with self.assertRaisesRegex(operator_provisioner.ProvisionError, "active_host_generation_validation"):
+                    operator_provisioner.revalidate_active_lock_bootstrap(
+                        source_root, target_sha=target_sha, target_host_tools_sha=target_host_sha, expected=snapshot,
+                        app_root=app, generation_root=generation_root,
+                    )
 
     def test_installed_generation_verifies_manifest_normalized_modes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
