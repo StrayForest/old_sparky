@@ -1986,6 +1986,117 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     private_report.name,
                     private_bytes,
                 )
+                screenshot_record = {
+                    "objective_screenshot_state": "captured",
+                    "objective_screenshot": {
+                        "schema": 1,
+                        "category": "other",
+                        "error_name": "Error",
+                        "phase": "capture",
+                        "viewport": {"width": 1440, "height": 1000},
+                        "document_height_bucket": "10k-30k",
+                        "elapsed_bucket": "<30s",
+                        "page_closed": False,
+                        "browser_connected": True,
+                        "crash_observed": False,
+                        "error_code": "other",
+                    },
+                }
+                platform_live_qa_guard._validate_objective_screenshot_evidence(screenshot_record)
+                legacy_screenshot_record = {
+                    "objective_screenshot_state": "captured",
+                    "objective_screenshot": {
+                        key: value
+                        for key, value in screenshot_record["objective_screenshot"].items()
+                        if key != "error_code"
+                    },
+                }
+                platform_live_qa_guard._validate_objective_screenshot_evidence(legacy_screenshot_record)
+                option_phase_screenshot = json.loads(json.dumps(screenshot_record))
+                option_phase_screenshot["objective_screenshot"]["phase"] = "resolve_options"
+                platform_live_qa_guard._validate_objective_screenshot_evidence(option_phase_screenshot)
+                invalid_screenshot = json.loads(json.dumps(screenshot_record))
+                invalid_screenshot["objective_screenshot"]["error_code"] = "/private/path"
+                with self.assertRaises(platform_live_qa_guard.GuardError):
+                    platform_live_qa_guard._validate_objective_screenshot_evidence(invalid_screenshot)
+
+                navigation_record = {
+                    "navigation_failure_state": "captured",
+                    "navigation_failure": {
+                        "schema": 1,
+                        "test_id": "csp_nonce_rotation",
+                        "result_route": "other",
+                        "query_present": False,
+                        "hash_present": False,
+                        "trailing_slash": False,
+                        "click_dispatched": True,
+                        "click_default_prevented": "unavailable",
+                        "document_response": "not_seen",
+                        "info_rsc_response": "2xx",
+                        "info_rsc_response_phase": "during_click",
+                        "info_rsc_response_timing": "<1s",
+                        "main_frame_commit": "not_seen",
+                        "soft_nonce": "not_read",
+                        "reload_nonce": "not_read",
+                    },
+                }
+                platform_live_qa_guard._validate_navigation_failure_evidence(navigation_record)
+                invalid_navigation = json.loads(json.dumps(navigation_record))
+                invalid_navigation["navigation_failure"]["result_route"] = "/private?token=x"
+                with self.assertRaises(platform_live_qa_guard.GuardError):
+                    platform_live_qa_guard._validate_navigation_failure_evidence(invalid_navigation)
+
+                decoded_image_record = {
+                    "decoded_image_failure_state": "captured",
+                    "decoded_image_failure": {
+                        "schema": 1,
+                        "patch_id": "1850460852986472",
+                        "role": "ability",
+                        "section_index": 35,
+                        "element_index": 0,
+                        "state": "decode_rejected",
+                        "decode_error": "rejected",
+                        "current_src_present": True,
+                        "current_src_changed": False,
+                        "width_bucket": "129-512",
+                        "height_bucket": "129-512",
+                    },
+                }
+                platform_live_qa_guard._validate_decoded_image_failure_evidence(decoded_image_record)
+                pending_decoded_image = json.loads(json.dumps(decoded_image_record))
+                pending_decoded_image["decoded_image_failure"]["state"] = "decode_pending"
+                pending_decoded_image["decoded_image_failure"]["decode_error"] = "none"
+                platform_live_qa_guard._validate_decoded_image_failure_evidence(pending_decoded_image)
+                invalid_decoded_image = json.loads(json.dumps(decoded_image_record))
+                invalid_decoded_image["decoded_image_failure"]["patch_id"] = "1850460852986472?token=x"
+                with self.assertRaises(platform_live_qa_guard.GuardError):
+                    platform_live_qa_guard._validate_decoded_image_failure_evidence(invalid_decoded_image)
+                for failure_id, pair in (
+                    ("csp_nonce_rotation", navigation_record),
+                    ("patch_owner_sections", decoded_image_record),
+                ):
+                    bound_payload = json.loads(json.dumps(private_payload))
+                    bound_failure = dict(private_payload["failures"][0])
+                    for optional_name in (
+                        "image_inventory_state", "image_inventory",
+                        "browser_request_failure_state", "browser_request_failures",
+                        "objective_screenshot_state", "objective_screenshot",
+                    ):
+                        bound_failure.pop(optional_name, None)
+                    bound_failure.update({
+                        "id": failure_id,
+                        "project": "live-desktop",
+                        "source_file": None,
+                        "source_line": None,
+                        "source_column": None,
+                        "source_kind": "unavailable",
+                        **pair,
+                    })
+                    bound_payload["failures"] = [bound_failure]
+                    platform_live_qa_guard._validate_retained_failure_report(
+                        private_report.name,
+                        (json.dumps(bound_payload) + "\n").encode("ascii"),
+                    )
                 legacy_private_payload = json.loads(private_bytes)
                 del legacy_private_payload["failures"][0]["image_inventory_state"]
                 del legacy_private_payload["failures"][0]["image_inventory"]

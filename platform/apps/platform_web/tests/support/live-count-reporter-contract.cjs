@@ -515,12 +515,57 @@ function objectiveScreenshotAttachment(overrides = {}) {
       category: "capture_timeout",
       error_name: "TimeoutError",
       phase: "capture",
+      error_code: "ETIMEDOUT",
       viewport: { width: 1430, height: 1000 },
       document_height_bucket: "10k-30k",
       elapsed_bucket: ">=30s",
       page_closed: false,
       browser_connected: true,
       crash_observed: false,
+      ...overrides,
+    }), "ascii"),
+  };
+}
+function navigationFailureAttachment(overrides = {}) {
+  return {
+    name: "live-navigation-failure-v1",
+    contentType: "application/json",
+    body: Buffer.from(JSON.stringify({
+      schema: 1,
+      test_id: "csp_nonce_rotation",
+      result_route: "other",
+      query_present: false,
+      hash_present: false,
+      trailing_slash: false,
+      click_dispatched: true,
+      click_default_prevented: "unavailable",
+      document_response: "not_seen",
+      info_rsc_response: "2xx",
+      info_rsc_response_phase: "during_click",
+      info_rsc_response_timing: "<1s",
+      main_frame_commit: "not_seen",
+      soft_nonce: "changed",
+      reload_nonce: "not_read",
+      ...overrides,
+    }), "ascii"),
+  };
+}
+function decodedImageFailureAttachment(overrides = {}) {
+  return {
+    name: "decoded-image-failure-v1",
+    contentType: "application/json",
+    body: Buffer.from(JSON.stringify({
+      schema: 1,
+      patch_id: "123456",
+      role: "ability",
+      section_index: 2,
+      element_index: 1,
+      state: "decode_rejected",
+      decode_error: "rejected",
+      current_src_present: true,
+      current_src_changed: false,
+      width_bucket: "zero",
+      height_bucket: "zero",
       ...overrides,
     }), "ascii"),
   };
@@ -2075,6 +2120,98 @@ try {
   for (const privateValue of ["https://", "private-path", "private.host"]) {
     assert.equal(v2RequestBytes.includes(Buffer.from(privateValue)), false);
   }
+
+  const navigationFixture = diagnosticFixture(failureRoot, "nv1b3c4d");
+  const navigationTitle = "live CSP nonce is stable on soft navigation and rotates on hard reload";
+  const navigationFailure = failureTest(navigationFixture, {
+    title: navigationTitle,
+    project: "live-desktop",
+    omitSourceLocation: true,
+    attachments: [navigationFailureAttachment()],
+  });
+  const navigationPlan = publicPlanWithFailure(navigationFailure);
+  const navigationSummary = summarizeRun({ allTests: () => navigationPlan }, "failed", { publicGate: true });
+  assert.equal(withRootOwnedGate(navigationFixture.gateRoot, () => writeBoundedSummary(
+    navigationFixture.binding,
+    navigationSummary,
+    { gateRoot: navigationFixture.gateRoot },
+  )), true);
+  assert.equal(withRootOwnedGate(navigationFixture.gateRoot, () => writeBoundedFailureSummary(
+    navigationFixture.binding,
+    { allTests: () => navigationPlan },
+    navigationSummary,
+    { gateRoot: navigationFixture.gateRoot, sourceRoot: navigationFixture.sourceRoot },
+  )), true, "closed nonce diagnostics preserve the csp_nonce_rotation identity");
+  const navigationBytes = fs.readFileSync(path.join(navigationFixture.results, "live-failures-v2.json"));
+  const navigationReport = JSON.parse(navigationBytes.toString("ascii"));
+  assert.equal(navigationReport.failures[0].navigation_failure_state, "captured");
+  assert.deepEqual(navigationReport.failures[0].navigation_failure, {
+    schema: 1,
+    test_id: "csp_nonce_rotation",
+    result_route: "other",
+    query_present: false,
+    hash_present: false,
+    trailing_slash: false,
+    click_dispatched: true,
+    click_default_prevented: "unavailable",
+    document_response: "not_seen",
+    info_rsc_response: "2xx",
+    info_rsc_response_phase: "during_click",
+    info_rsc_response_timing: "<1s",
+    main_frame_commit: "not_seen",
+    soft_nonce: "changed",
+    reload_nonce: "not_read",
+  });
+  assert.equal(navigationBytes.includes(Buffer.from("nonce-value")), false);
+  const navigationGuard = validateEphemeralAndRetainedBrowserReportThroughGuard(
+    path.join(navigationFixture.results, "live-failures-v2.json"),
+  );
+  assert.equal(navigationGuard.status, 0, navigationGuard.stderr);
+
+  const decodedImageFixture = diagnosticFixture(failureRoot, "im1b3c4d");
+  const patchOwnerTitle = "live four current patch DTOs render owner-scoped hero and ability changes";
+  const decodedImageFailure = failureTest(decodedImageFixture, {
+    title: patchOwnerTitle,
+    project: "live-mobile",
+    omitSourceLocation: true,
+    attachments: [decodedImageFailureAttachment()],
+  });
+  const decodedImagePlan = publicPlanWithFailure(decodedImageFailure);
+  const decodedImageSummary = summarizeRun({ allTests: () => decodedImagePlan }, "failed", { publicGate: true });
+  assert.equal(withRootOwnedGate(decodedImageFixture.gateRoot, () => writeBoundedSummary(
+    decodedImageFixture.binding,
+    decodedImageSummary,
+    { gateRoot: decodedImageFixture.gateRoot },
+  )), true);
+  assert.equal(withRootOwnedGate(decodedImageFixture.gateRoot, () => writeBoundedFailureSummary(
+    decodedImageFixture.binding,
+    { allTests: () => decodedImagePlan },
+    decodedImageSummary,
+    { gateRoot: decodedImageFixture.gateRoot, sourceRoot: decodedImageFixture.sourceRoot },
+  )), true, "closed decoded-image diagnostics preserve the patch_owner_sections identity");
+  const decodedImageBytes = fs.readFileSync(path.join(decodedImageFixture.results, "live-failures-v2.json"));
+  const decodedImageReport = JSON.parse(decodedImageBytes.toString("ascii"));
+  assert.equal(decodedImageReport.failures[0].decoded_image_failure_state, "captured");
+  assert.deepEqual(decodedImageReport.failures[0].decoded_image_failure, {
+    schema: 1,
+    patch_id: "123456",
+    role: "ability",
+    section_index: 2,
+    element_index: 1,
+    state: "decode_rejected",
+    decode_error: "rejected",
+    current_src_present: true,
+    current_src_changed: false,
+    width_bucket: "zero",
+    height_bucket: "zero",
+  });
+  for (const privateValue of ["https://", "private asset", "nonce-value"]) {
+    assert.equal(decodedImageBytes.includes(Buffer.from(privateValue)), false);
+  }
+  const decodedImageGuard = validateEphemeralAndRetainedBrowserReportThroughGuard(
+    path.join(decodedImageFixture.results, "live-failures-v2.json"),
+  );
+  assert.equal(decodedImageGuard.status, 0, decodedImageGuard.stderr);
 
   const screenshotFixture = diagnosticFixture(failureRoot, "scv1b3c4");
   const objectiveScreenshotTitle = "live current patch route and objective source icons remain available";

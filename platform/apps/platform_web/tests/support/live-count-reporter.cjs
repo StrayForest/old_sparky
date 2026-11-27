@@ -35,6 +35,10 @@ const FAILURE_REPORT_FILE = "live-failures-v2.json";
 const FAILURE_IDENTITY_REPORT_FILE = "live-failure-identities-v1.json";
 const LIVE_USER_FAILURE_REPORT_FILE = "live-user-failures-v3.json";
 const PAGE_ERROR_ATTACHMENT_NAME = "live-pageerror-evidence-v1";
+const LIVE_NAVIGATION_FAILURE_ATTACHMENT_NAME = "live-navigation-failure-v1";
+const MAX_LIVE_NAVIGATION_FAILURE_ATTACHMENT_BYTES = 1024;
+const DECODED_IMAGE_FAILURE_ATTACHMENT_NAME = "decoded-image-failure-v1";
+const MAX_DECODED_IMAGE_FAILURE_ATTACHMENT_BYTES = 1024;
 const OBJECTIVE_SCREENSHOT_ATTACHMENT_NAME = "objective-screenshot-error-v1";
 const MAX_OBJECTIVE_SCREENSHOT_ATTACHMENT_BYTES = 2 * 1024;
 const LIVE_USER_BROWSER_GATE_ATTACHMENT_NAME = "live-user-browser-gate-v2";
@@ -853,6 +857,10 @@ function objectiveScreenshotEvidenceForAttempt(result) {
   ]);
   const heightBuckets = new Set(["unavailable", "<10k", "10k-30k", "30k-60k", ">=60k"]);
   const elapsedBuckets = new Set(["<100ms", "<1s", "<5s", "<30s", ">=30s"]);
+  const errorCodes = new Set([
+    "none", "EACCES", "EROFS", "ENOSPC", "EFBIG", "ENOENT", "EIO",
+    "ETIMEDOUT", "ECONNRESET", "EPIPE", "other",
+  ]);
   const viewport = payload?.viewport;
   if (
     !payload
@@ -860,12 +868,13 @@ function objectiveScreenshotEvidenceForAttempt(result) {
     || Array.isArray(payload)
     || Object.keys(payload).sort().join(",") !== [
       "browser_connected", "category", "crash_observed", "document_height_bucket",
-      "elapsed_bucket", "error_name", "page_closed", "phase", "schema", "viewport",
+      "elapsed_bucket", "error_code", "error_name", "page_closed", "phase", "schema", "viewport",
     ].join(",")
     || payload.schema !== 1
     || !categories.has(payload.category)
     || !["TimeoutError", "TargetClosedError", "Error", "unknown"].includes(payload.error_name)
-    || payload.phase !== "capture"
+    || !["resolve_options", "capture"].includes(payload.phase)
+    || !errorCodes.has(payload.error_code)
     || !heightBuckets.has(payload.document_height_bucket)
     || !elapsedBuckets.has(payload.elapsed_bucket)
     || typeof payload.page_closed !== "boolean"
@@ -879,6 +888,112 @@ function objectiveScreenshotEvidenceForAttempt(result) {
       viewport[key] === null
       || (Number.isSafeInteger(viewport[key]) && viewport[key] >= 1 && viewport[key] <= 10_000)
     ))
+    || attachment.body.toString("ascii") !== JSON.stringify(payload)
+  ) return { present: true, state: "unavailable", evidence: null };
+  return { present: true, state: "captured", evidence: payload };
+}
+
+function navigationFailureEvidenceForAttempt(result) {
+  const attachments = Array.isArray(result?.attachments)
+    ? result.attachments.filter((attachment) => attachment?.name === LIVE_NAVIGATION_FAILURE_ATTACHMENT_NAME)
+    : [];
+  if (attachments.length === 0) return { present: false, state: "unavailable", evidence: null };
+  if (attachments.length !== 1) return { present: true, state: "unavailable", evidence: null };
+  const attachment = attachments[0];
+  if (
+    attachment.contentType !== "application/json"
+    || attachment.path !== undefined
+    || !Buffer.isBuffer(attachment.body)
+    || attachment.body.length > MAX_LIVE_NAVIGATION_FAILURE_ATTACHMENT_BYTES
+    || attachment.body.some((byte) => byte > 0x7f)
+  ) return { present: true, state: "unavailable", evidence: null };
+  let payload;
+  try {
+    payload = JSON.parse(attachment.body.toString("ascii"));
+  } catch {
+    return { present: true, state: "unavailable", evidence: null };
+  }
+  if (
+    !payload
+    || typeof payload !== "object"
+    || Array.isArray(payload)
+    || Object.keys(payload).sort().join(",") !== [
+      "click_default_prevented", "click_dispatched", "document_response", "hash_present",
+      "info_rsc_response", "info_rsc_response_phase", "info_rsc_response_timing",
+      "main_frame_commit", "query_present", "reload_nonce", "result_route", "schema",
+      "soft_nonce", "test_id", "trailing_slash",
+    ].join(",")
+    || payload.schema !== 1
+    || payload.test_id !== "csp_nonce_rotation"
+    || !["root", "info", "other"].includes(payload.result_route)
+    || typeof payload.query_present !== "boolean"
+    || typeof payload.hash_present !== "boolean"
+    || typeof payload.trailing_slash !== "boolean"
+    || typeof payload.click_dispatched !== "boolean"
+    || !["unavailable", "true", "false"].includes(payload.click_default_prevented)
+    || !["not_seen", "2xx", "non_2xx", "failed"].includes(payload.document_response)
+    || !["not_seen", "pending", "2xx", "non_2xx", "failed"].includes(payload.info_rsc_response)
+    || !["not_seen", "before_click", "during_click", "after_click"].includes(payload.info_rsc_response_phase)
+    || !["unavailable", "<100ms", "<1s", "<5s", ">=5s"].includes(payload.info_rsc_response_timing)
+    || (payload.info_rsc_response_phase === "not_seen"
+      && (payload.info_rsc_response !== "not_seen" || payload.info_rsc_response_timing !== "unavailable"))
+    || (payload.info_rsc_response_phase !== "not_seen" && payload.info_rsc_response === "not_seen")
+    || !["not_seen", "info", "other_origin", "failed"].includes(payload.main_frame_commit)
+    || !["not_read", "missing", "stable", "changed"].includes(payload.soft_nonce)
+    || !["not_read", "missing", "rotated", "unchanged"].includes(payload.reload_nonce)
+    || attachment.body.toString("ascii") !== JSON.stringify(payload)
+  ) return { present: true, state: "unavailable", evidence: null };
+  return { present: true, state: "captured", evidence: payload };
+}
+
+function decodedImageFailureEvidenceForAttempt(result) {
+  const attachments = Array.isArray(result?.attachments)
+    ? result.attachments.filter((attachment) => attachment?.name === DECODED_IMAGE_FAILURE_ATTACHMENT_NAME)
+    : [];
+  if (attachments.length === 0) return { present: false, state: "unavailable", evidence: null };
+  if (attachments.length !== 1) return { present: true, state: "unavailable", evidence: null };
+  const attachment = attachments[0];
+  if (
+    attachment.contentType !== "application/json"
+    || attachment.path !== undefined
+    || !Buffer.isBuffer(attachment.body)
+    || attachment.body.length > MAX_DECODED_IMAGE_FAILURE_ATTACHMENT_BYTES
+    || attachment.body.some((byte) => byte > 0x7f)
+  ) return { present: true, state: "unavailable", evidence: null };
+  let payload;
+  try {
+    payload = JSON.parse(attachment.body.toString("ascii"));
+  } catch {
+    return { present: true, state: "unavailable", evidence: null };
+  }
+  const dimensionBuckets = new Set(["zero", "1-32", "33-128", "129-512", ">512", "unavailable"]);
+  if (
+    !payload
+    || typeof payload !== "object"
+    || Array.isArray(payload)
+    || Object.keys(payload).sort().join(",") !== [
+      "current_src_changed", "current_src_present", "decode_error", "element_index",
+      "height_bucket", "patch_id", "role", "schema", "section_index", "state", "width_bucket",
+    ].join(",")
+    || payload.schema !== 1
+    || typeof payload.patch_id !== "string"
+    || !/^[1-9][0-9]{0,15}$/u.test(payload.patch_id)
+    || !["hero", "objective", "ability"].includes(payload.role)
+    || !Number.isSafeInteger(payload.section_index)
+    || payload.section_index < 0
+    || payload.section_index > 127
+    || (payload.role === "ability"
+      ? !Number.isSafeInteger(payload.element_index) || payload.element_index < 0 || payload.element_index > 1023
+      : payload.element_index !== null)
+    || !["not_complete", "decode_pending", "decode_rejected", "zero_dimensions"].includes(payload.state)
+    || !["none", "timeout", "rejected", "other"].includes(payload.decode_error)
+    || typeof payload.current_src_present !== "boolean"
+    || typeof payload.current_src_changed !== "boolean"
+    || !dimensionBuckets.has(payload.width_bucket)
+    || !dimensionBuckets.has(payload.height_bucket)
+    || (payload.state === "zero_dimensions"
+      && payload.width_bucket !== "zero" && payload.height_bucket !== "zero")
+    || (payload.state === "decode_rejected" && payload.decode_error === "none")
     || attachment.body.toString("ascii") !== JSON.stringify(payload)
   ) return { present: true, state: "unavailable", evidence: null };
   return { present: true, state: "captured", evidence: payload };
@@ -1661,6 +1776,20 @@ function failureRecordForAttempt(test, result, attempt, sourceRoot) {
     page_errors_truncated: pageErrorEvidence.truncated,
     page_errors: pageErrorEvidence.events,
   };
+  if (id === "csp_nonce_rotation") {
+    const navigationEvidence = navigationFailureEvidenceForAttempt(result);
+    if (navigationEvidence.present) {
+      failure.navigation_failure_state = navigationEvidence.state;
+      failure.navigation_failure = navigationEvidence.evidence;
+    }
+  }
+  if (id === "patch_owner_sections") {
+    const imageFailureEvidence = decodedImageFailureEvidenceForAttempt(result);
+    if (imageFailureEvidence.present) {
+      failure.decoded_image_failure_state = imageFailureEvidence.state;
+      failure.decoded_image_failure = imageFailureEvidence.evidence;
+    }
+  }
   if (id === "image_csp_hosts") {
     const imageEvidence = imageInventoryEvidenceForAttempt(result);
     const requestFailureEvidence = browserRequestFailureEvidenceForAttempt(result);

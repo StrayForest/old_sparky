@@ -380,21 +380,138 @@ function sectionHeading(section: PlatformPatchSection): string {
   return section.title;
 }
 
-async function expectDecodedImage(image: Locator, label: string): Promise<void> {
+type DecodedImageFailureContext = {
+  patchId: string;
+  role: "hero" | "objective" | "ability";
+  sectionIndex: number;
+  elementIndex: number | null;
+};
+
+type DecodedImageSample = {
+  state: "decoded" | "not_complete" | "decode_pending" | "decode_rejected" | "zero_dimensions";
+  decodeError: "none" | "timeout" | "rejected" | "other";
+  currentSrcPresent: boolean;
+  currentSrcChanged: boolean;
+  width: number;
+  height: number;
+};
+
+function imageDimensionBucket(value: number): "zero" | "1-32" | "33-128" | "129-512" | ">512" | "unavailable" {
+  if (!Number.isSafeInteger(value) || value < 0) return "unavailable";
+  if (value === 0) return "zero";
+  if (value <= 32) return "1-32";
+  if (value <= 128) return "33-128";
+  if (value <= 512) return "129-512";
+  return ">512";
+}
+
+async function expectDecodedImage(
+  image: Locator,
+  context: DecodedImageFailureContext,
+  testInfo: import("@playwright/test").TestInfo,
+): Promise<void> {
   await image.scrollIntoViewIfNeeded();
-  await expect.poll(
-    () => image.evaluate(async (element) => {
-      const loadedImage = element as HTMLImageElement;
-      if (!loadedImage.complete) return false;
-      try {
-        await loadedImage.decode();
-      } catch {
-        return false;
+  const latest: { sample: DecodedImageSample | null } = { sample: null };
+  const trackerKey = `__oldSparkyDecodedImageV1_${context.patchId}_${context.role}_${context.sectionIndex}_${context.elementIndex ?? "none"}`;
+  try {
+    await expect.poll(
+      async () => {
+        const sample = await image.evaluate((element, key): DecodedImageSample => {
+          const loadedImage = element as HTMLImageElement;
+          const currentSrc = loadedImage.currentSrc;
+          const state = window as unknown as Record<string, unknown>;
+          type DecodeTracker = DecodedImageSample & { initialCurrentSrc: string | null };
+          const existing = state[key] as DecodeTracker | undefined;
+          if (existing) {
+            if (!existing.initialCurrentSrc && currentSrc) existing.initialCurrentSrc = currentSrc;
+            existing.currentSrcChanged = Boolean(
+              existing.initialCurrentSrc && currentSrc
+              && existing.initialCurrentSrc !== currentSrc,
+            );
+            existing.currentSrcPresent = Boolean(currentSrc);
+            existing.width = loadedImage.naturalWidth;
+            existing.height = loadedImage.naturalHeight;
+            const sample = { ...existing };
+            delete (sample as Partial<DecodeTracker>).initialCurrentSrc;
+            if (existing.state === "decoded") delete state[key];
+            return sample;
+          }
+          if (!loadedImage.complete) {
+            return {
+              state: "not_complete",
+              decodeError: "none",
+              currentSrcPresent: Boolean(currentSrc),
+              currentSrcChanged: false,
+              width: loadedImage.naturalWidth,
+              height: loadedImage.naturalHeight,
+            };
+          }
+          const tracker: DecodeTracker = {
+            state: "decode_pending",
+            decodeError: "none",
+            currentSrcPresent: Boolean(currentSrc),
+            currentSrcChanged: false,
+            width: loadedImage.naturalWidth,
+            height: loadedImage.naturalHeight,
+            initialCurrentSrc: currentSrc || null,
+          };
+          state[key] = tracker;
+          void Promise.resolve().then(() => loadedImage.decode()).then(() => {
+            tracker.width = loadedImage.naturalWidth;
+            tracker.height = loadedImage.naturalHeight;
+            tracker.state = tracker.width > 0 && tracker.height > 0 ? "decoded" : "zero_dimensions";
+          }).catch((error: unknown) => {
+            const name = error instanceof Error ? error.name : "";
+            tracker.state = "decode_rejected";
+            tracker.decodeError = name === "TimeoutError"
+              ? "timeout"
+              : name === "EncodingError" || name === "InvalidStateError"
+                ? "rejected" : "other";
+          });
+          const sample = { ...tracker };
+          delete (sample as Partial<DecodeTracker>).initialCurrentSrc;
+          return sample;
+        }, trackerKey);
+        latest.sample = sample;
+        return sample.state;
+      },
+      { message: "patch image should decode", timeout: 15_000 },
+    ).toBe("decoded");
+  } catch (error) {
+    try {
+      const contextIsClosed = /^[1-9][0-9]{0,15}$/u.test(context.patchId)
+        && Number.isSafeInteger(context.sectionIndex)
+        && context.sectionIndex >= 0 && context.sectionIndex <= 127
+        && (context.role === "ability"
+          ? context.elementIndex !== null
+            && Number.isSafeInteger(context.elementIndex)
+            && context.elementIndex >= 0 && context.elementIndex <= 1023
+          : context.elementIndex === null);
+      if (contextIsClosed) {
+        const sample = latest.sample;
+        await testInfo.attach("decoded-image-failure-v1", {
+          body: Buffer.from(JSON.stringify({
+            schema: 1,
+            patch_id: context.patchId,
+            role: context.role,
+            section_index: context.sectionIndex,
+            element_index: context.elementIndex,
+            state: sample?.state === "decode_rejected" || sample?.state === "zero_dimensions"
+              ? sample.state : sample?.state === "decode_pending" ? "decode_pending" : "not_complete",
+            decode_error: sample?.decodeError ?? "other",
+            current_src_present: sample?.currentSrcPresent ?? false,
+            current_src_changed: sample?.currentSrcChanged ?? false,
+            width_bucket: sample ? imageDimensionBucket(sample.width) : "unavailable",
+            height_bucket: sample ? imageDimensionBucket(sample.height) : "unavailable",
+          }), "ascii"),
+          contentType: "application/json",
+        });
       }
-      return loadedImage.naturalWidth > 0 && loadedImage.naturalHeight > 0;
-    }),
-    { message: `${label} should decode`, timeout: 15_000 },
-  ).toBe(true);
+    } catch {
+      // Best-effort diagnostic must never replace the image assertion failure.
+    }
+    throw error;
+  }
 }
 
 function hasOwnerPrefix(change: string): boolean {
@@ -794,21 +911,246 @@ test("production Chromium live QA keeps its process sandbox enabled", async ({ p
   await assertLiveQaChromiumSandbox(page.context(), browserName);
 });
 
-test("live CSP nonce is stable on soft navigation and rotates on hard reload", async ({ page }) => {
-  const initialResponse = await page.goto("/");
-  expect(initialResponse).not.toBeNull();
-  const initialNonce = responseCspNonce(initialResponse!);
-  await expectDocumentNonce(page, initialNonce);
+function safeCspRoute(rawUrl: string, expectedOrigin: string): {
+  result_route: "root" | "info" | "other";
+  query_present: boolean;
+  hash_present: boolean;
+  trailing_slash: boolean;
+} {
+  try {
+    const parsed = new URL(rawUrl);
+    return {
+      result_route: parsed.origin === expectedOrigin
+        ? parsed.pathname === "/" ? "root" : parsed.pathname === "/info" ? "info" : "other"
+        : "other",
+      query_present: parsed.search.length > 0,
+      hash_present: parsed.hash.length > 0,
+      trailing_slash: parsed.pathname.length > 1 && parsed.pathname.endsWith("/"),
+    };
+  } catch {
+    return {
+      result_route: "other",
+      query_present: false,
+      hash_present: false,
+      trailing_slash: false,
+    };
+  }
+}
 
-  await page.locator('a[href="/info"]').first().click();
-  await expect(page).toHaveURL(/\/info$/u);
-  await expectDocumentNonce(page, initialNonce);
+async function safeDocumentNonceState(
+  page: import("@playwright/test").Page,
+  expectedNonce: string,
+): Promise<"missing" | "stable" | "changed"> {
+  const nonces = await page.evaluate(() => ({
+    scripts: Array.from(document.querySelectorAll("script:not([src])"))
+      .map((element) => (element as HTMLScriptElement).nonce),
+    styles: Array.from(document.querySelectorAll("style"))
+      .map((element) => (element as HTMLStyleElement).nonce),
+  }));
+  if (nonces.scripts.length === 0) return "missing";
+  return nonces.scripts.every((value) => value === expectedNonce)
+    && nonces.styles.every((value) => value === expectedNonce)
+    ? "stable" : "changed";
+}
 
-  const reloadedResponse = await page.reload();
-  expect(reloadedResponse).not.toBeNull();
-  const reloadedNonce = responseCspNonce(reloadedResponse!);
-  expect(reloadedNonce).not.toBe(initialNonce);
-  await expectDocumentNonce(page, reloadedNonce);
+test("live CSP nonce is stable on soft navigation and rotates on hard reload", async ({ page }, testInfo) => {
+  let expectedOrigin = "";
+  let resultRoute: "root" | "info" | "other" = "root";
+  let queryPresent = false;
+  let hashPresent = false;
+  let trailingSlash = false;
+  let clickDispatched = false;
+  let documentResponse: "not_seen" | "2xx" | "non_2xx" | "failed" = "not_seen";
+  let clickDefaultPrevented: "unavailable" | "true" | "false" = "unavailable";
+  let infoRscResponse: "not_seen" | "pending" | "2xx" | "non_2xx" | "failed" = "not_seen";
+  let infoRscResponsePhase: "not_seen" | "before_click" | "during_click" | "after_click" = "not_seen";
+  let infoRscResponseTiming: "unavailable" | "<100ms" | "<1s" | "<5s" | ">=5s" = "unavailable";
+  let clickStartedAt: number | null = null;
+  let clickFinishedAt: number | null = null;
+  let mainFrameCommit: "not_seen" | "info" | "other_origin" | "failed" = "not_seen";
+  let softNonce: "not_read" | "missing" | "stable" | "changed" = "not_read";
+  let reloadNonce: "not_read" | "missing" | "rotated" | "unchanged" = "not_read";
+  const attachment = async () => {
+    try {
+      await testInfo.attach("live-navigation-failure-v1", {
+        body: Buffer.from(JSON.stringify({
+          schema: 1,
+          test_id: "csp_nonce_rotation",
+          result_route: resultRoute,
+          query_present: queryPresent,
+          hash_present: hashPresent,
+          trailing_slash: trailingSlash,
+          click_dispatched: clickDispatched,
+          document_response: documentResponse,
+          click_default_prevented: clickDefaultPrevented,
+          info_rsc_response: infoRscResponse,
+          info_rsc_response_phase: infoRscResponsePhase,
+          info_rsc_response_timing: infoRscResponseTiming,
+          main_frame_commit: mainFrameCommit,
+          soft_nonce: softNonce,
+          reload_nonce: reloadNonce,
+        }), "ascii"),
+        contentType: "application/json",
+      });
+    } catch {
+      // Diagnostic failure must never replace the CSP assertion result.
+    }
+  };
+  try {
+    const initialResponse = await page.goto("/");
+    expect(initialResponse).not.toBeNull();
+    const initialNonce = responseCspNonce(initialResponse!);
+    expectedOrigin = new URL(initialResponse!.url()).origin;
+    await expectDocumentNonce(page, initialNonce);
+
+    const clickStateKey = "__oldSparkyPublicQaCspClickV1";
+    try {
+      await page.evaluate((key) => {
+        const state = window as unknown as Record<string, unknown>;
+        state[key] = null;
+        window.addEventListener("click", (event) => {
+          const target = event.target;
+          if (!(target instanceof Element)) return;
+          const anchor = target.closest("a[href='/info']");
+          if (anchor) state[key] = event.defaultPrevented ? "true" : "false";
+        }, { capture: false, once: true });
+      }, clickStateKey);
+    } catch {
+      clickDefaultPrevented = "unavailable";
+    }
+
+    const responsePhase = (at: number): "before_click" | "during_click" | "after_click" => (
+      clickStartedAt === null || at < clickStartedAt
+        ? "before_click"
+        : clickFinishedAt === null ? "during_click" : "after_click"
+    );
+    const responseTiming = (at: number): typeof infoRscResponseTiming => {
+      if (clickStartedAt === null || at < clickStartedAt) return "unavailable";
+      const elapsed = at - clickStartedAt;
+      if (elapsed < 100) return "<100ms";
+      if (elapsed < 1_000) return "<1s";
+      if (elapsed < 5_000) return "<5s";
+      return ">=5s";
+    };
+    const isInfoRsc = (rawUrl: string): boolean => {
+      try {
+        const parsed = new URL(rawUrl);
+        return parsed.origin === expectedOrigin
+          && parsed.pathname === "/info"
+          && parsed.searchParams.has("_rsc");
+      } catch {
+        return false;
+      }
+    };
+    const onResponse = (response: import("@playwright/test").Response) => {
+      const observedAt = performance.now();
+      try {
+        const request = response.request();
+        const parsed = new URL(response.url());
+        if (
+          request.isNavigationRequest()
+          && parsed.origin === expectedOrigin
+          && parsed.pathname === "/info"
+        ) documentResponse = response.status() >= 200 && response.status() < 300 ? "2xx" : "non_2xx";
+        if (
+          isInfoRsc(response.url())
+          && (infoRscResponse === "not_seen" || infoRscResponse === "pending")
+        ) {
+          infoRscResponse = response.status() >= 200 && response.status() < 300 ? "2xx" : "non_2xx";
+          infoRscResponsePhase = responsePhase(observedAt);
+          infoRscResponseTiming = responseTiming(observedAt);
+        }
+      } catch {
+        // Opaque or detached response objects contribute no diagnostic detail.
+      }
+    };
+    const onRequest = (request: import("@playwright/test").Request) => {
+      if (!isInfoRsc(request.url()) || infoRscResponse !== "not_seen") return;
+      const observedAt = performance.now();
+      infoRscResponse = "pending";
+      infoRscResponsePhase = responsePhase(observedAt);
+      infoRscResponseTiming = "unavailable";
+    };
+    const onFrameNavigated = (frame: import("@playwright/test").Frame) => {
+      if (frame !== page.mainFrame()) return;
+      try {
+        const parsed = new URL(frame.url());
+        mainFrameCommit = parsed.origin !== expectedOrigin
+          ? "other_origin" : parsed.pathname === "/info" ? "info" : "not_seen";
+      } catch {
+        mainFrameCommit = "other_origin";
+      }
+    };
+    const onRequestFailed = (request: import("@playwright/test").Request) => {
+      try {
+        if (request.isNavigationRequest() && request.frame() === page.mainFrame()) {
+          try {
+            const parsed = new URL(request.url());
+            if (parsed.origin === expectedOrigin && parsed.pathname === "/info") {
+              documentResponse = "failed";
+            }
+          } catch {
+            documentResponse = "failed";
+          }
+        } else if (isInfoRsc(request.url())) {
+          infoRscResponse = "failed";
+          infoRscResponsePhase = responsePhase(performance.now());
+          infoRscResponseTiming = "unavailable";
+        }
+        if (request.isNavigationRequest() && request.frame() === page.mainFrame()) {
+          mainFrameCommit = "failed";
+        }
+      } catch {
+        mainFrameCommit = "failed";
+      }
+    };
+    page.on("response", onResponse);
+    page.on("request", onRequest);
+    page.on("framenavigated", onFrameNavigated);
+    page.on("requestfailed", onRequestFailed);
+    try {
+      clickStartedAt = performance.now();
+      await page.locator('a[href="/info"]').first().click();
+      clickFinishedAt = performance.now();
+      clickDispatched = true;
+      try {
+        clickDefaultPrevented = await page.evaluate((key) => {
+          const state = window as unknown as Record<string, unknown>;
+          const value = state[key];
+          delete state[key];
+          return value === "true" || value === "false" ? value : "unavailable";
+        }, clickStateKey) as typeof clickDefaultPrevented;
+      } catch {
+        clickDefaultPrevented = "unavailable";
+      }
+      const route = safeCspRoute(page.url(), expectedOrigin);
+      resultRoute = route.result_route;
+      queryPresent = route.query_present;
+      hashPresent = route.hash_present;
+      trailingSlash = route.trailing_slash;
+      try {
+        softNonce = await safeDocumentNonceState(page, initialNonce);
+      } catch {
+        softNonce = "not_read";
+      }
+      await expect(page).toHaveURL(/\/info$/u);
+      await expectDocumentNonce(page, initialNonce);
+    } finally {
+      page.off("response", onResponse);
+      page.off("request", onRequest);
+      page.off("framenavigated", onFrameNavigated);
+      page.off("requestfailed", onRequestFailed);
+    }
+
+    const reloadedResponse = await page.reload();
+    expect(reloadedResponse).not.toBeNull();
+    reloadNonce = safeResponseNonceRotation(reloadedResponse!, initialNonce);
+    const reloadedNonce = responseCspNonce(reloadedResponse!);
+    await expectDocumentNonce(page, reloadedNonce);
+  } catch (error) {
+    await attachment();
+    throw error;
+  }
 });
 
 test("local enforced CSP blocks negative inline and external probes", async ({ page }, testInfo) => {
@@ -1100,7 +1442,7 @@ test("live current patch route and objective source icons remain available", asy
   }
 });
 
-test("live four current patch DTOs render owner-scoped hero and ability changes", async ({ page, request }) => {
+test("live four current patch DTOs render owner-scoped hero and ability changes", async ({ page, request }, testInfo) => {
   test.setTimeout(120_000);
   const patchIds = await currentIndexedPatchIds(request);
   expect(patchIds).toHaveLength(4);
@@ -1143,7 +1485,12 @@ test("live four current patch DTOs render owner-scoped hero and ability changes"
         if (section.hero_image_url) {
           const heroImage = renderedSection.locator(".patch-hero-image");
           await expect(heroImage).toHaveCount(1);
-          await expectDecodedImage(heroImage, `${patchId} ${section.hero_name ?? section.title} portrait`);
+          await expectDecodedImage(heroImage, {
+            patchId,
+            role: "hero",
+            sectionIndex,
+            elementIndex: null,
+          }, testInfo);
           const renderedSource = await heroImage.getAttribute("src");
           const bundledSource = `/assets/heroes/${encodeURIComponent(
             (section.hero_name ?? section.title).replaceAll(" ", "_"),
@@ -1157,7 +1504,12 @@ test("live four current patch DTOs render owner-scoped hero and ability changes"
         await expect(objectiveImage).toHaveCount(1);
         await expect(renderedSection.locator(".patch-objective-fallback")).toHaveCount(0);
         await expect(objectiveImage).toHaveAttribute("src", section.objective_icon_url);
-        await expectDecodedImage(objectiveImage, `${patchId} ${sectionHeading(section)} objective icon`);
+        await expectDecodedImage(objectiveImage, {
+          patchId,
+          role: "objective",
+          sectionIndex,
+          elementIndex: null,
+        }, testInfo);
       }
 
       expectCleanPatchChanges(section.changes);
@@ -1183,7 +1535,12 @@ test("live four current patch DTOs render owner-scoped hero and ability changes"
           await expect(icon).toHaveCount(1);
           await expect(renderedAbility.locator(".patch-ability-icon-fallback")).toHaveCount(0);
           await expect(icon).toHaveAttribute("src", ability.icon_url);
-          await expectDecodedImage(icon, `${patchId} ${ability.display_name || ability.name} ability icon`);
+          await expectDecodedImage(icon, {
+            patchId,
+            role: "ability",
+            sectionIndex,
+            elementIndex: abilityIndex,
+          }, testInfo);
         }
 
         expectCleanPatchChanges(ability.changes);
@@ -1558,6 +1915,27 @@ function responseCspNonce(response: import("@playwright/test").Response): string
   const decoded = Buffer.from(nonces[0], "base64");
   expect(decoded.byteLength).toBeGreaterThanOrEqual(16);
   return nonces[0];
+}
+
+function safeResponseNonceRotation(
+  response: import("@playwright/test").Response,
+  initialNonce: string,
+): "missing" | "rotated" | "unchanged" {
+  try {
+    const headers = response.headers();
+    const policy = headers["content-security-policy"]
+      ?? headers["content-security-policy-report-only"]
+      ?? "";
+    const matches = policy.match(/'nonce-([^']+)'/gu) ?? [];
+    if (matches.length !== 2) return "missing";
+    const nonces = matches.map((value) => value.slice("'nonce-".length, -1));
+    if (new Set(nonces).size !== 1 || Buffer.from(nonces[0], "base64").byteLength < 16) {
+      return "missing";
+    }
+    return nonces[0] === initialNonce ? "unchanged" : "rotated";
+  } catch {
+    return "missing";
+  }
 }
 
 function summarizeCspConsoleError(message: string): string {

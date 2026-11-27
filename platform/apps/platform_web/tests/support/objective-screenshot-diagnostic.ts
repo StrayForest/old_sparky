@@ -20,7 +20,19 @@ export type ObjectiveScreenshotDiagnostic = {
   schema: 1;
   category: ObjectiveScreenshotFailureCategory;
   error_name: "TimeoutError" | "TargetClosedError" | "Error" | "unknown";
-  phase: "capture";
+  phase: "resolve_options" | "capture";
+  error_code:
+    | "none"
+    | "EACCES"
+    | "EROFS"
+    | "ENOSPC"
+    | "EFBIG"
+    | "ENOENT"
+    | "EIO"
+    | "ETIMEDOUT"
+    | "ECONNRESET"
+    | "EPIPE"
+    | "other";
   viewport: { width: number | null; height: number | null };
   document_height_bucket: "unavailable" | "<10k" | "10k-30k" | "30k-60k" | ">=60k";
   elapsed_bucket: "<100ms" | "<1s" | "<5s" | "<30s" | ">=30s";
@@ -47,6 +59,23 @@ function closedErrorName(error: unknown): ObjectiveScreenshotDiagnostic["error_n
   if (name === "TargetClosedError") return "TargetClosedError";
   if (name === "Error") return "Error";
   return "unknown";
+}
+
+function closedErrorCode(error: unknown): ObjectiveScreenshotDiagnostic["error_code"] {
+  const code = errorString(error, "code");
+  if (!code) return "none";
+  if (
+    code === "EACCES"
+    || code === "EROFS"
+    || code === "ENOSPC"
+    || code === "EFBIG"
+    || code === "ENOENT"
+    || code === "EIO"
+    || code === "ETIMEDOUT"
+    || code === "ECONNRESET"
+    || code === "EPIPE"
+  ) return code;
+  return "other";
 }
 
 export function classifyObjectiveScreenshotError(
@@ -134,8 +163,11 @@ export async function takeObjectiveScreenshotWithDiagnostics(
   }
   const height = await boundedDocumentHeight(page);
   const startedAt = performance.now();
+  let phase: ObjectiveScreenshotDiagnostic["phase"] = "resolve_options";
   try {
-    return await page.screenshot(resolveOptions());
+    const options = resolveOptions();
+    phase = "capture";
+    return await page.screenshot(options);
   } catch (error) {
     let pageClosed = false;
     let browserConnected = false;
@@ -150,7 +182,8 @@ export async function takeObjectiveScreenshotWithDiagnostics(
       schema: 1,
       category: classifyObjectiveScreenshotError(error, browserConnected),
       error_name: closedErrorName(error),
-      phase: "capture",
+      phase,
+      error_code: closedErrorCode(error),
       viewport: {
         width: closedViewportDimension(viewport?.width),
         height: closedViewportDimension(viewport?.height),

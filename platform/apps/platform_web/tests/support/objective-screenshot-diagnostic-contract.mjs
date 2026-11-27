@@ -50,11 +50,13 @@ async function main() {
   const payload = JSON.parse(attachment.options.body.toString("utf8"));
   assert.deepEqual(Object.keys(payload).sort(), [
     "browser_connected", "category", "crash_observed", "document_height_bucket",
-    "elapsed_bucket", "error_name", "page_closed", "phase", "schema", "viewport",
+    "elapsed_bucket", "error_code", "error_name", "page_closed", "phase", "schema", "viewport",
   ]);
   assert.equal(payload.schema, 1);
   assert.equal(payload.category, "other");
   assert.equal(payload.error_name, "Error");
+  assert.equal(payload.phase, "capture");
+  assert.equal(payload.error_code, "none");
   assert.equal(payload.document_height_bucket, ">=60k");
   assert.equal(payload.viewport.width, 1440);
   assert.equal(payload.viewport.height, 1000);
@@ -102,7 +104,24 @@ async function main() {
   assert.equal(pathScreenshotCalled, false);
   const pathFailurePayload = JSON.parse(pathFailureAttachment.options.body.toString("utf8"));
   assert.equal(pathFailurePayload.category, "output_enoent");
+  assert.equal(pathFailurePayload.phase, "resolve_options");
+  assert.equal(pathFailurePayload.error_code, "ENOENT");
   assert.equal(JSON.stringify(pathFailurePayload).includes("output path"), false);
+
+  const unknownCodeError = Object.assign(new Error("private error code"), { code: "PRIVATE_CODE" });
+  let unknownCodeAttachment;
+  await assert.rejects(
+    takeObjectiveScreenshotWithDiagnostics({
+      ...page,
+      screenshot: async () => { throw unknownCodeError; },
+    }, {
+      attach: async (name, options) => { unknownCodeAttachment = { name, options }; },
+    }, () => ({ fullPage: true })),
+    (error) => error === unknownCodeError,
+  );
+  const unknownCodePayload = JSON.parse(unknownCodeAttachment.options.body.toString("utf8"));
+  assert.equal(unknownCodePayload.error_code, "other");
+  assert.equal(JSON.stringify(unknownCodePayload).includes("PRIVATE_CODE"), false);
 
   const attachFailure = new Error("secondary private attachment failure");
   const closedPage = {

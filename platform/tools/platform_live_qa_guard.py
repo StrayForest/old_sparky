@@ -3133,11 +3133,17 @@ def _validate_objective_screenshot_evidence(record: Mapping[str, object]) -> Non
         if evidence is not None:
             raise GuardError("private objective screenshot unavailable state is malformed")
         return
-    if state != "captured" or not isinstance(evidence, dict) or set(evidence) != {
+    current_keys = {
         "schema", "category", "error_name", "phase", "viewport",
         "document_height_bucket", "elapsed_bucket", "page_closed",
-        "browser_connected", "crash_observed",
-    }:
+        "browser_connected", "crash_observed", "error_code",
+    }
+    legacy_keys = current_keys - {"error_code"}
+    if (
+        state != "captured"
+        or not isinstance(evidence, dict)
+        or frozenset(evidence) not in {frozenset(current_keys), frozenset(legacy_keys)}
+    ):
         raise GuardError("private objective screenshot evidence is malformed")
     viewport = evidence.get("viewport")
     if (
@@ -3152,7 +3158,18 @@ def _validate_objective_screenshot_evidence(record: Mapping[str, object]) -> Non
         }
         or not isinstance(evidence.get("error_name"), str)
         or evidence.get("error_name") not in {"TimeoutError", "TargetClosedError", "Error", "unknown"}
-        or evidence.get("phase") != "capture"
+        or not isinstance(evidence.get("phase"), str)
+        or evidence.get("phase") not in {"capture"} | ({"resolve_options"} if "error_code" in evidence else set())
+        or (
+            "error_code" in evidence
+            and (
+                not isinstance(evidence.get("error_code"), str)
+                or evidence.get("error_code") not in {
+                    "none", "EACCES", "EROFS", "ENOSPC", "EFBIG", "ENOENT",
+                    "EIO", "ETIMEDOUT", "ECONNRESET", "EPIPE", "other",
+                }
+            )
+        )
         or not isinstance(evidence.get("document_height_bucket"), str)
         or evidence.get("document_height_bucket") not in {
             "unavailable", "<10k", "10k-30k", "30k-60k", ">=60k",
@@ -3171,6 +3188,114 @@ def _validate_objective_screenshot_evidence(record: Mapping[str, object]) -> Non
         )
     ):
         raise GuardError("private objective screenshot evidence is malformed")
+
+
+def _validate_navigation_failure_evidence(record: Mapping[str, object]) -> None:
+    state = record.get("navigation_failure_state")
+    evidence = record.get("navigation_failure")
+    if state == "unavailable":
+        if evidence is not None:
+            raise GuardError("private navigation failure unavailable state is malformed")
+        return
+    if state != "captured" or not isinstance(evidence, dict) or set(evidence) != {
+        "schema", "test_id", "result_route", "query_present", "hash_present",
+        "trailing_slash", "click_dispatched", "click_default_prevented",
+        "document_response", "info_rsc_response", "info_rsc_response_phase",
+        "info_rsc_response_timing", "main_frame_commit", "soft_nonce", "reload_nonce",
+    }:
+        raise GuardError("private navigation failure evidence is malformed")
+    if (
+        type(evidence.get("schema")) is not int
+        or evidence["schema"] != 1
+        or any(not isinstance(evidence.get(field), str) for field in (
+            "test_id", "result_route", "click_default_prevented", "document_response",
+            "info_rsc_response", "info_rsc_response_phase", "info_rsc_response_timing",
+            "main_frame_commit", "soft_nonce", "reload_nonce",
+        ))
+        or evidence.get("test_id") != "csp_nonce_rotation"
+        or evidence.get("result_route") not in {"root", "info", "other"}
+        or any(type(evidence.get(field)) is not bool for field in (
+            "query_present", "hash_present", "trailing_slash", "click_dispatched",
+        ))
+        or evidence.get("click_default_prevented") not in {"unavailable", "true", "false"}
+        or evidence.get("document_response") not in {"not_seen", "2xx", "non_2xx", "failed"}
+        or evidence.get("info_rsc_response") not in {
+            "not_seen", "pending", "2xx", "non_2xx", "failed",
+        }
+        or evidence.get("info_rsc_response_phase") not in {
+            "not_seen", "before_click", "during_click", "after_click",
+        }
+        or evidence.get("info_rsc_response_timing") not in {
+            "unavailable", "<100ms", "<1s", "<5s", ">=5s",
+        }
+        or (
+            evidence.get("info_rsc_response_phase") == "not_seen"
+            and (
+                evidence.get("info_rsc_response") != "not_seen"
+                or evidence.get("info_rsc_response_timing") != "unavailable"
+            )
+        )
+        or (
+            evidence.get("info_rsc_response_phase") != "not_seen"
+            and evidence.get("info_rsc_response") == "not_seen"
+        )
+        or evidence.get("main_frame_commit") not in {
+            "not_seen", "info", "other_origin", "failed",
+        }
+        or evidence.get("soft_nonce") not in {"not_read", "missing", "stable", "changed"}
+        or evidence.get("reload_nonce") not in {
+            "not_read", "missing", "rotated", "unchanged",
+        }
+    ):
+        raise GuardError("private navigation failure evidence is malformed")
+
+
+def _validate_decoded_image_failure_evidence(record: Mapping[str, object]) -> None:
+    state = record.get("decoded_image_failure_state")
+    evidence = record.get("decoded_image_failure")
+    if state == "unavailable":
+        if evidence is not None:
+            raise GuardError("private decoded-image unavailable state is malformed")
+        return
+    if state != "captured" or not isinstance(evidence, dict) or set(evidence) != {
+        "schema", "patch_id", "role", "section_index", "element_index", "state",
+        "decode_error", "current_src_present", "current_src_changed",
+        "width_bucket", "height_bucket",
+    }:
+        raise GuardError("private decoded-image evidence is malformed")
+    patch_id = evidence.get("patch_id")
+    role = evidence.get("role")
+    section_index = evidence.get("section_index")
+    element_index = evidence.get("element_index")
+    if (
+        type(evidence.get("schema")) is not int
+        or evidence["schema"] != 1
+        or not isinstance(patch_id, str)
+        or re.fullmatch(r"[1-9][0-9]{0,15}", patch_id) is None
+        or any(not isinstance(evidence.get(field), str) for field in (
+            "role", "state", "decode_error", "width_bucket", "height_bucket",
+        ))
+        or role not in {"hero", "objective", "ability"}
+        or (section_index is not None and (type(section_index) is not int or not 0 <= section_index <= 127))
+        or (element_index is not None and (type(element_index) is not int or not 0 <= element_index <= 1023))
+        or (role in {"hero", "objective"} and (
+            section_index is None or element_index is not None
+        ))
+        or (role == "ability" and (section_index is None or element_index is None))
+        or evidence.get("state") not in {
+            "not_complete", "decode_pending", "decode_rejected", "zero_dimensions",
+        }
+        or evidence.get("decode_error") not in {"none", "timeout", "rejected", "other"}
+        or type(evidence.get("current_src_present")) is not bool
+        or type(evidence.get("current_src_changed")) is not bool
+        or evidence.get("width_bucket") not in {"zero", "1-32", "33-128", "129-512", ">512", "unavailable"}
+        or evidence.get("height_bucket") not in {"zero", "1-32", "33-128", "129-512", ">512", "unavailable"}
+        or (evidence["state"] == "zero_dimensions" and (
+            evidence["width_bucket"] != "zero" and evidence["height_bucket"] != "zero"
+        ))
+        or (evidence["state"] == "decode_rejected" and evidence["decode_error"] == "none")
+    ):
+        raise GuardError("private decoded-image evidence is malformed")
 
 
 def _validate_image_inventory_evidence(record: Mapping[str, object]) -> None:
@@ -3824,6 +3949,12 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
         if schema == 2 and failure_id == "objective_icons":
             screenshot_keys = {"objective_screenshot_state", "objective_screenshot"}
             allowed_failure_key_sets.add(frozenset(expected_failure_keys | screenshot_keys))
+        if schema == 2 and failure_id == "csp_nonce_rotation":
+            navigation_keys = {"navigation_failure_state", "navigation_failure"}
+            allowed_failure_key_sets.add(frozenset(expected_failure_keys | navigation_keys))
+        if schema == 2 and failure_id == "patch_owner_sections":
+            decoded_image_keys = {"decoded_image_failure_state", "decoded_image_failure"}
+            allowed_failure_key_sets.add(frozenset(expected_failure_keys | decoded_image_keys))
         if (
             not isinstance(failure, dict)
             or frozenset(failure) not in allowed_failure_key_sets
@@ -3855,6 +3986,14 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
                 if failure.get("id") != "image_csp_hosts":
                     raise GuardError("private browser request-failure evidence is bound to the wrong test")
                 _validate_browser_request_failure_evidence(failure)
+            if "navigation_failure_state" in failure or "navigation_failure" in failure:
+                if failure.get("id") != "csp_nonce_rotation":
+                    raise GuardError("private navigation evidence is bound to the wrong test")
+                _validate_navigation_failure_evidence(failure)
+            if "decoded_image_failure_state" in failure or "decoded_image_failure" in failure:
+                if failure.get("id") != "patch_owner_sections":
+                    raise GuardError("private decoded-image evidence is bound to the wrong test")
+                _validate_decoded_image_failure_evidence(failure)
         if schema == 4:
             continue
         if schema == 3:
@@ -4519,6 +4658,10 @@ def _read_ephemeral_failure_report(
         browser_request_failure_keys = {
             "browser_request_failure_state", "browser_request_failures",
         }
+        navigation_failure_keys = {"navigation_failure_state", "navigation_failure"}
+        decoded_image_failure_keys = {
+            "decoded_image_failure_state", "decoded_image_failure",
+        }
         objective_screenshot_keys = {
             "objective_screenshot_state", "objective_screenshot",
         }
@@ -4537,6 +4680,14 @@ def _read_ephemeral_failure_report(
                 and not (
                     record.get("id") == "objective_icons"
                     and set(record) == base_record_keys | objective_screenshot_keys
+                )
+                and not (
+                    record.get("id") == "csp_nonce_rotation"
+                    and set(record) == base_record_keys | navigation_failure_keys
+                )
+                and not (
+                    record.get("id") == "patch_owner_sections"
+                    and set(record) == base_record_keys | decoded_image_failure_keys
                 )
             )
             or record.get("id") not in LIVE_BROWSER_FAILURE_DIAGNOSTIC_NAMES
@@ -4560,6 +4711,14 @@ def _read_ephemeral_failure_report(
             if record.get("id") != "objective_icons":
                 raise GuardError("ephemeral objective screenshot evidence is bound to the wrong test")
             _validate_objective_screenshot_evidence(record)
+        if navigation_failure_keys.issubset(record):
+            if record.get("id") != "csp_nonce_rotation":
+                raise GuardError("ephemeral navigation evidence is bound to the wrong test")
+            _validate_navigation_failure_evidence(record)
+        if decoded_image_failure_keys.issubset(record):
+            if record.get("id") != "patch_owner_sections":
+                raise GuardError("ephemeral decoded-image evidence is bound to the wrong test")
+            _validate_decoded_image_failure_evidence(record)
         _validate_failure_location(record, manifest)
     if failure_status_counts != {
         "failed": counts["attempt_fail"],
