@@ -852,7 +852,8 @@ function objectiveScreenshotEvidenceForAttempt(result) {
   }
   const categories = new Set([
     "capture_timeout", "test_timeout", "browser_closed_or_crashed", "capture_unavailable",
-    "page_navigating", "invalid_geometry", "output_eacces", "output_erofs", "output_enospc",
+    "page_navigating", "context_closed", "protocol_capture_error", "invalid_geometry",
+    "output_eacces", "output_erofs", "output_enospc",
     "output_efbig", "output_enoent", "other",
   ]);
   const heightBuckets = new Set(["unavailable", "<10k", "10k-30k", "30k-60k", ">=60k"]);
@@ -1763,11 +1764,13 @@ function failureRecordForAttempt(test, result, attempt, sourceRoot) {
     location = normalizedFailureLocation(test.location, sourceRoot, "declaration");
   }
   const pageErrorEvidence = pageErrorEvidenceForAttempt(result);
+  const durationVsTimeout = failureDurationVsTimeout(test, result);
   const failure = {
     id,
     project,
     status: result.status,
     attempt,
+    ...(durationVsTimeout === "unavailable" ? {} : { duration_vs_timeout: durationVsTimeout }),
     source_file: location?.file ?? null,
     source_line: location?.line ?? null,
     source_column: location?.column ?? null,
@@ -1792,13 +1795,13 @@ function failureRecordForAttempt(test, result, attempt, sourceRoot) {
   }
   if (id === "image_csp_hosts") {
     const imageEvidence = imageInventoryEvidenceForAttempt(result);
-    const requestFailureEvidence = browserRequestFailureEvidenceForAttempt(result);
     failure.image_inventory_state = imageEvidence.state;
     failure.image_inventory = imageEvidence.inventory;
-    if (requestFailureEvidence.present) {
-      failure.browser_request_failure_state = requestFailureEvidence.state;
-      failure.browser_request_failures = requestFailureEvidence.evidence;
-    }
+  }
+  const requestFailureEvidence = browserRequestFailureEvidenceForAttempt(result);
+  if (requestFailureEvidence.present) {
+    failure.browser_request_failure_state = requestFailureEvidence.state;
+    failure.browser_request_failures = requestFailureEvidence.evidence;
   }
   if (id === "objective_icons") {
     const screenshotEvidence = objectiveScreenshotEvidenceForAttempt(result);
@@ -1808,6 +1811,19 @@ function failureRecordForAttempt(test, result, attempt, sourceRoot) {
     }
   }
   return failure;
+}
+
+function failureDurationVsTimeout(test, result) {
+  const timeout = test?.timeout;
+  if (!Number.isSafeInteger(timeout) || timeout < 0) return "unavailable";
+  if (timeout === 0) return "timeout_disabled";
+  const duration = result?.duration;
+  if (!Number.isSafeInteger(duration) || duration < 0) return "unavailable";
+  const ratio = duration / timeout;
+  if (ratio >= 1) return "at_or_over_timeout";
+  if (ratio >= 0.9) return "90_to_99_percent";
+  if (ratio >= 0.5) return "50_to_89_percent";
+  return "under_50_percent";
 }
 
 function boundedFailureReportBytes(payload) {
@@ -1918,6 +1934,17 @@ function boundedFailureReportBytes(payload) {
       failure.page_errors_truncated = true;
       if (failure.page_errors.length === 0) failure.page_error_state = "unavailable";
       bytes = Buffer.from(`${JSON.stringify(payload)}\n`, "ascii");
+    }
+  }
+  // Preserve the existing last page-error sample before dropping optional
+  // duration buckets to meet the bounded report size.
+  if (bytes.length > MAX_EPHEMERAL_FAILURE_REPORT_BYTES) {
+    for (const failure of [...payload.failures].reverse()) {
+      if (Object.hasOwn(failure, "duration_vs_timeout")) {
+        delete failure.duration_vs_timeout;
+        bytes = Buffer.from(`${JSON.stringify(payload)}\n`, "ascii");
+        if (bytes.length <= MAX_EPHEMERAL_FAILURE_REPORT_BYTES) break;
+      }
     }
   }
   // The durable record must never lose a failed-attempt identity. If a

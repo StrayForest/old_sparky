@@ -1227,12 +1227,37 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     resourceType: "script",
                   }],
                 });
+                const requestFailureAttachment = {
+                  name: "live-browser-request-failures-v2",
+                  contentType: "application/json",
+                  body: Buffer.from(JSON.stringify({
+                    schema: 2,
+                    coverage: "since_before_each",
+                    failure_phase: "hook",
+                    truncated: false,
+                    events: [{
+                      ordinal: 1,
+                      resource_type: "fetch",
+                      route_scope: "home",
+                      navigation_relation: "changed",
+                      failure_class: "cancelled",
+                      duration_bucket: "<100ms",
+                      method: "GET",
+                      failure_route_scope: "other",
+                      endpoint_family: "api_content",
+                      navigation_phase: "pending_route_change",
+                    }],
+                  }), "ascii"),
+                };
                 for (const project of projects) {
                   for (const title of titles) {
                     const key = `${title}|${project}`;
                     const skipDescription = skips.get(key);
-                    const failed = title === "live image currentSrc inventory stays inside the exact CSP hosts"
+                    const imageFailure = title === "live image currentSrc inventory stays inside the exact CSP hosts"
                       && project === "live-webkit-mobile";
+                    const cspFailure = title === "live CSP nonce is stable on soft navigation and rotates on hard reload"
+                      && project === "live-desktop";
+                    const failed = imageFailure || cspFailure;
                     const status = skipDescription ? "skipped" : failed ? "failed" : "passed";
                     const result = {
                       status,
@@ -1262,7 +1287,8 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                             resourceType: "script",
                           }],
                         }),
-                        ...[
+                        ...(cspFailure ? [requestFailureAttachment] : []),
+                        ...(imageFailure ? [
                           { route: "home", image_count: 4, missing_current_src_count: 0,
                             unloaded_count: 0, complete: true, counts_truncated: false },
                           { route: "patch", image_count: 3, missing_current_src_count: 0,
@@ -1273,7 +1299,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                           name: "live-image-inventory-evidence-v1",
                           contentType: "application/json",
                           body: Buffer.from(JSON.stringify({ schema: 1, ...image }), "ascii"),
-                        })),
+                        })) : []),
                       ];
                     }
                     const failureResult = {
@@ -1353,22 +1379,30 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             failure_payload = json.loads(failures_path.read_text(encoding="ascii"))
             identities_payload = json.loads(identities_path.read_text(encoding="ascii"))
             self.assertEqual(count_payload["logical_total"], 57)
-            self.assertEqual(count_payload["logical_pass"], 50)
-            self.assertEqual(count_payload["logical_fail"], 1)
+            self.assertEqual(count_payload["logical_pass"], 49)
+            self.assertEqual(count_payload["logical_fail"], 2)
             self.assertEqual(count_payload["logical_skip"], 6)
-            self.assertEqual(failure_payload["failures"][0]["id"], "image_csp_hosts")
-            self.assertEqual(identities_payload["failures"][0], {
+            failure_by_id = {failure["id"]: failure for failure in failure_payload["failures"]}
+            identity_by_id = {failure["id"]: failure for failure in identities_payload["failures"]}
+            self.assertEqual(set(failure_by_id), {"csp_nonce_rotation", "image_csp_hosts"})
+            self.assertEqual(identity_by_id["image_csp_hosts"], {
                 "id": "image_csp_hosts",
                 "project": "live-webkit-mobile",
                 "status": "failed",
                 "attempt": 1,
             })
-            self.assertEqual(failure_payload["failures"][0]["source_file"], "tests/support/live-qa-sandbox.ts")
-            self.assertEqual(failure_payload["failures"][0]["source_line"], 2)
-            self.assertEqual(failure_payload["failures"][0]["source_kind"], "assertion")
-            self.assertEqual(failure_payload["failures"][0]["image_inventory_state"], "captured")
+            self.assertEqual(identity_by_id["csp_nonce_rotation"], {
+                "id": "csp_nonce_rotation",
+                "project": "live-desktop",
+                "status": "failed",
+                "attempt": 1,
+            })
+            self.assertEqual(failure_by_id["image_csp_hosts"]["source_file"], "tests/support/live-qa-sandbox.ts")
+            self.assertEqual(failure_by_id["image_csp_hosts"]["source_line"], 2)
+            self.assertEqual(failure_by_id["image_csp_hosts"]["source_kind"], "assertion")
+            self.assertEqual(failure_by_id["image_csp_hosts"]["image_inventory_state"], "captured")
             self.assertEqual(
-                failure_payload["failures"][0]["image_inventory"]["routes"],
+                failure_by_id["image_csp_hosts"]["image_inventory"]["routes"],
                 [
                     {
                         "schema": 1,
@@ -1399,11 +1433,30 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     },
                 ],
             )
-            self.assertNotIn("image_inventory", identities_payload["failures"][0])
+            self.assertNotIn("image_inventory", identity_by_id["image_csp_hosts"])
             self.assertEqual(
-                failure_payload["failures"][0]["page_errors"],
+                failure_by_id["image_csp_hosts"]["page_errors"],
                 [["TypeError", "patch", "abcdefghijklm.js", 12, 34]],
             )
+            csp_request_failure = failure_by_id["csp_nonce_rotation"]
+            self.assertEqual(csp_request_failure["browser_request_failure_state"], "captured")
+            self.assertEqual(csp_request_failure["browser_request_failures"], {
+                "schema": 2,
+                "failure_phase": "hook",
+                "truncated": False,
+                "events": [{
+                    "ordinal": 1,
+                    "resource_type": "fetch",
+                    "route_scope": "home",
+                    "navigation_relation": "changed",
+                    "failure_class": "cancelled",
+                    "duration_bucket": "<100ms",
+                    "method": "GET",
+                    "failure_route_scope": "other",
+                    "endpoint_family": "api_content",
+                    "navigation_phase": "pending_route_change",
+                }],
+            })
             self.assertNotIn("private pageerror text", failures_path.read_text(encoding="ascii"))
 
             env = {
@@ -1887,7 +1940,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                         platform_live_qa_guard._validate_page_error_evidence(invalid_evidence)
                 failures_path.write_text(json.dumps(failure_payload) + "\n", encoding="ascii")
                 failures_path.chmod(0o600)
-                page_error_record = failure_payload["failures"][0]
+                page_error_record = failure_by_id["image_csp_hosts"]
                 for field, invalid_value in (
                     ("page_error_state", []),
                     ("page_errors", [[{}, "patch", None, None, None]]),
@@ -1933,7 +1986,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     sorted([max_private_report.name, user_private_report.name]),
                     "a failed second publication leaves prior valid records intact",
                 )
-                failure_payload["failures"][0]["status"] = "interrupted"
+                failure_by_id["image_csp_hosts"]["status"] = "interrupted"
                 failures_path.write_text(json.dumps(failure_payload) + "\n", encoding="ascii")
                 failures_path.chmod(0o600)
                 with self.assertRaisesRegex(
@@ -1948,7 +2001,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                         persist_failure_report=True,
                     )
                 self.assertFalse(private_report.exists())
-                failure_payload["failures"][0]["status"] = "failed"
+                failure_by_id["image_csp_hosts"]["status"] = "failed"
                 failures_path.write_text(json.dumps(failure_payload) + "\n", encoding="ascii")
                 failures_path.chmod(0o600)
                 public_line = platform_live_qa_guard.public_browser_counts_line(
@@ -1965,21 +2018,50 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 self.assertEqual(private_metadata.st_nlink, 1)
                 self.assertLessEqual(private_metadata.st_size, 16 * 1024)
                 private_payload = json.loads(private_bytes)
+                private_failure_by_id = {
+                    failure["id"]: failure for failure in private_payload["failures"]
+                }
                 self.assertEqual(private_payload["schema"], 2)
                 self.assertEqual(private_payload["gate"], gate.name)
                 self.assertEqual(private_payload["source_sha"], source_sha)
                 self.assertEqual(private_payload["app_sha"], app_sha)
                 self.assertEqual(private_payload["marker_sha256"], marker_sha)
+                for duration_value in (
+                    "unavailable", "timeout_disabled", "under_50_percent",
+                    "50_to_89_percent", "90_to_99_percent", "at_or_over_timeout",
+                ):
+                    duration_payload = json.loads(json.dumps(private_payload))
+                    duration_failure = next(
+                        item for item in duration_payload["failures"]
+                        if item["id"] == "csp_nonce_rotation"
+                    )
+                    duration_failure["duration_vs_timeout"] = duration_value
+                    platform_live_qa_guard._validate_retained_failure_report(
+                        private_report.name,
+                        (json.dumps(duration_payload) + "\n").encode("ascii"),
+                    )
+                for invalid_duration in (None, "almost_timeout"):
+                    duration_payload = json.loads(json.dumps(private_payload))
+                    duration_failure = next(
+                        item for item in duration_payload["failures"]
+                        if item["id"] == "csp_nonce_rotation"
+                    )
+                    duration_failure["duration_vs_timeout"] = invalid_duration
+                    with self.assertRaises(platform_live_qa_guard.GuardError):
+                        platform_live_qa_guard._validate_retained_failure_report(
+                            private_report.name,
+                            (json.dumps(duration_payload) + "\n").encode("ascii"),
+                        )
                 self.assertEqual(
-                    private_payload["failures"][0]["page_errors"],
+                    private_failure_by_id["image_csp_hosts"]["page_errors"],
                     [["TypeError", "patch", "abcdefghijklm.js", 12, 34]],
                 )
                 self.assertEqual(
-                    private_payload["failures"][0]["source_file"],
+                    private_failure_by_id["image_csp_hosts"]["source_file"],
                     "tests/support/live-qa-sandbox.ts",
                 )
-                self.assertEqual(private_payload["failures"][0]["source_line"], 2)
-                self.assertEqual(private_payload["failures"][0]["source_kind"], "assertion")
+                self.assertEqual(private_failure_by_id["image_csp_hosts"]["source_line"], 2)
+                self.assertEqual(private_failure_by_id["image_csp_hosts"]["source_kind"], "assertion")
                 self.assertNotIn(b"assertion text", private_bytes)
                 self.assertNotIn("image_inventory", public_line)
                 platform_live_qa_guard._validate_retained_failure_report(
@@ -2003,6 +2085,17 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     },
                 }
                 platform_live_qa_guard._validate_objective_screenshot_evidence(screenshot_record)
+                for screenshot_category in ("context_closed", "protocol_capture_error"):
+                    categorized_screenshot = json.loads(json.dumps(screenshot_record))
+                    categorized_screenshot["objective_screenshot"]["category"] = screenshot_category
+                    platform_live_qa_guard._validate_objective_screenshot_evidence(
+                        categorized_screenshot
+                    )
+                    categorized_screenshot["objective_screenshot"]["phase"] = "resolve_options"
+                    with self.assertRaises(platform_live_qa_guard.GuardError):
+                        platform_live_qa_guard._validate_objective_screenshot_evidence(
+                            categorized_screenshot
+                        )
                 legacy_screenshot_record = {
                     "objective_screenshot_state": "captured",
                     "objective_screenshot": {
@@ -2076,7 +2169,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     ("patch_owner_sections", decoded_image_record),
                 ):
                     bound_payload = json.loads(json.dumps(private_payload))
-                    bound_failure = dict(private_payload["failures"][0])
+                    bound_failure = dict(private_failure_by_id["image_csp_hosts"])
                     for optional_name in (
                         "image_inventory_state", "image_inventory",
                         "browser_request_failure_state", "browser_request_failures",
@@ -2098,18 +2191,30 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                         (json.dumps(bound_payload) + "\n").encode("ascii"),
                     )
                 legacy_private_payload = json.loads(private_bytes)
-                del legacy_private_payload["failures"][0]["image_inventory_state"]
-                del legacy_private_payload["failures"][0]["image_inventory"]
+                legacy_image_failure = next(
+                    item for item in legacy_private_payload["failures"]
+                    if item["id"] == "image_csp_hosts"
+                )
+                del legacy_image_failure["image_inventory_state"]
+                del legacy_image_failure["image_inventory"]
                 platform_live_qa_guard._validate_retained_failure_report(
                     private_report.name,
                     (json.dumps(legacy_private_payload) + "\n").encode("ascii"),
                 )
                 invalid_retained_variants = []
                 partial_retained = json.loads(private_bytes)
-                del partial_retained["failures"][0]["image_inventory"]
+                partial_image_failure = next(
+                    item for item in partial_retained["failures"]
+                    if item["id"] == "image_csp_hosts"
+                )
+                del partial_image_failure["image_inventory"]
                 invalid_retained_variants.append(partial_retained)
                 wrong_id_retained = json.loads(private_bytes)
-                wrong_id_retained["failures"][0]["id"] = "patch_owner_sections"
+                wrong_id_failure = next(
+                    item for item in wrong_id_retained["failures"]
+                    if item["id"] == "image_csp_hosts"
+                )
+                wrong_id_failure["id"] = "patch_owner_sections"
                 invalid_retained_variants.append(wrong_id_retained)
                 unknown_field_retained = json.loads(private_bytes)
                 unknown_field_retained["failures"][0]["unexpected"] = "private"
@@ -2295,9 +2400,10 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 self.assertEqual(summary_payload["source_sha"], source_sha)
                 self.assertEqual(summary_payload["app_sha"], app_sha)
                 self.assertEqual(summary_payload["marker_sha256"], marker_sha)
-                self.assertEqual(summary_payload["failures"], [[
-                    "image_csp_hosts", "live-webkit-mobile", "failed", 1
-                ]])
+                self.assertEqual(summary_payload["failures"], [
+                    ["csp_nonce_rotation", "live-desktop", "failed", 1],
+                    ["image_csp_hosts", "live-webkit-mobile", "failed", 1],
+                ])
                 self.assertNotIn(b"private assertion text", summary_bytes)
                 with patch.object(platform_live_qa_guard, "assert_liveqa_idle"):
                     platform_live_qa_guard.remove_public_browser_gate(store_failure_gate)
@@ -3407,6 +3513,153 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         source = (REPO_ROOT / ".github/workflows/platform-live-launch.yml").read_text(
             encoding="utf-8"
         )
+        validation_step_start = source.index(
+            "      - name: Validate sanitized live-launch report\n"
+        )
+        validator_script_start = source.index("<<'PY'\n", validation_step_start) + len(
+            "<<'PY'\n"
+        )
+        validator_script_end = source.index("\n          PY\n", validator_script_start)
+        validator_script = textwrap.dedent(
+            source[validator_script_start:validator_script_end]
+        )
+
+        def failure_report(
+            *,
+            logical_fail: int = 5,
+            attempt_fail: int = 3,
+            attempt_timedout: int = 2,
+            failure_statuses: tuple[str, ...] = (
+                "failed", "failed", "failed", "timedOut", "timedOut",
+            ),
+            retry_attempt: bool = False,
+        ) -> dict[str, object]:
+            source_sha = "a" * 40
+            app_sha = "b" * 40
+            marker_sha = "c" * 64
+            skipped = 10
+            logical_pass = 57 - skipped - logical_fail
+            attempt_pass = 57 - skipped - attempt_fail - attempt_timedout
+            attempts = {
+                "attempt_total": 57,
+                "attempt_pass": attempt_pass,
+                "attempt_fail": attempt_fail,
+                "attempt_skip": skipped,
+                "attempt_interrupted": 0,
+                "attempt_timedout": attempt_timedout,
+            }
+            failures = [
+                [
+                    (
+                        "objective_icons",
+                        "patch_owner_sections",
+                        "csp_nonce_rotation",
+                        "image_csp_hosts",
+                        "route_root_overflow",
+                    )[index],
+                    "live-desktop",
+                    status,
+                    1,
+                ]
+                for index, status in enumerate(failure_statuses)
+            ]
+            if retry_attempt:
+                attempts["attempt_total"] += 1
+                attempts["attempt_fail"] += 1
+                failures.append(
+                    ["route_tournaments_overflow", "live-mobile", "failed", 2]
+                )
+            return {
+                "schema": 1,
+                "source_git_sha": source_sha,
+                "app_target_sha": app_sha,
+                "source_binding_sha256": "d" * 64,
+                "status": "failed",
+                "success": False,
+                "failure_reason": "child_failed",
+                "truncated": False,
+                "test_count": 57 - skipped,
+                "failed_test_count": logical_fail,
+                "flaky_test_count": 0,
+                "skipped_test_count": skipped,
+                "interrupted_test_count": 0,
+                "logical_counts": {
+                    "logical_total": 57,
+                    "logical_pass": logical_pass,
+                    "logical_fail": logical_fail,
+                    "logical_expected_fail": 0,
+                    "logical_flaky": 0,
+                    "logical_skip": skipped,
+                    "logical_interrupted": 0,
+                },
+                "attempt_counts": attempts,
+                "tests": [],
+                "error_class_counts": {"browser_test_failure": len(failures)},
+                "child_diagnostic": {
+                    "kind": "failure_report_published",
+                    "failure_reason": "private_store_available",
+                },
+                "browser_failure_metadata": {
+                    "schema": 1,
+                    "gate": "public-live-qa.a1b2c3d4",
+                    "source_sha": source_sha,
+                    "app_sha": app_sha,
+                    "marker_sha256": marker_sha,
+                    "run_status": "timedout" if attempt_fail == 0 else "failed",
+                    "failure_reason": "private_store_available",
+                    "failures": failures,
+                },
+            }
+
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            report_path = Path(temporary) / "live-launch-report.json"
+
+            def validate_report(report: dict[str, object]) -> subprocess.CompletedProcess[str]:
+                report_path.write_text(json.dumps(report), encoding="utf-8")
+                return subprocess.run(
+                    [sys.executable, "-", str(report_path), "a" * 40],
+                    input=validator_script,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+
+            mixed_failure_timeout = validate_report(failure_report())
+            self.assertEqual(
+                mixed_failure_timeout.returncode,
+                0,
+                mixed_failure_timeout.stderr,
+            )
+            all_timeout = validate_report(
+                failure_report(
+                    logical_fail=2,
+                    attempt_fail=0,
+                    attempt_timedout=2,
+                    failure_statuses=("timedOut", "timedOut"),
+                )
+            )
+            self.assertEqual(all_timeout.returncode, 0, all_timeout.stderr)
+
+            too_many_logical_failures = validate_report(
+                failure_report(logical_fail=6)
+            )
+            self.assertNotEqual(too_many_logical_failures.returncode, 0)
+            wrong_timeout_identity_count = validate_report(
+                failure_report(
+                    failure_statuses=(
+                        "failed", "failed", "failed", "failed", "timedOut",
+                    )
+                )
+            )
+            self.assertNotEqual(wrong_timeout_identity_count.returncode, 0)
+            retried_attempt = validate_report(failure_report(retry_attempt=True))
+            self.assertNotEqual(retried_attempt.returncode, 0)
+            wrong_source_binding = failure_report()
+            wrong_source_binding["browser_failure_metadata"]["source_sha"] = "e" * 40
+            wrong_source = validate_report(wrong_source_binding)
+            self.assertNotEqual(wrong_source.returncode, 0)
+
         browser_spec = (
             REPO_ROOT / "platform/apps/platform_web/tests/smoke/live-launch.spec.ts"
         ).read_text(encoding="utf-8")

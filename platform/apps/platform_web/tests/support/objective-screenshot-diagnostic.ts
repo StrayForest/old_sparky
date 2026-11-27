@@ -8,6 +8,8 @@ export type ObjectiveScreenshotFailureCategory =
   | "browser_closed_or_crashed"
   | "capture_unavailable"
   | "page_navigating"
+  | "context_closed"
+  | "protocol_capture_error"
   | "invalid_geometry"
   | "output_eacces"
   | "output_erofs"
@@ -81,10 +83,17 @@ function closedErrorCode(error: unknown): ObjectiveScreenshotDiagnostic["error_c
 export function classifyObjectiveScreenshotError(
   error: unknown,
   browserConnected: boolean,
+  phase: ObjectiveScreenshotDiagnostic["phase"] = "capture",
 ): ObjectiveScreenshotFailureCategory {
   const name = errorString(error, "name");
   const message = errorString(error, "message");
   const code = errorString(error, "code").toUpperCase();
+  if (phase === "capture") {
+    if (/^(?:page\.screenshot: )?Test ended\.$/u.test(message)) return "context_closed";
+    if (/^(?:page\.screenshot: )?Protocol error \(Page\.captureScreenshot\):/u.test(message)) {
+      return "protocol_capture_error";
+    }
+  }
   if (/test timeout(?: of .*?)? exceeded|test timed out/iu.test(message)) return "test_timeout";
   if (/navigat(?:ing|ion).*screenshot|screenshot.*navigat/iu.test(message)) return "page_navigating";
   if (/invalid.*(?:width|height|clip|dimension)|(?:width|height|clip).*out of (?:range|bounds)|cannot screenshot.*(?:empty|zero|dimension)/iu.test(message)) {
@@ -180,7 +189,7 @@ export async function takeObjectiveScreenshotWithDiagnostics(
     const message = errorString(error, "message");
     const diagnostic: ObjectiveScreenshotDiagnostic = {
       schema: 1,
-      category: classifyObjectiveScreenshotError(error, browserConnected),
+      category: classifyObjectiveScreenshotError(error, browserConnected, phase),
       error_name: closedErrorName(error),
       phase,
       error_code: closedErrorCode(error),

@@ -12,6 +12,14 @@ async function main() {
     [Object.assign(new Error("target closed"), { name: "TargetClosedError" }), true, "browser_closed_or_crashed"],
     [new Error("Page.captureScreenshot is not supported"), true, "capture_unavailable"],
     [new Error("Cannot take screenshot while page is navigating"), true, "page_navigating"],
+    [new Error("Test ended."), true, "context_closed"],
+    [new Error("page.screenshot: Test ended."), true, "context_closed"],
+    [new Error("page.screenshot:\tTest ended."), true, "other"],
+    [new Error("Protocol error (Page.captureScreenshot): Screenshot failed"), true, "protocol_capture_error"],
+    [new Error("page.screenshot: Protocol error (Page.captureScreenshot): Screenshot failed"), true, "protocol_capture_error"],
+    [new Error("https://private.invalid/Test ended."), true, "other"],
+    [new Error("private-marker Protocol error (Page.captureScreenshot): failed"), true, "other"],
+    [new Error("page.screenshot: Test ended. /tmp/private-path"), true, "other"],
     [new Error("Invalid screenshot clip width"), true, "invalid_geometry"],
     [Object.assign(new Error("permission denied"), { code: "EACCES" }), true, "output_eacces"],
     [Object.assign(new Error("read-only file system"), { code: "EROFS" }), true, "output_erofs"],
@@ -23,6 +31,18 @@ async function main() {
   for (const [error, connected, expected] of cases) {
     assert.equal(classifyObjectiveScreenshotError(error, connected), expected);
   }
+  assert.equal(
+    classifyObjectiveScreenshotError(new Error("Test ended."), true, "resolve_options"),
+    "other",
+  );
+  assert.equal(
+    classifyObjectiveScreenshotError(
+      new Error("Protocol error (Page.captureScreenshot): failed"),
+      true,
+      "resolve_options",
+    ),
+    "other",
+  );
 
   const original = new Error("private-marker /tmp/private-path https://private.invalid/x");
   let attachment;
@@ -63,6 +83,27 @@ async function main() {
   assert.equal(JSON.stringify(payload).includes("private-marker"), false);
   assert.equal(JSON.stringify(payload).includes("private-path"), false);
   assert.equal(JSON.stringify(payload).includes("private.invalid"), false);
+
+  const resolverError = new Error("Test ended.");
+  let resolverScreenshotCalled = false;
+  let resolverFailureAttachment;
+  const resolverFailurePage = {
+    ...page,
+    screenshot: async () => {
+      resolverScreenshotCalled = true;
+      throw original;
+    },
+  };
+  await assert.rejects(
+    takeObjectiveScreenshotWithDiagnostics(resolverFailurePage, {
+      attach: async (name, options) => { resolverFailureAttachment = { name, options }; },
+    }, () => { throw resolverError; }),
+    (error) => error === resolverError,
+  );
+  assert.equal(resolverScreenshotCalled, false);
+  const resolverFailurePayload = JSON.parse(resolverFailureAttachment.options.body.toString("utf8"));
+  assert.equal(resolverFailurePayload.phase, "resolve_options");
+  assert.equal(resolverFailurePayload.category, "other");
 
   const viewportError = new Error("viewport query failed");
   let viewportScreenshotCalled = false;

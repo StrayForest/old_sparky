@@ -1150,19 +1150,24 @@ function failureTest(
     omitSourceLocation = false,
     attachments,
     results,
+    timeout,
+    duration,
   } = {},
 ) {
+  const result = {
+    status: "failed",
+    errors: [{ message: "private assertion text", location: errorLocation }],
+    attachments,
+  };
+  if (duration !== undefined) result.duration = duration;
   return {
     title,
     expectedStatus: "passed",
     parent: { project: () => ({ name: project }) },
-    results: results ?? [{
-      status: "failed",
-      errors: [{ message: "private assertion text", location: errorLocation }],
-      attachments,
-    }],
+    results: results ?? [result],
     outcome: () => "unexpected",
     location: omitSourceLocation ? undefined : { file: fixture.spec, line: 1, column: 1 },
+    timeout,
   };
 }
 
@@ -1354,7 +1359,7 @@ function validateEphemeralAndRetainedBrowserReportThroughGuard(reportPath) {
     "    bad_pair = 'objective_screenshot'",
     "else:",
     "    bad_pair = None",
-    "bad_cases = {'wrong_gate': lambda record: record.update({'id': 'csp_negative_probes'})}",
+    "bad_cases = {'unallowlisted_id': lambda record: record.update({'id': 'private_test_id'})}",
     "if bad_pair == 'browser_request_failures':",
     "    bad_cases.update({'missing_pair_member': lambda record: record.pop(bad_pair), 'malformed_pair': lambda record: record[bad_pair].update({'extra': True})})",
     "elif bad_pair == 'objective_screenshot':",
@@ -2121,6 +2126,108 @@ try {
     assert.equal(v2RequestBytes.includes(Buffer.from(privateValue)), false);
   }
 
+  const allPublicRequestFixture = diagnosticFixture(failureRoot, "rqall234");
+  const allPublicRequestAttachment = rawBrowserRequestFailureAttachment({
+    schema: 2,
+    coverage: "since_before_each",
+    failure_phase: "hook",
+    truncated: false,
+    events: [browserRequestFailureEventV2({
+      route_scope: "patch",
+      failure_route_scope: "other",
+      endpoint_family: "api_patch_content",
+      navigation_phase: "pending_route_change",
+    })],
+  });
+  const durationBudgetFixtures = [
+    { timeout: 1_000, duration: 499 },
+    { timeout: 1_000, duration: 500 },
+    { timeout: 1_000, duration: 890 },
+    { timeout: 1_000, duration: 900 },
+    { timeout: 1_000, duration: 990 },
+    { timeout: 1_000, duration: 1_000 },
+    { timeout: 0, duration: 750 },
+    { timeout: 1_000 },
+  ];
+  let durationBudgetFixtureIndex = 0;
+  const allPublicRequestPlan = publicTests.map((testCase) => {
+    if (
+      testCase.parent.project().name !== "live-desktop"
+      || testCase.outcome() === "skipped"
+    ) return testCase;
+    const budget = durationBudgetFixtures[durationBudgetFixtureIndex] ?? {};
+    durationBudgetFixtureIndex += 1;
+    return failureTest(allPublicRequestFixture, {
+      title: testCase.title,
+      project: "live-desktop",
+      omitSourceLocation: true,
+      attachments: [allPublicRequestAttachment],
+      ...budget,
+    });
+  });
+  const allPublicRequestSuite = { allTests: () => allPublicRequestPlan };
+  const allPublicRequestSummary = summarizeRun(
+    allPublicRequestSuite,
+    "failed",
+    { publicGate: true },
+  );
+  assert.ok(allPublicRequestSummary);
+  assert.equal(withRootOwnedGate(allPublicRequestFixture.gateRoot, () => writeBoundedSummary(
+    allPublicRequestFixture.binding,
+    allPublicRequestSummary,
+    { gateRoot: allPublicRequestFixture.gateRoot },
+  )), true);
+  assert.equal(withRootOwnedGate(allPublicRequestFixture.gateRoot, () => writeBoundedFailureSummary(
+    allPublicRequestFixture.binding,
+    allPublicRequestSuite,
+    allPublicRequestSummary,
+    { gateRoot: allPublicRequestFixture.gateRoot, sourceRoot: allPublicRequestFixture.sourceRoot },
+  )), true, "hook request failures are retained for every allowlisted failed public test");
+  const allPublicRequestBytes = fs.readFileSync(
+    path.join(allPublicRequestFixture.results, "live-failures-v2.json"),
+  );
+  const allPublicRequestReport = JSON.parse(allPublicRequestBytes.toString("ascii"));
+  const expectedPublicRequestFailures = publicTests.filter((testCase) => (
+    testCase.parent.project().name === "live-desktop" && testCase.outcome() !== "skipped"
+  ));
+  assert.equal(allPublicRequestReport.failures.length, expectedPublicRequestFailures.length);
+  assert.equal(
+    new Set(allPublicRequestReport.failures.map((record) => record.id)).size,
+    expectedPublicRequestFailures.length,
+    "the request attachment applies across the full allowlisted desktop failure-ID set",
+  );
+  assert.deepEqual(
+    allPublicRequestReport.failures.map((record) => [record.project, record.status, record.attempt]),
+    expectedPublicRequestFailures.map(() => ["live-desktop", "failed", 1]),
+    "request diagnostics remain bound to each generated failure identity tuple",
+  );
+  assert.ok(allPublicRequestReport.failures.every((record) => (
+    record.browser_request_failure_state === "captured"
+    && record.browser_request_failures?.schema === 2
+    && record.browser_request_failures.failure_phase === "hook"
+    && record.browser_request_failures.events.length === 1
+  )));
+  assert.deepEqual(
+    allPublicRequestReport.failures.slice(0, durationBudgetFixtures.length)
+      .map((record) => record.duration_vs_timeout ?? "unavailable"),
+    [
+      "under_50_percent", "50_to_89_percent", "50_to_89_percent",
+      "90_to_99_percent", "90_to_99_percent", "at_or_over_timeout",
+      "timeout_disabled", "unavailable",
+    ],
+    "attempt duration is represented only by the fixed timeout-relative buckets",
+  );
+  assert.ok(allPublicRequestReport.failures.slice(durationBudgetFixtures.length).every(
+    (record) => !Object.hasOwn(record, "duration_vs_timeout"),
+  ));
+  for (const privateValue of ["https://", "private-path", "private.host"]) {
+    assert.equal(allPublicRequestBytes.includes(Buffer.from(privateValue)), false);
+  }
+  const allPublicRequestGuard = validateEphemeralAndRetainedBrowserReportThroughGuard(
+    path.join(allPublicRequestFixture.results, "live-failures-v2.json"),
+  );
+  assert.equal(allPublicRequestGuard.status, 0, allPublicRequestGuard.stderr);
+
   const navigationFixture = diagnosticFixture(failureRoot, "nv1b3c4d");
   const navigationTitle = "live CSP nonce is stable on soft navigation and rotates on hard reload";
   const navigationFailure = failureTest(navigationFixture, {
@@ -2604,6 +2711,7 @@ try {
     const key = `${project}:${testCase.title}`;
     const failureResult = {
       status: "interrupted",
+      duration: 500,
       errors: [{
         message: "private assertion text",
         location: maxSourceLocation,
@@ -2614,6 +2722,7 @@ try {
       return failureTest(sizeFixture, {
         title: testCase.title,
         project,
+        timeout: 1_000,
         errorLocation: maxSourceLocation,
         attachments: [maxAttachment],
         results: [failureResult],
@@ -2630,6 +2739,7 @@ try {
       results: [failureResult, terminalSkip],
       outcome: () => "skipped",
       location: { file: sizeFixture.spec, line: 1, column: 1 },
+      timeout: 1_000,
     };
   });
   const fullFailureSummary = summarizeRun(
@@ -2662,6 +2772,18 @@ try {
   assert.ok(maximumReportBytes.length <= 16 * 1024 - 256);
   assert.equal(maximumReport.failures.length, 57);
   assert.ok(maximumReport.failures.every((failure) => failure.status === "interrupted"));
+  assert.ok(maximumReport.failures.some(
+    (failure) => Object.hasOwn(failure, "duration_vs_timeout"),
+  ), "the bounded stress report retains meaningful duration buckets when they fit");
+  assert.ok(maximumReport.failures.some(
+    (failure) => !Object.hasOwn(failure, "duration_vs_timeout"),
+  ), "the final byte compaction can remove optional duration buckets before identities");
+  assert.ok(maximumReport.failures.every((failure) => (
+    !Object.hasOwn(failure, "duration_vs_timeout")
+    || [
+      "under_50_percent", "50_to_89_percent", "90_to_99_percent", "at_or_over_timeout",
+    ].includes(failure.duration_vs_timeout)
+  )));
   assert.ok(maximumReport.failures.every((failure) => (
     failure.id === "image_csp_hosts"
     || (

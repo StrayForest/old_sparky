@@ -3154,12 +3154,16 @@ def _validate_objective_screenshot_evidence(record: Mapping[str, object]) -> Non
             "capture_timeout", "test_timeout", "browser_closed_or_crashed",
             "capture_unavailable", "page_navigating", "invalid_geometry",
             "output_eacces", "output_erofs", "output_enospc", "output_efbig",
-            "output_enoent", "other",
+            "output_enoent", "context_closed", "protocol_capture_error", "other",
         }
         or not isinstance(evidence.get("error_name"), str)
         or evidence.get("error_name") not in {"TimeoutError", "TargetClosedError", "Error", "unknown"}
         or not isinstance(evidence.get("phase"), str)
         or evidence.get("phase") not in {"capture"} | ({"resolve_options"} if "error_code" in evidence else set())
+        or (
+            evidence.get("category") in {"context_closed", "protocol_capture_error"}
+            and evidence.get("phase") != "capture"
+        )
         or (
             "error_code" in evidence
             and (
@@ -3915,6 +3919,8 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
         )
     ):
         raise GuardError("retained private browser diagnostics schema is invalid")
+
+
     seen: set[tuple[str, str, int]] = set()
     for failure in payload["failures"]:
         expected_failure_keys = {
@@ -3933,31 +3939,52 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
             )
         allowed_failure_key_sets = {frozenset(expected_failure_keys)}
         failure_id = failure.get("id") if isinstance(failure, dict) else None
+        browser_request_failure_keys = {
+            "browser_request_failure_state", "browser_request_failures",
+        }
+        if (
+            schema == 2
+            and failure_id in LIVE_BROWSER_FAILURE_DIAGNOSTIC_NAMES
+            and failure_id != "image_csp_hosts"
+        ):
+            allowed_failure_key_sets.add(
+                frozenset(expected_failure_keys | browser_request_failure_keys)
+            )
         if schema == 3:
             allowed_failure_key_sets.add(
                 frozenset(expected_failure_keys | {"browser_gate_state", "browser_gate"})
             )
         if schema == 2 and failure_id == "image_csp_hosts":
             image_keys = {"image_inventory_state", "image_inventory"}
-            request_failure_keys = {
-                "browser_request_failure_state", "browser_request_failures",
-            }
             allowed_failure_key_sets.update({
                 frozenset(expected_failure_keys | image_keys),
-                frozenset(expected_failure_keys | image_keys | request_failure_keys),
+                frozenset(expected_failure_keys | image_keys | browser_request_failure_keys),
             })
         if schema == 2 and failure_id == "objective_icons":
             screenshot_keys = {"objective_screenshot_state", "objective_screenshot"}
             allowed_failure_key_sets.add(frozenset(expected_failure_keys | screenshot_keys))
+            allowed_failure_key_sets.add(
+                frozenset(expected_failure_keys | screenshot_keys | browser_request_failure_keys)
+            )
         if schema == 2 and failure_id == "csp_nonce_rotation":
             navigation_keys = {"navigation_failure_state", "navigation_failure"}
             allowed_failure_key_sets.add(frozenset(expected_failure_keys | navigation_keys))
+            allowed_failure_key_sets.add(
+                frozenset(expected_failure_keys | navigation_keys | browser_request_failure_keys)
+            )
         if schema == 2 and failure_id == "patch_owner_sections":
             decoded_image_keys = {"decoded_image_failure_state", "decoded_image_failure"}
             allowed_failure_key_sets.add(frozenset(expected_failure_keys | decoded_image_keys))
+            allowed_failure_key_sets.add(
+                frozenset(expected_failure_keys | decoded_image_keys | browser_request_failure_keys)
+            )
         if (
             not isinstance(failure, dict)
-            or frozenset(failure) not in allowed_failure_key_sets
+            or (
+                frozenset(failure) not in allowed_failure_key_sets
+                and frozenset(set(failure) - {"duration_vs_timeout"})
+                not in allowed_failure_key_sets
+            )
             or not isinstance(failure.get("id"), str)
             or failure["id"] not in ({"live_user_journey"} if schema == 3 else LIVE_BROWSER_FAILURE_DIAGNOSTIC_NAMES)
             or not isinstance(failure.get("project"), str)
@@ -3975,6 +4002,7 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
             raise GuardError("retained private browser diagnostics record is duplicated")
         seen.add(key)
         if schema == 2:
+            _validate_failure_duration_vs_timeout(failure)
             _validate_page_error_evidence(failure)
             if "objective_screenshot_state" in failure or "objective_screenshot" in failure:
                 if failure.get("id") != "objective_icons":
@@ -3983,8 +4011,6 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
             if "image_inventory_state" in failure or "image_inventory" in failure:
                 _validate_image_inventory_evidence(failure)
             if "browser_request_failure_state" in failure or "browser_request_failures" in failure:
-                if failure.get("id") != "image_csp_hosts":
-                    raise GuardError("private browser request-failure evidence is bound to the wrong test")
                 _validate_browser_request_failure_evidence(failure)
             if "navigation_failure_state" in failure or "navigation_failure" in failure:
                 if failure.get("id") != "csp_nonce_rotation":
@@ -4048,6 +4074,17 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
             or source_kind not in allowed_source_kinds
         ):
             raise GuardError("retained private browser diagnostics location is invalid")
+
+
+def _validate_failure_duration_vs_timeout(record: Mapping[str, object]) -> None:
+    if "duration_vs_timeout" not in record:
+        return
+    value = record.get("duration_vs_timeout")
+    if not isinstance(value, str) or value not in {
+        "unavailable", "timeout_disabled", "under_50_percent",
+        "50_to_89_percent", "90_to_99_percent", "at_or_over_timeout",
+    }:
+        raise GuardError("private browser duration/timeout evidence is malformed")
 
 
 def _prune_browser_failure_diagnostics(*, reserve_slots: int) -> None:
@@ -4665,30 +4702,24 @@ def _read_ephemeral_failure_report(
         objective_screenshot_keys = {
             "objective_screenshot_state", "objective_screenshot",
         }
+        allowed_ephemeral_keys = {
+            frozenset(base_record_keys),
+            frozenset(base_record_keys | image_inventory_keys),
+            frozenset(base_record_keys | browser_request_failure_keys),
+            frozenset(base_record_keys | image_inventory_keys | browser_request_failure_keys),
+            frozenset(base_record_keys | objective_screenshot_keys),
+            frozenset(base_record_keys | objective_screenshot_keys | browser_request_failure_keys),
+            frozenset(base_record_keys | navigation_failure_keys),
+            frozenset(base_record_keys | navigation_failure_keys | browser_request_failure_keys),
+            frozenset(base_record_keys | decoded_image_failure_keys),
+            frozenset(base_record_keys | decoded_image_failure_keys | browser_request_failure_keys),
+        }
         if (
             not isinstance(record, dict)
             or (
-                set(record) != base_record_keys
-                and not (
-                    record.get("id") == "image_csp_hosts"
-                    and set(record) == base_record_keys | image_inventory_keys
-                )
-                and not (
-                    record.get("id") == "image_csp_hosts"
-                    and set(record) == base_record_keys | image_inventory_keys | browser_request_failure_keys
-                )
-                and not (
-                    record.get("id") == "objective_icons"
-                    and set(record) == base_record_keys | objective_screenshot_keys
-                )
-                and not (
-                    record.get("id") == "csp_nonce_rotation"
-                    and set(record) == base_record_keys | navigation_failure_keys
-                )
-                and not (
-                    record.get("id") == "patch_owner_sections"
-                    and set(record) == base_record_keys | decoded_image_failure_keys
-                )
+                frozenset(record) not in allowed_ephemeral_keys
+                and frozenset(set(record) - {"duration_vs_timeout"})
+                not in allowed_ephemeral_keys
             )
             or record.get("id") not in LIVE_BROWSER_FAILURE_DIAGNOSTIC_NAMES
             or record.get("project") not in {"live-desktop", "live-mobile", "live-webkit-mobile"}
@@ -4702,6 +4733,7 @@ def _read_ephemeral_failure_report(
             raise GuardError("ephemeral browser failure record is duplicated")
         seen.add(key)
         failure_status_counts[record["status"]] += 1
+        _validate_failure_duration_vs_timeout(record)
         _validate_page_error_evidence(record)
         if image_inventory_keys.issubset(record):
             _validate_image_inventory_evidence(record)

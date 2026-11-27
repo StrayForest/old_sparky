@@ -1217,7 +1217,12 @@ jobs:
                       else "failure_report_unavailable"
                   )
                   or diagnostic.get("failure_reason") != metadata.get("failure_reason")
-                  or logical["logical_fail"] != attempts["attempt_fail"]
+                  or (
+                      logical["logical_fail"]
+                      + logical["logical_expected_fail"]
+                      + logical["logical_flaky"]
+                      > attempts["attempt_fail"] + attempts["attempt_timedout"]
+                  )
                   or logical["logical_interrupted"] != attempts["attempt_interrupted"]
                   or attempts["attempt_fail"] + attempts["attempt_interrupted"] + attempts["attempt_timedout"] == 0
               ):
