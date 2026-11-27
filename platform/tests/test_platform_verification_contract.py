@@ -1716,9 +1716,9 @@ class PlatformVerificationContractTests(unittest.TestCase):
         self.assertIn("Verify every backend component result and catalog union", workflow)
         self.assertIn("--component-dir", workflow)
         duplicate_full_gate = workflow.replace(
-            "          .venv_platform/bin/python tools/platform_verify.py backend-privileged\n",
-            "          .venv_platform/bin/python tools/platform_verify.py backend-privileged\n"
-            "          .venv_platform/bin/python tools/platform_verify.py backend-privileged\n",
+            "            .venv_platform/bin/python tools/platform_verify.py backend-privileged \\\n",
+            "            .venv_platform/bin/python tools/platform_verify.py backend-privileged \\\n"
+            "            .venv_platform/bin/python tools/platform_verify.py backend-privileged \\\n",
             1,
         )
         self.assertTrue(
@@ -3136,6 +3136,17 @@ except lock.VerificationLockError as exc:
         self.assertIn('PLATFORM_RELEASE_PYTHON="$root_runtime_python"', builder_step["run"])
         self.assertIn('"$root_runtime_python" -m venv', builder_step["run"])
         privileged_job = workflow_data["jobs"]["backend-privileged"]
+        privileged_steps = privileged_job["steps"]
+        setup_node_index = next(
+            index for index, step in enumerate(privileged_steps)
+            if step.get("uses", "").startswith("actions/setup-node@")
+        )
+        setup_node_step = privileged_steps[setup_node_index]
+        self.assertEqual(
+            setup_node_step["uses"].split("@", 1)[1].split()[0],
+            "249970729cb0ef3589644e2896645e5dc5ba9c38",
+        )
+        self.assertEqual(setup_node_step["with"]["node-version"], "26.3.1")
         self.assertEqual(
             privileged_job["env"],
             {
@@ -3153,8 +3164,12 @@ except lock.VerificationLockError as exc:
         ):
             step = next(
                 item
-                for item in privileged_job["steps"]
+                for item in privileged_steps
                 if item.get("name") == step_name
+            )
+            self.assertGreater(
+                next(index for index, item in enumerate(privileged_steps) if item is step),
+                setup_node_index,
             )
             command = step["run"]
             self.assertIn("sudo -n env -i", command)
@@ -3165,6 +3180,9 @@ except lock.VerificationLockError as exc:
                 'GITHUB_ACTIONS="$GITHUB_ACTIONS"',
                 'RUNNER_OS="$RUNNER_OS"',
                 'RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT"',
+                'PLATFORM_NODE_BIN="$(command -v node)"',
+                'test -x "$PLATFORM_NODE_BIN"',
+                'PLATFORM_NODE_BIN="$PLATFORM_NODE_BIN"',
             ):
                 self.assertIn(identity, command)
             for env_reference in (
