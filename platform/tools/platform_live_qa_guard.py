@@ -3445,9 +3445,7 @@ def _validate_browser_request_failure_evidence(record: Mapping[str, object]) -> 
             raise GuardError("private browser request-failure event is malformed")
         if schema == 2 and (
             not isinstance(event.get("method"), str)
-            or event.get("method") not in {
-                "DELETE", "GET", "HEAD", "OPTIONS", "OTHER", "PATCH", "POST", "PUT",
-            }
+            or event.get("method") not in LIVE_USER_BROWSER_GATE_METHODS
             or not isinstance(event.get("failure_route_scope"), str)
             or event.get("failure_route_scope") not in {
                 "home", "patch", "tournaments", "other", "unknown",
