@@ -110,6 +110,7 @@ class HostToolsBundleTests(unittest.TestCase):
                 "id": 3, "name": "Verify immutable production host capabilities",
                 "status": "completed", "conclusion": "failure",
                 "steps": [{
+                    "number": 5,
                     "name": "Validate root SSH identity and installed generation",
                     "status": "completed", "conclusion": "failure",
                 }],
@@ -394,6 +395,180 @@ class HostToolsBundleTests(unittest.TestCase):
             b"2026-11-27T00:00:02.000Z ##[error]Process completed with exit code 10.\n"
         )
         self.assertEqual(operator_provisioner.parse_missing_generation_log(actual), hashlib.sha256(actual).hexdigest())
+        per_step = (
+            b"2026-11-27T00:00:00.000Z echo 'Exact host-tools generation is not installed yet.'\n"
+            b"2026-11-27T00:00:00.000Z ##[endgroup]\n"
+            b"2026-11-27T00:00:01.000Z Exact host-tools generation is not installed yet.\n"
+            b"2026-11-27T00:00:02.000Z ##[error]Process completed with exit code 10.\n"
+        )
+        self.assertEqual(operator_provisioner.parse_missing_generation_log(per_step), hashlib.sha256(per_step).hexdigest())
+        unframed = (
+            b"2026-11-27T00:00:01.000Z Exact host-tools generation is not installed yet.\n"
+            b"2026-11-27T00:00:02.000Z ##[error]Process completed with exit code 10.\n"
+        )
+        self.assertEqual(operator_provisioner.parse_missing_generation_log(unframed), hashlib.sha256(unframed).hexdigest())
+        malformed = per_step.replace(b"##[endgroup]\n", b"##[endgroup]\n##[endgroup]\n")
+        with self.assertRaisesRegex(operator_provisioner.ProvisionError, "failed_step_log_group_malformed"):
+            operator_provisioner.parse_missing_generation_log(malformed)
+        unexpected_before_group = per_step.replace(
+            b"##[endgroup]\n", b"##[error]Unexpected failure\n##[endgroup]\n",
+        )
+        with self.assertRaisesRegex(operator_provisioner.ProvisionError, "failed_step_log_unexpected_error"):
+            operator_provisioner.parse_missing_generation_log(unexpected_before_group)
+        unexpected_after_group = per_step.replace(
+            b"##[error]Process completed with exit code 10.\n",
+            b"##[error]Unexpected failure\n##[error]Process completed with exit code 10.\n",
+        )
+        with self.assertRaisesRegex(operator_provisioner.ProvisionError, "failed_step_log_unexpected_error"):
+            operator_provisioner.parse_missing_generation_log(unexpected_after_group)
+
+    def test_operator_gh_binary_download_streams_exact_bytes_without_output_flag(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="host-tools-gh-output-") as temporary:
+            root = Path(temporary)
+            gh = root / "bin/gh"
+            gh.parent.mkdir(mode=0o755)
+            gh.write_text(
+                "#!/bin/sh\n"
+                "for arg do [ \"$arg\" = --output ] && { echo unsupported >&2; exit 90; }; done\n"
+                "printf '\\000\\377\\033[31mbinary\\n'\n",
+                encoding="ascii",
+            )
+            gh.chmod(0o700)
+            destination = root / "download.zip"
+            args = ["api", "--hostname", "github.com", "repos/StrayForest/old_sparky/actions/artifacts/123/zip"]
+            real_writer = operator_provisioner._run_bounded_output_to_file
+            invoked: list[list[str]] = []
+
+            def test_writer(argv: list[str], output: Path, **kwargs: object) -> None:
+                invoked.append(argv)
+                real_writer(argv, output, expected_uid=os.geteuid(), **kwargs)
+
+            real_lstat = Path.lstat
+
+            def root_owned_gh(path: Path) -> SimpleNamespace | os.stat_result:
+                metadata = real_lstat(path)
+                if path in {gh, gh.parent, root}:
+                    return SimpleNamespace(
+                        st_mode=metadata.st_mode, st_uid=0, st_gid=0, st_nlink=metadata.st_nlink,
+                        st_size=metadata.st_size, st_dev=metadata.st_dev, st_ino=metadata.st_ino,
+                        st_mtime_ns=metadata.st_mtime_ns, st_ctime_ns=metadata.st_ctime_ns,
+                    )
+                return metadata
+
+            with patch.object(Path, "lstat", autospec=True, side_effect=root_owned_gh), patch.object(
+                operator_provisioner, "_run_bounded_output_to_file", side_effect=test_writer,
+            ):
+                gh.chmod(0o755)
+                with self.assertRaisesRegex(operator_provisioner.ProvisionError, "pinned_gh_metadata"):
+                    operator_provisioner.call_gh(gh, args, output=destination, output_limit=64)
+                self.assertFalse(destination.exists())
+                gh.chmod(0o700)
+                self.assertEqual(
+                    operator_provisioner.call_gh(gh, args, output=destination, output_limit=64), b"",
+                )
+            self.assertEqual(invoked, [[str(gh), *args, "--allow-escape-sequences"]])
+            self.assertNotIn("--output", invoked[0])
+            self.assertEqual(invoked[0].count("--allow-escape-sequences"), 1)
+            self.assertEqual(destination.read_bytes(), b"\x00\xff\x1b[31mbinary\n")
+            info = destination.lstat()
+            self.assertEqual(stat.S_IMODE(info.st_mode), 0o600)
+            self.assertEqual(info.st_nlink, 1)
+
+    def test_operator_verify_gh_checks_private_binary_mode_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="host-tools-gh-verify-") as temporary:
+            root = Path(temporary)
+            gh = root / "bin/gh"
+            gh.parent.mkdir(mode=0o755)
+            gh.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+            gh.chmod(0o700)
+            real_lstat = Path.lstat
+
+            def root_owned_gh(path: Path) -> SimpleNamespace | os.stat_result:
+                metadata = real_lstat(path)
+                if path in {gh, gh.parent, root}:
+                    return SimpleNamespace(
+                        st_mode=metadata.st_mode, st_uid=0, st_gid=0, st_nlink=metadata.st_nlink,
+                        st_size=metadata.st_size, st_dev=metadata.st_dev, st_ino=metadata.st_ino,
+                        st_mtime_ns=metadata.st_mtime_ns, st_ctime_ns=metadata.st_ctime_ns,
+                    )
+                return metadata
+
+            with patch.object(Path, "lstat", autospec=True, side_effect=root_owned_gh):
+                gh.chmod(0o755)
+                with patch.object(operator_provisioner, "safe_run") as safe_run:
+                    with self.assertRaisesRegex(operator_provisioner.ProvisionError, "pinned_gh_metadata"):
+                        operator_provisioner.verify_gh(gh)
+                    safe_run.assert_not_called()
+
+                gh.chmod(0o700)
+                with patch.object(
+                    operator_provisioner,
+                    "safe_run",
+                    side_effect=[
+                        subprocess.CompletedProcess([str(gh), "version"], 0, b"gh version 2.105.0 test\n", b""),
+                        subprocess.CompletedProcess([str(gh), "attestation", "verify", "--help"], 0, b"help\n", b""),
+                    ],
+                ) as safe_run:
+                    operator_provisioner.verify_gh(gh)
+                    self.assertEqual(safe_run.call_count, 2)
+
+    def test_operator_gh_binary_download_enforces_bound_during_stream(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="host-tools-gh-bound-") as temporary:
+            root = Path(temporary)
+            child = root / "emit"
+            child.write_text("#!/bin/sh\nprintf 12345\n", encoding="ascii")
+            child.chmod(0o755)
+            output = root / "output.zip"
+            with self.assertRaisesRegex(
+                operator_provisioner.ProvisionError, "github_api_download_output_bound",
+            ):
+                operator_provisioner._run_bounded_output_to_file(
+                    [str(child)], output, output_limit=4, timeout=5, env={}, expected_uid=os.geteuid(),
+                )
+            self.assertFalse(output.exists())
+
+    def test_operator_gh_binary_download_cleans_failure_timeout_and_preserves_existing_paths(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="host-tools-gh-failure-") as temporary:
+            root = Path(temporary)
+            child = root / "emit"
+            child.write_text("#!/bin/sh\nprintf partial\necho private-diagnostic >&2\nexit 7\n", encoding="ascii")
+            child.chmod(0o755)
+            output = root / "failed.zip"
+            with self.assertRaisesRegex(operator_provisioner.ProvisionError, "github_api_download_failed") as failure:
+                operator_provisioner._run_bounded_output_to_file(
+                    [str(child)], output, output_limit=32, timeout=5, env={}, expected_uid=os.geteuid(),
+                )
+            self.assertNotIn("private-diagnostic", str(failure.exception))
+            self.assertFalse(output.exists())
+
+            child.write_text("#!/bin/sh\nprintf partial\nsleep 5\n", encoding="ascii")
+            with self.assertRaisesRegex(operator_provisioner.ProvisionError, "github_api_download_timeout"):
+                operator_provisioner._run_bounded_output_to_file(
+                    [str(child)], output, output_limit=32, timeout=1, env={}, expected_uid=os.geteuid(),
+                )
+            self.assertFalse(output.exists())
+
+            sentinel = root / "sentinel.zip"
+            sentinel.write_bytes(b"preserve me")
+            with self.assertRaisesRegex(
+                operator_provisioner.ProvisionError, "github_api_download_destination_exists",
+            ):
+                operator_provisioner._run_bounded_output_to_file(
+                    [str(child)], sentinel, output_limit=32, timeout=1, env={}, expected_uid=os.geteuid(),
+                )
+            self.assertEqual(sentinel.read_bytes(), b"preserve me")
+
+            target = root / "target.zip"
+            target.write_bytes(b"preserve target")
+            link = root / "link.zip"
+            link.symlink_to(target)
+            with self.assertRaisesRegex(
+                operator_provisioner.ProvisionError, "github_api_download_destination_exists",
+            ):
+                operator_provisioner._run_bounded_output_to_file(
+                    [str(child)], link, output_limit=32, timeout=1, env={}, expected_uid=os.geteuid(),
+                )
+            self.assertEqual(target.read_bytes(), b"preserve target")
 
     def test_operator_rejects_partial_artifact_owner_account(self) -> None:
         existing = SimpleNamespace(pw_uid=700, pw_gid=701, pw_dir="/nonexistent", pw_shell="/usr/sbin/nologin")
@@ -407,6 +582,112 @@ class HostToolsBundleTests(unittest.TestCase):
         jobs = self._preflight_jobs_fixture()
         result = operator_provisioner.verify_preflight_job_set(jobs, mode="preflight")
         self.assertEqual(result["failed_job_id"], 3)
+
+        masked_jobs = self._preflight_jobs_fixture()
+        masked_jobs[2]["steps"][0]["name"] = "Validate *** SSH identity and installed generation"
+        self.assertEqual(
+            operator_provisioner.verify_preflight_job_set(masked_jobs, mode="preflight")["failed_job_id"], 3,
+        )
+
+        for bad_name in (
+            "Validate **** SSH identity and installed generation",
+            "Validate root SSH identity and installed generation (masked)",
+        ):
+            invalid_jobs = self._preflight_jobs_fixture()
+            invalid_jobs[2]["steps"][0]["name"] = bad_name
+            with self.subTest(step_name=bad_name), self.assertRaisesRegex(
+                operator_provisioner.ProvisionError, "preflight_failed_step_mismatch",
+            ):
+                operator_provisioner.verify_preflight_job_set(invalid_jobs, mode="preflight")
+
+        duplicate_failed_steps = self._preflight_jobs_fixture()
+        duplicate_failed_steps[2]["steps"].append({
+            "number": 6,
+            "name": "Validate *** SSH identity and installed generation",
+            "status": "completed", "conclusion": "failure",
+        })
+        with self.assertRaisesRegex(operator_provisioner.ProvisionError, "preflight_failed_step_mismatch"):
+            operator_provisioner.verify_preflight_job_set(duplicate_failed_steps, mode="preflight")
+
+        cancelled_alias_step = self._preflight_jobs_fixture()
+        cancelled_alias_step[2]["steps"].append({
+            "number": 6,
+            "name": "Validate *** SSH identity and installed generation",
+            "status": "completed", "conclusion": "cancelled",
+        })
+        with self.assertRaisesRegex(operator_provisioner.ProvisionError, "preflight_other_step_failure"):
+            operator_provisioner.verify_preflight_job_set(cancelled_alias_step, mode="preflight")
+
+        self.assertEqual(result["failed_step_number"], 5)
+        for number in (True, 0, -1, "5", 5.0, None):
+            invalid_number_jobs = self._preflight_jobs_fixture()
+            invalid_number_jobs[2]["steps"][0]["number"] = number
+            with self.subTest(step_number=number), self.assertRaisesRegex(
+                operator_provisioner.ProvisionError, "preflight_failed_step_number",
+            ):
+                operator_provisioner.verify_preflight_job_set(invalid_number_jobs, mode="preflight")
+
+        high_step_number = self._preflight_jobs_fixture()
+        high_step_number[2]["steps"][0]["number"] = 101
+        self.assertEqual(
+            operator_provisioner.verify_preflight_job_set(high_step_number, mode="preflight")["failed_step_number"],
+            101,
+        )
+
+        duplicate_numbers = self._preflight_jobs_fixture()
+        duplicate_numbers[2]["steps"].append({
+            "number": 5, "name": "Another step", "status": "completed", "conclusion": "success",
+        })
+        with self.assertRaisesRegex(operator_provisioner.ProvisionError, "preflight_failed_step_number"):
+            operator_provisioner.verify_preflight_job_set(duplicate_numbers, mode="preflight")
+
+        with tempfile.TemporaryDirectory(prefix="host-tools-failed-step-log-") as temporary:
+            scratch = Path(temporary)
+            response = (
+                b"##[group]Run verify generation\n##[endgroup]\n"
+                b"Exact host-tools generation is not installed yet.\n"
+                b"##[error]Process completed with exit code 10.\n"
+            )
+            calls: list[tuple[list[str], Path, int]] = []
+
+            def write_step_response(
+                gh: Path, args: list[str], *, output: Path, output_limit: int, **kwargs: object,
+            ) -> bytes:
+                calls.append((args, output, output_limit))
+                output.write_bytes(response)
+                output.chmod(0o600)
+                return b""
+
+            with patch.object(operator_provisioner, "call_gh", side_effect=write_step_response):
+                raw = operator_provisioner.fetch_failed_step_log(
+                    Path("/pinned/gh"), scratch,
+                    job_id=result["failed_job_id"], step_number=result["failed_step_number"],
+                )
+            self.assertEqual(raw, response)
+            log_sha = hashlib.sha256(response).hexdigest()
+            self.assertEqual(
+                calls[0][0][-1], f"repos/{operator_provisioner.REPOSITORY}/actions/jobs/3/steps/5/logs",
+            )
+            self.assertEqual(calls[0][0][3:5], ["--header", "X-GitHub-Api-Version: 2026-03-10"])
+            self.assertEqual(calls[0][2], 2 * 1024 * 1024)
+            self.assertEqual(operator_provisioner.parse_missing_generation_log(raw), log_sha)
+
+            (scratch / "failed-step.log").unlink()
+
+            def write_oversized_step_response(
+                gh: Path, args: list[str], *, output: Path, output_limit: int, **kwargs: object,
+            ) -> bytes:
+                output.write_bytes(b"x" * (output_limit + 1))
+                output.chmod(0o600)
+                return b""
+
+            with patch.object(operator_provisioner, "call_gh", side_effect=write_oversized_step_response), self.assertRaisesRegex(
+                operator_provisioner.ProvisionError, "input_file_metadata",
+            ):
+                operator_provisioner.fetch_failed_step_log(
+                    Path("/pinned/gh"), scratch, job_id=3, step_number=5,
+                )
+
         with self.assertRaisesRegex(operator_provisioner.ProvisionError, "preflight_mode_not_proven"):
             operator_provisioner.verify_preflight_job_set(jobs, mode="deploy")
         jobs.append({"id": 99, "name": "Unrelated skipped gate", "status": "completed", "conclusion": "skipped"})
@@ -2121,7 +2402,7 @@ class HostToolsBundleTests(unittest.TestCase):
         flattened = self._flattened_release_pin_fixture(root / "flattened")
         shutil.copytree(flattened / "tools", release / "tools")
         shutil.copytree(flattened / "contracts", release / "contracts")
-        (release / "contracts/host_tools_pin.json").chmod(0o444)
+        (release / "contracts/host_tools_pin.json").chmod(0o644)
         receipt = {"artifact_format_version": 1, "release_slug": release.name, "source_git_commit": source_sha}
         (release / "RELEASE.json").write_text(
             json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii",
@@ -2239,6 +2520,21 @@ class HostToolsBundleTests(unittest.TestCase):
                         source_root, target_sha=target_sha, target_host_tools_sha=target_host_sha, app_root=app,
                         generation_root=generation_root,
                     )
+            pin_path = app / "releases/active-release/contracts/host_tools_pin.json"
+            for mode in (0o444, 0o600, 0o664):
+                with self.subTest(pin_mode=oct(mode)):
+                    pin_path.chmod(mode)
+                    try:
+                        with self._operator_root_owner_fixture(source_root, app):
+                            with self.assertRaisesRegex(
+                                operator_provisioner.ProvisionError, "input_file_metadata",
+                            ):
+                                operator_provisioner.active_lock_bootstrap(
+                                    source_root, target_sha=target_sha, target_host_tools_sha=target_host_sha,
+                                    app_root=app, generation_root=generation_root,
+                                )
+                    finally:
+                        pin_path.chmod(0o644)
             with self._operator_root_owner_fixture(source_root, app):
                 snapshot = operator_provisioner.active_lock_bootstrap(
                     source_root, target_sha=target_sha, target_host_tools_sha=target_host_sha, app_root=app,
@@ -2327,17 +2623,13 @@ class HostToolsBundleTests(unittest.TestCase):
                 pin_path = app / "releases/active-release/contracts/host_tools_pin.json"
                 active_pin = json.loads(pin_path.read_text(encoding="ascii"))
                 active_pin["host_tools_sha"] = target_host_sha
-                os.chmod(pin_path, 0o644)
                 pin_path.write_text(json.dumps(active_pin, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
-                os.chmod(pin_path, 0o444)
                 with self.assertRaisesRegex(operator_provisioner.ProvisionError, "active_pin_target_mismatch"):
                     operator_provisioner.revalidate_active_lock_bootstrap(
                         source_root, target_sha=target_sha, target_host_tools_sha=target_host_sha, expected=snapshot,
                         app_root=app, generation_root=generation_root,
                     )
-                os.chmod(pin_path, 0o644)
                 pin_path.write_text(json.dumps(pin._read_pin(REPO_ROOT), sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
-                os.chmod(pin_path, 0o444)
                 lock_helper = generation_root / PIN_SHA / "platform_release_lock.sh"
                 os.chmod(lock_helper, 0o644)
                 lock_helper.write_bytes(lock_helper.read_bytes() + b"\n# drift\n")
@@ -3622,6 +3914,37 @@ class HostToolsBundleTests(unittest.TestCase):
             verified = bundle.verify_bundle(archive, expected_source_sha=SOURCE_SHA)
             contract = root / "contract"
             bundle.write_contract_files(verified, contract)
+            raw_contracts = {
+                f"contract/{path.name}": path.read_bytes()
+                for path in contract.iterdir()
+                if path.is_file()
+            }
+            validated = operator_provisioner.validate_bundle_contract(
+                archive, raw_contracts, SOURCE_SHA, REPO_ROOT,
+            )
+            self.assertEqual(validated[0], verified["manifest"])
+
+            mode_lines = raw_contracts["contract/files.modes"].splitlines()
+            malformed_modes = dict(raw_contracts)
+            malformed_modes["contract/files.modes"] = mode_lines[0].replace(b"  ", b" ", 1) + b"\n" + b"\n".join(mode_lines[1:]) + b"\n"
+            with self.assertRaisesRegex(
+                operator_provisioner.ProvisionError, "outer_modes_contract_invalid",
+            ):
+                operator_provisioner.validate_bundle_contract(archive, malformed_modes, SOURCE_SHA, REPO_ROOT)
+
+            noncanonical_modes = dict(raw_contracts)
+            noncanonical_modes["contract/files.modes"] = b"0" + raw_contracts["contract/files.modes"]
+            with self.assertRaisesRegex(
+                operator_provisioner.ProvisionError, "outer_modes_contract_invalid",
+            ):
+                operator_provisioner.validate_bundle_contract(archive, noncanonical_modes, SOURCE_SHA, REPO_ROOT)
+
+            duplicate_modes = dict(raw_contracts)
+            duplicate_modes["contract/files.modes"] += mode_lines[0] + b"\n"
+            with self.assertRaisesRegex(
+                operator_provisioner.ProvisionError, "outer_modes_contract_duplicate",
+            ):
+                operator_provisioner.validate_bundle_contract(archive, duplicate_modes, SOURCE_SHA, REPO_ROOT)
 
             manifest = summary["manifest"]
             self.assertIsInstance(manifest, dict)

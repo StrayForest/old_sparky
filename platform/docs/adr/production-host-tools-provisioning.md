@@ -152,11 +152,10 @@ application-SHA fallback.
 The generation directory is `root:root`, regular, link-count 2 and mode
 `0555`.  Every member is a root-owned regular file with link-count 1 and mode
 `0555` (the manifest and capability data are still non-executable `0444`
-content contracts).  The bundle manifest binds the source SHA, toolset version,
-component closure, capabilities, POSIX-relative filenames, numeric Unix modes
-and SHA-256 digests.  The generated `files.modes` sidecar serializes those
-modes as the conventional octal text emitted by `stat -c %a` (`444`/`555`) for
-shell preflight consumers. Its three components are kept explicit:
+content contracts). The manifest binds source SHA, toolset, closure,
+capabilities, POSIX paths, numeric modes and SHA-256 digests. Its
+`files.modes` sidecar uses octal `stat -c %a` text (`444`/`555`) with exactly
+two spaces between mode and path. Its three components are explicit:
 
 - `prepare_artifact`: the fixed dispatcher, input guard and artifact-directory
 helper;
@@ -338,15 +337,16 @@ resolver, bundle verifier and `platform/contracts/host_tools_pin.json` to **P**'
 tree bytes/modes, root-owned regular-file identities, fixed non-writable
 parents and no-follow stable reads. Missing or substituted paths fail even if
 Git hides them. Builder, bundle upload, attestation and dispatch validation
-must succeed. The only failure may be job `Verify immutable production host
-capabilities`, step `Validate root SSH identity and installed generation`.
-Its log must show the actual missing-**C** diagnostic and terminal 10 outside
-the echoed shell-source group; any other failure, skip, missing log or
-ambiguous binding aborts.
+must succeed. The sole failed job/step pair may be `Verify immutable production
+host capabilities` / `Validate root SSH identity and installed generation`; the
+API may redact the label only as `Validate *** SSH identity and installed generation`.
+Use its unique positive `steps[].number` to fetch only per-step plain text with
+pinned CLI API version `2026-03-10`, into private `0600` output capped at 2 MiB
+(`--allow-escape-sequences` only for that file capture). Require the exact
+missing-**C** diagnostic followed by terminal 10 outside echoed source; any
+extra error, skip, missing log or ambiguous binding aborts.
 
-The eligible missing-**C** gate makes the producer attempt fail. After
-installation, a separate fresh same-**P** preflight must pass fully, including
-installed host capability.
+After install, a fresh same-**P** preflight must pass fully, including installed host capability.
 
 Use that preflight's bundle name `platform-host-tools-bundle-<run-id>-<attempt>`
 and input name `platform-production-deploy-input-<run-id>-<attempt>`. The helper
@@ -382,10 +382,10 @@ test "$("$GH" api repos/StrayForest/old_sparky/commits/dev --jq .sha)" = "$TARGE
   --operator-change-id "$OPERATOR_CHANGE_ID"
 ```
 
-Before locking, the helper binds active release source (ancestor of **P**) and app pin,
-then verifies pin/generation through `platform_host_tools_pin.validate_release_pin` and
-`platform_host_tools_bundle.verify_installed_generation`, including every installed digest.
-It requires active v4 and runs only that generation's lock helper, never `current/tools`.
+Before locking, bind active release source (ancestor of **P**) and the app pin
+at exact mode `0644`; verify the pin via `platform_host_tools_pin.validate_release_pin`
+and active v4 generation via `platform_host_tools_bundle.verify_installed_generation`,
+including all digests. Run only that generation's lock helper, never `current/tools`.
 Under lock it rechecks the snapshot and validates release/service/disk/source, `dev` and
 **P**→**C**; active v3 or any drift fails closed before publication.
 It accepts a valid `oldsparky-load-artifacts` account or creates both user and group when absent; partial/invalid accounts abort, and only the old generation's bound `owner` command runs.
@@ -399,9 +399,9 @@ identity is uncertain, it stops without deleting that path.
 
 Success prints generation inode, receipt path and SHA-256. The root-only receipt is
 `/root/.oldsparky/host-tools-provision-<preflight-run-id>-<attempt>/provisioning-receipt.json`.
-binds active source/pin/lock identity, producer runs and artifacts,
-outer/inner/attestation/manifest digests, self-test and published inode; its
-digest is separate, not self-referential. Temporary downloads
+It binds active source/pin/lock identity, producer runs and artifacts,
+outer/inner/attestation/manifest and `missing_generation_step_sha256` digests,
+self-test and published inode; its digest is separate, not self-referential. Temporary downloads
 and logs are removed. Before rename, inspect only fixed stage/receipt paths
 before a new authorized attempt. On uncertain post-rename identity, stop and
 use release recovery; never glob-delete or change permissions to retry.

@@ -23,6 +23,8 @@ import os
 from pathlib import Path
 import pwd
 import re
+import selectors
+import signal
 import shutil
 import spwd
 import stat
@@ -57,6 +59,11 @@ CAPABILITIES_OUTPUT_RE = re.compile(
     rb"release_baseline=1 retained_load_export_cleanup=1 retained_load_source_binding=1 "
     rb"cpu_diagnostic_plan_control=1 python_isolated=1 python_bytecode_disabled=1\n"
 )
+MAX_PREFLIGHT_STEPS = 100
+PREFLIGHT_FAILURE_STEP_NAMES = frozenset({
+    "Validate root SSH identity and installed generation",
+    "Validate *** SSH identity and installed generation",
+})
 TRUSTED_SOURCE_PATHS = (
     "platform/tools/platform_host_tools_provision_operator.py",
     "platform/tools/platform_host_tools_pin.py",
@@ -147,14 +154,7 @@ def checked_file(path: Path, *, mode: int | None, max_bytes: int, root_owned: bo
 def safe_run(
     argv: list[str], *, env: dict[str, str] | None = None, timeout: int = 30, output_limit: int = 2_000_000
 ) -> subprocess.CompletedProcess[bytes]:
-    clean_env = {
-        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
-        "HOME": "/root",
-        "LC_ALL": "C",
-        "PYTHONDONTWRITEBYTECODE": "1",
-    }
-    if env:
-        clean_env.update(env)
+    clean_env = _safe_command_environment(env)
     try:
         result = subprocess.run(
             argv,
@@ -172,46 +172,201 @@ def safe_run(
     return result
 
 
+def _safe_command_environment(env: dict[str, str] | None = None) -> dict[str, str]:
+    clean_env = {
+        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+        "HOME": "/root",
+        "LC_ALL": "C",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    if env:
+        clean_env.update(env)
+    return clean_env
+
+
 def gh_auth_environment() -> dict[str, str]:
     """Forward GH credentials only to the official CLI; never print or persist them."""
     return {name: os.environ[name] for name in ("GH_TOKEN", "GITHUB_TOKEN") if os.environ.get(name)}
+
+
+def _run_bounded_output_to_file(
+    argv: list[str], output: Path, *, output_limit: int, timeout: int, env: dict[str, str],
+    expected_uid: int = 0,
+) -> None:
+    """Stream bounded binary stdout into one new private file without exposing diagnostics."""
+    if output_limit <= 0 or timeout <= 0:
+        stop("github_api_download_bounds_invalid")
+    try:
+        parent = output.parent.lstat()
+    except OSError:
+        stop("github_api_download_destination")
+    if (
+        not stat.S_ISDIR(parent.st_mode) or stat.S_ISLNK(parent.st_mode)
+        or parent.st_uid != expected_uid or stat.S_IMODE(parent.st_mode) != 0o700
+    ):
+        stop("github_api_download_destination")
+    descriptor = -1
+    created_identity: tuple[int, int] | None = None
+    process: subprocess.Popen[bytes] | None = None
+    selector = selectors.DefaultSelector()
+    written = 0
+    stderr_size = 0
+    completed = False
+    try:
+        descriptor = os.open(
+            output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600,
+        )
+        initial = os.fstat(descriptor)
+        created_identity = (initial.st_dev, initial.st_ino)
+        os.fchmod(descriptor, 0o600)
+        initial = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(initial.st_mode) or initial.st_uid != expected_uid
+            or initial.st_nlink != 1 or stat.S_IMODE(initial.st_mode) != 0o600
+            or initial.st_size != 0
+        ):
+            stop("github_api_download_destination")
+        process = subprocess.Popen(
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            close_fds=True, start_new_session=True, env=_safe_command_environment(env),
+        )
+        if process.stdout is None or process.stderr is None:
+            stop("github_api_download_failed")
+        deadline = time.monotonic() + timeout
+        for stream, label in ((process.stdout, "stdout"), (process.stderr, "stderr")):
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream.fileno(), selectors.EVENT_READ, label)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            events = selector.select(remaining) if remaining > 0 else []
+            if not events:
+                stop("github_api_download_timeout")
+            for key, _ in events:
+                try:
+                    chunk = os.read(key.fd, 65536)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fd)
+                    continue
+                if key.data == "stdout":
+                    if written + len(chunk) > output_limit:
+                        stop("github_api_download_output_bound")
+                    view = memoryview(chunk)
+                    while view:
+                        count = os.write(descriptor, view)
+                        if count <= 0:
+                            stop("github_api_download_write_failed")
+                        written += count
+                        view = view[count:]
+                else:
+                    stderr_size += len(chunk)
+                    if stderr_size > 65536:
+                        stop("github_api_download_stderr_bound")
+        try:
+            returncode = process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            stop("github_api_download_timeout")
+        if returncode != 0 or stderr_size:
+            stop("github_api_download_failed")
+        os.fsync(descriptor)
+        final = os.fstat(descriptor)
+        path_info = output.lstat()
+        if (
+            (final.st_dev, final.st_ino) != created_identity
+            or (path_info.st_dev, path_info.st_ino) != created_identity
+            or not stat.S_ISREG(final.st_mode) or stat.S_ISLNK(path_info.st_mode)
+            or final.st_uid != expected_uid or path_info.st_uid != expected_uid
+            or final.st_nlink != 1 or path_info.st_nlink != 1
+            or stat.S_IMODE(final.st_mode) != 0o600 or stat.S_IMODE(path_info.st_mode) != 0o600
+            or final.st_size != written or path_info.st_size != written
+        ):
+            stop("github_api_download_identity")
+        os.close(descriptor)
+        descriptor = -1
+        completed = True
+    except FileExistsError:
+        stop("github_api_download_destination_exists")
+    except ProvisionError:
+        raise
+    except (OSError, subprocess.SubprocessError):
+        stop("github_api_download_failed")
+    finally:
+        selector.close()
+        if process is not None and not completed:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=0.25)
+            except subprocess.TimeoutExpired:
+                pass
+            time.sleep(0.25)
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            if process.poll() is None:
+                process.wait()
+        if process is not None:
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+        if descriptor >= 0:
+            os.close(descriptor)
+        if created_identity is not None and not completed:
+            try:
+                current = output.lstat()
+                if (current.st_dev, current.st_ino) == created_identity:
+                    output.unlink()
+            except OSError:
+                pass
+
+
+def _verify_pinned_gh(gh: Path) -> None:
+    try:
+        metadata = gh.lstat()
+        parent = gh.parent.lstat()
+        grandparent = gh.parent.parent.lstat()
+    except OSError:
+        stop("pinned_gh_metadata")
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or metadata.st_nlink != 1
+        or not stat.S_ISDIR(parent.st_mode)
+        or stat.S_ISLNK(parent.st_mode)
+        or parent.st_uid != 0
+        or stat.S_IMODE(parent.st_mode) & 0o022
+        or grandparent.st_uid != 0
+        or stat.S_IMODE(grandparent.st_mode) != 0o700
+    ):
+        stop("pinned_gh_metadata")
 
 
 def call_gh(
     gh: Path, args: list[str], *, output: Path | None = None, timeout: int = 45,
     output_limit: int = 2_000_000,
 ) -> bytes:
-    metadata = gh.lstat()
-    parent = gh.parent.lstat()
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or stat.S_ISLNK(metadata.st_mode)
-        or metadata.st_uid != 0
-        or stat.S_IMODE(metadata.st_mode) != 0o755
-        or metadata.st_nlink != 1
-        or not stat.S_ISDIR(parent.st_mode)
-        or stat.S_ISLNK(parent.st_mode)
-        or parent.st_uid != 0
-        or stat.S_IMODE(parent.st_mode) & 0o022
-        or parent.parent.lstat().st_uid != 0
-        or stat.S_IMODE(parent.parent.lstat().st_mode) != 0o700
-    ):
-        stop("pinned_gh_metadata")
+    _verify_pinned_gh(gh)
     if output is None:
         result = safe_run([str(gh), *args], timeout=timeout, output_limit=output_limit, env=gh_auth_environment())
         if result.returncode != 0 or result.stderr:
             stop("github_api_read_failed")
         return result.stdout
-    result = safe_run(
-        [str(gh), *args, "--output", str(output)], timeout=timeout,
-        output_limit=0, env=gh_auth_environment(),
+    _run_bounded_output_to_file(
+        [str(gh), *args, "--allow-escape-sequences"], output,
+        output_limit=output_limit, timeout=timeout, env=gh_auth_environment(),
     )
-    if result.returncode != 0 or result.stderr:
-        stop("github_api_download_failed")
     return b""
 
 
 def verify_gh(gh: Path) -> None:
+    _verify_pinned_gh(gh)
     version = safe_run([str(gh), "version"], output_limit=4096)
     if version.returncode != 0 or not version.stdout.startswith(b"gh version 2.105.0 "):
         stop("official_gh_version_mismatch")
@@ -367,72 +522,128 @@ def verify_preflight_job_set(jobs: list[dict[str, Any]], *, mode: str) -> dict[s
     ):
         stop("preflight_nonfailure_job_state")
     steps = host_gate[0].get("steps")
-    if not isinstance(steps, list):
+    if not isinstance(steps, list) or not steps or len(steps) > MAX_PREFLIGHT_STEPS:
         stop("preflight_failed_steps_invalid")
+    step_numbers: set[int] = set()
+    for step in steps:
+        if not isinstance(step, dict):
+            stop("preflight_failed_steps_invalid")
+        number = step.get("number")
+        if type(number) is not int or number <= 0 or number in step_numbers:
+            stop("preflight_failed_step_number")
+        step_numbers.add(number)
     failed_steps = [
         row for row in steps
         if isinstance(row, dict) and row.get("status") == "completed" and row.get("conclusion") == "failure"
     ]
-    expected_name = "Validate root SSH identity and installed generation"
-    if len(failed_steps) != 1 or failed_steps[0].get("name") != expected_name:
+    if len(failed_steps) != 1 or failed_steps[0].get("name") not in PREFLIGHT_FAILURE_STEP_NAMES:
         stop("preflight_failed_step_mismatch")
+    selected_failed = failed_steps[0]
     other_bad = [
         row for row in steps
         if isinstance(row, dict)
+        and row is not selected_failed
         and row.get("status") == "completed"
-        and row.get("name") != expected_name
         and row.get("conclusion") not in {"success", "skipped"}
     ]
     if other_bad:
         stop("preflight_other_step_failure")
-    return {"validate_job_id": validate.get("id"), "build_job_id": build.get("id"), "failed_job_id": host_gate[0].get("id")}
+    failed_job_id = host_gate[0].get("id")
+    if type(failed_job_id) is not int or failed_job_id <= 0:
+        stop("preflight_failed_job_id")
+    return {
+        "validate_job_id": validate.get("id"), "build_job_id": build.get("id"),
+        "failed_job_id": failed_job_id, "failed_step_number": selected_failed["number"],
+    }
 
 
-def extract_failed_step_log(archive: Path, *, expected_step: str) -> tuple[bytes, str]:
-    raw_archive = checked_file(archive, mode=0o600, max_bytes=16 * 1024 * 1024)
-    digest = sha256(raw_archive)
-    try:
-        with zipfile.ZipFile(archive, "r", allowZip64=False) as zipped:
-            names = [name for name in zipped.namelist() if name.endswith("/" + expected_step + ".txt")]
-            if len(names) != 1 or len(zipped.infolist()) > 256:
-                stop("failed_step_log_inventory")
-            info = zipped.getinfo(names[0])
-            if info.file_size > 2 * 1024 * 1024 or info.is_dir():
-                stop("failed_step_log_size")
-            return zipped.read(info), digest
-    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
-        stop("failed_step_log_archive_invalid")
+def fetch_failed_step_log(gh: Path, scratch: Path, *, job_id: int, step_number: int) -> bytes:
+    if (
+        type(job_id) is not int or job_id <= 0
+        or type(step_number) is not int or step_number <= 0
+    ):
+        stop("failed_step_identity_invalid")
+    log_path = scratch / "failed-step.log"
+    call_gh(
+        gh, [
+            "api", "--hostname", "github.com", "--header", "X-GitHub-Api-Version: 2026-03-10",
+            f"repos/{REPOSITORY}/actions/jobs/{job_id}/steps/{step_number}/logs",
+        ], output=log_path, output_limit=2 * 1024 * 1024,
+    )
+    return checked_file(log_path, mode=0o600, max_bytes=2 * 1024 * 1024)
 
 
 def parse_missing_generation_log(raw: bytes) -> str:
-    """Accept the exact diagnostic only as runtime output, outside echoed script groups."""
+    """Accept the exact diagnostic only as runtime output outside echoed command preambles."""
     try:
-        lines = raw.decode("utf-8", "strict").splitlines()
+        lines = [re.sub(r"^[0-9T:.Z+-]+\s+", "", line) for line in raw.decode("utf-8", "strict").splitlines()]
     except UnicodeError:
         stop("failed_step_log_encoding")
+    starts = [index for index, body in enumerate(lines) if body.startswith("##[group]Run ")]
+    ends = [index for index, body in enumerate(lines) if body == "##[endgroup]"]
+    if any(body.startswith("##[group]") and not body.startswith("##[group]Run ") for body in lines):
+        stop("failed_step_log_group_malformed")
+
+    if starts:
+        if len(starts) != len(ends):
+            stop("failed_step_log_group_malformed")
+        process_lines = lines
+    elif len(ends) == 1:
+        # The per-step API response omits the corresponding UI group start;
+        # treat all preceding lines as the echoed command preamble, while still
+        # refusing fatal markers before the boundary.
+        preamble = lines[:ends[0]]
+        if any(
+            body.startswith("##[error]") or body == "HOST_TOOLS_VERIFY schema=1 status=failed"
+            for body in preamble
+        ):
+            stop("failed_step_log_unexpected_error")
+        process_lines = lines[ends[0] + 1:]
+    elif not ends:
+        # An unframed per-step response has no echoed preamble: accept only the
+        # two exact evidence lines and blank separators.
+        if any(body and body not in {
+            "Exact host-tools generation is not installed yet.",
+            "##[error]Process completed with exit code 10.",
+        } for body in lines):
+            stop("failed_step_log_unexpected_output")
+        process_lines = lines
+    else:
+        stop("failed_step_log_group_malformed")
+
     in_group = False
     diagnostic_count = 0
     exit_count = 0
-    group_seen = False
-    for line in lines:
-        body = re.sub(r"^[0-9T:.Z+-]+\s+", "", line)
+    diagnostic_index = -1
+    exit_index = -1
+    for index, body in enumerate(process_lines):
         if body.startswith("##[group]Run "):
             if in_group:
                 stop("failed_step_log_group_malformed")
             in_group = True
-            group_seen = True
+            continue
+        if body.startswith("##[group]"):
+            stop("failed_step_log_group_malformed")
+        if body == "##[endgroup]":
+            if in_group:
+                in_group = False
+            elif starts:
+                stop("failed_step_log_group_malformed")
             continue
         if in_group:
-            if body == "##[endgroup]":
-                in_group = False
             continue
         if body == "Exact host-tools generation is not installed yet.":
             diagnostic_count += 1
+            diagnostic_index = index
         elif body == "##[error]Process completed with exit code 10.":
             exit_count += 1
+            exit_index = index
         elif body.startswith("##[error]") or body == "HOST_TOOLS_VERIFY schema=1 status=failed":
             stop("failed_step_log_unexpected_error")
-    if in_group or not group_seen or diagnostic_count != 1 or exit_count != 1:
+    if (
+        in_group or diagnostic_count != 1 or exit_count != 1
+        or diagnostic_index >= exit_index
+    ):
         stop("missing_generation_refusal_unproven")
     return sha256(raw)
 
@@ -577,7 +788,7 @@ def verify_security_and_preflight(
     preflight_attempt: str,
     preflight_mode: str,
     scratch: Path,
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], str, str]:
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], str]:
     security = api_json(gh, f"repos/{REPOSITORY}/actions/runs/{security_run_id}/attempts/{security_attempt}")
     validate_workflow_run(
         security, run_id=security_run_id, attempt=security_attempt, target_sha=target_sha,
@@ -603,12 +814,12 @@ def verify_security_and_preflight(
         run_id=preflight_run_id, attempt=preflight_attempt, target_sha=target_sha,
     )
     job_ids = verify_preflight_job_set(preflight_jobs, mode=preflight_mode)
-    logs_path = scratch / "failed-job-logs.zip"
-    call_gh(gh, ["api", "--hostname", "github.com", f"repos/{REPOSITORY}/actions/jobs/{job_ids['failed_job_id']}/logs"], output=logs_path)
-    raw_log, logs_sha256 = extract_failed_step_log(logs_path, expected_step="Validate root SSH identity and installed generation")
+    raw_log = fetch_failed_step_log(
+        gh, scratch, job_id=job_ids["failed_job_id"], step_number=job_ids["failed_step_number"],
+    )
     failed_step_log_sha256 = parse_missing_generation_log(raw_log)
-    logs_path.unlink()
-    return security, preflight, job_ids, logs_sha256, failed_step_log_sha256
+    (scratch / "failed-step.log").unlink()
+    return security, preflight, job_ids, failed_step_log_sha256
 
 
 def validate_dispatch_input_artifact(
@@ -641,7 +852,10 @@ def download_artifact(gh: Path, *, artifact_id: str, destination: Path) -> tuple
         or re.fullmatch(r"sha256:[0-9a-f]{64}", metadata["digest"]) is None
     ):
         stop("artifact_metadata_invalid")
-    call_gh(gh, ["api", "--hostname", "github.com", f"repos/{REPOSITORY}/actions/artifacts/{artifact_id}/zip"], output=destination)
+    call_gh(
+        gh, ["api", "--hostname", "github.com", f"repos/{REPOSITORY}/actions/artifacts/{artifact_id}/zip"],
+        output=destination, output_limit=8 * 1024 * 1024,
+    )
     outer = checked_file(destination, mode=0o600, max_bytes=8 * 1024 * 1024)
     digest = sha256(outer)
     if len(outer) != metadata["size_in_bytes"] or f"sha256:{digest}" != metadata["digest"]:
@@ -768,10 +982,21 @@ def validate_bundle_contract(bundle_path: Path, raw_contracts: dict[str, bytes],
         stop("outer_files_contract_mismatch")
     mode_contract: dict[str, int] = {}
     for line in raw_contracts.get("contract/files.modes", b"").decode("ascii", "strict").splitlines():
-        mode, path = line.split(" ", 1)
+        fields = line.split("  ", 1)
+        if len(fields) != 2 or not fields[0] or not fields[1]:
+            stop("outer_modes_contract_invalid")
+        mode, path = fields
+        if not re.fullmatch(r"[0-7]+", mode):
+            stop("outer_modes_contract_invalid")
         if path in mode_contract:
             stop("outer_modes_contract_duplicate")
-        mode_contract[path] = int(mode, 8)
+        try:
+            parsed_mode = int(mode, 8)
+        except ValueError:
+            stop("outer_modes_contract_invalid")
+        if mode != format(parsed_mode, "o"):
+            stop("outer_modes_contract_invalid")
+        mode_contract[path] = parsed_mode
     expected_modes = {path: row["mode"] for path, row in expected_files.items()}
     if mode_contract != expected_modes:
         stop("outer_modes_contract_mismatch")
@@ -1108,7 +1333,7 @@ def source_release_state(host_tools_sha: str) -> dict[str, Any]:
     current = pointer("current")
     previous = pointer("previous")
     pin_path = Path(current[0]) / "contracts/host_tools_pin.json"
-    pin = bounded_json(checked_file(pin_path, mode=0o444, max_bytes=65536), limit=65536, stage="installed_pin_invalid")
+    pin = bounded_json(checked_file(pin_path, mode=0o644, max_bytes=65536), limit=65536, stage="installed_pin_invalid")
     old_sha = pin.get("host_tools_sha") if isinstance(pin, dict) else None
     if not isinstance(old_sha, str) or not TARGET_RE.fullmatch(old_sha) or old_sha == host_tools_sha:
         stop("installed_application_pin_changed")
@@ -1242,7 +1467,7 @@ def active_lock_bootstrap(
     if source_relation.returncode != 0 or source_relation.stdout or source_relation.stderr:
         stop("active_release_source_not_in_target_history")
     pin_path = release_root / "contracts/host_tools_pin.json"
-    pin_bytes = checked_file(pin_path, mode=0o444, max_bytes=65536)
+    pin_bytes = checked_file(pin_path, mode=0o644, max_bytes=65536)
     pin_payload = bounded_json(pin_bytes, limit=65536, stage="active_pin_invalid")
     active_sha = pin_payload.get("host_tools_sha") if isinstance(pin_payload, dict) else None
     if not isinstance(active_sha, str) or TARGET_RE.fullmatch(active_sha) is None or active_sha == target_host_tools_sha:
@@ -1452,7 +1677,7 @@ def provision_locked(args: argparse.Namespace, expected_bootstrap: dict[str, Any
             classifier_run_attempt=args.security_run_attempt,
             destination=scratch / "dispatch-input.zip",
         )
-        security, preflight, job_ids, failed_logs_sha, failed_step_sha = verify_security_and_preflight(
+        security, preflight, job_ids, failed_step_sha = verify_security_and_preflight(
             gh, target_sha=target_sha,
             security_run_id=args.security_run_id, security_attempt=args.security_run_attempt,
             preflight_run_id=args.preflight_run_id, preflight_attempt=args.preflight_run_attempt,
@@ -1539,7 +1764,6 @@ def provision_locked(args: argparse.Namespace, expected_bootstrap: dict[str, Any
                     "security_run_id": args.security_run_id, "security_run_attempt": int(args.security_run_attempt),
                     "preflight_run_id": args.preflight_run_id, "preflight_run_attempt": int(args.preflight_run_attempt),
                     "preflight_failed_job_id": job_ids["failed_job_id"],
-                    "preflight_failure_log_sha256": failed_logs_sha,
                     "missing_generation_step_sha256": failed_step_sha,
                     "bundle_artifact_id": artifact_id, "bundle_artifact_name": artifact_name,
                     "outer_artifact_sha256": outer_digest, "inner_bundle_sha256": bundle_sha,
