@@ -707,6 +707,9 @@ def _validate_liveqa_runtime(
         raise ArtifactError("liveqa-runtime launch spec is truncated")
     requires_patch_acceptance = b"../support/patch-acceptance" in launch_spec
     requires_live_image_inventory = b"../support/live-image-inventory" in launch_spec
+    requires_objective_screenshot_diagnostic = (
+        b"../support/objective-screenshot-diagnostic" in launch_spec
+    )
     user_journey_name = f"{prefix}/web/tests/smoke/live-user-journey.spec.ts"
     user_journey_member = by_name[user_journey_name]
     if user_journey_member.size > MAX_LIVE_QA_LAUNCH_SPEC_BYTES:
@@ -739,6 +742,15 @@ def _validate_liveqa_runtime(
                 "liveqa-runtime is missing required file: "
                 "web/tests/support/live-image-inventory.ts"
             )
+    if requires_objective_screenshot_diagnostic:
+        helper_member = by_name.get(
+            f"{prefix}/web/tests/support/objective-screenshot-diagnostic.ts"
+        )
+        if helper_member is None or not helper_member.isfile():
+            raise ArtifactError(
+                "liveqa-runtime is missing required file: "
+                "web/tests/support/objective-screenshot-diagnostic.ts"
+            )
     if requires_live_user_browser_gate:
         helper_member = by_name.get(
             f"{prefix}/web/tests/support/live-user-browser-gate.ts"
@@ -765,6 +777,8 @@ def _validate_liveqa_runtime(
         allowed_web_files.add("web/tests/support/live-user-browser-gate.ts")
     if requires_live_image_inventory:
         allowed_web_files.add("web/tests/support/live-image-inventory.ts")
+    if requires_objective_screenshot_diagnostic:
+        allowed_web_files.add("web/tests/support/objective-screenshot-diagnostic.ts")
     allowed_package_roots = {
         "web/node_modules/@playwright/test",
         "web/node_modules/playwright",
