@@ -145,6 +145,84 @@ class HostToolsBundleTests(unittest.TestCase):
         manifest_bytes = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
         return manifest, {**payloads, "manifest.json": manifest_bytes}
 
+    def _trusted_source_fixture(self, root: Path) -> tuple[Path, str, Path]:
+        source = root / "source"
+        for relative in operator_provisioner.TRUSTED_SOURCE_PATHS:
+            path = source / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if relative.endswith(".json"):
+                path.write_text('{"host_tools_sha":"' + "a" * 40 + '"}\n', encoding="ascii")
+            else:
+                path.write_text(f"# trusted fixture: {relative}\n", encoding="ascii")
+        unrelated = source / "tracked.txt"
+        unrelated.write_text("reviewed\n", encoding="ascii")
+        subprocess.run(["/usr/bin/git", "-C", str(source), "init", "--quiet"], check=True)
+        subprocess.run(["/usr/bin/git", "-C", str(source), "config", "user.name", "Fixture"], check=True)
+        subprocess.run(
+            ["/usr/bin/git", "-C", str(source), "config", "user.email", "fixture@example.invalid"], check=True,
+        )
+        subprocess.run(["/usr/bin/git", "-C", str(source), "add", "."], check=True)
+        subprocess.run(["/usr/bin/git", "-C", str(source), "commit", "--quiet", "-m", "source"], check=True)
+        target = subprocess.run(
+            ["/usr/bin/git", "-C", str(source), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        subprocess.run(["/usr/bin/git", "-C", str(source), "update-ref", "refs/remotes/origin/dev", target], check=True)
+        return source, target, unrelated
+
+    def test_operator_source_checkout_allows_untracked_unrelated_file(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="host-tools-source-clean-") as temporary:
+            source, target, _ = self._trusted_source_fixture(Path(temporary))
+            (source / "attachments").mkdir()
+            (source / "attachments/private-report.txt").write_text("private\n", encoding="ascii")
+            operator_provisioner._verify_source_checkout(source, target, trusted_uid=os.geteuid())
+
+    def test_operator_source_checkout_rejects_staged_and_unstaged_tracked_changes(self) -> None:
+        for staged in (False, True):
+            with self.subTest(staged=staged), tempfile.TemporaryDirectory(prefix="host-tools-source-dirty-") as temporary:
+                source, target, tracked = self._trusted_source_fixture(Path(temporary))
+                tracked.write_text("changed\n", encoding="ascii")
+                if staged:
+                    subprocess.run(["/usr/bin/git", "-C", str(source), "add", "tracked.txt"], check=True)
+                with self.assertRaisesRegex(operator_provisioner.ProvisionError, "reviewed_source_checkout_changed"):
+                    operator_provisioner._verify_source_checkout(source, target, trusted_uid=os.geteuid())
+
+        with tempfile.TemporaryDirectory(prefix="host-tools-source-assume-unchanged-") as temporary:
+            source, target, _ = self._trusted_source_fixture(Path(temporary))
+            relative = "platform/tools/platform_host_tools_pin.py"
+            trusted = source / relative
+            trusted.write_text("# altered trusted bytes\n", encoding="ascii")
+            subprocess.run(
+                ["/usr/bin/git", "-C", str(source), "update-index", "--assume-unchanged", relative], check=True,
+            )
+            with self.assertRaisesRegex(operator_provisioner.ProvisionError, "trusted_operator_source_changed"):
+                operator_provisioner._verify_source_checkout(source, target, trusted_uid=os.geteuid())
+
+        with tempfile.TemporaryDirectory(prefix="host-tools-source-mode-") as temporary:
+            source, target, _ = self._trusted_source_fixture(Path(temporary))
+            trusted = source / "platform/tools/platform_host_tools_pin.py"
+            trusted.chmod(0o600)
+            with self.assertRaisesRegex(operator_provisioner.ProvisionError, "trusted_operator_source_mode_changed"):
+                operator_provisioner._verify_source_checkout(source, target, trusted_uid=os.geteuid())
+
+    def test_operator_source_checkout_rejects_untracked_shadow_of_trusted_path(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="host-tools-source-shadow-") as temporary:
+            source, target, _ = self._trusted_source_fixture(Path(temporary))
+            trusted = source / "platform/tools/platform_host_tools_pin.py"
+            subprocess.run(["/usr/bin/git", "-C", str(source), "rm", "--quiet", "platform/tools/platform_host_tools_pin.py"], check=True)
+            trusted.write_text("# untracked replacement\n", encoding="ascii")
+            with self.assertRaisesRegex(operator_provisioner.ProvisionError, "reviewed_source_checkout_changed"):
+                operator_provisioner._verify_source_checkout(source, target, trusted_uid=os.geteuid())
+
+    def test_operator_source_checkout_rejects_origin_identity_drift(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="host-tools-source-drift-") as temporary:
+            source, target, tracked = self._trusted_source_fixture(Path(temporary))
+            tracked.write_text("second reviewed commit\n", encoding="ascii")
+            subprocess.run(["/usr/bin/git", "-C", str(source), "add", "tracked.txt"], check=True)
+            subprocess.run(["/usr/bin/git", "-C", str(source), "commit", "--quiet", "-m", "drift"], check=True)
+            operator_provisioner._verify_trusted_source_files(source, target, trusted_uid=os.geteuid())
+            with self.assertRaisesRegex(operator_provisioner.ProvisionError, "reviewed_source_checkout_changed"):
+                operator_provisioner._verify_source_checkout(source, target, trusted_uid=os.geteuid())
+
     def test_operator_rehearsal_publishes_exact_inventory_without_candidate_execution(self) -> None:
         manifest, files = self._operator_fixture()
         owner = (os.geteuid(), os.getegid())
@@ -2006,10 +2084,11 @@ class HostToolsBundleTests(unittest.TestCase):
 
     def _operator_lock_bootstrap_fixture(self, root: Path) -> tuple[Path, Path, Path, str, str]:
         source_root = root / "source-checkout"
-        source_tools = source_root / "platform/tools"
-        source_tools.mkdir(parents=True)
-        for name in ("platform_host_tools_pin.py", "platform_host_tools_bundle.py"):
-            shutil.copy2(TOOLS_ROOT / name, source_tools / name)
+        for relative in operator_provisioner.TRUSTED_SOURCE_PATHS:
+            source = REPO_ROOT / relative
+            target = source_root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
         subprocess.run(["/usr/bin/git", "-C", str(source_root), "init", "--quiet"], check=True)
         subprocess.run(
             ["/usr/bin/git", "-C", str(source_root), "config", "user.name", "Host-tools fixture"], check=True,
@@ -2017,7 +2096,7 @@ class HostToolsBundleTests(unittest.TestCase):
         subprocess.run(
             ["/usr/bin/git", "-C", str(source_root), "config", "user.email", "fixture@example.invalid"], check=True,
         )
-        subprocess.run(["/usr/bin/git", "-C", str(source_root), "add", "platform/tools"], check=True)
+        subprocess.run(["/usr/bin/git", "-C", str(source_root), "add", "platform/tools", "platform/contracts"], check=True)
         subprocess.run(
             ["/usr/bin/git", "-C", str(source_root), "commit", "--quiet", "-m", "fixture source"], check=True,
         )
@@ -2065,14 +2144,18 @@ class HostToolsBundleTests(unittest.TestCase):
         """Model root-owned release metadata while keeping bundle checks real."""
         real_lstat = Path.lstat
         trusted_sources = {
-            source_root / "platform/tools/platform_host_tools_pin.py",
-            source_root / "platform/tools/platform_host_tools_bundle.py",
+            source_root / relative for relative in operator_provisioner.TRUSTED_SOURCE_PATHS
+        }
+        trusted_parents = {
+            source_root / Path(*Path(relative).parts[:index])
+            for relative in operator_provisioner.TRUSTED_SOURCE_PATHS
+            for index in range(1, len(Path(relative).parts))
         }
         real_loader = operator_provisioner._load_trusted_source_module
 
         def fixture_lstat(path: Path) -> SimpleNamespace | os.stat_result:
             metadata = real_lstat(path)
-            if path != app and app not in path.parents and path not in trusted_sources:
+            if path != app and app not in path.parents and path not in trusted_sources | trusted_parents:
                 return metadata
             wrong_owner = path == owner_drift
             uid = (os.geteuid() or 65534) if wrong_owner else 0
@@ -2083,8 +2166,8 @@ class HostToolsBundleTests(unittest.TestCase):
                 st_mtime_ns=metadata.st_mtime_ns, st_ctime_ns=metadata.st_ctime_ns,
             )
 
-        def load_trusted(name: str, path: Path):
-            module = real_loader(name, path)
+        def load_trusted(name: str, path: Path, *, source_root: Path, target_sha: str):
+            module = real_loader(name, path, source_root=source_root, target_sha=target_sha)
             if name == "trusted_operator_host_tools_bundle":
                 verify_generation = module.verify_installed_generation
 

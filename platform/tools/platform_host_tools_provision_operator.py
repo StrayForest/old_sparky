@@ -57,6 +57,12 @@ CAPABILITIES_OUTPUT_RE = re.compile(
     rb"release_baseline=1 retained_load_export_cleanup=1 retained_load_source_binding=1 "
     rb"cpu_diagnostic_plan_control=1 python_isolated=1 python_bytecode_disabled=1\n"
 )
+TRUSTED_SOURCE_PATHS = (
+    "platform/tools/platform_host_tools_provision_operator.py",
+    "platform/tools/platform_host_tools_pin.py",
+    "platform/tools/platform_host_tools_bundle.py",
+    "platform/contracts/host_tools_pin.json",
+)
 
 
 class ProvisionError(Exception):
@@ -448,16 +454,7 @@ def validate_source(source_root: Path, *, target_sha: str) -> str:
         or stat.S_IMODE(helper_info.st_mode) & 0o022
     ):
         stop("trusted_operator_source_metadata")
-    head = safe_run(["/usr/bin/git", "-C", str(source_root), "rev-parse", "HEAD"])
-    origin = safe_run(["/usr/bin/git", "-C", str(source_root), "rev-parse", "origin/dev"])
-    status = safe_run(["/usr/bin/git", "-C", str(source_root), "status", "--porcelain=v1", "--untracked-files=all"])
-    if (
-        head.returncode or origin.returncode or status.returncode
-        or head.stdout != (target_sha + "\n").encode("ascii")
-        or origin.stdout != head.stdout
-        or status.stdout.strip()
-    ):
-        stop("reviewed_source_checkout_changed")
+    _verify_source_checkout(source_root, target_sha)
     authoritative = safe_run([
         "/usr/bin/curl", "--fail", "--silent", "--show-error", "--max-time", "8",
         "--max-filesize", "65536", "--header", "Accept: application/vnd.github+json",
@@ -477,6 +474,97 @@ def validate_source(source_root: Path, *, target_sha: str) -> str:
     if TARGET_RE.fullmatch(host_tools_sha) is None:
         stop("target_pin_resolution_invalid")
     return host_tools_sha
+
+
+def _verify_source_checkout(source_root: Path, target_sha: str, *, trusted_uid: int = 0) -> None:
+    head = safe_run(["/usr/bin/git", "-C", str(source_root), "rev-parse", "HEAD"])
+    origin = safe_run(["/usr/bin/git", "-C", str(source_root), "rev-parse", "origin/dev"])
+    status = safe_run([
+        "/usr/bin/git", "-C", str(source_root), "status", "--porcelain=v1", "--untracked-files=no",
+    ])
+    if (
+        head.returncode or origin.returncode or status.returncode
+        or head.stdout != (target_sha + "\n").encode("ascii")
+        or origin.stdout != head.stdout
+        or status.stdout.strip()
+    ):
+        stop("reviewed_source_checkout_changed")
+    _verify_trusted_source_files(source_root, target_sha, trusted_uid=trusted_uid)
+
+
+def _verify_trusted_source_files(source_root: Path, target_sha: str, *, trusted_uid: int = 0) -> None:
+    """Bind executable source paths to regular files in the selected commit."""
+    for relative in TRUSTED_SOURCE_PATHS:
+        path = source_root / relative
+        try:
+            parents = [source_root / Path(*Path(relative).parts[:index]) for index in range(1, len(Path(relative).parts))]
+            parent_infos = [parent.lstat() for parent in parents]
+            metadata = path.lstat()
+        except OSError:
+            stop("trusted_operator_source_unavailable")
+        if (
+            any(
+                not stat.S_ISDIR(info.st_mode)
+                or stat.S_ISLNK(info.st_mode)
+                or info.st_uid != trusted_uid
+                or stat.S_IMODE(info.st_mode) & 0o022
+                for info in parent_infos
+            )
+            or not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != trusted_uid
+            or metadata.st_nlink != 1
+            or metadata.st_size > 2_000_000
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+        ):
+            stop("trusted_operator_source_metadata")
+        tree_entry = safe_run([
+            "/usr/bin/git", "-C", str(source_root), "ls-tree", "-z", target_sha, "--", relative,
+        ], output_limit=4096)
+        if tree_entry.returncode != 0:
+            stop("trusted_operator_source_tree_unavailable")
+        record = tree_entry.stdout[:-1].split(b"\t", 1) if tree_entry.stdout.endswith(b"\0") else []
+        if len(record) != 2 or record[1] != relative.encode("ascii"):
+            stop("trusted_operator_source_untracked")
+        fields = record[0].split()
+        if len(fields) != 3 or fields[0] not in (b"100644", b"100755") or fields[1] != b"blob":
+            stop("trusted_operator_source_tree_metadata")
+        expected_mode = 0o755 if fields[0] == b"100755" else 0o644
+        if stat.S_IMODE(metadata.st_mode) != expected_mode:
+            stop("trusted_operator_source_mode_changed")
+        blob = safe_run([
+            "/usr/bin/git", "-C", str(source_root), "cat-file", "blob", f"{target_sha}:{relative}",
+        ], output_limit=2_000_000)
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                opened = os.fstat(descriptor)
+                if (opened.st_dev, opened.st_ino, opened.st_size) != (
+                    metadata.st_dev, metadata.st_ino, metadata.st_size,
+                ):
+                    stop("trusted_operator_source_changed")
+                chunks: list[bytes] = []
+                total = 0
+                while True:
+                    chunk = os.read(descriptor, 65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    total += len(chunk)
+                    if total > 2_000_000:
+                        stop("trusted_operator_source_size")
+                after = os.fstat(descriptor)
+                if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) != (
+                    opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns,
+                ):
+                    stop("trusted_operator_source_changed")
+                source_bytes = b"".join(chunks)
+            finally:
+                os.close(descriptor)
+        except OSError:
+            stop("trusted_operator_source_unavailable")
+        if blob.returncode != 0 or blob.stdout != source_bytes:
+            stop("trusted_operator_source_changed")
 
 
 def verify_security_and_preflight(
@@ -1073,8 +1161,11 @@ def source_release_state(host_tools_sha: str) -> dict[str, Any]:
     }
 
 
-def _load_trusted_source_module(name: str, path: Path) -> Any:
+def _load_trusted_source_module(name: str, path: Path, *, source_root: Path, target_sha: str) -> Any:
     try:
+        _verify_trusted_source_files(source_root, target_sha)
+        if path not in {source_root / "platform/tools/platform_host_tools_pin.py", source_root / "platform/tools/platform_host_tools_bundle.py"}:
+            stop("trusted_source_verifier_path")
         metadata = path.lstat()
         if (
             not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
@@ -1159,6 +1250,7 @@ def active_lock_bootstrap(
 
     pin_module = _load_trusted_source_module(
         "trusted_operator_host_tools_pin", source_root / "platform/tools/platform_host_tools_pin.py",
+        source_root=source_root, target_sha=target_sha,
     )
     try:
         validated_pin = pin_module.validate_release_pin(
@@ -1171,6 +1263,7 @@ def active_lock_bootstrap(
 
     bundle_module = _load_trusted_source_module(
         "trusted_operator_host_tools_bundle", source_root / "platform/tools/platform_host_tools_bundle.py",
+        source_root=source_root, target_sha=target_sha,
     )
     generation = generation_root / active_sha
     try:

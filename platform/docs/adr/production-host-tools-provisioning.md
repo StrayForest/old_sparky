@@ -327,15 +327,21 @@ Prepare official isolated GitHub CLI v2.105.0 per the
 keep its private directory/cleanup trap active through the command. The helper
 enforces version/path and runs verification; do not use `gh` from `PATH`.
 
-Required inputs: clean root-owned `/root/old_sparky` where `HEAD`, `origin/dev`
-and authoritative GitHub `dev` equal **P** (resolver derives **C**); exact
-successful Security **P** run/attempt; and exact production `workflow_dispatch`
-at **P**, with dispatch-input artifact proving `mode=preflight` and Security
-identity, plus both artifact IDs. Builder, bundle upload, attestation and
-dispatch validation succeed. The only failure may be job `Verify immutable
-production host capabilities`, step `Validate root SSH identity and installed
-generation`. Its log must show actual missing-**C** diagnostic and terminal 10
-outside the echoed shell-source group; any other failure, skip, missing log or
+Required inputs: root-owned canonical `/root/old_sparky` where `HEAD`,
+`origin/dev` and authoritative GitHub `dev` equal **P** (resolver derives
+**C**); exact successful Security **P** run/attempt; and exact production
+`workflow_dispatch` at **P**, with dispatch-input artifact proving
+`mode=preflight` and Security identity, plus both artifact IDs. Any tracked
+change reported by Git fails; untracked paths are ignored. After startup and
+before pin resolution or bundle loading, the helper binds the operator, pin
+resolver, bundle verifier and `platform/contracts/host_tools_pin.json` to **P**'s
+tree bytes/modes, root-owned regular-file identities, fixed non-writable
+parents and no-follow stable reads. Missing or substituted paths fail even if
+Git hides them. Builder, bundle upload, attestation and dispatch validation
+must succeed. The only failure may be job `Verify immutable production host
+capabilities`, step `Validate root SSH identity and installed generation`.
+Its log must show the actual missing-**C** diagnostic and terminal 10 outside
+the echoed shell-source group; any other failure, skip, missing log or
 ambiguous binding aborts.
 
 The eligible missing-**C** gate makes the producer attempt fail. After
@@ -364,6 +370,7 @@ DISPATCH_INPUT_ARTIFACT_ID=<exact-dispatch-input-artifact-id>
 OPERATOR_CHANGE_ID=<approved-change-id>
 test "$(git -C "$SOURCE_ROOT" rev-parse HEAD)" = "$TARGET_SHA"
 test "$(git -C "$SOURCE_ROOT" rev-parse origin/dev)" = "$TARGET_SHA"
+test -z "$(/usr/bin/git -C "$SOURCE_ROOT" status --porcelain=v1 --untracked-files=no)"
 test "$("$GH" api repos/StrayForest/old_sparky/commits/dev --jq .sha)" = "$TARGET_SHA"
 /usr/bin/python3.12 -I -B \
   "$SOURCE_ROOT/platform/tools/platform_host_tools_provision_operator.py" provision \
@@ -402,16 +409,9 @@ use release recovery; never glob-delete or change permissions to retry.
 After success, require fresh `mode=preflight` at **P** to pass before the
 separate automatic baseline-reconcile/deploy route; provisioning never dispatches or activates an app release.
 
-The code commit **C** and its pin-bearing target **P** are separate identities.
-The reviewed change places the host-control edits in **C**, followed by a
-pin-only-with-respect-to-host-control commit **P** that names **C** and records
-the exact closure digests. **C** must be an ancestor of **P**; the resolver
-must accept the exact pin and closure at **P**. The pull request and its
-synthetic merge are tested together, and the exact merged **P** must pass the
-full `Platform security and build` workflow. A host-control-only cumulative
-range is non-deployable by itself. The active automatic chain may route that
-exact recovery-bootstrap-only range through `mode=baseline-reconcile`; do not
-dispatch this mode manually. The production workflow authenticates the exact
+Host-control-only cumulative ranges are non-deployable alone. The automatic
+chain may route the exact recovery-bootstrap-only range through
+`mode=baseline-reconcile`; never dispatch it manually. The production workflow authenticates the exact
 source-CI and automatic caller attempts, reads the installed host baseline
 through the pinned generation, verifies successful deployment proof for the
 baseline source using its unique latest bot-authored deploy marker, canonical
