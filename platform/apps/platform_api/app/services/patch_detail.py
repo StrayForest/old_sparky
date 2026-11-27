@@ -5,6 +5,10 @@ from typing import Any
 
 from apps.platform_api.app.services import home_content as base
 from apps.platform_api.app.services.patch_translation import apply_cached_patch_translation
+from apps.platform_api.app.services.patch_translation_terms import (
+    catalog_protected_terms,
+    term_pattern,
+)
 
 
 _ENTITY_DELIMITERS = " \t:-–—"
@@ -16,6 +20,7 @@ _PATCH_ABILITY_ALIASES = {
     # Chimera Mk1 jetpack, not a separate selectable ability in the game data.
     "deadman danny": {"rocket jumping": "chimera mk1"},
 }
+PATCH_CANONICAL_ENTITY_NAMES_MAX = 2000
 
 
 def _patch_lines(content: str) -> list[str]:
@@ -30,6 +35,21 @@ def _patch_lines(content: str) -> list[str]:
 
     normalized = _FLATTENED_ENTITY_BULLET_RE.sub("\n- ", content)
     return base._patch_lines(normalized)
+
+
+def _canonical_entity_references(content: str, catalog: dict[str, Any]) -> list[str]:
+    """Return protected canonical identity terms present in patch source."""
+
+    referenced: list[str] = []
+    for term in catalog_protected_terms(catalog):
+        pattern = term_pattern(term)
+        if pattern and re.search(pattern, content, flags=re.IGNORECASE):
+            referenced.append(term)
+            if len(referenced) > PATCH_CANONICAL_ENTITY_NAMES_MAX:
+                raise ValueError(
+                    "Patch source references more than the canonical entity-name limit."
+                )
+    return referenced
 
 
 def _cached_change_group_sources(raw: dict[str, Any]) -> list[dict[str, Any]]:
@@ -642,7 +662,8 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
     current_ability_alias: str | None = None
     current_general_ability_pending = False
 
-    for line in _patch_lines(str(raw.get("content") or "")):
+    source_content = str(raw.get("content") or "")
+    for line in _patch_lines(source_content):
         mode_name = base._patch_mode_heading(line)
         if mode_name is not None:
             current_scope = "heroes"
@@ -1069,6 +1090,7 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
     return {
         **public_raw,
         "sections": sections,
+        "canonical_entity_names": _canonical_entity_references(source_content, catalog),
         "hero_metadata_pending": any(
             section.get("hero_metadata_pending") for section in sections
         ) or bool(pending_names and not announcement_heroes),

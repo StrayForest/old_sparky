@@ -277,6 +277,7 @@ class PatchDetailResponse(BaseModel):
     url: str = Field(max_length=1000)
     content: str = Field(max_length=30000)
     sections: list[PatchSectionResponse] = Field(default_factory=list, max_length=100)
+    canonical_entity_names: list[str] = Field(default_factory=list, max_length=2000)
     hero_metadata_pending: bool = False
 
 

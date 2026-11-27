@@ -317,90 +317,90 @@ separate classifier and release contract.
 
 ## One-time operator provisioning (out of band)
 
-This repository change prepares and verifies the handoff only. An operator or
-approved host-image/configuration-management authority performs provisioning
-for a reviewed `HOST_TOOLS_SHA`; the GitHub workflow must not be used as the
-installer:
+The maintained [`platform_host_tools_provision_operator.py`](../../tools/platform_host_tools_provision_operator.py)
+supports **route (a) only**, using a read-only `mode=preflight` producer at
+current merged `dev` **P**. It refuses AUTO-parent and deployment-child
+artifacts; routes (b)/(c) remain separate contracts. Workflows never install.
 
-Before provisioning, prepare a supported official GitHub CLI attestation verifier before the admitted route begins; route (b) must do this before opening its 1,800-second AUTO readiness window. Follow the exact isolated verifier setup, artifact binding and JSON field checks in the [host-tools attestation verification procedure](production-host-tools-attestation-verification.md). A verified attestation is required in addition to the offline bundle/content checks; it does not authorize publication by itself.
+Prepare official isolated GitHub CLI v2.105.0 per the
+[attestation procedure](production-host-tools-attestation-verification.md), and
+keep its private directory/cleanup trap active through the command. The helper
+enforces version/path and runs verification; do not use `gh` from `PATH`.
 
-1. Record the successful exact-`TARGET_SHA` Security run. A successful `build-host-tools` job
-   and attested bundle qualify from (a) a fresh read-only `workflow_dispatch`
-   `mode=preflight` at that same merged `dev` SHA, after the official verifier is ready; (b) the exact automatic parent in its active 1,800-second pre-child readiness window,
-   only if `TARGET_SHA` is current `dev`, its source-bound restore-verified backup and bundle
-   build/attestation/upload succeeded, and no child, app write, pending release transaction or
-   competing production operation exists; or (c) the exact automatic child whose only failure
-   was the missing pinned generation, with prior checks passed and no build, pending state or
-   production write. For (b), provision before the deadline; the parent verifies the generation
-   before dispatching its child. For route (b), AUTO's readiness job and shared verifier step
-   must still be `in_progress`; stop if readiness completed or dispatch started.
-   No other failure qualifies. Bind `TARGET_SHA`, `HOST_TOOLS_SHA`,
-   builder job and full Sigstore signature/chain/subject/signer/source/invocation to exact runs.
-   The parent artifact ID/name/digest must bind its exact parent run/attempt, independent of the
-   source Security attempt; use its emitted name. Download through the approved channel and
-   verify the outer SHA-256 before opening. A pull-request candidate artifact is never a
-   substitute.
-2. Run the offline `platform_host_tools_bundle.py verify` command from the
-   pinned reviewed checkout with the expected `HOST_TOOLS_SHA`. Retain the
-   generated manifest/capability checksum files with the provisioning record.
-   A v3 archive has exactly 16 top-level members: the 14 declared tools,
-   `capabilities.txt` and `manifest.json`. The manifest's `files` array has 15
-   records for the 14 tools plus `capabilities.txt`; `manifest.json` is the
-   separate sixteenth archive member and is not self-listed. Do not treat the
-   record count as the archive member count.
-3. Through the approved root-only console or host-image pipeline, extract verified bytes into
-   private staging for the exact `HOST_TOOLS_SHA`. Derive the exact inventory from the pin and
-   bundle: v3 has 16 top-level members/15 records (14 tools, capabilities and manifest); v4 has
-   17 members/16 records (15 tools, capabilities and manifest). Verify that complete name set
-   and each root-owned regular single-link file's mode/digest; reject extras, a missing manifest,
-   or any staged member execution. Apply the exact lock-held publication and
-   route-specific freshness checks in the [attestation verification procedure](production-host-tools-attestation-verification.md#final-publication-checks).
-4. Keep the previous generation untouched. On any post-publication check, fixed self-test or
-   success-evidence failure, remove or quarantine only the exact new generation inode after
-   checking its fixed path and complete tree, while both locks remain held. Preserve the prior
-   generation; never repoint `current`. Stop if exact cleanup cannot be proven. Never use the
-   deployment workflow as installer or execute downloaded/candidate code on the host.
+Required inputs: clean root-owned `/root/old_sparky` where `HEAD`, `origin/dev`
+and authoritative GitHub `dev` equal **P** (resolver derives **C**); exact
+successful Security **P** run/attempt; and exact production `workflow_dispatch`
+at **P**, with dispatch-input artifact proving `mode=preflight` and Security
+identity, plus both artifact IDs. Builder, bundle upload, attestation and
+dispatch validation succeed. The only failure may be job `Verify immutable
+production host capabilities`, step `Validate root SSH identity and installed
+generation`. Its log must show actual missing-**C** diagnostic and terminal 10
+outside the echoed shell-source group; any other failure, skip, missing log or
+ambiguous binding aborts.
 
-The evidence record must include the exact application `TARGET_SHA`, pinned
-`HOST_TOOLS_SHA`, GitHub artifact ID, outer artifact digest, inner bundle
-digest, verifier output, pre/post inventory and the operator/host-image change
-ID. The reviewed offline check is
-deterministic and can be run before the privileged provisioning action:
+The eligible missing-**C** gate makes the producer attempt fail. After
+installation, a separate fresh same-**P** preflight must pass fully, including
+installed host capability.
+
+Use that preflight's bundle name `platform-host-tools-bundle-<run-id>-<attempt>`
+and input name `platform-production-deploy-input-<run-id>-<attempt>`. The helper
+rechecks API metadata, digests, run binding, Sigstore and v4 inventory. Do not
+manually extract, substitute a PR candidate or print logs.
+
+Run this from the prepared verifier shell as root, filling the run/attempt and
+artifact IDs from the exact API records and using an operator change identifier
+that contains no secret or personal data:
 
 ```bash
-HOST_TOOLS_SHA=<40-lowercase-hex-host-tools-sha>
-BUNDLE=/secure/handoff/platform-host-tools-bundle.zip
-CONTRACT=/secure/handoff/platform-host-tools-contract
-/usr/bin/sha256sum "$BUNDLE"
-/usr/bin/python3 -I platform/tools/platform_host_tools_bundle.py verify \
-  --bundle "$BUNDLE" --expected-source-sha "$HOST_TOOLS_SHA" --contract-dir "$CONTRACT"
-```
-
-The approved root-console/configuration-management operation then extracts
-only the verifier-accepted regular members into a private staging directory
-named for `HOST_TOOLS_SHA`, applies the manifest modes/ownership, verifies every
-post-copy digest and performs an atomic no-replace rename into the versioned
-generation path only after all checks pass. It must not execute an archive
-member while staging and must leave the prior generation untouched. The
-post-publish self-test is the fixed installed entrypoint, with no candidate
-input. Run it with isolated Python and bytecode disabled; do not use an
-import-only diagnostic against the published generation:
-
-```bash
+set -euo pipefail
+SOURCE_ROOT=/root/old_sparky
+TARGET_SHA=<40-lowercase-hex-P>
+SECURITY_RUN_ID=<exact-security-run-id>
+SECURITY_RUN_ATTEMPT=<exact-security-run-attempt>
+PREFLIGHT_RUN_ID=<exact-failed-preflight-run-id>
+PREFLIGHT_RUN_ATTEMPT=<exact-preflight-attempt>
+BUNDLE_ARTIFACT_ID=<exact-bundle-artifact-id>
+DISPATCH_INPUT_ARTIFACT_ID=<exact-dispatch-input-artifact-id>
+OPERATOR_CHANGE_ID=<approved-change-id>
+test "$(git -C "$SOURCE_ROOT" rev-parse HEAD)" = "$TARGET_SHA"
+test "$(git -C "$SOURCE_ROOT" rev-parse origin/dev)" = "$TARGET_SHA"
+test "$("$GH" api repos/StrayForest/old_sparky/commits/dev --jq .sha)" = "$TARGET_SHA"
 /usr/bin/python3.12 -I -B \
-  /opt/oldsparky/platform/shared/host-tools/$HOST_TOOLS_SHA/platform_workflow_remote_dispatch.py \
-host-capabilities
+  "$SOURCE_ROOT/platform/tools/platform_host_tools_provision_operator.py" provision \
+  --target-sha "$TARGET_SHA" --source-root "$SOURCE_ROOT" --gh "$GH" \
+  --security-run-id "$SECURITY_RUN_ID" --security-run-attempt "$SECURITY_RUN_ATTEMPT" \
+  --preflight-run-id "$PREFLIGHT_RUN_ID" --preflight-run-attempt "$PREFLIGHT_RUN_ATTEMPT" \
+  --bundle-artifact-id "$BUNDLE_ARTIFACT_ID" \
+  --dispatch-input-artifact-id "$DISPATCH_INPUT_ARTIFACT_ID" \
+  --operator-change-id "$OPERATOR_CHANGE_ID"
 ```
 
-The self-test must print only the bounded `HOST_TOOLS schema=1 ...` contract,
-including `release_baseline=1` and `python_bytecode_disabled=1`, and return
-zero. The baseline query is separately exercised only after the capability
-gate confirms this exact generation. It must not create
-`__pycache__` or `.pyc` entries.  A non-zero result, any metadata/digest mismatch or an
-interrupted staging action is a failed provisioning attempt: quarantine/remove
-only that identified incomplete staging/generation through the approved
-authority, retain the previous valid generation, record post-failure hashes and
-do not retry by changing permissions or using `current/tools`.
+Before locking, the helper binds active release source (ancestor of **P**) and app pin,
+then verifies pin/generation through `platform_host_tools_pin.validate_release_pin` and
+`platform_host_tools_bundle.verify_installed_generation`, including every installed digest.
+It requires active v4 and runs only that generation's lock helper, never `current/tools`.
+Under lock it rechecks the snapshot and validates release/service/disk/source, `dev` and
+**P**→**C**; active v3 or any drift fails closed before publication.
+It accepts a valid `oldsparky-load-artifacts` account or creates both user and group when absent; partial/invalid accounts abort, and only the old generation's bound `owner` command runs.
+
+It verifies exact 17-member v4 inventory/modes/digests, stages root-owned bytes
+without execution and publishes by no-replace rename. Only the fixed installed
+`host-capabilities` command runs afterward, with isolated Python and bytecode
+disabled. The previous generation and `current` stay unchanged. Post-rename,
+self-test or receipt failure quarantines only the proven new inode/tree; if
+identity is uncertain, it stops without deleting that path.
+
+Success prints generation inode, receipt path and SHA-256. The root-only receipt is
+`/root/.oldsparky/host-tools-provision-<preflight-run-id>-<attempt>/provisioning-receipt.json`.
+binds active source/pin/lock identity, producer runs and artifacts,
+outer/inner/attestation/manifest digests, self-test and published inode; its
+digest is separate, not self-referential. Temporary downloads
+and logs are removed. Before rename, inspect only fixed stage/receipt paths
+before a new authorized attempt. On uncertain post-rename identity, stop and
+use release recovery; never glob-delete or change permissions to retry.
+
+After success, require fresh `mode=preflight` at **P** to pass before the
+separate automatic baseline-reconcile/deploy route; provisioning never dispatches or activates an app release.
 
 The code commit **C** and its pin-bearing target **P** are separate identities.
 The reviewed change places the host-control edits in **C**, followed by a
@@ -597,4 +597,4 @@ The host-control trust boundary is independent of application releases and canno
 Source **C** `c635240ba9e146e12e1d3a4d43c65224bf87553e` adds bounded private public-browser failure reports and makes validated failed counts fail the outer launch even when Playwright exits zero. Pin-only **P** `e78b290344d288ae9b137390871b3d28187ade09` records its exact 15-member closure, including dispatcher SHA-256 `5d62f944185af3926705b563844ff819268cf7827ca9d7cb5b01398a8da12da6`. Exact-P CI, signed preflight, approved provisioning and installed self-test remain required. At PR preparation on 2026-10-20, installed **C** was `5849001b78aed824527f474c4c3586108019c402` per CURRENT; this is historical state, not activation proof.
 The current pinned dispatcher/supervisor route includes the bounded A↔B runtime-profile workflow. The pin-only change refreshes the exact 15-member v4 closure; it does not establish installation. Exact-target CI, the signed host-tools artifact, approved provisioning and installed-generation self-test remain required before using the route.
 ## Current pin verification and provisioning
-`platform/contracts/host_tools_pin.json` is the authoritative source pin. Resolve it from the exact candidate checkout with `/usr/bin/python3.12 -I platform/tools/platform_host_tools_pin.py resolve --source-root "$PWD" --target-sha "$TARGET_SHA" --expected-repository StrayForest/old_sparky`; the resolver validates the selected immutable host-tools commit and every listed helper's mode and digest. Record the resolver-selected source in the operation receipts. Pin resolution is source selection only; it does not prove installation. `CURRENT.md` owns the installed active generation. Keep that generation active until the exact signed AUTO host-tools artifact selected by the candidate pin is provisioned and passes installed-generation self-test. Require exact-source Security, the source-bound backup, the normal automatic bundle, installed-generation self-test, and production preflight before using the new generation.
+`platform/contracts/host_tools_pin.json` is the authoritative source pin. Resolve it from the exact candidate checkout with `/usr/bin/python3.12 -I platform/tools/platform_host_tools_pin.py resolve --source-root "$PWD" --target-sha "$TARGET_SHA" --expected-repository StrayForest/old_sparky`; the resolver validates the selected immutable host-tools commit and every listed helper's mode and digest. Record the resolver-selected source in the operation receipts. `CURRENT.md` owns the installed active generation. Keep that generation active until the exact signed AUTO host-tools artifact selected by the candidate pin is provisioned and passes installed-generation self-test. Require exact-source Security, the source-bound backup, the normal automatic bundle, installed-generation self-test, and production preflight before using the new generation.

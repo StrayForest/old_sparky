@@ -223,6 +223,7 @@ export type PlatformPatchDetail = {
   url: string;
   content: string;
   sections: PlatformPatchSection[];
+  canonical_entity_names?: string[];
   hero_metadata_pending?: boolean;
 };
 

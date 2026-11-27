@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import unittest
 
+from apps.platform_api.app.api.schemas import PatchDetailResponse
 from apps.platform_api.app.services import home_content
 from apps.platform_api.app.services.patch_detail import structure_patch_detail
 from apps.platform_api.app.services.patch_translation_runtime import (
@@ -91,6 +92,76 @@ class PatchDetailParserTests(unittest.TestCase):
             },
             "objectives": {},
         }
+
+    def _assert_patch_dto_projects_only_source_referenced_canonical_entity_names(self) -> None:
+        catalog = {
+            "heroes": {
+                "grey_talon": {
+                    "name": "Grey Talon",
+                    "class_name": "hero_grey_talon",
+                    "abilities": {
+                        "charged shot": {"name": "Charged Shot"},
+                        "rain of arrows": {"name": "Rain of Arrows"},
+                    },
+                }
+            },
+            "items": {
+                "split shot": {"name": "Split Shot"},
+                "superior duration": {"name": "Superior Duration"},
+                "unused item": {"name": "Unused Item"},
+            },
+            "ranks": {},
+            "objectives": {},
+        }
+        source = {
+            "id": "entity-references",
+            "title": "Entity references",
+            "published_at": "2026-11-27T00:00:00+00:00",
+            "url": "https://store.steampowered.com/news/app/1422450/view/123",
+            "content": (
+                "[General]\n"
+                "Charged-Shot and Rain_of_Arrows remain unchanged.\n"
+                "Split Shot and Superior-Duration changed.\n"
+                "lowercase duration reduced."
+            ),
+        }
+
+        detail = structure_patch_detail(source, catalog)
+        self.assertEqual(
+            set(detail["canonical_entity_names"]),
+            {"Charged Shot", "Rain of Arrows", "Split Shot", "Superior Duration"},
+        )
+        self.assertNotIn("Unused Item", detail["canonical_entity_names"])
+
+        old_cached_detail = {
+            key: value
+            for key, value in detail.items()
+            if key != "canonical_entity_names"
+        }
+        old_wire = PatchDetailResponse.model_validate(old_cached_detail)
+        self.assertEqual(old_wire.canonical_entity_names, [])
+        reparsed = structure_patch_detail(old_cached_detail, catalog)
+        self.assertEqual(
+            set(reparsed["canonical_entity_names"]),
+            {"Charged Shot", "Rain of Arrows", "Split Shot", "Superior Duration"},
+        )
+        self.assertEqual(
+            set(PatchDetailResponse.model_validate(reparsed).canonical_entity_names),
+            {"Charged Shot", "Rain of Arrows", "Split Shot", "Superior Duration"},
+        )
+
+        oversized_names = [f"Entity {index:04d}" for index in range(2001)]
+        oversized_catalog = {
+            "heroes": {},
+            "items": {name.casefold(): {"name": name} for name in oversized_names},
+            "ranks": {},
+            "objectives": {},
+        }
+        with self.assertRaisesRegex(ValueError, "canonical entity-name limit"):
+            structure_patch_detail(
+                {**source, "content": " ".join(oversized_names)},
+                oversized_catalog,
+            )
 
     def test_multiline_hero_headings_keep_changes_with_each_hero(self) -> None:
         raw = {
@@ -334,6 +405,7 @@ Bonus health reduced
             reparsed["change_lists"],
             [{"start": 1, "end": 3, "ordered": True}],
         )
+        self._assert_patch_dto_projects_only_source_referenced_canonical_entity_names()
 
     def test_source_fixture_preserves_all_ranked_patch_headings_and_final_paragraph(self) -> None:
         fixture_path = Path(__file__).parent / "fixtures/patch-acceptance/steam-news-four-patches.json"

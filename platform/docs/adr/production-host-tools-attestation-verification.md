@@ -112,10 +112,20 @@ For route (a), a pre-install preflight may be overall unsuccessful only when
 its exact host-capability gate reports pinned **C** absent before build,
 transaction, transfer or protected write. The exact attempt must still have a
 successful builder job, and the attestation above must verify every route
-binding. Any other failed step, unexpected skip, ambiguous binding or
-incomplete required check makes the artifact ineligible. Downstream jobs
-skipped solely because they depend on this accepted missing-**C** gate are
-expected; any other skip is ineligible.
+binding. The dispatch-input artifact must prove `mode=preflight` before jobs
+are interpreted. The exact workflow's permitted skipped jobs are
+`Validate exact classifier artifact before build` (not applicable in
+preflight mode), plus `Authenticate active production baseline and cumulative
+route`, `Publish exact non-runtime no-op source receipt`,
+`Authenticate exact report-only failed release and active baseline`,
+`Dispatch exact-target baseline runtime proof`,
+`Validate exact-target baseline runtime proof`,
+`Build immutable release artifact in CI`, `Validate exact security
+provenance`, `Production preflight`, `Deploy production`, and
+`Dispatch automatic post-deploy live QA` (mode/dependency gated in this
+preflight route). The maintained operator accepts only this closed skip-name
+set; any other skipped job, any other failed step, ambiguous binding or
+incomplete required check makes the artifact ineligible.
 After provisioning **C**, a separate fresh exact-target
 `mode=preflight` must pass in full, including installed host capability.
 

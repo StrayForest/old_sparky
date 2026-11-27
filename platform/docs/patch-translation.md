@@ -112,6 +112,18 @@ catalog retries for hidden metadata. A valid ability with no supported numeric
 properties does not retry indefinitely.
 Structural and entity labels keep their canonical English identity, with
 separate localized display labels where the catalog provides them.
+Patch-detail DTOs also expose `canonical_entity_names`: up to 2,000 names from
+the same term set used by translation entity protection that occur in the
+original patch source. The set includes current catalog hero, ability, item and
+rank names, hero class-name aliases, and the fixed `Urn`, `Unstable Rift` and
+`Mid Boss` identities. Matching uses the translation term boundaries and
+separator rules. This lets source-aware acceptance checks recognize an entity
+reference anywhere in a change, including General changes, without treating
+unrelated English prose as a label. A source exceeding the limit fails closed
+instead of publishing a partial identity list. The field is rebuilt with the
+cached source when patch details are reparsed against the current asset
+catalog; old cached DTOs may omit it and are accepted with an empty default
+until reparsed.
 
 Mid Boss changes receive the `mid_boss` objective identity and the verified
 neutral boss marker image when the source icon catalog provides it. Decorative

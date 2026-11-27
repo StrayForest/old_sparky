@@ -28,6 +28,7 @@ from tools import platform_host_tools_bundle as bundle
 from tools import platform_host_tools_installed_check as installed_check
 from tools import platform_host_tools_candidate as candidate
 from tools import platform_host_tools_pin as pin
+from tools import platform_host_tools_provision_operator as operator_provisioner
 from tools import platform_readonly_live_readiness as live_readiness
 from tools import platform_workflow_remote_dispatch as dispatcher
 from tools.platform_verify_contract import (
@@ -88,6 +89,297 @@ def _release_receipt(
 
 
 class HostToolsBundleTests(unittest.TestCase):
+    @staticmethod
+    def _preflight_jobs_fixture() -> list[dict[str, object]]:
+        skipped = sorted(operator_provisioner.PREFLIGHT_ALLOWED_SKIPPED_JOBS)
+        return [
+            {"id": 1, "name": "Validate deployment dispatch", "status": "completed", "conclusion": "success"},
+            {
+                "id": 2, "name": "Build deterministic host-tools bundle in CI",
+                "status": "completed", "conclusion": "success",
+                "steps": [
+                    {"name": name, "status": "completed", "conclusion": "success"}
+                    for name in (
+                        "Build and verify deterministic host-tools bundle",
+                        "Publish exact host-tools bundle",
+                        "Attest exact host-tools bundle",
+                    )
+                ],
+            },
+            {
+                "id": 3, "name": "Verify immutable production host capabilities",
+                "status": "completed", "conclusion": "failure",
+                "steps": [{
+                    "name": "Validate root SSH identity and installed generation",
+                    "status": "completed", "conclusion": "failure",
+                }],
+            },
+            *[
+                {"id": index + 4, "name": name, "status": "completed", "conclusion": "skipped"}
+                for index, name in enumerate(skipped)
+            ],
+        ]
+
+    @staticmethod
+    def _operator_fixture() -> tuple[dict[str, object], dict[str, bytes]]:
+        payloads = {
+            "platform_workflow_remote_dispatch.py": b"raise RuntimeError('candidate execution is forbidden')\n",
+            **{f"platform_operator_fixture_{index}.py": f"# fixture {index}\n".encode() for index in range(14)},
+            "capabilities.txt": b"schema=1\ntoolset_version=production-host-tools-v4\n",
+        }
+        records = [
+            {
+                "path": name,
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "mode": 0o444 if name == "capabilities.txt" else 0o555,
+            }
+            for name, data in payloads.items()
+        ]
+        manifest: dict[str, object] = {
+            "schema": 1,
+            "source_sha": "a" * 40,
+            "generation": "a" * 40,
+            "toolset_version": "production-host-tools-v4",
+            "files": records,
+        }
+        manifest_bytes = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        return manifest, {**payloads, "manifest.json": manifest_bytes}
+
+    def test_operator_rehearsal_publishes_exact_inventory_without_candidate_execution(self) -> None:
+        manifest, files = self._operator_fixture()
+        owner = (os.geteuid(), os.getegid())
+        with tempfile.TemporaryDirectory(prefix="host-tools-operator-exact-") as temporary:
+            root = Path(temporary)
+            prior = root / ("b" * 40)
+            prior.mkdir(mode=0o700)
+            sentinel = prior / "prior-generation.txt"
+            sentinel.write_bytes(b"preserve prior generation\n")
+            os.chmod(prior, 0o555)
+            result = operator_provisioner.publish(
+                root, "a" * 40, "12345", manifest, files, rehearsal=True, owner=owner
+            )
+            target = Path(result["path"])
+            self.assertEqual(result["self_test"], "not_run_rehearsal")
+            self.assertTrue(operator_provisioner.tree_matches(target, files, owner=owner))
+            self.assertEqual(sentinel.read_bytes(), b"preserve prior generation\n")
+            self.assertFalse((target / "__pycache__").exists())
+            self.assertEqual({item.name for item in target.iterdir()}, set(files))
+
+    def test_operator_no_replace_refuses_existing_generation(self) -> None:
+        manifest, files = self._operator_fixture()
+        owner = (os.geteuid(), os.getegid())
+        with tempfile.TemporaryDirectory(prefix="host-tools-operator-noreplace-") as temporary:
+            root = Path(temporary)
+            target = root / ("a" * 40)
+            target.mkdir()
+            sentinel = target / "existing.txt"
+            sentinel.write_bytes(b"must stay intact\n")
+            with self.assertRaisesRegex(operator_provisioner.ProvisionError, "publication_path_already_exists"):
+                operator_provisioner.publish(
+                    root, "a" * 40, "12346", manifest, files, rehearsal=True, owner=owner
+                )
+            self.assertEqual(sentinel.read_bytes(), b"must stay intact\n")
+            self.assertFalse((root / (".stage-" + "a" * 40 + "-12346")).exists())
+
+    def test_operator_post_rename_fsync_failure_quarantines_only_new_inode(self) -> None:
+        manifest, files = self._operator_fixture()
+        owner = (os.geteuid(), os.getegid())
+        with tempfile.TemporaryDirectory(prefix="host-tools-operator-fsync-") as temporary:
+            root = Path(temporary)
+            prior = root / ("b" * 40)
+            prior.mkdir()
+            sentinel = prior / "prior.txt"
+            sentinel.write_bytes(b"old generation remains\n")
+            os.chmod(prior, 0o555)
+            real_fsync = operator_provisioner.fsync_directory
+
+            failures_left = [1]
+
+            def fail_generation_root(path: Path) -> None:
+                if path == root:
+                    if failures_left[0]:
+                        failures_left[0] -= 1
+                        raise OSError("injected parent fsync failure")
+                real_fsync(path)
+
+            with patch.object(operator_provisioner, "fsync_directory", side_effect=fail_generation_root):
+                with self.assertRaisesRegex(operator_provisioner.ProvisionError, "post_publish_failure_quarantined"):
+                    operator_provisioner.publish(
+                        root, "a" * 40, "12347", manifest, files, rehearsal=True, owner=owner
+                    )
+            target = root / ("a" * 40)
+            quarantine = root / (".failed-" + "a" * 40 + "-12347")
+            self.assertFalse(target.exists())
+            self.assertTrue(operator_provisioner.tree_matches(quarantine, files, owner=owner))
+            self.assertEqual(sentinel.read_bytes(), b"old generation remains\n")
+            os.chmod(prior, 0o700)
+
+    def test_operator_post_rename_tree_check_failure_quarantines_exact_inode(self) -> None:
+        manifest, files = self._operator_fixture()
+        owner = (os.geteuid(), os.getegid())
+        with tempfile.TemporaryDirectory(prefix="host-tools-operator-tree-") as temporary:
+            root = Path(temporary)
+            prior = root / ("b" * 40)
+            prior.mkdir()
+            sentinel = prior / "prior.txt"
+            sentinel.write_bytes(b"old generation remains\n")
+            os.chmod(prior, 0o555)
+            real_tree_matches = operator_provisioner.tree_matches
+            failures_left = [1]
+
+            def fail_once(path: Path, candidate_files: dict[str, bytes], *, owner: tuple[int, int] = (0, 0)) -> bool:
+                if path == root / ("a" * 40) and failures_left[0]:
+                    failures_left[0] -= 1
+                    return False
+                return real_tree_matches(path, candidate_files, owner=owner)
+
+            with patch.object(operator_provisioner, "tree_matches", side_effect=fail_once):
+                with self.assertRaisesRegex(operator_provisioner.ProvisionError, "post_publish_failure_quarantined"):
+                    operator_provisioner.publish(
+                        root, "a" * 40, "12349", manifest, files, rehearsal=True, owner=owner
+                    )
+            quarantine = root / (".failed-" + "a" * 40 + "-12349")
+            self.assertFalse((root / ("a" * 40)).exists())
+            self.assertTrue(real_tree_matches(quarantine, files, owner=owner))
+            self.assertEqual(sentinel.read_bytes(), b"old generation remains\n")
+            os.chmod(prior, 0o700)
+
+    def test_operator_post_rename_unprovable_tree_stops_without_quarantine(self) -> None:
+        manifest, files = self._operator_fixture()
+        owner = (os.geteuid(), os.getegid())
+        with tempfile.TemporaryDirectory(prefix="host-tools-operator-unprovable-") as temporary:
+            root = Path(temporary)
+            prior = root / ("b" * 40)
+            prior.mkdir()
+            sentinel = prior / "prior.txt"
+            sentinel.write_bytes(b"old generation remains\n")
+            os.chmod(prior, 0o555)
+            real_fsync = operator_provisioner.fsync_directory
+
+            def mutate_new_tree_after_rename(path: Path) -> None:
+                if path == root:
+                    target = root / ("a" * 40)
+                    os.chmod(target, 0o755)
+                    (target / "unexpected-member").write_bytes(b"unknown bytes\n")
+                    os.chmod(target, 0o555)
+                real_fsync(path)
+
+            with patch.object(operator_provisioner, "fsync_directory", side_effect=mutate_new_tree_after_rename):
+                with self.assertRaisesRegex(operator_provisioner.ProvisionError, "post_publish_identity_uncertain"):
+                    operator_provisioner.publish(
+                        root, "a" * 40, "12350", manifest, files, rehearsal=True, owner=owner
+                    )
+            target = root / ("a" * 40)
+            self.assertTrue(target.exists())
+            self.assertEqual((target / "unexpected-member").read_bytes(), b"unknown bytes\n")
+            self.assertFalse((root / (".failed-" + "a" * 40 + "-12350")).exists())
+            self.assertEqual(sentinel.read_bytes(), b"old generation remains\n")
+            for child in target.iterdir():
+                child.chmod(0o600)
+                child.unlink()
+            target.chmod(0o700)
+            target.rmdir()
+            prior.chmod(0o700)
+
+    def test_operator_receipt_failure_quarantines_exact_published_inode(self) -> None:
+        manifest, files = self._operator_fixture()
+        owner = (os.geteuid(), os.getegid())
+        with tempfile.TemporaryDirectory(prefix="host-tools-operator-receipt-") as temporary:
+            root = Path(temporary)
+
+            def fail_receipt(_: dict[str, object]) -> dict[str, object]:
+                raise operator_provisioner.ProvisionError("injected_receipt_failure")
+
+            with self.assertRaisesRegex(operator_provisioner.ProvisionError, "receipt_failure_quarantined"):
+                operator_provisioner.publish_with_receipt(
+                    root, "a" * 40, "12348", manifest, files, root / "receipt",
+                    fail_receipt, rehearsal=True, owner=owner,
+                )
+            self.assertFalse((root / ("a" * 40)).exists())
+            self.assertTrue(operator_provisioner.tree_matches(
+                root / (".failed-" + "a" * 40 + "-12348"), files, owner=owner
+            ))
+
+    def test_operator_missing_generation_log_ignores_echoed_shell_source(self) -> None:
+        echoed = (
+            b"2026-11-27T00:00:00.000Z ##[group]Run set -euo pipefail\n"
+            b"echo 'Exact host-tools generation is not installed yet.'\n"
+            b"##[endgroup]\n"
+            b"##[error]Process completed with exit code 10.\n"
+        )
+        with self.assertRaisesRegex(operator_provisioner.ProvisionError, "missing_generation_refusal_unproven"):
+            operator_provisioner.parse_missing_generation_log(echoed)
+        actual = (
+            b"2026-11-27T00:00:00.000Z ##[group]Run set -euo pipefail\n"
+            b"echo 'check generation'\n##[endgroup]\n"
+            b"2026-11-27T00:00:01.000Z Exact host-tools generation is not installed yet.\n"
+            b"2026-11-27T00:00:02.000Z ##[error]Process completed with exit code 10.\n"
+        )
+        self.assertEqual(operator_provisioner.parse_missing_generation_log(actual), hashlib.sha256(actual).hexdigest())
+
+    def test_operator_rejects_partial_artifact_owner_account(self) -> None:
+        existing = SimpleNamespace(pw_uid=700, pw_gid=701, pw_dir="/nonexistent", pw_shell="/usr/sbin/nologin")
+        with patch.object(operator_provisioner.pwd, "getpwnam", return_value=existing), patch.object(
+            operator_provisioner.grp, "getgrnam", side_effect=KeyError
+        ):
+            with self.assertRaisesRegex(operator_provisioner.ProvisionError, "artifact_owner_partial_account"):
+                operator_provisioner.validate_account_contract("b" * 40)
+
+    def test_operator_preflight_accepts_only_closed_mode_specific_skips(self) -> None:
+        jobs = self._preflight_jobs_fixture()
+        result = operator_provisioner.verify_preflight_job_set(jobs, mode="preflight")
+        self.assertEqual(result["failed_job_id"], 3)
+        with self.assertRaisesRegex(operator_provisioner.ProvisionError, "preflight_mode_not_proven"):
+            operator_provisioner.verify_preflight_job_set(jobs, mode="deploy")
+        jobs.append({"id": 99, "name": "Unrelated skipped gate", "status": "completed", "conclusion": "skipped"})
+        with self.assertRaisesRegex(operator_provisioner.ProvisionError, "preflight_unexpected_skipped_job"):
+            operator_provisioner.verify_preflight_job_set(jobs, mode="preflight")
+
+    def test_operator_attestation_source_mismatch_stops_before_publication(self) -> None:
+        invocation = "https://github.com/StrayForest/old_sparky/actions/runs/12345/attempts/1"
+        rows = [{"verificationResult": {
+            "verifiedTimestamps": ["2026-11-27T00:00:00Z"],
+            "statement": {
+                "subject": [{"name": "platform-host-tools-bundle.zip", "digest": {"sha256": "c" * 64}}],
+                "predicateType": "https://slsa.dev/provenance/v1",
+                "predicate": {
+                    "buildDefinition": {
+                        "externalParameters": {"workflow": {
+                            "repository": "https://github.com/StrayForest/old_sparky",
+                            "path": ".github/workflows/platform-production-deploy.yml",
+                            "ref": "refs/heads/dev",
+                        }},
+                        "resolvedDependencies": [{
+                            "uri": "git+https://github.com/StrayForest/old_sparky@refs/heads/dev",
+                            "digest": {"gitCommit": "a" * 40},
+                        }],
+                    },
+                    "runDetails": {"metadata": {"invocationId": invocation}},
+                },
+            },
+            "signature": {"certificate": {
+                "sourceRepositoryURI": "https://github.com/StrayForest/old_sparky",
+                "sourceRepositoryRef": "refs/heads/dev",
+                "sourceRepositoryDigest": "d" * 40,
+                "githubWorkflowRepository": "StrayForest/old_sparky",
+                "githubWorkflowName": "Platform production deploy",
+                "githubWorkflowRef": "refs/heads/dev",
+                "githubWorkflowSHA": "a" * 40,
+                "githubWorkflowTrigger": "workflow_dispatch",
+                "runInvocationURI": invocation,
+            }},
+        }}]
+        completed = subprocess.CompletedProcess([], 0, json.dumps(rows).encode(), b"")
+        with tempfile.TemporaryDirectory(prefix="host-tools-attestation-source-") as temporary:
+            with patch.object(operator_provisioner, "safe_run", return_value=completed):
+                with self.assertRaisesRegex(operator_provisioner.ProvisionError, "attestation_certificate_binding"):
+                    operator_provisioner.verify_attestation(
+                        Path("/root/.private-gh/bin/gh"), Path(temporary) / "bundle.zip",
+                        target_sha="a" * 40, preflight_run_id="12345", preflight_attempt="1",
+                        bundle_sha256="c" * 64, scratch=Path(temporary),
+                    )
+            self.assertEqual(list(Path(temporary).iterdir()), [])
+
     def test_installed_checker_reports_closed_stage_for_remote_nonzero(self) -> None:
         cases = (
             ("member_digest", 255, "reason=ssh_nonzero ssh_exit_code=255"),
@@ -1712,6 +2004,34 @@ class HostToolsBundleTests(unittest.TestCase):
         generation.chmod(0o555)
         return generation
 
+    def _operator_lock_bootstrap_fixture(self, root: Path) -> tuple[Path, Path, Path, str, str]:
+        app = root / "app"
+        releases = app / "releases"
+        release = releases / "active-release"
+        release.mkdir(parents=True)
+        flattened = self._flattened_release_pin_fixture(root / "flattened")
+        shutil.copytree(flattened / "tools", release / "tools")
+        shutil.copytree(flattened / "contracts", release / "contracts")
+        (release / "contracts/host_tools_pin.json").chmod(0o444)
+        receipt = {"artifact_format_version": 1, "release_slug": release.name, "source_git_commit": SOURCE_SHA}
+        (release / "RELEASE.json").write_text(
+            json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii",
+        )
+        (release / "RELEASE.json").chmod(0o444)
+        (app / "current").symlink_to(release)
+        generation_root = app / "shared/host-tools"
+        generation_root.mkdir(parents=True)
+        staged_root = root / "staged"
+        staged_root.mkdir()
+        staged = self._installed_generation_fixture(staged_root)
+        shutil.copytree(staged, generation_root / PIN_SHA, copy_function=shutil.copy2)
+        (generation_root / PIN_SHA).chmod(0o555)
+        target_sha = subprocess.run(
+            ["/usr/bin/git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        return REPO_ROOT, app, generation_root, target_sha, "a" * 40
+
     def _verify_installed_fixture(self, generation: Path) -> dict[str, object]:
         return bundle.verify_installed_generation(
             generation,
@@ -1738,6 +2058,75 @@ class HostToolsBundleTests(unittest.TestCase):
             target.write_bytes(source.read_bytes())
             target.chmod(stat.S_IMODE(source.stat().st_mode))
         return release
+
+    def test_operator_lock_bootstrap_binds_active_pin_and_immutable_generation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="host-tools-lock-bootstrap-") as temporary:
+            source_root, app, generation_root, target_sha, target_host_sha = self._operator_lock_bootstrap_fixture(Path(temporary))
+            snapshot = operator_provisioner.active_lock_bootstrap(
+                source_root, target_sha=target_sha, target_host_tools_sha=target_host_sha, app_root=app,
+                generation_root=generation_root,
+            )
+            self.assertEqual(snapshot["active_pin_sha"], PIN_SHA)
+            self.assertEqual(
+                Path(snapshot["lock_helper_path"]), generation_root / PIN_SHA / "platform_release_lock.sh",
+            )
+            self.assertEqual(
+                snapshot["lock_helper_sha256"],
+                next(
+                    record["sha256"] for record in json.loads(
+                        (app / "current/contracts/host_tools_pin.json").read_text(encoding="ascii")
+                    )["closure"] if record["path"].endswith("/platform_release_lock.sh")
+                ),
+            )
+
+    def test_operator_lock_bootstrap_rejects_active_source_and_helper_drift(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="host-tools-lock-bootstrap-drift-") as temporary:
+            source_root, app, generation_root, target_sha, target_host_sha = self._operator_lock_bootstrap_fixture(Path(temporary))
+            snapshot = operator_provisioner.active_lock_bootstrap(
+                source_root, target_sha=target_sha, target_host_tools_sha=target_host_sha, app_root=app,
+                generation_root=generation_root,
+            )
+            alternate = app / "releases/alternate"
+            shutil.copytree(app / "releases/active-release", alternate, copy_function=shutil.copy2)
+            (alternate / "RELEASE.json").write_text(
+                json.dumps({"artifact_format_version": 1, "release_slug": "alternate", "source_git_commit": SOURCE_SHA},
+                           sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii",
+            )
+            (alternate / "RELEASE.json").chmod(0o444)
+            replacement = app / "replacement-current"
+            replacement.symlink_to(alternate)
+            replacement.replace(app / "current")
+            with self.assertRaisesRegex(operator_provisioner.ProvisionError, "active_lock_bootstrap_changed"):
+                operator_provisioner.revalidate_active_lock_bootstrap(
+                    source_root, target_sha=target_sha, target_host_tools_sha=target_host_sha, expected=snapshot,
+                    app_root=app, generation_root=generation_root,
+                )
+
+            (app / "current").unlink()
+            (app / "current").symlink_to(app / "releases/active-release")
+            pin_path = app / "releases/active-release/contracts/host_tools_pin.json"
+            active_pin = json.loads(pin_path.read_text(encoding="ascii"))
+            active_pin["host_tools_sha"] = target_host_sha
+            os.chmod(pin_path, 0o644)
+            pin_path.write_text(json.dumps(active_pin, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
+            os.chmod(pin_path, 0o444)
+            with self.assertRaisesRegex(operator_provisioner.ProvisionError, "active_pin_target_mismatch"):
+                operator_provisioner.revalidate_active_lock_bootstrap(
+                    source_root, target_sha=target_sha, target_host_tools_sha=target_host_sha, expected=snapshot,
+                    app_root=app, generation_root=generation_root,
+                )
+            os.chmod(pin_path, 0o644)
+            pin_path.write_text(json.dumps(pin._read_pin(REPO_ROOT), sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
+            os.chmod(pin_path, 0o444)
+            lock_helper = generation_root / PIN_SHA / "platform_release_lock.sh"
+            os.chmod(lock_helper, 0o644)
+            lock_helper.write_bytes(lock_helper.read_bytes() + b"\n# drift\n")
+            os.chmod(lock_helper, 0o555)
+            with self.assertRaisesRegex(operator_provisioner.ProvisionError, "active_host_generation_validation"):
+                operator_provisioner.revalidate_active_lock_bootstrap(
+                    source_root, target_sha=target_sha, target_host_tools_sha=target_host_sha, expected=snapshot,
+                    app_root=app, generation_root=generation_root,
+                )
 
     def test_installed_generation_verifies_manifest_normalized_modes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

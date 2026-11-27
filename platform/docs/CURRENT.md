@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-11-24
+- Last reviewed: 2026-11-27
 
 Read this page for live pins, pending release work, open QA gates and hard
 operational limits. Product contracts, procedures and detailed run evidence
@@ -11,11 +11,15 @@ belong in the linked owner documents below.
 ## Live and pending state
 
 - Production currently runs application source
-  `da6427ebfd9abd7288c9903c9e8f3bd286e398f5` in automatic release
-  `gha-45266015590-1-da6427ebfd9a`. Exact-SHA security/build and automatic
-  release checks passed; deployment smoke and post-deploy health passed.
-  See the [deployment runbook](deployment-runbook.md) for source-bound release
-  procedures.
+  `b6cb531ef05eda17c38a04e6a24f33d2b6bb606e` in automatic release
+  `gha-45965332588-1-b6cb531ef05e`; exact-SHA Security run `45958781985/1`,
+  the signed preflight, restore verification, deployment and post-deploy health
+  passed. The separately installed shared host-tools generation is
+  `ec2506d0099f788d210b84e3ad3001431bfeeced`, with installed receipt digest
+  `1c1958ec5799180c88743932f9344145cd1c29d3db07a237380f2b85dc5516f5`.
+  The host-tools pin and app release are separate identities. See the
+  [host-tools provisioning ADR](adr/production-host-tools-provisioning.md) and
+  [deployment runbook](deployment-runbook.md) for their source-bound procedures.
 - Installed-origin API acceptance for patch `1848664643342973` passed: the
   Russian patch detail returns 27 changes, with the leaderboard heading at
   index 21, its four descriptions at indexes 22–25, and the Beta Season 2
@@ -33,16 +37,6 @@ belong in the linked owner documents below.
   Cloudflare scoring.
 - Historical timeout and uncredited-run detail is in the
   [closeout audit](archive/simplification-performance-audit-2026-11-13.md).
-- The 11-cell production matrix is complete, but cell 9 failed its stress
-  contract with unknown capacity attribution; no server capacity ceiling is
-  certified. Cell 7's client/origin request join remains unresolved. A recent
-  SSR composite recovered bounded profile attribution, but its workflow report
-  remains incomplete and receives no capacity or SLO credit. Another SSR
-  diagnostic has one unexplained ON response disconnect. These findings do not
-  establish a production capacity limit or a root cause. Use the
-  [performance matrix](../performance/README.md#current-11-profile-production-matrix)
-  and [SSR diagnostic runbook](ssr-capacity-diagnostic-runbook.md) for scoped
-  evidence and procedures; no matrix rerun is pending.
 - Production backup, deployment and source-binding rules remain owned by the
   [deployment runbook](deployment-runbook.md) and
   [backup and restore runbook](backup-restore-runbook.md).
@@ -53,29 +47,41 @@ belong in the linked owner documents below.
   automatic exact cleanup for a confirmed terminal Public failure and
   preserves the fixed browser-output protocol.
 - Automatic release QA for source
-  `da6427ebfd9abd7288c9903c9e8f3bd286e398f5` produced canonical Public QA
-  child `45271917185/1`, which passed with 47 passed, 10 skipped and 0 failed.
-  UserQA child `45273158082/1` failed `live_user_journey` at
-  `tests/smoke/live-user-journey.spec.ts:337`, where the browser-gate snapshot
-  contained browser failures. The retained v3 report was bound to the active
-  source, app and marker, but its optional event details were unavailable, so
-  the event category and historical cause remain unknown. The failed run's
-  root state and gates are absent and the QA unit/cgroup is idle; no durable
-  database-absence proof was retained, so complete cleanup is not established.
-  Do not infer a CSP, lazy-loading, decode or application cause. See the
-  [CSP/live-QA runbook](csp-live-qa-runbook.md) for the evidence contract and
-  recovery procedure.
-- Latest read-only storage diagnostics `45209278827/1` found about 18 GB free,
-  healthy services, an enabled maintenance timer and no QA cache artifact
-  candidates. No manual retention deletion was needed. The CI Siteverify
-  fixture does not establish production Cloudflare challenge/scoring.
-- The completed external HTTP matrix is not whole-site functional coverage.
-  Cell 9's attribution failure and cell 7's unresolved client/origin join are
-  not closed by the separate SSR diagnostics. No cause or server capacity
-  ceiling is established. Do not rerun completed cells; use the owner
+  `b6cb531ef05eda17c38a04e6a24f33d2b6bb606e` produced Public child
+  `45966461244/1`: 42 passed, 5 failed, 10 skipped, 0 flaky and 0 timed out.
+  The failed assertions include the desktop `objective_icons` screenshot,
+  `patch_owner_sections` translation acceptance, and mobile
+  `image_csp_hosts` completeness. The retained report did not preserve enough
+  detail to establish the historical screenshot exception or a unique image
+  failure cause; the screenshot diagnostic remains pending. The exact public
+  cleanup receipt says `cleaned`; this records
+  cleanup completion only, not a QA pass or proof of historical database
+  absence. UserQA was not dispatched after the Public failure. Current fixes
+  are under validation: patch translation acceptance now uses catalog-backed
+  entity names, and the image inventory tracks responsive source generations
+  and bounded request-start coverage while retaining strict completeness.
+  Candidate image inventory and translation fixes remain under validation; no
+  unique historical image cause is established. Rerun Public and UserQA only
+  after the candidate source is released. See the [CSP/live-QA runbook](csp-live-qa-runbook.md)
+  for the evidence contract and recovery procedure.
+- Latest read-only storage diagnostics `45984612377/1` bound to the active b6
+  source found 59% disk use (about 14.8 GiB free), an unlocked storage lock,
+  healthy API/worker/web services, an enabled maintenance timer matching its
+  installed unit, a restore-verified backup and no LiveQA cache candidates or
+  tombstones. The report-only retention dry-run passed; its four generic
+  release candidates are not an apply set. No manual deletion was needed. The
+  CI Siteverify fixture does not establish production Cloudflare
+  challenge/scoring.
+- The 11-cell production matrix is complete, but cell 9 failed its stress
+  contract with unknown capacity attribution; no server capacity ceiling is
+  certified. Cell 7's client/origin request join remains unresolved. A recent
+  SSR composite recovered bounded profile attribution, but its workflow report
+  remains incomplete and receives no capacity or SLO credit. Another SSR
+  diagnostic has one unexplained ON response disconnect. These findings do not
+  establish a production capacity limit or a root cause. Use the
   [performance matrix](../performance/README.md#current-11-profile-production-matrix)
-  and [SSR diagnostic runbook](ssr-capacity-diagnostic-runbook.md) for any
-  separately authorized follow-up.
+  and [SSR diagnostic runbook](ssr-capacity-diagnostic-runbook.md) for scoped
+  evidence and procedures; no matrix rerun is pending.
 
 ## Hard operational limits
 

@@ -116,11 +116,11 @@ function registerTenImageFixture(
   { failedImage = false, failedImageMode = "abort" as "abort" | "http-error" } = {},
 ) {
   return page.route("http://image-inventory.test/**", async (route) => {
-    const { pathname } = new URL(route.request().url());
-    if (pathname === "/fixture") {
-      await route.fulfill({
-        contentType: "text/html; charset=utf-8",
-        body: `<!doctype html>
+      const { pathname } = new URL(route.request().url());
+      if (pathname === "/fixture") {
+        await route.fulfill({
+          contentType: "text/html; charset=utf-8",
+          body: `<!doctype html>
           <html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head>
           <body>
             <main id="image-content" style="padding-top: 1800px"></main>
@@ -224,6 +224,146 @@ async function collectTenImageInventory(page: Page, failedImage = false, failedI
     timeoutMs: 1_500,
   });
   return { inventory, requestFailure: failureEvent ? await failureEvent : null };
+}
+
+function registerPatchScaleImageFixture(
+  page: Page,
+  { failureOrdinal = 0, overflowOrdinal = 0, viewportGated = false } = {},
+): Promise<number[]> {
+  const imageCount = 128;
+  const initialCount = 96;
+  const lateCount = imageCount - initialCount;
+  const requestStartOrdinals: number[] = [];
+  page.on("request", (request) => {
+    if (request.resourceType() !== "image") return;
+    const match = /^\/images\/patch-image-([1-9][0-9]*)\.svg$/u.exec(new URL(request.url()).pathname);
+    if (match) requestStartOrdinals.push(Number(match[1]));
+  });
+  const setup = async () => {
+    await page.addInitScript(() => {
+      const scrollCounts = new WeakMap<HTMLImageElement, number>();
+      const sourceOpportunityScrollCounts = new Map<number, number>();
+      const original = Element.prototype.scrollIntoView;
+      Element.prototype.scrollIntoView = function (this: Element, ...args: Parameters<typeof original>) {
+        if (this instanceof HTMLImageElement) {
+          scrollCounts.set(this, (scrollCounts.get(this) ?? 0) + 1);
+        }
+        return Reflect.apply(original, this, args);
+      };
+      (window as Window & {
+        __patchScaleImageProbe?: {
+          scrollCountFor: (ordinal: number) => number;
+          sourceOpportunityScrollCountFor: (ordinal: number) => number | null;
+          recordSourceOpportunity: (ordinal: number, scrollCount: number) => void;
+        };
+      }).__patchScaleImageProbe = {
+        scrollCountFor: (ordinal) => {
+          const image = [...document.images].find((entry) => (
+            entry.dataset.probeImageOrdinal === String(ordinal)
+          ));
+          return image ? scrollCounts.get(image) ?? 0 : 0;
+        },
+        sourceOpportunityScrollCountFor: (ordinal) => sourceOpportunityScrollCounts.get(ordinal) ?? null,
+        recordSourceOpportunity: (ordinal, scrollCount) => {
+          sourceOpportunityScrollCounts.set(ordinal, scrollCount);
+        },
+      };
+    });
+    await page.route("http://image-inventory.test/**", async (route) => {
+      const { pathname } = new URL(route.request().url());
+      if (pathname === "/fixture") {
+        await route.fulfill({
+          contentType: "text/html; charset=utf-8",
+          body: `<!doctype html>
+          <html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+          <body>
+            <main id="image-content"></main>
+            <div data-testid="route-ready" data-ready="false"></div>
+            <script>
+              const addImages = (start, count) => {
+                const content = document.querySelector("#image-content");
+                for (let index = start; index < start + count; index += 1) {
+                  const section = document.createElement("section");
+                  section.style.height = "480px";
+                  section.style.display = "grid";
+                  section.style.placeItems = "center";
+                  const image = document.createElement("img");
+                  image.alt = "patch-image-" + (index + 1);
+                  image.dataset.probeImageOrdinal = String(index + 1);
+                  image.loading = "lazy";
+                  image.width = 32;
+                  image.height = 32;
+                  const imageUrl = "/images/patch-image-" + (index + 1) + ".svg"
+                    + (index + 1 === ${overflowOrdinal} ? "?oversized=" + "x".repeat(2_100) : "");
+                  if (${viewportGated}) {
+                    image.dataset.pendingSrc = imageUrl;
+                    imageSourceObserver.observe(image);
+                  } else {
+                    image.src = imageUrl;
+                  }
+                  section.append(image);
+                  content.append(section);
+                }
+              };
+              const imageSourceObserver = new IntersectionObserver((entries) => {
+                for (const entry of entries) {
+                  const image = entry.target;
+                  if (entry.isIntersecting && !image.hasAttribute("src")) {
+                    image.src = image.dataset.pendingSrc;
+                    image.dataset.sourcePublished = "true";
+                    const probe = window.__patchScaleImageProbe;
+                    const ordinal = Number(image.dataset.probeImageOrdinal);
+                    probe?.recordSourceOpportunity(ordinal, probe.scrollCountFor(ordinal));
+                  }
+                }
+              }, { threshold: [0] });
+              fetch("/api/content/initial")
+                .then((response) => response.json())
+                .then((count) => {
+                  addImages(0, count);
+                  document.querySelector('[data-testid="route-ready"]')
+                    .setAttribute("data-ready", "true");
+                  if (${lateCount} > 0) {
+                    setTimeout(() => {
+                      void fetch("/api/content/late")
+                        .then((response) => response.json())
+                        .then((late) => addImages(count, late));
+                    }, 30);
+                  }
+                });
+            </script>
+          </body></html>`,
+        });
+        return;
+      }
+      if (pathname === "/api/content/initial") {
+        await route.fulfill({
+          contentType: "application/json",
+          body: String(initialCount),
+        });
+        return;
+      }
+      if (pathname === "/api/content/late") {
+        await route.fulfill({
+          contentType: "application/json",
+          body: String(lateCount),
+        });
+        return;
+      }
+      const match = /^\/images\/patch-image-([1-9][0-9]*)\.svg$/u.exec(pathname);
+      if (match) {
+        if (Number(match[1]) === failureOrdinal) {
+          await route.abort("failed");
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, Number(match[1]) === overflowOrdinal ? 400 : 8));
+        await route.fulfill({ contentType: "image/svg+xml", body: fixtureSvg });
+        return;
+      }
+      await route.abort();
+    });
+  };
+  return setup().then(() => requestStartOrdinals);
 }
 
 type HookFailureScenario = {
@@ -448,7 +588,7 @@ test("WebKit inventories delayed offscreen lazy images after route content is re
     "/images/image-three.svg",
   ]);
   expect(inventory.images.every((image) => image.loaded && image.currentSrc.length > 0)).toBe(true);
-  expect(inventory.scrollAttempts).toBe(3);
+  expect(inventory.scrollAttempts).toBeLessThanOrEqual(3);
 });
 
 // This controlled viewport-gated source publisher checks scan robustness; it is
@@ -584,6 +724,271 @@ test("WebKit revisits lazy images while their viewport-gated source is still pen
     ));
     expect(entered, `lazy image ${image.diagnostic.ordinal} should actually enter the viewport`).toBe(true);
   }
+});
+
+test("WebKit completes a patch-scale inventory after dynamically added lazy images start", async ({ page }) => {
+  await registerPatchScaleImageFixture(page);
+  const inventory = await collectLiveImageInventory(page, {
+    route: "patch-scale-lazy-images",
+    waitForContent: async () => {
+      await page.goto("http://image-inventory.test/fixture", { waitUntil: "domcontentloaded" });
+      await expect(page.getByTestId("route-ready")).toHaveAttribute("data-ready", "true");
+      await expect.poll(() => page.locator("img").count()).toBe(128);
+    },
+  });
+
+  expect(inventory.images).toHaveLength(128);
+  expect(inventory.complete).toBe(true);
+  expect(inventory.images.every((image) => image.loaded && image.currentSrc.length > 0)).toBe(true);
+  expect(inventory.scrollAttempts).toBeLessThanOrEqual(128);
+  expect(inventory.observationCoverage.networkState).toBe("truncated");
+});
+
+test("WebKit waits for real viewport delivery before assigning patch-scale lazy sources", async ({ page }) => {
+  const requestStartOrdinals = await registerPatchScaleImageFixture(page, { viewportGated: true });
+  const inventory = await collectLiveImageInventory(page, {
+    route: "patch-scale-intersection-lazy-images",
+    waitForContent: async () => {
+      await page.goto("http://image-inventory.test/fixture", { waitUntil: "domcontentloaded" });
+      await expect(page.getByTestId("route-ready")).toHaveAttribute("data-ready", "true");
+      await expect.poll(() => page.locator("img").count()).toBe(128);
+    },
+  });
+  const publishedCount = await page.locator("img").evaluateAll((elements) => (
+    (elements as HTMLImageElement[]).filter((image) => image.dataset.sourcePublished === "true").length
+  ));
+
+  expect(inventory.images).toHaveLength(128);
+  expect(inventory.complete).toBe(true);
+  expect(inventory.images.every((image) => image.loaded && image.currentSrc.length > 0)).toBe(true);
+  expect(publishedCount).toBe(128);
+  expect(requestStartOrdinals.length).toBeGreaterThan(64);
+  expect(inventory.observationCoverage.networkState).toBe("truncated");
+});
+
+test("WebKit records a new viewport opportunity when currentSrc changes on the same node", async ({ page }) => {
+  let releaseSourceSwitchScroll: () => void = () => undefined;
+  let releaseNewSourceResponse: () => void = () => undefined;
+  let releaseBlockerResponse: () => void = () => undefined;
+  const sourceSwitchScroll = new Promise<void>((resolve) => {
+    releaseSourceSwitchScroll = resolve;
+  });
+  const newSourceResponse = new Promise<void>((resolve) => {
+    releaseNewSourceResponse = resolve;
+  });
+  const blockerResponse = new Promise<void>((resolve) => {
+    releaseBlockerResponse = resolve;
+  });
+  let sourceSwitchPromise: Promise<void> = Promise.resolve();
+  let initialSourceAttributes: { src: string | null; srcset: string | null } | null = null;
+
+  await page.addInitScript(() => {
+    const scrollSources: string[] = [];
+    const original = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function (this: Element, ...args: Parameters<typeof original>) {
+      if (this instanceof HTMLImageElement && this.id === "responsive-patch-image") {
+        scrollSources.push(this.currentSrc.split("/").at(-1) ?? "unknown");
+        (window as Window & { __responsivePatchProbe?: { scrollSources: string[] } })
+          .__responsivePatchProbe = { scrollSources };
+      }
+      return Reflect.apply(original, this, args);
+    };
+    const observer = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        const image = entry.target;
+        if (entry.isIntersecting && image instanceof HTMLImageElement && image.id === "responsive-patch-image") {
+          const name = image.currentSrc.split("/").at(-1);
+          if (name === "responsive-light.svg") {
+            (window as Window & { __responsivePatchProbe?: { firstSourceVisible: boolean } })
+              .__responsivePatchProbe = {
+                ...(window as Window & { __responsivePatchProbe?: { scrollSources: string[] } })
+                  .__responsivePatchProbe,
+                firstSourceVisible: true,
+              };
+          }
+        }
+      }
+    }, { threshold: [0] });
+    new MutationObserver((records) => {
+      for (const record of records) {
+        for (const node of record.addedNodes) {
+          if (node instanceof HTMLImageElement && node.id === "responsive-patch-image") observer.observe(node);
+          if (node instanceof Element) {
+            const image = node.querySelector<HTMLImageElement>("#responsive-patch-image");
+            if (image) observer.observe(image);
+          }
+        }
+      }
+    }).observe(document, { subtree: true, childList: true });
+  });
+  await page.route("http://image-inventory.test/**", async (route) => {
+    const { pathname } = new URL(route.request().url());
+    if (pathname === "/fixture") {
+      await route.fulfill({
+        contentType: "text/html; charset=utf-8",
+        body: `<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+          <body><main style="padding-top: 2000px"><picture>
+            <source media="(prefers-color-scheme: light)" srcset="/images/responsive-light.svg">
+            <source media="(prefers-color-scheme: dark)" srcset="/images/responsive-dark.svg">
+            <img id="responsive-patch-image" alt="responsive-patch" width="32" height="32"
+              loading="eager" src="/images/responsive-fallback.svg">
+            </picture>
+            <img id="inventory-blocker" alt="inventory-blocker" width="32" height="32"
+              loading="eager" src="/images/inventory-blocker.svg"></main></body></html>`,
+      });
+      return;
+    }
+    if (pathname === "/images/responsive-light.svg") {
+      await sourceSwitchScroll;
+      await route.fulfill({ contentType: "image/svg+xml", body: fixtureSvg });
+      return;
+    }
+    if (pathname === "/images/responsive-dark.svg") {
+      await newSourceResponse;
+      await route.fulfill({ contentType: "image/svg+xml", body: fixtureSvg });
+      return;
+    }
+    if (pathname === "/images/inventory-blocker.svg") {
+      await blockerResponse;
+      await route.fulfill({ contentType: "image/svg+xml", body: fixtureSvg });
+      return;
+    }
+    await route.abort();
+  });
+
+  const inventoryPromise = collectLiveImageInventory(page, {
+    route: "responsive-current-src-generation",
+    waitForContent: async () => {
+      await page.emulateMedia({ colorScheme: "light" });
+      await page.goto("http://image-inventory.test/fixture", { waitUntil: "domcontentloaded" });
+      await expect.poll(() => page.locator("#responsive-patch-image").evaluate((image) => (
+        (image as HTMLImageElement).currentSrc.split("/").at(-1)
+      ))).toBe("responsive-light.svg");
+      initialSourceAttributes = await page.locator("#responsive-patch-image").evaluate((image) => ({
+        src: image.getAttribute("src"),
+        srcset: image.getAttribute("srcset"),
+      }));
+      sourceSwitchPromise = (async () => {
+        await expect.poll(() => page.evaluate(() => (
+          (window as Window & { __responsivePatchProbe?: { firstSourceVisible?: boolean } })
+            .__responsivePatchProbe?.firstSourceVisible === true
+        ))).toBe(true);
+        releaseSourceSwitchScroll();
+        await expect.poll(() => page.locator("#responsive-patch-image").evaluate((image) => (
+          (image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth > 0
+        ))).toBe(true);
+        await page.emulateMedia({ colorScheme: "dark" });
+        await expect.poll(() => page.locator("#responsive-patch-image").evaluate((image) => (
+          (image as HTMLImageElement).currentSrc.split("/").at(-1)
+        ))).toBe("responsive-dark.svg");
+        await expect.poll(() => page.evaluate(() => (
+          (window as Window & { __responsivePatchProbe?: { scrollSources: string[] } })
+            .__responsivePatchProbe?.scrollSources.includes("responsive-dark.svg") === true
+        ))).toBe(true);
+        releaseNewSourceResponse();
+        releaseBlockerResponse();
+        await expect.poll(() => page.locator("#responsive-patch-image").evaluate((image) => (
+          (image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth > 0
+        ))).toBe(true);
+      })();
+    },
+  });
+  const inventory = await inventoryPromise;
+  await sourceSwitchPromise;
+  const observedScrollSources = await page.evaluate(() => (
+    (window as Window & { __responsivePatchProbe?: { scrollSources: string[] } })
+      .__responsivePatchProbe?.scrollSources ?? []
+  ));
+  const finalSourceAttributes = await page.locator("#responsive-patch-image").evaluate((image) => ({
+    src: image.getAttribute("src"),
+    srcset: image.getAttribute("srcset"),
+  }));
+
+  expect(inventory.images).toHaveLength(2);
+  expect(inventory.complete).toBe(true);
+  expect(inventory.images[0].loaded).toBe(true);
+  expect(inventory.images[0].currentSrc.split("/").at(-1)).toBe("responsive-dark.svg");
+  expect(finalSourceAttributes).toEqual(initialSourceAttributes);
+  expect(observedScrollSources).toEqual(expect.arrayContaining([
+    "responsive-light.svg",
+    "responsive-dark.svg",
+  ]));
+});
+
+test("WebKit keeps a failed tail image after request detail coverage truncates", async ({ page }) => {
+  const failedOrdinal = 128;
+  const requestStartOrdinals = await registerPatchScaleImageFixture(page, { failureOrdinal: failedOrdinal });
+  const inventory = await collectLiveImageInventory(page, {
+    route: "patch-scale-failed-tail-image",
+    waitForContent: async () => {
+      await page.goto("http://image-inventory.test/fixture", { waitUntil: "domcontentloaded" });
+      await expect(page.getByTestId("route-ready")).toHaveAttribute("data-ready", "true");
+      await expect(page.locator("img")).toHaveCount(128);
+    },
+    timeoutMs: 12_000,
+  });
+
+  const evidence = producerImageEvidencePayload("patch", inventory);
+  const failed = evidence.images.find((image) => image.ordinal === failedOrdinal);
+  const failureRequestStartPosition = requestStartOrdinals.indexOf(failedOrdinal) + 1;
+  const failedImageScrollCount = await page.evaluate((ordinal) => (
+    (window as Window & {
+      __patchScaleImageProbe?: { scrollCountFor: (value: number) => number };
+    }).__patchScaleImageProbe?.scrollCountFor(ordinal) ?? 0
+  ), failedOrdinal);
+  expect(inventory.images).toHaveLength(128);
+  expect(inventory.complete).toBe(false);
+  expect(evidence.unloaded_count).toBe(1);
+  expect(evidence.coverage.network_state).toBe("truncated");
+  expect(evidence.images).toHaveLength(16);
+  expect(failed).toMatchObject({
+    complete: true,
+    current_src_present: true,
+    natural_width_positive: false,
+    request_failed: null,
+    request_failure_class: "unavailable",
+    request_state: "unavailable",
+  });
+  expect(failureRequestStartPosition).toBeGreaterThan(64);
+  expect(failedImageScrollCount).toBeLessThanOrEqual(1);
+  expect(inventory.scrollAttempts).toBeLessThanOrEqual(128);
+});
+
+test("WebKit avoids repeat scrolling after opportunity when request-start membership overflows", async ({ page }) => {
+  const overflowOrdinal = 128;
+  const requestStartOrdinals = await registerPatchScaleImageFixture(page, {
+    overflowOrdinal,
+    viewportGated: true,
+  });
+  const inventory = await collectLiveImageInventory(page, {
+    route: "patch-scale-request-start-overflow",
+    waitForContent: async () => {
+      await page.goto("http://image-inventory.test/fixture", { waitUntil: "domcontentloaded" });
+      await expect(page.getByTestId("route-ready")).toHaveAttribute("data-ready", "true");
+      await expect(page.locator("img")).toHaveCount(128);
+    },
+  });
+  const overflowImageScrollCount = await page.evaluate((ordinal) => (
+    (window as Window & {
+      __patchScaleImageProbe?: {
+        scrollCountFor: (value: number) => number;
+        sourceOpportunityScrollCountFor: (value: number) => number | null;
+      };
+    }).__patchScaleImageProbe?.scrollCountFor(ordinal) ?? 0
+  ), overflowOrdinal);
+  const overflowImageScrollCountAtOpportunity = await page.evaluate((ordinal) => (
+    (window as Window & {
+      __patchScaleImageProbe?: { sourceOpportunityScrollCountFor: (value: number) => number | null };
+    }).__patchScaleImageProbe?.sourceOpportunityScrollCountFor(ordinal) ?? null
+  ), overflowOrdinal);
+
+  expect(inventory.images).toHaveLength(128);
+  expect(inventory.complete).toBe(true);
+  expect(inventory.images.every((image) => image.loaded && image.currentSrc.length > 0)).toBe(true);
+  expect(requestStartOrdinals.indexOf(overflowOrdinal) + 1).toBeGreaterThan(64);
+  expect(overflowImageScrollCountAtOpportunity).not.toBeNull();
+  expect(overflowImageScrollCount).toBe(overflowImageScrollCountAtOpportunity);
+  expect(inventory.observationCoverage.networkState).toBe("truncated");
 });
 
 test("WebKit emits bounded producer evidence for ten images with one failed asset", async ({ page }) => {

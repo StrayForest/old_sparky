@@ -44,6 +44,10 @@ function escapeRegex(value: string): string {
 
 function identityLabels(patch: PlatformPatchDetail): string[] {
   const labels = new Set<string>(OWNER_OR_SECTION_LABELS);
+  for (const value of patch.canonical_entity_names || []) {
+    const label = value.trim();
+    if (label) labels.add(label);
+  }
   for (const section of patch.sections) {
     for (const value of [
       section.title,
@@ -69,9 +73,23 @@ function identityLabels(patch: PlatformPatchDetail): string[] {
 function removeKnownNames(value: string, labels: string[]): string {
   let result = value;
   for (const label of labels) {
+    const pieces = label.trim().split(/[\s_\-‐-―]+/u).filter(Boolean);
+    if (pieces.length === 0) continue;
+    const boundaryClass = /^[\x00-\x7F]*$/u.test(label)
+      ? "A-Za-z0-9"
+      : "\\p{L}\\p{N}";
+    const pattern = [
+      new RegExp(`^[${boundaryClass}]`, "u").test(label)
+        ? `(?<![${boundaryClass}])`
+        : "",
+      pieces.map(escapeRegex).join("[\\s_\\-‐-―]*"),
+      new RegExp(`[${boundaryClass}]$`, "u").test(label)
+        ? `(?![${boundaryClass}])`
+        : "",
+    ].join("");
     result = result.replace(
-      new RegExp(`(^|[^\\p{L}\\p{N}])${escapeRegex(label)}(?=$|[^\\p{L}\\p{N}])`, "giu"),
-      "$1 ",
+      new RegExp(pattern, "giu"),
+      " ",
     );
   }
   return result;

@@ -130,6 +130,14 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
     },
   );
   expect(patchAcceptanceIssues(cleanCanonicalAndNumeric)).toEqual([]);
+  const referencedCanonicalEntities = {
+    ...acceptanceDetail(
+      "[General]\nCharged-Shot, Split_Shot, Rain-of-Arrows, and Superior_Duration remain canonical names.",
+      ["Charged-Shot и Rain_of_Arrows изменены; Split Shot и Superior-Duration сохранены."],
+    ),
+    canonical_entity_names: ["Charged Shot", "Split Shot", "Rain of Arrows", "Superior Duration"],
+  };
+  expect(patchAcceptanceIssues(referencedCanonicalEntities)).toEqual([]);
   expect(patchAcceptanceIssues(acceptanceDetail(
     "[General]\nCooldown reduced by 2 seconds\n[Items]",
     ["Перезарядка reduced by 2 seconds"],
@@ -137,6 +145,10 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
   expect(patchAcceptanceIssues(acceptanceDetail(
     "[General]\nDamage increased by 10%.\n[Items]",
     ["Damage increased by 10%."],
+  ))).toContain("untranslated_change");
+  expect(patchAcceptanceIssues(acceptanceDetail(
+    "[General]\nDamage increased; duration reduced\n[Items]",
+    ["Урон увеличен, duration снижена"],
   ))).toContain("untranslated_change");
   expect(patchAcceptanceIssues(acceptanceDetail(
     "[General]\nonly 50% as effective\n[Items]",

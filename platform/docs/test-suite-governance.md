@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform maintainers
-- Last reviewed: 2026-11-04
+- Last reviewed: 2026-11-27
 
 The executable registry at `platform/tools/platform_verify.py` is the single source of truth for verification ownership, commands, environment
 requirements and CI membership. Use `list --json` when tooling needs the
@@ -396,7 +396,7 @@ test is explicit test debt with an owner, not a reason to weaken a gate.
 
 ### Web hermetic ownership
 
-The web package has three deterministic owners: source contracts, full hermetic suites and the isolated image-inventory WebKit fixtures. `test:source-contract` owns source assertions; [`playwright.source-contract.config.ts`](../apps/platform_web/playwright.source-contract.config.ts) must not define `webServer`. [`platform_web_hermetic.sh`](../tools/platform_web_hermetic.sh) builds standalone Next once, then runs source-contract, auth lifecycle, smoke, participant, SSR diagnostics and image-inventory. After WebKit it passes generated body-only, hook-only and combined producer payloads through the reporter, ephemeral guard reader, actual `public_browser_counts_line` publisher and retained-report validator before cleanup; missing fixtures fail. `live-user-browser-gate.spec.ts` exercises the shared UserQA observer with a local routed page and verifies closed category/phase counts, privacy and caps. Auth precedes smoke; smoke and participant use fresh API/web processes (`reuseExistingServer: false`). The image fixtures use no server/API/database/external images.
+The web package has three deterministic owners: source contracts, full hermetic suites and the isolated image-inventory WebKit fixtures. `test:source-contract` owns source assertions; [`playwright.source-contract.config.ts`](../apps/platform_web/playwright.source-contract.config.ts) must not define `webServer`. [`platform_web_hermetic.sh`](../tools/platform_web_hermetic.sh) builds standalone Next once, then runs source-contract, auth lifecycle, smoke, participant, SSR diagnostics and image-inventory. After WebKit it passes generated body-only, hook-only and combined producer payloads through the reporter, ephemeral guard reader, actual `public_browser_counts_line` publisher and retained-report validator before cleanup; missing fixtures fail. `live-user-browser-gate.spec.ts` exercises the shared UserQA observer with a local routed page and verifies closed category/phase counts, privacy and caps. Auth precedes smoke; smoke and participant use fresh API/web processes (`reuseExistingServer: false`). The image fixtures use no server/API/database/external images; WebKit covers 128 dynamically added lazy images, immediate `IntersectionObserver` source assignment, an oversized request URL that overflows request-start membership after more than 64 starts, a same-node responsive `currentSrc` generation change and a deliberate failed tail image retained in the bounded diagnostic sample. Inventory completion still requires every image loaded with a current source and three identical full-DOM snapshots (two equal-signature comparisons) within the fixed 30-second budget.
 
 When hosted-services preflight blocks `web-hermetic`, run the focused WebKit producer and reporter/guard roundtrip from `platform/`:
 
@@ -413,7 +413,7 @@ python3 tools/platform_web_hermetic_browsers.py --web-root apps/platform_web --o
   ../../tools/platform_run_quiet.sh "Live count reporter contract" -- ../../tools/platform_node.sh tests/support/live-count-reporter-contract.cjs)
 ```
 
-This covers the helper, afterEach finalizer and full producer-to-reporter-to-ephemeral-reader-to-publisher-to-retained-validator path without production services; exact-SHA `web-hermetic` CI remains required.
+Focused standalone diagnosis must mirror the exact case's project/config fixture settings and test deadline, including `test.setTimeout`; raw `browser.newContext()` lacks `@playwright/test` fixture defaults. Keep collector `timeoutMs` separate from the test-body budget and wait for the same route, app shell and content response before image attribution. It earns no canonical QA credit and does not replace exact-SHA `web-hermetic` CI or the owner full-suite live-QA wrapper.
 
 The responsive smoke project owns `desktop`, `wide-1300`, `tablet-820` and `mobile-layout`; the explicit desktop-only list
 in [`playwright.config.ts`](../apps/platform_web/playwright.config.ts) is owned only by `desktop`. The participant-progressive suite owns a sequential one-worker contour and explicit desktop/mobile projects in [`playwright.participant.config.ts`](../apps/platform_web/playwright.participant.config.ts). Do not infer viewport ownership from a test name or silently add exclusions; update the owning config and contract test with matrix changes.

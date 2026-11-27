@@ -130,6 +130,28 @@ required evidence, review, safety checks and release gates.
   timeout, batch and WAL caps, a successful checkpoint, and a post-check; stop
   on contention or a failed bound. Never truncate a live WAL or run a full
   `VACUUM` as routine artifact cleanup.
+- For task-local scratch under `/tmp` or a checkout `.tmp` path, use only the
+  exact paths in that task's existing private inventory; names or prefixes do
+  not establish ownership. The inventory must bind each removable root or
+  subtree to device/inode, owner, mode and a closed descendant inventory with
+  each entry's identity, owner, mode, link count and size/mtime; record
+  evidence digests and mark retained evidence.
+  Never create a per-run path diary to authorize deletion; if the task has no adequate inventory,
+  leave the scratch and report the gap.
+- Clean only after the owning executor, review and required gates finish. Check
+  `/proc` cwd, executable and open descriptors for consumers beneath each
+  exact path; never kill a consumer to make cleanup pass. Recheck the closed
+  inventory and root identity immediately before cleanup, refusing owner,
+  mode, inode, mount, symlink, hardlink, size/mtime or evidence-digest drift.
+- Move one exact disposable root/subtree to a unique sibling quarantine with
+  an atomic collision-safe no-replace rename on the same filesystem. Before
+  removal, recheck the root and the full closed descendant inventory there,
+  including identities, modes, links, size/mtime and evidence digests. On any
+  mismatch, restore only when the original path is vacant; otherwise leave
+  both paths and stop.
+  Never glob, sweep by prefix, cross filesystems or remove a mixed scratch root
+  that contains retained evidence. Preserve forensic evidence at its existing
+  private owner path with its recorded digest; verify cleaned paths are absent.
 
 - Keep one short active state in the task handoff: verified facts, source SHA,
   relevant run IDs, owners, blocker (if any) and the single next action. Link
