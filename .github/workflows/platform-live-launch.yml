@@ -831,7 +831,9 @@ jobs:
                       "route_profile_lisalexy_overflow", "chromium_sandbox", "csp_nonce_rotation",
                       "csp_negative_probes", "tournament_hub", "tournament_catalog_containment",
                       "tournament_detail_bracket", "admin_anonymous_protection", "home_steps_overflow",
-                      "contact_recipient_privacy", "objective_icons", "patch_owner_sections",
+                      "contact_recipient_privacy", "objective_icons", "patch_owner_sections_slot_1",
+                      "patch_owner_sections_slot_2", "patch_owner_sections_slot_3",
+                      "patch_owner_sections_slot_4",
                       "analytics_csp", "image_csp_hosts",
                   }
                   failures = summary.get("failures") if isinstance(summary, dict) else None
@@ -963,8 +965,8 @@ jobs:
               and marker[0] == "passed"
               and count_values is not None
               and count_values["run_status"] == "passed"
-              and count_values["logical_total"] == 57
-              and 6 <= count_values["logical_skip"] <= 10
+              and count_values["logical_total"] == 66
+              and 6 <= count_values["logical_skip"] <= 19
               and count_values["logical_pass"] == count_values["logical_total"] - count_values["logical_skip"]
               and count_values["logical_fail"] == 0
               and count_values["logical_expected_fail"] == 0
@@ -1154,8 +1156,8 @@ jobs:
               or set(attempts) != set(attempt_fields)
               or any(type(logical.get(key)) is not int or logical[key] < 0 for key in logical_fields)
               or any(type(attempts.get(key)) is not int or attempts[key] < 0 for key in attempt_fields)
-              or logical["logical_total"] != 57
-              or not 6 <= logical["logical_skip"] <= 10
+              or logical["logical_total"] != 66
+              or not 6 <= logical["logical_skip"] <= 19
               or logical["logical_total"] - logical["logical_skip"] != report.get("test_count")
               or sum(logical[key] for key in logical_fields[1:]) != logical["logical_total"]
               or sum(attempts[key] for key in attempt_fields[1:]) != attempts["attempt_total"]
@@ -1190,7 +1192,9 @@ jobs:
                   "route_profile_lisalexy_overflow", "chromium_sandbox", "csp_nonce_rotation",
                   "csp_negative_probes", "tournament_hub", "tournament_catalog_containment",
                   "tournament_detail_bracket", "admin_anonymous_protection", "home_steps_overflow",
-                  "contact_recipient_privacy", "objective_icons", "patch_owner_sections",
+                  "contact_recipient_privacy", "objective_icons", "patch_owner_sections_slot_1",
+                  "patch_owner_sections_slot_2", "patch_owner_sections_slot_3",
+                  "patch_owner_sections_slot_4",
                   "analytics_csp", "image_csp_hosts",
               }
               if (

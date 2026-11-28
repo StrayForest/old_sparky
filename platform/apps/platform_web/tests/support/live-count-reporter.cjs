@@ -65,7 +65,7 @@ const SHA40 = /^[0-9a-f]{40}$/u;
 const SHA64 = /^[0-9a-f]{64}$/u;
 const PUBLIC_GATE_NAME = /^public-live-qa\.[a-z0-9_]{8}$/u;
 const LIVE_USER_GATE_NAME = /^live-user-qa\.[A-Za-z0-9]{6}$/u;
-const PUBLIC_LOGICAL_TOTAL = 57;
+const PUBLIC_LOGICAL_TOTAL = 66;
 const EXPECTED_PUBLIC_SKIP_TYPE = "public-live-qa-expected-skip";
 const PUBLIC_PROJECTS = new Set([
   "live-desktop",
@@ -89,9 +89,18 @@ const PUBLIC_TEST_IDS = new Map([
   ["live home uses text-only tournament steps without overflow", "home_steps_overflow"],
   ["live public contact surfaces do not publish the support recipient", "contact_recipient_privacy"],
   ["live current patch route and objective source icons remain available", "objective_icons"],
-  ["live four current patch DTOs render owner-scoped hero and ability changes", "patch_owner_sections"],
+  ["live current patch slot 1 DTO renders owner-scoped hero and ability changes", "patch_owner_sections_slot_1"],
+  ["live current patch slot 2 DTO renders owner-scoped hero and ability changes", "patch_owner_sections_slot_2"],
+  ["live current patch slot 3 DTO renders owner-scoped hero and ability changes", "patch_owner_sections_slot_3"],
+  ["live current patch slot 4 DTO renders owner-scoped hero and ability changes", "patch_owner_sections_slot_4"],
   ["live Cloudflare Analytics is conditionally observed without widening CSP", "analytics_csp"],
   ["live image currentSrc inventory stays inside the exact CSP hosts", "image_csp_hosts"],
+]);
+const PATCH_OWNER_SECTION_TEST_IDS = new Set([
+  "patch_owner_sections_slot_1",
+  "patch_owner_sections_slot_2",
+  "patch_owner_sections_slot_3",
+  "patch_owner_sections_slot_4",
 ]);
 const FAILURE_SOURCE_FILES = new Set([
   "tests/smoke/live-launch.spec.ts",
@@ -262,7 +271,10 @@ const PUBLIC_TEST_TITLES = new Set([
   "live home uses text-only tournament steps without overflow",
   "live public contact surfaces do not publish the support recipient",
   "live current patch route and objective source icons remain available",
-  "live four current patch DTOs render owner-scoped hero and ability changes",
+  "live current patch slot 1 DTO renders owner-scoped hero and ability changes",
+  "live current patch slot 2 DTO renders owner-scoped hero and ability changes",
+  "live current patch slot 3 DTO renders owner-scoped hero and ability changes",
+  "live current patch slot 4 DTO renders owner-scoped hero and ability changes",
   "live Cloudflare Analytics is conditionally observed without widening CSP",
   "live image currentSrc inventory stays inside the exact CSP hosts",
 ]);
@@ -285,6 +297,10 @@ const EXPECTED_PUBLIC_SKIP_DESCRIPTIONS = new Map([
     "empty_tournament_list:live-mobile",
     "empty_tournament_list:live-webkit-mobile",
   ])],
+  ...[2, 3, 4].map((slot) => [
+    `live current patch slot ${slot} DTO renders owner-scoped hero and ability changes`,
+    new Set([...PUBLIC_PROJECTS].map((project) => `patch_slot_${slot}_absent:${project}`)),
+  ]),
 ]);
 
 function supportedGateName(name) {
@@ -330,7 +346,7 @@ function publicCoverageIsComplete(tests, logical) {
   if (
     tests.length !== PUBLIC_LOGICAL_TOTAL
     || logical.skip < 6
-    || logical.skip > 10
+    || logical.skip > 19
     || !publicFailureIdentityMappingIsComplete()
   ) return false;
   const seen = new Set();
@@ -852,7 +868,9 @@ function objectiveScreenshotEvidenceForAttempt(result) {
   }
   const categories = new Set([
     "capture_timeout", "test_timeout", "browser_closed_or_crashed", "capture_unavailable",
-    "page_navigating", "context_closed", "protocol_capture_error", "invalid_geometry",
+    "page_navigating", "context_closed", "protocol_capture_error",
+    "capture_empty_image", "capture_dimensions_too_large", "capture_invalid_clip_dimension",
+    "invalid_geometry",
     "output_eacces", "output_erofs", "output_enospc",
     "output_efbig", "output_enoent", "other",
   ]);
@@ -1786,7 +1804,7 @@ function failureRecordForAttempt(test, result, attempt, sourceRoot) {
       failure.navigation_failure = navigationEvidence.evidence;
     }
   }
-  if (id === "patch_owner_sections") {
+  if (PATCH_OWNER_SECTION_TEST_IDS.has(id)) {
     const imageFailureEvidence = decodedImageFailureEvidenceForAttempt(result);
     if (imageFailureEvidence.present) {
       failure.decoded_image_failure_state = imageFailureEvidence.state;
@@ -1901,6 +1919,15 @@ function boundedFailureReportBytes(payload) {
       bytes = Buffer.from(`${JSON.stringify(payload)}\n`, "ascii");
     }
   }
+  // Source locations are optional as a closed four-field block. Drop them
+  // atomically before removing the last retained page-error sample.
+  for (const failure of [...payload.failures].reverse()) {
+    if (bytes.length <= MAX_EPHEMERAL_FAILURE_REPORT_BYTES) break;
+    for (const key of ["source_file", "source_line", "source_column", "source_kind"]) {
+      delete failure[key];
+    }
+    bytes = Buffer.from(`${JSON.stringify(payload)}\n`, "ascii");
+  }
   // Only after route aggregates, page errors and sources have been compacted do
   // we remove remaining image rows. Keep the aggregate route record if it fits.
   for (const row of compactableRows()) {
@@ -1956,11 +1983,8 @@ function boundedFailureReportBytes(payload) {
       failure.page_errors_truncated = true;
       failure.page_error_state = "unavailable";
       if (
-        failure.id === "image_csp_hosts"
-        && (
-          Object.hasOwn(failure, "browser_request_failure_state")
-          || Object.hasOwn(failure, "browser_request_failures")
-        )
+        Object.hasOwn(failure, "browser_request_failure_state")
+        || Object.hasOwn(failure, "browser_request_failures")
       ) {
         failure.browser_request_failure_state = "unavailable";
         failure.browser_request_failures = null;

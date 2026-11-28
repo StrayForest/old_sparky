@@ -373,7 +373,9 @@ LIVE_LAUNCH_FAILURE_SUMMARY_IDS = frozenset(
         "route_profile_lisalexy_overflow", "chromium_sandbox", "csp_nonce_rotation",
         "csp_negative_probes", "tournament_hub", "tournament_catalog_containment",
         "tournament_detail_bracket", "admin_anonymous_protection", "home_steps_overflow",
-        "contact_recipient_privacy", "objective_icons", "patch_owner_sections",
+        "contact_recipient_privacy", "objective_icons", "patch_owner_sections_slot_1",
+        "patch_owner_sections_slot_2", "patch_owner_sections_slot_3",
+        "patch_owner_sections_slot_4",
         "analytics_csp", "image_csp_hosts",
     }
 )

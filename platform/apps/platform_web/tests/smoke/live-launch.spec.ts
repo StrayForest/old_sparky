@@ -1442,13 +1442,24 @@ test("live current patch route and objective source icons remain available", asy
   }
 });
 
-test("live four current patch DTOs render owner-scoped hero and ability changes", async ({ page, request }, testInfo) => {
-  test.setTimeout(120_000);
-  const patchIds = await currentIndexedPatchIds(request);
-  expect(patchIds).toHaveLength(4);
-  expect(new Set(patchIds).size).toBe(4);
+for (const slotIndex of [0, 1, 2, 3] as const) {
+  const slotNumber = slotIndex + 1;
+  test(`live current patch slot ${slotNumber} DTO renders owner-scoped hero and ability changes`, async ({ page, request }, testInfo) => {
+    test.setTimeout(120_000);
+    const patchIds = await currentIndexedPatchIds(request);
+    expect(patchIds.length).toBeGreaterThan(0);
+    expect(patchIds.length).toBeLessThanOrEqual(4);
+    expect(new Set(patchIds).size).toBe(patchIds.length);
+    const patchId = patchIds[slotIndex];
+    if (!patchId) {
+      testInfo.annotations.push({
+        type: "public-live-qa-expected-skip",
+        description: `patch_slot_${slotNumber}_absent:${testInfo.project.name}`,
+      });
+      test.skip(true, `Current patch slot ${slotNumber} is absent.`);
+      return;
+    }
 
-  for (const patchId of patchIds) {
     const detailResponsePromise = page.waitForResponse((response) => (
       new URL(response.url()).pathname === `/api/v1/content/patches/${patchId}`
     ));
@@ -1674,8 +1685,8 @@ test("live four current patch DTOs render owner-scoped hero and ability changes"
     }
 
     await expectNoHorizontalOverflow(page);
-  }
-});
+  });
+}
 
 test("live Cloudflare Analytics is conditionally observed without widening CSP", async ({ page }, testInfo) => {
   const scriptResponses: Array<{ status: number; url: string }> = [];

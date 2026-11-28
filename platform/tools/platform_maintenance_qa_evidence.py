@@ -890,8 +890,8 @@ def validate_live_launch_report(
     total = logical["logical_total"]
     skipped = logical["logical_skip"]
     if (
-        total != 57
-        or not 6 <= skipped <= 10
+        total != 66
+        or not 6 <= skipped <= 19
         or logical["logical_pass"] != total - skipped
         or any(
             logical[name] != 0

@@ -263,6 +263,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
             self.assertEqual(os.readlink(trusted / "active"), f"releases/{source_sha}")
             cache_dir = payload / "platform/tools/__pycache__"
             cache_dir.mkdir(mode=0o755)
+            os.chmod(cache_dir, 0o755)
             for module in (
                 "platform_live_qa_guard",
                 "platform_live_qa_machine_lock",

@@ -311,6 +311,7 @@ resource names as CI:
 ```bash
 cd /root/old_sparky/platform
 set -euo pipefail
+original_umask="$(umask)"
 umask 077
 test_env_dir="$(mktemp -d)"
 test_env_file="$test_env_dir/test.env"
@@ -326,6 +327,7 @@ PLATFORM_CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/14
 PLATFORM_OBJECT_STORAGE_BACKEND=local
 EOF
 chmod 600 "$test_env_file"
+umask "$original_umask"
 PLATFORM_ENV_FILE="$test_env_file" \
   .venv_platform/bin/python tools/platform_verify.py backend-unit
 ```

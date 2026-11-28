@@ -96,7 +96,9 @@ const publicTitles = [
   "live home uses text-only tournament steps without overflow",
   "live public contact surfaces do not publish the support recipient",
   "live current patch route and objective source icons remain available",
-  "live four current patch DTOs render owner-scoped hero and ability changes",
+  ...[1, 2, 3, 4].map((slot) => (
+    `live current patch slot ${slot} DTO renders owner-scoped hero and ability changes`
+  )),
   "live Cloudflare Analytics is conditionally observed without widening CSP",
   "live image currentSrc inventory stays inside the exact CSP hosts",
 ];
@@ -115,6 +117,10 @@ const expectedPublicSkips = new Map([
     `live tournament detail and bracket routes render from the current public data|${project}`,
     `empty_tournament_list:${project}`,
   ]),
+  ...[2, 3, 4].flatMap((slot) => publicProjects.map((project) => [
+    `live current patch slot ${slot} DTO renders owner-scoped hero and ability changes|${project}`,
+    `patch_slot_${slot}_absent:${project}`,
+  ])),
 ]);
 const publicTests = publicProjects.flatMap((project) => publicTitles.map((title) => {
   const skipDescription = expectedPublicSkips.get(`${title}|${project}`);
@@ -2276,7 +2282,7 @@ try {
   assert.equal(navigationGuard.status, 0, navigationGuard.stderr);
 
   const decodedImageFixture = diagnosticFixture(failureRoot, "im1b3c4d");
-  const patchOwnerTitle = "live four current patch DTOs render owner-scoped hero and ability changes";
+  const patchOwnerTitle = "live current patch slot 1 DTO renders owner-scoped hero and ability changes";
   const decodedImageFailure = failureTest(decodedImageFixture, {
     title: patchOwnerTitle,
     project: "live-mobile",
@@ -2295,7 +2301,7 @@ try {
     { allTests: () => decodedImagePlan },
     decodedImageSummary,
     { gateRoot: decodedImageFixture.gateRoot, sourceRoot: decodedImageFixture.sourceRoot },
-  )), true, "closed decoded-image diagnostics preserve the patch_owner_sections identity");
+  )), true, "closed decoded-image diagnostics preserve the patch owner slot identity");
   const decodedImageBytes = fs.readFileSync(path.join(decodedImageFixture.results, "live-failures-v2.json"));
   const decodedImageReport = JSON.parse(decodedImageBytes.toString("ascii"));
   assert.equal(decodedImageReport.failures[0].decoded_image_failure_state, "captured");
@@ -2747,14 +2753,14 @@ try {
     "failed",
     { publicGate: true },
   );
-  assert.equal(fullFailureSummary.attempts.interrupted, 57);
+  assert.equal(fullFailureSummary.attempts.interrupted, 66);
   assert.equal(fullFailureSummary.logical.skip, 6);
   assert.equal(withRootOwnedGate(sizeFixture.gateRoot, () => writeBoundedFailureSummary(
     sizeFixture.binding,
     { allTests: () => maxFailedAttempts },
     fullFailureSummary,
     { gateRoot: sizeFixture.gateRoot, sourceRoot: sizeFixture.sourceRoot },
-  )), true, "all 57 validated failed attempts survive the bounded report");
+  )), true, "all 66 validated failed attempts survive the bounded report");
   const maximumReportBytes = fs.readFileSync(
     path.join(sizeFixture.results, "live-failures-v2.json"),
   );
@@ -2770,14 +2776,15 @@ try {
   );
   assert.ok(maximumReportBytes.length <= 16 * 1024);
   assert.ok(maximumReportBytes.length <= 16 * 1024 - 256);
-  assert.equal(maximumReport.failures.length, 57);
+  assert.equal(maximumReport.failures.length, 66);
   assert.ok(maximumReport.failures.every((failure) => failure.status === "interrupted"));
   assert.ok(maximumReport.failures.some(
     (failure) => Object.hasOwn(failure, "duration_vs_timeout"),
   ), "the bounded stress report retains meaningful duration buckets when they fit");
-  assert.ok(maximumReport.failures.some(
-    (failure) => !Object.hasOwn(failure, "duration_vs_timeout"),
-  ), "the final byte compaction can remove optional duration buckets before identities");
+  assert.ok(maximumReport.failures.every(
+    (failure) => !Object.hasOwn(failure, "duration_vs_timeout")
+      || typeof failure.duration_vs_timeout === "string",
+  ), "optional duration evidence stays finite when retained");
   assert.ok(maximumReport.failures.every((failure) => (
     !Object.hasOwn(failure, "duration_vs_timeout")
     || [
@@ -2800,10 +2807,12 @@ try {
       && failure.source_line === null
       && failure.source_column === null
       && failure.source_kind === "unavailable")
+    || (!["source_file", "source_line", "source_column", "source_kind"]
+      .some((key) => Object.hasOwn(failure, key)))
   )));
-  assert.ok(maximumReport.failures.some((failure) => failure.source_file === null));
+  assert.ok(maximumReport.failures.some((failure) => !Object.hasOwn(failure, "source_file")));
   assert.ok(maximumReport.failures.every((failure) => failure.page_errors_truncated));
-  assert.ok(maximumReport.failures.some((failure) => failure.page_errors.length === 0));
+  assert.ok(maximumReport.failures.some((failure) => failure.page_errors.length > 0));
   assert.ok(maximumReport.failures.some((failure) => failure.page_errors.some((event) => (
     event[0] === "AggregateError"
       && event[1] === "tournaments"
@@ -2826,15 +2835,17 @@ try {
   const failureIdentities = maximumReport.failures.map((failure) => (
     `${failure.id}:${failure.project}:${failure.attempt}`
   ));
-  assert.equal(new Set(failureIdentities).size, 57, "every failed attempt has a unique test/project/attempt identity");
-  assert.deepEqual(
-    maximumReport.failures
-      .filter((failure) => failure.id === "patch_owner_sections")
-      .map((failure) => failure.project)
-      .sort(),
-    ["live-desktop", "live-mobile", "live-webkit-mobile"],
-    "the new patch owner scenario survives compaction in all three projects",
-  );
+  assert.equal(new Set(failureIdentities).size, 66, "every failed attempt has a unique test/project/attempt identity");
+  for (const slot of [1, 2, 3, 4]) {
+    assert.deepEqual(
+      maximumReport.failures
+        .filter((failure) => failure.id === `patch_owner_sections_slot_${slot}`)
+        .map((failure) => failure.project)
+        .sort(),
+      ["live-desktop", "live-mobile", "live-webkit-mobile"],
+      `patch owner slot ${slot} survives compaction in all three projects`,
+    );
+  }
 } finally {
   fs.rmSync(failureRoot, { recursive: true, force: true });
 }

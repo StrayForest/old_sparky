@@ -6,6 +6,7 @@ async function main() {
     classifyObjectiveScreenshotError,
     takeObjectiveScreenshotWithDiagnostics,
   } = await import("./objective-screenshot-diagnostic.ts");
+  const protocolPrefix = "Protocol error (Page.captureScreenshot): ";
   const cases = [
     [new Error("Test timeout of 30000ms exceeded"), true, "test_timeout"],
     [new Error("page.screenshot: Timeout 30000ms exceeded"), true, "capture_timeout"],
@@ -15,8 +16,14 @@ async function main() {
     [new Error("Test ended."), true, "context_closed"],
     [new Error("page.screenshot: Test ended."), true, "context_closed"],
     [new Error("page.screenshot:\tTest ended."), true, "other"],
-    [new Error("Protocol error (Page.captureScreenshot): Screenshot failed"), true, "protocol_capture_error"],
-    [new Error("page.screenshot: Protocol error (Page.captureScreenshot): Screenshot failed"), true, "protocol_capture_error"],
+    [new Error(`${protocolPrefix}Screenshot failed`), true, "protocol_capture_error"],
+    [new Error(`page.screenshot: ${protocolPrefix}Screenshot failed`), true, "protocol_capture_error"],
+    [new Error(`${protocolPrefix}Unable to capture screenshot`), true, "capture_empty_image"],
+    [new Error(`page.screenshot: ${protocolPrefix}Page is too large.`), true, "capture_dimensions_too_large"],
+    [new Error(`${protocolPrefix}Cannot take screenshot with 0 width.`), true, "capture_invalid_clip_dimension"],
+    [new Error(`page.screenshot: ${protocolPrefix}Cannot take screenshot with 0 height.`), true, "capture_invalid_clip_dimension"],
+    [new Error(`${protocolPrefix}Unable to capture screenshot; /private/path`), true, "protocol_capture_error"],
+    [new Error(`private-marker ${protocolPrefix}Unable to capture screenshot`), true, "other"],
     [new Error("https://private.invalid/Test ended."), true, "other"],
     [new Error("private-marker Protocol error (Page.captureScreenshot): failed"), true, "other"],
     [new Error("page.screenshot: Test ended. /tmp/private-path"), true, "other"],
@@ -37,12 +44,33 @@ async function main() {
   );
   assert.equal(
     classifyObjectiveScreenshotError(
-      new Error("Protocol error (Page.captureScreenshot): failed"),
+      new Error(`${protocolPrefix}Unable to capture screenshot`),
       true,
       "resolve_options",
     ),
     "other",
   );
+  assert.equal(
+    classifyObjectiveScreenshotError(
+      new Error(`page.screenshot: ${protocolPrefix}Page is too large.`),
+      true,
+      "resolve_options",
+    ),
+    "other",
+  );
+  for (const tail of [
+    "Cannot take screenshot with 0 width.",
+    "Cannot take screenshot with 0 height.",
+  ]) {
+    assert.equal(
+      classifyObjectiveScreenshotError(
+        new Error(`page.screenshot: ${protocolPrefix}${tail}`),
+        true,
+        "resolve_options",
+      ),
+      "other",
+    );
+  }
 
   const original = new Error("private-marker /tmp/private-path https://private.invalid/x");
   let attachment;
@@ -83,6 +111,32 @@ async function main() {
   assert.equal(JSON.stringify(payload).includes("private-marker"), false);
   assert.equal(JSON.stringify(payload).includes("private-path"), false);
   assert.equal(JSON.stringify(payload).includes("private.invalid"), false);
+
+  const exactProtocolCases = [
+    ["Unable to capture screenshot", "capture_empty_image"],
+    ["Page is too large.", "capture_dimensions_too_large"],
+    ["Cannot take screenshot with 0 width.", "capture_invalid_clip_dimension"],
+    ["Cannot take screenshot with 0 height.", "capture_invalid_clip_dimension"],
+  ];
+  for (const [tail, category] of exactProtocolCases) {
+    const protocolError = new Error(`page.screenshot: ${protocolPrefix}${tail}`);
+    let protocolAttachment;
+    await assert.rejects(
+      takeObjectiveScreenshotWithDiagnostics({
+        ...page,
+        screenshot: async () => { throw protocolError; },
+      }, {
+        attach: async (name, options) => { protocolAttachment = { name, options }; },
+      }, () => ({ fullPage: true })),
+      (error) => error === protocolError,
+    );
+    assert.equal(protocolAttachment.name, OBJECTIVE_SCREENSHOT_ATTACHMENT_NAME);
+    const protocolPayload = JSON.parse(protocolAttachment.options.body.toString("utf8"));
+    assert.equal(protocolPayload.category, category);
+    assert.equal(protocolPayload.error_code, "none");
+    assert.equal(protocolPayload.phase, "capture");
+    assert.equal(JSON.stringify(protocolPayload).includes(tail), false);
+  }
 
   const resolverError = new Error("Test ended.");
   let resolverScreenshotCalled = false;

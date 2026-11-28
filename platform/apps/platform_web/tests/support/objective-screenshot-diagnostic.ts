@@ -10,6 +10,9 @@ export type ObjectiveScreenshotFailureCategory =
   | "page_navigating"
   | "context_closed"
   | "protocol_capture_error"
+  | "capture_empty_image"
+  | "capture_dimensions_too_large"
+  | "capture_invalid_clip_dimension"
   | "invalid_geometry"
   | "output_eacces"
   | "output_erofs"
@@ -90,6 +93,21 @@ export function classifyObjectiveScreenshotError(
   const code = errorString(error, "code").toUpperCase();
   if (phase === "capture") {
     if (/^(?:page\.screenshot: )?Test ended\.$/u.test(message)) return "context_closed";
+    const protocolPrefixes = [
+      "page.screenshot: Protocol error (Page.captureScreenshot): ",
+      "Protocol error (Page.captureScreenshot): ",
+    ];
+    const protocolPrefix = protocolPrefixes.find((prefix) => message.startsWith(prefix));
+    if (protocolPrefix !== undefined) {
+      const protocolTail = message.slice(protocolPrefix.length);
+      if (protocolTail === "Unable to capture screenshot") return "capture_empty_image";
+      if (protocolTail === "Page is too large.") return "capture_dimensions_too_large";
+      if (
+        protocolTail === "Cannot take screenshot with 0 width."
+        || protocolTail === "Cannot take screenshot with 0 height."
+      ) return "capture_invalid_clip_dimension";
+      return "protocol_capture_error";
+    }
     if (/^(?:page\.screenshot: )?Protocol error \(Page\.captureScreenshot\):/u.test(message)) {
       return "protocol_capture_error";
     }

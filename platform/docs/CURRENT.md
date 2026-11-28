@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-11-27
+- Last reviewed: 2026-11-28
 
 Read this page for live pins, pending release work, open QA gates and hard
 operational limits. Product contracts, procedures and detailed run evidence
@@ -11,15 +11,15 @@ belong in the linked owner documents below.
 ## Live and pending state
 
 - Production currently runs application source
-  `bc00f9e7986fc85aa4fb984dbd3f2bb1889be5fb` in automatic release
-  `gha-46052467985-1-bc00f9e7986f`; exact-SHA Security run `46049160055/1`,
-  source-bound backup `46052050116/1` with restore verification, deployment
-  and post-deploy health passed. The separately installed shared host-tools
-  generation is `a3379dc4f1a872158f3a926ded64b1262addab1d`, with installed
-  receipt digest
+  `192cb3f35d3d90f816ad8e2918283731f6aff224` in automatic release
+  `gha-46076911900-1-192cb3f35d3d`; exact-SHA Security run `46075131753/1`,
+  source-bound backup `46076597122/1` with restore verification, deployment
+  `46076911900/1` and post-deploy activation passed. The separately installed
+  shared host-tools generation is `a3379dc4f1a872158f3a926ded64b1262addab1d`,
+  with installed receipt digest
   `42f91e3ed0c09ae550021e1c14ef5eea107d660a19612f411731106432453396`, bound
-  to source `bc00f9e7986fc85aa4fb984dbd3f2bb1889be5fb`.
-  The host-tools pin and app release are separate identities. See the
+  to provisioning source `bc00f9e7986fc85aa4fb984dbd3f2bb1889be5fb`. The
+  host-tools pin and app release are separate identities. See the
   [host-tools provisioning ADR](adr/production-host-tools-provisioning.md) and
   [deployment runbook](deployment-runbook.md) for their source-bound procedures.
 - Installed-origin API acceptance for patch `1848664643342973` passed: the
@@ -49,27 +49,25 @@ belong in the linked owner documents below.
   automatic exact cleanup for a confirmed terminal Public failure and
   preserves the fixed browser-output protocol.
 - Automatic post-deploy QA for source
-  `bc00f9e7986fc85aa4fb984dbd3f2bb1889be5fb` parent `46053436904/1` and exact
-  Public child `46053471978/1` failed with 44 passed, 3 failed, 10 skipped,
-  0 flaky and 0 timed out. Public cleanup is `cleaned`; UserQA was not
-  dispatched. The retained report shows `image_csp_hosts` passed with all
-  128 images loaded and zero CSP violations. The three failures were: the
-  `csp_nonce_rotation` route assertion after clicking `/info` (before nonce
-  comparisons); `objective_icons` screenshot failure, category `other`, phase
-  `capture`; and `patch_owner_sections` decoded-image assertion. The private
-  report intentionally contains no raw exception, URL or image source, so the
-  screenshot and decoded-image causes remain undetermined. Targeted read-only
-  reproductions have not established either failure's cause. See the
+  `192cb3f35d3d90f816ad8e2918283731f6aff224` parent `46077858278/1` and exact
+  Public child `46077877721/1` failed with 45 passed, 2 failed, 10 skipped,
+  0 flaky and 0 timed-out attempts. Public cleanup is `cleaned`; its exact
+  gate directory is absent, and UserQA was not dispatched. `objective_icons`
+  failed during screenshot capture with the closed category
+  `protocol_capture_error`. `patch_owner_sections` failed while checking the
+  hero image at section 48; the retained evidence records `not_complete`, no
+  `currentSrc`, and a test duration at or over its timeout. Both failures have
+  bounded request evidence and no request-failure events. Their causes remain
+  under investigation; no timeout or assertion has been relaxed. See the
   [CSP/live-QA runbook](csp-live-qa-runbook.md) for the bounded evidence and
-  recovery procedure.
-- Read-only storage diagnostics `46057366190/1` are bound to active source
-  `bc00f9e7986fc85aa4fb984dbd3f2bb1889be5fb`: disk use is 65.74% with about
-  12.75 GiB free, the storage lock is unlocked, API/worker/web services are
-  active, the maintenance timer is enabled and matches its installed unit,
-  and the latest backup is restore-verified. The LiveQA cache preview found
-  no candidates. The full retention preview was report-only; no deletion was
-  performed. The CI Siteverify fixture does not establish production
-  Cloudflare challenge/scoring.
+  recovery procedure. Next, resolve both causes, publish through the normal
+  release chain, and run UserQA only after a successful Public run.
+- The installed-unit-bound storage retention preview for active release
+  `gha-46076911900-1-192cb3f35d3d` completed in dry-run mode and protected the
+  current release; no deletion occurred. Disk use was 66.8% with about
+  12.36 GiB free, and the maintenance timer was restored active and enabled.
+  A separate task-cache preview also made no removals. The CI Siteverify
+  fixture does not establish production Cloudflare challenge/scoring.
 - The 11-cell production matrix is complete, but cell 9 failed its stress
   contract with unknown capacity attribution; no server capacity ceiling is
   certified. Cell 7's client/origin request join remains unresolved. A recent

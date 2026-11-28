@@ -314,6 +314,16 @@ LIVE_BROWSER_PAGE_ERROR_ASSET_BASENAME = re.compile(
 )
 LIVE_BROWSER_FAILURE_REPORT_EXIT = 42
 LIVE_BROWSER_FAILURE_COUNTS_EXIT = 43
+PATCH_OWNER_SECTION_FAILURE_IDS = frozenset({
+    "patch_owner_sections_slot_1",
+    "patch_owner_sections_slot_2",
+    "patch_owner_sections_slot_3",
+    "patch_owner_sections_slot_4",
+})
+LEGACY_PATCH_OWNER_SECTION_FAILURE_ID = "patch_owner_sections"
+PATCH_OWNER_SECTION_READER_IDS = PATCH_OWNER_SECTION_FAILURE_IDS | frozenset({
+    LEGACY_PATCH_OWNER_SECTION_FAILURE_ID,
+})
 LIVE_BROWSER_FAILURE_DIAGNOSTIC_NAMES = frozenset(
     {
         "route_root_overflow",
@@ -332,7 +342,8 @@ LIVE_BROWSER_FAILURE_DIAGNOSTIC_NAMES = frozenset(
         "home_steps_overflow",
         "contact_recipient_privacy",
         "objective_icons",
-        "patch_owner_sections",
+        LEGACY_PATCH_OWNER_SECTION_FAILURE_ID,
+        *PATCH_OWNER_SECTION_FAILURE_IDS,
         "analytics_csp",
         "image_csp_hosts",
     }
@@ -3154,14 +3165,19 @@ def _validate_objective_screenshot_evidence(record: Mapping[str, object]) -> Non
             "capture_timeout", "test_timeout", "browser_closed_or_crashed",
             "capture_unavailable", "page_navigating", "invalid_geometry",
             "output_eacces", "output_erofs", "output_enospc", "output_efbig",
-            "output_enoent", "context_closed", "protocol_capture_error", "other",
+            "output_enoent", "context_closed", "protocol_capture_error",
+            "capture_empty_image", "capture_dimensions_too_large",
+            "capture_invalid_clip_dimension", "other",
         }
         or not isinstance(evidence.get("error_name"), str)
         or evidence.get("error_name") not in {"TimeoutError", "TargetClosedError", "Error", "unknown"}
         or not isinstance(evidence.get("phase"), str)
         or evidence.get("phase") not in {"capture"} | ({"resolve_options"} if "error_code" in evidence else set())
         or (
-            evidence.get("category") in {"context_closed", "protocol_capture_error"}
+            evidence.get("category") in {
+                "context_closed", "protocol_capture_error", "capture_empty_image",
+                "capture_dimensions_too_large", "capture_invalid_clip_dimension",
+            }
             and evidence.get("phase") != "capture"
         )
         or (
@@ -3972,12 +3988,20 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
             allowed_failure_key_sets.add(
                 frozenset(expected_failure_keys | navigation_keys | browser_request_failure_keys)
             )
-        if schema == 2 and failure_id == "patch_owner_sections":
+        if schema == 2 and failure_id in PATCH_OWNER_SECTION_READER_IDS:
             decoded_image_keys = {"decoded_image_failure_state", "decoded_image_failure"}
             allowed_failure_key_sets.add(frozenset(expected_failure_keys | decoded_image_keys))
             allowed_failure_key_sets.add(
                 frozenset(expected_failure_keys | decoded_image_keys | browser_request_failure_keys)
             )
+        source_location_keys = {
+            "source_file", "source_line", "source_column", "source_kind",
+        }
+        allowed_failure_key_sets.update(
+            frozenset(set(keys) - source_location_keys)
+            for keys in tuple(allowed_failure_key_sets)
+            if source_location_keys.issubset(keys)
+        )
         if (
             not isinstance(failure, dict)
             or (
@@ -4017,7 +4041,7 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
                     raise GuardError("private navigation evidence is bound to the wrong test")
                 _validate_navigation_failure_evidence(failure)
             if "decoded_image_failure_state" in failure or "decoded_image_failure" in failure:
-                if failure.get("id") != "patch_owner_sections":
+                if failure.get("id") not in PATCH_OWNER_SECTION_READER_IDS:
                     raise GuardError("private decoded-image evidence is bound to the wrong test")
                 _validate_decoded_image_failure_evidence(failure)
         if schema == 4:
@@ -4044,6 +4068,8 @@ def _validate_retained_failure_report(name: str, raw: bytes) -> None:
                 raise GuardError("retained UserQA API evidence is invalid")
             if "browser_gate_state" in failure or "browser_gate" in failure:
                 _validate_live_user_browser_gate_evidence(failure)
+            continue
+        if schema == 2 and not source_location_keys.intersection(failure):
             continue
         source_file = failure.get("source_file")
         source_line = failure.get("source_line")
@@ -4714,6 +4740,13 @@ def _read_ephemeral_failure_report(
             frozenset(base_record_keys | decoded_image_failure_keys),
             frozenset(base_record_keys | decoded_image_failure_keys | browser_request_failure_keys),
         }
+        source_location_keys = {
+            "source_file", "source_line", "source_column", "source_kind",
+        }
+        allowed_ephemeral_keys.update(
+            frozenset(set(keys) - source_location_keys)
+            for keys in tuple(allowed_ephemeral_keys)
+        )
         if (
             not isinstance(record, dict)
             or (
@@ -4748,9 +4781,11 @@ def _read_ephemeral_failure_report(
                 raise GuardError("ephemeral navigation evidence is bound to the wrong test")
             _validate_navigation_failure_evidence(record)
         if decoded_image_failure_keys.issubset(record):
-            if record.get("id") != "patch_owner_sections":
+            if record.get("id") not in PATCH_OWNER_SECTION_READER_IDS:
                 raise GuardError("ephemeral decoded-image evidence is bound to the wrong test")
             _validate_decoded_image_failure_evidence(record)
+        if not source_location_keys.intersection(record):
+            continue
         _validate_failure_location(record, manifest)
     if failure_status_counts != {
         "failed": counts["attempt_fail"],
