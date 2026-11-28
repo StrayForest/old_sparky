@@ -266,7 +266,7 @@ jobs:
                   manifest.get("reason") == recovery_bootstrap_reason
                   and manifest.get("class") == "full"
                   and manifest.get("expected_gates") == ["backend", "python-quality", "security", "migration", "docs", "web-quality", "web-hermetic", "verification-contract"]
-                  and manifest.get("runtime_sensitive") is True
+                  and type(manifest.get("runtime_sensitive")) is bool
                   and manifest.get("deployable") is False
                   and manifest.get("fallback") is False
                   and isinstance(files, list)

@@ -2655,6 +2655,46 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertEqual(
             recovery_result.stdout.strip(), "classifier manifest accepted"
         )
+        exact_idle_capture_paths = [
+            "platform/docs/adr/maintenance-failure-host-local-evidence.md",
+            "platform/docs/deployment-runbook.md",
+            "platform/docs/operations-runbook.md",
+            "platform/tests/test_platform_recovery_bootstrap.py",
+            "platform/tools/platform_maintenance_failure_evidence.py",
+            "platform/tools/platform_test_catalog.py",
+        ]
+        exact_idle_capture = classify(
+            exact_idle_capture_paths,
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(exact_idle_capture["reason"], RECOVERY_BOOTSTRAP_REASON)
+        self.assertFalse(exact_idle_capture["runtime_sensitive"])
+        self.assertFalse(exact_idle_capture["deployable"])
+        self.assertFalse(exact_idle_capture["fallback"])
+        with tempfile.TemporaryDirectory() as temporary:
+            exact_archive = self._write_production_classifier_archive(
+                Path(temporary), exact_idle_capture
+            )
+            exact_result = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    str(REPO_ROOT / "platform/tools/platform_production_classifier_artifact.py"),
+                    "manifest",
+                    str(exact_archive),
+                    "--target-sha",
+                    self.TARGET_SHA,
+                    "--require-recovery-bootstrap",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(exact_result.returncode, 0, exact_result.stderr)
+        self.assertEqual(exact_result.stdout.strip(), "classifier manifest accepted")
         recovery_build_workflow = (
             REPO_ROOT
             / ".github/workflows/platform-production-recovery-bootstrap-build.yml"
@@ -2663,6 +2703,14 @@ class PlatformCiClassifierTests(unittest.TestCase):
             'else "recovery-bootstrap" if recovery_bootstrap_only',
             recovery_build_workflow,
         )
+        recovery_route_validation = recovery_build_workflow.split(
+            "recovery_bootstrap_only = (", 1
+        )[1].split("project_guidance_only = (", 1)[0]
+        self.assertIn(
+            'and type(manifest.get("runtime_sensitive")) is bool',
+            recovery_route_validation,
+        )
+        self.assertNotIn('manifest.get("runtime_sensitive") is True', recovery_route_validation)
         self.assertNotIn(
             "or recovery_bootstrap_only\n          route_family",
             recovery_build_workflow,
