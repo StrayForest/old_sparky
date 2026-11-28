@@ -1395,6 +1395,14 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         self.assertIn("platform_recovery_bootstrap.py\" install", workflow)
         self.assertIn("platform_abort_retained_only.sh", workflow)
         self.assertIn("platform_maintenance_failure_evidence.py", workflow)
+        self.assertIn(
+            'platform_release_lock.sh" --run /usr/bin/python3 -I -B "$generation/platform_maintenance_failure_evidence.py" capture_maintenance_failure',
+            workflow,
+        )
+        self.assertIn(
+            'platform_release_lock.sh" --run /usr/bin/python3 -I -B "$generation/platform_maintenance_failure_evidence.py" reset_maintenance_failed',
+            workflow,
+        )
         self.assertIn("platform-maintenance-receipt-${{ github.run_id }}-${{ github.run_attempt }}", workflow)
         self.assertNotIn("recipient_certificate_b64", workflow)
         self.assertNotIn("recipient_certificate_sha256", workflow)
@@ -6065,6 +6073,127 @@ class MaintenanceFailureEvidenceTests(unittest.TestCase):
         self.assertEqual(caught.exception.private_cause["reason"], "nonzero_exit")
         self.assertEqual(caught.exception.private_cause["returncode"], 7)
         self.assertEqual(base64.b64decode(caught.exception.private_cause["stdout_b64"]), b"partial stdout")
+
+    @unittest.skipUnless(os.geteuid() == 0, "idle transaction fixture requires root-owned evidence")
+    def test_idle_transaction_state_binds_absence_through_capture_and_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = Path(temporary) / "app"
+            (app / "shared" / ".release-recovery").mkdir(parents=True, mode=0o755)
+            os.chmod(app / "shared", 0o755)
+            os.chmod(app / "shared" / ".release-recovery", 0o755)
+            output = self._evidence_path(app)
+            pointers = {"current": "current-a", "previous": "previous-b"}
+            reset_called = False
+
+            def properties(unit: str) -> dict[str, str]:
+                value = self._properties(unit)
+                if unit == maintenance_evidence.UNIT and reset_called:
+                    value.update({"ActiveState": "inactive", "SubState": "dead", "Result": "success"})
+                return value
+
+            def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+                nonlocal reset_called
+                if command[1:3] == ["reset-failed", maintenance_evidence.UNIT]:
+                    reset_called = True
+                return subprocess.CompletedProcess(command, 0, b"", b"")
+
+            with (
+                mock.patch.object(maintenance_evidence, "_pointer", side_effect=lambda _app, name: pointers[name]),
+                mock.patch.object(maintenance_evidence, "_systemd_properties", side_effect=properties),
+                mock.patch.object(maintenance_evidence, "_queued_jobs", return_value=[]),
+                mock.patch.object(maintenance_evidence, "_cgroup_members", return_value=[]),
+                mock.patch.object(maintenance_evidence, "_journal", return_value=[]),
+                mock.patch.object(maintenance_evidence, "PRODUCTION_APP_DIR", str(app)),
+                mock.patch.object(maintenance_evidence, "_run", side_effect=run) as systemd_run,
+            ):
+                digest, evidence_value = maintenance_evidence.capture(
+                    app_dir=app,
+                    source_sha="a" * 40,
+                    bundle_sha="b" * 64,
+                    output=output,
+                    capture_run_id="12345",
+                    capture_run_attempt="1",
+                    security_run_id="12340",
+                    security_run_attempt="2",
+                )
+                self.assertEqual(evidence_value["schema"], 2)
+                self.assertEqual(evidence_value["pointers"], pointers)
+                self.assertEqual(evidence_value["receipts"]["transaction_state"], "idle")
+                self.assertIsNone(evidence_value["receipts"]["operation_sha256"])
+                self.assertIsNone(evidence_value["receipts"]["systemd_sha256"])
+                self.assertIsNone(evidence_value["receipts"]["candidate_source_sha"])
+                validated = maintenance_evidence._validate_evidence(
+                    output,
+                    digest,
+                    source_sha="a" * 40,
+                    bundle_sha="b" * 64,
+                    capture_run_id="12345",
+                    capture_run_attempt="1",
+                    security_run_id="12340",
+                    security_run_attempt="2",
+                )
+                self.assertEqual(validated["receipts"]["transaction_state"], "idle")
+
+                mutated = json.loads(output.read_text(encoding="ascii"))
+                mutated["receipts"]["transaction_state"] = "recovery_restored"
+                bad_evidence = output.with_name("bad-transaction-state.json")
+                bad_evidence.write_text(json.dumps(mutated), encoding="ascii")
+                bad_evidence.chmod(0o600)
+                with self.assertRaises(maintenance_evidence.EvidenceError):
+                    maintenance_evidence._validate_evidence(
+                        bad_evidence,
+                        hashlib.sha256(bad_evidence.read_bytes()).hexdigest(),
+                        source_sha="a" * 40,
+                        bundle_sha="b" * 64,
+                        capture_run_id="12345",
+                        capture_run_attempt="1",
+                        security_run_id="12340",
+                        security_run_attempt="2",
+                    )
+
+                maintenance_evidence.reset_failed(
+                    app_dir=app,
+                    source_sha="a" * 40,
+                    bundle_sha="b" * 64,
+                    evidence=output,
+                    evidence_sha=digest,
+                    capture_run_id="12345",
+                    capture_run_attempt="1",
+                    security_run_id="12340",
+                    security_run_attempt="2",
+                )
+                self.assertEqual(
+                    systemd_run.call_args.args[0],
+                    ["/usr/bin/systemctl", "reset-failed", "deadlock-maintenance.service"],
+                )
+
+                appeared = app / "shared/.release-operation.json"
+                appeared.write_text("{}\n", encoding="ascii")
+                appeared.chmod(0o600)
+                with self.assertRaises(maintenance_evidence.EvidenceError):
+                    maintenance_evidence.reset_failed(
+                        app_dir=app,
+                        source_sha="a" * 40,
+                        bundle_sha="b" * 64,
+                        evidence=output,
+                        evidence_sha=digest,
+                        capture_run_id="12345",
+                        capture_run_attempt="1",
+                        security_run_id="12340",
+                        security_run_attempt="2",
+                    )
+                self.assertEqual(systemd_run.call_count, 1)
+
+            with self.assertRaises(maintenance_evidence.EvidenceError):
+                maintenance_evidence._validate_transaction_context(
+                    app, "current-a", "previous-b", None, {"schema": 1},
+                )
+            quiesce = app / "shared/.release-quiesce.json"
+            quiesce.write_text("{}\n", encoding="ascii")
+            with self.assertRaises(maintenance_evidence.EvidenceError):
+                maintenance_evidence._validate_transaction_context(
+                    app, "current-a", "previous-b", None, None,
+                )
 
     def test_reset_rechecks_evidence_and_invokes_only_fixed_reset_failed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

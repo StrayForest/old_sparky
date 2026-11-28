@@ -25,7 +25,18 @@ command output to Actions. The capture action publishes one closed
 workflow, source, bundle, capture/security/recovery/publisher run tuples, the
 raw evidence SHA-256, `host_bound=true`, and `historical_cause=unknown`. The
 artifact contains no host identity, paths, PIDs, cgroup contents, journal,
-exception text, or stdout/stderr. Logs contain only fixed status markers.
+exception text, or stdout/stderr. Logs contain only a closed success summary or
+one allowlisted stage/error-code failure marker; all other remote stderr text
+is discarded.
+
+The evidence binds one explicit transaction state. `idle` requires the
+operation, systemd-companion and quiesce receipts all to be absent under the
+canonical release lock. `recovery_restored` requires the existing validated
+`recovery-restored` operation receipt and its existing optional, matching
+systemd companion contract. Partial or malformed receipts, any quiesce marker,
+or pointer mismatch fail closed. The evidence records the state and exact
+receipt digests (null only for the explicit `idle` state); reset rechecks the
+same state and pointers before acknowledging systemd metadata.
 
 For `reset_maintenance_failed`, the operator supplies the exact successful
 capture run ID and attempt, but no certificate, private key or evidence hash.

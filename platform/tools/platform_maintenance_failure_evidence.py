@@ -26,6 +26,7 @@ from typing import Any
 
 UNIT = "deadlock-maintenance.service"
 TIMER = "deadlock-maintenance.timer"
+PRODUCTION_APP_DIR = "/opt/oldsparky/platform"
 SYSTEMCTL = "/usr/bin/systemctl"
 JOURNALCTL = "/usr/bin/journalctl"
 SERVICE_PROPERTIES = (
@@ -85,7 +86,7 @@ DIAGNOSTIC_CODES = {
 
 def _diagnostic_class(error: BaseException) -> tuple[str, str]:
     message = str(error)
-    if message.startswith("release operation receipt") or message.startswith("release transaction receipt"):
+    if message.startswith(("release receipt", "release operation receipt", "release transaction receipt", "release quiesce receipt")):
         return "transaction_receipt", DIAGNOSTIC_CODES["transaction_receipt"]
     if message.startswith("release transaction") or message.startswith("release pointer"):
         return "transaction_context", DIAGNOSTIC_CODES["transaction_context"]
@@ -481,8 +482,19 @@ def _validate_transaction_context(
     app_dir: Path, current: str | None, previous: str | None,
     operation: dict[str, Any] | None, systemd: dict[str, Any] | None,
 ) -> str | None:
+    quiesce_path = app_dir / "shared/.release-quiesce.json"
+    try:
+        quiesce_path.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise EvidenceError("release quiesce receipt is unavailable") from exc
+    else:
+        raise EvidenceError("release quiesce receipt is present")
     if operation is None:
-        raise EvidenceError("release operation receipt is required")
+        if systemd is not None:
+            raise EvidenceError("release transaction receipt pair is incomplete")
+        return None
     try:
         operation = _TRANSACTION_VALIDATOR["_validate_record"](
             app_dir / "shared/.release-operation.json", operation,
@@ -917,7 +929,7 @@ def capture(
     if not INVOCATION_ID.fullmatch(unit["InvocationID"]) or unit["InvocationID"] == "0" * 32:
         raise EvidenceError("maintenance service invocation identity is unavailable")
     payload = {
-        "schema": 1,
+        "schema": 2,
         "kind": "maintenance_failure_evidence",
         "source_sha": source_sha,
         "bundle_sha256": bundle_sha,
@@ -930,6 +942,7 @@ def capture(
         "app_dir": str(app_dir),
         "pointers": {"current": current, "previous": previous},
         "receipts": {
+            "transaction_state": "idle" if operation is None else "recovery_restored",
             "operation_sha256": operation_sha,
             "systemd_sha256": systemd_sha,
             "operation_id": operation.get("operation_id") if operation else None,
@@ -955,6 +968,59 @@ def capture(
         raise EvidenceError("maintenance evidence destination is not source/run bound")
     _atomic_private_file(expected_output, raw)
     return hashlib.sha256(raw).hexdigest(), payload
+
+
+def _receipt_evidence_is_valid(receipts: object, app_dir: object) -> bool:
+    if not isinstance(receipts, dict) or not isinstance(app_dir, str):
+        return False
+    if set(receipts) != {
+        "transaction_state", "operation_sha256", "systemd_sha256", "operation_id",
+        "operation", "phase", "candidate_release", "candidate_identity",
+        "candidate_source_sha", "peer", "companion_present",
+    }:
+        return False
+    if receipts.get("transaction_state") == "idle":
+        return all(
+            receipts.get(key) is None
+            for key in (
+                "operation_sha256", "systemd_sha256", "operation_id", "operation",
+                "phase", "candidate_release", "candidate_identity",
+                "candidate_source_sha", "peer",
+            )
+        ) and receipts.get("companion_present") is False
+    if receipts.get("transaction_state") != "recovery_restored":
+        return False
+    candidate_identity = receipts.get("candidate_identity")
+    candidate_release = receipts.get("candidate_release")
+    candidate_source = receipts.get("candidate_source_sha")
+    return (
+        isinstance(receipts.get("operation_sha256"), str)
+        and HEX64.fullmatch(receipts["operation_sha256"]) is not None
+        and type(receipts.get("companion_present")) is bool
+        and (
+            (receipts["companion_present"] is True
+             and isinstance(receipts.get("systemd_sha256"), str)
+             and HEX64.fullmatch(receipts["systemd_sha256"]) is not None)
+            or (receipts["companion_present"] is False and receipts.get("systemd_sha256") is None)
+        )
+        and receipts.get("operation") in {"install", "rollback"}
+        and receipts.get("phase") == "recovery-restored"
+        and isinstance(receipts.get("operation_id"), str)
+        and re.fullmatch(r"[0-9a-f]{32}", receipts["operation_id"]) is not None
+        and isinstance(candidate_release, str)
+        and Path(candidate_release).parent == Path(app_dir) / "releases"
+        and isinstance(candidate_identity, dict)
+        and set(candidate_identity) == {"dev", "ino"}
+        and type(candidate_identity.get("dev")) is int
+        and candidate_identity["dev"] >= 0
+        and type(candidate_identity.get("ino")) is int
+        and candidate_identity["ino"] > 0
+        and isinstance(receipts.get("peer"), str)
+        and (
+            candidate_source is None
+            or (isinstance(candidate_source, str) and re.fullmatch(r"[0-9a-f]{40}", candidate_source) is not None)
+        )
+    )
 
 
 def _validate_evidence(
@@ -991,7 +1057,7 @@ def _validate_evidence(
         raise EvidenceError("production host identity is unavailable") from exc
     if (
         set(value) != expected_keys
-        or value.get("schema") != 1
+        or value.get("schema") != 2
         or value.get("kind") != "maintenance_failure_evidence"
         or value.get("source_sha") != source_sha
         or value.get("bundle_sha256") != bundle_sha
@@ -1008,40 +1074,25 @@ def _validate_evidence(
         or value.get("security_run_id") != security_run_id
         or value.get("security_run_attempt") != security_run_attempt
         or value.get("host_id_sha256") != hashlib.sha256(host_id.encode("ascii")).hexdigest()
-        or value.get("app_dir") != "/opt/oldsparky/platform"
+        or value.get("app_dir") != PRODUCTION_APP_DIR
         or not isinstance(value.get("pointers"), dict)
         or set(value["pointers"]) != {"current", "previous"}
         or not isinstance(value.get("receipts"), dict)
         or set(value["receipts"]) != {
+            "transaction_state",
             "operation_sha256", "systemd_sha256", "operation_id", "operation", "phase",
             "candidate_release", "candidate_identity", "candidate_source_sha", "peer",
             "companion_present",
         }
+        or not _receipt_evidence_is_valid(value.get("receipts"), value.get("app_dir"))
         or not isinstance(value.get("unit"), dict)
         or not isinstance(value.get("timer"), dict)
         or not isinstance(value.get("journal"), list)
         or set(value.get("unit", {})) != set(SERVICE_PROPERTIES)
         or set(value.get("timer", {})) != set(TIMER_PROPERTIES)
         or any(item is not None and (not isinstance(item, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,179}", item) is None) for item in value.get("pointers", {}).values())
-        or not HEX64.fullmatch(str(value.get("receipts", {}).get("operation_sha256", "")))
-        or (value.get("receipts", {}).get("companion_present") is True and not HEX64.fullmatch(str(value.get("receipts", {}).get("systemd_sha256", ""))))
-        or (value.get("receipts", {}).get("companion_present") is False and value.get("receipts", {}).get("systemd_sha256") is not None)
-        or type(value.get("receipts", {}).get("companion_present")) is not bool
-        or value.get("receipts", {}).get("operation") not in {"install", "rollback"}
-        or value.get("receipts", {}).get("phase") != "recovery-restored"
-        or not isinstance(value.get("receipts", {}).get("operation_id"), str)
-        or re.fullmatch(r"[0-9a-f]{32}", value["receipts"]["operation_id"]) is None
-        or not isinstance(value.get("receipts", {}).get("candidate_release"), str)
-        or not isinstance(value.get("receipts", {}).get("candidate_identity"), dict)
-        or not isinstance(value.get("receipts", {}).get("peer"), str)
-        or set(value["receipts"]["candidate_identity"]) != {"dev", "ino"}
-        or type(value["receipts"]["candidate_identity"].get("dev")) is not int
-        or value["receipts"]["candidate_identity"].get("dev") < 0
-        or type(value["receipts"]["candidate_identity"].get("ino")) is not int
-        or value["receipts"]["candidate_identity"].get("ino") <= 0
-        or (value["receipts"].get("candidate_source_sha") is not None and (not isinstance(value["receipts"].get("candidate_source_sha"), str) or re.fullmatch(r"[0-9a-f]{40}", value["receipts"]["candidate_source_sha"]) is None))
-        or not isinstance(value["receipts"]["candidate_release"], str)
-        or Path(value["receipts"]["candidate_release"]).parent != Path(value["app_dir"]) / "releases"
+        or (value["receipts"].get("candidate_source_sha") is not None and (not isinstance(value["receipts"]["candidate_source_sha"], str) or re.fullmatch(r"[0-9a-f]{40}", value["receipts"]["candidate_source_sha"]) is None))
+        or (value["receipts"].get("transaction_state") == "recovery_restored" and Path(value["receipts"]["candidate_release"]).parent != Path(value["app_dir"]) / "releases")
         or len(value["journal"]) > 100
         or any(not isinstance(row, dict) or set(row) != {"realtime_timestamp", "priority", "message"} or not all(isinstance(row[key], str) for key in row) or len(row["message"]) > 4096 for row in value["journal"])
         or value.get("unit", {}).get("ActiveState") != "failed"
@@ -1084,7 +1135,10 @@ def reset_failed(
     receipts = evidence_value["receipts"]
     if current_operation_sha != receipts.get("operation_sha256") or current_systemd_sha != receipts.get("systemd_sha256"):
         raise EvidenceError("release receipts changed after evidence capture")
-    if current_operation is None or (current_systemd is not None) != receipts.get("companion_present"):
+    if receipts.get("transaction_state") == "idle":
+        if current_operation is not None or current_systemd is not None:
+            raise EvidenceError("release transaction receipt presence changed")
+    elif current_operation is None or (current_systemd is not None) != receipts.get("companion_present"):
         raise EvidenceError("release transaction receipt presence changed")
     candidate_source_sha = _validate_transaction_context(
         app_dir, evidence_value["pointers"].get("current"),
