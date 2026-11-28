@@ -37,7 +37,8 @@ DEADLOCK_ASSET_BASE_URL = "https://deadlock.io"
 HOME_CONTENT_KEY = "platform:home-content:v4"
 HOME_CONTENT_STALE_KEY = "platform:home-content:stale:v4"
 HOME_CONTENT_LOCK_KEY = "platform:home-content:refresh-lock:v4"
-PATCH_DETAIL_KEY_PREFIX = "platform:home-content:patch:v19:"
+PATCH_DETAIL_KEY_PREFIX = "platform:home-content:patch:v20:"
+PATCH_DETAIL_MIGRATION_SOURCE_PREFIX = "platform:home-content:patch:v19:"
 PATCH_ASSET_CATALOG_KEY = "platform:home-content:patch-assets:v9"
 PATCH_ASSET_CATALOG_STALE_KEY = "platform:home-content:patch-assets-stale:v3"
 PATCH_ASSET_PENDING_RETRY_KEY = "platform:home-content:patch-assets-pending-retry:v1"
@@ -732,6 +733,8 @@ def _strip_named_change_prefix(change: str, name: str) -> str:
 
 def _patch_scope_heading(line: str) -> str | None:
     normalized = " ".join(line.split()).casefold()
+    if normalized.startswith(r"\[") and normalized.endswith("]"):
+        normalized = normalized[1:]
     if len(normalized) >= 2 and normalized[0] == "[" and normalized[-1] == "]":
         label = normalized[1:-1].strip()
     elif normalized.endswith(":"):

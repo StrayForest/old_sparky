@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
@@ -94,6 +95,19 @@ class PatchChangeListResponse(BaseModel):
     ordered: bool = False
 
 
+class PatchReferenceEntityResponse(BaseModel):
+    kind: Literal["hero", "ability", "item"]
+    name: str = Field(min_length=1, max_length=120)
+    display_name: str | None = Field(default=None, max_length=120)
+    icon_url: str | None = Field(default=None, max_length=1000)
+    description: str | None = Field(default=None, max_length=2400)
+
+
+class PatchChangeReferenceResponse(BaseModel):
+    change_index: int = Field(ge=0, le=499)
+    entities: list[PatchReferenceEntityResponse] = Field(min_length=1, max_length=4)
+
+
 class PatchAbilityResponse(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     display_name: str | None = Field(default=None, max_length=120)
@@ -163,6 +177,26 @@ def _validate_patch_change_structure(
         previous_end = descriptor.end
 
 
+def _validate_patch_change_references(
+    changes: list[str],
+    references: list[PatchChangeReferenceResponse],
+) -> None:
+    previous_index = -1
+    for reference in references:
+        if reference.change_index >= len(changes) or reference.change_index <= previous_index:
+            raise ValueError("Patch change references must be ordered and inside changes.")
+        identities = [(entity.kind, entity.name.casefold()) for entity in reference.entities]
+        if len(identities) != len(set(identities)):
+            raise ValueError("Patch change references cannot duplicate an entity.")
+        previous_index = reference.change_index
+
+
+_ESCAPED_PATCH_SCOPE_MARKER = re.compile(
+    r"^\\\[\s*(?:general|items|heroes|objectives)\s*\]$",
+    re.IGNORECASE,
+)
+
+
 class PatchSectionResponse(BaseModel):
     kind: Literal["general", "objective", "item", "hero"]
     title: str = Field(min_length=1, max_length=120)
@@ -183,6 +217,7 @@ class PatchSectionResponse(BaseModel):
     change_groups: list[PatchChangeGroupResponse] = Field(default_factory=list, max_length=50)
     change_headings: list[int] = Field(default_factory=list, max_length=100)
     change_lists: list[PatchChangeListResponse] = Field(default_factory=list, max_length=50)
+    change_references: list[PatchChangeReferenceResponse] = Field(default_factory=list, max_length=500)
     abilities: list[PatchAbilityResponse] = Field(default_factory=list, max_length=20)
 
     @model_validator(mode="after")
@@ -191,6 +226,9 @@ class PatchSectionResponse(BaseModel):
         _validate_patch_change_structure(
             self.changes, self.change_groups, self.change_headings, self.change_lists
         )
+        _validate_patch_change_references(self.changes, self.change_references)
+        if any(_ESCAPED_PATCH_SCOPE_MARKER.fullmatch(change.strip()) for change in self.changes):
+            raise ValueError("Patch scope markers cannot be published as change text.")
         if self.kind == "hero":
             if self.hero_name is None:
                 raise ValueError("Hero patch sections require hero_name.")

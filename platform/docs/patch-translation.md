@@ -25,21 +25,21 @@ one delayed automatic retry after 15 minutes when its error is a known network
 or timeout failure and its attempt count is below the fixed retry limit. Other
 failures remain durable and do not incur repeated model calls.
 
-The translation version configured in this source tree is `ru-v16`, defined in
+The translation version configured in this source tree is `ru-v17`, defined in
 `apps/platform_api/app/services/patch_translation_config.py`. It includes the
-durable DB-first state, the reviewed ambiguity handling and the immutable
-numeric/tier validation described below. It gathers typed ENTITY/FACT
-placeholder failures, numeric-fact mismatches and the reviewed effectiveness
-comparison failure across the initial batches before using the single shared
-follow-up request. That request contains only the affected stable segment IDs.
+durable DB-first state, the reviewed ambiguity handling, the immutable
+numeric/tier validation and the `Net Worth` glossary term described below. It
+gathers typed ENTITY/FACT placeholder failures, numeric-fact mismatches and the
+reviewed effectiveness comparison failure across the initial batches before
+using the single shared follow-up request. That request contains only the
+affected stable segment IDs.
 The `Gun Damage` entity/mechanic collision is source-sensitive: named ability
 references such as Rem's `Gun Damage` stay protected as entity names, while
 source-backed `Base gun damage` stat lines remain visible to the model and use
 the checked-in `Weapon Damage` glossary value. A source-matched gun-damage stat
 row that still contains the English mechanic label is rejected into the same
 single follow-up correction path; named ability references remain protected.
-The four-patch regression procedure
-and its historical evidence live in
+Historical evidence for the original fixed four-patch QA set lives in
 [`archive/patch-translation-qa-2026-08-22.md`](archive/patch-translation-qa-2026-08-22.md).
 
 ## Scope
@@ -55,14 +55,36 @@ a historical launch snapshot, so the client labels them as current values.
 The patch API keeps section and ability changes as ordered strings and adds
 source-derived presentation indexes. Standalone Steam headings are marked by
 `change_headings`; unheaded list ranges carry `start`, `end` and `ordered` in
-`change_lists`; the existing `change_groups` ties a standalone bold heading to
-an immediately following Steam list. All indexes refer to the ordered
-`changes` strings and do not change translation segments, source hashes or the
-translation version. The web renders marked headings at the detail-page
-subheading level, list ranges as ordered or unordered lists, and remaining
-changes as paragraphs. Unordered patch lists have no marker dots or extra left
-indent; ordered lists retain numbering. Inline bold remains inline prose and is
-not promoted to a heading.
+`change_lists`; `change_groups` ties a standalone bold heading to its following
+Steam list. `change_references` attaches up to four exact catalog-backed entity
+references to a `change_index`, with a canonical name and only available
+display name, validated icon URL or Russian ability description. The web keeps
+the change text under its parsed owner and renders reference metadata beside
+the indexed line. Only matched catalog metadata is projected; the source change
+text remains present. A missing or ambiguous catalog match adds no metadata.
+At most four deterministic references are projected per change; excess matches
+are omitted from metadata, retained in source prose and counted in an
+identifier-only diagnostic. All indexes refer to the ordered `changes`
+strings. Translation replaces text in place; presentation metadata does not
+become a translation segment or alter source hashes or translation identity.
+The web renders marked headings at the detail-page subheading level, list
+ranges as ordered or unordered lists, and remaining changes as paragraphs.
+Unordered patch lists have no marker dots or extra left indent; ordered lists
+retain numbering. Inline bold remains inline prose and is not promoted to a
+heading.
+
+For item sections, a Steam list introduced by an item-owned lead-in remains a
+group under that item. Its child changes stay in source order, and later item
+follow-up text remains with the same item after the group. References point to
+the resulting ordered change indexes; they never move child text into General,
+another item or a referenced hero/ability section.
+
+Hero section `title` and `hero_name` remain canonical catalog identities.
+When `hero_display_name` is a nonblank, distinct localized name, the web uses it
+as the visible heading and shows the canonical English title as a secondary
+label. If the localized name is absent, blank or equal to the canonical title
+(case-insensitively), the canonical title appears once. This presentation does
+not alter entity IDs, parser keys or protected translation terms.
 
 These descriptors are extracted from original Steam BBCode/HTML before source
 normalization and are attached only when an exact sequence maps to one parsed
@@ -187,6 +209,9 @@ hash of newly extracted segments, so old normalized source cannot be reused as
 current detail or translation input.
 
 The translation glossary is a **small checked-in canonical glossary owned by Old Sparky**. It is curated from Valve/Steam Russian Deadlock terminology and contains only important reusable gameplay mechanics: movement, damage, resistances, lifesteal, cooldowns, duration, range/radius, control durations and similar core concepts.
+
+`Net Worth` is a canonical reusable gameplay/economy concept with the glossary
+value `Общая стоимость ресурсов`; keep its wording consistent across patches.
 
 The glossary intentionally does **not** contain:
 
@@ -315,14 +340,27 @@ smaller of 75 seconds or the remaining task time. The delayed durable retry
 remains a separate queue attempt, and the existing maximum of two durable
 attempts is unchanged.
 
-The warm-up's `max_openai_calls` setting and `translation_calls` report count
-cache-miss patch translations; they are not a count of provider HTTP requests.
+The warm-up's `max_openai_calls` setting bounds patch-level cache-miss
+translation attempts. `translation_calls` charges an attempt before the direct
+translation call, whether that attempt succeeds or fails; it is not a count of
+provider HTTP requests. One patch attempt can make multiple bounded provider
+calls for retries or correction.
 Validation failures are not retried in a loop.
 
 ## Parser and catalog cache changes
 
 When patch parsing or source normalization changes extracted sections, update
-the detail-cache contract so new reads cannot reuse stale structure. Catalog
+the detail-cache contract so new reads cannot reuse stale structure. The
+current patch-detail projection namespace is `v20`; its preceding `v19` cache
+is treated only as a bounded source for the explicit
+[manual exact-ID repair procedure](patch-translation-repair-runbook.md#manual-exact-id-repair).
+That repair accepts one to six unique, caller-selected decimal patch IDs bound
+to the current source/release SHA. The current audited repair uses exactly its six approved IDs;
+operators must not turn that audited set into a hard-coded default. The tool
+verifies cached source identity before reparsing and never treats an old
+translated projection as current structure. The routine latest-four-patch
+regression remains a separate content diagnostic; it does not select or widen
+the repair set. Catalog
 readiness is tracked by the `hero_image_candidates_version` marker: a warm
 catalog without the marker is incomplete and schedules the normal bounded
 refresh, while the last-good catalog remains available if the source is down.
@@ -374,7 +412,20 @@ Likewise, do not grow the item/mechanic ambiguity list speculatively. Add an ent
 
 ## QA
 
-For translation changes, use at least the four newest patches available in production as a regression set. Compare:
+For parser and translation changes, use the offline source-derived fixtures to
+check ownership, structure and translation merge behavior. The original fixed
+four-patch production set is historical evidence, not the current live selector.
+For live content diagnostics, compare the dynamically selected four current
+home patches and their Russian detail DTOs. A parser-cache repair is a separate
+operation that requires an explicit ID list.
+
+Live current-four content diagnostics do not trigger cache repair or choose
+repair IDs. The post-deploy current-four warm-up uses the current cached home
+projection and may translate a bounded number of cache misses. A parser-
+namespace repair is a separate, explicit operation using the bounded
+[manual exact-ID repair procedure](patch-translation-repair-runbook.md#manual-exact-id-repair).
+
+For each source change under review, compare:
 
 - the English source change;
 - Old Sparky's generated Russian `sections` change (the source `content` field remains English);
@@ -383,9 +434,14 @@ For translation changes, use at least the four newest patches available in produ
 Also verify balance abilities omit catalog prose/stats, introductions and
 replacements include only catalog-backed descriptions/stats, image URLs are
 not translation segments, new heroes retain image/name metadata, and each
-objective change remains grouped with its identity/image. Reparse the exact
-four displayed patch IDs from their source details after a parser namespace
-change; a source-only parser test does not repair cached patch structures.
+objective change remains grouped with its identity/image. Verify nested item
+changes remain under their item owner, every child appears once in source order,
+follow-up text stays with the item, and entity reference cards point to the
+correct ordered change after Russian translation. Reference icons and optional
+metadata must come from the validated catalog; do not duplicate the referenced
+entity's patch body in another section. Reparse cached details only through the
+separate exact-ID repair procedure; a source-only parser test does not repair
+cached patch structures.
 
 Pay particular attention to movement speed, cooldown, spirit power/scaling, bullet/spirit/melee resistance, bullet/spirit/melee lifesteal, range/radius, duration and common upgrade wording.
 
@@ -395,8 +451,8 @@ Structural production checks are fail-fast, but the post-deploy workflow is a
 controlled cache warm-up rather than read-only QA: a cache miss acquires a
 Redis lock, may call OpenAI and writes the translation cache. The workflow is
 named `Platform patch translation warm-up`, requires an explicit maximum number
-of cache-miss patch translations (four by default), and reports that patch
-translation budget in its result. A translation may make one additional
+of patch-level cache-miss attempts (four by default), and reports the charged
+attempt count in its result. One attempt may make an additional
 bounded request from the shared transient-retry or aggregate validation
 correction allowance. It must not run in a polling loop or be described as a
 pure QA check. A read-only check must fail on cache miss instead of invoking

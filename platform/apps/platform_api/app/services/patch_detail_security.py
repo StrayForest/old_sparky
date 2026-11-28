@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from typing import Any
 
 import httpx
 
+from apps.platform_api.app.api.schemas import PatchDetailResponse
 from apps.platform_api.app.services import home_content as base
 from apps.platform_api.app.services.patch_detail import (
     finalize_patch_translation_metadata,
@@ -15,6 +17,7 @@ from apps.platform_api.app.services.patch_detail import (
 from apps.platform_api.app.services.patch_translation import (
     apply_cached_patch_translation,
     ensure_patch_translation_records,
+    translation_source_hash,
 )
 from python_packages.platform_infra.config import get_settings
 from python_packages.platform_infra.redis import redis_client
@@ -27,6 +30,7 @@ PATCH_MISS_REFRESH_GATE_KEY = "platform:home-content:patch-miss-refresh:v1"
 PATCH_MISS_NEGATIVE_TTL_SECONDS = 5 * 60
 PATCH_MISS_REFRESH_GATE_SECONDS = 60
 PATCH_MISS_RESPONSE_MAX_BYTES = base.STEAM_NEWS_RESPONSE_MAX_BYTES
+PATCH_DETAIL_REPARSE_MAX_IDS = 6
 
 _BACKGROUND_REFRESH_TASKS: set[asyncio.Task[None]] = set()
 
@@ -244,18 +248,138 @@ async def _cached_patch_source(patch_id: str) -> dict[str, Any] | None:
     return None
 
 
-async def get_patch_detail(patch_id: str) -> dict[str, Any] | None:
-    source = await _cached_patch_source(patch_id)
-    if source is None:
-        return None
+def _validate_cached_patch_source(patch_id: str, source: dict[str, Any], pttl: int) -> None:
+    safe_url = base._https_url(
+        source.get("url"),
+        host_suffixes=base.STEAM_NEWS_HOST_SUFFIXES,
+    )
+    if (
+        not patch_id.isdigit()
+        or len(patch_id) > 32
+        or source.get("id") != patch_id
+        or not str(source.get("title") or "").strip()
+        or safe_url != source.get("url")
+        or not isinstance(source.get("content"), str)
+        or not source["content"].strip()
+        or len(source["content"]) > 30000
+        or pttl <= 0
+    ):
+        raise ValueError("Patch source identity or cache lifetime is invalid.")
+    base._source_datetime(source.get("published_at"))
+
+
+async def reparse_cached_patch_details(
+    patch_ids: list[str],
+) -> dict[str, Any]:
+    """Reparse an explicit bounded patch set from current/v19 Redis source only."""
+
+    if (
+        not isinstance(patch_ids, list)
+        or not 1 <= len(patch_ids) <= PATCH_DETAIL_REPARSE_MAX_IDS
+        or any(
+            not isinstance(patch_id, str)
+            or not patch_id.isdigit()
+            or len(patch_id) > 32
+            for patch_id in patch_ids
+        )
+        or len(set(patch_ids)) != len(patch_ids)
+    ):
+        raise ValueError("Patch reparse IDs must be 1–6 unique decimal IDs.")
 
     catalog = await _cached_asset_catalog()
-    if catalog is None and isinstance(source.get("sections"), list):
-        structured = source
+    if catalog is None or not base._asset_catalog_is_ready(catalog):
+        raise RuntimeError("The current patch asset catalog is not ready.")
+
+    cache = redis_client()
+    raw_sources: dict[str, tuple[dict[str, Any], str, int]] = {}
+    try:
+        for patch_id in patch_ids:
+            current_key = base.PATCH_DETAIL_KEY_PREFIX + patch_id
+            source = _decode_mapping(await cache.get(current_key))
+            pttl = int(await cache.pttl(current_key)) if source is not None else 0
+            namespace = "v20"
+            if source is None:
+                previous_key = base.PATCH_DETAIL_MIGRATION_SOURCE_PREFIX + patch_id
+                source = _decode_mapping(await cache.get(previous_key))
+                pttl = int(await cache.pttl(previous_key)) if source is not None else 0
+                namespace = "v19"
+            if source is None:
+                raise ValueError(f"Audited patch source is missing: {patch_id}.")
+            _validate_cached_patch_source(patch_id, source, pttl)
+            raw_sources[patch_id] = (source, namespace, pttl)
+    finally:
+        await cache.aclose()
+
+    details: dict[str, dict[str, Any]] = {}
+    provenance: dict[str, dict[str, Any]] = {}
+    for patch_id, (source, namespace, pttl) in raw_sources.items():
+        detail = structure_patch_detail(source, catalog)
+        if detail.get("id") != patch_id:
+            raise ValueError(f"Reparsed patch identity changed: {patch_id}.")
+        PatchDetailResponse.model_validate(detail)
+        details[patch_id] = detail
+        source_text = str(source["content"])
+        provenance[patch_id] = {
+            "source_namespace": namespace,
+            "source_pttl_seconds": pttl,
+            "source_title": str(source.get("title") or ""),
+            "source_published_at": str(source.get("published_at") or ""),
+            "source_url": str(source.get("url") or ""),
+            "source_content_sha256": hashlib.sha256(
+                source_text.encode("utf-8")
+            ).hexdigest(),
+            "source_hash": translation_source_hash(detail),
+        }
+
+    cache = redis_client()
+    try:
+        async with cache.pipeline(transaction=True) as pipeline:
+            for patch_id, detail in details.items():
+                pipeline.set(
+                    base.PATCH_DETAIL_KEY_PREFIX + patch_id,
+                    json.dumps(detail, ensure_ascii=False, separators=(",", ":")),
+                    ex=base.PATCH_DETAIL_TTL_SECONDS,
+                )
+            await pipeline.execute()
+    finally:
+        await cache.aclose()
+
+    registration = await ensure_patch_translation_records(details, enqueue=False)
+    return {
+        "details": details,
+        "provenance": provenance,
+        "translation_registration": registration,
+    }
+
+
+async def get_patch_detail(patch_id: str) -> dict[str, Any] | None:
+    source = await _cached_patch_source(patch_id)
+    migrated_detail: dict[str, Any] | None = None
+    if source is None:
+        if not patch_id.isdigit() or len(patch_id) > 32:
+            return None
+        try:
+            migration = await reparse_cached_patch_details([patch_id])
+            migrated_detail = migration["details"][patch_id]
+        except Exception as error:  # noqa: BLE001
+            logger.warning(
+                "audited_patch_cache_migration_failed patch_id=%s error=%s",
+                patch_id,
+                type(error).__name__,
+            )
+            return None
+
+    if migrated_detail is not None:
+        structured = migrated_detail
     else:
-        structured = structure_patch_detail(
-            source,
-            catalog or {"heroes": {}, "items": {}, "ranks": {}, "objectives": {}},
-        )
+        assert source is not None
+        catalog = await _cached_asset_catalog()
+        if catalog is None and isinstance(source.get("sections"), list):
+            structured = source
+        else:
+            structured = structure_patch_detail(
+                source,
+                catalog or {"heroes": {}, "items": {}, "ranks": {}, "objectives": {}},
+            )
     translated = await apply_cached_patch_translation(structured)
     return finalize_patch_translation_metadata(translated)

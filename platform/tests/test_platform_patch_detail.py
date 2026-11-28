@@ -6,7 +6,10 @@ import unittest
 
 from apps.platform_api.app.api.schemas import PatchDetailResponse
 from apps.platform_api.app.services import home_content
-from apps.platform_api.app.services.patch_detail import structure_patch_detail
+from apps.platform_api.app.services.patch_detail import (
+    _change_reference_entities,
+    structure_patch_detail,
+)
 from apps.platform_api.app.services.patch_translation_runtime import (
     extract_translation_segments,
     merge_translation,
@@ -207,6 +210,165 @@ Bonus health reduced
         self.assertEqual([section["item_name"] for section in items], ["Basic Magazine", "Extra Health"])
         self.assertEqual(items[0]["changes"], ["Ammo increased"])
         self.assertEqual(items[1]["changes"], ["Bonus health reduced"])
+
+    def test_live_restorative_locket_source_keeps_nested_changes_and_references(self) -> None:
+        abilities_by_hero = {
+            "Danny": ["Jettison Fuel", "Strix Salvo"],
+            "Doorman": ["Door Recall"],
+            "Mina": ["Sanguine Retreat"],
+            "Nurse Harrow": ["Healing Needles"],
+            "Solomon": ["Move King", "Move Piece"],
+            "Venator": ["Ira Domini"],
+            "Violet": ["Living Ink"],
+        }
+        heroes = {
+            hero.casefold(): {
+                "name": hero,
+                "class_name": "hero_" + hero.casefold().replace(" ", "_"),
+                "hero_image_url": f"https://assets.test/{hero.casefold()}.png",
+                "abilities": {
+                    ability.casefold(): {
+                        "name": ability,
+                        "icon_url": f"https://assets.test/{ability.casefold().replace(' ', '-')}.png",
+                        "description": f"Description of {ability}",
+                        "russian_metadata_available": True,
+                    }
+                    for ability in abilities
+                },
+            }
+            for hero, abilities in abilities_by_hero.items()
+        }
+        heroes["abrams"] = {"name": "Abrams", "abilities": {}}
+        items = {
+            name.casefold(): {
+                "name": name,
+                "category": "vitality",
+                "icon_url": f"https://assets.test/{name.casefold().replace(' ', '-')}.png",
+            }
+            for name in ("Restorative Locket", "Spellslinger", "Radiant Regeneration")
+        }
+        fixture = Path(__file__).parent / (
+            "fixtures/patch-acceptance/restorative-locket-1850460852986472.txt"
+        )
+        source = fixture.read_text(encoding="utf-8")
+        detail = structure_patch_detail(
+            {
+                "id": "1850460852986472",
+                "title": "November 26 Patch",
+                "published_at": "2026-11-26T00:00:00+00:00",
+                "url": "https://store.steampowered.com/news/app/1422450/view/1850460852986472",
+                "content": source,
+            },
+            {"heroes": heroes, "items": items, "objectives": {}},
+        )
+
+        self.assertEqual(
+            [section["kind"] for section in detail["sections"]],
+            ["general", "item", "hero"],
+        )
+        general, item, _hero = detail["sections"]
+        self.assertEqual(
+            general["changes"],
+            [
+                "Hero base health reduced by 8%. The health is redistributed into boons, so total health at max boons is roughly the same.",
+                "Bullet damage growth per boon increased for all heroes by 5% (except for Haze, Holliday, Venator, Vindicta, Warden, Wraith)",
+                "First kill bonus for each player increased from 125 to 175 souls",
+            ],
+        )
+        self.assertFalse(any(
+            change.startswith("\\[")
+            for section in detail["sections"]
+            for change in section["changes"]
+        ))
+        self.assertEqual(item["item_name"], "Restorative Locket")
+        self.assertEqual(len(item["changes"]), 11)
+        self.assertEqual(item["change_groups"], [
+            {"heading_index": 0, "description_start": 1, "description_end": 10}
+        ])
+        self.assertEqual(
+            item["changes"][1:10],
+            [
+                "Danny Jettison Fuel now grants a charge",
+                "Danny Strix Salvo now grants a charge",
+                "Doorman Door Recall no longer grants a charge",
+                "Mina Sanguine Retreat recast now grants charges",
+                "Nurse Harrow Healing Needles no longer grants a charge",
+                "Solomon Move King now grants a charge",
+                "Solomon Move Piece (Bishop, Knight and Queen moves) now grants a charge",
+                "Venator Ira Domini now grants a charge",
+                "Violet Living Ink (draw) now grants a charge",
+            ],
+        )
+        self.assertEqual(item["changes"][10], "Applied similar fixes to Spellslinger and Radiant Regeneration for the above list")
+        self.assertEqual(
+            [reference["change_index"] for reference in item["change_references"]],
+            list(range(1, 11)),
+        )
+        self.assertTrue(all(
+            entity["icon_url"]
+            for reference in item["change_references"]
+            for entity in reference["entities"]
+        ))
+        self.assertFalse(any(
+            entity["name"] == "Restorative Locket"
+            for reference in item["change_references"]
+            for entity in reference["entities"]
+        ))
+        wire = PatchDetailResponse.model_validate(detail)
+        segments = extract_translation_segments(detail)
+        translated = merge_translation(
+            detail,
+            {segment["id"]: f"Перевод {index}" for index, segment in enumerate(segments)},
+        )
+        translated_item = next(section for section in translated["sections"] if section["kind"] == "item")
+        self.assertEqual(translated_item["change_references"], item["change_references"])
+        self.assertEqual(translated_item["change_groups"], item["change_groups"])
+        self.assertEqual(len(wire.sections[1].change_references), 10)
+
+    def test_unknown_nested_entity_remains_text_and_logs_without_metadata(self) -> None:
+        with self.assertLogs(
+            "apps.platform_api.app.services.patch_detail", level="WARNING"
+        ) as captured:
+            detail = structure_patch_detail(
+                {
+                    "id": "1850460852986472",
+                    "title": "November 26 Patch",
+                    "content": (
+                        "[Items]\nRestorative Locket:\n"
+                        "-- Unknown Catalog Entity received a change"
+                    ),
+                },
+                {"heroes": {}, "items": {"restorative locket": {"name": "Restorative Locket"}}, "objectives": {}},
+            )
+        item = next(section for section in detail["sections"] if section["kind"] == "item")
+        self.assertEqual(item["changes"], ["Unknown Catalog Entity received a change"])
+        self.assertEqual(item.get("change_references", []), [])
+        self.assertIn("patch_nested_entity_reference_unresolved", captured.output[0])
+
+    def test_ambiguous_exact_catalog_alias_has_no_reference_metadata(self) -> None:
+        entities = _change_reference_entities(
+            "Shared Name received a change",
+            {"shared": {"name": "Shared Name", "class_name": "hero_shared"}},
+            {"shared": {"name": "Shared Name", "icon_url": "https://assets.test/shared.png"}},
+        )
+        self.assertEqual(entities, [])
+
+    def test_change_references_respect_the_wire_bound(self) -> None:
+        catalog = {
+            f"item {index}": {
+                "name": f"Item {index}",
+                "icon_url": f"https://assets.test/item-{index}.png",
+            }
+            for index in range(5)
+        }
+        entities = _change_reference_entities(
+            "Item 0, Item 1, Item 2, Item 3 and Item 4 changed.",
+            {},
+            catalog,
+        )
+        self.assertEqual([entity["name"] for entity in entities], [
+            "Item 0", "Item 1", "Item 2", "Item 3"
+        ])
 
     def test_inline_legacy_format_remains_supported(self) -> None:
         raw = {

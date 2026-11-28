@@ -2668,7 +2668,7 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
     def test_public_content_cache_versions_keep_home_contract_stable(self) -> None:
         self.assertEqual(home_content.HOME_CONTENT_KEY, "platform:home-content:v4")
         self.assertEqual(home_content.HOME_CONTENT_STALE_KEY, "platform:home-content:stale:v4")
-        self.assertEqual(home_content.PATCH_DETAIL_KEY_PREFIX, "platform:home-content:patch:v19:")
+        self.assertEqual(home_content.PATCH_DETAIL_KEY_PREFIX, "platform:home-content:patch:v20:")
         self.assertEqual(
             home_content.PATCH_ASSET_CATALOG_KEY,
             "platform:home-content:patch-assets:v9",

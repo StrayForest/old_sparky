@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
 
@@ -21,6 +22,7 @@ _PATCH_ABILITY_ALIASES = {
     "deadman danny": {"rocket jumping": "chimera mk1"},
 }
 PATCH_CANONICAL_ENTITY_NAMES_MAX = 2000
+logger = logging.getLogger(__name__)
 
 
 def _patch_lines(content: str) -> list[str]:
@@ -33,8 +35,16 @@ def _patch_lines(content: str) -> list[str]:
     numeric minus signs and prose hyphens remain untouched.
     """
 
-    normalized = _FLATTENED_ENTITY_BULLET_RE.sub("\n- ", content)
-    return base._patch_lines(normalized)
+    nested_marker = "\uf8ffPATCH_NESTED_BULLET\uf8ff"
+    protected = re.sub(r"(?m)^[ \t]*--[ \t]+", nested_marker, content)
+    normalized = _FLATTENED_ENTITY_BULLET_RE.sub("\n- ", protected)
+    lines = base._patch_lines(normalized)
+    return [
+        "- " + line[len(nested_marker):].lstrip()
+        if line.startswith(nested_marker)
+        else line
+        for line in lines
+    ]
 
 
 def _canonical_entity_references(content: str, catalog: dict[str, Any]) -> list[str]:
@@ -297,6 +307,160 @@ def _item_section(
         },
     )
     return item_key, section
+
+
+def _change_reference_entities(
+    text: str,
+    hero_catalog: dict[str, Any],
+    item_catalog: dict[str, Any],
+    *,
+    owner_item_name: str | None = None,
+    patch_id: str | None = None,
+    change_index: int | None = None,
+) -> list[dict[str, Any]]:
+    """Project only exact catalog-backed references for a source change."""
+
+    matches: list[tuple[int, int, dict[str, Any]]] = []
+
+    def add_reference(
+        kind: str,
+        name: str,
+        aliases: list[str],
+        entity: dict[str, Any],
+    ) -> None:
+        spans: list[tuple[int, int]] = []
+        for alias in sorted(set(aliases), key=lambda value: (-len(value), value.casefold())):
+            pattern = term_pattern(alias)
+            if not pattern:
+                continue
+            spans.extend(
+                (match.start(), match.end())
+                for match in re.finditer(pattern, text, flags=re.IGNORECASE)
+            )
+        if not spans:
+            return
+        start, end = min(spans, key=lambda span: (span[0], -(span[1] - span[0])))
+        reference: dict[str, Any] = {"kind": kind, "name": name}
+        display_name = str(entity.get("display_name") or "").strip()
+        if display_name:
+            reference["display_name"] = display_name
+        icon_url = str(
+            entity.get("hero_image_url") or entity.get("icon_url") or ""
+        ).strip()
+        if icon_url:
+            reference["icon_url"] = icon_url
+        description = str(entity.get("description") or "").strip()
+        if (
+            kind == "ability"
+            and description
+            and entity.get("russian_metadata_available") is True
+        ):
+            reference["description"] = description
+        matches.append((start, end, reference))
+
+    for alias, hero in hero_catalog.items():
+        if not isinstance(hero, dict):
+            continue
+        canonical_name = str(hero.get("name") or alias).strip()
+        aliases = [canonical_name, str(alias)]
+        class_name = str(hero.get("class_name") or "").strip().casefold()
+        class_match = re.fullmatch(r"hero_([a-z0-9]+(?:_[a-z0-9]+)*)", class_name)
+        if class_match is not None:
+            aliases.append(class_match.group(1).replace("_", " "))
+        add_reference("hero", canonical_name, aliases, hero)
+        for ability_alias, ability in (hero.get("abilities") or {}).items():
+            if not isinstance(ability, dict):
+                continue
+            ability_name = str(ability.get("name") or ability_alias).strip()
+            ability_aliases = [ability_name, str(ability_alias)]
+            extra_aliases = ability.get("aliases") or []
+            if isinstance(extra_aliases, str):
+                extra_aliases = [extra_aliases]
+            ability_aliases.extend(
+                value.strip() for value in extra_aliases
+                if isinstance(value, str) and value.strip()
+            )
+            add_reference("ability", ability_name, ability_aliases, ability)
+
+    for alias, item in item_catalog.items():
+        if not isinstance(item, dict):
+            continue
+        item_name = str(item.get("name") or alias).strip()
+        add_reference("item", item_name, [item_name, str(alias)], item)
+
+    # Exact alias collisions are ambiguous without local sentence parsing.
+    # Keep their prose but do not attach potentially misleading metadata.
+    span_identities: dict[tuple[int, int], set[tuple[str, str]]] = {}
+    for start, end, reference in matches:
+        identity = (str(reference["kind"]), str(reference["name"]).casefold())
+        span_identities.setdefault((start, end), set()).add(identity)
+
+    references: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for start, end, reference in sorted(
+        matches,
+        key=lambda value: (
+            value[0],
+            -(value[1] - value[0]),
+            str(value[2]["kind"]),
+            str(value[2]["name"]).casefold(),
+        ),
+    ):
+        identity = (str(reference["kind"]), str(reference["name"]).casefold())
+        if len(span_identities[(start, end)]) > 1:
+            continue
+        if (
+            identity[0] == "item"
+            and owner_item_name
+            and identity[1] == owner_item_name.casefold()
+        ):
+            continue
+        if identity in seen:
+            continue
+        seen.add(identity)
+        references.append(reference)
+    if len(references) > 4:
+        logger.warning(
+            "patch_change_reference_limit_reached patch_id=%s owner=%s change_index=%s omitted_count=%s",
+            patch_id or "unknown",
+            (owner_item_name or "unknown")[:120],
+            change_index if change_index is not None else "unknown",
+            len(references) - 4,
+        )
+    return references[:4]
+
+
+def _append_item_change(
+    section: dict[str, Any],
+    text: str,
+    *,
+    patch_id: str,
+    hero_catalog: dict[str, Any],
+    item_catalog: dict[str, Any],
+    diagnose_unresolved: bool = False,
+) -> None:
+    for chunk in base._change_chunks(text):
+        change_index = len(section["changes"])
+        section["changes"].append(chunk)
+        entities = _change_reference_entities(
+            chunk,
+            hero_catalog,
+            item_catalog,
+            owner_item_name=str(section.get("item_name") or ""),
+            patch_id=patch_id,
+            change_index=change_index,
+        )
+        if entities:
+            section.setdefault("change_references", []).append(
+                {"change_index": change_index, "entities": entities}
+            )
+        elif diagnose_unresolved:
+            logger.warning(
+                "patch_nested_entity_reference_unresolved patch_id=%s owner=%s change_index=%s",
+                patch_id,
+                str(section.get("item_name") or section.get("title") or "unknown")[:120],
+                change_index,
+            )
 
 
 def _match_ability(
@@ -677,6 +841,9 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
 
         scope_heading = base._patch_scope_heading(line)
         if scope_heading is not None:
+            if current_item_key is not None:
+                item_sections[current_item_key].pop("_active_nested_group", None)
+                item_sections[current_item_key].pop("_active_nested_expectation", None)
             current_scope = scope_heading
             current_mode_name = None
             current_hero_key = None
@@ -757,10 +924,48 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
                 continue
 
         if current_scope == "items":
+            if current_item_key is not None and line.startswith("-"):
+                section = item_sections[current_item_key]
+                nested_text = line[1:].strip()
+                chunks = base._change_chunks(nested_text)
+                if chunks:
+                    active_group = section.get("_active_nested_group")
+                    if active_group is None and section.get("changes") and section["changes"][-1].rstrip().endswith(":"):
+                        active_group = {
+                            "heading_index": len(section["changes"]) - 1,
+                            "description_start": len(section["changes"]),
+                            "description_end": len(section["changes"]) + len(chunks),
+                        }
+                        section.setdefault("change_groups", []).append(active_group)
+                        section["_active_nested_group"] = active_group
+                        expectation = {
+                            "description_start": active_group["description_start"],
+                            "changes": [],
+                        }
+                        section.setdefault("_nested_group_expectations", []).append(expectation)
+                        section["_active_nested_expectation"] = expectation
+                    elif active_group is not None:
+                        active_group["description_end"] = len(section["changes"]) + len(chunks)
+                    expectation = section.get("_active_nested_expectation")
+                    if expectation is not None:
+                        expectation["changes"].extend(chunks)
+                    _append_item_change(
+                        section,
+                        nested_text,
+                        patch_id=str(raw.get("id") or "unknown"),
+                        hero_catalog=hero_catalog,
+                        item_catalog=item_catalog,
+                        diagnose_unresolved=True,
+                    )
+                continue
+
             item_match = _match_named_line(line, item_catalog)
             if item_match is not None:
                 item_alias, remainder = item_match
                 item = item_catalog[item_alias]
+                if current_item_key is not None:
+                    item_sections[current_item_key].pop("_active_nested_group", None)
+                    item_sections[current_item_key].pop("_active_nested_expectation", None)
                 current_item_key, section = _item_section(item_sections, item, item_alias)
                 current_hero_key = None
                 current_hero_alias = None
@@ -770,7 +975,16 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
                     section["changes"].extend(base._change_chunks(remainder))
                 continue
             if current_item_key is not None:
-                item_sections[current_item_key]["changes"].extend(base._change_chunks(line))
+                section = item_sections[current_item_key]
+                section.pop("_active_nested_group", None)
+                section.pop("_active_nested_expectation", None)
+                _append_item_change(
+                    section,
+                    line,
+                    patch_id=str(raw.get("id") or "unknown"),
+                    hero_catalog=hero_catalog,
+                    item_catalog=item_catalog,
+                )
                 continue
 
         if current_scope == "general":
@@ -1048,7 +1262,15 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
         ),
     )
     for section in sorted_item_sections:
+        for expectation in section.get("_nested_group_expectations", []):
+            start = expectation["description_start"]
+            expected_changes = expectation["changes"]
+            if section["changes"][start:start + len(expected_changes)] != expected_changes:
+                raise ValueError("Nested item patch changes were not preserved in source order.")
         section.pop("_item_cost", None)
+        section.pop("_active_nested_group", None)
+        section.pop("_active_nested_expectation", None)
+        section.pop("_nested_group_expectations", None)
         sections.append(section)
 
     for section in hero_sections.values():

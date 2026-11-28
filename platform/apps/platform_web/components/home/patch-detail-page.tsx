@@ -16,14 +16,20 @@ import {
   TrendingUp,
   X,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { useI18n } from "@/components/i18n-provider";
 import { Hero } from "@/components/layout/hero";
 import { CspImage } from "@/components/media/csp-image";
 import { DeadlockHeroImage } from "@/components/media/deadlock-hero-image";
 import { formatPatchDate, formatPatchTitle } from "@/lib/patch-format";
 import { platformApiMessage, platformApiRequest } from "@/lib/platform-api";
-import type { PlatformPatchAbility, PlatformPatchAbilityStat, PlatformPatchDetail } from "@/lib/platform-types";
+import type {
+  PlatformPatchAbility,
+  PlatformPatchAbilityStat,
+  PlatformPatchChangeReference,
+  PlatformPatchDetail,
+  PlatformPatchReferenceEntity,
+} from "@/lib/platform-types";
 
 const steamPatchImagePattern = /^https:\/\/clan\.fastly\.steamstatic\.com\/images\/\d+\/[a-f0-9]{32,64}\.(?:avif|gif|jpe?g|png|webp)$/i;
 
@@ -61,11 +67,17 @@ export function PatchDetailPage({ patchId }: { patchId: string }) {
           <article className="patch-article">
             <div className="patch-article-cover" aria-hidden="true" />
             <div className="patch-sections">
-              {patch.sections.map((section, sectionIndex) => (
-                <section
-                  className={`patch-section ${section.kind}-patch-section`}
-                  key={`${section.title}-${sectionIndex}`}
-                >
+              {patch.sections.map((section, sectionIndex) => {
+                const heroDisplayName = section.hero_display_name?.trim();
+                const hasDistinctHeroDisplayName = section.kind === "hero"
+                  && Boolean(heroDisplayName)
+                  && heroDisplayName!.toLocaleLowerCase() !== section.title.trim().toLocaleLowerCase();
+                const heading = hasDistinctHeroDisplayName ? heroDisplayName! : section.title;
+                return (
+                  <section
+                    className={`patch-section ${section.kind}-patch-section`}
+                    key={`${section.title}-${sectionIndex}`}
+                  >
                   <header className="patch-section-header">
                     {section.hero_name ? (
                       <DeadlockHeroImage
@@ -103,7 +115,10 @@ export function PatchDetailPage({ patchId }: { patchId: string }) {
                           ? t("patch.objective.unstableRift")
                           : section.objective_key === "mid_boss"
                             ? "Mid Boss"
-                          : section.title}</h2>
+                          : heading}</h2>
+                      {hasDistinctHeroDisplayName ? (
+                        <p className="patch-hero-canonical-name">{section.title}</p>
+                      ) : null}
                       {section.kind === "hero" && section.hero_presentation_kind === "introduction" && section.hero_description ? (
                         <p className="patch-hero-description">{section.hero_description}</p>
                       ) : null}
@@ -112,7 +127,7 @@ export function PatchDetailPage({ patchId }: { patchId: string }) {
                       ) : null}
                     </div>
                   </header>
-                  {section.changes.length ? <ChangeList changes={section.changes} groups={section.change_groups} headings={section.change_headings} lists={section.change_lists} /> : null}
+                  {section.changes.length ? <ChangeList changes={section.changes} groups={section.change_groups} headings={section.change_headings} lists={section.change_lists} references={section.change_references} /> : null}
                   {section.abilities.length ? (
                     <div className={`patch-abilities${hasAbilityDetails(section.abilities) ? " patch-abilities-detail" : ""}`}>
                       {section.abilities.map((ability) => (
@@ -132,8 +147,9 @@ export function PatchDetailPage({ patchId }: { patchId: string }) {
                       ))}
                     </div>
                   ) : null}
-                </section>
-              ))}
+                  </section>
+                );
+              })}
               {patch.sections.length === 0 ? <p className="patch-raw-content">{patch.content}</p> : null}
             </div>
           </article>
@@ -290,32 +306,43 @@ function ObjectiveIcon({ iconUrl }: { iconUrl: string | null }) {
   );
 }
 
-function ChangeList({ changes, groups = [], headings = [], lists = [], headingLevel = 3 }: { changes: string[]; groups?: Array<{
+function ChangeList({ changes, groups = [], headings = [], lists = [], references = [], headingLevel = 3 }: { changes: string[]; groups?: Array<{
   heading_index: number;
   description_start: number;
   description_end: number;
-}>; headings?: number[]; lists?: Array<{ start: number; end: number; ordered: boolean }>; headingLevel?: 3 | 4 }) {
+}>; headings?: number[]; lists?: Array<{ start: number; end: number; ordered: boolean }>; references?: PlatformPatchChangeReference[]; headingLevel?: 3 | 4 }) {
   const groupByHeading = new Map(groups.map((group) => [group.heading_index, group]));
   const headingIndexes = new Set(headings);
   const listByStart = new Map(lists.map((list) => [list.start, list]));
+  const referencesByIndex = new Map(references.map((reference) => [reference.change_index, reference.entities]));
   const HeadingTag = headingLevel === 4 ? "h4" : "h3";
   const rendered: React.ReactNode[] = [];
+  const referenceContent = (index: number) => (
+    <PatchChangeReferences entities={referencesByIndex.get(index) ?? []} />
+  );
   for (let index = 0; index < changes.length;) {
     const group = groupByHeading.get(index);
     if (group && group.description_start > index && group.description_end <= changes.length) {
       rendered.push(
         <section className="patch-change-group" key={`group-${index}`}>
           <HeadingTag className="patch-change-heading">{changes[index]}</HeadingTag>
+          {referenceContent(index)}
           <ul className="patch-change-list patch-change-group-list">
             {changes.slice(group.description_start, group.description_end).map((change, itemIndex) => (
-              <li className={steamPatchImagePattern.test(change) ? "patch-inline-image" : undefined} key={`${index}-${itemIndex}`}>{renderPatchChange(change)}</li>
+              <li className={steamPatchImagePattern.test(change) ? "patch-inline-image" : undefined} key={`${index}-${itemIndex}`}>
+                {renderPatchChange(change)}
+                {referenceContent(group.description_start + itemIndex)}
+              </li>
             ))}
           </ul>
         </section>
       );
       index = group.description_end;
     } else if (headingIndexes.has(index)) {
-      rendered.push(<HeadingTag className="patch-change-heading" key={`heading-${index}`}>{changes[index]}</HeadingTag>);
+      rendered.push(<Fragment key={`heading-${index}`}>
+        <HeadingTag className="patch-change-heading">{changes[index]}</HeadingTag>
+        {referenceContent(index)}
+      </Fragment>);
       index += 1;
     } else if (listByStart.has(index)) {
       const list = listByStart.get(index)!;
@@ -323,19 +350,50 @@ function ChangeList({ changes, groups = [], headings = [], lists = [], headingLe
       rendered.push(
         <ListTag className="patch-change-list patch-source-list" key={`list-${index}`}>
           {changes.slice(index, list.end).map((change, itemIndex) => (
-            <li className={steamPatchImagePattern.test(change) ? "patch-inline-image" : undefined} key={`${index}-${itemIndex}`}>{renderPatchChange(change)}</li>
+            <li className={steamPatchImagePattern.test(change) ? "patch-inline-image" : undefined} key={`${index}-${itemIndex}`}>
+              {renderPatchChange(change)}
+              {referenceContent(index + itemIndex)}
+            </li>
           ))}
         </ListTag>
       );
       index = list.end;
     } else {
       rendered.push(steamPatchImagePattern.test(changes[index])
-        ? <div className="patch-inline-image" key={`image-${index}`}>{renderPatchChange(changes[index])}</div>
-        : <p className="patch-change-paragraph" key={`paragraph-${index}`}>{changes[index]}</p>);
+        ? <Fragment key={`image-${index}`}>
+          <div className="patch-inline-image">{renderPatchChange(changes[index])}</div>
+          {referenceContent(index)}
+        </Fragment>
+        : <Fragment key={`paragraph-${index}`}>
+          <p className="patch-change-paragraph">{changes[index]}</p>
+          {referenceContent(index)}
+        </Fragment>);
       index += 1;
     }
   }
   return <div className="patch-change-content">{rendered}</div>;
+}
+
+function PatchChangeReferences({ entities }: { entities: PlatformPatchReferenceEntity[] }) {
+  const uniqueEntities = entities.filter((entity, index) => entities.findIndex((candidate) => (
+    candidate.kind === entity.kind && candidate.name === entity.name
+  )) === index);
+  if (!uniqueEntities.length) return null;
+  return (
+    <div className="patch-change-references">
+      {uniqueEntities.map((entity) => (
+        <div className="patch-change-reference" data-reference-kind={entity.kind} key={`${entity.kind}:${entity.name}`}>
+          {entity.icon_url ? (
+            <CspImage alt="" className="patch-change-reference-icon" height={28} src={entity.icon_url} width={28} />
+          ) : null}
+          <div>
+            <span className="patch-change-reference-name">{entity.display_name?.trim() || entity.name}</span>
+            {entity.description?.trim() ? <p className="patch-change-reference-description">{entity.description}</p> : null}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function renderPatchChange(change: string) {

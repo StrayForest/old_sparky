@@ -37,6 +37,11 @@ METRIC_FIELDS = (
     "segments_checked",
     "watched_segments",
     "translation_calls",
+    "translations_completed",
+    "translation_noops",
+    "translation_failures",
+    "records_registered",
+    "records_enqueued",
     "max_source_length",
     "max_translation_length",
 )
@@ -50,6 +55,20 @@ def _bounded_metric(value: object) -> int:
     except (TypeError, ValueError, OverflowError):
         return 0
     return min(MAX_METRIC, max(0, number))
+
+
+def charge_translation_cache_miss(
+    metrics: dict[str, object], maximum: int
+) -> bool:
+    """Charge one eligible patch cache miss before provider work begins."""
+
+    calls = _bounded_metric(metrics.get("translation_calls", 0))
+    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 0:
+        return False
+    if calls >= maximum:
+        return False
+    metrics["translation_calls"] = calls + 1
+    return True
 
 
 def public_summary(

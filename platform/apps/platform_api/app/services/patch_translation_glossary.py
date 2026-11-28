@@ -66,6 +66,7 @@ CANONICAL_GLOSSARY: CanonicalGlossary = {
     "Slow": ("Замедление",),
     "Boon": ("Бонус",),
     "Souls": ("Души",),
+    "Net Worth": ("Общая стоимость ресурсов",),
 }
 
 # These strings are actual Deadlock entity names and gameplay mechanic names.

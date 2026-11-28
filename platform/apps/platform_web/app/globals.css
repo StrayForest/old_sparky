@@ -5763,6 +5763,13 @@ img.rank-icon,
   font-size: 24px;
 }
 
+.patch-hero-canonical-name {
+  margin: 2px 0 0;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.3;
+}
+
 .patch-mode-context {
   margin: 0 0 4px;
   color: var(--gold-muted);
@@ -5853,6 +5860,42 @@ ul.patch-change-list {
   color: #c8c0b3;
   font-size: 13px;
   line-height: 1.6;
+}
+
+.patch-change-references {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 7px;
+}
+
+.patch-change-reference {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  min-width: 0;
+  max-width: 100%;
+  color: var(--text-main);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.patch-change-reference-icon {
+  flex: 0 0 28px;
+  width: 28px;
+  height: 28px;
+  object-fit: contain;
+  border-radius: 5px;
+}
+
+.patch-change-reference-name {
+  font-weight: 700;
+}
+
+.patch-change-reference-description {
+  margin: 1px 0 0;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
 }
 
 .patch-change-group > .patch-change-heading {

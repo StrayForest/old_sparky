@@ -1,0 +1,18 @@
+\[ General ]
+- Hero base health reduced by 8%. The health is redistributed into boons, so total health at max boons is roughly the same.
+- Bullet damage growth per boon increased for all heroes by 5% (except for Haze, Holliday, Venator, Vindicta, Warden, Wraith)
+- First kill bonus for each player increased from 125 to 175 souls
+\[ Items ]
+Restorative Locket: Fixed interaction with the following abilities:
+-- Danny Jettison Fuel now grants a charge
+-- Danny Strix Salvo now grants a charge
+-- Doorman Door Recall no longer grants a charge
+-- Mina Sanguine Retreat recast now grants charges
+-- Nurse Harrow Healing Needles no longer grants a charge
+-- Solomon Move King now grants a charge
+-- Solomon Move Piece (Bishop, Knight and Queen moves) now grants a charge
+-- Venator Ira Domini now grants a charge
+-- Violet Living Ink (draw) now grants a charge
+- Applied similar fixes to Spellslinger and Radiant Regeneration for the above list
+\[ Heroes ]
+- Abrams: Shoulder Charge - Fixed enemies stunned by the charge not being slowed

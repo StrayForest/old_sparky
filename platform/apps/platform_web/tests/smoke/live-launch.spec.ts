@@ -377,7 +377,12 @@ function sectionHeading(section: PlatformPatchSection): string {
   if (section.objective_key === "urn") return "Урна";
   if (section.objective_key === "unstable_rift") return "Нестабильный разлом";
   if (section.objective_key === "mid_boss") return "Mid Boss";
-  return section.title;
+  const displayName = section.hero_display_name?.trim();
+  return section.kind === "hero"
+    && displayName
+    && displayName.toLocaleLowerCase() !== section.title.trim().toLocaleLowerCase()
+    ? displayName
+    : section.title;
 }
 
 type DecodedImageFailureContext = {
@@ -1477,7 +1482,15 @@ for (const slotIndex of [0, 1, 2, 3] as const) {
       const renderedSection = renderedSections.nth(sectionIndex);
       await expect(renderedSection.getByRole("heading", { level: 2 }))
         .toHaveText(sectionHeading(section));
-      await expect(renderedSection.locator(".patch-hero-display-name")).toHaveCount(0);
+      const displayName = section.hero_display_name?.trim();
+      const hasDistinctDisplayName = section.kind === "hero"
+        && Boolean(displayName)
+        && displayName!.toLocaleLowerCase() !== section.title.trim().toLocaleLowerCase();
+      if (hasDistinctDisplayName) {
+        await expect(renderedSection.locator(".patch-hero-canonical-name")).toHaveText(section.title);
+      } else {
+        await expect(renderedSection.locator(".patch-hero-canonical-name")).toHaveCount(0);
+      }
       if (section.mode_name) {
         await expect(renderedSection.locator(".patch-mode-context")).toHaveText(section.mode_name);
       } else {

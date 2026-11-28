@@ -696,8 +696,10 @@ async def _clear_translation_enqueue_timestamp(record_id: str) -> None:
 
 async def ensure_patch_translation_records(
     patch_details: dict[str, dict[str, Any]],
+    *,
+    enqueue: bool = True,
 ) -> dict[str, int]:
-    """Register newly observed patch versions and enqueue each at most once."""
+    """Register patch versions and, by default, enqueue each eligible version once."""
 
     settings = get_settings()
     entries: list[tuple[str, str, list[dict[str, str]]]] = []
@@ -740,49 +742,50 @@ async def ensure_patch_translation_records(
             )
             registered += max(int(result.rowcount or 0), 0)
 
-        for patch_id, source_hash, segments in entries:
-            if not segments:
-                continue
-            record = await _select_translation_record(
-                db_session,
-                patch_id=patch_id,
-                source_hash=source_hash,
-                settings=settings,
-                for_update=True,
-            )
-            if record is None:
-                continue
-            if record.status == TRANSLATION_STATUS_PROCESSING:
-                started_at = record.processing_started_at
-                if started_at is None or now - started_at >= timedelta(
-                    seconds=TRANSLATION_PROCESSING_TIMEOUT_SECONDS
-                ):
-                    record.status = TRANSLATION_STATUS_FAILED
-                    record.error_code = (
-                        "WorkerTimeout"
-                        if int(getattr(record, "attempts", 0) or 0)
-                        <= TRANSLATION_AUTOMATIC_RETRY_LIMIT
-                        else "attempts_exhausted"
-                    )
-                    record.processing_started_at = None
-            allow_failed_retry = bool(
-                record.status == TRANSLATION_STATUS_FAILED
-                and getattr(record, "error_code", None) in _RETRYABLE_TRANSLATION_ERRORS
-                and int(getattr(record, "attempts", 0) or 0) == TRANSLATION_AUTOMATIC_RETRY_LIMIT
-                and record.last_enqueued_at is not None
-                and now - record.last_enqueued_at >= timedelta(
-                    seconds=TRANSLATION_AUTOMATIC_RETRY_DELAY_SECONDS
-                )
-            )
-            if record.status != TRANSLATION_STATUS_PENDING:
-                if not allow_failed_retry:
+        if enqueue:
+            for patch_id, source_hash, segments in entries:
+                if not segments:
                     continue
-            if record.last_enqueued_at is not None and now - record.last_enqueued_at < timedelta(
-                seconds=TRANSLATION_ENQUEUE_RETRY_SECONDS
-            ):
-                continue
-            record.last_enqueued_at = now
-            enqueue_candidates.append((str(record.id), patch_id, source_hash, allow_failed_retry))
+                record = await _select_translation_record(
+                    db_session,
+                    patch_id=patch_id,
+                    source_hash=source_hash,
+                    settings=settings,
+                    for_update=True,
+                )
+                if record is None:
+                    continue
+                if record.status == TRANSLATION_STATUS_PROCESSING:
+                    started_at = record.processing_started_at
+                    if started_at is None or now - started_at >= timedelta(
+                        seconds=TRANSLATION_PROCESSING_TIMEOUT_SECONDS
+                    ):
+                        record.status = TRANSLATION_STATUS_FAILED
+                        record.error_code = (
+                            "WorkerTimeout"
+                            if int(getattr(record, "attempts", 0) or 0)
+                            <= TRANSLATION_AUTOMATIC_RETRY_LIMIT
+                            else "attempts_exhausted"
+                        )
+                        record.processing_started_at = None
+                allow_failed_retry = bool(
+                    record.status == TRANSLATION_STATUS_FAILED
+                    and getattr(record, "error_code", None) in _RETRYABLE_TRANSLATION_ERRORS
+                    and int(getattr(record, "attempts", 0) or 0) == TRANSLATION_AUTOMATIC_RETRY_LIMIT
+                    and record.last_enqueued_at is not None
+                    and now - record.last_enqueued_at >= timedelta(
+                        seconds=TRANSLATION_AUTOMATIC_RETRY_DELAY_SECONDS
+                    )
+                )
+                if record.status != TRANSLATION_STATUS_PENDING:
+                    if not allow_failed_retry:
+                        continue
+                if record.last_enqueued_at is not None and now - record.last_enqueued_at < timedelta(
+                    seconds=TRANSLATION_ENQUEUE_RETRY_SECONDS
+                ):
+                    continue
+                record.last_enqueued_at = now
+                enqueue_candidates.append((str(record.id), patch_id, source_hash, allow_failed_retry))
         await db_session.commit()
 
     enqueued = 0

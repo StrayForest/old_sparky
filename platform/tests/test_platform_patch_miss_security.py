@@ -94,6 +94,9 @@ class _Cache:
         self.get_calls.append(key)
         return self.values.get(key)
 
+    async def pttl(self, key: str) -> int:
+        return 3600 if key in self.values else -2
+
     async def set(self, key: str, value: str, **kwargs) -> bool:
         self.set_calls.append((key, value, kwargs))
         if kwargs.get("nx") and key in self.values:
@@ -150,6 +153,48 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
 
         self.assertEqual(result, detail)
         refresh.assert_not_awaited()
+
+    async def test_bounded_cached_reparse_reads_exact_v19_id_and_registers_without_enqueue(self) -> None:
+        patch_id = "1850460852986472"
+        fixture = Path(__file__).parent / (
+            "fixtures/patch-acceptance/restorative-locket-1850460852986472.txt"
+        )
+        source = {
+            "id": patch_id,
+            "title": "November 26 Patch",
+            "published_at": "2026-11-26T00:00:00+00:00",
+            "url": f"https://store.steampowered.com/news/app/1422450/view/{patch_id}",
+            "content": fixture.read_text(encoding="utf-8"),
+        }
+        legacy_key = patch_detail_security.base.PATCH_DETAIL_MIGRATION_SOURCE_PREFIX + patch_id
+        cache = _Cache({legacy_key: json.dumps(source)})
+        catalog = {"heroes": {}, "items": {}, "ranks": {}, "objectives": {}}
+        registration = {"registered": 1, "enqueued": 0, "enqueue_failures": 0}
+
+        with (
+            patch.object(patch_detail_security, "redis_client", return_value=cache),
+            patch.object(patch_detail_security, "_cached_asset_catalog", AsyncMock(return_value=catalog)),
+            patch.object(patch_detail_security.base, "_asset_catalog_is_ready", return_value=True),
+            patch.object(patch_detail_security, "ensure_patch_translation_records", AsyncMock(return_value=registration)) as register,
+        ):
+            result = await patch_detail_security.reparse_cached_patch_details([patch_id])
+
+        self.assertEqual(result["details"][patch_id]["id"], patch_id)
+        self.assertEqual(result["provenance"][patch_id]["source_namespace"], "v19")
+        self.assertEqual(result["provenance"][patch_id]["source_pttl_seconds"], 3600)
+        self.assertEqual(result["translation_registration"], registration)
+        self.assertIn(patch_detail_security.base.PATCH_DETAIL_KEY_PREFIX + patch_id, cache.values)
+        register.assert_awaited_once_with(result["details"], enqueue=False)
+
+    async def test_cached_reparse_rejects_unbounded_or_duplicate_id_sets(self) -> None:
+        for patch_ids in (
+            [],
+            ["123", "123"],
+            ["not-decimal"],
+            [str(index) for index in range(7)],
+        ):
+            with self.subTest(patch_ids=patch_ids), self.assertRaises(ValueError):
+                await patch_detail_security.reparse_cached_patch_details(patch_ids)
 
     async def test_unknown_patch_sets_negative_cache_and_schedules_background_refresh(self) -> None:
         fixture_root = Path(__file__).parent / "fixtures" / "patch-acceptance"

@@ -13,6 +13,7 @@ const patchIds = [
 ] as const;
 const nursePatchId = "1847920302240420";
 const nurseIntroductionPatchId = "1846651706696737";
+const referenceImage = "https://assets-bucket.deadlock-api.com/assets-api-res/images/abilities/fixture/reference.png";
 const rawPatchMarkupPattern = /STEAM_CLAN_LOC_IMAGE|clan\.fastly\.steamstatic\.com|\[\s*\/?\s*img\b|\[\s*url\b|\[\s*\/\s*\*\s*\]/iu;
 const patchFixtures = Promise.all(patchIds.map(async (id) => (
   JSON.parse(await readFile(path.join(process.cwd(), "tests", "fixtures", "patch-details", `${id}.json`), "utf8")) as PlatformPatchDetail
@@ -22,7 +23,17 @@ function sectionHeading(section: PlatformPatchSection): string {
   if (section.objective_key === "urn") return "Урна";
   if (section.objective_key === "unstable_rift") return "Нестабильный разлом";
   if (section.objective_key === "mid_boss") return "Mid Boss";
-  return section.title;
+  return distinctHeroDisplayName(section) ?? section.title;
+}
+
+function distinctHeroDisplayName(section: PlatformPatchSection): string | null {
+  const displayName = section.hero_display_name?.trim();
+  if (
+    section.kind !== "hero"
+    || !displayName
+    || displayName.toLowerCase() === section.title.trim().toLowerCase()
+  ) return null;
+  return displayName;
 }
 
 function expectCleanPatchChanges(changes: string[]): void {
@@ -223,6 +234,74 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
 
   await page.route("**/api/v1/content/patches/*", async (route) => {
     const requestId = new URL(route.request().url()).pathname.split("/").at(-1);
+    if (requestId === "synthetic-hero-label") {
+      const template = fixturesById.get(nurseIntroductionPatchId)!;
+      const sourceHero = template.sections.find((section) => section.kind === "hero")!;
+      const sections: PlatformPatchSection[] = [
+        { ...sourceHero, title: "Nurse Harrow", hero_display_name: "Сестра Хэрроу" },
+        { ...sourceHero, title: "Fallback Hero", hero_display_name: "   " },
+        { ...sourceHero, title: "Rat King", hero_display_name: " rat king " },
+      ];
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        json: { ...template, id: requestId, sections },
+      });
+      return;
+    }
+    if (requestId === "synthetic-item-reference") {
+      const template = fixturesById.get(nurseIntroductionPatchId)!;
+      const changes = [
+        "Restorative Locket was reworked.",
+        "Healing cooldown reduced.",
+        "The item now references Healing Needles.",
+        "Healing duration increased.",
+        "The active is easier to use.",
+        "Bonus health increased.",
+        "Cooldown recovery improved.",
+        "The effect now stacks once.",
+        "Range increased.",
+        "The follow-up effect is retained.",
+        "A later general change remains outside the item list.",
+      ];
+      const reference = {
+        kind: "ability" as const,
+        name: "Healing Needles",
+        display_name: "Лечебные иглы",
+        icon_url: referenceImage,
+        description: "Восстанавливает здоровье союзника.",
+      };
+      const section: PlatformPatchSection = {
+        kind: "item",
+        title: "Restorative Locket",
+        hero_name: null,
+        item_name: "Restorative Locket",
+        item_category: "vitality",
+        item_icon_url: null,
+        changes,
+        change_groups: [{ heading_index: 0, description_start: 1, description_end: 10 }],
+        change_references: [
+          { change_index: 2, entities: [reference, reference] },
+          {
+            change_index: 8,
+            entities: [{
+              kind: "item",
+              name: "Long Canonical Item Name",
+              display_name: "Очень длинное локализованное название предмета для проверки переноса",
+              description: "Длинное описание связанного предмета должно переноситься внутри блока и не создавать горизонтальную прокрутку на узком экране.",
+            }],
+          },
+          { change_index: 9, entities: [{ kind: "hero", name: "Fallback Hero" }] },
+        ],
+        abilities: [],
+      };
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        json: { ...template, id: requestId, sections: [section] },
+      });
+      return;
+    }
     const fixture = requestId ? fixturesById.get(requestId) : undefined;
     if (!fixture) {
       await route.continue();
@@ -262,6 +341,9 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
     alternateNurseImageRequests += 1;
     await route.fulfill({ status: 200, contentType: "image/png", body: alternateImageBytes });
   });
+  await page.route(referenceImage, async (route) => {
+    await route.fulfill({ status: 200, contentType: "image/png", body: alternateImageBytes });
+  });
 
   let capturedCeleste = false;
   let capturedNurse = false;
@@ -278,6 +360,11 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
     for (const [sectionIndex, section] of fixture!.sections.entries()) {
       const sectionCard = sections.nth(sectionIndex);
       await expect(sectionCard.getByRole("heading", { level: 2 })).toHaveText(sectionHeading(section));
+      if (distinctHeroDisplayName(section)) {
+        await expect(sectionCard.locator(".patch-hero-canonical-name")).toHaveText(section.title);
+      } else {
+        await expect(sectionCard.locator(".patch-hero-canonical-name")).toHaveCount(0);
+      }
       if (section.mode_name) {
         await expect(sectionCard.locator(".patch-mode-context")).toHaveText(section.mode_name);
       } else {
@@ -285,9 +372,6 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
       }
       if (section.kind === "hero" && section.hero_presentation_kind !== "introduction") {
         await expect(sectionCard.locator(".patch-hero-description")).toHaveCount(0);
-      }
-      if (section.kind === "hero" && section.hero_display_name) {
-        await expect(sectionCard.getByText(section.hero_display_name, { exact: true })).toHaveCount(0);
       }
       expectCleanPatchChanges(section.changes);
       await expectRenderedPatchChangeList(
@@ -596,6 +680,58 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
   }
 
   await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/patches/synthetic-hero-label");
+  const syntheticHeroSections = page.locator(".hero-patch-section");
+  await expect(syntheticHeroSections).toHaveCount(3);
+  await expect(syntheticHeroSections.nth(0).getByRole("heading", { level: 2 }))
+    .toHaveText("Сестра Хэрроу");
+  await expect(syntheticHeroSections.nth(0).locator(".patch-hero-canonical-name"))
+    .toHaveText("Nurse Harrow");
+  await expect(syntheticHeroSections.nth(1).getByRole("heading", { level: 2 }))
+    .toHaveText("Fallback Hero");
+  await expect(syntheticHeroSections.nth(1).locator(".patch-hero-canonical-name")).toHaveCount(0);
+  await expect(syntheticHeroSections.nth(2).getByRole("heading", { level: 2 }))
+    .toHaveText("Rat King");
+  await expect(syntheticHeroSections.nth(2).locator(".patch-hero-canonical-name")).toHaveCount(0);
+  await expectNoHorizontalOverflow(page);
+  await savePatchCardScreenshot(syntheticHeroSections.nth(0), "hero-russian-mobile.png", artifactDirectory);
+
+  await page.goto("/patches/synthetic-item-reference");
+  const locketSection = page.locator(".item-patch-section");
+  await expect(locketSection.getByRole("heading", { level: 2 })).toHaveText("Restorative Locket");
+  const locketChanges = locketSection.locator(":scope > .patch-change-content");
+  await expect(locketChanges.locator(":scope > .patch-change-group > .patch-change-group-list > li"))
+    .toHaveCount(9);
+  await expect(locketChanges.locator(".patch-change-group-list > li").nth(2))
+    .toContainText("The item now references Healing Needles.");
+  const healingNeedlesReference = locketChanges.locator('.patch-change-reference[data-reference-kind="ability"]');
+  await expect(healingNeedlesReference).toHaveCount(1);
+  await expect(healingNeedlesReference.locator(".patch-change-reference-name")).toHaveText("Лечебные иглы");
+  await expect(healingNeedlesReference.locator(".patch-change-reference-description"))
+    .toHaveText("Восстанавливает здоровье союзника.");
+  const referenceIcon = healingNeedlesReference.locator(".patch-change-reference-icon");
+  await expect(referenceIcon).toHaveAttribute("src", referenceImage);
+  await expect(referenceIcon).toHaveJSProperty("naturalWidth", 1);
+  const longReferenceRow = locketChanges.locator(".patch-change-group-list > li").nth(7);
+  await expect(longReferenceRow.locator(".patch-change-reference-name"))
+    .toHaveText("Очень длинное локализованное название предмета для проверки переноса");
+  await expect(longReferenceRow.locator(".patch-change-reference-description"))
+    .toHaveText("Длинное описание связанного предмета должно переноситься внутри блока и не создавать горизонтальную прокрутку на узком экране.");
+  await expect(longReferenceRow.locator(".patch-change-reference-icon")).toHaveCount(0);
+  const metadataFallbackRow = locketChanges.locator(".patch-change-group-list > li").nth(8);
+  await expect(metadataFallbackRow.locator(".patch-change-reference-name")).toHaveText("Fallback Hero");
+  await expect(metadataFallbackRow.locator(".patch-change-reference-description, .patch-change-reference-icon"))
+    .toHaveCount(0);
+  await expect(locketChanges.locator(":scope > .patch-change-paragraph"))
+    .toHaveText("A later general change remains outside the item list.");
+  await expectNoHorizontalOverflow(page);
+  await savePatchCardScreenshot(locketSection, "item-reference-mobile.png", artifactDirectory);
+  await page.setViewportSize({ width: 320, height: 800 });
+  await expectNoHorizontalOverflow(page);
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await expectNoHorizontalOverflow(page);
+  await savePatchCardScreenshot(locketSection, "item-reference-desktop.png", artifactDirectory);
+
   await page.goto("/patches/synthetic-format");
   const syntheticGeneralSection = page.locator(".patch-section.general-patch-section");
   const syntheticContent = syntheticGeneralSection.locator(":scope > .patch-change-content");

@@ -193,6 +193,19 @@ export type PlatformPatchAbility = {
   change_lists?: PlatformPatchChangeList[];
 };
 
+export type PlatformPatchReferenceEntity = {
+  kind: "hero" | "ability" | "item";
+  name: string;
+  display_name?: string | null;
+  icon_url?: string | null;
+  description?: string | null;
+};
+
+export type PlatformPatchChangeReference = {
+  change_index: number;
+  entities: PlatformPatchReferenceEntity[];
+};
+
 export type PlatformPatchSection = {
   kind: "general" | "objective" | "item" | "hero";
   title: string;
@@ -213,6 +226,7 @@ export type PlatformPatchSection = {
   change_groups?: PlatformPatchChangeGroup[];
   change_headings?: number[];
   change_lists?: PlatformPatchChangeList[];
+  change_references?: PlatformPatchChangeReference[];
   abilities: PlatformPatchAbility[];
 };
 

@@ -5,6 +5,8 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+from sqlalchemy.dialects import postgresql
+
 from apps.platform_api.app.services import patch_translation_runtime as runtime
 from apps.platform_worker import worker
 from python_packages.platform_infra.config import PlatformSettings
@@ -190,6 +192,60 @@ class PatchTranslationPersistenceTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(first["enqueued"], 1)
         self.assertEqual(second["enqueued"], 0)
         enqueue.assert_called_once()
+
+    async def test_register_only_persists_source_version_without_enqueue_or_provider_work(self) -> None:
+        patch_detail = _patch_detail()
+        source_hash = runtime.translation_source_hash(patch_detail)
+        record = SimpleNamespace(
+            id="translation-register-only",
+            status=runtime.TRANSLATION_STATUS_PENDING,
+            attempts=0,
+            last_enqueued_at=None,
+            processing_started_at=None,
+        )
+        db_session = _FakeDbSession(record)
+        settings = PlatformSettings(platform_openai_model="test-model")
+        enqueue = Mock()
+        translate = AsyncMock()
+        select_record = AsyncMock(return_value=record)
+
+        with (
+            patch.object(runtime, "get_settings", return_value=settings),
+            patch.object(
+                runtime,
+                "session_factory",
+                return_value=lambda: _SessionContext(db_session),
+            ),
+            patch.object(runtime, "_select_translation_record", new=select_record),
+            patch.object(runtime, "_enqueue_translation_task", enqueue),
+            patch.object(worker, "translate_patch_to_russian", new=translate),
+        ):
+            result = await runtime.ensure_patch_translation_records(
+                {"123": patch_detail},
+                enqueue=False,
+            )
+
+        self.assertEqual(
+            result,
+            {"registered": 1, "enqueued": 0, "enqueue_failures": 0},
+        )
+        self.assertEqual(db_session.commit_count, 1)
+        self.assertEqual(len(db_session.execute_calls), 1)
+        parameters = db_session.execute_calls[0].compile(
+            dialect=postgresql.dialect()
+        ).params
+        self.assertEqual(parameters["patch_id"], "123")
+        self.assertEqual(parameters["source_hash"], source_hash)
+        self.assertEqual(parameters["translation_version"], runtime.PATCH_TRANSLATION_VERSION)
+        self.assertEqual(parameters["locale"], runtime.PATCH_TRANSLATION_LOCALE)
+        self.assertEqual(parameters["model"], settings.platform_openai_model)
+        select_record.assert_not_awaited()
+        enqueue.assert_not_called()
+        translate.assert_not_awaited()
+        self.assertEqual(record.status, runtime.TRANSLATION_STATUS_PENDING)
+        self.assertEqual(record.attempts, 0)
+        self.assertIsNone(record.last_enqueued_at)
+        self.assertIsNone(record.processing_started_at)
 
     async def test_completed_source_version_is_never_requeued(self) -> None:
         record = SimpleNamespace(
