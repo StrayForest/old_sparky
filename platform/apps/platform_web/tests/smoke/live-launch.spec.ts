@@ -1436,7 +1436,7 @@ test("live current patch route and objective source icons remain available", asy
     await takeObjectiveScreenshotWithDiagnostics(page, testInfo, () => ({
       animations: "allow",
       caret: "initial",
-      fullPage: true,
+      fullPage: false,
       path: testInfo.outputPath("production-current-patch.png")
     }));
   }

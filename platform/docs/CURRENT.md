@@ -11,14 +11,12 @@ belong in the linked owner documents below.
 ## Live and pending state
 
 - Production currently runs application source
-  `192cb3f35d3d90f816ad8e2918283731f6aff224` in automatic release
-  `gha-46076911900-1-192cb3f35d3d`; exact-SHA Security run `46075131753/1`,
-  source-bound backup `46076597122/1` with restore verification, deployment
-  `46076911900/1` and post-deploy activation passed. The separately installed
-  shared host-tools generation is `a3379dc4f1a872158f3a926ded64b1262addab1d`,
-  with installed receipt digest
-  `42f91e3ed0c09ae550021e1c14ef5eea107d660a19612f411731106432453396`, bound
-  to provisioning source `bc00f9e7986fc85aa4fb984dbd3f2bb1889be5fb`. The
+  `7895e32da29a6e53a8d8e6cceeb45e2aea93ace1` in automatic release
+  `gha-46097693180-1-7895e32da29a`; exact-SHA Security run `46090132339/2`,
+  source-bound backup `46097392702/1` with restore verification, deployment
+  `46097693180/1` and post-deploy activation passed. The separately installed
+  shared host-tools generation is `b655b2969c70e8787805d98ebb61a8a3e6a7bd74`.
+  The
   host-tools pin and app release are separate identities. See the
   [host-tools provisioning ADR](adr/production-host-tools-provisioning.md) and
   [deployment runbook](deployment-runbook.md) for their source-bound procedures.
@@ -49,24 +47,21 @@ belong in the linked owner documents below.
   automatic exact cleanup for a confirmed terminal Public failure and
   preserves the fixed browser-output protocol.
 - Automatic post-deploy QA for source
-  `192cb3f35d3d90f816ad8e2918283731f6aff224` parent `46077858278/1` and exact
-  Public child `46077877721/1` failed with 45 passed, 2 failed, 10 skipped,
-  0 flaky and 0 timed-out attempts. Public cleanup is `cleaned`; its exact
-  gate directory is absent, and UserQA was not dispatched. `objective_icons`
-  failed during screenshot capture with the closed category
-  `protocol_capture_error`. `patch_owner_sections` failed while checking the
-  hero image at section 48; the retained evidence records `not_complete`, no
-  `currentSrc`, and a test duration at or over its timeout. Both failures have
-  bounded request evidence and no request-failure events. Their causes remain
-  under investigation; no timeout or assertion has been relaxed. See the
-  [CSP/live-QA runbook](csp-live-qa-runbook.md) for the bounded evidence and
-  recovery procedure. Next, resolve both causes, publish through the normal
-  release chain, and run UserQA only after a successful Public run.
-- The installed-unit-bound storage retention preview for active release
-  `gha-46076911900-1-192cb3f35d3d` completed in dry-run mode and protected the
-  current release; no deletion occurred. Disk use was 66.8% with about
-  12.36 GiB free, and the maintenance timer was restored active and enabled.
-  A separate task-cache preview also made no removals. The CI Siteverify
+  `7895e32da29a6e53a8d8e6cceeb45e2aea93ace1`, deployment parent
+  `46097693180/1` and exact Public child `46098379744/1` failed with 55 passed,
+  1 failed, 10 skipped, and 0 flaky, timed-out, interrupted or retried
+  attempts. Public cleanup is `cleaned`; UserQA was not dispatched. The sole
+  failure was `objective_icons` during its final screenshot capture, classified
+  as `protocol_capture_error`; the retained evidence does not identify a more
+  specific capture cause. The test already passed its route, HTTP/MIME, PNG
+  signature and overflow assertions. A pending change makes this artifact
+  viewport-sized while preserving those checks; the failure is not yet
+  resolved. See the [CSP/live-QA runbook](csp-live-qa-runbook.md).
+- The installed-unit-bound storage retention preview after Public child
+  `46098379744/1` completed in dry-run mode: 4 user-cache candidates, 3 busy,
+  0 removed; 6 unregistered task directories were left untouched. The
+  maintenance timer remains active and enabled. No retention deletion was
+  performed. The CI Siteverify
   fixture does not establish production Cloudflare challenge/scoring.
 - The 11-cell production matrix is complete, but cell 9 failed its stress
   contract with unknown capacity attribution; no server capacity ceiling is

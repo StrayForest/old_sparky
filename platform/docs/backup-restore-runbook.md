@@ -233,16 +233,9 @@ auto-deploy only checks its exact proof. Use this order:
    Require full, deployable and non-fallback classification for a normal app
    release. Global-guidance routes do not qualify; documented recovery,
    bootstrap, candidate and docs routes use their own procedures.
-2. After exact Security PASS, inspect for a successful restore-verified receipt
-   or active create producer bound to that exact ID/attempt/SHA. Reuse or wait
-   if found; AUTO never dispatches a backup. If none exists and no failed,
-   cancelled or duplicate match exists, operator dispatches one create with
-   the shared slot unowned, using the command below within AUTO's proof wait.
-   Require `security_started <= created_at <= run_started_at <= backup_job.started_at`.
-3. Wait for exact Security success and the create-only receipt; archive identity,
-   restore/Alembic and keep-one retention proofs must agree. Watch AUTO consume it.
-   Parent-bound C provisioning follows backup in AUTO's 1,800-second window;
-   no separate preflight or second backup is needed.
+2. If the pinned host-tools closure changes, first complete ADR **C→P**: exact-P full CI and read-only `mode=preflight` signed bundle, canonical operator provisioning/self-test, then a fresh exact-P capability preflight. The operator accepts route (a) only; the AUTO-parent bundle is separate readiness evidence, never route-(a) input. If C is unchanged, verify the installed generation.
+3. After exact Security PASS and any required C→P route, inspect for a successful restore-verified receipt or active create producer bound to that Security ID/attempt/SHA. Reuse or wait; AUTO never dispatches backups. If absent with no failed, cancelled or duplicate match, confirm the shared slot is unowned and dispatch exactly one create within AUTO's proof wait. Require `security_started <= created_at <= run_started_at <= backup_job.started_at`.
+4. Verify exact Security and create-only receipt, archive identity, restore/Alembic and keep-one retention proofs; AUTO consumes that receipt. Never create a second backup for the same Security ID/attempt/SHA.
 
 Do not substitute a run ID, attempt or SHA. If a run failed/cancelled, multiple matches exist,
 AUTO's wait ended or `dev` moved, follow [deployment recovery](deployment-runbook.md#preconditions); never duplicate, rebind or manually deploy.
