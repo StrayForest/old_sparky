@@ -160,23 +160,26 @@ PY
 
 4. Verify and record the result before another run:
 
-   ```bash
-   df -hT /
-   df -ih /
-   readlink -f /opt/oldsparky/platform/current
-   readlink -f /opt/oldsparky/platform/previous
-   for service in deadlock-api deadlock-worker deadlock-web; do
-     systemctl is-active --quiet "$service" || exit 1
-   done
-   curl -fsS --max-time 10 http://127.0.0.1:8010/api/v1/health/live >/dev/null
-   curl -fsS --max-time 10 http://127.0.0.1:8010/api/v1/health/ready >/dev/null
-   curl -fsS --max-time 10 http://127.0.0.1:3000/ >/dev/null
-   ```
-
    Confirm the maintenance result is `ok=true`, the backup is
    `restore_verified=true`, no pending release transaction remains, and
-   `current`/`previous` are unchanged. Preserve the run ID, maintenance
-   report, backup metadata, and final disk/health evidence in the handoff.
+   `current`/`previous` are unchanged. Then dispatch the canonical read-only
+   health and installed-unit retention diagnostics with the exact active
+   application source SHA:
+
+   ```bash
+   gh workflow run platform-production-storage-diagnostics.yml --ref dev \
+     -f expected_sha=<exact-active-source-sha>
+   ```
+
+   Require its closed `health_monitor_state` to report `status=ok` with all
+   nine checks true: API, worker, web, nginx, loopback readiness, disk, memory,
+   backup age and certificate expiry. Also require the installed-unit-bound
+   retention summary to report `status=ok`, `mode=dry-run`. Preserve the
+   diagnostic run ID alongside the maintenance run ID, report and backup
+   metadata in the handoff. A failed or unavailable strict-health record
+   stops closeout; it does not authorize retention apply or a service start.
+   See `platform/docs/deployment-runbook.md` under “Immutable recovery
+   bootstrap” for source binding and closed-output details.
 
 ## Failure boundaries
 

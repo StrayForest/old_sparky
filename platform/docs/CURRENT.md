@@ -66,20 +66,22 @@ belong in the linked owner documents below.
   with a bound invocation, active+enabled timer, no queued jobs and no cgroup
   members. The exact current-state acknowledgement `46130730347/1` succeeded;
   it reset only systemd failure metadata and did not establish a historical
-  cause or maintenance success. Read-only storage diagnostics `46130890080/1`
-  then reported an unlocked host, active API/worker/web services, an
-  active+enabled source-matched timer with no drop-ins, and a restore/Alembic/
-  checksum-verified backup. Disk use was 68% with 12.342 GB free, above the
-  shared minimum. The installed-unit-bound retention preview returned
-  `status=ok`, `mode=dry-run`; its summary showed 2 protected and 6 retained
-  production releases with 7 proposed deletions. No production deletion or
-  maintenance-service start was performed. The app release remains
-  `259118797db9b000fab061888cff8c3433420457`; its existing Public/UserQA
-  passes remain the current application QA evidence. This storage report did
-  not include a fresh `platform_health_monitor.py` strict-readiness record; an
-  external health URL check from the runner returned 403 and is inconclusive
-  about origin readiness. See the certificate-free capture and acknowledgement
-  procedure in the [deployment runbook](deployment-runbook.md#immutable-recovery-bootstrap).
+  cause or maintenance success. The read-only storage diagnostic
+  `46134009532/1`, running workflow source `beff4d83aaa81f8a143b867cf447d791e41e8fe6`,
+  remained bound to active app release
+  `gha-46102005767-1-259118797db9` at source
+  `259118797db9b000fab061888cff8c3433420457`. Its locked strict-readiness
+  check returned `status=ok`, `failed_count=0`; all nine checks passed for API,
+  worker, web, nginx, loopback readiness, disk, memory, backup age and
+  certificate expiry. The restore/Alembic/checksum-verified backup was
+  0.877 hours old. The installed-unit-bound retention result was
+  `status=ok`, `mode=dry-run`, and the release preview was complete. No
+  production deletion or maintenance-service start was performed. The app
+  release's existing Public/UserQA passes remain the current application QA
+  evidence. An external health URL check from the runner still returns 403 and
+  is inconclusive about origin readiness; the installed health monitor passed.
+  See the certificate-free capture and acknowledgement procedure in the
+  [deployment runbook](deployment-runbook.md#immutable-recovery-bootstrap).
 - The 11-cell production matrix is complete, but cell 9 failed its stress
   contract with unknown capacity attribution; no server capacity ceiling is
   certified. Cell 7's client/origin request join remains unresolved. A recent
