@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import runpy
+import secrets
 import stat
 import subprocess
 import sys
@@ -29,7 +30,7 @@ SYSTEMCTL = "/usr/bin/systemctl"
 JOURNALCTL = "/usr/bin/journalctl"
 SERVICE_PROPERTIES = (
     "ActiveState", "SubState", "Result", "ExecMainCode", "ExecMainStatus",
-    "MainPID", "ExecMainPID", "ControlGroup", "ExecMainStartTimestamp",
+    "MainPID", "ExecMainPID", "InvocationID", "ControlGroup", "ExecMainStartTimestamp",
     "ExecMainExitTimestamp", "StateChangeTimestamp", "UnitFileState",
 )
 TIMER_PROPERTIES = (
@@ -43,6 +44,7 @@ MAX_JOURNAL_BYTES = 128 * 1024
 MAX_EVIDENCE_BYTES = 256 * 1024
 MAX_PRIVATE_TEXT = 1024
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+INVOCATION_ID = re.compile(r"^[0-9a-f]{32}$")
 SOURCE_SHA = re.compile(r"^[0-9a-f]{40,64}$")
 UNIT_STATES = {"active", "inactive", "failed", "activating", "deactivating", "reloading", "maintenance", "unknown"}
 SECRET_PATTERN = re.compile(
@@ -215,6 +217,8 @@ def _argv_identity(argv: list[str]) -> tuple[str, str, str]:
         return "systemctl_list_jobs", "systemd_jobs", "none"
     if argv == [JOURNALCTL, "--unit", UNIT, "--lines=100", "--output=json", "--no-pager", "--quiet", "--since=-24 hours"]:
         return "journalctl_unit", "journal", "service"
+    if argv in ([SYSTEMCTL, "stop", TIMER], [SYSTEMCTL, "start", TIMER]):
+        return "systemctl_timer_state", "reset", "timer"
     if argv == [SYSTEMCTL, "reset-failed", UNIT]:
         return "systemctl_reset_failed", "reset", "service"
     return "none", "capture_guard", "none"
@@ -705,6 +709,178 @@ def _durable_evidence_path(
     return directory / f"{source_sha}-{capture_run_id}-{capture_run_attempt}.json"
 
 
+def _acknowledgement_path(
+    app_dir: Path, source_sha: str, capture_run_id: str,
+    capture_run_attempt: str, *, create: bool,
+) -> Path:
+    shared = app_dir / "shared"
+    recovery = shared / ".release-recovery"
+    for directory, expected_mode in ((shared, None), (recovery, 0o755)):
+        metadata = directory.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or (expected_mode is not None and stat.S_IMODE(metadata.st_mode) != expected_mode)
+        ):
+            raise EvidenceError("maintenance acknowledgement directory is unsafe")
+    directory = recovery / "maintenance-failure-acknowledgements"
+    if create and not os.path.lexists(directory):
+        try:
+            directory.mkdir(mode=0o700)
+            os.chown(directory, 0, 0)
+            os.chmod(directory, 0o700)
+        except FileExistsError:
+            pass
+    metadata = directory.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise EvidenceError("maintenance acknowledgement directory is unsafe")
+    return directory / f"{source_sha}-{capture_run_id}-{capture_run_attempt}.json"
+
+
+def _write_acknowledgement(path: Path, value: dict[str, Any], *, create: bool) -> None:
+    raw = (json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+    if len(raw) > MAX_EVIDENCE_BYTES:
+        raise EvidenceError("maintenance acknowledgement exceeded its bound")
+    parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    temporary_name = f".{path.name}.tmp-{secrets.token_hex(8)}"
+    try:
+        directory = os.fstat(parent_fd)
+        if not stat.S_ISDIR(directory.st_mode) or directory.st_uid != 0 or stat.S_IMODE(directory.st_mode) != 0o700:
+            raise EvidenceError("maintenance acknowledgement directory changed")
+        existing = None
+        try:
+            existing = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        if create and existing is not None:
+            raise EvidenceError("maintenance acknowledgement already exists")
+        if not create and (
+            existing is None
+            or not stat.S_ISREG(existing.st_mode)
+            or existing.st_uid != 0
+            or existing.st_nlink != 1
+            or stat.S_IMODE(existing.st_mode) != 0o600
+        ):
+            raise EvidenceError("maintenance acknowledgement metadata is unsafe")
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if existing is not None:
+                current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) != (existing.st_dev, existing.st_ino):
+                    raise EvidenceError("maintenance acknowledgement changed during update")
+            os.replace(temporary_name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        except BaseException:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            raise
+    finally:
+        os.close(parent_fd)
+
+
+def _read_acknowledgement(path: Path) -> dict[str, Any]:
+    metadata = path.lstat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_size > MAX_EVIDENCE_BYTES
+    ):
+        raise EvidenceError("maintenance acknowledgement metadata is unsafe")
+    return _strict_json(path.read_bytes(), label="maintenance acknowledgement")
+
+
+def _timer_snapshot_matches(
+    observed: dict[str, str], expected: dict[str, str], *, active: bool,
+) -> bool:
+    return (
+        observed.get("ActiveState") == ("active" if active else "inactive")
+        and observed.get("UnitFileState") == expected.get("UnitFileState")
+        and observed.get("Result") == expected.get("Result")
+    )
+
+
+def _reset_postcondition(
+    observed: dict[str, str], failed: dict[str, str],
+) -> bool:
+    return (
+        observed.get("ActiveState") == "inactive"
+        and observed.get("SubState") == "dead"
+        and observed.get("Result") == "success"
+        and observed.get("MainPID") == "0"
+        and observed.get("InvocationID") == failed.get("InvocationID")
+        and observed.get("ExecMainCode") == failed.get("ExecMainCode")
+        and observed.get("ExecMainStatus") == failed.get("ExecMainStatus")
+        and observed.get("ExecMainPID") == failed.get("ExecMainPID")
+        and observed.get("ExecMainStartTimestamp") == failed.get("ExecMainStartTimestamp")
+        and observed.get("ExecMainExitTimestamp") == failed.get("ExecMainExitTimestamp")
+        and observed.get("ControlGroup") == failed.get("ControlGroup")
+    )
+
+
+def _ack_matches_evidence(
+    acknowledgement: dict[str, Any], evidence_value: dict[str, Any], *,
+    source_sha: str, bundle_sha: str, evidence_sha: str,
+    capture_run_id: str, capture_run_attempt: str,
+    security_run_id: str, security_run_attempt: str,
+) -> bool:
+    required = {
+        "schema", "kind", "source_sha", "bundle_sha256", "capture_run_id",
+        "capture_run_attempt", "security_run_id", "security_run_attempt",
+        "host_id_sha256", "evidence_sha256", "phase", "pointers", "receipts",
+        "unit", "timer", "timer_was_active", "timer_was_enabled", "post_reset_unit",
+    }
+    return (
+        set(acknowledgement) == required
+        and acknowledgement.get("schema") == 1
+        and acknowledgement.get("kind") == "maintenance_failure_acknowledgement"
+        and acknowledgement.get("source_sha") == source_sha
+        and acknowledgement.get("bundle_sha256") == bundle_sha
+        and acknowledgement.get("capture_run_id") == capture_run_id
+        and acknowledgement.get("capture_run_attempt") == capture_run_attempt
+        and acknowledgement.get("security_run_id") == security_run_id
+        and acknowledgement.get("security_run_attempt") == security_run_attempt
+        and acknowledgement.get("host_id_sha256") == evidence_value.get("host_id_sha256")
+        and acknowledgement.get("evidence_sha256") == evidence_sha
+        and acknowledgement.get("phase") in {"prepared", "reset_pending", "unit_reset", "complete"}
+        and acknowledgement.get("pointers") == evidence_value.get("pointers")
+        and acknowledgement.get("receipts") == evidence_value.get("receipts")
+        and acknowledgement.get("unit") == evidence_value.get("unit")
+        and acknowledgement.get("timer") == evidence_value.get("timer")
+        and type(acknowledgement.get("timer_was_active")) is bool
+        and type(acknowledgement.get("timer_was_enabled")) is bool
+        and (
+            acknowledgement.get("post_reset_unit") is None
+            or (
+                isinstance(acknowledgement.get("post_reset_unit"), dict)
+                and set(acknowledgement["post_reset_unit"]) == set(SERVICE_PROPERTIES)
+                and all(isinstance(item, str) for item in acknowledgement["post_reset_unit"].values())
+            )
+        )
+    )
+
+
 def capture(
     *, app_dir: Path, source_sha: str, bundle_sha: str, output: Path,
     capture_run_id: str, capture_run_attempt: str,
@@ -738,6 +914,8 @@ def capture(
     journal = _journal()
     if unit["ActiveState"] != "failed":
         raise EvidenceError("maintenance service is not in the observed failed state")
+    if not INVOCATION_ID.fullmatch(unit["InvocationID"]) or unit["InvocationID"] == "0" * 32:
+        raise EvidenceError("maintenance service invocation identity is unavailable")
     payload = {
         "schema": 1,
         "kind": "maintenance_failure_evidence",
@@ -867,6 +1045,9 @@ def _validate_evidence(
         or len(value["journal"]) > 100
         or any(not isinstance(row, dict) or set(row) != {"realtime_timestamp", "priority", "message"} or not all(isinstance(row[key], str) for key in row) or len(row["message"]) > 4096 for row in value["journal"])
         or value.get("unit", {}).get("ActiveState") != "failed"
+        or not isinstance(value.get("unit", {}).get("InvocationID"), str)
+        or not INVOCATION_ID.fullmatch(value["unit"]["InvocationID"])
+        or value["unit"]["InvocationID"] == "0" * 32
         or not isinstance(value.get("queued_jobs"), list)
         or len(value["queued_jobs"]) > 256
         or any(not isinstance(row, dict) or set(row) != {"unit", "job_type", "job_state"} or any(not isinstance(row[key], str) or len(row[key]) > 255 for key in row) for row in value["queued_jobs"])
@@ -911,24 +1092,145 @@ def reset_failed(
     )
     if candidate_source_sha != receipts.get("candidate_source_sha"):
         raise EvidenceError("release candidate source changed after evidence capture")
-    unit = _systemd_properties(UNIT)
-    timer = _systemd_properties(TIMER)
-    jobs = _queued_jobs()
-    pids = _cgroup_members(unit["ControlGroup"])
-    if (
-        unit["ActiveState"] != "failed"
-        or unit["MainPID"] != "0"
-        or unit != evidence_value["unit"]
-        or timer["ActiveState"] != "inactive"
-        or timer["UnitFileState"] not in {"disabled", "masked"}
-        or timer != evidence_value["timer"]
-        or jobs
-        or pids
-    ):
-        raise EvidenceError("maintenance reset preconditions changed")
-    result = _run([SYSTEMCTL, "reset-failed", UNIT], maximum=4096)
-    if result.returncode != 0:
-        raise EvidenceError("fixed maintenance reset failed")
+    timer_expected = evidence_value["timer"]
+    timer_was_active = timer_expected["ActiveState"] == "active"
+    timer_was_enabled = timer_expected["UnitFileState"] == "enabled"
+    timer_unchanged_stopped = not timer_was_active and timer_expected["ActiveState"] == "inactive" and timer_expected["UnitFileState"] in {"disabled", "masked"}
+    if not ((timer_was_active and timer_was_enabled) or timer_unchanged_stopped):
+        raise EvidenceError("maintenance timer state is not eligible for acknowledgement")
+    host_id = Path("/etc/machine-id").read_text(encoding="ascii").strip()
+    acknowledgement_path = _acknowledgement_path(
+        app_dir, source_sha, capture_run_id, capture_run_attempt, create=True,
+    )
+    if acknowledgement_path.exists() or acknowledgement_path.is_symlink():
+        acknowledgement = _read_acknowledgement(acknowledgement_path)
+        if not _ack_matches_evidence(
+            acknowledgement, evidence_value, source_sha=source_sha, bundle_sha=bundle_sha,
+            evidence_sha=evidence_sha, capture_run_id=capture_run_id,
+            capture_run_attempt=capture_run_attempt, security_run_id=security_run_id,
+            security_run_attempt=security_run_attempt,
+        ) or acknowledgement.get("timer_was_active") is not timer_was_active or acknowledgement.get("timer_was_enabled") is not timer_was_enabled:
+            raise EvidenceError("maintenance acknowledgement binding changed")
+    else:
+        unit = _systemd_properties(UNIT)
+        timer = _systemd_properties(TIMER)
+        jobs = _queued_jobs()
+        pids = _cgroup_members(unit["ControlGroup"])
+        if unit != evidence_value["unit"] or timer != timer_expected or jobs or pids:
+            raise EvidenceError("maintenance reset preconditions changed")
+        acknowledgement = {
+            "schema": 1,
+            "kind": "maintenance_failure_acknowledgement",
+            "source_sha": source_sha,
+            "bundle_sha256": bundle_sha,
+            "capture_run_id": capture_run_id,
+            "capture_run_attempt": capture_run_attempt,
+            "security_run_id": security_run_id,
+            "security_run_attempt": security_run_attempt,
+            "host_id_sha256": hashlib.sha256(host_id.encode("ascii")).hexdigest(),
+            "evidence_sha256": evidence_sha,
+            "phase": "prepared",
+            "pointers": evidence_value["pointers"],
+            "receipts": evidence_value["receipts"],
+            "unit": evidence_value["unit"],
+            "timer": timer_expected,
+            "timer_was_active": timer_was_active,
+            "timer_was_enabled": timer_was_enabled,
+            "post_reset_unit": None,
+        }
+        _write_acknowledgement(acknowledgement_path, acknowledgement, create=True)
+
+    if acknowledgement["phase"] == "complete":
+        unit = _systemd_properties(UNIT)
+        timer = _systemd_properties(TIMER)
+        if (
+            unit != acknowledgement["post_reset_unit"]
+            or not _reset_postcondition(unit, acknowledgement["unit"])
+            or (timer_was_active and not _timer_snapshot_matches(timer, timer_expected, active=True))
+            or (not timer_was_active and timer != timer_expected)
+        ):
+            raise EvidenceError("completed maintenance acknowledgement state changed")
+        return
+
+    try:
+        unit = _systemd_properties(UNIT)
+        timer = _systemd_properties(TIMER)
+        jobs = _queued_jobs()
+        pids = _cgroup_members(unit["ControlGroup"])
+        if jobs or pids:
+            raise EvidenceError("maintenance reset preconditions changed")
+        if acknowledgement["phase"] == "reset_pending" and _reset_postcondition(unit, acknowledgement["unit"]):
+            acknowledgement["phase"] = "unit_reset"
+            acknowledgement["post_reset_unit"] = unit
+            _write_acknowledgement(acknowledgement_path, acknowledgement, create=False)
+        elif acknowledgement["phase"] == "reset_pending":
+            raise EvidenceError("maintenance reset outcome is unconfirmed; capture fresh evidence before another attempt")
+        elif acknowledgement["phase"] == "unit_reset":
+            if unit != acknowledgement["post_reset_unit"] or not _reset_postcondition(unit, acknowledgement["unit"]):
+                raise EvidenceError("maintenance post-reset service state changed")
+        elif unit != acknowledgement["unit"] or unit["ActiveState"] != "failed" or unit["MainPID"] != "0":
+            raise EvidenceError("maintenance failed invocation changed before acknowledgement")
+
+        if acknowledgement["phase"] == "prepared":
+            timer = _systemd_properties(TIMER)
+            if timer_was_active:
+                if _timer_snapshot_matches(timer, timer_expected, active=True):
+                    result = _run([SYSTEMCTL, "stop", TIMER], maximum=4096)
+                    if result.returncode != 0:
+                        raise EvidenceError("fixed maintenance timer pause failed")
+                elif not _timer_snapshot_matches(timer, timer_expected, active=False):
+                    raise EvidenceError("maintenance timer is not safely paused")
+                timer = _systemd_properties(TIMER)
+                if not _timer_snapshot_matches(timer, timer_expected, active=False):
+                    raise EvidenceError("maintenance timer pause postcondition failed")
+            elif timer != timer_expected:
+                raise EvidenceError("maintenance timer changed before acknowledgement")
+            unit = _systemd_properties(UNIT)
+            timer = _systemd_properties(TIMER)
+            jobs = _queued_jobs()
+            pids = _cgroup_members(unit["ControlGroup"])
+            if (
+                unit != acknowledgement["unit"]
+                or unit["ActiveState"] != "failed"
+                or unit["MainPID"] != "0"
+                or jobs
+                or pids
+                or (timer_was_active and not _timer_snapshot_matches(timer, timer_expected, active=False))
+                or (not timer_was_active and timer != timer_expected)
+            ):
+                raise EvidenceError("maintenance reset preconditions changed")
+            acknowledgement["phase"] = "reset_pending"
+            _write_acknowledgement(acknowledgement_path, acknowledgement, create=False)
+            reset_result = _run([SYSTEMCTL, "reset-failed", UNIT], maximum=4096)
+            unit_after = _systemd_properties(UNIT)
+            jobs_after = _queued_jobs()
+            pids_after = _cgroup_members(unit_after["ControlGroup"])
+            if not _reset_postcondition(unit_after, acknowledgement["unit"]) or jobs_after or pids_after:
+                if reset_result.returncode != 0:
+                    raise EvidenceError("fixed maintenance reset failed")
+                raise EvidenceError("maintenance reset postcondition failed")
+            acknowledgement["phase"] = "unit_reset"
+            acknowledgement["post_reset_unit"] = unit_after
+            _write_acknowledgement(acknowledgement_path, acknowledgement, create=False)
+    finally:
+        if timer_was_active:
+            timer_now = _systemd_properties(TIMER)
+            if _timer_snapshot_matches(timer_now, timer_expected, active=False):
+                restore = _run([SYSTEMCTL, "start", TIMER], maximum=4096)
+                restored = _systemd_properties(TIMER)
+                if restore.returncode != 0 or not _timer_snapshot_matches(restored, timer_expected, active=True):
+                    raise EvidenceError("maintenance timer restoration failed")
+            elif not _timer_snapshot_matches(timer_now, timer_expected, active=True):
+                raise EvidenceError("maintenance timer restoration state is unsafe")
+
+    if acknowledgement["phase"] == "unit_reset" and timer_was_active:
+        timer = _systemd_properties(TIMER)
+        if not _timer_snapshot_matches(timer, timer_expected, active=True):
+            raise EvidenceError("maintenance timer restoration is incomplete")
+    elif not timer_was_active and _systemd_properties(TIMER) != timer_expected:
+        raise EvidenceError("maintenance timer state changed")
+    acknowledgement["phase"] = "complete"
+    _write_acknowledgement(acknowledgement_path, acknowledgement, create=False)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -963,7 +1265,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.app_dir, args.source_sha, args.capture_run_id,
                 args.capture_run_attempt, create=True,
             )
-            digest, _ = capture(
+            digest, payload = capture(
                 app_dir=args.app_dir, source_sha=args.source_sha,
                 bundle_sha=args.bundle_sha, output=output,
                 capture_run_id=args.capture_run_id,
@@ -971,7 +1273,15 @@ def main(argv: list[str] | None = None) -> int:
                 security_run_id=args.security_run_id,
                 security_run_attempt=args.security_run_attempt,
             )
-            print("MAINTENANCE_EVIDENCE schema=1 status=captured private=true")
+            print(
+                "MAINTENANCE_EVIDENCE schema=1 status=captured "
+                f"evidence_sha256={digest} service_state=failed invocation_bound=true "
+                f"timer_active={str(payload['timer']['ActiveState'] == 'active').lower()} "
+                f"timer_enabled={str(payload['timer']['UnitFileState'] == 'enabled').lower()} "
+                f"queued_job_count={len(payload['queued_jobs'])} "
+                f"cgroup_member_count={len(payload['cgroup_pids'])} "
+                "host_bound=true historical_cause=unknown"
+            )
             return 0
         reset_failed(
             app_dir=args.app_dir, source_sha=args.source_sha, bundle_sha=args.bundle_sha,
@@ -984,7 +1294,7 @@ def main(argv: list[str] | None = None) -> int:
             security_run_id=args.security_run_id,
             security_run_attempt=args.security_run_attempt,
         )
-        print("MAINTENANCE_RESET schema=1 status=complete unit=deadlock-maintenance.service")
+        print("MAINTENANCE_RESET schema=1 status=complete mode=current_state_acknowledgement unit=deadlock-maintenance.service")
         return 0
     except Exception as exc:
         diagnostic_written = False

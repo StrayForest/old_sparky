@@ -48,14 +48,6 @@ on:
         description: "Exact capture action attempt (reset only)"
         required: false
         type: string
-      evidence_sha256:
-        description: "Locally verified SHA-256 of the decrypted host evidence (reset only)"
-        required: false
-        type: string
-      recipient_certificate_b64:
-        description: "Base64 PEM X.509 recipient certificate for encrypted capture only"
-        required: false
-        type: string
 
 # This is the only manual execution path for the immutable recovery bootstrap.
 # Validation is evidence-only and completes before production secrets or SSH are
@@ -87,8 +79,6 @@ jobs:
       ACTION: ${{ inputs.action }}
       CAPTURE_RUN_ID: ${{ inputs.capture_run_id }}
       CAPTURE_RUN_ATTEMPT: ${{ inputs.capture_run_attempt }}
-      EVIDENCE_SHA256: ${{ inputs.evidence_sha256 }}
-      RECIPIENT_CERTIFICATE_SHA256: 28d857f5fc6ff987444ca920a2bb5072081dbf2e41ef158d362b60e45e3f67a3
       SECURITY_WORKFLOW: Platform security and build
       SECURITY_WORKFLOW_PATH: .github/workflows/platform-security.yml
       SECURITY_JOB: Verification contract
@@ -98,8 +88,6 @@ jobs:
     steps:
       - name: Validate exact recovery request before secrets or SSH
         shell: bash
-        env:
-          RECIPIENT_CERTIFICATE_B64: ${{ inputs.recipient_certificate_b64 }}
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = "$REPOSITORY"
@@ -116,65 +104,15 @@ jobs:
               ;;
             capture_maintenance_failure)
               test "$ABORT_CONFIRMATION" = "CAPTURE-MAINTENANCE-FAILURE"
-              test -z "$CAPTURE_RUN_ID" && test -z "$CAPTURE_RUN_ATTEMPT" && test -z "$EVIDENCE_SHA256"
-              test -n "$RECIPIENT_CERTIFICATE_B64"
+              test -z "$CAPTURE_RUN_ID" && test -z "$CAPTURE_RUN_ATTEMPT"
               ;;
             reset_maintenance_failed)
-              test "$ABORT_CONFIRMATION" = "RESET-MAINTENANCE-FAILED"
+              test "$ABORT_CONFIRMATION" = "ACKNOWLEDGE-MAINTENANCE-CURRENT-STATE"
               [[ "$CAPTURE_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
               [[ "$CAPTURE_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
-              [[ "$EVIDENCE_SHA256" =~ ^[0-9a-f]{64}$ ]]
-              test -z "$RECIPIENT_CERTIFICATE_B64"
               ;;
-            *) test -z "$RECIPIENT_CERTIFICATE_B64"; exit 1 ;;
+            *) exit 1 ;;
           esac
-
-      - name: Validate pinned encrypted-capture recipient before production access
-        if: ${{ inputs.action == 'capture_maintenance_failure' }}
-        shell: bash
-        env:
-          RECIPIENT_CERTIFICATE_B64: ${{ inputs.recipient_certificate_b64 }}
-          RECIPIENT_CERTIFICATE_SHA256: 28d857f5fc6ff987444ca920a2bb5072081dbf2e41ef158d362b60e45e3f67a3
-        run: |
-          set -euo pipefail
-          umask 077
-          certificate="$RUNNER_TEMP/platform-maintenance-recipient.pem"
-          public_key="$RUNNER_TEMP/platform-maintenance-recipient-public.pem"
-          /usr/bin/python3 -I - "$certificate" <<'PY'
-          import base64, os, re, sys
-          from pathlib import Path
-          encoded = os.environ.get("RECIPIENT_CERTIFICATE_B64", "")
-          if len(encoded) > 16384 or not encoded:
-              raise SystemExit("capture recipient certificate input is outside its bound")
-          try:
-              raw = base64.b64decode(encoded, validate=True)
-          except (ValueError, base64.binascii.Error) as exc:
-              raise SystemExit("capture recipient certificate encoding is invalid") from exc
-          if len(raw) > 8192 or re.fullmatch(rb"\s*-----BEGIN CERTIFICATE-----\s+[A-Za-z0-9+/=\r\n]+-----END CERTIFICATE-----\s*", raw) is None:
-              raise SystemExit("capture recipient must contain exactly one PEM certificate")
-          destination = Path(sys.argv[1])
-          descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-          with os.fdopen(descriptor, "wb") as stream:
-              stream.write(raw)
-              stream.flush()
-              os.fsync(stream.fileno())
-          PY
-          openssl x509 -in "$certificate" -noout -checkend 0 >/dev/null
-          fingerprint="$(openssl x509 -in "$certificate" -noout -fingerprint -sha256 | sed 's/^[^=]*=//; s/://g' | tr '[:upper:]' '[:lower:]')"
-          test "$fingerprint" = "$RECIPIENT_CERTIFICATE_SHA256"
-          openssl x509 -in "$certificate" -pubkey -noout -out "$public_key"
-          key_description="$(openssl pkey -pubin -in "$public_key" -text -noout)"
-          grep -Eq 'Public-Key: \(3072 bit\)' <<<"$key_description"
-          openssl cms -help 2>&1 | grep -q -- '-encrypt'
-          if ! printf 'cms-capability-check\n' | openssl cms -encrypt -binary -aes-256-gcm -outform DER -recip "$certificate" -keyopt rsa_padding_mode:oaep -keyopt rsa_oaep_md:sha256 -out "$RUNNER_TEMP/platform-cms-capability.der"; then
-            echo "OpenSSL CMS AES-256-GCM/RSA-OAEP-SHA-256 is unavailable" >&2
-            exit 1
-          fi
-          printf 'Recipient certificate pin validated: sha256=%s\n' "$fingerprint"
-          {
-            printf 'RECIPIENT_CERT_PATH=%s\n' "$certificate"
-            printf 'RECIPIENT_CERTIFICATE_FINGERPRINT=%s\n' "$fingerprint"
-          } >> "$GITHUB_ENV"
 
       - name: Validate exact successful security run, route artifact and evidence
         id: evidence
@@ -667,14 +605,14 @@ jobs:
               raise SystemExit("attestation certificate/source/run/subject policy failed")
           PY
 
-      - name: Fetch and validate exact encrypted capture artifact
+      - name: Fetch and validate exact maintenance receipt
+        id: capture_receipt
         if: ${{ inputs.action == 'reset_maintenance_failed' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           CAPTURE_RUN_ID: ${{ inputs.capture_run_id }}
           CAPTURE_RUN_ATTEMPT: ${{ inputs.capture_run_attempt }}
-          EXPECTED_EVIDENCE_SHA256: ${{ inputs.evidence_sha256 }}
           SOURCE_SHA: ${{ steps.evidence.outputs.source_sha }}
           BUNDLE_SHA: ${{ steps.bundle.outputs.bundle_sha }}
           SECURITY_RUN_ID: ${{ inputs.security_run_id }}
@@ -683,12 +621,10 @@ jobs:
           RECOVERY_RUN_ATTEMPT: ${{ inputs.recovery_run_attempt }}
           PUBLISHER_RUN_ID: ${{ inputs.publisher_run_id }}
           PUBLISHER_RUN_ATTEMPT: ${{ inputs.publisher_run_attempt }}
-          RECIPIENT_CERTIFICATE_SHA256: 28d857f5fc6ff987444ca920a2bb5072081dbf2e41ef158d362b60e45e3f67a3
         run: |
           set -euo pipefail
           [[ "$CAPTURE_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
           [[ "$CAPTURE_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
-          [[ "$EXPECTED_EVIDENCE_SHA256" =~ ^[0-9a-f]{64}$ ]]
           metadata="$RUNNER_TEMP/platform-maintenance-capture"
           install -d -m 700 "$metadata"
           api="$GITHUB_API_URL/repos/$REPOSITORY"
@@ -700,10 +636,10 @@ jobs:
             --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' \
             --header 'X-GitHub-Api-Version: 2022-11-28' \
             "$api/actions/runs/$CAPTURE_RUN_ID/artifacts?per_page=100&page=1" --output "$metadata/artifacts.json"
-          /usr/bin/python3 -I -B - "$metadata" "$RUNNER_TEMP" "$GITHUB_OUTPUT" <<'PY'
-          import hashlib, json, os, re, sys, zipfile
+          /usr/bin/python3 -I -B - "$metadata" "$GITHUB_OUTPUT" <<'PY'
+          import json, os, re, sys
           from pathlib import Path
-          root, runner_temp, output = map(Path, sys.argv[1:])
+          root, output = map(Path, sys.argv[1:])
           env = os.environ
           run = json.loads((root / "run.json").read_text(encoding="utf-8"))
           if any((run.get("id") != int(env["CAPTURE_RUN_ID"]), run.get("run_attempt") != int(env["CAPTURE_RUN_ATTEMPT"]), run.get("name") != "Platform production recovery bootstrap abort", run.get("path") != ".github/workflows/platform-production-recovery-bootstrap-abort.yml", run.get("head_branch") != "dev", run.get("head_sha") != env["SOURCE_SHA"], run.get("event") != "workflow_dispatch", run.get("status") != "completed", run.get("conclusion") != "success")):
@@ -712,14 +648,14 @@ jobs:
           rows = listing.get("artifacts") if isinstance(listing, dict) else None
           if not isinstance(rows, list) or type(listing.get("total_count")) is not int or listing["total_count"] != len(rows) or len(rows) > 100:
               raise SystemExit("capture artifact page is incomplete")
-          name = f"platform-maintenance-failure-{env['CAPTURE_RUN_ID']}-{env['CAPTURE_RUN_ATTEMPT']}"
+          name = f"platform-maintenance-receipt-{env['CAPTURE_RUN_ID']}-{env['CAPTURE_RUN_ATTEMPT']}"
           matches = [row for row in rows if isinstance(row, dict) and row.get("name") == name and row.get("expired") is False and isinstance(row.get("workflow_run"), dict) and row["workflow_run"].get("id") == int(env["CAPTURE_RUN_ID"]) and row["workflow_run"].get("head_sha") == env["SOURCE_SHA"] and (row["workflow_run"].get("run_attempt") is None or (type(row["workflow_run"].get("run_attempt")) is int and row["workflow_run"].get("run_attempt") == int(env["CAPTURE_RUN_ATTEMPT"]))) ]
           if (len(matches) != 1 or type(matches[0].get("id")) is not int or matches[0]["id"] <= 0
-              or type(matches[0].get("size_in_bytes")) is not int or not 1 <= matches[0]["size_in_bytes"] <= 1024 * 1024):
-              raise SystemExit("exact encrypted capture artifact is missing or duplicated")
+              or type(matches[0].get("size_in_bytes")) is not int or not 1 <= matches[0]["size_in_bytes"] <= 64 * 1024):
+              raise SystemExit("exact maintenance receipt is missing or duplicated")
           digest = matches[0].get("digest")
           if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
-              raise SystemExit("capture artifact digest is invalid")
+              raise SystemExit("maintenance receipt archive digest is invalid")
           with output.open("a", encoding="ascii") as stream:
               stream.write(f"artifact_id={matches[0]['id']}\nartifact_digest={digest.removeprefix('sha256:')}\n")
           PY
@@ -731,58 +667,71 @@ jobs:
           test "$(stat -c %s "$metadata/capture.zip")" -le 1048576
           expected_archive_digest="$(awk -F= '$1=="artifact_digest" {print $2}' "$GITHUB_OUTPUT" | tail -n 1)"
           test "$(sha256sum "$metadata/capture.zip" | awk '{print $1}')" = "$expected_archive_digest"
-          /usr/bin/python3 -I -B - "$metadata/capture.zip" "$metadata" <<'PY'
+          /usr/bin/python3 -I -B - "$metadata/capture.zip" "$GITHUB_OUTPUT" <<'PY'
           import hashlib, json, os, re, stat, sys, zipfile
           from pathlib import Path
-          archive, root = map(Path, sys.argv[1:3])
+          archive = Path(sys.argv[1])
+          output = Path(sys.argv[2])
           env = os.environ
-          source_sha, bundle_sha = env["SOURCE_SHA"], env["BUNDLE_SHA"]
-          capture_id, capture_attempt = env["CAPTURE_RUN_ID"], env["CAPTURE_RUN_ATTEMPT"]
-          security_id, security_attempt = env["SECURITY_RUN_ID"], env["SECURITY_RUN_ATTEMPT"]
+          digest_lines = [
+              value.split("=", 1)[1] for value in output.read_text(encoding="ascii").splitlines()
+              if value.startswith("artifact_digest=")
+          ]
+          if len(digest_lines) != 1 or re.fullmatch(r"[0-9a-f]{64}", digest_lines[0]) is None:
+              raise SystemExit("maintenance receipt archive digest binding is invalid")
+          expected_digest = digest_lines[0]
+          if hashlib.sha256(archive.read_bytes()).hexdigest() != expected_digest:
+              raise SystemExit("maintenance receipt archive digest does not match GitHub metadata")
           with zipfile.ZipFile(archive) as bundle:
               entries = bundle.infolist()
-              names = {"manifest.json", "evidence.cms"}
-              if len(entries) != 2 or {entry.filename for entry in entries} != names:
-                  raise SystemExit("capture artifact archive is not closed")
-              for entry in entries:
-                  mode = (entry.external_attr >> 16) & 0o177777
-                  if entry.file_size > 512 * 1024 or entry.flag_bits & 0x1 or entry.is_dir() or not stat.S_ISREG(mode):
-                      raise SystemExit("capture artifact member is unsafe")
-              manifest_raw = bundle.read("manifest.json")
-              ciphertext = bundle.read("evidence.cms")
-          if len(ciphertext) > 384 * 1024 or len(manifest_raw) > 8192:
-              raise SystemExit("encrypted capture artifact exceeded its bound")
+              if len(entries) != 1 or entries[0].filename != "receipt.json":
+                  raise SystemExit("maintenance receipt archive is not closed")
+              entry = entries[0]
+              mode = (entry.external_attr >> 16) & 0o177777
+              if entry.file_size > 8192 or entry.flag_bits & 0x1 or entry.is_dir() or not stat.S_ISREG(mode):
+                  raise SystemExit("maintenance receipt member is unsafe")
+              receipt_raw = bundle.read("receipt.json")
           def unique_object(pairs):
               value = {}
               for key, item in pairs:
                   if key in value:
-                      raise SystemExit("encrypted capture manifest has duplicate keys")
+                      raise SystemExit("maintenance receipt has duplicate keys")
                   value[key] = item
               return value
-          manifest = json.loads(manifest_raw.decode("ascii"), object_pairs_hook=unique_object)
-          required = {"schema", "kind", "repository", "workflow_path", "capture_run_id", "capture_run_attempt", "source_sha", "bundle_sha256", "security_run_id", "security_run_attempt", "recovery_run_id", "recovery_run_attempt", "publisher_run_id", "publisher_run_attempt", "recipient_certificate_sha256", "encryption", "ciphertext_sha256", "ciphertext_size"}
-          if (set(manifest) != required or manifest.get("schema") != 1 or manifest.get("kind") != "encrypted_maintenance_failure_report"
-              or manifest.get("repository") != "StrayForest/old_sparky" or manifest.get("workflow_path") != ".github/workflows/platform-production-recovery-bootstrap-abort.yml"
-              or manifest.get("capture_run_id") != capture_id or manifest.get("capture_run_attempt") != capture_attempt
-              or manifest.get("source_sha") != source_sha or manifest.get("bundle_sha256") != bundle_sha
-              or manifest.get("security_run_id") != security_id or manifest.get("security_run_attempt") != security_attempt
-              or manifest.get("recovery_run_id") != env["RECOVERY_RUN_ID"] or manifest.get("recovery_run_attempt") != env["RECOVERY_RUN_ATTEMPT"]
-              or manifest.get("publisher_run_id") != env["PUBLISHER_RUN_ID"] or manifest.get("publisher_run_attempt") != env["PUBLISHER_RUN_ATTEMPT"]
-              or manifest.get("recipient_certificate_sha256") != env["RECIPIENT_CERTIFICATE_SHA256"]
-              or manifest.get("encryption") != "CMS-EnvelopedData/AES-256-GCM/RSA-OAEP-SHA-256"
-              or type(manifest.get("ciphertext_size")) is not int or manifest["ciphertext_size"] != len(ciphertext)
-              or not isinstance(manifest.get("ciphertext_sha256"), str) or re.fullmatch(r"[0-9a-f]{64}", manifest["ciphertext_sha256"]) is None
-              or hashlib.sha256(ciphertext).hexdigest() != manifest["ciphertext_sha256"]
-              or re.fullmatch(r"[0-9a-f]{40,64}", source_sha) is None or re.fullmatch(r"[0-9a-f]{64}", bundle_sha) is None):
-              raise SystemExit("encrypted capture manifest or provenance is invalid")
-          ciphertext_path = root / "evidence.cms"
-          descriptor = os.open(ciphertext_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-          with os.fdopen(descriptor, "wb") as stream:
-              stream.write(ciphertext); stream.flush(); os.fsync(stream.fileno())
-          with (root / "artifact-info.txt").open("a", encoding="ascii") as stream:
-              stream.write(f"ciphertext_sha256={manifest['ciphertext_sha256']}\n")
+          receipt = json.loads(receipt_raw.decode("ascii"), object_pairs_hook=unique_object)
+          required = {"schema", "kind", "repository", "workflow_path", "capture_run_id", "capture_run_attempt", "source_sha", "bundle_sha256", "security_run_id", "security_run_attempt", "recovery_run_id", "recovery_run_attempt", "publisher_run_id", "publisher_run_attempt", "evidence_sha256", "service_state", "invocation_bound", "timer_active", "timer_enabled", "queued_job_count", "cgroup_member_count", "host_bound", "historical_cause"}
+          if (set(receipt) != required or receipt.get("schema") != 1 or receipt.get("kind") != "maintenance_failure_receipt"
+              or receipt.get("repository") != "StrayForest/old_sparky" or receipt.get("workflow_path") != ".github/workflows/platform-production-recovery-bootstrap-abort.yml"
+              or receipt.get("capture_run_id") != env["CAPTURE_RUN_ID"] or receipt.get("capture_run_attempt") != env["CAPTURE_RUN_ATTEMPT"]
+              or receipt.get("source_sha") != env["SOURCE_SHA"] or receipt.get("bundle_sha256") != env["BUNDLE_SHA"]
+              or receipt.get("security_run_id") != env["SECURITY_RUN_ID"] or receipt.get("security_run_attempt") != env["SECURITY_RUN_ATTEMPT"]
+              or receipt.get("recovery_run_id") != env["RECOVERY_RUN_ID"] or receipt.get("recovery_run_attempt") != env["RECOVERY_RUN_ATTEMPT"]
+              or receipt.get("publisher_run_id") != env["PUBLISHER_RUN_ID"] or receipt.get("publisher_run_attempt") != env["PUBLISHER_RUN_ATTEMPT"]
+              or not isinstance(receipt.get("evidence_sha256"), str) or re.fullmatch(r"[0-9a-f]{64}", receipt["evidence_sha256"]) is None
+              or receipt.get("service_state") != "failed" or receipt.get("invocation_bound") is not True
+              or type(receipt.get("timer_active")) is not bool or type(receipt.get("timer_enabled")) is not bool
+              or type(receipt.get("queued_job_count")) is not int or not 0 <= receipt["queued_job_count"] <= 256
+              or type(receipt.get("cgroup_member_count")) is not int or not 0 <= receipt["cgroup_member_count"] <= 256
+              or receipt.get("host_bound") is not True or receipt.get("historical_cause") != "unknown"):
+              raise SystemExit("maintenance receipt provenance is invalid")
+          with output.open("a", encoding="ascii") as stream:
+              stream.write(
+                  f"evidence_sha256={receipt['evidence_sha256']}\n"
+                  f"service_state={receipt['service_state']}\n"
+                  f"invocation_bound=true\n"
+                  f"timer_active={str(receipt['timer_active']).lower()}\n"
+                  f"timer_enabled={str(receipt['timer_enabled']).lower()}\n"
+                  f"queued_job_count={receipt['queued_job_count']}\n"
+                  f"cgroup_member_count={receipt['cgroup_member_count']}\n"
+              )
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="ascii") as stream:
+              stream.write(
+                  "Maintenance state acknowledgement receipt validated. "
+                  f"Capture evidence SHA-256: `{receipt['evidence_sha256']}`. "
+                  "The historical cause remains unknown.\n"
+              )
           PY
-          echo "MAINTENANCE_EVIDENCE status=bound local_evidence_hash_supplied=true"
+          echo "MAINTENANCE_EVIDENCE status=bound host_bound=true historical_cause=unknown"
 
       - name: Validate production SSH inputs
         shell: bash
@@ -872,10 +821,8 @@ jobs:
           PUBLISHER_RUN_ATTEMPT: ${{ steps.evidence.outputs.publisher_run_attempt }}
           ACTION: ${{ inputs.action }}
           ACTION_CONFIRMATION: ${{ inputs.confirmation }}
-          EVIDENCE_SHA256: ${{ inputs.evidence_sha256 }}
-          CAPTURE_EVIDENCE_PATH: ${{ runner.temp }}/platform-maintenance-evidence.json
-          CAPTURE_CIPHERTEXT_DIR: ${{ runner.temp }}/platform-maintenance-capture-artifact
-          RECIPIENT_CERT_PATH: ${{ runner.temp }}/platform-maintenance-recipient.pem
+          EVIDENCE_SHA256: ${{ steps.capture_receipt.outputs.evidence_sha256 }}
+          CAPTURE_RECEIPT_DIR: ${{ runner.temp }}/platform-maintenance-capture-artifact
           CAPTURE_RUN_ID: ${{ inputs.capture_run_id }}
           CAPTURE_RUN_ATTEMPT: ${{ inputs.capture_run_attempt }}
           ACTION_RUN_ID: ${{ github.run_id }}
@@ -886,7 +833,7 @@ jobs:
           case "$ACTION" in
             abort_retained_only) test "$ACTION_CONFIRMATION" = "ABORT-RECOVERY-BOOTSTRAP-RETAINED-ONLY" ;;
             capture_maintenance_failure) test "$ACTION_CONFIRMATION" = "CAPTURE-MAINTENANCE-FAILURE" ;;
-            reset_maintenance_failed) test "$ACTION_CONFIRMATION" = "RESET-MAINTENANCE-FAILED" ;;
+            reset_maintenance_failed) test "$ACTION_CONFIRMATION" = "ACKNOWLEDGE-MAINTENANCE-CURRENT-STATE" ;;
             *) exit 1 ;;
           esac
           remote_stage="$(
@@ -994,7 +941,7 @@ jobs:
           REMOTE
           timeout --foreground 300s scp -F /dev/null -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$BUNDLE" "$PROD_SSH_USER@$PROD_SSH_HOST:$remote_bundle"
           set +e
-          timeout --foreground 300s ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s -- '$remote_stage' '$BUNDLE_SHA' '$SOURCE_SHA' '$SECURITY_RUN_ID' '$SECURITY_RUN_ATTEMPT' '$RECOVERY_RUN_ID' '$RECOVERY_RUN_ATTEMPT' '$RECOVERY_JOB_ID' '$RECOVERY_WORKFLOW_SHA' '$ROUTE_DIGEST' '$ACTION' '$EVIDENCE_SHA256' '$CAPTURE_RUN_ID' '$CAPTURE_RUN_ATTEMPT' '$ACTION_RUN_ID' '$ACTION_RUN_ATTEMPT' '$ACTION_CONFIRMATION'" <<'REMOTE'
+          timeout --foreground 300s ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s -- '$remote_stage' '$BUNDLE_SHA' '$SOURCE_SHA' '$SECURITY_RUN_ID' '$SECURITY_RUN_ATTEMPT' '$RECOVERY_RUN_ID' '$RECOVERY_RUN_ATTEMPT' '$RECOVERY_JOB_ID' '$RECOVERY_WORKFLOW_SHA' '$ROUTE_DIGEST' '$ACTION' '$EVIDENCE_SHA256' '$CAPTURE_RUN_ID' '$CAPTURE_RUN_ATTEMPT' '$ACTION_RUN_ID' '$ACTION_RUN_ATTEMPT' '$ACTION_CONFIRMATION'" > "$RUNNER_TEMP/maintenance-action.stdout" 2> "$RUNNER_TEMP/maintenance-action.stderr" <<'REMOTE'
           set -Eeuo pipefail
           umask 077
           stage="$1"; expected_sha="$2"; source_sha="$3"; security_run_id="$4"; security_run_attempt="$5"; recovery_run_id="$6"; recovery_run_attempt="$7"; recovery_job_id="$8"; recovery_workflow_sha="$9"; route_digest="${10}"; action="${11}"; evidence_sha="${12}"; capture_run_id="${13}"; capture_run_attempt="${14}"; action_run_id="${15}"; action_run_attempt="${16}"; action_confirmation="${17}"; bundle="$stage/bundle.zip"; app_dir=/opt/oldsparky/platform
@@ -1012,7 +959,7 @@ jobs:
           case "$action" in
             abort_retained_only) test "$action_confirmation" = "ABORT-RECOVERY-BOOTSTRAP-RETAINED-ONLY" ;;
             capture_maintenance_failure) test "$action_confirmation" = "CAPTURE-MAINTENANCE-FAILURE"; [[ "$action_run_id" =~ ^[1-9][0-9]{0,31}$ ]]; [[ "$action_run_attempt" =~ ^[1-9][0-9]{0,31}$ ]] ;;
-            reset_maintenance_failed) test "$action_confirmation" = "RESET-MAINTENANCE-FAILED"; [[ "$evidence_sha" =~ ^[0-9a-f]{64}$ ]]; [[ "$capture_run_id" =~ ^[1-9][0-9]{0,31}$ ]]; [[ "$capture_run_attempt" =~ ^[1-9][0-9]{0,31}$ ]] ;;
+            reset_maintenance_failed) test "$action_confirmation" = "ACKNOWLEDGE-MAINTENANCE-CURRENT-STATE"; [[ "$evidence_sha" =~ ^[0-9a-f]{64}$ ]]; [[ "$capture_run_id" =~ ^[1-9][0-9]{0,31}$ ]]; [[ "$capture_run_attempt" =~ ^[1-9][0-9]{0,31}$ ]] ;;
             *) exit 1 ;;
           esac
           test "$(id -u)" -eq 0
@@ -1057,9 +1004,6 @@ jobs:
             local status="$?"
             trap - EXIT
             set +e
-            if (( status == 0 )) && [[ "$action" == capture_maintenance_failure ]]; then
-              exit 0
-            fi
             local cleanup_status=0
             if [[ -L "$stage" ]]; then
               rm -f -- "$stage" || cleanup_status="$?"
@@ -1201,7 +1145,7 @@ jobs:
               stream.flush()
               os.fsync(stream.fileno())
           PY
-          "$payload/platform_release_lock.sh" --run /usr/bin/python3 -I -B "$payload/platform_recovery_bootstrap.py" install --bundle "$bundle" --app-dir "$app_dir" --expected-bundle-sha "$expected_sha" --source-sha "$source_sha" --provenance "$provenance_path" --capability "$action"
+          "$payload/platform_release_lock.sh" --run /usr/bin/python3 -I -B "$payload/platform_recovery_bootstrap.py" install --bundle "$bundle" --app-dir "$app_dir" --expected-bundle-sha "$expected_sha" --source-sha "$source_sha" --provenance "$provenance_path" --capability "$action" >/dev/null
           generation="$app_dir/shared/.release-recovery/generations/$expected_sha"
           if [[ "$action" == abort_retained_only ]]; then
             test -x "$generation/platform_abort_retained_only.sh"
@@ -1216,53 +1160,81 @@ jobs:
           REMOTE
           capture_remote_status="$?"
           set -e
-          if [[ "$ACTION" != capture_maintenance_failure && "$capture_remote_status" -ne 0 ]]; then
-            exit "$capture_remote_status"
+          if [[ "$ACTION" != capture_maintenance_failure ]]; then
+            cat "$RUNNER_TEMP/maintenance-action.stdout"
           fi
           if [[ "$ACTION" == capture_maintenance_failure ]]; then
-            /usr/bin/python3 -I -B - "$CAPTURE_EVIDENCE_PATH" <<'PY'
-          import os, sys
-          fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-          os.close(fd)
-          PY
-            capture_remote_path="/opt/oldsparky/platform/shared/.release-recovery/maintenance-failure-evidence/${SOURCE_SHA}-${ACTION_RUN_ID}-${ACTION_RUN_ATTEMPT}.json"
-            timeout --foreground 300s scp -F /dev/null -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST:$capture_remote_path" "$CAPTURE_EVIDENCE_PATH"
-            test -f "$CAPTURE_EVIDENCE_PATH" && test ! -L "$CAPTURE_EVIDENCE_PATH"
-            chmod 600 "$CAPTURE_EVIDENCE_PATH"
-            install -d -m 700 "$CAPTURE_CIPHERTEXT_DIR"
-            ciphertext="$CAPTURE_CIPHERTEXT_DIR/evidence.cms"
-            manifest="$CAPTURE_CIPHERTEXT_DIR/manifest.json"
-            python3 -I - "$ciphertext" "$manifest" <<'PY'
-          import os, sys
-          for name in sys.argv[1:]:
-              descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-              os.close(descriptor)
-          PY
-            openssl cms -encrypt -binary -aes-256-gcm -outform DER -in "$CAPTURE_EVIDENCE_PATH" -out "$ciphertext" -recip "$RECIPIENT_CERT_PATH" -keyopt rsa_padding_mode:oaep -keyopt rsa_oaep_md:sha256
-            chmod 600 "$ciphertext"
-            plaintext_size="$(stat -c %s "$CAPTURE_EVIDENCE_PATH")"
-            ciphertext_size="$(stat -c %s "$ciphertext")"
-            ciphertext_sha256="$(sha256sum "$ciphertext" | awk '{print $1}')"
-            python3 -I - "$manifest" "$ciphertext_sha256" "$ciphertext_size" <<'PY'
+            if (( capture_remote_status != 0 )); then
+              printf 'MAINTENANCE_EVIDENCE status=failed historical_cause=unknown\n'
+              exit "$capture_remote_status"
+            fi
+            receipt_line="$(cat "$RUNNER_TEMP/maintenance-action.stdout")"
+            if [[ ! "$receipt_line" =~ ^MAINTENANCE_EVIDENCE\ schema=1\ status=captured\ evidence_sha256=([0-9a-f]{64})\ service_state=failed\ invocation_bound=true\ timer_active=(true|false)\ timer_enabled=(true|false)\ queued_job_count=([0-9]{1,3})\ cgroup_member_count=([0-9]{1,3})\ host_bound=true\ historical_cause=unknown$ ]]; then
+              printf 'MAINTENANCE_EVIDENCE status=failed error_class=receipt_invalid\n' >&2
+              exit 1
+            fi
+            printf 'evidence_sha256=%s\n' "${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+            printf 'evidence_sha256=%s\n' "${BASH_REMATCH[1]}" >> "$GITHUB_STEP_SUMMARY"
+            printf 'service_state=failed\ninvocation_bound=true\ntimer_active=%s\ntimer_enabled=%s\nqueued_job_count=%s\ncgroup_member_count=%s\n' \
+              "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}" "${BASH_REMATCH[5]}" >> "$GITHUB_OUTPUT"
+            printf 'MAINTENANCE_EVIDENCE status=captured service_state=failed invocation_bound=true timer_active=%s timer_enabled=%s queued_job_count=%s cgroup_member_count=%s host_bound=true historical_cause=unknown\n' \
+              "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}" "${BASH_REMATCH[5]}"
+          elif (( capture_remote_status != 0 )); then
+            printf 'Signed recovery capability failed error_class=remote\n' >&2
+            exit "$capture_remote_status"
+          fi
+
+      - name: Validate closed maintenance receipt staging
+        if: ${{ inputs.action == 'capture_maintenance_failure' && steps.maintenance_action.outputs.evidence_sha256 != '' }}
+        shell: bash
+        env:
+          EVIDENCE_SHA256: ${{ steps.maintenance_action.outputs.evidence_sha256 }}
+          SERVICE_STATE: ${{ steps.maintenance_action.outputs.service_state }}
+          INVOCATION_BOUND: ${{ steps.maintenance_action.outputs.invocation_bound }}
+          TIMER_ACTIVE: ${{ steps.maintenance_action.outputs.timer_active }}
+          TIMER_ENABLED: ${{ steps.maintenance_action.outputs.timer_enabled }}
+          QUEUED_JOB_COUNT: ${{ steps.maintenance_action.outputs.queued_job_count }}
+          CGROUP_MEMBER_COUNT: ${{ steps.maintenance_action.outputs.cgroup_member_count }}
+          CAPTURE_RECEIPT_DIR: ${{ runner.temp }}/platform-maintenance-capture-artifact
+          SOURCE_SHA: ${{ steps.evidence.outputs.source_sha }}
+          BUNDLE_SHA: ${{ steps.bundle.outputs.bundle_sha }}
+          SECURITY_RUN_ID: ${{ inputs.security_run_id }}
+          SECURITY_RUN_ATTEMPT: ${{ inputs.security_run_attempt }}
+          RECOVERY_RUN_ID: ${{ steps.evidence.outputs.recovery_run_id }}
+          RECOVERY_RUN_ATTEMPT: ${{ steps.evidence.outputs.recovery_run_attempt }}
+          PUBLISHER_RUN_ID: ${{ steps.evidence.outputs.publisher_run_id }}
+          PUBLISHER_RUN_ATTEMPT: ${{ steps.evidence.outputs.publisher_run_attempt }}
+          CAPTURE_RUN_ID: ${{ github.run_id }}
+          CAPTURE_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          [[ "$EVIDENCE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          install -d -m 700 "$CAPTURE_RECEIPT_DIR"
+          /usr/bin/python3 -I - "$CAPTURE_RECEIPT_DIR/receipt.json" <<'PY'
           import json, os, re, sys
           from pathlib import Path
-          output = Path(sys.argv[1])
-          ciphertext_sha, ciphertext_size = sys.argv[2:]
           env = os.environ
           decimal = re.compile(r"^[1-9][0-9]{0,31}$")
-          for key in ("ACTION_RUN_ID", "ACTION_RUN_ATTEMPT", "SECURITY_RUN_ID", "SECURITY_RUN_ATTEMPT", "RECOVERY_RUN_ID", "RECOVERY_RUN_ATTEMPT", "PUBLISHER_RUN_ID", "PUBLISHER_RUN_ATTEMPT"):
+          for key in ("CAPTURE_RUN_ID", "CAPTURE_RUN_ATTEMPT", "SECURITY_RUN_ID", "SECURITY_RUN_ATTEMPT", "RECOVERY_RUN_ID", "RECOVERY_RUN_ATTEMPT", "PUBLISHER_RUN_ID", "PUBLISHER_RUN_ATTEMPT"):
               if not decimal.fullmatch(env[key]):
-                  raise SystemExit("maintenance capture run binding is invalid")
-          recipient = env["RECIPIENT_CERTIFICATE_FINGERPRINT"]
-          if not re.fullmatch(r"[0-9a-f]{64}", recipient):
-              raise SystemExit("maintenance capture recipient pin is invalid")
+                  raise SystemExit("maintenance receipt run binding is invalid")
+          if not re.fullmatch(r"[0-9a-f]{40,64}", env["SOURCE_SHA"]) or not re.fullmatch(r"[0-9a-f]{64}", env["BUNDLE_SHA"]) or not re.fullmatch(r"[0-9a-f]{64}", env["EVIDENCE_SHA256"]):
+              raise SystemExit("maintenance receipt identity is invalid")
+          if (env["SERVICE_STATE"] != "failed" or env["INVOCATION_BOUND"] != "true"
+              or env["TIMER_ACTIVE"] not in {"true", "false"}
+              or env["TIMER_ENABLED"] not in {"true", "false"}
+              or not re.fullmatch(r"(?:0|[1-9][0-9]{0,2})", env["QUEUED_JOB_COUNT"])
+              or int(env["QUEUED_JOB_COUNT"]) > 256
+              or not re.fullmatch(r"(?:0|[1-9][0-9]{0,2})", env["CGROUP_MEMBER_COUNT"])
+              or int(env["CGROUP_MEMBER_COUNT"]) > 256):
+              raise SystemExit("maintenance receipt state summary is invalid")
           payload = {
               "schema": 1,
-              "kind": "encrypted_maintenance_failure_report",
+              "kind": "maintenance_failure_receipt",
               "repository": "StrayForest/old_sparky",
               "workflow_path": ".github/workflows/platform-production-recovery-bootstrap-abort.yml",
-              "capture_run_id": env["ACTION_RUN_ID"],
-              "capture_run_attempt": env["ACTION_RUN_ATTEMPT"],
+              "capture_run_id": env["CAPTURE_RUN_ID"],
+              "capture_run_attempt": env["CAPTURE_RUN_ATTEMPT"],
               "source_sha": env["SOURCE_SHA"],
               "bundle_sha256": env["BUNDLE_SHA"],
               "security_run_id": env["SECURITY_RUN_ID"],
@@ -1271,58 +1243,32 @@ jobs:
               "recovery_run_attempt": env["RECOVERY_RUN_ATTEMPT"],
               "publisher_run_id": env["PUBLISHER_RUN_ID"],
               "publisher_run_attempt": env["PUBLISHER_RUN_ATTEMPT"],
-              "recipient_certificate_sha256": recipient,
-              "encryption": "CMS-EnvelopedData/AES-256-GCM/RSA-OAEP-SHA-256",
-              "ciphertext_sha256": ciphertext_sha,
-              "ciphertext_size": int(ciphertext_size),
+              "evidence_sha256": env["EVIDENCE_SHA256"],
+              "service_state": env["SERVICE_STATE"],
+              "invocation_bound": True,
+              "timer_active": env["TIMER_ACTIVE"] == "true",
+              "timer_enabled": env["TIMER_ENABLED"] == "true",
+              "queued_job_count": int(env["QUEUED_JOB_COUNT"]),
+              "cgroup_member_count": int(env["CGROUP_MEMBER_COUNT"]),
+              "host_bound": True,
+              "historical_cause": "unknown",
           }
-          plaintext = json.loads(Path(os.environ["CAPTURE_EVIDENCE_PATH"]).read_text(encoding="ascii"))
-          if (not isinstance(plaintext, dict)
-              or plaintext.get("kind") not in {"maintenance_failure_evidence", "maintenance_failure_diagnostic"}
-              or not re.fullmatch(r"[0-9a-f]{40,64}", payload["source_sha"])
-              or not re.fullmatch(r"[0-9a-f]{64}", payload["bundle_sha256"])
-              or not re.fullmatch(r"[0-9a-f]{64}", ciphertext_sha)
-              or not 1 <= payload["ciphertext_size"] <= 384 * 1024):
-              raise SystemExit("maintenance capture manifest fields are outside their bounds")
           raw = (json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
-          descriptor = os.open(output, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
-          with os.fdopen(descriptor, "wb") as stream:
+          fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+          with os.fdopen(fd, "wb") as stream:
               stream.write(raw); stream.flush(); os.fsync(stream.fileno())
           PY
-            test "$plaintext_size" -le 262144 && test "$ciphertext_size" -le 393216
-            printf 'encrypted_artifact_ready=true\ncapture_remote_status=%s\n' "$capture_remote_status" >> "$GITHUB_OUTPUT"
-            rm -f -- "$CAPTURE_EVIDENCE_PATH" "$RECIPIENT_CERT_PATH" "$RUNNER_TEMP/platform-maintenance-recipient-public.pem" "$RUNNER_TEMP/platform-cms-capability.der"
-            test ! -e "$CAPTURE_EVIDENCE_PATH" && test ! -e "$RECIPIENT_CERT_PATH"
-            printf 'MAINTENANCE_EVIDENCE status=encrypted ciphertext_sha256=%s recipient_certificate_sha256=%s\n' "$ciphertext_sha256" "$RECIPIENT_CERTIFICATE_FINGERPRINT"
-            if (( capture_remote_status != 0 )); then
-              exit "$capture_remote_status"
-            fi
-          fi
+          test "$(stat -c %a "$CAPTURE_RECEIPT_DIR/receipt.json")" = 600
+          test "$(find "$CAPTURE_RECEIPT_DIR" -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 1
 
-      - name: Validate ciphertext-only capture artifact staging
-        if: ${{ always() && inputs.action == 'capture_maintenance_failure' && steps.maintenance_action.outputs.encrypted_artifact_ready == 'true' }}
-        shell: bash
-        env:
-          CAPTURE_EVIDENCE_PATH: ${{ runner.temp }}/platform-maintenance-evidence.json
-          CAPTURE_CIPHERTEXT_DIR: ${{ runner.temp }}/platform-maintenance-capture-artifact
-        run: |
-          set -euo pipefail
-          test ! -e "$CAPTURE_EVIDENCE_PATH"
-          test ! -e "$RUNNER_TEMP/platform-maintenance-recipient.pem"
-          test -f "$CAPTURE_CIPHERTEXT_DIR/evidence.cms"
-          test -f "$CAPTURE_CIPHERTEXT_DIR/manifest.json"
-          test "$(find "$CAPTURE_CIPHERTEXT_DIR" -maxdepth 1 -type f | wc -l)" -eq 2
-          test "$(stat -c %a "$CAPTURE_CIPHERTEXT_DIR/evidence.cms")" = 600
-          test "$(stat -c %a "$CAPTURE_CIPHERTEXT_DIR/manifest.json")" = 600
-
-      - name: Upload encrypted maintenance failure evidence
-        if: ${{ always() && inputs.action == 'capture_maintenance_failure' && steps.maintenance_action.outputs.encrypted_artifact_ready == 'true' }}
+      - name: Upload closed maintenance receipt
+        if: ${{ inputs.action == 'capture_maintenance_failure' && steps.maintenance_action.outputs.evidence_sha256 != '' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: platform-maintenance-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          name: platform-maintenance-receipt-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/platform-maintenance-capture-artifact/*
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 14
 
       - name: Remove production SSH material
         if: ${{ always() }}
@@ -1336,7 +1282,7 @@ jobs:
             rmdir -- "$ssh_dir"
           fi
           test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
-          rm -f -- "$RUNNER_TEMP/platform-maintenance-evidence.json" "$RUNNER_TEMP/platform-maintenance-recipient.pem" "$RUNNER_TEMP/platform-maintenance-recipient-public.pem" "$RUNNER_TEMP/platform-cms-capability.der"
+          rm -f -- "$RUNNER_TEMP/maintenance-action.stdout" "$RUNNER_TEMP/maintenance-action.stderr"
           capture_artifact_dir="$RUNNER_TEMP/platform-maintenance-capture-artifact"
           if [[ -e "$capture_artifact_dir" || -L "$capture_artifact_dir" ]]; then
             test -d "$capture_artifact_dir" && test ! -L "$capture_artifact_dir"

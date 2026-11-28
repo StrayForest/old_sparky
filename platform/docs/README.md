@@ -84,7 +84,7 @@ for the task. Open deeper references only when the task needs them.
 - Candidate forward-migration safety: [candidate forward migration guard](adr/candidate-forward-migration-guard.md).
 - Immutable retained-release recovery bootstrap: [recovery bootstrap ADR](adr/recovery-bootstrap-retained-abort.md), [first-install systemd ADR](adr/first-install-systemd-activation.md), and [deployment runbook](deployment-runbook.md#immutable-recovery-bootstrap).
 - Prune one consumed quarantined candidate: [signed quarantine-pruning ADR](adr/quarantined-candidate-pruning.md) and [deployment runbook](deployment-runbook.md#immutable-recovery-bootstrap).
-- Failed maintenance evidence and guarded reset: [encrypted evidence transport ADR](adr/maintenance-failure-evidence-encryption.md), [failure capture and reset ADR](adr/maintenance-failure-capture-and-reset.md), and [deployment runbook](deployment-runbook.md#immutable-recovery-bootstrap).
+- Failed maintenance evidence and current-state acknowledgement: [host-local evidence ADR](adr/maintenance-failure-host-local-evidence.md) and [deployment runbook](deployment-runbook.md#immutable-recovery-bootstrap). The [encrypted transport ADR](adr/maintenance-failure-evidence-encryption.md) is historical.
 - Report-only failed-deployment recovery: [recovery bootstrap ADR](adr/recovery-bootstrap-retained-abort.md#operator-recovery-deployment-for-a-report-only-invalid-marker) and [manual workflow fallback](deployment-runbook.md#manual-workflow-fallback).
 - Secret-bearing workflow artifact boundary: [secret-job artifact boundary ADR](adr/secret-job-artifact-boundary.md).
 - Release-independent host-tools generations and trusted PR handoff: [host-tools provisioning ADR](adr/production-host-tools-provisioning.md).

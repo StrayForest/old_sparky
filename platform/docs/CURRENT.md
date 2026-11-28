@@ -57,16 +57,22 @@ belong in the linked owner documents below.
   and overflow assertions. Earlier capture failures remain without a proven
   internal browser cause; this passing run does not establish one. See the
   [CSP/live-QA runbook](csp-live-qa-runbook.md).
-- The latest installed-unit-bound storage preview remains the dry-run after
-  Public child `46098379744/1`: 4 user-cache candidates, 3 busy, 0 removed;
-  6 unregistered task directories were left untouched. The 2026-11-28 02:37
-  UTC maintenance invocation failed with the closed lock-failure marker; its
-  service remains failed (`exit-code`) and the timer remains active and
-  enabled. No matching encrypted-evidence recipient was found in the
-  inspected protected operator paths, so no current post-run storage preview
-  or retention deletion has been performed. Preserve the failure state and
-  follow the encrypted maintenance evidence procedure before any reset or
-  retry. The CI Siteverify fixture does not establish production Cloudflare
+- The 2026-11-28 02:37 UTC maintenance invocation failed with a closed lock
+  marker. Its historical lock owner and exact cause remain unknown. Read-only
+  storage diagnostics `46115005011/1` refreshed the timer only: it is
+  active+enabled and source-matched, with last trigger `2026-11-28T02:37:06Z`
+  and next trigger `2026-11-29T02:31:07Z`. That run did not query the maintenance
+  service, so its current service state is unrefreshed. Its source-bound full
+  storage dry-run reported `ok=true`, 10 release candidates, 7 hypothetical
+  deletions, 2 protected current/previous releases, and 2.333 GB estimated
+  reclaim; it performed no deletion. This is not the installed-unit-bound
+  acknowledgement preview. Disk use was 68.98% with 12.398 GB free; the latest
+  backup was restore-verified at 2.866 hours old. Use the certificate-free
+  host-local capture and current-state acknowledgement route in the
+  [deployment runbook](deployment-runbook.md#immutable-recovery-bootstrap).
+  A capture reports cause as unknown unless bounded current evidence proves
+  otherwise. Do not start maintenance or treat resetting failed metadata as a
+  fix. The CI Siteverify fixture does not establish production Cloudflare
   challenge/scoring.
 - The 11-cell production matrix is complete, but cell 9 failed its stress
   contract with unknown capacity attribution; no server capacity ceiling is

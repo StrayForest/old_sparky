@@ -1,6 +1,6 @@
 # Signed maintenance failure capture and reset — superseded
 
-- Status: Superseded by [encrypted evidence transport](maintenance-failure-evidence-encryption.md)
+- Status: Superseded by [host-local evidence and current-state acknowledgement](maintenance-failure-host-local-evidence.md)
 - Date: 2026-10-16
 - Owners: Platform release maintainers
 
@@ -14,9 +14,10 @@ collected and reviewed.
 ## Decision
 
 This ADR records the original private-repository artifact boundary. Its
-transport and capture preconditions are superseded. Follow the [encrypted
-evidence transport ADR](maintenance-failure-evidence-encryption.md) for the
-current artifact, local decryption, capture and reset requirements.
+transport and capture preconditions are superseded. Follow the [host-local
+evidence ADR](maintenance-failure-host-local-evidence.md) for current capture
+and acknowledgement requirements. The intermediate CMS transport decision is
+preserved in the [encrypted evidence ADR](maintenance-failure-evidence-encryption.md).
 
 Two separate capabilities use the existing recovery-bootstrap producer,
 publisher, provenance and attestation chain. Both actions accept only the

@@ -181,8 +181,14 @@ PY
 ## Failure boundaries
 
 - A backup or restore-drill failure stops deletion in the full sweep. Inspect
-  the maintenance journal and resolve the specific failure; do not repeatedly
-  retry a production load or silently bypass the backup gate.
+  the maintenance failure through the certificate-free, source-bound
+  `capture_maintenance_failure` and `reset_maintenance_failed` actions in
+  `platform/docs/deployment-runbook.md` under “Immutable recovery bootstrap”.
+  Raw evidence stays on the host; the receipt artifact contains only closed
+  provenance and a digest. The acknowledgement is current-state handling, not
+  a repair or historical cause claim. Do not start maintenance, apply retention,
+  repeatedly retry a production load, or bypass the backup gate until fresh
+  readiness and the installed-unit-bound preview pass.
 - A held release/build/live-QA lock means wait or inspect the owner. Do not
   kill the owner process or delete its temporary files.
 - An unexpected symlink, ownership, inode, pending transaction, service state,

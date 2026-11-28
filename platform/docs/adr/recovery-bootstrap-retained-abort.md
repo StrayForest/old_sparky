@@ -10,12 +10,12 @@ This ADR remains authoritative for the operation-less v1/v2 compatibility
 bridges and retained-release recovery provenance.
 
 The recovery generation also carries the fixed `capture_maintenance_failure`
-and `reset_maintenance_failed` capabilities. Their evidence transport uses a
-source-pinned X.509 recipient and client-side CMS encryption; only ciphertext
-and a closed manifest may leave Actions. The durable host evidence, local
-decryption, and plaintext-hash reset contract are defined in the [maintenance
-evidence encryption ADR](maintenance-failure-evidence-encryption.md). These
-capabilities do not alter retained-release recovery or authorize service start.
+and `reset_maintenance_failed` capabilities. Their raw diagnostics remain in
+root-only host storage; Actions receives only a closed, source/run-bound receipt
+with safe state facts and an automatically bound evidence digest. The current
+handling is defined in the [host-local maintenance evidence ADR](maintenance-failure-host-local-evidence.md).
+These capabilities do not alter retained-release recovery or authorize service
+start.
 
 ## Context
 

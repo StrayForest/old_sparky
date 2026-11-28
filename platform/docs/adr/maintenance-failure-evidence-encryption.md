@@ -1,11 +1,16 @@
-# Encrypted maintenance failure evidence transport
+# Encrypted maintenance failure evidence transport — superseded
 
-- Status: Accepted
+- Status: Superseded by [host-local evidence and current-state acknowledgement](maintenance-failure-host-local-evidence.md)
 - Date: 2026-10-16
 - Owners: Platform release maintainers
 - Supersedes: [private-repository transport in the original capture/reset ADR](maintenance-failure-capture-and-reset.md)
 
 ## Context
+
+This ADR preserves the prior encrypted transport decision for historical
+context. Current maintenance capture and acknowledgement follow the
+[host-local evidence decision](maintenance-failure-host-local-evidence.md);
+operators no longer need to provide a certificate or private key.
 
 The repository is public, so GitHub Actions artifacts cannot contain raw host
 evidence. Cause review still needs the bounded unit properties, transaction
