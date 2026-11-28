@@ -10,14 +10,14 @@ belong in the linked owner documents below.
 
 ## Live and pending state
 
-- Production currently runs application source
-  `7895e32da29a6e53a8d8e6cceeb45e2aea93ace1` in automatic release
-  `gha-46097693180-1-7895e32da29a`; exact-SHA Security run `46090132339/2`,
-  source-bound backup `46097392702/1` with restore verification, deployment
-  `46097693180/1` and post-deploy activation passed. The separately installed
-  shared host-tools generation is `b655b2969c70e8787805d98ebb61a8a3e6a7bd74`.
-  The
-  host-tools pin and app release are separate identities. See the
+- Production runs application source
+  `259118797db9b000fab061888cff8c3433420457` in automatic release
+  `gha-46102005767-1-259118797db9`. Exact-SHA Security run
+  `46100564969/1`, source-bound restore-verified backup `46101741188/1`,
+  deployment `46102005767/1` and post-deploy activation passed. The separately
+  installed shared host-tools generation is
+  `b655b2969c70e8787805d98ebb61a8a3e6a7bd74`. The host-tools pin and app
+  release are separate identities. See the
   [host-tools provisioning ADR](adr/production-host-tools-provisioning.md) and
   [deployment runbook](deployment-runbook.md) for their source-bound procedures.
 - Installed-origin API acceptance for patch `1848664643342973` passed: the
@@ -46,23 +46,28 @@ belong in the linked owner documents below.
 - After successful roster provisioning, the deployed release includes
   automatic exact cleanup for a confirmed terminal Public failure and
   preserves the fixed browser-output protocol.
-- Automatic post-deploy QA for source
-  `7895e32da29a6e53a8d8e6cceeb45e2aea93ace1`, deployment parent
-  `46097693180/1` and exact Public child `46098379744/1` failed with 55 passed,
-  1 failed, 10 skipped, and 0 flaky, timed-out, interrupted or retried
-  attempts. Public cleanup is `cleaned`; UserQA was not dispatched. The sole
-  failure was `objective_icons` during its final screenshot capture, classified
-  as `protocol_capture_error`; the retained evidence does not identify a more
-  specific capture cause. The test already passed its route, HTTP/MIME, PNG
-  signature and overflow assertions. A pending change makes this artifact
-  viewport-sized while preserving those checks; the failure is not yet
-  resolved. See the [CSP/live-QA runbook](csp-live-qa-runbook.md).
-- The installed-unit-bound storage retention preview after Public child
-  `46098379744/1` completed in dry-run mode: 4 user-cache candidates, 3 busy,
-  0 removed; 6 unregistered task directories were left untouched. The
-  maintenance timer remains active and enabled. No retention deletion was
-  performed. The CI Siteverify
-  fixture does not establish production Cloudflare challenge/scoring.
+- Automatic Public QA for source
+  `259118797db9b000fab061888cff8c3433420457`, deployment parent
+  `46102642752/1` and exact Public child `46102660292/1` passed: 56 passed,
+  10 skipped, 66 total, and zero failed, flaky, timed-out or interrupted
+  attempts. UserQA child `46103242805/1` passed 1/1; sequencer parent
+  `46102642752/1` succeeded. Public and UserQA cleanup completed, and the
+  fixed LiveQA credential files are absent. The objective screenshot now
+  captures the viewport while retaining the route, HTTP/MIME, PNG-signature
+  and overflow assertions. Earlier capture failures remain without a proven
+  internal browser cause; this passing run does not establish one. See the
+  [CSP/live-QA runbook](csp-live-qa-runbook.md).
+- The latest installed-unit-bound storage preview remains the dry-run after
+  Public child `46098379744/1`: 4 user-cache candidates, 3 busy, 0 removed;
+  6 unregistered task directories were left untouched. The 2026-11-28 02:37
+  UTC maintenance invocation failed with the closed lock-failure marker; its
+  service remains failed (`exit-code`) and the timer remains active and
+  enabled. No matching encrypted-evidence recipient was found in the
+  inspected protected operator paths, so no current post-run storage preview
+  or retention deletion has been performed. Preserve the failure state and
+  follow the encrypted maintenance evidence procedure before any reset or
+  retry. The CI Siteverify fixture does not establish production Cloudflare
+  challenge/scoring.
 - The 11-cell production matrix is complete, but cell 9 failed its stress
   contract with unknown capacity attribution; no server capacity ceiling is
   certified. Cell 7's client/origin request join remains unresolved. A recent
