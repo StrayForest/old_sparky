@@ -1630,8 +1630,8 @@ for (const slotIndex of [0, 1, 2, 3] as const) {
     ));
     if (celesteIndex >= 0) {
       const celesteSection = renderedSections.nth(celesteIndex);
-      await expect(celesteSection.getByRole("heading", { level: 2 })).toHaveText("Celeste");
-      await expect(celesteSection.getByText("СЕЛЕСТА", { exact: true })).toHaveCount(0);
+      await expect(celesteSection.getByRole("heading", { level: 2 }))
+        .toHaveText(sectionHeading(patch.sections[celesteIndex]!));
       await celesteSection.locator(".patch-ability-icon").first().scrollIntoViewIfNeeded();
       await expect.poll(() => celesteSection.locator(".patch-ability-icon").first().evaluate((image) => (
         (image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth > 0

@@ -101,6 +101,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          /usr/bin/python3 platform/tools/platform_workflow_input_guard.py bounded-int \
+            --value "$MAX_OPENAI_CALLS" \
+            --minimum 1 \
+            --maximum 6
           /usr/bin/python3 - "$MAX_OPENAI_CALLS" "$REPAIR_PATCH_IDS" "$GITHUB_OUTPUT" <<'PY'
           import re
           import sys

@@ -1962,12 +1962,12 @@ test("patch detail keeps objective sections, the upper cover crop, and no source
     "Нестабильный разлом",
     "Mid Boss",
     "Crushing Fists",
-    "The Doorman"
+    "Привратник"
   ]);
   await expect(patchSections.nth(1)).toHaveClass(/objective-patch-section/u);
   await expect(patchSections.nth(2)).toHaveClass(/objective-patch-section/u);
-  await expect(patchSections.nth(5).getByText("Привратник", { exact: true })).toHaveCount(0);
-  await expect(patchSections.nth(5).getByRole("heading", { level: 2, name: "The Doorman" })).toBeVisible();
+  await expect(patchSections.nth(5).getByRole("heading", { level: 2, name: "Привратник" })).toHaveCount(1);
+  await expect(patchSections.nth(5).locator(".patch-hero-canonical-name")).toHaveText("The Doorman");
   await expect(patchSections.nth(5).getByText("Хозяин дверей и скрытых проходов.", { exact: true })).toBeVisible();
   await expect(patchSections.nth(5).getByText("Подробности героя появятся после обновления данных.", { exact: true })).toBeVisible();
   await expect(patchSections.nth(5).locator(".patch-hero-image")).toHaveAttribute(

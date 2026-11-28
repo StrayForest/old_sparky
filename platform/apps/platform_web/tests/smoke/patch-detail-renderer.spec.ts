@@ -470,8 +470,8 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
     ));
     if (celesteIndex >= 0) {
       const celeste = sections.nth(celesteIndex);
-      await expect(celeste.getByRole("heading", { level: 2 })).toHaveText("Celeste");
-      await expect(celeste.getByText("СЕЛЕСТА", { exact: true })).toHaveCount(0);
+      await expect(celeste.getByRole("heading", { level: 2 }))
+        .toHaveText(sectionHeading(fixture!.sections[celesteIndex]!));
       await celeste.locator(".patch-ability").first().scrollIntoViewIfNeeded();
       await expect.poll(() => celeste.locator(".patch-ability-icon").first().evaluate((image) => (
         (image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth > 0
