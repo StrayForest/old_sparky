@@ -58,22 +58,28 @@ belong in the linked owner documents below.
   internal browser cause; this passing run does not establish one. See the
   [CSP/live-QA runbook](csp-live-qa-runbook.md).
 - The 2026-11-28 02:37 UTC maintenance invocation failed with a closed lock
-  marker. Its historical lock owner and exact cause remain unknown. Read-only
-  storage diagnostics `46115005011/1` refreshed the timer only: it is
-  active+enabled and source-matched, with last trigger `2026-11-28T02:37:06Z`
-  and next trigger `2026-11-29T02:31:07Z`. That run did not query the maintenance
-  service, so its current service state is unrefreshed. Its source-bound full
-  storage dry-run reported `ok=true`, 10 release candidates, 7 hypothetical
-  deletions, 2 protected current/previous releases, and 2.333 GB estimated
-  reclaim; it performed no deletion. This is not the installed-unit-bound
-  acknowledgement preview. Disk use was 68.98% with 12.398 GB free; the latest
-  backup was restore-verified at 2.866 hours old. Use the certificate-free
-  host-local capture and current-state acknowledgement route in the
-  [deployment runbook](deployment-runbook.md#immutable-recovery-bootstrap).
-  A capture reports cause as unknown unless bounded current evidence proves
-  otherwise. Do not start maintenance or treat resetting failed metadata as a
-  fix. The CI Siteverify fixture does not establish production Cloudflare
-  challenge/scoring.
+  marker. Its historical lock owner and exact cause remain unknown. The
+  certificate-free capture `46130553213/1`, bound to Security
+  `46128787815/1`, recovery producer `46129738168/1` and publisher
+  `46129774355/1` for source
+  `58bcf332d6b0329d618384c97eadce067f679922`, recorded the service as failed
+  with a bound invocation, active+enabled timer, no queued jobs and no cgroup
+  members. The exact current-state acknowledgement `46130730347/1` succeeded;
+  it reset only systemd failure metadata and did not establish a historical
+  cause or maintenance success. Read-only storage diagnostics `46130890080/1`
+  then reported an unlocked host, active API/worker/web services, an
+  active+enabled source-matched timer with no drop-ins, and a restore/Alembic/
+  checksum-verified backup. Disk use was 68% with 12.342 GB free, above the
+  shared minimum. The installed-unit-bound retention preview returned
+  `status=ok`, `mode=dry-run`; its summary showed 2 protected and 6 retained
+  production releases with 7 proposed deletions. No production deletion or
+  maintenance-service start was performed. The app release remains
+  `259118797db9b000fab061888cff8c3433420457`; its existing Public/UserQA
+  passes remain the current application QA evidence. This storage report did
+  not include a fresh `platform_health_monitor.py` strict-readiness record; an
+  external health URL check from the runner returned 403 and is inconclusive
+  about origin readiness. See the certificate-free capture and acknowledgement
+  procedure in the [deployment runbook](deployment-runbook.md#immutable-recovery-bootstrap).
 - The 11-cell production matrix is complete, but cell 9 failed its stress
   contract with unknown capacity attribution; no server capacity ceiling is
   certified. Cell 7's client/origin request join remains unresolved. A recent

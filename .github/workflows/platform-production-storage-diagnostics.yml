@@ -451,6 +451,8 @@ jobs:
           backup_file=""
           timer_file=""
           timer_dir=""
+          health_dir=""
+          health_report=""
           retention_file=""
           retention_preview_file=""
           liveqa_preview_file=""
@@ -458,6 +460,8 @@ jobs:
             [[ -z "$backup_file" ]] || rm -f -- "$backup_file"
             [[ -z "$timer_file" ]] || rm -f -- "$timer_file"
             [[ -z "$timer_dir" ]] || rmdir -- "$timer_dir" 2>/dev/null || true
+            [[ -z "$health_report" ]] || rm -f -- "$health_report"
+            [[ -z "$health_dir" ]] || rmdir -- "$health_dir" 2>/dev/null || true
             [[ -z "$retention_file" ]] || rm -f -- "$retention_file"
             [[ -z "$retention_preview_file" ]] || rm -f -- "$retention_preview_file"
             [[ -z "$liveqa_preview_file" ]] || rm -f -- "$liveqa_preview_file"
@@ -585,6 +589,173 @@ jobs:
             || report_failure identity release_identity_invalid 1
           printf '{"schema":1,"kind":"platform_storage_diagnostics","active_release_id":"%s","active_source_sha":"%s","previous_release_id":"%s","previous_source_sha":"%s"}\n' \
             "$current_id" "$active_sha" "$previous_id" "$previous_sha"
+
+          CURRENT_STAGE=strict_readiness
+          health_dir="$(mktemp -d)" || report_failure strict_readiness private_workspace_unavailable 2
+          chmod 700 "$health_dir"
+          umask 077
+          health_report="$health_dir/report.json"
+          health_rc=0
+          if timeout --foreground 90s \
+            "$runtime/releases/$current_id/tools/platform_release_lock.sh" --run \
+            /usr/bin/bash -s -- "$runtime" "$current_id" "$active_sha" "$health_report" "$python_bin" \
+            2>/dev/null <<'HEALTH_CHECK'
+          set -Eeuo pipefail
+          umask 077
+          runtime="$1"
+          release_id="$2"
+          source_sha="$3"
+          report_path="$4"
+          python_bin="$5"
+          release_dir="$runtime/releases/$release_id"
+          current="$runtime/current"
+          verify_release_identity() {
+            test -L "$current" \
+              && test "$(readlink -f "$current")" = "$release_dir" \
+              || return 1
+            "$python_bin" -I -B - "$release_dir" "$release_id" "$source_sha" <<'IDENTITY'
+          import json
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+
+          release_dir = Path(sys.argv[1])
+          release_id, source_sha = sys.argv[2:]
+          release = Path(os.path.realpath(release_dir))
+          if release != release_dir or release.name != release_id:
+              raise SystemExit(21)
+          path = release / "RELEASE.json"
+          named = path.lstat()
+          if not stat.S_ISREG(named.st_mode) or named.st_uid != os.geteuid() or named.st_nlink != 1 or named.st_size > 65536:
+              raise SystemExit(22)
+          descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+          try:
+              opened = os.fstat(descriptor)
+              if (opened.st_dev, opened.st_ino, opened.st_size) != (named.st_dev, named.st_ino, named.st_size):
+                  raise SystemExit(23)
+              raw = bytearray()
+              while len(raw) <= 65536:
+                  block = os.read(descriptor, min(8192, 65537 - len(raw)))
+                  if not block:
+                      break
+                  raw.extend(block)
+              final = os.fstat(descriptor)
+          finally:
+              os.close(descriptor)
+          if len(raw) != named.st_size or (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns) != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns):
+              raise SystemExit(24)
+          def unique_pairs(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError
+                  result[key] = value
+              return result
+          try:
+              record = json.loads(raw, object_pairs_hook=unique_pairs)
+          except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+              raise SystemExit(25)
+          if not isinstance(record, dict) or record.get("release_slug") != release_id or record.get("source_git_commit") != source_sha:
+              raise SystemExit(26)
+          IDENTITY
+          }
+          verify_release_identity || exit 20
+          ulimit -f 128
+          set +e
+          "$python_bin" -I -B "$release_dir/tools/platform_health_monitor.py" \
+            --disk-min-free-gib 5 --disk-max-used-percent 90 \
+            >"$report_path" 2>/dev/null
+          monitor_rc=$?
+          set -e
+          verify_release_identity || exit 27
+          exit "$monitor_rc"
+          HEALTH_CHECK
+          then
+            health_rc=0
+          else
+            health_rc=$?
+          fi
+          test -f "$health_report" && chmod 600 "$health_report" \
+            || report_failure strict_readiness report_unavailable 2
+          health_summary="$(/usr/bin/python3 -I -B - "$health_report" "$health_rc" <<'HEALTH_SUMMARY'
+          import json
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+          from datetime import datetime
+
+          report_path = Path(sys.argv[1])
+          try:
+              command_status = int(sys.argv[2])
+              named = report_path.lstat()
+              if not stat.S_ISREG(named.st_mode) or stat.S_ISLNK(named.st_mode) or named.st_uid != os.geteuid() or stat.S_IMODE(named.st_mode) != 0o600 or named.st_nlink != 1 or named.st_size > 65536:
+                  raise ValueError
+              descriptor = os.open(report_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+              try:
+                  opened = os.fstat(descriptor)
+                  if (opened.st_dev, opened.st_ino, opened.st_size) != (named.st_dev, named.st_ino, named.st_size):
+                      raise ValueError
+                  raw = bytearray()
+                  while len(raw) <= 65536:
+                      block = os.read(descriptor, min(8192, 65537 - len(raw)))
+                      if not block:
+                          break
+                      raw.extend(block)
+                  final = os.fstat(descriptor)
+              finally:
+                  os.close(descriptor)
+              after = report_path.lstat()
+              if len(raw) != named.st_size or (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns) != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns) or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != (named.st_dev, named.st_ino, named.st_size, named.st_mtime_ns):
+                  raise ValueError
+              def unique_pairs(pairs):
+                  result = {}
+                  for key, value in pairs:
+                      if key in result:
+                          raise ValueError
+                      result[key] = value
+                  return result
+              report = json.loads(bytes(raw).decode("utf-8", "strict"), object_pairs_hook=unique_pairs)
+              names = {
+                  "service:deadlock-api", "service:deadlock-worker",
+                  "service:deadlock-web", "service:nginx", "api_ready",
+                  "disk", "memory", "backup", "certificate",
+              }
+              if (
+                  command_status not in {0, 1}
+                  or not isinstance(report, dict)
+                  or set(report) != {"event", "timestamp", "ok", "failed", "checks"}
+                  or report.get("event") != "platform_health_monitor"
+                  or not isinstance(report.get("timestamp"), str)
+                  or type(report.get("ok")) is not bool
+                  or not isinstance(report.get("failed"), list)
+                  or any(not isinstance(item, str) or item not in names for item in report["failed"])
+                  or not isinstance(report.get("checks"), list)
+                  or len(report["checks"]) != len(names)
+              ):
+                  raise ValueError
+              timestamp = datetime.fromisoformat(report["timestamp"].replace("Z", "+00:00"))
+              if timestamp.tzinfo is None:
+                  raise ValueError
+              checks = {}
+              for check in report["checks"]:
+                  if not isinstance(check, dict) or set(check) != {"name", "ok", "detail"} or check.get("name") not in names or type(check.get("ok")) is not bool or not isinstance(check.get("detail"), dict) or check["name"] in checks:
+                      raise ValueError
+                  checks[check["name"]] = check["ok"]
+              failed = sorted(name for name, ok in checks.items() if not ok)
+              if set(checks) != names or failed != sorted(report["failed"]) or report["ok"] != (not failed) or command_status != (0 if report["ok"] else 1):
+                  raise ValueError
+              result = {"schema": 1, "kind": "health_monitor_state", "status": "ok" if report["ok"] else "failed", "checks": {name: checks[name] for name in sorted(checks)}, "failed_count": len(failed)}
+          except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError, TypeError):
+              result = {"schema": 1, "kind": "health_monitor_state", "status": "unavailable", "reason": "report_invalid"}
+          print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+          HEALTH_SUMMARY
+          )" || report_failure strict_readiness summary_contract 2
+          printf '%s\n' "$health_summary"
+          health_status="$(printf '%s\n' "$health_summary" | /usr/bin/python3 -I -c 'import json,sys; record=json.load(sys.stdin); print(record.get("status", "unavailable"))')"
+          health_failure_code=0
+          [[ "$health_status" == ok ]] || health_failure_code=1
 
           CURRENT_STAGE=retained_load_lock
           retained_load_lock=/run/lock/oldsparky-retained-load-matrix.lock
@@ -1561,6 +1732,10 @@ jobs:
             || report_failure identity_recheck release_pointer_changed 1
           if (( retention_failure_code != 0 )); then
             exit "$retention_failure_code"
+          fi
+          if (( health_failure_code != 0 )); then
+            printf '{"schema":1,"kind":"collection_failure","status":"failed","stage":"strict_readiness","outcome":"health_gate_failed","exit_code":1}\n'
+            exit 1
           fi
           printf '{"schema":1,"kind":"collection_status","status":"ok","stage":"complete","exit_code":0}\n'
           REMOTE

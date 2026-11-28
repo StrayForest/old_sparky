@@ -2248,6 +2248,12 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertIn('"state": "unavailable"', workflow)
         self.assertIn('"state": "read"', workflow)
         self.assertIn("platform-production-backup-failure-helper-", workflow)
+        self.assertIn('platform_release_lock.sh" --run', workflow)
+        self.assertIn('python_bin="$runtime/shared/venv/bin/python"', workflow)
+        self.assertIn('platform_health_monitor.py" \\\n            --disk-min-free-gib 5 --disk-max-used-percent 90', workflow)
+        self.assertIn('CURRENT_STAGE=strict_readiness', workflow)
+        self.assertIn('"kind": "health_monitor_state"', workflow)
+        self.assertIn('"status": "unavailable", "reason": "report_invalid"', workflow)
         parsed_workflow = yaml.safe_load(workflow)
         collection_step = next(
             step
@@ -2269,6 +2275,188 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         )
         self.assertIsNotNone(remote_script)
         remote_source = remote_script.group("source")
+        health_summary_match = re.search(
+            r"<<'HEALTH_SUMMARY'\n(?P<source>.*?)\n[ ]*HEALTH_SUMMARY(?:\n|$)",
+            remote_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(health_summary_match)
+        health_summary_source = textwrap.dedent(health_summary_match.group("source"))
+        health_check_match = re.search(
+            r"<<'HEALTH_CHECK'\n(?P<source>.*?)\n[ ]*HEALTH_CHECK(?:\n|$)",
+            remote_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(health_check_match)
+        health_check_source = textwrap.dedent(health_check_match.group("source"))
+        self.assertIn("umask 077", health_check_source)
+        self.assertIn("verify_release_identity || exit 20", health_check_source)
+        self.assertIn("verify_release_identity || exit 27", health_check_source)
+        self.assertIn(
+            '"$python_bin" -I -B "$release_dir/tools/platform_health_monitor.py"',
+            health_check_source,
+        )
+        self.assertNotIn(
+            '/usr/bin/python3 -I -B "$release_dir/tools/platform_health_monitor.py"',
+            health_check_source,
+        )
+        expected_health_checks = {
+            "service:deadlock-api", "service:deadlock-worker",
+            "service:deadlock-web", "service:nginx", "api_ready",
+            "disk", "memory", "backup", "certificate",
+        }
+
+        def run_health_summary(report: dict[str, object], command_status: int = 0) -> dict[str, object]:
+            with tempfile.TemporaryDirectory() as temporary:
+                report_path = Path(temporary) / "health.json"
+                report_path.write_text(json.dumps(report), encoding="utf-8")
+                report_path.chmod(0o600)
+                result = subprocess.run(
+                    [sys.executable, "-I", "-B", "-", str(report_path), str(command_status)],
+                    input=health_summary_source,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("health-private-sentinel", result.stdout)
+                return json.loads(result.stdout)
+
+        def run_health_summary_bytes(payload: bytes, command_status: int = 0) -> dict[str, object]:
+            with tempfile.TemporaryDirectory() as temporary:
+                report_path = Path(temporary) / "health.json"
+                report_path.write_bytes(payload)
+                report_path.chmod(0o600)
+                result = subprocess.run(
+                    [sys.executable, "-I", "-B", "-", str(report_path), str(command_status)],
+                    input=health_summary_source,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("health-private-sentinel", result.stdout)
+                return json.loads(result.stdout)
+
+        checks = [
+            {"name": name, "ok": True, "detail": {"private": "health-private-sentinel"}}
+            for name in sorted(expected_health_checks)
+        ]
+        healthy_report = {
+            "event": "platform_health_monitor",
+            "timestamp": "2026-11-28T05:00:00+00:00",
+            "ok": True,
+            "failed": [],
+            "checks": checks,
+        }
+        healthy_summary = run_health_summary(healthy_report)
+        self.assertEqual(healthy_summary["status"], "ok")
+        self.assertEqual(set(healthy_summary["checks"]), expected_health_checks)
+        self.assertEqual(
+            set(healthy_summary), {"schema", "kind", "status", "checks", "failed_count"}
+        )
+        failed_report = json.loads(json.dumps(healthy_report))
+        failed_report["checks"][3]["ok"] = False
+        failed_report["failed"] = [failed_report["checks"][3]["name"]]
+        failed_report["ok"] = False
+        failed_summary = run_health_summary(failed_report, 1)
+        self.assertEqual(failed_summary["status"], "failed")
+        self.assertEqual(failed_summary["checks"][failed_report["failed"][0]], False)
+        unknown_report = json.loads(json.dumps(healthy_report))
+        unknown_report["checks"][0]["name"] = "service:unknown"
+        self.assertEqual(run_health_summary(unknown_report)["status"], "unavailable")
+        duplicate_report = json.loads(json.dumps(healthy_report))
+        duplicate_report["checks"][0] = dict(duplicate_report["checks"][1])
+        self.assertEqual(run_health_summary(duplicate_report)["status"], "unavailable")
+        wrong_status_report = json.loads(json.dumps(healthy_report))
+        wrong_status_report["ok"] = False
+        self.assertEqual(run_health_summary(wrong_status_report)["status"], "unavailable")
+        self.assertEqual(
+            run_health_summary_bytes(b'{"private":"health-private-sentinel"}')["status"],
+            "unavailable",
+        )
+        oversized_report = json.loads(json.dumps(healthy_report))
+        oversized_report["checks"][0]["detail"] = {"private": "x" * 70000}
+        self.assertEqual(
+            run_health_summary_bytes(json.dumps(oversized_report).encode())["status"],
+            "unavailable",
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "platform"
+            release_id = "gha-health-fixture"
+            source_sha = "a" * 40
+            release = runtime / "releases" / release_id
+            tools = release / "tools"
+            tools.mkdir(parents=True)
+            shared_python = runtime / "shared" / "venv" / "bin" / "python"
+            shared_python.parent.mkdir(parents=True)
+            shared_python.symlink_to(sys.executable)
+            current = runtime / "current"
+            current.symlink_to(release, target_is_directory=True)
+            (release / "RELEASE.json").write_text(
+                json.dumps({"release_slug": release_id, "source_git_commit": source_sha}),
+                encoding="utf-8",
+            )
+            report_path = root / "private" / "health.json"
+            report_path.parent.mkdir(mode=0o700)
+            lock_wrapper = tools / "platform_release_lock.sh"
+            lock_wrapper.write_text(
+                "#!/bin/sh\n[ \"$1\" = --run ] || exit 2\nshift\nexec \"$@\"\n",
+                encoding="utf-8",
+            )
+            lock_wrapper.chmod(0o700)
+            report_json = json.dumps(healthy_report, separators=(",", ":"))
+            monitor = tools / "platform_health_monitor.py"
+            monitor.write_text(
+                "import os, pathlib, sys\n"
+                "expected = ['--disk-min-free-gib', '5', '--disk-max-used-percent', '90']\n"
+                "if sys.argv[1:] != expected: raise SystemExit(81)\n"
+                f"print({report_json!r})\n"
+                "if os.environ.get('HEALTH_TEST_DRIFT') == '1':\n"
+                " current = pathlib.Path(os.environ['HEALTH_TEST_CURRENT'])\n"
+                " alternate = pathlib.Path(os.environ['HEALTH_TEST_ALTERNATE'])\n"
+                " current.unlink(); current.symlink_to(alternate, target_is_directory=True)\n",
+                encoding="utf-8",
+            )
+            monitor.chmod(0o644)
+
+            def run_health_script(*, drift: bool) -> subprocess.CompletedProcess[str]:
+                environment = os.environ.copy()
+                environment["HEALTH_TEST_DRIFT"] = "1" if drift else "0"
+                environment["HEALTH_TEST_CURRENT"] = str(current)
+                environment["HEALTH_TEST_ALTERNATE"] = str(root / "alternate-release")
+                return subprocess.run(
+                    [
+                        str(lock_wrapper), "--run", "/bin/bash", "-s", "--",
+                        str(runtime), release_id, source_sha, str(report_path), str(shared_python),
+                    ],
+                    input=health_check_source,
+                    text=True,
+                    capture_output=True,
+                    env=environment,
+                    check=False,
+                )
+
+            success = run_health_script(drift=False)
+            self.assertEqual(success.returncode, 0, success.stderr)
+            self.assertEqual(success.stdout, "")
+            self.assertNotIn("health-private-sentinel", success.stderr)
+            self.assertEqual(stat.S_IMODE(report_path.stat().st_mode), 0o600)
+            self.assertIn("health-private-sentinel", report_path.read_text(encoding="utf-8"))
+            report_path.unlink()
+            alternate = runtime / "releases" / "gha-health-alternate"
+            (alternate / "tools").mkdir(parents=True)
+            (alternate / "RELEASE.json").write_text(
+                json.dumps({"release_slug": alternate.name, "source_git_commit": "b" * 40}),
+                encoding="utf-8",
+            )
+            drifted = run_health_script(drift=True)
+            self.assertEqual(drifted.returncode, 27)
+            self.assertEqual(drifted.stdout, "")
+            self.assertNotIn("health-private-sentinel", drifted.stderr)
+
         receipt_reader = remote_source.index('if [[ -n "$backup_failure_run_id" ]]; then')
         deferred_retention_exit = remote_source.index(
             'if (( retention_failure_code != 0 )); then'
