@@ -36,6 +36,7 @@ from tools.platform_ci_classifier import (
     STORAGE_OPERATIONS_REASON,
     STORAGE_OPERATIONS_TRIGGER_FILES,
     WEB_PR_GATE_IDS,
+    _is_recovery_bootstrap_only,
     ClassifierError,
     SECURITY_WORKFLOW_NAME,
     SECURITY_WORKFLOW_PATH,
@@ -2601,6 +2602,100 @@ class PlatformCiClassifierTests(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(completed.stdout.strip(), "classifier manifest accepted")
+
+        recovery_with_storage_skill = [
+            ".agents/skills/platform-storage-retention/SKILL.md",
+            ".github/workflows/platform-production-recovery-bootstrap-abort.yml",
+            "platform/docs/CURRENT.md",
+            "platform/docs/README.md",
+            "platform/docs/adr/maintenance-failure-host-local-evidence.md",
+            "platform/docs/adr/maintenance-failure-evidence-encryption.md",
+            "platform/docs/adr/maintenance-failure-capture-and-reset.md",
+            "platform/docs/adr/recovery-bootstrap-retained-abort.md",
+            "platform/docs/deployment-runbook.md",
+            "platform/docs/operations-runbook.md",
+            "platform/docs/test-suite-governance.md",
+            "platform/tests/test_platform_recovery_bootstrap.py",
+            "platform/tools/platform_maintenance_failure_evidence.py",
+            "platform/tools/platform_test_catalog.py",
+        ]
+        recovery_manifest = classify(
+            recovery_with_storage_skill,
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(recovery_manifest["reason"], RECOVERY_BOOTSTRAP_REASON)
+        self.assertFalse(recovery_manifest["fallback"])
+        self.assertFalse(recovery_manifest["deployable"])
+        self.assertTrue(
+            _is_recovery_bootstrap_only(recovery_manifest["files"])
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            recovery_archive = self._write_production_classifier_archive(
+                Path(temporary), recovery_manifest
+            )
+            recovery_result = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    str(REPO_ROOT / "platform/tools/platform_production_classifier_artifact.py"),
+                    "manifest",
+                    str(recovery_archive),
+                    "--target-sha",
+                    self.TARGET_SHA,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(recovery_result.returncode, 0, recovery_result.stderr)
+        self.assertEqual(
+            recovery_result.stdout.strip(), "classifier manifest accepted"
+        )
+        recovery_build_workflow = (
+            REPO_ROOT
+            / ".github/workflows/platform-production-recovery-bootstrap-build.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'else "recovery-bootstrap" if recovery_bootstrap_only',
+            recovery_build_workflow,
+        )
+        self.assertNotIn(
+            "or recovery_bootstrap_only\n          route_family",
+            recovery_build_workflow,
+        )
+
+        unknown_recovery = classify(
+            [*recovery_with_storage_skill, "unknown-root-config.toml"],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertTrue(unknown_recovery["fallback"])
+        self.assertNotEqual(unknown_recovery["reason"], RECOVERY_BOOTSTRAP_REASON)
+        with tempfile.TemporaryDirectory() as temporary:
+            unknown_archive = self._write_production_classifier_archive(
+                Path(temporary), unknown_recovery
+            )
+            unknown_result = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    str(REPO_ROOT / "platform/tools/platform_production_classifier_artifact.py"),
+                    "manifest",
+                    str(unknown_archive),
+                    "--target-sha",
+                    self.TARGET_SHA,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        self.assertNotEqual(unknown_result.returncode, 0)
+        self.assertIn("classifier validation rejected", unknown_result.stderr)
 
         runtime_manifest = classify(
             ["platform/apps/platform_api/app/main.py"],

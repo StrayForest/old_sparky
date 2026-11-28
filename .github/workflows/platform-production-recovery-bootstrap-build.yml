@@ -253,9 +253,27 @@ jobs:
           project_guidance_reason = "project guidance change requires full verification and is non-deployable"
           project_guidance_runtime_only = False
           project_guidance_runtime_reason = "runtime-sensitive project guidance change requires full verification and is non-deployable"
-          if manifest.get("reason") in {project_guidance_reason, project_guidance_runtime_reason}:
+          recovery_bootstrap_only = False
+          recovery_bootstrap_reason = "retained-release recovery-bootstrap change requires full verification and is non-deployable"
+          if manifest.get("reason") in {recovery_bootstrap_reason, project_guidance_reason, project_guidance_runtime_reason}:
               sys.path.insert(0, str(Path("trusted-source/platform/tools").resolve()))
-              from platform_ci_classifier import _is_project_guidance_only, _is_project_guidance_runtime_only
+              from platform_ci_classifier import (
+                  _is_project_guidance_only,
+                  _is_project_guidance_runtime_only,
+                  _is_recovery_bootstrap_only,
+              )
+              recovery_bootstrap_only = (
+                  manifest.get("reason") == recovery_bootstrap_reason
+                  and manifest.get("class") == "full"
+                  and manifest.get("expected_gates") == ["backend", "python-quality", "security", "migration", "docs", "web-quality", "web-hermetic", "verification-contract"]
+                  and manifest.get("runtime_sensitive") is True
+                  and manifest.get("deployable") is False
+                  and manifest.get("fallback") is False
+                  and isinstance(files, list)
+                  and files == sorted(set(files))
+                  and _is_recovery_bootstrap_only(files)
+                  and manifest.get("target_sha") == sys.argv[3]
+              )
               project_guidance_only = (
                   manifest.get("reason") == project_guidance_reason
                   and manifest.get("class") == "full"
@@ -286,6 +304,8 @@ jobs:
               raise SystemExit("out-of-scope classifier proof is inconsistent")
           if manifest.get("reason") == "trusted candidate-packaging change requires full verification and is non-deployable" and not candidate_packaging_only:
               raise SystemExit("candidate-packaging classifier proof is inconsistent")
+          if manifest.get("reason") == recovery_bootstrap_reason and not recovery_bootstrap_only:
+              raise SystemExit("recovery-bootstrap classifier proof is inconsistent")
           if manifest.get("reason") == project_guidance_reason and not project_guidance_only:
               raise SystemExit("project-guidance classifier proof is inconsistent")
           if manifest.get("reason") == project_guidance_runtime_reason and not project_guidance_runtime_only:
@@ -296,6 +316,7 @@ jobs:
               else "docs-only" if docs_only
               else "out-of-scope" if out_of_scope_only
               else "candidate-packaging" if candidate_packaging_only
+              else "recovery-bootstrap" if recovery_bootstrap_only
               else "project-guidance" if project_guidance_only
               else "project-guidance-runtime-sensitive" if project_guidance_runtime_only
               else ""

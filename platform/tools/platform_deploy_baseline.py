@@ -28,12 +28,14 @@ from tools.platform_ci_classifier import (
     PROJECT_GUIDANCE_RUNTIME_REASON,
     PROJECT_GUIDANCE_RUNTIME_FILES,
     RECOVERY_BOOTSTRAP_FILES,
+    RECOVERY_BOOTSTRAP_COMPANION_FILES,
     RECOVERY_BOOTSTRAP_REASON,
     STORAGE_OPERATIONS_FILES,
     STORAGE_OPERATIONS_TRIGGER_FILES,
     ClassifierError,
     classify,
     classify_cumulative_baseline_paths,
+    _is_recovery_bootstrap_only,
     _is_project_guidance_only,
     _is_project_guidance_runtime_only,
     route_files_without_root_guide,
@@ -81,12 +83,13 @@ def _is_runtime_guidance_reconcile_union(files: Sequence[str]) -> bool:
     """Recognize the closed runtime-guidance plus verified tooling no-op family."""
 
     route_files = route_files_without_root_guide(files)
-    tooling_files = RECOVERY_BOOTSTRAP_FILES | CANDIDATE_PACKAGING_FILES
+    tooling_triggers = RECOVERY_BOOTSTRAP_FILES | CANDIDATE_PACKAGING_FILES
+    tooling_files = tooling_triggers | RECOVERY_BOOTSTRAP_COMPANION_FILES
     guidance_files = PROJECT_GUIDANCE_FILES | PROJECT_GUIDANCE_RUNTIME_FILES
     allowed_files = tooling_files | guidance_files
     return bool(
         any(path in PROJECT_GUIDANCE_RUNTIME_FILES for path in route_files)
-        and any(path in tooling_files for path in route_files)
+        and any(path in tooling_triggers for path in route_files)
         and all(
             path in allowed_files or path.startswith(DOCS_PREFIX)
             for path in route_files
@@ -271,11 +274,7 @@ def validate_report_only_recovery_baseline(
         or not files
         or any(not isinstance(path, str) for path in files)
         or len(set(files)) != len(files)
-        or not any(path in RECOVERY_BOOTSTRAP_FILES for path in route_files)
-        or any(
-            path not in RECOVERY_BOOTSTRAP_FILES and not path.startswith(DOCS_PREFIX)
-            for path in route_files
-        )
+        or not _is_recovery_bootstrap_only(route_files)
     ):
         raise ProvenanceError("classifier manifest is not the exact recovery-only route")
     return {
@@ -400,11 +399,7 @@ def classify_cumulative_baseline(
     ):
         raise ProvenanceError("incremental manifest is not a full non-deployable source route")
     recovery_bootstrap_only = bool(
-        any(path in RECOVERY_BOOTSTRAP_FILES for path in incremental_route_files)
-        and all(
-            path in RECOVERY_BOOTSTRAP_FILES or path.startswith("platform/docs/")
-            for path in incremental_route_files
-        )
+        _is_recovery_bootstrap_only(incremental_route_files)
         and incremental_manifest.get("reason") == RECOVERY_BOOTSTRAP_REASON
     )
     candidate_packaging_only = bool(
@@ -564,6 +559,7 @@ def classify_cumulative_baseline(
         and all(
             path in STORAGE_OPERATIONS_FILES
             or path in RECOVERY_BOOTSTRAP_FILES
+            or path in RECOVERY_BOOTSTRAP_COMPANION_FILES
             or path.startswith(DOCS_PREFIX)
             for path in cumulative_route_files
         )
@@ -584,11 +580,7 @@ def classify_cumulative_baseline(
             raise ProvenanceError("cumulative non-deployable file list is malformed")
         recovery_no_op = bool(
             cumulative.get("reason") == RECOVERY_BOOTSTRAP_REASON
-            and any(path in RECOVERY_BOOTSTRAP_FILES for path in cumulative_route_files)
-            and all(
-                path in RECOVERY_BOOTSTRAP_FILES or path.startswith("platform/docs/")
-                for path in cumulative_route_files
-            )
+            and _is_recovery_bootstrap_only(cumulative_route_files)
         )
         candidate_no_op = bool(
             cumulative.get("reason") == CANDIDATE_PACKAGING_REASON
@@ -697,8 +689,7 @@ def validate_cumulative_reconcile_route(route: object) -> dict[str, bool]:
         )
 
         recovery_family = bool(
-            any(path in RECOVERY_BOOTSTRAP_FILES for path in route_files)
-            and all(path in RECOVERY_BOOTSTRAP_FILES or path.startswith(DOCS_PREFIX) for path in route_files)
+            _is_recovery_bootstrap_only(route_files)
             and manifest.get("reason") == RECOVERY_BOOTSTRAP_REASON
             and manifest["deployable"] is False
         )
@@ -733,6 +724,7 @@ def validate_cumulative_reconcile_route(route: object) -> dict[str, bool]:
             and all(
                 path in STORAGE_OPERATIONS_FILES
                 or path in RECOVERY_BOOTSTRAP_FILES
+                or path in RECOVERY_BOOTSTRAP_COMPANION_FILES
                 or path.startswith(DOCS_PREFIX)
                 for path in route_files
             )

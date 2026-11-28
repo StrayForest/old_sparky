@@ -5210,6 +5210,29 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         )
         self.assertEqual(canonical, classifier_files)
         self.assertEqual(canonical, artifact_files)
+        companions = frozenset(classifier.RECOVERY_BOOTSTRAP_COMPANION_FILES)
+        self.assertEqual(
+            companions,
+            self._set_assignment(
+                classifier_source, "RECOVERY_BOOTSTRAP_COMPANION_FILES"
+            ),
+        )
+        self.assertEqual(
+            companions,
+            self._set_assignment(
+                artifact_source, "RECOVERY_BOOTSTRAP_COMPANION_FILES"
+            ),
+        )
+        self.assertTrue(canonical.isdisjoint(companions))
+        recovery_trigger = sorted(canonical)[0]
+        self.assertTrue(
+            classifier._is_recovery_bootstrap_only(
+                [recovery_trigger, *companions]
+            )
+        )
+        self.assertFalse(
+            classifier._is_recovery_bootstrap_only(sorted(companions))
+        )
         # Auto-deploy delegates manifest family checks to the shared trusted
         # artifact validator rather than carrying a second inline allowlist.
         self.assertIn(

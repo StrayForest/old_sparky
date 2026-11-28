@@ -316,6 +316,13 @@ RECOVERY_BOOTSTRAP_FILES = frozenset(
         "platform/deploy/systemd/deadlock-health-monitor.service",
     }
 )
+RECOVERY_BOOTSTRAP_COMPANION_FILES = frozenset(
+    {
+        # A storage-retention skill edit can accompany recovery changes, but a
+        # skill-only edit remains owned by the storage-operations route.
+        ".agents/skills/platform-storage-retention/SKILL.md",
+    }
+)
 RECOVERY_BOOTSTRAP_REASON = (
     "retained-release recovery-bootstrap change requires full verification and is non-deployable"
 )
@@ -523,13 +530,15 @@ def _is_candidate_packaging_only(files: Sequence[str]) -> bool:
 
 
 def _is_recovery_bootstrap_only(files: Sequence[str]) -> bool:
-    """Return whether files are the closed recovery-bootstrap route plus docs."""
+    """Return whether files are recovery paths plus approved companions/docs."""
 
     files = route_files_without_root_guide(files)
     return bool(
         any(path in RECOVERY_BOOTSTRAP_FILES for path in files)
         and all(
-            path in RECOVERY_BOOTSTRAP_FILES or path.startswith(DOCS_PREFIX)
+            path in RECOVERY_BOOTSTRAP_FILES
+            or path in RECOVERY_BOOTSTRAP_COMPANION_FILES
+            or path.startswith(DOCS_PREFIX)
             for path in files
         )
     )
