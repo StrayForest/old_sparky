@@ -700,11 +700,29 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
   const locketSection = page.locator(".item-patch-section");
   await expect(locketSection.getByRole("heading", { level: 2 })).toHaveText("Restorative Locket");
   const locketChanges = locketSection.locator(":scope > .patch-change-content");
-  await expect(locketChanges.locator(":scope > .patch-change-group > .patch-change-group-list > li"))
-    .toHaveCount(9);
-  await expect(locketChanges.locator(".patch-change-group-list > li").nth(2))
-    .toContainText("The item now references Healing Needles.");
-  const healingNeedlesReference = locketChanges.locator('.patch-change-reference[data-reference-kind="ability"]');
+  const locketRows = locketChanges.locator(":scope > .patch-change-group > .patch-change-group-list > li");
+  await expect(locketRows).toHaveCount(9);
+  const renderedSourceRows = await locketRows.evaluateAll((rows) => rows.map((row) => {
+    const sourceText = row.cloneNode(true) as HTMLElement;
+    sourceText.querySelectorAll(".patch-change-references").forEach((reference) => reference.remove());
+    return sourceText.textContent?.trim() ?? "";
+  }));
+  expect(renderedSourceRows).toEqual([
+    "Healing cooldown reduced.",
+    "The item now references Healing Needles.",
+    "Healing duration increased.",
+    "The active is easier to use.",
+    "Bonus health increased.",
+    "Cooldown recovery improved.",
+    "The effect now stacks once.",
+    "Range increased.",
+    "The follow-up effect is retained.",
+  ]);
+  const referencedChildChange = locketRows.nth(1);
+  await expect(referencedChildChange).toContainText("The item now references Healing Needles.");
+  const healingNeedlesReference = referencedChildChange.locator(
+    '.patch-change-reference[data-reference-kind="ability"]',
+  );
   await expect(healingNeedlesReference).toHaveCount(1);
   await expect(healingNeedlesReference.locator(".patch-change-reference-name")).toHaveText("Лечебные иглы");
   await expect(healingNeedlesReference.locator(".patch-change-reference-description"))
@@ -712,13 +730,13 @@ test("four parsed patch DTOs render correct hero and ability ownership at mobile
   const referenceIcon = healingNeedlesReference.locator(".patch-change-reference-icon");
   await expect(referenceIcon).toHaveAttribute("src", referenceImage);
   await expect(referenceIcon).toHaveJSProperty("naturalWidth", 1);
-  const longReferenceRow = locketChanges.locator(".patch-change-group-list > li").nth(7);
+  const longReferenceRow = locketRows.nth(7);
   await expect(longReferenceRow.locator(".patch-change-reference-name"))
     .toHaveText("Очень длинное локализованное название предмета для проверки переноса");
   await expect(longReferenceRow.locator(".patch-change-reference-description"))
     .toHaveText("Длинное описание связанного предмета должно переноситься внутри блока и не создавать горизонтальную прокрутку на узком экране.");
   await expect(longReferenceRow.locator(".patch-change-reference-icon")).toHaveCount(0);
-  const metadataFallbackRow = locketChanges.locator(".patch-change-group-list > li").nth(8);
+  const metadataFallbackRow = locketRows.nth(8);
   await expect(metadataFallbackRow.locator(".patch-change-reference-name")).toHaveText("Fallback Hero");
   await expect(metadataFallbackRow.locator(".patch-change-reference-description, .patch-change-reference-icon"))
     .toHaveCount(0);
