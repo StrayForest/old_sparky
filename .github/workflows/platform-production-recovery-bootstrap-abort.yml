@@ -1165,7 +1165,60 @@ jobs:
           fi
           if [[ "$ACTION" == capture_maintenance_failure ]]; then
             if (( capture_remote_status != 0 )); then
-              printf 'MAINTENANCE_EVIDENCE status=failed historical_cause=unknown\n'
+              diagnostic_marker="$(/usr/bin/python3 -I -B - "$RUNNER_TEMP/maintenance-action.stderr" 2>/dev/null <<'PY_DIAGNOSTIC'
+          from pathlib import Path
+          import re
+          import sys
+
+          UNAVAILABLE = "MAINTENANCE_EVIDENCE schema=1 status=failed error_class=remote_diagnostic_unavailable"
+          GENERIC_HELPER_FAILURE = "MAINTENANCE_EVIDENCE schema=1 status=failed error_code=capture_guard_failed"
+          ALLOWED_CODES = {
+              "transaction_receipt": "receipt_invalid",
+              "transaction_context": "receipt_binding_mismatch",
+              "host_identity": "host_identity_unavailable",
+              "systemd_properties": "unit_properties_unavailable",
+              "systemd_jobs": "jobs_unavailable_or_malformed",
+              "cgroup": "cgroup_unavailable_or_malformed",
+              "journal": "journal_unavailable_or_malformed",
+              "evidence_write": "evidence_destination_invalid",
+              "capture_guard": "capture_guard_failed",
+          }
+
+          try:
+              with Path(sys.argv[1]).open("rb") as stream:
+                  raw = stream.read(4097)
+              if len(raw) > 4096:
+                  raise ValueError
+              lines = raw.decode("ascii").splitlines()
+              if len(lines) > 64:
+                  raise ValueError
+          except (IndexError, OSError, UnicodeError, ValueError):
+              print(UNAVAILABLE)
+              raise SystemExit(0)
+
+          candidates = [
+              line
+              for line in lines
+              if line.lstrip(" \t").startswith("MAINTENANCE_EVIDENCE")
+          ]
+          if len(candidates) != 1:
+              print(UNAVAILABLE)
+              raise SystemExit(0)
+          line = candidates[0]
+          if line == GENERIC_HELPER_FAILURE:
+              print(line)
+              raise SystemExit(0)
+          match = re.fullmatch(
+              r"MAINTENANCE_EVIDENCE schema=1 status=diagnostic stage=([a-z_]+) error_code=([a-z_]+) private=true",
+              line,
+          )
+          if match is None or ALLOWED_CODES.get(match.group(1)) != match.group(2):
+              print(UNAVAILABLE)
+          else:
+              print(line)
+          PY_DIAGNOSTIC
+              )" || diagnostic_marker='MAINTENANCE_EVIDENCE schema=1 status=failed error_class=remote_diagnostic_unavailable'
+              printf '%s\n' "$diagnostic_marker"
               exit "$capture_remote_status"
             fi
             receipt_line="$(cat "$RUNNER_TEMP/maintenance-action.stdout")"

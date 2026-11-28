@@ -2617,6 +2617,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
             "platform/docs/test-suite-governance.md",
             "platform/tests/test_platform_recovery_bootstrap.py",
             "platform/tools/platform_maintenance_failure_evidence.py",
+            "platform/tools/platform_deploy_baseline.py",
             "platform/tools/platform_test_catalog.py",
         ]
         recovery_manifest = classify(

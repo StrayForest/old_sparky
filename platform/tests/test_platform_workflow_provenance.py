@@ -781,6 +781,97 @@ class WorkflowProvenanceTests(unittest.TestCase):
             {"no_op": True, "runtime_required": False},
         )
 
+        exact_recovery_incremental_paths = [
+            ".github/workflows/platform-production-recovery-bootstrap-build.yml",
+            "platform/docs/deployment-runbook.md",
+            "platform/tests/test_platform_ci_classifier.py",
+            "platform/tests/test_platform_recovery_bootstrap.py",
+            "platform/tools/platform_ci_classifier.py",
+            "platform/tools/platform_deploy_baseline.py",
+            "platform/tools/platform_production_classifier_artifact.py",
+        ]
+        exact_recovery_incremental = classify(
+            exact_recovery_incremental_paths,
+            event="push",
+            branch="dev",
+            target_sha=self.SHA,
+        )
+        self.assertEqual(exact_recovery_incremental["reason"], RECOVERY_BOOTSTRAP_REASON)
+        self.assertFalse(exact_recovery_incremental["fallback"])
+        self.assertFalse(exact_recovery_incremental["deployable"])
+        exact_cumulative = classify_cumulative_baseline(
+            exact_recovery_incremental,
+            exact_recovery_incremental_paths,
+            expected_target_sha=self.SHA,
+        )
+        self.assertTrue(exact_cumulative["no_op"])
+        self.assertEqual(
+            validate_cumulative_reconcile_route(exact_cumulative),
+            {"no_op": True, "runtime_required": False},
+        )
+
+        baseline_validator_alone = classify(
+            ["platform/tools/platform_deploy_baseline.py"],
+            event="push",
+            branch="dev",
+            target_sha=self.SHA,
+        )
+        self.assertEqual(
+            baseline_validator_alone["reason"], RECOVERY_BOOTSTRAP_REASON
+        )
+        self.assertFalse(baseline_validator_alone["fallback"])
+
+        actual_cumulative_paths = [
+            ".agents/skills/platform-storage-retention/SKILL.md",
+            ".github/workflows/platform-production-recovery-bootstrap-abort.yml",
+            ".github/workflows/platform-production-recovery-bootstrap-build.yml",
+            "platform/docs/CURRENT.md",
+            "platform/docs/README.md",
+            "platform/docs/adr/maintenance-failure-capture-and-reset.md",
+            "platform/docs/adr/maintenance-failure-evidence-encryption.md",
+            "platform/docs/adr/maintenance-failure-host-local-evidence.md",
+            "platform/docs/adr/recovery-bootstrap-retained-abort.md",
+            "platform/docs/deployment-runbook.md",
+            "platform/docs/operations-runbook.md",
+            "platform/docs/test-suite-governance.md",
+            "platform/tests/test_platform_ci_classifier.py",
+            "platform/tests/test_platform_recovery_bootstrap.py",
+            "platform/tools/platform_ci_classifier.py",
+            "platform/tools/platform_deploy_baseline.py",
+            "platform/tools/platform_maintenance_failure_evidence.py",
+            "platform/tools/platform_production_classifier_artifact.py",
+            "platform/tools/platform_test_catalog.py",
+        ]
+        actual_cumulative = classify_cumulative_baseline(
+            exact_recovery_incremental,
+            actual_cumulative_paths,
+            expected_target_sha=self.SHA,
+        )
+        self.assertTrue(actual_cumulative["no_op"])
+        self.assertEqual(
+            actual_cumulative["manifest"]["files"],
+            sorted(actual_cumulative_paths),
+        )
+        self.assertEqual(
+            validate_cumulative_reconcile_route(actual_cumulative),
+            {"no_op": True, "runtime_required": True},
+        )
+
+        exact_recovery_with_unknown = classify(
+            [*actual_cumulative_paths, "unknown-root-config.toml"],
+            event="push",
+            branch="dev",
+            target_sha=self.SHA,
+        )
+        self.assertTrue(exact_recovery_with_unknown["fallback"])
+        self.assertNotEqual(exact_recovery_with_unknown["reason"], RECOVERY_BOOTSTRAP_REASON)
+        with self.assertRaises(ProvenanceError):
+            classify_cumulative_baseline(
+                exact_recovery_incremental,
+                exact_recovery_with_unknown["files"],
+                expected_target_sha=self.SHA,
+            )
+
         bootstrap_paths_with_guide = [
             ".github/workflows/platform-production-deploy.yml",
             "AGENTS.md",

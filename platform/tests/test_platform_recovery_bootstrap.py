@@ -1169,6 +1169,83 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         self._assert_runtime_child_private_capture_is_opt_in_bounded_and_runner_only()
         workflow = (REPO_ROOT / ".github/workflows/platform-production-recovery-bootstrap-abort.yml").read_text(encoding="utf-8")
         self._run_reset_capture_artifact_fetch_contract(workflow)
+        parser_match = re.search(
+            r"<<'PY_DIAGNOSTIC'\n(.*?)\n          PY_DIAGNOSTIC\n",
+            workflow,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(parser_match)
+        diagnostic_parser = textwrap.dedent(parser_match.group(1))
+        self.assertIn("len(raw) > 4096", diagnostic_parser)
+        self.assertIn("len(lines) > 64", diagnostic_parser)
+        self.assertIn("len(candidates) != 1", diagnostic_parser)
+        self.assertIn("error_class=remote_diagnostic_unavailable", diagnostic_parser)
+        self.assertNotIn('cat "$RUNNER_TEMP/maintenance-action.stderr"', workflow)
+        valid_diagnostic = (
+            "MAINTENANCE_EVIDENCE schema=1 status=diagnostic "
+            "stage=systemd_properties error_code=unit_properties_unavailable private=true\n"
+        )
+        unavailable = (
+            "MAINTENANCE_EVIDENCE schema=1 status=failed "
+            "error_class=remote_diagnostic_unavailable"
+        )
+        with tempfile.TemporaryDirectory(prefix="platform-maintenance-diagnostic-") as temporary:
+            diagnostic_file = Path(temporary) / "remote.stderr"
+
+            def project(raw: bytes) -> subprocess.CompletedProcess[str]:
+                diagnostic_file.write_bytes(raw)
+                return subprocess.run(
+                    [sys.executable, "-I", "-B", "-", str(diagnostic_file)],
+                    input=diagnostic_parser,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+            accepted = project(valid_diagnostic.encode("ascii"))
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertEqual(accepted.stdout.strip(), valid_diagnostic.strip())
+            noisy_but_valid = project(
+                b"SENTINEL_PRIVATE_CAUSE credentials\n"
+                + valid_diagnostic.encode("ascii")
+                + b"transport noise\n"
+            )
+            self.assertEqual(noisy_but_valid.returncode, 0, noisy_but_valid.stderr)
+            self.assertEqual(noisy_but_valid.stdout.strip(), valid_diagnostic.strip())
+            self.assertNotIn("SENTINEL_PRIVATE_CAUSE", noisy_but_valid.stdout)
+            generic_helper = project(
+                b"MAINTENANCE_EVIDENCE schema=1 status=failed "
+                b"error_code=capture_guard_failed\n"
+            )
+            self.assertEqual(generic_helper.stdout.strip(),
+                             "MAINTENANCE_EVIDENCE schema=1 status=failed error_code=capture_guard_failed")
+            for rejected in (
+                b"SENTINEL_PRIVATE_CAUSE credentials\ntransport noise\n",
+                valid_diagnostic.encode("ascii") * 2,
+                valid_diagnostic.encode("ascii") + b"MAINTENANCE_EVIDENCE unknown\n",
+                b"MAINTENANCE_EVIDENCE schema=1 status=diagnostic stage=unknown error_code=unknown private=true\n",
+                b"MAINTENANCE_EVIDENCE schema=1 status=diagnostic stage=systemd_jobs error_code=unit_properties_unavailable private=true\n",
+                b"MAINTENANCE_EVIDENCE schema=1 status=diagnostic stage=systemd_jobs error_code=jobs_unavailable_or_malformed trailing private=true\n",
+                b"  " + valid_diagnostic.encode("ascii"),
+                b"\xff\n",
+                b"x" * 4097,
+                b"",
+            ):
+                projected = project(rejected)
+                self.assertEqual(projected.returncode, 0, projected.stderr)
+                self.assertEqual(projected.stdout.strip(), unavailable)
+                self.assertNotIn("credentials", projected.stdout)
+                self.assertNotIn("SENTINEL_PRIVATE_CAUSE", projected.stdout)
+            diagnostic_file.unlink()
+            missing = subprocess.run(
+                [sys.executable, "-I", "-B", "-", str(diagnostic_file)],
+                input=diagnostic_parser,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(missing.returncode, 0, missing.stderr)
+            self.assertEqual(missing.stdout.strip(), unavailable)
         evidence = workflow.index("Validate exact successful security run")
         secrets = workflow.index("secrets.PROD_SSH_HOST")
         self.assertLess(evidence, secrets)

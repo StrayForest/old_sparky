@@ -730,14 +730,19 @@ def validate_cumulative_reconcile_route(route: object) -> dict[str, bool]:
             )
             and manifest["runtime_sensitive"] is True
         )
-        no_op_families = (
-            docs_family,
-            recovery_family,
-            candidate_family,
-            storage_recovery_family,
-            project_guidance_family,
-            runtime_guidance_reconcile_family,
-        )
+        # The exact runtime-guidance + recovery-tooling union is the most
+        # specific route. Its skill path also belongs to storage operations,
+        # so generic recovery/storage predicates intentionally do not compete.
+        if runtime_guidance_reconcile_family:
+            no_op_families = (True,)
+        else:
+            no_op_families = (
+                docs_family,
+                recovery_family,
+                candidate_family,
+                storage_recovery_family,
+                project_guidance_family,
+            )
         if sum(no_op_families) != 1:
             raise ProvenanceError("cumulative no-op route is outside the exact authorized file families")
         return {
